@@ -24,8 +24,8 @@ use ravel_object_store::{
     Version, list_all,
 };
 use ravel_proto::catalog::v1::{
-    ColumnStatsSegment, SnapshotColumnStatsPartRef, SnapshotColumnStatsRef, SnapshotEntry,
-    SnapshotHead, SnapshotPartRef, SnapshotPostingsRef,
+    ColumnStatsSegment, SnapshotColumnStatsPartRef, SnapshotEntry, SnapshotHead, SnapshotPartRef,
+    SnapshotPostingsRef,
 };
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord, RewriteRecord};
 use ravel_segment::{ExpectedIdentity, ReaderLimits, SegmentError};
@@ -148,27 +148,6 @@ pub struct FoldReport {
     /// Encoded size of the postings object, in bytes. `0` when
     /// `postings_built` is `false`.
     pub postings_bytes: u64,
-    /// `true` if this fold successfully built and attached a column-statistics
-    /// object (ADR-0850). `false` covers "the tenant has no configured typed
-    /// attribute columns" (nothing to build), a no-op fold, and "the build
-    /// failed and the fold proceeded without a column-stats ref" -- exactly
-    /// the same three-way ambiguity `postings_built` already accepts.
-    pub column_stats_built: bool,
-    /// Encoded size of the column-stats object, in bytes. `0` when
-    /// `column_stats_built` is `false`.
-    pub column_stats_bytes: u64,
-    /// `true` if this fold successfully built and attached the part-hash-keyed
-    /// (v2) column-statistics object under `SnapshotHead.column_stats_part`
-    /// (field 13, ADR-0942). Covers L0 and L1 uniformly. `false` carries the
-    /// same three-way ambiguity as [`Self::column_stats_built`]: no configured
-    /// typed columns, a no-op fold, or a build/PUT failure the fold proceeded
-    /// past. Independent of [`Self::column_stats_built`]: during the
-    /// dual-publish window both the v1 (field 11) and v2 (field 13) objects are
-    /// written each fold.
-    pub column_stats_part_built: bool,
-    /// Encoded size of the v2 part-hash-keyed column-stats object, in bytes.
-    /// `0` when `column_stats_part_built` is `false`.
-    pub column_stats_part_bytes: u64,
     /// Number of per-part (v3, ADR-1413) column-statistics objects this fold
     /// built and PUT, one per newly written or rewritten part (never for a
     /// part carried forward by reference: its existing
@@ -269,14 +248,15 @@ impl HeadState {
     }
 }
 
-/// Orders v2 column-statistics records by their join key (the covered part's
-/// content hash, carried in `writer_id`) and collapses repeats.
+/// Orders per-part (v3) column-statistics records by their join key (the
+/// covered part's content hash, carried in `writer_id`) and collapses
+/// repeats.
 ///
-/// `encode_column_stats_v2` rejects a repeated key outright, and the fold
-/// treats that error as "no field 13 this time", so one repeat would strip the
-/// tenant's part-bound statistics on this and every later fold. A repeated key
-/// means two entries cover a byte-identical part, so their records carry the
-/// same statistics and keeping one is exact rather than a narrowing.
+/// `encode_column_stats_v3` rejects a repeated key outright, and the fold
+/// treats that error as "no field 7 ref for this part", so one repeat would
+/// strip the part's statistics. A repeated key means two entries cover a
+/// byte-identical part, so their records carry the same statistics and
+/// keeping one is exact rather than a narrowing.
 fn sort_and_dedup_part_segments(segments: &mut Vec<ColumnStatsSegment>) {
     segments.sort_by(|a, b| a.writer_id.cmp(&b.writer_id));
     segments.dedup_by(|a, b| a.writer_id == b.writer_id);
@@ -1900,409 +1880,6 @@ impl Catalog {
                 None => None,
             };
 
-            // Column statistics (ADR-0850): exact per-object statistics for
-            // the tenant's configured typed logs attribute columns. Unlike
-            // postings, the baseline is joined by identity
-            // (`entry_identity`), not ordinal position: a segment's exact
-            // statistics never change once written, so any L0 entry present
-            // in both the previous fold's column-stats object and this
-            // fold's entry set is reused verbatim with no re-fetch, and only
-            // a genuinely new L0 entry is fetched and scanned. This also
-            // makes the `reconciled`/`rebuilt` ordinal-invalidation concern
-            // that forces postings to restart from scratch moot here: a
-            // selective-erasure rewrite or a compaction excludes its
-            // superseded L0 entries from `entries` entirely (replacing them
-            // with an L1 entry under an unrelated identity,
-            // `classify_bucket`'s supersession handling above), so an erased
-            // entry's identity simply stops appearing in `entries` and its
-            // stale baseline statistics are never carried forward -- not
-            // because this code checks for erasure, but because the entry it
-            // would apply to is no longer in the set being folded.
-            //
-            // This v1 publish is restricted to level-0 entries: an L1 entry's
-            // writer_id/writer_epoch slots are repurposed
-            // (`build_l1_snapshot_entry`) and carry no real writer identity, so
-            // the five-field tuple a v1 record keys by cannot address one. L1
-            // coverage is the v2 (field-13) publish below, which keys by the
-            // covered part's content hash instead.
-            //
-            // A single segment's fetch/decode/tally failure never aborts the
-            // whole column-stats artifact (`column_stats_build`'s module
-            // docs): that segment is simply absent from `column_segments`,
-            // which the query-time reader already treats as "no stats here,
-            // fall back to scanning."
-            //
-            // One tally per covered object serves BOTH publishes (#964): the
-            // two passes cover the same L0 entries, and each fetching and
-            // scanning the object for itself cost two reads per L0 part where
-            // one does. The cache itself is constructed before the retry
-            // loop, so a lost CAS keeps its tallies too.
-            let (column_stats_built, column_stats_size, column_stats_ref) = if typed_attr_columns
-                .is_empty()
-            {
-                (false, 0u64, None)
-            } else {
-                let baseline: HashMap<EntryIdentity, ColumnStatsSegment> = if rebuilt {
-                    HashMap::new()
-                } else if let HeadState::Valid { head, .. } = &head_state
-                    && let Some(stats_ref) = &head.column_stats
-                {
-                    match self.store().get(&stats_ref.key, GetRange::Full).await {
-                        Ok(got) => {
-                            counters.get_requests += 1;
-                            // The previous fold's `.cstat` header is bound to
-                            // the parts THAT fold recorded on this HEAD, not to
-                            // the parts this fold just encoded (`part_hashes`).
-                            // Any incremental fold that appends entries rewrites
-                            // at least the tail part's hash, so binding against
-                            // `part_hashes` would reject the baseline on every
-                            // append and recompute every L0 segment. Bind
-                            // against `head.parts`, exactly as
-                            // `load_previous_postings` does. A malformed part
-                            // blake3 (never for a validated HEAD) yields an
-                            // empty expected set, so the binding check below
-                            // fails and the baseline is dropped -- fail safe.
-                            let expected_part_blake3: Vec<[u8; 32]> = head
-                                .parts
-                                .iter()
-                                .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()))
-                                .collect::<Result<_, _>>()
-                                .unwrap_or_default();
-                            match column_stats_build::decode_previous_column_stats(
-                                &got.data,
-                                &expected_part_blake3,
-                                &crate::snapshot_format::ColumnStatsLimits::default(),
-                            ) {
-                                Ok(segments) => segments
-                                    .into_iter()
-                                    .map(|segment| {
-                                        let identity: EntryIdentity = (
-                                            segment.ingest_hour_bucket,
-                                            segment.shard,
-                                            segment.writer_id.clone(),
-                                            segment.writer_epoch,
-                                            segment.writer_seq,
-                                        );
-                                        (identity, segment)
-                                    })
-                                    .collect(),
-                                Err(err) => {
-                                    tracing::warn!(
-                                        error = %err,
-                                        tenant = %tenant.to_hex(),
-                                        "previous column-stats object failed to decode or bind to this fold's parts; rebuilding every segment's statistics"
-                                    );
-                                    HashMap::new()
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                tenant = %tenant.to_hex(),
-                                "previous column-stats object GET failed; rebuilding every segment's statistics"
-                            );
-                            HashMap::new()
-                        }
-                    }
-                } else {
-                    HashMap::new()
-                };
-
-                let mut column_segments: Vec<ColumnStatsSegment> = Vec::new();
-                for entry in entries.iter().filter(|e| e.level == 0) {
-                    let identity = entry_identity(entry);
-                    if let Some(existing) = baseline.get(&identity) {
-                        column_segments.push(existing.clone());
-                        continue;
-                    }
-                    match column_stats_cache
-                        .segment_column_stats(self.store(), tenant, signal, entry)
-                        .await
-                    {
-                        Ok((segment, fetch)) => {
-                            if fetch == column_stats_build::StatsFetch::Issued {
-                                counters.get_requests += 1;
-                            }
-                            column_segments.push(segment);
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                tenant = %tenant.to_hex(),
-                                ingest_hour_bucket = entry.ingest_hour_bucket,
-                                shard = entry.shard,
-                                "column-stats build failed for one segment; it has no stats entry and queries over it fall back to scanning"
-                            );
-                        }
-                    }
-                }
-                column_segments.sort_by(|a, b| {
-                    (
-                        a.ingest_hour_bucket,
-                        a.shard,
-                        a.writer_id.as_slice(),
-                        a.writer_epoch,
-                        a.writer_seq,
-                    )
-                        .cmp(&(
-                            b.ingest_hour_bucket,
-                            b.shard,
-                            b.writer_id.as_slice(),
-                            b.writer_epoch,
-                            b.writer_seq,
-                        ))
-                });
-
-                match snapshot_format::encode_column_stats(
-                    tenant.0,
-                    signal_num,
-                    part_hashes.iter().map(|h| h.to_vec()).collect(),
-                    &column_segments,
-                ) {
-                    Ok(stats_bytes) => {
-                        let stats_crc = crc32c::crc32c(&stats_bytes);
-                        let stats_hash = blake3::hash(&stats_bytes);
-                        let stats_hash16 = &stats_hash.to_hex()[..16];
-                        let stats_key =
-                            column_stats_object_key(tenant, signal, watermark_hour, stats_hash16);
-                        let size = stats_bytes.len() as u64;
-                        let segment_count = column_segments.len() as u32;
-                        let put_result = self
-                            .store()
-                            .put(
-                                &stats_key,
-                                Bytes::from(stats_bytes),
-                                PutOptions::create_if_absent()
-                                    .with_checksum(UploadChecksum::Crc32c(stats_crc)),
-                            )
-                            .await;
-                        // Counted unconditionally: a real (non-AlreadyExists)
-                        // Err here still means the store received a PUT
-                        // request, and may have durably written the object
-                        // despite the client-visible error (#1598).
-                        counters.put_requests += 1;
-                        match put_result {
-                            Ok(_) | Err(StoreError::AlreadyExists) => (
-                                true,
-                                size,
-                                Some(SnapshotColumnStatsRef {
-                                    key: stats_key,
-                                    blake3: stats_hash.as_bytes().to_vec(),
-                                    size,
-                                    segment_count,
-                                    part_blake3: part_hashes.iter().map(|h| h.to_vec()).collect(),
-                                }),
-                            ),
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    tenant = %tenant.to_hex(),
-                                    "column-stats PUT failed, folding without a column-stats ref"
-                                );
-                                (false, 0, None)
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            tenant = %tenant.to_hex(),
-                            "column-stats encode failed, folding without a column-stats ref"
-                        );
-                        (false, 0, None)
-                    }
-                }
-            };
-
-            // ADR-0942 part-hash-keyed column statistics (envelope v2, HEAD
-            // field 13). This is a DUAL PUBLISH, not a replacement: the v1
-            // (field-11) block above still runs and writes its L0-tuple-keyed
-            // object unchanged. This block additionally covers BOTH L0 and L1
-            // entries, binding each record to its covered part's `content_hash`
-            // so two L1 parts of one (shard, hour) bucket -- which collapse to
-            // one nil-writer tuple on the reader side -- get two distinct
-            // records. Retiring field 11 is a separate, floor-citing change
-            // (ADR-0066 decision 1); dropping it here would silently take L0
-            // coverage from any reader predating field 13.
-            //
-            // A v2 record carries its covered part's content hash in the
-            // writer_id slot (the join key; ADR-0942, the record shape is
-            // frozen so no new field is added). The baseline is joined by that
-            // content hash (a segment's exact statistics never change once its
-            // content-addressed object is written), reused from the previous
-            // fold's v2 object, and bound to the previous HEAD's parts exactly
-            // as the v1 baseline is. On the first upgraded fold there is no
-            // field-13 baseline, so every entry is tallied once; thereafter
-            // only genuinely new parts are. An L0 entry the v1 pass above
-            // already tallied costs no second read: both passes go through the
-            // same `column_stats_cache` (#964).
-            let (column_stats_part_built, column_stats_part_size, column_stats_part_ref) =
-                if typed_attr_columns.is_empty() {
-                    (false, 0u64, None)
-                } else {
-                    let v2_baseline: HashMap<Vec<u8>, ColumnStatsSegment> = if rebuilt {
-                        HashMap::new()
-                    } else if let HeadState::Valid { head, .. } = &head_state
-                        && let Some(stats_ref) = &head.column_stats_part
-                    {
-                        match self.store().get(&stats_ref.key, GetRange::Full).await {
-                            Ok(got) => {
-                                counters.get_requests += 1;
-                                let expected_part_blake3: Vec<[u8; 32]> = head
-                                    .parts
-                                    .iter()
-                                    .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()))
-                                    .collect::<Result<_, _>>()
-                                    .unwrap_or_default();
-                                match column_stats_build::decode_previous_column_stats(
-                                    &got.data,
-                                    &expected_part_blake3,
-                                    &crate::snapshot_format::ColumnStatsLimits::default(),
-                                ) {
-                                    Ok(segments) => segments
-                                        .into_iter()
-                                        // v2 records carry the part content hash
-                                        // in writer_id; key the reuse map by it.
-                                        .map(|segment| (segment.writer_id.clone(), segment))
-                                        .collect(),
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            error = %err,
-                                            tenant = %tenant.to_hex(),
-                                            "previous part-bound column-stats object failed to decode or bind to this fold's parts; rebuilding every segment's statistics"
-                                        );
-                                        HashMap::new()
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    tenant = %tenant.to_hex(),
-                                    "previous part-bound column-stats object GET failed; rebuilding every segment's statistics"
-                                );
-                                HashMap::new()
-                            }
-                        }
-                    } else {
-                        HashMap::new()
-                    };
-
-                    let mut part_segments: Vec<ColumnStatsSegment> = Vec::new();
-                    for entry in entries.iter() {
-                        if let Some(existing) = v2_baseline.get(&entry.content_hash) {
-                            part_segments.push(existing.clone());
-                            continue;
-                        }
-                        match column_stats_cache
-                            .segment_column_stats(self.store(), tenant, signal, entry)
-                            .await
-                        {
-                            Ok((mut segment, fetch)) => {
-                                if fetch == column_stats_build::StatsFetch::Issued {
-                                    counters.get_requests += 1;
-                                }
-                                // The v2 join key: bind the record to its
-                                // covered part's content hash (== the reader's
-                                // `SegmentRef.content_hash`), uniform for L0 and
-                                // L1 and unique per part, carried in writer_id.
-                                // This overwrites the tuple's writer_id, which
-                                // is only informational in a v2 record.
-                                segment.writer_id = entry.content_hash.clone();
-                                part_segments.push(segment);
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    tenant = %tenant.to_hex(),
-                                    ingest_hour_bucket = entry.ingest_hour_bucket,
-                                    shard = entry.shard,
-                                    level = entry.level,
-                                    "part-bound column-stats build failed for one segment; it has no stats entry and queries over it fall back to scanning"
-                                );
-                            }
-                        }
-                    }
-                    // v2 records sort by their content hash (in writer_id).
-                    // Two entries can carry the same content hash: one bucket
-                    // can hold compaction records with different input sets and
-                    // a rewrite record that all reference a byte-identical
-                    // output part. `encode_column_stats_v2` rejects the whole
-                    // artifact on a repeated key, which would drop field 13 for
-                    // the tenant on this and every later fold, so collapse the
-                    // repeats first. A shared content hash means a byte-identical
-                    // part, so the records are equal and keeping one is exact.
-                    sort_and_dedup_part_segments(&mut part_segments);
-
-                    match snapshot_format::encode_column_stats_v2(
-                        tenant.0,
-                        signal_num,
-                        part_hashes.iter().map(|h| h.to_vec()).collect(),
-                        &part_segments,
-                    ) {
-                        Ok(stats_bytes) => {
-                            let stats_crc = crc32c::crc32c(&stats_bytes);
-                            let stats_hash = blake3::hash(&stats_bytes);
-                            let stats_hash16 = &stats_hash.to_hex()[..16];
-                            let stats_key = column_stats_object_key(
-                                tenant,
-                                signal,
-                                watermark_hour,
-                                stats_hash16,
-                            );
-                            let size = stats_bytes.len() as u64;
-                            let segment_count = part_segments.len() as u32;
-                            let put_result = self
-                                .store()
-                                .put(
-                                    &stats_key,
-                                    Bytes::from(stats_bytes),
-                                    PutOptions::create_if_absent()
-                                        .with_checksum(UploadChecksum::Crc32c(stats_crc)),
-                                )
-                                .await;
-                            // Counted unconditionally: a real (non-AlreadyExists)
-                            // Err here still means the store received a PUT
-                            // request, and may have durably written the object
-                            // despite the client-visible error (#1598).
-                            counters.put_requests += 1;
-                            match put_result {
-                                Ok(_) | Err(StoreError::AlreadyExists) => (
-                                    true,
-                                    size,
-                                    Some(SnapshotColumnStatsPartRef {
-                                        key: stats_key,
-                                        blake3: stats_hash.as_bytes().to_vec(),
-                                        size,
-                                        segment_count,
-                                        part_blake3: part_hashes
-                                            .iter()
-                                            .map(|h| h.to_vec())
-                                            .collect(),
-                                    }),
-                                ),
-                                Err(err) => {
-                                    tracing::warn!(
-                                        error = %err,
-                                        tenant = %tenant.to_hex(),
-                                        "part-bound column-stats PUT failed, folding without a field-13 ref"
-                                    );
-                                    (false, 0, None)
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                tenant = %tenant.to_hex(),
-                                "part-bound column-stats encode failed, folding without a field-13 ref"
-                            );
-                            (false, 0, None)
-                        }
-                    }
-                };
-
             let new_head = SnapshotHead {
                 format_version: HEAD_FORMAT_VERSION,
                 tenant_hash: tenant.0.to_vec(),
@@ -2316,12 +1893,6 @@ impl Catalog {
                 // `validate_head` enforces for a multi-part head.
                 parts: part_refs.clone(),
                 postings: postings_ref,
-                column_stats: column_stats_ref,
-                // ADR-0942 A2: the part-hash-keyed (v2) column-stats object,
-                // covering L0 and L1. Absent (None) when the tenant has no
-                // configured typed columns or the build/PUT failed; a reader
-                // treats absence as fall-back-to-scan, never an error.
-                column_stats_part: column_stats_part_ref,
                 folder_id: folder_id.into_bytes().to_vec(),
                 created_unix_ns: now_ns,
                 shard_generation_count,
@@ -2376,10 +1947,6 @@ impl Catalog {
                         put_requests: counters.put_requests,
                         postings_built,
                         postings_bytes: postings_size,
-                        column_stats_built,
-                        column_stats_bytes: column_stats_size,
-                        column_stats_part_built,
-                        column_stats_part_bytes: column_stats_part_size,
                         column_stats_part_objects_built,
                         column_stats_dictionaries_dropped,
                         layout_drift_count,
@@ -3136,10 +2703,6 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         put_requests: counters.put_requests,
         postings_built: false,
         postings_bytes: 0,
-        column_stats_built: false,
-        column_stats_bytes: 0,
-        column_stats_part_built: false,
-        column_stats_part_bytes: 0,
         column_stats_part_objects_built: 0,
         column_stats_dictionaries_dropped: 0,
         layout_drift_count: 0,
@@ -3522,8 +3085,8 @@ mod tests {
             .expect("first fold");
         assert!(first.rebuilt, "first fold rebuilds from the commit layout");
         assert!(
-            first.column_stats_built,
-            "the first fold builds column statistics over both hour-10 segments"
+            first.column_stats_part_objects_built > 0,
+            "the first fold builds per-part column statistics over the hour-10 segments"
         );
 
         // A new segment in a later hour, then an incremental second fold.
@@ -3544,8 +3107,8 @@ mod tests {
             .expect("second fold");
         assert!(!second.rebuilt, "the second fold is incremental");
         assert!(
-            second.column_stats_built,
-            "the second fold rebuilds the artifact"
+            second.column_stats_part_objects_built > 0,
+            "the second fold builds a per-part statistics object for the new part"
         );
 
         // The reuse assertion, by objects read. Segment B is the clean
@@ -3555,54 +3118,29 @@ mod tests {
         //
         // Segment A is read exactly once, by the name-postings pass, which
         // aborts on the first L0 entry because a logs RLOG object is not a
-        // metrics RSEG. None of the three column-stats publishes reads it:
-        // the v1 (tuple-keyed), v2 (content-hash-keyed), and v3
-        // (content-hash-keyed, per part) baselines all cover it.
+        // metrics RSEG. The v3 (content-hash-keyed, per part) baseline
+        // covers it without a second read.
         assert_eq!(
             store.count_gets_of(&key_a),
             1,
-            "only the postings pass reads A; all three publishes reuse its baseline record"
+            "only the postings pass reads A; the v3 publish reuses its baseline record"
         );
         assert_eq!(
             store.count_gets_of(&key_b),
             0,
             "segment B's stats were reused, not recomputed"
         );
-        // Issue #964: the one genuinely new segment is read ONCE for all
-        // three publishes. Against the pre-fix two-fetch code this is 2.
+        // Issue #964: the one genuinely new segment is read ONCE.
         assert_eq!(
             store.count_gets_of(&key_c),
             1,
-            "the new hour-11 segment is fetched once, for all three publishes"
+            "the new hour-11 segment is fetched once"
         );
 
-        // Reuse still produced a complete artifact covering all three segments.
-        //
-        // Coverage is asserted on the map the reader actually fills: since
-        // ADR-1413 the per-part v3 object answers this load and its records
-        // are content-hash keyed, so `segments`, which holds only the
-        // identity-keyed records of a v1 whole-object fallback, stays empty.
-        // The old `segments.len() == 3` was asserting that the fallback had
-        // been taken.
-        //
-        // Emptiness of `segments` is NOT the thing to assert in its place: it
-        // survives the failure that matters. If the per-part path is lost,
-        // the v2 whole-object (field 13) answers instead, which is also
-        // content-hash keyed, so the count is still 3 and `segments` is still
-        // empty. What pins the per-part path is that both whole-object
-        // fallbacks exist here and neither is read.
-        let head_after = read_logs_head(store.as_ref()).await;
-        let v1_key = head_after
-            .column_stats
-            .as_ref()
-            .map(|r| r.key.clone())
-            .expect("the fold dual-publishes a v1 whole-object artifact");
-        let v2_key = head_after
-            .column_stats_part
-            .as_ref()
-            .map(|r| r.key.clone())
-            .expect("the fold dual-publishes a v2 whole-object artifact");
-
+        // Reuse still produced a complete artifact covering all three
+        // segments. Since ADR-1413 the per-part v3 object answers this load
+        // and its records are content-hash keyed, so they land in
+        // `by_content_hash`, not the always-empty `segments` map.
         store.clear_gets();
         let acc = QueryAccounting::new();
         let loaded = catalog
@@ -3623,16 +3161,6 @@ mod tests {
             loaded.by_content_hash.len(),
             3,
             "the reused baseline plus the new segment cover all three"
-        );
-        assert_eq!(
-            store.count_gets_of(&v1_key),
-            0,
-            "the v1 whole-object artifact exists and must not be read: the per-part object answers"
-        );
-        assert_eq!(
-            store.count_gets_of(&v2_key),
-            0,
-            "the v2 whole-object artifact exists and must not be read: the per-part object answers"
         );
     }
 
@@ -4175,13 +3703,13 @@ mod tests {
         assert_eq!(col.sum, Some(sum));
     }
 
-    /// ADR-0942 (deliverables 1 & 3): a fold over an L1-COMPACTED fixture builds
-    /// part-bound (v2, field 13) records for the L1 entries, with EXACT expected
-    /// values, and two L1 parts of one (shard, hour) bucket -- the collision the
-    /// old five-field tuple key could not represent, because a reconstructed L1
-    /// SegmentRef carries writer_id nil / epoch 0 / seq 0 -- produce two DISTINCT
-    /// records keyed by their distinct content hashes, neither overwriting the
-    /// other.
+    /// ADR-1413: a fold over an L1-COMPACTED fixture builds the per-part (v3,
+    /// field 7) object over the L1 entries, with EXACT expected values, and
+    /// two L1 parts of one (shard, hour) bucket -- the collision the old
+    /// five-field tuple key could not represent, because a reconstructed L1
+    /// SegmentRef carries writer_id nil / epoch 0 / seq 0 -- produce two
+    /// DISTINCT records keyed by their distinct content hashes within that
+    /// one part's object, neither overwriting the other.
     #[tokio::test]
     async fn l1_compacted_fold_builds_part_bound_records_with_exact_values() {
         let store = Arc::new(MemoryStore::new());
@@ -4211,9 +3739,9 @@ mod tests {
             .expect("fold");
         assert!(report.rebuilt, "first fold rebuilds from the commit layout");
         assert_eq!(report.entry_count, 2, "two L1 parts folded");
-        assert!(
-            report.column_stats_part_built,
-            "the part-bound (field 13) object is built over the L1 entries"
+        assert_eq!(
+            report.column_stats_part_objects_built, 1,
+            "both L1 entries seal into one output part, so one v3 object is built"
         );
 
         let head = read_logs_head(store.as_ref()).await;
@@ -4221,23 +3749,28 @@ mod tests {
         let entries = collect_head_entries(store.as_ref(), &head).await;
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.level == 1), "genuinely L1 fixture");
+        assert_eq!(
+            head.parts.len(),
+            1,
+            "one output part covers both L1 entries"
+        );
 
-        let stats_ref = head
-            .column_stats_part
+        let stats_ref = head.parts[0]
+            .column_stats
             .clone()
-            .expect("field 13 present after folding L1 parts");
+            .expect("field 7 present after folding L1 parts");
         let got = store
             .get(&stats_ref.key, GetRange::Full)
             .await
-            .expect("v2 object present");
+            .expect("v3 object present");
         let decoded = snapshot_format::decode_column_stats(
             &got.data,
             &crate::snapshot_format::ColumnStatsLimits::default(),
         )
-        .expect("v2 decodes");
+        .expect("v3 decodes");
         assert_eq!(
-            decoded.header.format_version, 2,
-            "part-bound object is envelope v2"
+            decoded.header.format_version, 3,
+            "per-part object is envelope v3"
         );
         assert_eq!(
             decoded.segments.len(),
@@ -4278,14 +3811,14 @@ mod tests {
         out
     }
 
-    /// ADR-1413 (deliverables 1, 3, 4): a fold whose entry count crosses
+    /// ADR-1413 decision 6 (#1600): a fold whose entry count crosses
     /// `snapshot_part_max_entries` produces a multi-part HEAD, and EACH newly
     /// written part gets its OWN v3 (field 7) column-statistics object, not
-    /// one shared whole-tenant object. The pre-existing v1 (field 11) and v2
-    /// (field 13) whole-tenant objects are unaffected: this is a
-    /// dual-publish addition, not a replacement.
+    /// one shared whole-tenant object -- and no whole-tenant v1/v2 object is
+    /// published at all: the store holds EXACTLY one `.cstat` object per
+    /// part, never a whole-tenant one, at any size.
     #[tokio::test]
-    async fn fold_publishes_a_v3_object_per_part_and_keeps_field_13() {
+    async fn fold_over_two_parts_writes_exactly_two_cstat_objects_and_no_whole_object() {
         let store = Arc::new(MemoryStore::new());
         set_status_column_config(store.as_ref()).await;
 
@@ -4320,16 +3853,20 @@ mod tests {
             report.column_stats_part_objects_built, 2,
             "one v3 object per newly written part"
         );
-        assert!(
-            report.column_stats_part_built,
-            "field 13 (v2 whole-tenant) is still built alongside the per-part objects"
-        );
 
         let head = read_logs_head(store.as_ref()).await;
         assert_eq!(head.parts.len(), 2);
         assert!(
-            head.column_stats_part.is_some(),
-            "field 13 present: dual-publish, not a replacement"
+            head.parts.iter().all(|p| p.column_stats.is_some()),
+            "field 7 set on both parts"
+        );
+
+        let all_keys = list_all_keys(store.as_ref(), "").await;
+        let cstat_keys: Vec<&String> = all_keys.iter().filter(|k| k.ends_with(".cstat")).collect();
+        assert_eq!(
+            cstat_keys.len(),
+            2,
+            "exactly two .cstat objects in the store, one per part: {cstat_keys:?}"
         );
 
         for part in &head.parts {
@@ -5005,421 +4542,6 @@ mod tests {
             &segments,
         )
         .expect("encodes once the repeat is collapsed");
-    }
-
-    /// ADR-0942 (deliverable 2): the fold DUAL-PUBLISHES. After a fold over an
-    /// L0 fixture, HEAD carries both the v1 field-11 object and the v2 field-13
-    /// object, and the field-11 object is byte-for-byte identical to what the
-    /// pre-change fold wrote for the same input (reconstructed here from the
-    /// canonical v1 encoder over the same L0 segment stats).
-    #[tokio::test]
-    async fn fold_dual_publishes_v1_and_v2_and_v1_object_is_byte_identical() {
-        let store = Arc::new(MemoryStore::new());
-        set_status_column_config(store.as_ref()).await;
-
-        publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
-        publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
-
-        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
-        let report = catalog
-            .fold(
-                &tenant(),
-                Signal::Logs,
-                Uuid::new_v4(),
-                now_at_seal(10),
-                &[],
-                None,
-            )
-            .await
-            .expect("fold");
-        assert!(report.column_stats_built, "field 11 (v1) built");
-        assert!(report.column_stats_part_built, "field 13 (v2) built");
-
-        let head = read_logs_head(store.as_ref()).await;
-        let v1_ref = head.column_stats.clone().expect("field 11 present");
-        let v2_ref = head.column_stats_part.clone().expect("field 13 present");
-        assert_ne!(v1_ref.key, v2_ref.key, "v1 and v2 are distinct objects");
-
-        // Reconstruct the canonical v1 object over the same L0 segment stats and
-        // the same part set, exactly as the pre-change fold did.
-        let entries = collect_head_entries(store.as_ref(), &head).await;
-        let typed = vec![crate::tenant_config::DeclaredTypedColumn {
-            key: "status".to_string(),
-            ty: crate::tenant_config::DeclaredColumnType::I64,
-        }];
-        let mut l0: Vec<ColumnStatsSegment> = Vec::new();
-        for entry in entries.iter().filter(|e| e.level == 0) {
-            let seg = column_stats_build::fetch_segment_column_stats(
-                store.as_ref(),
-                &tenant(),
-                Signal::Logs,
-                entry,
-                &typed,
-            )
-            .await
-            .expect("l0 stats");
-            l0.push(seg);
-        }
-        l0.sort_by(|a, b| {
-            (
-                a.ingest_hour_bucket,
-                a.shard,
-                a.writer_id.as_slice(),
-                a.writer_epoch,
-                a.writer_seq,
-            )
-                .cmp(&(
-                    b.ingest_hour_bucket,
-                    b.shard,
-                    b.writer_id.as_slice(),
-                    b.writer_epoch,
-                    b.writer_seq,
-                ))
-        });
-        let part_blake3: Vec<Vec<u8>> = head.parts.iter().map(|p| p.blake3.clone()).collect();
-        let signal_num = signal::to_proto(Signal::Logs) as u32;
-        let expected_v1 =
-            snapshot_format::encode_column_stats(tenant().0, signal_num, part_blake3, &l0)
-                .expect("canonical v1 encodes");
-
-        let got_v1 = store
-            .get(&v1_ref.key, GetRange::Full)
-            .await
-            .expect("v1 object present")
-            .data;
-        assert_eq!(
-            got_v1.as_ref(),
-            expected_v1.as_slice(),
-            "field-11 v1 object is byte-identical to the canonical v1 encode"
-        );
-        assert_eq!(got_v1[4], 1, "field-11 object is envelope v1");
-
-        // The two objects differ only in keying: v1 records key by the tuple
-        // with a 16-byte writer_id uuid; v2 records key by the 32-byte part
-        // content hash carried in writer_id.
-        let limits = crate::snapshot_format::ColumnStatsLimits::default();
-        let dec_v1 = snapshot_format::decode_column_stats(&got_v1, &limits).expect("v1 decodes");
-        assert!(
-            dec_v1.segments.iter().all(|s| s.writer_id.len() == 16),
-            "v1 records carry the 16-byte writer uuid"
-        );
-        let got_v2 = store
-            .get(&v2_ref.key, GetRange::Full)
-            .await
-            .expect("v2 object present")
-            .data;
-        assert_eq!(got_v2[4], 2, "field-13 object is envelope v2");
-        let dec_v2 = snapshot_format::decode_column_stats(&got_v2, &limits).expect("v2 decodes");
-        assert_eq!(dec_v2.segments.len(), 2, "v2 covers both L0 segments");
-        assert!(
-            dec_v2.segments.iter().all(|s| s.writer_id.len() == 32),
-            "every v2 record is keyed by a 32-byte part content hash"
-        );
-        // Each v2 record's key is exactly the L0 entry's content hash.
-        let entry_hashes: std::collections::HashSet<Vec<u8>> = entries
-            .iter()
-            .filter(|e| e.level == 0)
-            .map(|e| e.content_hash.clone())
-            .collect();
-        assert!(
-            dec_v2
-                .segments
-                .iter()
-                .all(|s| entry_hashes.contains(&s.writer_id)),
-            "v2 keys are the covered L0 parts' content hashes"
-        );
-    }
-
-    /// The pre-#964 two-fetch dual publish, kept as the reference the
-    /// production single-fetch path is compared against: builds the v1
-    /// (field 11) and v2 (field 13) objects over a folded HEAD exactly as the
-    /// two independent passes did, each pass fetching every entry it covers on
-    /// its own. `fetch_segment_column_stats` is the per-entry, per-pass fetch
-    /// those passes called.
-    async fn reference_dual_publish_bytes(
-        store: &dyn ObjectStoreBackend,
-        head: &SnapshotHead,
-    ) -> (Vec<u8>, Vec<u8>) {
-        let entries = collect_head_entries(store, head).await;
-        let typed = vec![crate::tenant_config::DeclaredTypedColumn {
-            key: "status".to_string(),
-            ty: crate::tenant_config::DeclaredColumnType::I64,
-        }];
-        let part_blake3: Vec<Vec<u8>> = head.parts.iter().map(|p| p.blake3.clone()).collect();
-        let signal_num = signal::to_proto(Signal::Logs) as u32;
-
-        // v1 pass: L0 entries only, tuple-keyed, its own fetch per entry.
-        let mut l0: Vec<ColumnStatsSegment> = Vec::new();
-        for entry in entries.iter().filter(|e| e.level == 0) {
-            l0.push(
-                column_stats_build::fetch_segment_column_stats(
-                    store,
-                    &tenant(),
-                    Signal::Logs,
-                    entry,
-                    &typed,
-                )
-                .await
-                .expect("v1 pass stats"),
-            );
-        }
-        l0.sort_by(|a, b| {
-            (
-                a.ingest_hour_bucket,
-                a.shard,
-                a.writer_id.as_slice(),
-                a.writer_epoch,
-                a.writer_seq,
-            )
-                .cmp(&(
-                    b.ingest_hour_bucket,
-                    b.shard,
-                    b.writer_id.as_slice(),
-                    b.writer_epoch,
-                    b.writer_seq,
-                ))
-        });
-        let v1 =
-            snapshot_format::encode_column_stats(tenant().0, signal_num, part_blake3.clone(), &l0)
-                .expect("reference v1 encodes");
-
-        // v2 pass: every entry, a SECOND fetch for each L0 one, writer_id
-        // overwritten with the covered part's content hash, sorted and deduped.
-        let mut part_segments: Vec<ColumnStatsSegment> = Vec::new();
-        for entry in entries.iter() {
-            let mut seg = column_stats_build::fetch_segment_column_stats(
-                store,
-                &tenant(),
-                Signal::Logs,
-                entry,
-                &typed,
-            )
-            .await
-            .expect("v2 pass stats");
-            seg.writer_id = entry.content_hash.clone();
-            part_segments.push(seg);
-        }
-        sort_and_dedup_part_segments(&mut part_segments);
-        let v2 = snapshot_format::encode_column_stats_v2(
-            tenant().0,
-            signal_num,
-            part_blake3,
-            &part_segments,
-        )
-        .expect("reference v2 encodes");
-
-        (v1, v2)
-    }
-
-    /// Fold `store` at `seal_hour` and assert both published column-stats
-    /// objects are byte-identical to [`reference_dual_publish_bytes`], with the
-    /// record counts the fixture implies (so neither side can be vacuously
-    /// empty).
-    async fn assert_dual_publish_matches_reference(
-        store: &Arc<MemoryStore>,
-        seal_hour: u32,
-        l0_records: usize,
-        all_records: usize,
-        label: &str,
-    ) {
-        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
-        let report = catalog
-            .fold(
-                &tenant(),
-                Signal::Logs,
-                Uuid::new_v4(),
-                now_at_seal(seal_hour),
-                &[],
-                None,
-            )
-            .await
-            .expect("fold");
-        assert_eq!(
-            report.entry_count as usize, all_records,
-            "{label}: fixture entry count"
-        );
-        assert!(report.column_stats_built, "{label}: field 11 built");
-        assert!(report.column_stats_part_built, "{label}: field 13 built");
-
-        let head = read_logs_head(store.as_ref()).await;
-        let (want_v1, want_v2) = reference_dual_publish_bytes(store.as_ref(), &head).await;
-        let limits = crate::snapshot_format::ColumnStatsLimits::default();
-        assert_eq!(
-            snapshot_format::decode_column_stats(&want_v1, &limits)
-                .expect("reference v1 decodes")
-                .segments
-                .len(),
-            l0_records,
-            "{label}: reference v1 covers every L0 entry"
-        );
-        assert_eq!(
-            snapshot_format::decode_column_stats(&want_v2, &limits)
-                .expect("reference v2 decodes")
-                .segments
-                .len(),
-            all_records,
-            "{label}: reference v2 covers every entry"
-        );
-
-        let v1_key = head
-            .column_stats
-            .as_ref()
-            .expect("field 11 ref")
-            .key
-            .clone();
-        let v2_key = head
-            .column_stats_part
-            .as_ref()
-            .expect("field 13 ref")
-            .key
-            .clone();
-        let got_v1 = store
-            .get(&v1_key, GetRange::Full)
-            .await
-            .expect("v1 object present")
-            .data;
-        let got_v2 = store
-            .get(&v2_key, GetRange::Full)
-            .await
-            .expect("v2 object present")
-            .data;
-        assert_eq!(
-            got_v1.as_ref(),
-            want_v1.as_slice(),
-            "{label}: field-11 object bytes"
-        );
-        assert_eq!(
-            got_v2.as_ref(),
-            want_v2.as_slice(),
-            "{label}: field-13 object bytes"
-        );
-    }
-
-    /// Issue #964: folding each covered object ONCE for both publishes is a
-    /// request-count change, never a content change. Both published objects
-    /// stay byte-identical to what the two independent per-pass fetches
-    /// produced, over an L0-only, an L1-only, and a mixed fold.
-    ///
-    /// FLIP (demonstrated): tallying with the wrong declared columns --
-    /// `SegmentColumnStatsCache::segment_column_stats` passing
-    /// `&self.typed_columns[..0]` instead of `self.typed_columns` -- keeps both
-    /// objects publishable but empties every record's `columns`, and the
-    /// "L0 only: field-11 object bytes" `assert_eq!` fails on 93 bytes against
-    /// 178. Mis-keying a record is caught one assertion earlier: dropping
-    /// `segment.writer_id = entry.content_hash.clone()` from the v2 publish, or
-    /// applying it to the v1 record, makes that publish's encoder reject the
-    /// artifact and the `column_stats_part_built` / `column_stats_built`
-    /// assertion fails.
-    #[tokio::test]
-    async fn dual_publish_objects_are_byte_identical_to_the_two_fetch_reference() {
-        // L0 only.
-        let store = Arc::new(MemoryStore::new());
-        set_status_column_config(store.as_ref()).await;
-        publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
-        publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
-        assert_dual_publish_matches_reference(&store, 10, 2, 2, "L0 only").await;
-
-        // L1 only: no L0 entry at all, so the v1 object covers nothing while
-        // the v2 object covers both parts.
-        let store = Arc::new(MemoryStore::new());
-        set_status_column_config(store.as_ref()).await;
-        publish_logs_l1(
-            store.as_ref(),
-            0,
-            10,
-            "input-set-seed",
-            &[&[200, 404, 200, 500], &[500, 500, 200]],
-        )
-        .await;
-        assert_dual_publish_matches_reference(&store, 10, 0, 2, "L1 only").await;
-
-        // Mixed: two L0 entries in hour 10, two L1 parts in hour 11. The
-        // compaction is in a different bucket, so it supersedes neither L0
-        // entry and the fold covers all four parts.
-        let store = Arc::new(MemoryStore::new());
-        set_status_column_config(store.as_ref()).await;
-        publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
-        publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
-        publish_logs_l1(
-            store.as_ref(),
-            0,
-            11,
-            "input-set-seed",
-            &[&[200, 404], &[500]],
-        )
-        .await;
-        assert_dual_publish_matches_reference(&store, 11, 2, 4, "mixed L0 and L1").await;
-    }
-
-    /// Issue #964: a dual-publishing fold reads each covered object EXACTLY
-    /// ONCE. The v1 (field 11) pass covers the L0 entries and the v2 (field 13)
-    /// pass covers the same L0 entries plus the L1 ones, and each pass used to
-    /// fetch and scan the object itself, so every L0 part cost two GETs.
-    ///
-    /// Counted per object key on a RecordingStore over a no-baseline (rebuild)
-    /// fold of n = 2 L0 entries and m = 2 L1 parts: 4 stats reads, plus the one
-    /// GET the name-postings pass spends before it aborts on the first entry (a
-    /// logs RLOG object is not a metrics RSEG), for 5 in total.
-    ///
-    /// FLIP (pre-fix figures): with each pass fetching for itself the total is
-    /// 2n + m + 1 = 7, with segment A read 3 times and segment B twice.
-    #[tokio::test]
-    async fn dual_publish_reads_each_covered_object_once() {
-        let store = Arc::new(RecordingStore::new());
-        set_status_column_config(store.as_ref()).await;
-
-        let rec_a = publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
-        let rec_b = publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
-        let l1 = publish_logs_l1(
-            store.as_ref(),
-            0,
-            11,
-            "input-set-seed",
-            &[&[200, 404], &[500]],
-        )
-        .await;
-        let key_a = keys::reconstruct_data_key(&rec_a).expect("key a");
-        let key_b = keys::reconstruct_data_key(&rec_b).expect("key b");
-        let key_p0 = keys::reconstruct_l1_part_key(&l1, &l1.parts[0]).expect("key p0");
-        let key_p1 = keys::reconstruct_l1_part_key(&l1, &l1.parts[1]).expect("key p1");
-
-        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
-        store.clear_gets();
-        let report = catalog
-            .fold(
-                &tenant(),
-                Signal::Logs,
-                Uuid::new_v4(),
-                now_at_seal(11),
-                &[],
-                None,
-            )
-            .await
-            .expect("fold");
-        assert!(report.rebuilt, "first fold rebuilds from the commit layout");
-        assert_eq!(report.entry_count, 4, "two L0 entries and two L1 parts");
-        assert!(report.column_stats_built, "field 11 built");
-        assert!(report.column_stats_part_built, "field 13 built");
-
-        // Segment A is the first entry in fold order, so it also carries the
-        // name-postings pass's single GET before that pass aborts.
-        let counts = [
-            store.count_gets_of(&key_a),
-            store.count_gets_of(&key_b),
-            store.count_gets_of(&key_p0),
-            store.count_gets_of(&key_p1),
-        ];
-        assert_eq!(
-            counts,
-            [2, 1, 1, 1],
-            "one column-stats read per part (A also carries the postings read); \
-             the two-fetch path reads [3, 2, 1, 1]"
-        );
-        assert_eq!(
-            counts.iter().sum::<usize>(),
-            5,
-            "n + m stats reads plus the one postings read (the two-fetch path: 2n + m + 1 = 7)"
-        );
     }
 
     #[test]
