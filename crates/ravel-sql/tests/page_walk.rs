@@ -46,11 +46,16 @@
 //! the plan it is checking. A parse that fails, or a statement whose ordering
 //! has no term list to append to, is a panic rather than a fallback spelling.
 //!
-//! Two more properties fall out of asserting per page rather than over the
-//! concatenation: a page that returns fewer rows than the cap while rows
-//! remain is a finding (it breaks the indexing the claim rests on), and a walk
-//! that ends early is reported against the ordering's length rather than
-//! against a row set that happens to match.
+//! [`COMMENT_TERMINATED_STATEMENT`] is what makes that a claim rather than a
+//! preference. It is in the walked set precisely because its text does not
+//! survive concatenation: everything appended after it is inside a `--`
+//! comment, so a concatenating builder produces a reference with no ordering
+//! at all. Every other walked statement agrees under both spellings, which is
+//! why the parse could be reverted with nothing going red before it was added.
+//!
+//! One more property falls out of asserting per page rather than over the
+//! concatenation: a walk that ends early is reported against the ordering's
+//! length rather than against a row set that happens to match.
 //!
 //! # The fixture has to be able to fail
 //!
@@ -78,14 +83,46 @@
 //!   on the wrong one of the two produces a different sequence rather than the
 //!   same one;
 //! - one `ts` is not a multiple of 1000 ns, so a truncating or rescaling
-//!   round trip through a cursor value is visible;
-//! - the same walk runs over a one-row table (an empty second page) and a
-//!   zero-row table (an empty first page).
+//!   round trip through a cursor value is visible.
 //!
 //! [`the_fixture_can_expose_a_broken_keyset_predicate`] pins every one of
 //! those as an exact count, so a later edit to the fixture that removes one
 //! fails there rather than quietly turning the walks into a statement about
 //! nothing.
+//!
+//! # What the three fixtures each cover, and what the walked count is not
+//!
+//! Every statement is walked over three `samples` fixtures, so the pinned
+//! count in [`a_total_order_claim_survives_an_executed_page_walk`] is three
+//! times the walked statement count. That number is a real pin and it does
+//! move, but it is not a breadth figure, and reading it as one overstates what
+//! the suite covers.
+//!
+//! Only [`FIXTURE`] can say anything about an ORDERING. It is the seven-row
+//! table, it is the one that carries every property listed above, and every
+//! mutation this suite has caught was caught by it.
+//!
+//! [`ONE_ROW`] and [`NO_ROWS`] cover the walk's PAGE BOUNDARIES and nothing
+//! else: a one-row table has exactly one cursor mint and ends on an empty
+//! SECOND page, and an empty table has no mint at all and ends on an empty
+//! FIRST page. Neither can distinguish two orderings, because one row admits
+//! one sequence and no rows admit none. They are worth their third of the
+//! count for the boundaries alone --
+//! [`a_walk_terminates_on_an_empty_page_at_both_table_boundaries`] pins those
+//! two page counts directly -- but a mutation that reorders rows is invisible
+//! to both. Widening the ordering coverage means more STATEMENTS or more
+//! fixture properties, never more rows in these two.
+//!
+//! [`LOG_FIXTURE`] does not vary across that axis at all: `logs` is registered
+//! identically under all three, because what it is here for is the absence of
+//! a row identity rather than a row count that tracks `samples`. It is still
+//! registered under all three rather than only under [`FIXTURE`], so that
+//! every statement in [`STATEMENTS`] can execute under every fixture: a
+//! context missing the table would turn the planner regression this table
+//! exists to catch into a "table not found" panic under two of the three,
+//! which is a worse report of the same thing. What it does mean is that a
+//! `logs` walk under the second and third fixtures would repeat the first
+//! exactly, so the reverse direction is covered once, not three times.
 //!
 //! # Two tables, because one table hides a whole class of mutation
 //!
@@ -118,6 +155,18 @@
 //! on every page rather than counting down as the walk advances. A statement
 //! whose result depends on rows a keyset filter would remove and which the
 //! planner cannot page is asserted as a refusal rather than omitted.
+//!
+//! Walking them is not what makes them carry their weight, and for one round
+//! they did not carry it: the walk compares a page against the same statement
+//! run unpaged, so a window value that changed per page changes on both sides
+//! and the sequence still matches. What pins them is
+//! [`a_count_window_reports_the_whole_row_count_on_every_page`] and
+//! [`a_rank_window_ranks_against_the_whole_row_set`], which assert the window
+//! column BY VALUE over the walk. Those are what fail when the keyset
+//! predicate moves inside the derived table, and they fail on the window's own
+//! numbers -- 7, 6, 5, 4, 3, 2, 1 for the count, and 1 seven times over for the
+//! rank -- rather than through the parse error that same mutation happens to
+//! raise first on the `DISTINCT ON` statement.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -721,6 +770,13 @@ fn row_at(batches: &[RecordBatch], index: usize) -> (&RecordBatch, usize) {
 
 /// Where the walk's page sequence departs from `reference`, or `None` when
 /// page k held rows k of it from the first page to the last.
+///
+/// There is no short-page check here, because a short page cannot occur: the
+/// page statement carries no row cap of its own, so [`walk`] imposes
+/// [`PAGE_CAP`] with its own `take`, and a page that would have been short is
+/// the empty one that ends the walk. A page that returns too FEW rows shows up
+/// in the final length comparison below instead, as a walk that delivered
+/// fewer rows than the ordering holds.
 fn sequence_finding(reference: &[Vec<String>], found: &Walk) -> Option<String> {
     let mut cursor = 0usize;
     for (index, page) in found.page_rows.iter().enumerate() {
@@ -739,14 +795,6 @@ fn sequence_finding(reference: &[Vec<String>], found: &Walk) -> Option<String> {
                 "page {page_number} is not rows {cursor}..{end} of the ordering\n      page     \
                  {page:?}\n      ordering {:?}",
                 &reference[cursor..end],
-            ));
-        }
-        if page.len() != PAGE_CAP && end != reference.len() {
-            return Some(format!(
-                "page {page_number} returned {} of the {PAGE_CAP} rows a page holds while {} \
-                 rows were still unwalked, so page k stopped meaning rows k of the ordering",
-                page.len(),
-                reference.len() - end,
             ));
         }
         cursor = end;
@@ -778,6 +826,48 @@ fn sequence_finding(reference: &[Vec<String>], found: &Walk) -> Option<String> {
 const DISTINCT_ON_STATEMENT: &str =
     "SELECT DISTINCT ON (series_id) ts, series_id FROM samples ORDER BY series_id, ts DESC";
 
+/// The walked statement whose TEXT does not survive naive concatenation, so it
+/// is what makes [`reference_statement`]'s parse load-bearing.
+///
+/// A `--` comment runs to the end of the line, so everything appended after
+/// this statement's text is inside it. The statement carries no `ORDER BY`, so
+/// the reference has a whole `ORDER BY "ts" ASC, "series_id" ASC` to append,
+/// and a concatenating builder puts all of it in the comment: the reference is
+/// then the statement itself, unordered, which is [`FIXTURE`]'s deliberately
+/// unsorted insertion order rather than any ordering the walk produces.
+///
+/// Chosen over a trailing comment on a statement that DOES carry an `ORDER BY`
+/// because that form would leave the reference ordered by the caller's own
+/// terms and differ from the walk only on the tied pair, which puts the
+/// assertion at the mercy of whether a sort happens to be stable. Here the
+/// reference and the walk disagree on the first row.
+const COMMENT_TERMINATED_STATEMENT: &str =
+    "SELECT ts, series_id FROM samples -- the ordering is appended after this, not into it";
+
+/// A window whose value is a property of the WHOLE statement's row set: the
+/// count of every row it returns, which is [`FIXTURE`]'s seven on every page.
+const WINDOW_COUNT_STATEMENT: &str =
+    "SELECT ts, series_id, count(*) OVER () AS n FROM samples ORDER BY ts, series_id";
+
+/// A window whose value is each row's position in the whole statement's row
+/// set. Its `ORDER BY ts` ties the two rows at [`TIED_TS`], so the ranks it
+/// produces are not the row numbers and a walk cannot reproduce them by
+/// counting pages.
+const WINDOW_RANK_STATEMENT: &str =
+    "SELECT ts, series_id, rank() OVER (ORDER BY ts) AS rk FROM samples ORDER BY ts, series_id";
+
+/// What [`WINDOW_COUNT_STATEMENT`] reports on every one of its rows: the
+/// fixture's row count, spelled out rather than derived from `FIXTURE.len()`,
+/// so a page that reports the count of its own filtered input cannot agree
+/// with it by following the same fixture edit.
+const WINDOW_COUNTS: [&str; 7] = ["7", "7", "7", "7", "7", "7", "7"];
+
+/// What [`WINDOW_RANK_STATEMENT`] reports, in the order its own `ORDER BY ts,
+/// series_id` returns the rows: `ts` ascending is 500, 1000, 1000, 2000, 3000,
+/// 4000, 1234567, and the pair tied at 1000 takes rank 2 twice and leaves rank
+/// 3 unused.
+const WINDOW_RANKS: [&str; 7] = ["1", "2", "2", "4", "5", "6", "7"];
+
 /// The statements this suite walks, plus the shapes that must keep walking so
 /// a fix cannot be a blanket refusal.
 ///
@@ -801,6 +891,9 @@ const STATEMENTS: &[&str] = &[
     // keep doing so.
     "SELECT * FROM samples ORDER BY ts",
     "SELECT * FROM samples",
+    // The statement whose text does not survive concatenation. See
+    // [`COMMENT_TERMINATED_STATEMENT`].
+    COMMENT_TERMINATED_STATEMENT,
     "SELECT ts, series_id FROM samples ORDER BY ts",
     "SELECT ts, series_id, value FROM samples ORDER BY ts DESC, series_id",
     "SELECT ts, series_id FROM samples ORDER BY series_id",
@@ -813,12 +906,12 @@ const STATEMENTS: &[&str] = &[
     "SELECT ts, series_id, ts AS \"Select\" FROM samples ORDER BY \"Select\", ts, series_id",
     // Two window statements. Both plan with a total-order claim, and both are
     // correct only because the keyset predicate sits OUTSIDE the derived
-    // table: the window sees all the statement's rows on every page. A
-    // `count(*) OVER ()` that counted down as the walk advanced, or a `rank()`
-    // that restarted at 1, is a different result per page rather than a
-    // differently ordered one.
-    "SELECT ts, series_id, count(*) OVER () AS n FROM samples ORDER BY ts, series_id",
-    "SELECT ts, series_id, rank() OVER (ORDER BY ts) AS rk FROM samples ORDER BY ts, series_id",
+    // table: the window sees all the statement's rows on every page. What each
+    // one reports per page is asserted by value in
+    // [`a_window_is_computed_over_every_row_of_the_statement`]; here they are
+    // walked for their ordering like any other statement.
+    WINDOW_COUNT_STATEMENT,
+    WINDOW_RANK_STATEMENT,
     // Refused now rather than walked, both for a term whose values no cursor
     // carries. `value` is a float, so it admits the NaN that
     // `ResumeValue::Float` refuses; `labels` is a `Dictionary` over a `Map`,
@@ -919,12 +1012,17 @@ async fn a_total_order_claim_survives_an_executed_page_walk() {
         findings.len(),
         findings.join("\n  "),
     );
-    // Nine per fixture, three fixtures. Pinned exactly rather than as
+    // Ten per fixture, three fixtures. Pinned exactly rather than as
     // `walked > 0`: a change that drops a statement out of the total-order
     // class leaves this gate passing over a smaller set, which is the way a
     // suite of this shape goes quiet without going red.
+    //
+    // What the 30 is and is not: see the module docs. Ten of the walks are
+    // over seven rows and are what every mutation caught so far was caught by;
+    // the other twenty are over a one-row and a zero-row table, and what they
+    // exercise is the walk's page boundaries, not any ordering.
     assert_eq!(
-        walked, 27,
+        walked, 30,
         "the walked set changed size, so this gate is asserting about a different \
          set of statements than the one it was sized for",
     );
@@ -957,6 +1055,73 @@ async fn a_walk_terminates_on_an_empty_page_at_both_table_boundaries() {
         "non-empty pages over an empty table"
     );
     assert_eq!(none.stopped_at_null, None);
+}
+
+/// `count(*) OVER ()` reports the whole statement's row count on every page.
+///
+/// The property the walk itself cannot assert, and the reason the window
+/// statements are in [`STATEMENTS`] at all. The walk compares each page
+/// against the same statement run unpaged, so a window value that changed per
+/// page would have to disturb the ORDERING as well to be visible there. It
+/// does not: the rows come back in the same sequence carrying a different
+/// number, and the number is what the caller reads.
+///
+/// So the values are asserted here, by value, as the sequence the pages
+/// deliver them in. That is what makes the keyset predicate's POSITION
+/// load-bearing rather than incidental: the rewrite puts it outside the
+/// derived table, so the window is computed over all seven rows on every page.
+/// Moved inside, it counts the rows that survived the cursor filter and
+/// reports 7, 6, 5, 4, 3, 2, 1 down the walk.
+///
+/// Asserted directly rather than through [`STATEMENTS`] because that loop
+/// reaches a window statement only after the `DISTINCT ON` one, whose
+/// preserved inner `ORDER BY` makes the same mutation a PARSE error first: a
+/// suite that only caught it there would be reporting a syntax failure on an
+/// unrelated statement, which says nothing about where a window is computed.
+#[tokio::test]
+async fn a_count_window_reports_the_whole_row_count_on_every_page() {
+    let found = walk(&context(), WINDOW_COUNT_STATEMENT).await;
+    assert_eq!(found.pages, 8, "pages of the count window walk");
+    assert_eq!(
+        window_column(&found),
+        WINDOW_COUNTS,
+        "count(*) OVER () did not report the statement's whole row count on \
+         every page, so the keyset predicate reached the rows the window was \
+         computed over",
+    );
+}
+
+/// `rank() OVER (ORDER BY ts)` ranks each row against the whole statement's
+/// row set.
+///
+/// The same property as
+/// [`a_count_window_reports_the_whole_row_count_on_every_page`] read through a
+/// window whose value is per row rather than per result, so a page that
+/// recomputed it over its own rows alone would report a plausible-looking 1
+/// rather than an obviously shrinking total. [`WINDOW_RANKS`] is the sequence
+/// only the whole row set produces: it skips 3, because the pair tied at
+/// [`TIED_TS`] takes rank 2 twice.
+#[tokio::test]
+async fn a_rank_window_ranks_against_the_whole_row_set() {
+    let found = walk(&context(), WINDOW_RANK_STATEMENT).await;
+    assert_eq!(found.pages, 8, "pages of the rank window walk");
+    assert_eq!(
+        window_column(&found),
+        WINDOW_RANKS,
+        "rank() OVER (ORDER BY ts) did not rank each row against the \
+         statement's whole row set, so the keyset predicate reached the rows \
+         the window was computed over",
+    );
+}
+
+/// The window column of a walk over [`WINDOW_COUNT_STATEMENT`] or
+/// [`WINDOW_RANK_STATEMENT`]: the third projected column, in page order.
+fn window_column(found: &Walk) -> Vec<String> {
+    found
+        .rows()
+        .iter()
+        .map(|row| row[2].clone())
+        .collect::<Vec<String>>()
 }
 
 /// A `DISTINCT ON` page delivers the rows the caller's own statement delivers.
@@ -1239,8 +1404,9 @@ fn the_four_defect_statements_are_classified_exactly() {
         "SELECT ts, series_id FROM samples ORDER BY series_id",
         "SELECT * FROM samples WHERE value > 0.5 ORDER BY ts",
         "SELECT ts, series_id, ts AS \"Select\" FROM samples ORDER BY \"Select\", ts, series_id",
-        "SELECT ts, series_id, count(*) OVER () AS n FROM samples ORDER BY ts, series_id",
-        "SELECT ts, series_id, rank() OVER (ORDER BY ts) AS rk FROM samples ORDER BY ts, series_id",
+        COMMENT_TERMINATED_STATEMENT,
+        WINDOW_COUNT_STATEMENT,
+        WINDOW_RANK_STATEMENT,
     ];
     for sql in must_stay_total {
         let plan = plan_page(sql, None).unwrap_or_else(|e| panic!("{sql:?} refused: {e}"));
