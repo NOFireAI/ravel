@@ -2079,6 +2079,192 @@ mod tests {
         );
     }
 
+    /// The ClickBench corpus, the largest body of real statements this
+    /// repository holds, read from where the benchmarks keep it rather than
+    /// copied, so a corpus edit shows up here as a failing count.
+    const CLICKBENCH_CORPUS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/clickbench/hits.corpus.json"
+    ));
+
+    /// Whether a statement carries an `ORDER BY`, which is what makes it a
+    /// candidate for paging at all.
+    fn statement_has_an_order_by(sql: &str) -> bool {
+        sql.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_uppercase()
+            .contains("ORDER BY")
+    }
+
+    /// The trailing `LIMIT n [OFFSET m]` of a statement, removed.
+    ///
+    /// A refusal for a row limit is not a prover gap: a page IS a limit, so a
+    /// statement carrying its own is refused by design and there is nothing
+    /// to widen. Setting that clause aside is what makes the rest of the
+    /// tally a measurement of the nullability prover.
+    fn without_a_trailing_row_limit(sql: &str) -> String {
+        let upper = sql.to_ascii_uppercase();
+        let Some(at) = upper.rfind("LIMIT ") else {
+            return sql.to_string();
+        };
+        let tail = sql[at + "LIMIT ".len()..].trim();
+        let mut words = tail.split_whitespace();
+        let digits = |word: &str| !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit());
+        let trailing = match (words.next(), words.next(), words.next(), words.next()) {
+            (Some(rows), None, ..) => digits(rows),
+            (Some(rows), Some(offset), Some(skipped), None) => {
+                digits(rows) && offset.eq_ignore_ascii_case("OFFSET") && digits(skipped)
+            }
+            _ => false,
+        };
+        if trailing {
+            sql[..at].trim_end().to_string()
+        } else {
+            sql.to_string()
+        }
+    }
+
+    /// One statement's outcome, as the label the tally counts.
+    ///
+    /// A refusal is labelled by its variant, and an unproven-nullability
+    /// refusal also by which link of the proof is missing: the two are
+    /// different findings, and collapsing them would hide a prover gap
+    /// widening into a real hazard or the reverse.
+    fn page_plan_outcome(sql: &str) -> String {
+        match plan_page(sql, None) {
+            Ok(plan) if plan.total_order() => "plans, total order".to_string(),
+            Ok(_) => "plans, not a total order".to_string(),
+            Err(PagePlanError::Invalid(_)) => "Invalid".to_string(),
+            Err(PagePlanError::CrossSignal) => "CrossSignal".to_string(),
+            Err(PagePlanError::RowLimitInStatement) => "RowLimitInStatement".to_string(),
+            Err(PagePlanError::PipeOperator) => "PipeOperator".to_string(),
+            Err(PagePlanError::NoOrdering { .. }) => "NoOrdering".to_string(),
+            Err(PagePlanError::OrderByAll) => "OrderByAll".to_string(),
+            Err(PagePlanError::OrderTermNotColumn { .. }) => "OrderTermNotColumn".to_string(),
+            Err(PagePlanError::OrderTermNotProjected { .. }) => "OrderTermNotProjected".to_string(),
+            Err(PagePlanError::UnsupportedOrderOption { .. }) => {
+                "UnsupportedOrderOption".to_string()
+            }
+            Err(PagePlanError::OrderTermNullable { .. }) => "OrderTermNullable".to_string(),
+            Err(PagePlanError::OrderTermNullabilityUnknown { reason, .. }) => {
+                format!("OrderTermNullabilityUnknown: {reason}")
+            }
+            Err(PagePlanError::ResumeArity { .. }) => "ResumeArity".to_string(),
+            Err(PagePlanError::NonFiniteResumeValue) => "NonFiniteResumeValue".to_string(),
+        }
+    }
+
+    fn tally(outcomes: &BTreeMap<String, usize>, prefix: &str) -> usize {
+        outcomes
+            .iter()
+            .filter(|(label, _)| label.starts_with(prefix))
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
+    fn expected(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
+        pairs
+            .iter()
+            .map(|(label, count)| ((*label).to_string(), *count))
+            .collect()
+    }
+
+    /// What fraction of the ClickBench corpus this planner can page, pinned
+    /// as exact counts.
+    ///
+    /// This is the figure the tool is judged on, so it is asserted rather
+    /// than printed. Every number here is exact: a bare inequality would
+    /// pass while the planner regressed to refusing everything, which is the
+    /// direction that costs a caller a capability rather than correctness.
+    ///
+    /// Two passes. The first is the corpus as written, where 32 of the 43
+    /// statements carry their own `LIMIT` and are refused for that alone.
+    /// The second strips a trailing `LIMIT n [OFFSET m]`, which is what
+    /// exposes the nullability prover underneath.
+    #[test]
+    fn the_clickbench_corpus_page_plan_outcomes_are_pinned() {
+        let corpus: serde_json::Value =
+            serde_json::from_str(CLICKBENCH_CORPUS).expect("corpus parses");
+        let entries = corpus["entries"].as_array().expect("corpus has entries");
+
+        let mut statements = 0usize;
+        let mut ordered = 0usize;
+        let mut as_written: BTreeMap<String, usize> = BTreeMap::new();
+        let mut without_row_limit: BTreeMap<String, usize> = BTreeMap::new();
+
+        for entry in entries {
+            let sql = entry["sql"].as_str().expect("entry has sql");
+            statements += 1;
+            if statement_has_an_order_by(sql) {
+                ordered += 1;
+            }
+            *as_written.entry(page_plan_outcome(sql)).or_default() += 1;
+            *without_row_limit
+                .entry(page_plan_outcome(&without_a_trailing_row_limit(sql)))
+                .or_default() += 1;
+        }
+
+        assert_eq!(statements, 43, "corpus statement count");
+        assert_eq!(ordered, 32, "corpus statements carrying an ORDER BY");
+
+        assert_eq!(
+            as_written,
+            expected(&[
+                ("NoOrdering", 10),
+                ("OrderTermNotColumn", 1),
+                ("RowLimitInStatement", 32),
+            ]),
+            "outcomes for the corpus as written",
+        );
+        assert_eq!(tally(&as_written, "plans"), 0, "plans, as written");
+        assert_eq!(
+            statements - tally(&as_written, "plans"),
+            43,
+            "refusals, as written",
+        );
+
+        let mut want = expected(&[
+            ("NoOrdering", 11),
+            ("OrderTermNotColumn", 5),
+            ("OrderTermNotProjected", 2),
+            ("plans, not a total order", 1),
+        ]);
+        want.insert(
+            format!(
+                "OrderTermNullabilityUnknown: {}",
+                unproven::NOT_A_BARE_COLUMN
+            ),
+            23,
+        );
+        want.insert(
+            format!(
+                "OrderTermNullabilityUnknown: {}",
+                unproven::NOT_A_SCHEMA_COLUMN
+            ),
+            1,
+        );
+        assert_eq!(
+            without_row_limit, want,
+            "outcomes once a trailing row limit is set aside",
+        );
+        assert_eq!(
+            tally(&without_row_limit, "plans"),
+            1,
+            "plans, row limit set aside",
+        );
+        assert_eq!(
+            statements - tally(&without_row_limit, "plans"),
+            42,
+            "refusals, row limit set aside",
+        );
+        assert_eq!(
+            tally(&without_row_limit, "OrderTermNullab"),
+            24,
+            "nullability refusals, row limit set aside",
+        );
+    }
+
     /// A `samples` statement with no ORDER BY at all is pageable: the row
     /// identity is a complete ordering on its own, so the planner imposes it
     /// rather than refusing.
