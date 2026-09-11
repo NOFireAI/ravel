@@ -352,6 +352,25 @@ async fn inspect_preserves_partial_output_when_a_part_fetch_fails() {
         out.contains(&present_key),
         "partial report lost the successfully-fetched part that preceded the failure: {out}"
     );
+    // Every LISTED part carries a field-7 line, including the one whose
+    // object could not be fetched. `part_ref.column_stats` comes from the
+    // HEAD protobuf already in hand, so it does not depend on the fetch, and
+    // omitting the line for a failing part would reintroduce exactly the
+    // omitted-line-versus-unset-field ambiguity the ABSENT marker exists to
+    // remove, on the parts most worth inspecting.
+    //
+    // Prove-the-test: move the `column_stats (field 7)` push_str in
+    // `render_inspect` back below the `store.get(...)?` and this reads 1.
+    assert_eq!(
+        out.matches("column_stats (field 7):").count(),
+        2,
+        "both listed parts must carry a field-7 line, including the one whose \
+         fetch failed: {out}"
+    );
+    assert!(
+        out.contains(&missing_key),
+        "the failing part must still be listed: {out}"
+    );
 }
 
 /// Deliverable 3 (#1598): HEAD field 11 (`SnapshotColumnStatsRef`, ADR-0850),

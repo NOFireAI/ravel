@@ -147,7 +147,7 @@ async fn fold_human_report_prints_every_fold_report_field() {
     let created = now_ns() - SEALED_AGE_NS;
     publish_segment(&store, tenant, 0, 1, created).await;
 
-    let (_report, printed) = catalog::fold(
+    let (report, printed) = catalog::fold(
         store as Arc<dyn ObjectStoreBackend>,
         MEMORY,
         tenant,
@@ -200,6 +200,32 @@ async fn fold_human_report_prints_every_fold_report_field() {
             "previously-omitted field {field} missing from report:\n{printed}"
         );
     }
+
+    // The two lists above pin TODAY's field set by hand, which is the same
+    // mechanism that let the human report drift in the first place: add a
+    // `FoldReport` field tomorrow and `--json` carries it for free via
+    // `Serialize` while the text renderer silently omits it, with every
+    // assertion above still green. Derive the expected key set from the
+    // struct instead, so the claim in `render_fold_report`'s doc comment
+    // ("both forms print every field") holds for fields nobody has written
+    // yet. The hand-written lists stay for their documentation value.
+    let value = serde_json::to_value(&report).expect("FoldReport serializes");
+    let keys = value
+        .as_object()
+        .expect("FoldReport is a struct, so it serializes to an object");
+    assert!(
+        keys.len() >= 23,
+        "expected the derived key set to cover the whole struct, got {} keys; \
+         if FoldReport shrank, update this floor deliberately",
+        keys.len()
+    );
+    for key in keys.keys() {
+        assert!(
+            printed.contains(&format!("{key}:")),
+            "FoldReport field {key} is serialized by --json but missing from \
+             the human report:\n{printed}"
+        );
+    }
 }
 
 /// Deliverable 1's `--json` flag: the whole `FoldReport` round-trips through
@@ -224,13 +250,22 @@ async fn fold_json_report_serializes_the_whole_fold_report() {
     .await
     .expect("fold succeeds");
 
-    // First line is the store-selection header (every render function's
-    // first line, human or JSON); the rest is the JSON body.
-    let body = printed
-        .split_once('\n')
-        .map(|(_, rest)| rest)
-        .expect("header line present");
-    let value: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+    // The WHOLE of stdout must parse, with no header line to skip: `--json`
+    // exists so `... --json | jq .put_requests` works, and a consumer that
+    // has to drop a first line by convention is the defect this asserts
+    // against. Parsing `printed` directly rather than a suffix of it is the
+    // assertion.
+    let value: serde_json::Value = serde_json::from_str(&printed)
+        .unwrap_or_else(|err| panic!("--json stdout must be one JSON document: {err}\n{printed}"));
+    let body = printed.as_str();
+    // #1024 requires the store selection to stay visible. It moved from a
+    // header line into the document, so it is still there and now machine
+    // readable.
+    assert_eq!(
+        value.get("store"),
+        Some(&serde_json::json!("memory")),
+        "the store selection must survive as a field, not a header line:\n{body}"
+    );
     assert_eq!(
         value.get("column_stats_dictionaries_dropped"),
         Some(&serde_json::json!(report.column_stats_dictionaries_dropped)),
