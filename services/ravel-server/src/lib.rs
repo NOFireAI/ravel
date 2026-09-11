@@ -1590,6 +1590,15 @@ pub async fn start(
     // called) has already passed. Merged like every other mode's routes, so
     // `/healthz` truly reflects "the axum server task can route requests".
     let readiness = health::Readiness::new();
+    // Wire the metrics ingest router's shard-supervisor health into readiness
+    // (issue #1299): once one of its shard actors exhausts its respawn budget
+    // and is condemned, `/readyz` turns 503 so the orchestrator replaces this
+    // replica. The log and span routers do not yet respawn or condemn (they
+    // share the same single-point-of-permanent-failure spawn), so they are not
+    // registered here.
+    if let Some(router) = &ingest_router {
+        readiness.register_ingest_health(router.clone());
+    }
     let mut http_router = Router::new().merge(health::router(readiness.clone()));
     // The dedicated mTLS listener's router (ADR-0050 section 1): built up in
     // parallel with `http_router` below, merging the same tenant-resolving

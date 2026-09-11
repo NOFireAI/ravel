@@ -193,13 +193,24 @@ pub struct IngestMetrics {
     /// are kept (ADR-0047 decision 2), alongside the wire-side drop counters
     /// the normalize paths already report.
     exemplars_dropped_total: AtomicU64,
-    /// Distinct shard actors observed dead by the router: its send half or a
-    /// strict-mode ack found the shard channel closed, meaning the actor task
-    /// ended (e.g. panicked) without the router shutting it down. Counted
-    /// once per shard on the first observation, so it never exceeds
-    /// `shard_count` and makes a permanently degraded process observable
+    /// Shard-actor deaths observed by the router: its send half or a
+    /// strict-mode ack found a shard channel closed, meaning that actor task
+    /// ended (e.g. panicked mid-flush) without the router shutting it down.
+    /// Counted once per death and per respawned incarnation (issue #1299), so a
+    /// shard the router respawns and that dies again counts each death: this can
+    /// exceed `shard_count`, and a value above it is exactly the repeated-death
+    /// signal an operator wants. Deduped only against re-observation of one
+    /// already-counted incarnation, so the same death routed through many later
+    /// writes still counts once. Makes a degraded process observable
     /// (docs/ingest.md "Metrics (self-observability)").
     shard_deaths: AtomicU64,
+    /// Shards condemned after exhausting their respawn budget (issue #1299):
+    /// the router stopped respawning the shard and reports itself not-ready
+    /// (`IngestRouter::ready`) so the orchestrator replaces this replica. One
+    /// increment per shard, at most once per shard, so it never exceeds
+    /// `shard_count`. Nonzero means at least one shard is permanently down in
+    /// this process and its series keep failing until the replica is replaced.
+    shards_condemned: AtomicU64,
     /// Flushes failed closed because the router's cached provisioning view for
     /// the tenant was older than the refresh interval `C` (ADR-0052 section 3).
     /// The load-bearing staleness signal: a nonzero, growing value means the
@@ -563,6 +574,9 @@ pub struct IngestMetricsSnapshot {
     /// `ravel_ingest_partial_writes_total`.
     pub partial_writes: u64,
     pub shard_deaths: u64,
+    /// Shards condemned after exhausting their respawn budget (issue #1299).
+    /// Nonzero drives `IngestRouter::ready` false so `/readyz` turns 503.
+    pub shards_condemned: u64,
     pub exemplars_written_total: u64,
     pub exemplars_dropped_total: u64,
     pub stale_provisioning_flushes: u64,
@@ -794,6 +808,19 @@ impl IngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One shard condemned after exhausting its respawn budget (issue #1299).
+    /// Recorded at most once per shard, on the death that spends the last
+    /// respawn; drives `IngestRouter::ready` false.
+    pub(crate) fn record_shard_condemned(&self) {
+        self.shards_condemned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Shards condemned so far in this process (issue #1299). A direct atomic
+    /// read for the readiness probe, cheaper than a full [`Self::snapshot`].
+    pub fn condemned_shards(&self) -> u64 {
+        self.shards_condemned.load(Ordering::Relaxed)
+    }
+
     /// One flush refused because the router's cached provisioning view for the
     /// tenant exceeded the refresh interval `C` (ADR-0052 section 3, fail
     /// closed).
@@ -852,6 +879,7 @@ impl IngestMetrics {
             flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
+            shards_condemned: self.shards_condemned.load(Ordering::Relaxed),
             exemplars_written_total: self.exemplars_written_total.load(Ordering::Relaxed),
             exemplars_dropped_total: self.exemplars_dropped_total.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
@@ -892,6 +920,7 @@ mod tests {
         metrics.record_flush_all_residue(2);
         metrics.record_partial_write();
         metrics.record_shard_death();
+        metrics.record_shard_condemned();
         metrics.record_exemplars(2, 5);
 
         let snap = metrics.snapshot();
@@ -913,6 +942,8 @@ mod tests {
         assert_eq!(snap.flush_all_residue_tenants, 2);
         assert_eq!(snap.partial_writes, 1);
         assert_eq!(snap.shard_deaths, 1);
+        assert_eq!(snap.shards_condemned, 1);
+        assert_eq!(metrics.condemned_shards(), 1);
     }
 
     #[test]
