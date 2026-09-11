@@ -6928,11 +6928,15 @@ mod tests {
         );
     }
 
-    /// `fetch_max`, not a plain store: a fold whose caller holds a clock
-    /// behind an earlier caller's cannot walk the liveness gauge backwards
-    /// and make a healthy fold look stalled.
+    /// A plain `store`, not `fetch_max`: the liveness gauge tracks the most
+    /// recent successful fold's `now_ns`, so a backward clock step lowers it.
+    /// This pins the semantics deliberately. Within one process every fold
+    /// caller reads the same host clock, so the only way `now_ns` regresses is
+    /// an NTP step back on that host, and the safe response to it is a
+    /// transient false stall the next fold clears, not the permanently latched
+    /// future reading `fetch_max` would leave after a step forward.
     #[tokio::test]
-    async fn a_backwards_clock_never_lowers_the_last_success_gauge() {
+    async fn a_backwards_clock_lowers_the_last_success_gauge() {
         let store = Arc::new(MemoryStore::new());
         let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
 
@@ -6965,8 +6969,8 @@ mod tests {
             .expect("fold from the behind clock");
         assert_eq!(
             catalog.fold_last_success_unix_ns(),
-            ahead_ns,
-            "the gauge holds the highest successful now_ns, never the latest caller's"
+            behind_ns,
+            "the gauge holds the latest successful now_ns, even a backward one"
         );
         assert_eq!(catalog.fold_cycles(), 2, "both folds are still cycles");
     }

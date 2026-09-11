@@ -241,8 +241,16 @@ an explicit isolation-fault error. [Troubleshooting](operations/troubleshooting.
 Labels: `mode`. All three families render in every mode, but only the modes
 that fold ever move them: the background fold loop runs in every mode except
 `maintain`, and the on-demand fold route is mounted only in `all` and
-`query`. A `maintain` process therefore reports zeros permanently, which is
-why the alert below excludes it by label rather than by aggregation.
+`query`. A `maintain` process therefore reports zeros permanently. That is
+not why the alert filters `maintain` out under `max()`: a permanent `0` can
+never be the maximum of a set that holds any nonzero sample, and when every
+sample is `0` the filtered and unfiltered maxima are both `0`, so on a mixed
+fleet the filter changes nothing. The filter earns its place in the one case
+below where it does change behaviour: a legitimate maintain-only deployment.
+There the staleness comparison must see no folding series to compare (so it
+cannot trip on those permanent zeros), while the `absent()` branch still sees
+the maintain series exist and so stays silent, distinguishing a maintain-only
+fleet from one that is not being scraped at all.
 
 | Metric | Meaning |
 |---|---|
@@ -274,9 +282,13 @@ groups:
     rules:
       - alert: RavelCatalogFoldStalled
         expr: |
-          time() - max(
-            ravel_catalog_fold_last_success_timestamp_seconds{mode!="maintain"}
-          ) > 4800
+          (
+            time() - max(
+              ravel_catalog_fold_last_success_timestamp_seconds{mode!="maintain"}
+            ) > 4800
+          )
+          or
+          absent(ravel_catalog_fold_last_success_timestamp_seconds)
         for: 10m
         labels:
           severity: critical
@@ -310,6 +322,31 @@ fold loop skips its tick entirely when `HEAD` is already fresher than
 `fold_interval`. A replica whose peers are folding on schedule correctly does
 no folding of its own, and its own gauge is correctly stale; the fleet-wide
 maximum is the figure that answers "is this catalog being folded."
+
+The `or absent(...)` branch covers the outage the staleness comparison alone
+cannot see. `max()` of an empty instant vector is empty, and `time() - <empty>`
+is empty, so when nothing with `mode!="maintain"` is being scraped the first
+operand produces no sample and a rule of only that operand stays silent through
+the exact outage it exists to catch: a query fleet scaled to zero, a fleet
+crash-looping fast enough that its targets go stale, a scrape-config edit that
+drops the job. `absent()` returns `1` precisely when its argument matches no
+series, so it fires on that absence. It reads the metric family *without* the
+`mode!="maintain"` filter on purpose, so it fires only when no Ravel process is
+scraped at all, not when a legitimate maintain-only fleet is scraped (whose
+`mode="maintain"` series still exist). The one expression then reads as four
+states:
+
+| State | `max(...{mode!="maintain"})` operand | `absent(...)` operand | Alert |
+|---|---|---|---|
+| Nothing scraped at all | empty (no sample) | fires (family absent) | **fires** |
+| Maintain-only fleet scraped | empty (filter removes all) | silent (maintain series exist) | silent |
+| Healthy folding fleet | gauge fresh, `time() - gauge` under threshold | silent | silent |
+| Folding fleet whose fold stopped | gauge stale, over threshold | silent | **fires** |
+
+A maintain-only deployment stays silent forever, which is correct only if
+running one is legitimate; if a deployment is expected to fold, it should be
+running a folding mode, and that fleet's absence is then the first row, not the
+second.
 
 The threshold is the unsealed span the catalog configuration implies, in
 seconds:
@@ -350,6 +387,15 @@ cardinality, so a stuck single tenant is found through
 `ravel_catalog_fold_failures_total` and the fold task's per-tenant logs
 instead. And a deployment that has discovered no tenants at all folds nothing
 and so trips this rule; scope the group to deployments that serve traffic.
+
+`--disable-fold` trips this rule too, and deliberately. The flag returns no
+fold tasks, so the gauge stays at its `0` sentinel; a deployment that sets it
+on every non-maintain process leaves the gauge `0` forever, and the rule pages
+about ten minutes after start. That is arguably correct, because the unsealed
+span really does grow without a fold to seal it, but the flag is documented
+elsewhere as a pure query-cost optimization, so an operator who sets it will
+not expect a critical page. Either leave the fold running, or drop this rule
+for a fleet you have intentionally run without folding.
 
 ### Tenancy adoption (`ravel_tenancy_v1_unkeyed_adoptions_total`)
 
