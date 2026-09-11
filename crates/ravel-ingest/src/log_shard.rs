@@ -57,7 +57,7 @@ use crate::budget::IngestByteCharge;
 use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_ALL_PASSES,
-    MAX_FLUSH_CLOCK_HOLD_NS, checked_ingest_hour_bucket,
+    MAX_FLUSH_CLOCK_HOLD_NS, checked_ingest_hour_bucket, size_trigger_fires,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
@@ -103,8 +103,8 @@ pub(crate) enum LogShardMsg {
     Shutdown { done: oneshot::Sender<()> },
 }
 
-/// Estimated buffered byte cost of one attribute value, for the `est_bytes`
-/// flush-trigger heuristic and the process-wide ingest byte budget it feeds
+/// Estimated buffered byte cost of one attribute value, for the process-wide
+/// ingest byte budget it feeds
 /// (ADR-0069). Every container charges its per-element struct header at its own
 /// nesting level, not only at the top: a `Map` charges
 /// `size_of::<(String, AttrValue)>()` per entry and a `List` charges
@@ -194,6 +194,93 @@ pub(crate) fn est_columnar_bytes(batch: &ColumnarLogBatch) -> usize {
     body + severity_text + stream_attrs + attr_bytes + 32 * batch.num_rows
 }
 
+/// Fixed per-record cost in the object a log flush writes: the two i64
+/// timestamps, severity_num, flags, and the 16-byte trace id with its 8-byte
+/// span id. Above `est_record_bytes`'s own fixed 32 on purpose: that one
+/// registers buffered memory, where the ids sit inside the record struct this
+/// estimator must instead account for in stored form.
+const LOG_RECORD_OBJECT_FIXED_BYTES: usize = 48;
+
+/// Object-side length of one attribute value, the size-trigger counterpart of
+/// [`attr_value_len`] (issue #1305): the same leaf bytes, without the
+/// `AttrValue` and `(String, AttrValue)` struct headers the buffer holds and
+/// the object never stores.
+fn attr_value_object_len(value: &AttrValue) -> usize {
+    match value {
+        AttrValue::Str(s) => s.len(),
+        AttrValue::Bytes(b) => b.len(),
+        AttrValue::I64(_) | AttrValue::F64(_) => 8,
+        AttrValue::Bool(_) => 1,
+        AttrValue::List(items) => items.iter().map(attr_value_object_len).sum(),
+        AttrValue::Map(entries) => entries
+            .iter()
+            .map(|(k, v)| k.len() + attr_value_object_len(v))
+            .sum(),
+    }
+}
+
+/// Estimated bytes one record contributes to the object a log flush writes,
+/// for the size trigger only (`target_bytes` and `min_flush_bytes`, issue
+/// #1305). The memory-side figure stays [`est_record_bytes`], which the
+/// ADR-0069 ceiling charges.
+///
+/// Model: the record's stored payload -- body, severity text, stream attribute
+/// blob, and every attribute key and value byte -- plus
+/// [`LOG_RECORD_OBJECT_FIXED_BYTES`] for the fixed columns. No
+/// `(String, AttrValue)` header appears, because none reaches the object; a
+/// ten-attribute record charges about 560 bytes of struct headers to the
+/// ceiling that the object does not hold, which is what made the size trigger
+/// fire at a fraction of `target_bytes`.
+///
+/// Direction: an upper bound on the bytes the flush writes, for the reason
+/// [`crate::value::IngestPoint::est_object_sample_bytes`] states. RLOG
+/// dictionary-encodes repeated attribute keys and zstd-compresses its column
+/// blocks, both strictly below the raw bytes counted here.
+pub(crate) fn est_record_object_bytes(rec: &NormalizedLogRecord) -> usize {
+    let attr_bytes: usize = rec
+        .attrs
+        .iter()
+        .map(|(k, v)| k.len() + attr_value_object_len(v))
+        .sum();
+    rec.body.len()
+        + rec.severity_text.len()
+        + rec.stream_attrs.len()
+        + attr_bytes
+        + LOG_RECORD_OBJECT_FIXED_BYTES
+}
+
+/// [`est_record_object_bytes`] computed column-wise over a
+/// [`ColumnarLogBatch`] (ADR-0109 decision 6), term for term as
+/// [`est_columnar_bytes`] mirrors [`est_record_bytes`]: the two representations
+/// must give the same size trigger the same number for the same records, or a
+/// tenant's object size would depend on which wire path admitted it.
+pub(crate) fn est_columnar_object_bytes(batch: &ColumnarLogBatch) -> usize {
+    let body = batch.body.data().len();
+    let severity_text = batch.severity_text.data().len();
+    let stream_attrs: usize = batch
+        .stream_refs
+        .iter()
+        .map(|&r| batch.stream_attrs[r as usize].len())
+        .sum();
+
+    let mut attr_bytes = 0usize;
+    for col in &batch.dyn_columns {
+        for cell in &col.cells {
+            attr_bytes += col.name.len() + attr_value_object_len(cell);
+        }
+    }
+    for row in &batch.residual_attrs {
+        for (k, v) in row {
+            attr_bytes += k.len() + attr_value_object_len(v);
+        }
+    }
+
+    body + severity_text
+        + stream_attrs
+        + attr_bytes
+        + LOG_RECORD_OBJECT_FIXED_BYTES * batch.num_rows
+}
+
 /// Type-level bridge from the OTLP-independent [`NormalizedLogRecord`] to the
 /// writer's [`LogRecord`]. Every field maps one to one; there is no data
 /// transformation, only a struct rename.
@@ -234,6 +321,11 @@ enum BufContent {
 struct LogTenantBuf {
     content: BufContent,
     est_bytes: usize,
+    /// Estimated bytes the object this buffer's flush writes will hold, the
+    /// size trigger's own figure (issue #1305, [`est_record_object_bytes`]).
+    /// `est_bytes` above stays the buffered-memory charge behind the ADR-0069
+    /// ceiling.
+    flush_est_bytes: usize,
     oldest_arrival_ns: Option<i64>,
     min_ingest_ts_ns: Option<i64>,
     max_ingest_ts_ns: Option<i64>,
@@ -274,6 +366,7 @@ impl LogTenantBuf {
         arrival_ns: i64,
     ) -> Result<usize, LogWriteError> {
         let bytes_added: usize = records.iter().map(est_record_bytes).sum();
+        let object_bytes_added: usize = records.iter().map(est_record_object_bytes).sum();
         // ADR-0873 wave 5a: fold this write's eligible declared-column extrema
         // in the one pass that already visits the records, on the accepted arms
         // only. Extrema folded for a refused write would be stamped onto the
@@ -296,6 +389,7 @@ impl LogTenantBuf {
         }
         self.note_arrival(arrival_ns);
         self.est_bytes += bytes_added;
+        self.flush_est_bytes += object_bytes_added;
         Ok(bytes_added)
     }
 
@@ -311,6 +405,7 @@ impl LogTenantBuf {
         arrival_ns: i64,
     ) -> Result<usize, LogWriteError> {
         let bytes_added = est_columnar_bytes(&batch);
+        let object_bytes_added = est_columnar_object_bytes(&batch);
         // ADR-0873 wave 5a, on the accepted arms only, for the reason
         // [`Self::merge_rows`] gives: a refused batch's extrema would otherwise
         // be stamped onto a flush that does not carry its rows (issue #1036).
@@ -331,6 +426,7 @@ impl LogTenantBuf {
         }
         self.note_arrival(arrival_ns);
         self.est_bytes += bytes_added;
+        self.flush_est_bytes += object_bytes_added;
         Ok(bytes_added)
     }
 
@@ -1017,7 +1113,6 @@ impl LogShardActor {
         }
         let arrival_ns = self.clock.now_ns();
         let records_len = records.len() as u64;
-        let target_bytes = self.config.target_bytes;
 
         // Grab the timing handle before the mutable buffer borrow so recording
         // `merge` does not clash with the `&mut self.tenants` borrow held below.
@@ -1056,7 +1151,7 @@ impl LogShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| b.est_bytes >= target_bytes)
+            .map(|b| size_trigger_fires(b.flush_est_bytes, b.est_bytes, &self.config))
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
             return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
@@ -1067,7 +1162,7 @@ impl LogShardActor {
     /// The columnar counterpart of [`Self::handle_write`] (ADR-0109 decision 5):
     /// buffers one already-partitioned [`ColumnarLogBatch`] for `tenant`,
     /// refusing fail-loud if the buffer already holds row-major records. The
-    /// flush-trigger accounting (`est_bytes >= target_bytes`), the charge and
+    /// flush-trigger accounting (`flush_est_bytes >= target_bytes`), the charge and
     /// waiter handling, and the size-flush path are identical to the row path,
     /// as is the flush-permit wait it returns (see [`Self::handle_write`]).
     async fn handle_write_columnar(
@@ -1083,7 +1178,6 @@ impl LogShardActor {
         }
         let arrival_ns = self.clock.now_ns();
         let records_len = batch.num_rows as u64;
-        let target_bytes = self.config.target_bytes;
 
         #[cfg(feature = "stage-timing")]
         let merge_timings = Arc::clone(&self.ctx.stage_timings);
@@ -1117,7 +1211,7 @@ impl LogShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| b.est_bytes >= target_bytes)
+            .map(|b| size_trigger_fires(b.flush_est_bytes, b.est_bytes, &self.config))
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
             return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
@@ -1125,14 +1219,18 @@ impl LogShardActor {
         0
     }
 
-    /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
+    /// A buffer with a strict-mode waiter, or one whose flush would write at
+    /// least `min_flush_bytes` of object,
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
     /// else is idle and waits for the slower `max_flush_delay_idle` instead
-    /// (ADR-0051 section 7). Strict-mode ack latency is unaffected:
+    /// (ADR-0051 section 7). "Worth a PUT" is a claim about the object, so this
+    /// reads the object-bytes estimate, not the buffered-memory charge (issue
+    /// #1305). Strict-mode ack latency is unaffected:
     /// a strict write always leaves `waiters` non-empty for its whole flush
     /// window.
     fn age_threshold_ns(&self, buf: &LogTenantBuf) -> i64 {
-        let has_priority = !buf.waiters.is_empty() || buf.est_bytes >= self.config.min_flush_bytes;
+        let has_priority =
+            !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if has_priority {
             self.config.max_flush_delay.as_nanos() as i64
         } else {
@@ -2909,10 +3007,15 @@ mod tests {
             records in proptest::collection::vec(record_strategy(), 0..12)
         ) {
             let row_total: usize = records.iter().map(est_record_bytes).sum();
+            let object_total: usize = records.iter().map(est_record_object_bytes).sum();
             let logrecords: Vec<LogRecord> =
                 records.iter().map(|r| to_logseg_record(r.clone())).collect();
             let batch = ColumnarLogBatch::from_records(&logrecords);
             prop_assert_eq!(est_columnar_bytes(&batch), row_total);
+            // The same equality for the size trigger's object-bytes estimate:
+            // a tenant's object size must not depend on which wire path
+            // admitted its records.
+            prop_assert_eq!(est_columnar_object_bytes(&batch), object_total);
         }
     }
 
@@ -2957,8 +3060,10 @@ mod tests {
             attrs,
         };
         let row_total = est_record_bytes(&rec);
+        let object_total = est_record_object_bytes(&rec);
         let batch = ColumnarLogBatch::from_records(&[to_logseg_record(rec)]);
         assert_eq!(est_columnar_bytes(&batch), row_total);
+        assert_eq!(est_columnar_object_bytes(&batch), object_total);
     }
 
     /// ADR-0109 decision 5: a tenant's shard buffer is columnar or row-major,
