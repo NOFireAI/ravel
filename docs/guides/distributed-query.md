@@ -292,7 +292,10 @@ Every one of these is validated at startup, not at the first federated query:
 a malformed spec, an unknown key, a `tls` or `skip-unavailable` value that is
 not `true` or `false`, a duplicate cluster name, `tls=false` next to a
 `tls-ca-file`, a zero soft timeout, or an unreadable or empty credential file
-all fail the process before it binds a listener.
+all fail the process before it binds a listener. A remote cluster configured on
+a coordinator that can resolve more than one local tenant also fails startup
+here; see [One credential per process: federation is
+single-tenant](#one-credential-per-process-federation-is-single-tenant).
 
 ### What crosses the boundary, and what does not
 
@@ -313,6 +316,28 @@ tenant registry.
 
 `RemoteClusterConfig`'s debug formatting prints `credential: <redacted>`, so a
 config dump or a panic message never leaks the operator secret.
+
+### One credential per process: federation is single-tenant
+
+Federation today holds **one remote credential per process**, and that
+credential is the only principal the remote sees for every federated fetch. It
+cannot be keyed by the local tenant that issued the query: there is no
+per-tenant remote credential to configure. Both sides of a federation are
+single-tenant; the intended and tested model is one canonical tenant on the
+coordinator and the same tenant on each remote.
+
+That is why a coordinator that can resolve **more than one local tenant refuses
+to start with a remote cluster configured**. If it did not, every local
+tenant's metric selectors and discovery calls would fan out under that one
+credential, so each local tenant would receive the remote tenant's series and
+the remote tenant's data would reach whichever local tenant asked. A
+coordinator can resolve more than one local tenant when two or more
+`--tenant-token` values name different tenants, or when any dynamic resolver is
+enabled: `--dev-insecure-tenant-header`, `--oidc-issuer`, or `--mtls-enabled`,
+each of which derives the tenant from a request header or a token claim. In any
+of those cases, adding a `--remote-cluster` fails startup with an error naming
+the resolver that makes the deployment multi-tenant. Run exactly one local
+tenant to federate, or remove the remote cluster.
 
 Both the value-bearing endpoints (`/api/v1/query`, `/api/v1/query_range`) and
 the discovery endpoints (`/api/v1/series`, `/api/v1/labels`,

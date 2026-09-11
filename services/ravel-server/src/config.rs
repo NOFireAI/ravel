@@ -1520,7 +1520,11 @@ pub struct Cli {
     pub max_parallel_slices: usize,
 
     /// A remote cluster this coordinator federates a query out to (ADR-0071
-    /// cross-cluster federation). Repeatable: one flag per remote.
+    /// cross-cluster federation). Repeatable: one flag per remote. Refuses
+    /// startup when the coordinator can resolve more than one local tenant,
+    /// because federation holds one remote credential per process and cannot
+    /// express a per-tenant remote credential; single-tenant federation is the
+    /// only supported configuration.
     ///
     /// The value is a comma-separated `key=value` spec. Required keys: `name`
     /// (the cluster's stable label, surfaced in the `warnings` field when it is
@@ -1546,6 +1550,14 @@ pub struct Cli {
     /// client's credential across a cluster boundary; the remote only ever sees
     /// this configured principal. Remotes are operator configuration only and
     /// never appear in query text.
+    ///
+    /// Because that one credential is process-wide, federation is single-tenant:
+    /// a coordinator that can resolve more than one local tenant (two or more
+    /// `--tenant-token` tenants, or any of `--dev-insecure-tenant-header`,
+    /// `--oidc-issuer`, or `--mtls-enabled`) refuses to start with a remote
+    /// cluster configured, rather than fanning every local tenant's selectors
+    /// and discovery out under the same credential and returning another
+    /// tenant's series.
     ///
     /// Example:
     /// `--remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,skip-unavailable=true`
