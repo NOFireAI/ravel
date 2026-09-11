@@ -241,6 +241,27 @@ async fn main() -> anyhow::Result<()> {
     }
     ravel_server::warn_mtls_trusted_header(auth.mtls_header.as_deref());
 
+    // Federation TLS is on by default (ADR-0071 amendment), so a remote with
+    // `tls` off is a deliberate operator choice; log it by name once here,
+    // where the resolved remote-cluster config first exists. Parsed before
+    // `build_auth_resolver` consumes `tenant_tokens` and `auth`, so the
+    // single-tenant refusal can read every resolver input.
+    let remote_clusters = cli
+        .parse_remote_clusters()
+        .context("failed to resolve --remote-cluster settings")?;
+    // ADR-0071 federation holds one remote credential per process and cannot
+    // express a per-tenant remote credential. Refuse `--remote-cluster` on a
+    // coordinator that can resolve more than one local tenant, before any
+    // listener binds, rather than silently fanning every tenant's queries out
+    // under the same credential.
+    ravel_server::ensure_federation_single_tenant(
+        &remote_clusters,
+        &tenant_tokens,
+        cli.dev_insecure_tenant_header,
+        &auth,
+    )?;
+    ravel_server::warn_plaintext_federation(&remote_clusters);
+
     let resolver_bundle = ravel_server::tenant::build_auth_resolver(
         tenant_tokens,
         cli.dev_insecure_tenant_header,
@@ -417,14 +438,6 @@ async fn main() -> anyhow::Result<()> {
         .mtls_listener
         .zip(resolver_bundle.mtls_resolver)
         .map(|(addr, resolver)| ravel_server::MtlsListenerConfig { addr, resolver });
-
-    // Federation TLS is on by default (ADR-0071 amendment), so a remote with
-    // `tls` off is a deliberate operator choice; log it by name once here,
-    // where the resolved remote-cluster config first exists.
-    let remote_clusters = cli
-        .parse_remote_clusters()
-        .context("failed to resolve --remote-cluster settings")?;
-    ravel_server::warn_plaintext_federation(&remote_clusters);
 
     let flush_cadence = cli
         .resolve_flush_cadence()
