@@ -367,8 +367,12 @@ const STATEMENTS: &[&str] = &[
     "SELECT * FROM samples ORDER BY ts",
     "SELECT * FROM samples",
     "SELECT ts, series_id FROM samples ORDER BY ts",
-    "SELECT ts, series_id, value FROM samples ORDER BY value DESC, ts",
+    "SELECT ts, series_id, value FROM samples ORDER BY ts DESC, series_id",
     "SELECT * FROM samples WHERE value > 0.5 ORDER BY ts",
+    // Refused now rather than walked: `value` is a float, and NaN satisfies no
+    // disjunct of a keyset predicate. Kept in the table so the refusal is
+    // exercised on the same path the walks take.
+    "SELECT ts, series_id, value FROM samples ORDER BY value DESC, ts",
 ];
 
 /// The acceptance gate: every statement the planner claims a total order for
@@ -556,7 +560,10 @@ fn the_four_defect_statements_are_classified_exactly() {
         "SELECT * FROM samples ORDER BY ts",
         "SELECT * FROM samples",
         "SELECT ts, series_id FROM samples ORDER BY ts",
-        "SELECT ts, series_id, value FROM samples ORDER BY value DESC, ts",
+        // A DESC term, so a fix that reads every term as ASC is not a fix that
+        // passes here. `value DESC` used to be this case and is now refused
+        // outright: a float term admits NaN, which no keyset disjunct places.
+        "SELECT ts, series_id, value FROM samples ORDER BY ts DESC, series_id",
         "SELECT * FROM samples WHERE value > 0.5 ORDER BY ts",
     ];
     for sql in must_stay_total {
