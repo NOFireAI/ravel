@@ -181,6 +181,82 @@ pub fn warn_plaintext_federation(clusters: &[config::RemoteClusterConfig]) {
     }
 }
 
+/// The reason a resolver configuration can resolve more than one local tenant,
+/// or `None` when at most one tenant can ever resolve. A dynamic resolver
+/// derives the tenant from a request header or a token claim, so any tenant can
+/// resolve under it; a static bearer map is bounded by its distinct values.
+fn multi_tenant_resolver_reason(
+    tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
+    dev_insecure_tenant_header: bool,
+    auth: &config::AuthResolverSettings,
+) -> Option<String> {
+    if auth.oidc.is_some() {
+        return Some(
+            "--oidc-issuer resolves the tenant from a JWT claim, so any tenant can resolve"
+                .to_string(),
+        );
+    }
+    if auth.mtls_header.is_some() {
+        // The mTLS resolver backs its own listener, but that listener serves the
+        // same query surface on the same shared engine, so a federated fan-out
+        // still runs under the one process credential for whichever tenant the
+        // client certificate names.
+        return Some(
+            "--mtls-enabled resolves the tenant from a client-certificate header, so any tenant \
+             can resolve"
+                .to_string(),
+        );
+    }
+    if dev_insecure_tenant_header {
+        return Some(
+            "--dev-insecure-tenant-header resolves the tenant from a request header, so any \
+             tenant can resolve"
+                .to_string(),
+        );
+    }
+    let distinct: std::collections::HashSet<&ravel_types::TenantId> =
+        tenant_tokens.values().collect();
+    if distinct.len() > 1 {
+        return Some(format!(
+            "{} distinct --tenant-token tenants are configured",
+            distinct.len()
+        ));
+    }
+    None
+}
+
+/// Refuse `--remote-cluster` on a coordinator that can resolve more than one
+/// local tenant. ADR-0071 federation holds one remote credential per process
+/// and has no per-tenant remote credential, so on a multi-tenant coordinator
+/// every local tenant's federated metric selectors and discovery calls fan out
+/// under the same credential and receive another tenant's series. Single-tenant
+/// federation is the only configuration this can serve safely. Call this at
+/// startup once the resolver inputs and remote clusters are parsed, before any
+/// listener binds; it is a no-op when no remote cluster is configured.
+pub fn ensure_federation_single_tenant(
+    remote_clusters: &[config::RemoteClusterConfig],
+    tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
+    dev_insecure_tenant_header: bool,
+    auth: &config::AuthResolverSettings,
+) -> anyhow::Result<()> {
+    if remote_clusters.is_empty() {
+        return Ok(());
+    }
+    if let Some(reason) =
+        multi_tenant_resolver_reason(tenant_tokens, dev_insecure_tenant_header, auth)
+    {
+        anyhow::bail!(
+            "--remote-cluster is configured on a coordinator that can resolve more than one local \
+             tenant ({reason}). ADR-0071 federation holds one remote credential per process and \
+             cannot express a per-tenant remote credential, so every local tenant's federated \
+             metric selectors and discovery calls would fan out under that single credential and \
+             receive another tenant's series. Single-tenant federation is the only supported \
+             configuration: run one local tenant, or remove --remote-cluster."
+        );
+    }
+    Ok(())
+}
+
 /// The dedicated listener the mTLS resolver runs on (ADR-0050 section 1).
 /// `resolver` is wired only into this listener's router chain; the public
 /// HTTP and gRPC/Flight chains are built from `ServerConfig::tenant_resolver`

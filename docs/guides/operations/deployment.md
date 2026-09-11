@@ -385,6 +385,31 @@ The credential is an operator secret read from a file, never an inline value. It
 is the principal the remote sees. A federated query never forwards the calling
 client's credential across a cluster boundary.
 
+**Federation is single-tenant.** That credential is process-wide, one per
+remote, and cannot be keyed by the local tenant that issued the query, so both
+sides of a federation must be a single tenant (one canonical tenant on the
+coordinator, the same tenant on each remote). A coordinator that can resolve
+more than one local tenant therefore **refuses to start** with a
+`--remote-cluster` configured, rather than fanning every local tenant's
+selectors and discovery out under the one credential and returning another
+tenant's series. A coordinator can resolve more than one local tenant when two
+or more `--tenant-token` values name different tenants, or when any dynamic
+resolver is enabled (`--dev-insecure-tenant-header`, `--oidc-issuer`, or
+`--mtls-enabled`, each of which derives the tenant from a request header or a
+token claim). The startup error names the resolver that makes the deployment
+multi-tenant:
+
+```
+--remote-cluster is configured on a coordinator that can resolve more than one
+local tenant (...). ADR-0071 federation holds one remote credential per process
+and cannot express a per-tenant remote credential ... Single-tenant federation
+is the only supported configuration: run one local tenant, or remove
+--remote-cluster.
+```
+
+To federate, run one local tenant on the coordinator; a multi-tenant
+coordinator cannot federate today.
+
 **TLS is on unless the spec says otherwise.** Neither spec above names `tls`,
 and both dial over TLS, verifying the remote against the system trust roots plus
 `tls-ca-file` when one is set. A spec carrying `tls-ca-file` and no `tls` key
