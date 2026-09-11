@@ -2090,8 +2090,8 @@ pub async fn sweep_unreferenced_catalog_objects(
 /// [`read_head_reference`] fails the whole pass on it (fail-closed).
 enum HeadReference {
     /// HEAD is present and decoded: the set of keys it names (every
-    /// `parts[].key`, the optional `postings.key`, and the optional
-    /// column-statistics keys `column_stats.key`/`column_stats_part.key`).
+    /// `parts[].key`, the optional `postings.key`, and each part's optional
+    /// per-part column-statistics key `parts[].column_stats.key`).
     Present(HashSet<String>),
     /// HEAD is absent. There is no anchor to compare against, so rule 5 sweeps
     /// nothing for this (tenant, signal) (a fold rebuilding from no HEAD adopts
@@ -2117,12 +2117,8 @@ async fn read_head_reference(
                      nothing this pass rather than treating a live snapshot as unreferenced"
                 ))
             })?;
-            let mut referenced = HashSet::with_capacity(
-                head.parts.len() * 2
-                    + usize::from(head.postings.is_some())
-                    + usize::from(head.column_stats.is_some())
-                    + usize::from(head.column_stats_part.is_some()),
-            );
+            let mut referenced =
+                HashSet::with_capacity(head.parts.len() * 2 + usize::from(head.postings.is_some()));
             for part in &head.parts {
                 referenced.insert(part.key.clone());
                 // Additive, ADR-1413. `part.column_stats` (field 7,
@@ -2140,24 +2136,6 @@ async fn read_head_reference(
             }
             if let Some(postings) = &head.postings {
                 referenced.insert(postings.key.clone());
-            }
-            // A live snapshot's column-statistics object is an immutable,
-            // reachable object under the same `idx/` prefix this sweep lists
-            // (fold.rs writes `.cstat` there), so omitting it lets the sweep
-            // delete an object a resolvable snapshot still references (#958).
-            // All three carriers are covered: field 11 `column_stats`
-            // (`SnapshotColumnStatsRef`, ADR-0850) and field 13
-            // `column_stats_part` (`SnapshotColumnStatsPartRef`, ADR-0942's
-            // part-hash re-keying) are whole-object refs on the HEAD itself;
-            // `parts[].column_stats` (field 7, ADR-1413) is the per-part v3
-            // ref handled in the loop above. Whichever a HEAD carries names a
-            // `.cstat` key that must be spared exactly like a part or the
-            // postings object.
-            if let Some(column_stats) = &head.column_stats {
-                referenced.insert(column_stats.key.clone());
-            }
-            if let Some(column_stats_part) = &head.column_stats_part {
-                referenced.insert(column_stats_part.key.clone());
             }
             Ok(HeadReference::Present(referenced))
         }
@@ -2720,8 +2698,7 @@ mod tests {
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_proto::catalog::v1::{
-        SnapshotColumnStatsPartRef, SnapshotColumnStatsRef, SnapshotHead, SnapshotPartRef,
-        SnapshotPostingsRef,
+        SnapshotColumnStatsPartRef, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef,
     };
     use ravel_types::TenantId;
 
@@ -3342,8 +3319,6 @@ mod tests {
             folder_id: vec![0u8; 16],
             created_unix_ns: 0,
             postings,
-            column_stats: None,
-            column_stats_part: None,
             shard_generation_count: 1,
         };
         let bytes = ravel_catalog::encode_head(&head).expect("valid HEAD encodes");
@@ -3357,17 +3332,45 @@ mod tests {
             .expect("seed HEAD");
     }
 
-    /// Like [`put_head`] but also names a column-statistics object through
-    /// field 11 (`SnapshotColumnStatsRef`) and/or field 13
-    /// (`SnapshotColumnStatsPartRef`). Each ref's `part_blake3` mirrors the
-    /// parts' hashes, as `encode_head`'s own validation requires.
-    async fn put_head_with_column_stats(
+    /// Appends a length-delimited field to an already-encoded protobuf
+    /// message. Fields 11 and 13 on `SnapshotHead` (ADR-1413 decision 6,
+    /// #1600) are `reserved` and have no struct field to set, so this is the
+    /// only way to construct a HEAD that still carries one, the way a HEAD
+    /// folded before this change would. `SnapshotHead::decode` (a plain
+    /// `prost::Message::decode`) skips a field number it does not recognize,
+    /// so appending is equivalent to the field having been encoded in its
+    /// original position.
+    fn append_raw_field(
+        mut message_bytes: Vec<u8>,
+        field_number: u32,
+        field_value: &impl prost::Message,
+    ) -> Vec<u8> {
+        prost::encoding::encode_key(
+            field_number,
+            prost::encoding::WireType::LengthDelimited,
+            &mut message_bytes,
+        );
+        let payload = field_value.encode_to_vec();
+        prost::encoding::encode_varint(payload.len() as u64, &mut message_bytes);
+        message_bytes.extend_from_slice(&payload);
+        message_bytes
+    }
+
+    /// Like [`put_head`] but also plants a stale whole-object column-stats ref
+    /// on `field_number` (11 or 13, the retired `SnapshotColumnStatsRef`/
+    /// `SnapshotColumnStatsPartRef` whole-tenant forms), the way a HEAD folded
+    /// before ADR-1413 decision 6 would. Both fields are `reserved` now (no
+    /// struct field to set), so the ref is planted with [`append_raw_field`]
+    /// after `encode_head` produces well-formed bytes for the rest of the
+    /// message. `part_blake3` mirrors the parts' hashes so a decoder that did
+    /// still validate the retired field would find it internally consistent.
+    async fn put_head_with_stale_whole_object_column_stats(
         store: &dyn ObjectStoreBackend,
         tenant: &TenantHash,
         signal: Signal,
         parts: Vec<SnapshotPartRef>,
-        column_stats_key: Option<&str>,
-        column_stats_part_key: Option<&str>,
+        field_number: u32,
+        column_stats_key: &str,
     ) {
         let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
         let part_blake3: Vec<Vec<u8>> = parts.iter().map(|p| p.blake3.clone()).collect();
@@ -3381,23 +3384,17 @@ mod tests {
             folder_id: vec![0u8; 16],
             created_unix_ns: 0,
             postings: None,
-            column_stats: column_stats_key.map(|key| SnapshotColumnStatsRef {
-                key: key.to_string(),
-                blake3: [9u8; 32].to_vec(),
-                size: 1,
-                segment_count: 1,
-                part_blake3: part_blake3.clone(),
-            }),
-            column_stats_part: column_stats_part_key.map(|key| SnapshotColumnStatsPartRef {
-                key: key.to_string(),
-                blake3: [9u8; 32].to_vec(),
-                size: 1,
-                segment_count: 1,
-                part_blake3: part_blake3.clone(),
-            }),
             shard_generation_count: 1,
         };
         let bytes = ravel_catalog::encode_head(&head).expect("valid HEAD encodes");
+        let stale_ref = SnapshotColumnStatsPartRef {
+            key: column_stats_key.to_string(),
+            blake3: [9u8; 32].to_vec(),
+            size: 1,
+            segment_count: 1,
+            part_blake3,
+        };
+        let bytes = append_raw_field(bytes, field_number, &stale_ref);
         store
             .put(
                 &catalog_head_key(tenant, signal),
@@ -3590,15 +3587,22 @@ mod tests {
         );
     }
 
-    /// #958: a column-statistics `.cstat` object named by `HEAD.column_stats`
-    /// (field 11, ADR-0850) is immutable and reachable and must survive the
-    /// sweep, exactly like a part or the postings object. It lives under the
-    /// `idx/` prefix the sweep lists, so before the fix its key was absent from
-    /// the reachability set and the sweep deleted it. An unrelated old `.cstat`
-    /// not named by HEAD is still swept. The exact surviving/deleted key sets
-    /// are asserted.
+    /// ADR-1413 decision 6 (#1600): a stale `.cstat` object named ONLY by the
+    /// retired whole-tenant field 11 (`HEAD.column_stats`, `SnapshotColumnStatsRef`,
+    /// ADR-0850) is no longer referenced at all -- `read_head_reference` never
+    /// reads field 11 (it has no struct field to read; the proto field is
+    /// `reserved`), so the object is swept once it crosses the protection
+    /// horizon exactly like any other unreferenced `.cstat`, even though a
+    /// pre-#1600 HEAD still carries the raw bytes naming it. The live part
+    /// survives on its own account (`parts[].key`), unaffected by field 11.
+    ///
+    /// Prove-the-test: reintroducing a field-11 fallback read in
+    /// `read_head_reference` makes this fail: `outcome.deleted` becomes 0 and
+    /// the object added back to `referenced` before this fix at
+    /// `crates/ravel-maintain/src/sweep.rs:2138` (there is now no code at all
+    /// reading `head.column_stats`) would again be found there.
     #[tokio::test]
-    async fn catalog_sweep_spares_referenced_column_stats() {
+    async fn catalog_sweep_no_longer_spares_stale_field_eleven_column_stats() {
         let tenant = tenant();
         let signal = Signal::Metrics;
         let store = MemoryStore::new();
@@ -3610,9 +3614,9 @@ mod tests {
             "{}20260101T00.aaaa.csnap",
             catalog_snap_prefix(&tenant, signal)
         );
-        // The live column-stats object HEAD references (fold.rs keys `.cstat`
-        // under `idx/`), and an unrelated stale one no HEAD names.
-        let referenced_cstat = format!(
+        // A `.cstat` only a stale field-11 ref names, and an unrelated stale
+        // one no HEAD field names at all -- both are unreferenced now.
+        let field_eleven_cstat = format!(
             "{}20260101T00.cccc.cstat",
             catalog_idx_prefix(&tenant, signal)
         );
@@ -3621,15 +3625,15 @@ mod tests {
             catalog_idx_prefix(&tenant, signal)
         );
         put_catalog_object(&store, &part).await;
-        put_catalog_object(&store, &referenced_cstat).await;
+        put_catalog_object(&store, &field_eleven_cstat).await;
         put_catalog_object(&store, &stale_cstat).await;
-        put_head_with_column_stats(
+        put_head_with_stale_whole_object_column_stats(
             &store,
             &tenant,
             signal,
             vec![part_ref(&part, part_blake3)],
-            Some(&referenced_cstat),
-            None,
+            11,
+            &field_eleven_cstat,
         )
         .await;
 
@@ -3639,13 +3643,16 @@ mod tests {
                 .await
                 .expect("sweep must succeed");
 
-        // Exact sets: only the stale, unreferenced `.cstat` is deleted; the
-        // part, the referenced `.cstat`, and the HEAD survive.
-        assert_eq!(outcome.deleted, 1, "only the stale column-stats object");
-        assert_eq!(outcome.kept, 2, "the part and the referenced .cstat");
+        // Exact sets: both unreferenced `.cstat` objects are deleted; only the
+        // part survives.
+        assert_eq!(
+            outcome.deleted, 2,
+            "the field-11-only and the wholly-unreferenced column-stats objects"
+        );
+        assert_eq!(outcome.kept, 1, "the part alone");
         assert!(
-            present(&store, &referenced_cstat).await,
-            "a column-stats object the live HEAD names must never be swept (#958)"
+            !present(&store, &field_eleven_cstat).await,
+            "a retired field-11 ref no longer keeps its object alive"
         );
         assert!(
             present(&store, &part).await,
@@ -3657,12 +3664,12 @@ mod tests {
         );
     }
 
-    /// The ADR-0942 part-hash-keyed carrier, field 13
-    /// (`SnapshotColumnStatsPartRef`): a `.cstat` named there is reachable and
-    /// spared just like the field-11 form, so the fix does not depend on which
-    /// field a fold chose to write.
+    /// The ADR-0942 part-hash-keyed carrier, field 13 (`SnapshotColumnStatsPartRef`):
+    /// a stale `.cstat` named only there is equally unreferenced now, so the
+    /// fix does not depend on which retired field a pre-#1600 fold had chosen
+    /// to write.
     #[tokio::test]
-    async fn catalog_sweep_spares_referenced_column_stats_part() {
+    async fn catalog_sweep_no_longer_spares_stale_field_thirteen_column_stats() {
         let tenant = tenant();
         let signal = Signal::Metrics;
         let store = MemoryStore::new();
@@ -3674,19 +3681,19 @@ mod tests {
             "{}20260101T00.aaaa.csnap",
             catalog_snap_prefix(&tenant, signal)
         );
-        let referenced_cstat = format!(
+        let field_thirteen_cstat = format!(
             "{}20260101T00.eeee.cstat",
             catalog_idx_prefix(&tenant, signal)
         );
         put_catalog_object(&store, &part).await;
-        put_catalog_object(&store, &referenced_cstat).await;
-        put_head_with_column_stats(
+        put_catalog_object(&store, &field_thirteen_cstat).await;
+        put_head_with_stale_whole_object_column_stats(
             &store,
             &tenant,
             signal,
             vec![part_ref(&part, part_blake3)],
-            None,
-            Some(&referenced_cstat),
+            13,
+            &field_thirteen_cstat,
         )
         .await;
 
@@ -3696,11 +3703,11 @@ mod tests {
                 .await
                 .expect("sweep must succeed");
 
-        assert_eq!(outcome.deleted, 0, "nothing unreferenced to delete");
-        assert_eq!(outcome.kept, 2, "the part and the field-13 .cstat");
+        assert_eq!(outcome.deleted, 1, "the field-13-only column-stats object");
+        assert_eq!(outcome.kept, 1, "the part alone");
         assert!(
-            present(&store, &referenced_cstat).await,
-            "a field-13 column-stats object the live HEAD names must be spared (#958)"
+            !present(&store, &field_thirteen_cstat).await,
+            "a retired field-13 ref no longer keeps its object alive"
         );
         assert!(
             present(&store, &part).await,
@@ -4106,8 +4113,6 @@ mod tests {
                 folder_id: vec![0u8; 16],
                 created_unix_ns: 0,
                 postings: None,
-                column_stats: None,
-                column_stats_part: None,
                 shard_generation_count: 1,
             };
             Bytes::from(ravel_catalog::encode_head(&head).expect("valid swapped HEAD"))
