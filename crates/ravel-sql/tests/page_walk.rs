@@ -167,6 +167,12 @@
 //! numbers -- 7, 6, 5, 4, 3, 2, 1 for the count, and 1 seven times over for the
 //! rank -- rather than through the parse error that same mutation happens to
 //! raise first on the `DISTINCT ON` statement.
+//!
+//! Each of those two also asserts that its statement is still IN
+//! [`STATEMENTS`]. Without that the entries pinned nothing on their own:
+//! deleting both and adjusting the walked count left every test here green,
+//! because the two that read the window column reach their statement through
+//! a constant rather than through the table.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -908,8 +914,10 @@ const STATEMENTS: &[&str] = &[
     // correct only because the keyset predicate sits OUTSIDE the derived
     // table: the window sees all the statement's rows on every page. What each
     // one reports per page is asserted by value in
-    // [`a_window_is_computed_over_every_row_of_the_statement`]; here they are
-    // walked for their ordering like any other statement.
+    // [`a_count_window_reports_the_whole_row_count_on_every_page`] and
+    // [`a_rank_window_ranks_against_the_whole_row_set`], and each of those
+    // asserts its own membership here; this is where they are walked for
+    // their ordering like any other statement.
     WINDOW_COUNT_STATEMENT,
     WINDOW_RANK_STATEMENT,
     // Refused now rather than walked, both for a term whose values no cursor
@@ -1078,8 +1086,17 @@ async fn a_walk_terminates_on_an_empty_page_at_both_table_boundaries() {
 /// preserved inner `ORDER BY` makes the same mutation a PARSE error first: a
 /// suite that only caught it there would be reporting a syntax failure on an
 /// unrelated statement, which says nothing about where a window is computed.
+///
+/// Membership in [`STATEMENTS`] is asserted here rather than left to the
+/// count in [`a_total_order_claim_survives_an_executed_page_walk`]: that count
+/// moves with any edit to the table, so deleting the entry and adjusting the
+/// 30 left the whole suite green while nothing walked a window statement.
 #[tokio::test]
 async fn a_count_window_reports_the_whole_row_count_on_every_page() {
+    assert!(
+        STATEMENTS.contains(&WINDOW_COUNT_STATEMENT),
+        "the count window statement left STATEMENTS, so no walk covers its ordering",
+    );
     let found = walk(&context(), WINDOW_COUNT_STATEMENT).await;
     assert_eq!(found.pages, 8, "pages of the count window walk");
     assert_eq!(
@@ -1101,8 +1118,15 @@ async fn a_count_window_reports_the_whole_row_count_on_every_page() {
 /// rather than an obviously shrinking total. [`WINDOW_RANKS`] is the sequence
 /// only the whole row set produces: it skips 3, because the pair tied at
 /// [`TIED_TS`] takes rank 2 twice.
+///
+/// Its membership in [`STATEMENTS`] is asserted for the same reason as the
+/// count window's.
 #[tokio::test]
 async fn a_rank_window_ranks_against_the_whole_row_set() {
+    assert!(
+        STATEMENTS.contains(&WINDOW_RANK_STATEMENT),
+        "the rank window statement left STATEMENTS, so no walk covers its ordering",
+    );
     let found = walk(&context(), WINDOW_RANK_STATEMENT).await;
     assert_eq!(found.pages, 8, "pages of the rank window walk");
     assert_eq!(
