@@ -70,13 +70,21 @@ parse_job_timeouts() {
   ' "${yaml}"
 }
 
-# Seconds between two ISO-8601 timestamps, or empty if either is blank.
+# Seconds between two ISO-8601 timestamps, or empty if either is blank,
+# unusable, or the Go zero-value sentinel.
 duration_seconds() {
   local started="$1" completed="$2"
   [[ -z "${started}" || -z "${completed}" ]] && return 0
+  # gh serializes a null job timestamp as Go's zero-value time rather than
+  # leaving it blank. date parses that string into a real (thousands of
+  # years in the past) epoch instead of failing, so it must be rejected by
+  # value, not by relying on a parse error that never happens.
+  if [[ "${started}" == "0001-01-01T00:00:00Z" || "${completed}" == "0001-01-01T00:00:00Z" ]]; then
+    return 0
+  fi
   local s e
-  s=$(date -d "${started}" +%s)
-  e=$(date -d "${completed}" +%s)
+  s=$(date -d "${started}" +%s 2>/dev/null) || return 0
+  e=$(date -d "${completed}" +%s 2>/dev/null) || return 0
   echo $((e - s))
 }
 
@@ -123,6 +131,9 @@ while IFS= read -r row; do
         printf '%s\n' "${wf_yaml}" >"${caps_file}"
       fi
     fi
+    if [[ -z "${caps_file}" ]]; then
+      echo "PR #${pr_num}: could not read timeout-minutes caps for run ${run_id}; sweeping it without the timeout guard" >&2
+    fi
 
     declare -A cap_map=()
     if [[ -n "${caps_file}" ]]; then
@@ -134,17 +145,32 @@ while IFS= read -r row; do
     fi
 
     # Inspect each job's duration against its cap. A job within the margin
-    # of its cap marks the whole run as a timeout.
+    # of its cap marks the whole run as a timeout. Only a job that is still
+    # running or ended abnormally (cancelled, failed, ...) can be a timeout;
+    # a job that finished successfully or was skipped never has conclusion
+    # "success"/"skipped" from a timeout, so those are excluded up front.
     timed_out_report=""
     jobs=$(gh run view "${run_id}" --json jobs \
-      --jq '.jobs[] | "\(.name)\t\(.startedAt)\t\(.completedAt)"' \
+      --jq '.jobs[] | "\(.name)\t\(.startedAt)\t\(.completedAt)\t\(.conclusion)"' \
       2>/dev/null || true)
+    if [[ -z "${jobs}" ]]; then
+      echo "PR #${pr_num}: could not read job timings for run ${run_id}; sweeping it without the timeout guard" >&2
+    fi
     if [[ -n "${jobs}" ]]; then
-      while IFS=$'\t' read -r job_name started completed; do
+      while IFS=$'\t' read -r job_name started completed conclusion; do
         [[ -z "${job_name}" ]] && continue
+        [[ "${conclusion}" == "success" || "${conclusion}" == "skipped" ]] && continue
         dur=$(duration_seconds "${started}" "${completed}")
         [[ -z "${dur}" ]] && continue
+        ((dur <= 0)) && continue
 
+        # cap_map is keyed on the workflow job key (the `  <key>:` line under
+        # `jobs:`), but .name here is the job's display name, which differs
+        # from the key when the job sets a `name:` field. No job in this
+        # repo's ci.yml sets one today, so the lookup below is safe, but a
+        # future job that adds `name:` would silently miss both this direct
+        # lookup and the matrix-suffix strip and fall through to the
+        # GitHub-default cap.
         cap_min="${cap_map[${job_name}]:-}"
         if [[ -z "${cap_min}" ]]; then
           stripped="${job_name%% (*}"
