@@ -91,7 +91,12 @@ impl FoldTasks {
 /// cost described below (an `.rspan` object carries signal=3, so the
 /// RSEG-specific postings build fails to decode it and skips writing a
 /// postings ref, same as logs' signal=2).
-const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+///
+/// `pub(crate)` so `crate::metrics` renders exactly one fold-liveness series
+/// per entry: the series set at `/metrics` is then the set of loops that are
+/// supposed to be alive, and a loop that dies leaves its own series standing
+/// and going stale rather than hiding behind its siblings.
+pub(crate) const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
 
 /// Spawns one fold loop per signal in [`FOLD_SIGNALS`], not one per tenant:
 /// each tick re-derives the tenant set from storage. [`run_loop`] is

@@ -238,25 +238,28 @@ an explicit isolation-fault error. [Troubleshooting](operations/troubleshooting.
 
 ### Catalog fold liveness (`ravel_catalog_fold_*`)
 
-Labels: `mode`. All three families render in every mode, but only the modes
-that fold ever move them: the background fold loop runs in every mode except
-`maintain`, and the on-demand fold route is mounted only in `all` and
-`query`. A `maintain` process therefore reports zeros permanently. That is
-not why the alert filters `maintain` out: a permanent `0` can never be the
-maximum of a set that holds any nonzero sample, and when every sample is `0`
-the filtered and unfiltered maxima are both `0`, so on a healthy mixed fleet
-the filter changes nothing under `max()`. The filter earns its place in a
-split-role deployment that co-scrapes dedicated `maintain` nodes alongside
-its folding nodes: there it lets the alert treat a dead folding fleet as an
-outage even while the `maintain` series survive. The alert applies the same
-filter to both of its operands for that reason; the alert section below works
-it through state by state.
+Labels: `mode`, `signal`. All three families render in every mode, with one
+series per folded signal (`metrics`, `logs`, `spans`), but only the processes
+that actually fold ever move them. Two things stop the background fold loop:
+the `maintain` mode, which never spawns it, and `--disable-fold`, which
+returns no fold tasks in any mode. The on-demand fold route is mounted only
+in `all` and `query`. A `maintain` process, and any process run with
+`--disable-fold`, therefore reports zeros permanently.
+
+The `signal` label is the family's per-signal keying, not a convenience. The
+fold runs as one independent task per signal, each with its own loop and no
+supervisor, so one signal's fold can stop while the other two keep running.
+Process-global families read as healthy throughout that, because the two
+surviving loops keep the shared figures fresh: the span history stops sealing,
+the unsealed span grows, and nothing moves. One series per signal removes that
+blind spot, and the cardinality is three values per process, the same closed
+set `signal` already carries on the ingest and postings families.
 
 | Metric | Meaning |
 |---|---|
-| `ravel_catalog_fold_cycles_total` | Catalog folds that completed successfully, no-op folds included. |
-| `ravel_catalog_fold_failures_total` | Catalog folds that failed. The fold retries on the next tick and never fails a query directly. |
-| `ravel_catalog_fold_last_success_timestamp_seconds` | Gauge. Unix time of the last successful fold in this process, `0` if none has succeeded since it started. |
+| `ravel_catalog_fold_cycles_total` | Catalog folds of this signal that completed successfully, no-op folds included. |
+| `ravel_catalog_fold_failures_total` | Catalog folds of this signal that failed. The fold retries on the next tick and never fails a query directly. |
+| `ravel_catalog_fold_last_success_timestamp_seconds` | Gauge. Unix time of the last successful fold of this signal in this process, `0` if none has succeeded since it started. |
 
 A no-op fold counts as a cycle and advances the gauge. That is deliberate: a
 fold seals an ingest hour only once `max_flush_lifetime +
@@ -279,41 +282,44 @@ logs alone.
 ```yaml
 groups:
   - name: ravel-catalog-fold
-    # RavelCatalogFoldStalled fires on any deployment with no live folding
-    # series, which includes an intentionally maintain-only fleet. Such a
-    # fleet must drop this rule or inhibit it; the state walkthrough below
-    # explains why that opt-out is deliberate.
+    # RavelCatalogFoldStalled fires on any deployment where some signal has
+    # no fresh fold, which includes a fleet that never folds at all: an
+    # intentionally maintain-only fleet, or one running --disable-fold
+    # everywhere. Such a fleet must drop this rule or inhibit it; the state
+    # walkthrough below explains why that opt-out is deliberate.
     rules:
       - alert: RavelCatalogFoldStalled
         expr: |
           (
-            time() - max(
-              ravel_catalog_fold_last_success_timestamp_seconds{mode!="maintain"}
+            time() - max by (signal) (
+              ravel_catalog_fold_last_success_timestamp_seconds
             ) > 4800
           )
           or
-          absent(ravel_catalog_fold_last_success_timestamp_seconds{mode!="maintain"})
+          absent(ravel_catalog_fold_last_success_timestamp_seconds)
         for: 10m
         labels:
           severity: critical
         annotations:
           summary: >-
-            No Ravel process has completed a catalog fold for longer than the
-            unsealed ingest span the configuration allows
+            No Ravel process has completed a catalog fold of signal
+            {{ $labels.signal }} for longer than the unsealed ingest span the
+            configuration allows
           description: >-
-            The unsealed span grows for as long as this holds, and a cold
-            recent-window query over a wide enough span is refused for
-            exceeding its object-store request budget. Check
-            ravel_catalog_fold_failures_total for a fold that is running and
-            failing, and the fold task's logs for the underlying store error.
+            The unsealed span for this signal grows for as long as this holds,
+            and a cold recent-window query over a wide enough span is refused
+            for exceeding its object-store request budget. Check
+            ravel_catalog_fold_failures_total for the same signal for a fold
+            that is running and failing, and the fold task's logs for the
+            underlying store error.
       - alert: RavelCatalogFoldFailing
         expr: |
-          sum(rate(ravel_catalog_fold_failures_total[15m])) > 0
+          sum by (signal) (rate(ravel_catalog_fold_failures_total[15m])) > 0
         for: 30m
         labels:
           severity: warning
         annotations:
-          summary: Ravel catalog folds are failing
+          summary: Ravel catalog folds of {{ $labels.signal }} are failing
           description: >-
             The fold retries each tick, so a transient store fault clears on
             its own. A sustained failure rate does not, and it precedes
@@ -321,63 +327,93 @@ groups:
             allows.
 ```
 
-`max()` over the whole deployment, not a per-instance comparison, because the
-fold loop skips its tick entirely when `HEAD` is already fresher than
-`fold_interval`. A replica whose peers are folding on schedule correctly does
-no folding of its own, and its own gauge is correctly stale; the fleet-wide
-maximum is the figure that answers "is this catalog being folded."
+`max by (signal)`, not a bare `max()` and not a per-instance comparison. The
+grouping and the aggregation answer two different questions.
+
+The aggregation is fleet-wide because the fold loop skips its tick entirely
+when `HEAD` is already fresher than `fold_interval`. A replica whose peers are
+folding on schedule correctly does no folding of its own, and its own gauge is
+correctly stale; the fleet-wide maximum is the figure that answers "is this
+catalog being folded."
+
+The grouping is by `signal` because there is no such thing as "the fold" to be
+alive or dead. There are three independent fold loops per process, one per
+signal, and each is a single point of failure for its own signal's sealed
+history. An ungrouped `max()` collapses all three into one number that two
+healthy loops keep fresh while the third is dead, which is the same
+hides-a-dead-component shape as reading a process-global gauge across a
+split-role fleet. Grouping by `signal` produces one sample per signal, and any
+one of them crossing the threshold fires with `signal` on the alert, so the
+page names which history has stopped sealing.
 
 The `or absent(...)` branch covers the outage the staleness comparison alone
-cannot see. `max()` of an empty instant vector is empty, and `time() - <empty>`
-is empty, so when no folding series is being scraped the first operand produces
-no sample and a rule of only that operand stays silent through the exact outage
-it exists to catch: a query fleet scaled to zero, a fleet crash-looping fast
-enough that its targets go stale, a scrape-config edit that drops the job, or a
-folding fleet that has died outright. `absent()` returns `1` precisely when its
-argument matches no series, so it fires on that absence.
+cannot see. `max by (signal)` of an empty instant vector is empty, and
+`time() - <empty>` is empty, so when the family is not being scraped at all the
+first operand produces no sample and a rule of only that operand stays silent
+through the exact outage it exists to catch: a fleet scaled to zero, a fleet
+crash-looping fast enough that its targets go stale, or a scrape-config edit
+that drops the job. `absent()` returns `1` precisely when its argument matches
+no series, so it fires on that absence. That branch carries no `signal` label,
+because there is no series to take one from; an alert from it renders an empty
+`{{ $labels.signal }}` and means the whole family stopped arriving, not that
+one signal stalled.
 
-The `absent()` argument carries the same `mode!="maintain"` filter as the
-staleness operand, and that is a deliberate trade. An unfiltered
-`absent(<family>)` stays silent whenever *any* series of the family exists,
-including the `mode="maintain"` series of a split-role deployment that
-co-scrapes dedicated maintain nodes alongside its folding nodes. In that
-topology, if the entire folding fleet dies or goes stale, the `mode!="maintain"`
-series vanish (so the staleness operand is empty) while the maintain series
-remain (so an unfiltered `absent()` is also silent), and the alert falls silent
-through the fleet-wide, self-worsening outage it was written for. Filtering the
-`absent()` argument closes that hole: it fires whenever no *folding* series is
-scraped, whether none is scraped at all or the folding half of a split-role
-fleet has died while its maintain half survives.
+Neither operand filters `mode`. Earlier revisions of this rule carried
+`mode!="maintain"` on both, and it is behaviour-neutral here: `render_catalog_family`
+runs in every mode, so a co-scraped `maintain` process contributes a permanent
+`0` to each signal's group, and `0` can never win a `max()` against any live
+gauge. Where the filter used to matter was a folding fleet that died beside a
+surviving `maintain` node, and the unfiltered form covers that state too, just
+through the other operand: the `0` is the only sample left in each group, so
+`time() - 0` clears any threshold and the staleness operand fires where the
+filtered form needed `absent()` to. Every state below is identical under both
+forms, so the rule carries the simpler expression. The filter also cannot be
+what makes an intentionally non-folding fleet quiet: such a fleet pages under
+both forms, for the reason in the opt-out paragraph below.
 
-The cost is that those two states are metrics-identical from this family alone:
-"the folding fleet died" and "this deployment intentionally runs maintain-only"
-both present as no `mode!="maintain"` series with `mode="maintain"` series
-alongside. No arrangement of these two operands can tell them apart, so the rule
-fires loud on both, and a genuinely maintain-only deployment must opt out by
-dropping `RavelCatalogFoldStalled` or inhibiting it (the group comment on the
-rule marks this). Firing on a real outage and forcing one deliberate silencing
-on a fleet that never folds is the safer default than staying silent on the
-outage to spare that fleet the page: an alert that is silent in the case it
-exists for manufactures confidence.
+The states, of the observed system rather than of the expression:
 
-The expression then reads as five states of the deployment, not of the
-expression:
+| What the fleet is doing | Series at the scrape | Staleness operand | `absent()` operand | Alert |
+|---|---|---|---|---|
+| Nothing scraped at all | none | empty | fires | **fires** |
+| Only `maintain` nodes scraped, intentionally | 3, all `mode="maintain"` at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** (opt out) |
+| Healthy folding fleet | 3 per process, all fresh | under threshold for all 3 signals | silent | silent |
+| Folding fleet scraped, every fold loop stalled | 3 per process, all stale | over threshold for all 3 signals | silent | **fires** |
+| Folding fleet dead, co-scraped `maintain` alive | 3, all `mode="maintain"` at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** |
+| One signal's loop dead, other two healthy | 3 per process; 2 fresh, 1 stale | over threshold for that one signal | silent | **fires** for that signal |
+| `--disable-fold` on every non-`maintain` process | 3 per process, all at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** (opt out) |
+| Fleet whose tenants write only one signal | 3 per process, all fresh | under threshold for all 3 signals | silent | silent |
 
-| Deployment state | `max(...{mode!="maintain"})` operand | `absent(...{mode!="maintain"})` operand | Alert |
-|---|---|---|---|
-| Nothing scraped at all | empty (no series) | fires (no folding series) | **fires** |
-| Intentionally maintain-only fleet | empty (only maintain series) | fires (no folding series) | **fires** (opt out) |
-| Healthy folding fleet | gauge fresh, `time() - gauge` under threshold | silent (folding series exist) | silent |
-| Folding fleet scraped but fold stopped | gauge stale, over threshold | silent (folding series exist) | **fires** |
-| Folding fleet died, co-scraped maintain survives | empty (folding series gone) | fires (no folding series) | **fires** |
+The last row is the one that would be a false page if the gauge tracked
+published snapshots rather than fold cycles. Every loop folds every discovered
+tenant for its own signal every tick; a fold over a signal a tenant never
+writes is a healthy no-op cycle and stamps the gauge like any other. A fleet
+ingesting only logs still has all three gauges fresh.
 
-Rows 1, 2 and 5 all fire through the `absent()` operand and are
-indistinguishable from this family alone. Row 2 is the deliberate false page
-the opt-out exists for; row 5 is the co-scraped-death outage an unfiltered
-`absent()` left silent, and closing it is what the filter on the `absent()`
-argument buys. Row 4 fires through the staleness operand while the folding
-series are still scraped but stale. Only the healthy fleet, row 3, stays
-silent.
+Do any two rows produce identical telemetry while meaning different things?
+Yes, two pairs, and both are deliberate:
+
+- "Only `maintain` nodes scraped, intentionally" and "folding fleet dead,
+  co-scraped `maintain` alive" are byte-for-byte identical at the scrape: three
+  `mode="maintain"` series at `0` and nothing else. No arrangement of these
+  operands can tell an intended topology from a fleet-wide death, because the
+  dead processes' series are simply gone and absence carries no intent.
+- "`--disable-fold` everywhere" and "every fold loop crashed before its first
+  success" are likewise identical: every gauge at its `0` sentinel under a full
+  set of non-`maintain` series.
+
+Both pairs resolve the same way, and the rule fires loud on all four. A fleet
+that never folds -- maintain-only, or `--disable-fold` everywhere -- must opt
+out by dropping `RavelCatalogFoldStalled` or inhibiting it (the group comment
+on the rule marks this). `--disable-fold` is documented elsewhere as a pure
+query-cost optimization, so an operator who sets it deliberately should expect
+this rule to page about ten minutes after start and should silence it as part
+of setting the flag, not treat the page as a false positive: the unsealed span
+really does grow without a fold to seal it, and that is what the rule reports.
+Firing on a real outage and forcing one deliberate silencing on a fleet that
+never folds is safer than staying silent on the outage to spare that fleet the
+page: an alert that is silent in the case it exists for manufactures
+confidence.
 
 The threshold is the unsealed span the catalog configuration implies, in
 seconds:
@@ -397,10 +433,18 @@ window the deployment has already accepted as un-indexed, above it every
 further second is history that should have been sealed and was not. Raise or
 lower the threshold with those three settings, not independently of them.
 
-The headroom that keeps it quiet: `fold_interval` defaults to 5 minutes and
-the loop adds up to 10% jitter, so a healthy gauge is never older than 330
-seconds. 4800 is about 14 missed ticks of margin, which no single slow cycle,
-restart, or rolling deploy reaches.
+The headroom that keeps it quiet: `fold_interval` defaults to 5 minutes and the
+loop adds up to 10% jitter, so the sleep between two cycles is at most 330
+seconds. That is the sleep ceiling, not the gauge-age ceiling. The stamp is the
+reading taken before each tenant's fold and the loop re-stamps per tenant
+within a cycle, so the widest healthy gap runs from the last tenant's stamp in
+one cycle to the first tenant's stamp in the next: 330 s, plus the
+tenant-discovery LIST that opens the cycle, plus that first tenant's fold
+duration, which on a large tenant is tens of seconds. 4800 is about 14 missed
+ticks of margin over the sleep ceiling, which no single slow cycle, restart, or
+rolling deploy reaches. Use the fuller form, not the 330, if you tighten the
+threshold on a fleet with a shorter `fold_interval`: the discovery-plus-one-fold
+term stops being noise once the sleep shrinks toward it.
 
 `for: 10m` covers process start rather than the stall itself. The gauge reads
 `0` until the first fold succeeds, which makes `time() - 0` exceed any
@@ -410,23 +454,16 @@ grace. Keeping the `0` rather than omitting the series is what lets the one
 expression cover both a fold that stopped and a fold that never worked at
 all.
 
-Two limits to know before relying on it. The gauge is process-global, not
-per-tenant or per-signal: it goes stale when the fold job stops, not when one
-tenant's fold is stuck behind a permanent fault while every other tenant
-folds normally. Tenant-labelled fold series would carry unbounded
-cardinality, so a stuck single tenant is found through
+Two limits to know before relying on it. The gauge is per signal but not per
+tenant: one signal's series goes stale when that signal's fold stops, and stays
+fresh when one tenant's fold is stuck behind a permanent fault while every
+other tenant of that signal folds normally. `signal` is a closed set of three
+values and is labelled here for exactly that reason; `tenant` is not, and
+tenant-labelled fold series would carry cardinality that grows with the tenant
+count, so a stuck single tenant is found through
 `ravel_catalog_fold_failures_total` and the fold task's per-tenant logs
 instead. And a deployment that has discovered no tenants at all folds nothing
 and so trips this rule; scope the group to deployments that serve traffic.
-
-`--disable-fold` trips this rule too, and deliberately. The flag returns no
-fold tasks, so the gauge stays at its `0` sentinel; a deployment that sets it
-on every non-maintain process leaves the gauge `0` forever, and the rule pages
-about ten minutes after start. That is arguably correct, because the unsealed
-span really does grow without a fold to seal it, but the flag is documented
-elsewhere as a pure query-cost optimization, so an operator who sets it will
-not expect a critical page. Either leave the fold running, or drop this rule
-for a fleet you have intentionally run without folding.
 
 ### Tenancy adoption (`ravel_tenancy_v1_unkeyed_adoptions_total`)
 
