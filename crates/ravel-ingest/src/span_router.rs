@@ -18,7 +18,7 @@ use ravel_otlp::traces_normalize::NormalizedSpan;
 use ravel_types::CommitToken;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
+use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
@@ -98,6 +98,11 @@ pub struct SpanIngestRouter {
     /// `services/ravel-server` installs the configured budget via
     /// [`SpanIngestRouter::with_budget`].
     budget: Arc<IngestByteBudget>,
+    /// The ceiling from `budget`, shared with every shard actor this router
+    /// spawns so the per-buffer memory backstop is a fraction of the configured
+    /// limit. Written by [`SpanIngestRouter::with_budget`], which runs after the
+    /// actors exist.
+    backstop_ceiling: BufferBudgetCeiling,
 }
 
 impl SpanIngestRouter {
@@ -112,11 +117,13 @@ impl SpanIngestRouter {
         // seeded-injection caller; routing through the seam still keeps
         // `rand::rng()` and `Uuid::new_v4()` off this production path.
         let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
+        let backstop_ceiling = BufferBudgetCeiling::unlimited();
         let factory = {
             let store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
             let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
+            let backstop_ceiling = backstop_ceiling.clone();
             move |shard_count: u32| -> Vec<SpanShardHandle> {
                 let writer_id = rng.new_uuid();
                 let epoch =
@@ -134,6 +141,7 @@ impl SpanIngestRouter {
                             config,
                             Arc::clone(&metrics),
                             rx,
+                            backstop_ceiling.clone(),
                         );
                         tokio::spawn(actor.run());
                         SpanShardHandle {
@@ -154,12 +162,17 @@ impl SpanIngestRouter {
             metrics,
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
+            backstop_ceiling,
         }
     }
 
-    /// Installs the shared process-wide ingest buffer byte budget (ADR-0069).
+    /// Installs the shared process-wide ingest buffer byte budget (ADR-0069),
+    /// and publishes its ceiling to this router's shard actors so the
+    /// per-buffer memory backstop is a fraction of the configured limit rather
+    /// than of the default one (issue #1305).
     #[must_use]
     pub fn with_budget(mut self, budget: Arc<IngestByteBudget>) -> Self {
+        self.backstop_ceiling.set(budget.limit());
         self.budget = budget;
         self
     }
