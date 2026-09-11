@@ -555,14 +555,17 @@ mod catalog_cache_tests {
     /// which `main` fills from
     /// `ResolvedPerformanceDefaults::catalog_cache_max_bytes`). The catalog
     /// cache is a SEPARATE ceiling from the fetcher cache: on the reference
-    /// profile it resolves to 5% of `MemTotal` (1,610,612,736) while the fetcher
-    /// cache `store::build_cache` bounds stays at 25% (8,053,063,680), so the
-    /// two independent LRU caches do not each claim the full share. An explicit
+    /// profile (ADR-1170 decision 3: both ceilings carve from
+    /// `memory_budget_bytes`, i.e. `MemTotal` minus the fixed overhead
+    /// reserve, not raw `MemTotal`) it resolves to 5% of the budget
+    /// (1,556,925,644) while the fetcher cache `store::build_cache` bounds
+    /// stays at 25% of the budget (7,784,628,224), so the two independent
+    /// LRU caches do not each claim the full share. An explicit
     /// `--cache-max-bytes` sets both equal.
     ///
     /// Prove-the-test: pass `resolved.cache_max_bytes` (the fetcher 25% number)
-    /// to `build_catalog` here and the first assertion reads 8,053,063,680
-    /// against the expected 1,610,612,736.
+    /// to `build_catalog` here and the first assertion reads 7,784,628,224
+    /// against the expected 1,556,925,644.
     #[test]
     fn the_derived_cache_max_bytes_reaches_the_catalog_byte_cache() {
         use clap::Parser;
@@ -574,8 +577,8 @@ mod catalog_cache_tests {
             .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
             .expect("performance defaults resolve");
         // The two caches derive to different ceilings on the same host.
-        assert_eq!(resolved.cache_max_bytes, 8_053_063_680);
-        assert_eq!(resolved.catalog_cache_max_bytes, 1_610_612_736);
+        assert_eq!(resolved.cache_max_bytes, 7_784_628_224);
+        assert_eq!(resolved.catalog_cache_max_bytes, 1_556_925_644);
 
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let catalog = build_catalog(
@@ -589,9 +592,9 @@ mod catalog_cache_tests {
         .expect("catalog builds");
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
-            1_610_612_736,
+            1_556_925_644,
             "the catalog byte cache must be bounded by the derived catalog ceiling (5% of \
-             MemTotal), not the fetcher cache's 25% and not the compiled-in 256 MiB"
+             the memory budget), not the fetcher cache's 25% and not the compiled-in 256 MiB"
         );
 
         // An explicit --cache-max-bytes couples both caches at that one value.

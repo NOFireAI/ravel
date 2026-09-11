@@ -1253,14 +1253,17 @@ pub struct Cli {
     /// catalog cache at a smaller share (they are separate LRU caches, so one
     /// number would double-commit RAM). Read at startup only; there is no live
     /// resize. Ignored when `--disable-cache` is set. Default when unset:
-    /// derived, 25% of MemTotal for the fetcher cache and 5% for the catalog
-    /// byte cache; reference host (16 cores, 30 GiB): 8,053,063,680 and
-    /// 1,610,612,736. Fallback when MemTotal is unknown: 256 MiB each.
+    /// derived, 25% of the process memory budget for the fetcher cache and 5%
+    /// for the catalog byte cache (ADR-1170 decision 3: the budget is
+    /// `MemTotal`, capped by the cgroup memory limit in a container, minus a
+    /// fixed overhead reserve); reference host (16 cores, 30 GiB):
+    /// 7,784,628,224 and 1,556,925,644. Fallback when memory is unknown:
+    /// 256 MiB each.
     ///
     /// Omitted, the value is DERIVED from the host
-    /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
-    /// the fetcher cache takes [`CACHE_MEMORY_PERCENT`] of `MemTotal` (capped
-    /// by the cgroup memory limit in a container) and the catalog byte cache
+    /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141
+    /// and ADR-1170): the fetcher cache takes [`CACHE_MEMORY_PERCENT`] of
+    /// `memory_budget_bytes` and the catalog byte cache
     /// [`CATALOG_CACHE_MEMORY_PERCENT`], or [`DEFAULT_CACHE_MAX_BYTES`]
     /// (256 MiB) each when memory cannot be read.
     #[arg(long, value_name = "BYTES")]
@@ -2209,6 +2212,85 @@ pub const PERF_SOURCE_FALLBACK: &str = "fallback";
 /// was set, but the legacy `--fetch-concurrency` was, and its value is used
 /// verbatim (ADR-1195 legacy precedence).
 pub const PERF_SOURCE_LEGACY_FLAG: &str = "legacy-flag";
+/// [`ResolvedPerformanceDefaults`] source: a compiled-in constant that is
+/// never derived from the host or an operator flag (the overhead reserve).
+pub const PERF_SOURCE_FIXED: &str = "fixed";
+
+/// Fixed overhead reserve subtracted from cgroup-capped effective memory to
+/// derive `memory_budget_bytes` (ADR-1170 decision 3: "A static carve under
+/// one number").
+///
+/// ADR-1170's calibration methodology measures this as the peak gap between
+/// resident bytes and the `ravel-memory` accountant's uniquely-tracked total
+/// across a 10-connection window, plus a 25% margin, rounded up to the next
+/// 256 MiB (ADR-1170 "Calibration"). That accountant is ADR-1170 decisions
+/// 1/2, out of scope for this change (`services/ravel-server` and
+/// `HostProfile` alone), so no calibration run can produce the real figure
+/// yet. This is therefore a documented PLACEHOLDER, not a measured value: 1
+/// GiB. Replace it with the calibrated constant once decisions 1/2/4 land
+/// and the calibration run in the ADR has executed.
+pub const OVERHEAD_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// `memory_budget_bytes` when the host's effective memory cannot be read, so
+/// the two cache ceilings still have a fallback total to derive their own
+/// flat fallbacks from without pretending to know a real host size (the
+/// caches themselves keep their existing [`DEFAULT_CACHE_MAX_BYTES`]
+/// fallback, unaffected by this constant; this is the figure the startup log
+/// reports as the process's memory budget in that case).
+pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Typed refusal from [`resolve_performance_defaults`] when the host's
+/// derived memory budget cannot satisfy ADR-1170 decision 3's own accounting
+/// invariants. Both variants are refusals, not silently-adjusted defaults: a
+/// process that cannot fit its own accounting under its own numbers must not
+/// start up with a wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryBudgetError {
+    /// The overhead reserve ([`OVERHEAD_RESERVE_BYTES`]) is at or above the
+    /// host's cgroup-capped effective memory: subtracting it would underflow,
+    /// so there is no room left to derive a budget at all.
+    OverheadReserveExceedsEffectiveMemory {
+        effective_memory_bytes: u64,
+        overhead_reserve_bytes: u64,
+    },
+    /// The two hard cache ceilings (an explicit `--cache-max-bytes`, or the
+    /// shares derived from `memory_budget_bytes`) sum to more than
+    /// `memory_budget_bytes` itself: ADR-1170 decision 3's invariant that the
+    /// hard caps plus the shared remainder equal the budget would otherwise
+    /// require a negative remainder.
+    CacheCeilingsExceedMemoryBudget {
+        memory_budget_bytes: u64,
+        cache_max_bytes: u64,
+        catalog_cache_max_bytes: u64,
+    },
+}
+
+impl std::fmt::Display for MemoryBudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemoryBudgetError::OverheadReserveExceedsEffectiveMemory {
+                effective_memory_bytes,
+                overhead_reserve_bytes,
+            } => write!(
+                f,
+                "effective memory ({effective_memory_bytes} bytes) does not exceed the \
+                 overhead reserve ({overhead_reserve_bytes} bytes); no memory budget can be \
+                 derived"
+            ),
+            MemoryBudgetError::CacheCeilingsExceedMemoryBudget {
+                memory_budget_bytes,
+                cache_max_bytes,
+                catalog_cache_max_bytes,
+            } => write!(
+                f,
+                "cache_max_bytes ({cache_max_bytes}) plus catalog_cache_max_bytes \
+                 ({catalog_cache_max_bytes}) exceeds memory_budget_bytes ({memory_budget_bytes})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MemoryBudgetError {}
 
 /// The operator's explicit performance flags: `None` per field means "derive".
 ///
@@ -2261,6 +2343,19 @@ pub struct ResolvedPerformanceDefaults {
     pub promql_fetch_fanout: usize,
     /// Reaches `EngineConfig::max_segments`.
     pub max_segments: usize,
+    /// The process memory budget (ADR-1170 decision 3): cgroup-capped
+    /// effective memory minus [`OVERHEAD_RESERVE_BYTES`], or
+    /// [`DEFAULT_MEMORY_BUDGET_BYTES`] when effective memory is unknown.
+    /// [`Self::cache_max_bytes`] and [`Self::catalog_cache_max_bytes`] are
+    /// carved out of this rather than out of raw `MemTotal`; the remainder is
+    /// [`Self::memory_budget_remainder_bytes`].
+    pub memory_budget_bytes: u64,
+    /// `memory_budget_bytes` minus `cache_max_bytes` minus
+    /// `catalog_cache_max_bytes`: the share of the budget left for the rest
+    /// of the server (SQL and fetch reservations) to charge against. Equal to
+    /// the budget by construction -- `resolve_performance_defaults` refuses
+    /// rather than underflows when the hard caps alone exceed the budget.
+    pub memory_budget_remainder_bytes: u64,
     /// Reaches the query fetcher cache's byte ceiling
     /// (`store::build_cache`). NOT the catalog byte cache: that has its own
     /// [`Self::catalog_cache_max_bytes`], so the two independent LRU caches do
@@ -2306,6 +2401,7 @@ pub struct PerformanceSources {
     pub sql_partition_count: &'static str,
     pub promql_fetch_fanout: &'static str,
     pub max_segments: &'static str,
+    pub memory_budget_bytes: &'static str,
     pub cache_max_bytes: &'static str,
     pub catalog_cache_max_bytes: &'static str,
     pub sql_max_query_bytes: &'static str,
@@ -2388,11 +2484,34 @@ fn resolve_knob(
 ///
 /// Derived-vs-derived and fallback-vs-fallback never cross by construction
 /// (25% <= 50%, 256 MiB <= 1 GiB), so neither flag fires there.
+///
+/// Before any of that, one `memory_budget_bytes` is derived (ADR-1170
+/// decision 3): `host.mem_total_bytes` (already cgroup-capped by
+/// [`HostProfile::detect`]) minus [`OVERHEAD_RESERVE_BYTES`], or
+/// [`DEFAULT_MEMORY_BUDGET_BYTES`] when memory is unknown. `cache_max_bytes`
+/// and `catalog_cache_max_bytes` are then shares of THIS budget, not of raw
+/// `MemTotal`, and their sum is checked against it: an overhead reserve that
+/// exceeds effective memory, or hard cache ceilings that exceed the budget,
+/// is refused with a typed [`MemoryBudgetError`] rather than panicking or
+/// silently underflowing.
 pub fn resolve_performance_defaults(
     host: HostProfile,
     flags: PerformanceFlags,
-) -> ResolvedPerformanceDefaults {
+) -> Result<ResolvedPerformanceDefaults, MemoryBudgetError> {
     let cores = host.cores.max(1);
+
+    let (memory_budget_bytes, memory_budget_source) = match host.mem_total_bytes {
+        Some(effective) => (
+            effective.checked_sub(OVERHEAD_RESERVE_BYTES).ok_or(
+                MemoryBudgetError::OverheadReserveExceedsEffectiveMemory {
+                    effective_memory_bytes: effective,
+                    overhead_reserve_bytes: OVERHEAD_RESERVE_BYTES,
+                },
+            )?,
+            PERF_SOURCE_DERIVED,
+        ),
+        None => (DEFAULT_MEMORY_BUDGET_BYTES, PERF_SOURCE_FALLBACK),
+    };
 
     let derived_fetch_concurrency =
         (FETCH_CONCURRENCY_PER_CORE.saturating_mul(cores)).max(MIN_DERIVED_FETCH_CONCURRENCY);
@@ -2423,25 +2542,46 @@ pub fn resolve_performance_defaults(
         None => (DERIVED_MAX_SEGMENTS, PERF_SOURCE_DERIVED),
     };
 
+    // Carved from `memory_budget_bytes` (ADR-1170 decision 3), not raw
+    // `MemTotal`: the budget already has the overhead reserve taken out, so
+    // the two hard caps below cannot themselves claim bytes the process
+    // reserved for its own non-cache footprint.
     let (cache_max_bytes, cache_source) = match (flags.cache_max_bytes, host.mem_total_bytes) {
         (Some(n), _) => (n, PERF_SOURCE_FLAG),
-        (None, Some(total)) => (percent_of(total, CACHE_MEMORY_PERCENT), PERF_SOURCE_DERIVED),
+        (None, Some(_)) => (
+            percent_of(memory_budget_bytes, CACHE_MEMORY_PERCENT),
+            PERF_SOURCE_DERIVED,
+        ),
         (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
     };
 
     // The catalog byte cache is a SEPARATE LRU from the fetcher cache, so an
     // unset flag derives it at its own smaller share rather than committing a
-    // second 25% of RAM. An explicit `--cache-max-bytes` bounds both at that
-    // one value (the pre-#1141 coupling).
+    // second 25% of the budget. An explicit `--cache-max-bytes` bounds both at
+    // that one value (the pre-#1141 coupling).
     let (catalog_cache_max_bytes, catalog_cache_source) =
         match (flags.cache_max_bytes, host.mem_total_bytes) {
             (Some(n), _) => (n, PERF_SOURCE_FLAG),
-            (None, Some(total)) => (
-                percent_of(total, CATALOG_CACHE_MEMORY_PERCENT),
+            (None, Some(_)) => (
+                percent_of(memory_budget_bytes, CATALOG_CACHE_MEMORY_PERCENT),
                 PERF_SOURCE_DERIVED,
             ),
             (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
         };
+
+    // The shared remainder is what the rest of the server (SQL and fetch
+    // reservations) charges against; ADR-1170 decision 3 requires the hard
+    // caps plus this remainder to equal the budget by construction, so a
+    // combination (typically an explicit `--cache-max-bytes` on a small host)
+    // that leaves no room is refused rather than wrapped or underflowed.
+    let memory_budget_remainder_bytes = cache_max_bytes
+        .checked_add(catalog_cache_max_bytes)
+        .and_then(|hard_caps| memory_budget_bytes.checked_sub(hard_caps))
+        .ok_or(MemoryBudgetError::CacheCeilingsExceedMemoryBudget {
+            memory_budget_bytes,
+            cache_max_bytes,
+            catalog_cache_max_bytes,
+        })?;
 
     let (sql_tenant_max_bytes, tenant_source) =
         match (flags.sql_tenant_max_bytes, host.mem_total_bytes) {
@@ -2487,12 +2627,14 @@ pub fn resolve_performance_defaults(
         None => (DERIVED_QUERY_DEADLINE, PERF_SOURCE_DERIVED),
     };
 
-    ResolvedPerformanceDefaults {
+    Ok(ResolvedPerformanceDefaults {
         fetch_concurrency,
         store_get_concurrency,
         sql_partition_count,
         promql_fetch_fanout,
         max_segments,
+        memory_budget_bytes,
+        memory_budget_remainder_bytes,
         cache_max_bytes,
         catalog_cache_max_bytes,
         sql_max_query_bytes,
@@ -2504,6 +2646,7 @@ pub fn resolve_performance_defaults(
             sql_partition_count: sql_partition_count_source,
             promql_fetch_fanout: promql_fetch_fanout_source,
             max_segments: segments_source,
+            memory_budget_bytes: memory_budget_source,
             cache_max_bytes: cache_source,
             catalog_cache_max_bytes: catalog_cache_source,
             sql_max_query_bytes: query_bytes_source,
@@ -2512,7 +2655,7 @@ pub fn resolve_performance_defaults(
         },
         sql_max_query_bytes_clamped,
         sql_tenant_max_bytes_raised,
-    }
+    })
 }
 
 impl ResolvedPerformanceDefaults {
@@ -2561,6 +2704,23 @@ impl ResolvedPerformanceDefaults {
             source = self.sources.max_segments,
             "performance default resolved"
         );
+        // ADR-1170 decision 3/4: the process memory budget the two hard cache
+        // ceilings below are carved out of, the fixed reserve subtracted to
+        // derive it, and the shared remainder the rest of the server charges
+        // against, each named exactly once so an operator can check the carve
+        // sums to the budget without reading the source.
+        tracing::info!(
+            setting = "memory_budget_bytes",
+            value = self.memory_budget_bytes,
+            source = self.sources.memory_budget_bytes,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "memory_budget_overhead_reserve_bytes",
+            value = OVERHEAD_RESERVE_BYTES,
+            source = PERF_SOURCE_FIXED,
+            "performance default resolved"
+        );
         tracing::info!(
             setting = "cache_max_bytes",
             value = self.cache_max_bytes,
@@ -2571,6 +2731,12 @@ impl ResolvedPerformanceDefaults {
             setting = "catalog_cache_max_bytes",
             value = self.catalog_cache_max_bytes,
             source = self.sources.catalog_cache_max_bytes,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "memory_budget_remainder_bytes",
+            value = self.memory_budget_remainder_bytes,
+            source = self.sources.memory_budget_bytes,
             "performance default resolved"
         );
         // The only line that carries `clamped`: when it is true the value is
@@ -4297,7 +4463,7 @@ impl Cli {
         Ok(resolve_performance_defaults(
             host,
             self.performance_flags()?,
-        ))
+        )?)
     }
 
     /// Resolve the four `--gc-*` duration flags into the concrete values the
@@ -5257,6 +5423,18 @@ mod tests {
     use ravel_catalog::DeclaredTypedColumn;
     use ravel_ingest::{CountLimit, RateLimit};
 
+    /// Unwrap [`resolve_performance_defaults`] for every test host below that
+    /// is not itself exercising [`MemoryBudgetError`]: none of them are sized
+    /// to trip the overhead reserve or the cache-ceilings refusal, so a
+    /// `Result` there is a test bug, not a case to handle.
+    fn resolved_defaults(
+        host: HostProfile,
+        flags: PerformanceFlags,
+    ) -> ResolvedPerformanceDefaults {
+        resolve_performance_defaults(host, flags)
+            .expect("test host fits its own derived memory budget")
+    }
+
     /// Issue #1297: the two ingest memory flags must not document a memory
     /// bound they do not deliver. A flag doc that mentions bounding memory has
     /// to name the transient inflate/decompression term, so it cannot claim a
@@ -5961,7 +6139,7 @@ mod tests {
     /// `derived`.
     #[test]
     fn reference_host_resolves_the_three_unbundled_knobs() {
-        let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        let resolved = resolved_defaults(reference_host(), PerformanceFlags::default());
         assert_eq!(resolved.store_get_concurrency, 32);
         assert_eq!(resolved.sql_partition_count, 32);
         assert_eq!(resolved.promql_fetch_fanout, 32);
@@ -5974,7 +6152,7 @@ mod tests {
     /// `MIN_DERIVED_FETCH_CONCURRENCY`, exactly like `fetch_concurrency` does.
     #[test]
     fn small_host_floors_the_three_unbundled_knobs_at_the_minimum() {
-        let tiny = resolve_performance_defaults(
+        let tiny = resolved_defaults(
             HostProfile::new(1, Some(8 * 1024 * 1024 * 1024)),
             PerformanceFlags::default(),
         );
@@ -6314,19 +6492,23 @@ mod tests {
     /// produced "about 24 GiB" would be a different rule.
     ///
     /// Prove-the-test: flip `CACHE_MEMORY_PERCENT` from 25 to 20 and the cache
-    /// assertion reads 6,442,450,944 against the expected 8,053,063,680; flip
+    /// assertion reads 6,227,702,579 against the expected 7,784,628,224; flip
     /// `FETCH_CONCURRENCY_PER_CORE` from 2 to 1 and the concurrency assertion
     /// reads 16 against the expected 32.
     #[test]
     fn reference_host_resolves_the_clickbench_settings() {
-        let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        let resolved = resolved_defaults(reference_host(), PerformanceFlags::default());
 
         assert_eq!(resolved.fetch_concurrency, 32);
-        assert_eq!(resolved.cache_max_bytes, 8_053_063_680);
-        // The catalog byte cache derives at its own 5% share, a separate
-        // ceiling from the fetcher cache's 25%, so the pair does not commit
-        // 50% of RAM.
-        assert_eq!(resolved.catalog_cache_max_bytes, 1_610_612_736);
+        // Carved from memory_budget_bytes (30 GiB minus the 1 GiB overhead
+        // reserve), not raw MemTotal: 25% of 31,138,512,896.
+        assert_eq!(resolved.cache_max_bytes, 7_784_628_224);
+        // The catalog byte cache derives at its own 5% share of the same
+        // budget, a separate ceiling from the fetcher cache's 25%, so the
+        // pair does not commit 50% of the budget.
+        assert_eq!(resolved.catalog_cache_max_bytes, 1_556_925_644);
+        // SQL ceilings are unaffected by this change: they still derive from
+        // raw MemTotal, not the carved budget.
         assert_eq!(resolved.sql_max_query_bytes, 8_053_063_680);
         assert_eq!(resolved.sql_tenant_max_bytes, 16_106_127_360);
         assert_eq!(resolved.max_segments, 1_000_000);
@@ -6356,19 +6538,23 @@ mod tests {
     /// only observable on the catalog cache's 5% here.
     ///
     /// Prove-the-test: round the percentage up (`(product + 99) / 100` in
-    /// `percent_of`) and the CATALOG assertion reads 429,496,730 against the
-    /// expected 429,496,729. The cache assertion cannot serve as the rounding
-    /// witness at this size: 8 GiB * 25% is exact, so both rules agree on
-    /// 2,147,483,648 and the mutation would pass unnoticed.
+    /// `percent_of`) and the CATALOG assertion reads 375,809,639 against the
+    /// expected 375,809,638. The cache assertion cannot serve as the rounding
+    /// witness at this size: the 7,516,192,768-byte budget * 25% is exact, so
+    /// both rules agree on 1,879,048,192 and the mutation would pass
+    /// unnoticed.
     #[test]
     fn small_host_resolves_proportional_settings() {
         let host = HostProfile::new(4, Some(8 * 1024 * 1024 * 1024));
-        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+        let resolved = resolved_defaults(host, PerformanceFlags::default());
 
         assert_eq!(resolved.fetch_concurrency, 8);
-        assert_eq!(resolved.cache_max_bytes, 2_147_483_648);
-        // Catalog cache is 5% of the same 8 GiB, truncated.
-        assert_eq!(resolved.catalog_cache_max_bytes, 429_496_729);
+        // Carved from memory_budget_bytes (8 GiB minus the 1 GiB overhead
+        // reserve = 7,516,192,768), not raw MemTotal.
+        assert_eq!(resolved.cache_max_bytes, 1_879_048_192);
+        // Catalog cache is 5% of the same budget, truncated.
+        assert_eq!(resolved.catalog_cache_max_bytes, 375_809_638);
+        // SQL ceilings are unaffected: still 25%/50% of raw MemTotal (8 GiB).
         assert_eq!(resolved.sql_max_query_bytes, 2_147_483_648);
         assert_eq!(resolved.sql_tenant_max_bytes, 4_294_967_296);
         // The two host-independent rules do not shrink with the host: a
@@ -6377,7 +6563,7 @@ mod tests {
         assert_eq!(resolved.query_deadline, Duration::from_secs(660));
 
         // A one-core host still gets the floor, never 2.
-        let tiny = resolve_performance_defaults(
+        let tiny = resolved_defaults(
             HostProfile::new(1, Some(8 * 1024 * 1024 * 1024)),
             PerformanceFlags::default(),
         );
@@ -6397,7 +6583,7 @@ mod tests {
     #[test]
     fn unknown_memory_falls_back_to_the_compiled_in_constants() {
         let host = HostProfile::new(16, None);
-        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+        let resolved = resolved_defaults(host, PerformanceFlags::default());
 
         assert_eq!(resolved.cache_max_bytes, 268_435_456);
         assert_eq!(resolved.cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
@@ -6417,12 +6603,245 @@ mod tests {
         // The two fallbacks already satisfy query <= tenant, so neither side moved.
         assert!(!resolved.sql_max_query_bytes_clamped);
         assert!(!resolved.sql_tenant_max_bytes_raised);
+        // The memory budget itself falls back too: no effective memory means
+        // no reserve can be subtracted from anything real.
+        assert_eq!(resolved.memory_budget_bytes, DEFAULT_MEMORY_BUDGET_BYTES);
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_FALLBACK);
 
         // Cores are still known, so fetch concurrency is still derived.
         assert_eq!(resolved.fetch_concurrency, 32);
         assert_eq!(resolved.sources.fetch_concurrency, PERF_SOURCE_DERIVED);
         assert_eq!(resolved.max_segments, DERIVED_MAX_SEGMENTS);
         assert_eq!(resolved.query_deadline, DERIVED_QUERY_DEADLINE);
+    }
+
+    /// ADR-1170 decision 3's static carve, pinned by value at the reference
+    /// host: `memory_budget_bytes` is `REFERENCE_MEM_BYTES` minus
+    /// `OVERHEAD_RESERVE_BYTES`, the two hard cache ceilings are shares of
+    /// THAT budget (not of `REFERENCE_MEM_BYTES`), and the remainder is what
+    /// is left once both are carved out. The sum of the two hard caps and the
+    /// remainder must equal the budget exactly -- that equality is the
+    /// invariant the ADR states, not an incidental property of the numbers.
+    ///
+    /// Prove-the-test: change `memory_budget_remainder_bytes`'s computation to
+    /// subtract only `cache_max_bytes` (dropping `catalog_cache_max_bytes`)
+    /// and the remainder assertion reads 23,353,884,672 against the expected
+    /// 21,796,959,028.
+    #[test]
+    fn memory_budget_is_derived_and_the_carve_sums_to_it_exactly() {
+        let resolved = resolved_defaults(reference_host(), PerformanceFlags::default());
+
+        assert_eq!(resolved.memory_budget_bytes, REFERENCE_MEMORY_BUDGET_BYTES);
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.cache_max_bytes, REFERENCE_CACHE_MAX_BYTES);
+        assert_eq!(resolved.catalog_cache_max_bytes, 1_556_925_644);
+        assert_eq!(resolved.memory_budget_remainder_bytes, 21_796_959_028);
+
+        assert_eq!(
+            resolved.cache_max_bytes
+                + resolved.catalog_cache_max_bytes
+                + resolved.memory_budget_remainder_bytes,
+            resolved.memory_budget_bytes,
+            "the two hard caps plus the shared remainder must equal the budget by construction"
+        );
+    }
+
+    /// The behaviour change ADR-1170 decision 3 makes: a cgroup limit BELOW
+    /// `MemTotal` must size `memory_budget_bytes` (and, through it, both cache
+    /// ceilings) from the cgroup figure, not from the larger raw `MemTotal`.
+    /// `HostProfile::mem_total_bytes` is already the cgroup-capped effective
+    /// figure by the time it reaches `resolve_performance_defaults`
+    /// ([`effective_memory_total`]), so this test constructs the host the same
+    /// way `HostProfile::detect` would on a container: `MemTotal` at the
+    /// reference host's 30 GiB, capped by an 8 GiB cgroup limit.
+    ///
+    /// Prove-the-test: derive `memory_budget_bytes` from `REFERENCE_MEM_BYTES`
+    /// (the uncapped 30 GiB) instead of `host.mem_total_bytes`, and the first
+    /// assertion reads 7,784,628,224 against the expected 1,879,048,192 -- the
+    /// reference host's cache figure instead of the capped host's.
+    #[test]
+    fn cgroup_limit_below_mem_total_derives_the_budget_from_the_cgroup_figure() {
+        let capped_effective_memory =
+            effective_memory_total(Some(REFERENCE_MEM_BYTES), Some(8 * 1024 * 1024 * 1024))
+                .expect("both inputs are Some, so the effective total is too");
+        assert_eq!(
+            capped_effective_memory,
+            8 * 1024 * 1024 * 1024,
+            "guard: the cgroup limit must be the smaller of the two for this test to mean anything"
+        );
+
+        let host = HostProfile::new(REFERENCE_CORES, Some(capped_effective_memory));
+        let resolved = resolved_defaults(host, PerformanceFlags::default());
+
+        // Derived from the 8 GiB cgroup figure, matching the small-host case
+        // exactly, NOT from the 30 GiB REFERENCE_MEM_BYTES.
+        assert_eq!(resolved.memory_budget_bytes, 7_516_192_768);
+        assert_eq!(resolved.cache_max_bytes, 1_879_048_192);
+        assert_eq!(resolved.catalog_cache_max_bytes, 375_809_638);
+
+        assert_ne!(
+            resolved.cache_max_bytes, REFERENCE_CACHE_MAX_BYTES,
+            "a cgroup-capped host must not resolve to the uncapped reference host's cache size"
+        );
+        assert_ne!(resolved.memory_budget_bytes, REFERENCE_MEMORY_BUDGET_BYTES);
+    }
+
+    /// ADR-1170 decision 3's refusal: an effective memory small enough that
+    /// the fixed overhead reserve exceeds it must not panic (a bare
+    /// `effective - OVERHEAD_RESERVE_BYTES` underflow, which wraps to a huge
+    /// number in release and panics in debug) or silently produce a `0`
+    /// budget. It is refused with a typed [`MemoryBudgetError`] naming both
+    /// figures.
+    ///
+    /// Prove-the-test: replace the `checked_sub` with a bare `-` and this
+    /// either panics (debug) or the function stops returning a `Result` at
+    /// all, failing to compile against this test's `assert_eq!` on `Err`.
+    #[test]
+    fn overhead_reserve_exceeding_effective_memory_is_refused_not_underflowed() {
+        let tiny_host = HostProfile::new(1, Some(OVERHEAD_RESERVE_BYTES - 1));
+        assert_eq!(
+            resolve_performance_defaults(tiny_host, PerformanceFlags::default()),
+            Err(MemoryBudgetError::OverheadReserveExceedsEffectiveMemory {
+                effective_memory_bytes: OVERHEAD_RESERVE_BYTES - 1,
+                overhead_reserve_bytes: OVERHEAD_RESERVE_BYTES,
+            })
+        );
+
+        // Exactly equal is NOT refused: `checked_sub` only fails on a true
+        // underflow (reserve > effective), matching the ADR's "exceeds"
+        // wording rather than "at or above". Equal effective memory and
+        // reserve leaves a valid, if degenerate, 0-byte budget.
+        let exact_host = HostProfile::new(1, Some(OVERHEAD_RESERVE_BYTES));
+        let exact = resolved_defaults(exact_host, PerformanceFlags::default());
+        assert_eq!(exact.memory_budget_bytes, 0);
+        assert_eq!(exact.cache_max_bytes, 0);
+        assert_eq!(exact.catalog_cache_max_bytes, 0);
+        assert_eq!(exact.memory_budget_remainder_bytes, 0);
+
+        // One byte of room is enough to produce a (degenerate but valid)
+        // budget: no refusal.
+        let one_byte_host = HostProfile::new(1, Some(OVERHEAD_RESERVE_BYTES + 1));
+        let resolved = resolved_defaults(one_byte_host, PerformanceFlags::default());
+        assert_eq!(resolved.memory_budget_bytes, 1);
+    }
+
+    /// ADR-1170 decision 3's other refusal: explicit `--cache-max-bytes` hard
+    /// caps that alone exceed `memory_budget_bytes` leave no room for the
+    /// shared remainder. "Startup refuses a flag combination whose hard caps
+    /// alone exceed it" (ADR-1170 decision 3) rather than letting the
+    /// remainder underflow.
+    ///
+    /// Prove-the-test: replace the remainder's `checked_sub` with a saturating
+    /// one and this test's `assert_eq!` on `Err` fails because the call
+    /// returns `Ok` with a `memory_budget_remainder_bytes` of 0 instead.
+    #[test]
+    fn cache_ceilings_exceeding_the_memory_budget_are_refused() {
+        // An explicit --cache-max-bytes larger than the whole reference-host
+        // budget: the catalog cache is bounded to the same value (the
+        // pre-#1141 coupling), so the pair alone is already 2x the budget.
+        let flags = PerformanceFlags {
+            cache_max_bytes: Some(REFERENCE_MEMORY_BUDGET_BYTES),
+            ..PerformanceFlags::default()
+        };
+        assert_eq!(
+            resolve_performance_defaults(reference_host(), flags),
+            Err(MemoryBudgetError::CacheCeilingsExceedMemoryBudget {
+                memory_budget_bytes: REFERENCE_MEMORY_BUDGET_BYTES,
+                cache_max_bytes: REFERENCE_MEMORY_BUDGET_BYTES,
+                catalog_cache_max_bytes: REFERENCE_MEMORY_BUDGET_BYTES,
+            })
+        );
+    }
+
+    /// The startup `emit` path names each resolved figure EXACTLY once: a
+    /// figure missing from the log leaves an operator unable to see what was
+    /// derived, and a figure emitted twice is just as much a bug (a copy-paste
+    /// duplicate line, or the same setting logged under two names) because a
+    /// reader cannot tell which of the two is the one actually enforced.
+    ///
+    /// Prove-the-test: duplicate the `memory_budget_bytes` `tracing::info!`
+    /// call in `emit` and the count assertion for it reads 2 against the
+    /// expected 1.
+    #[test]
+    fn emit_names_each_resolved_setting_exactly_once() {
+        use std::sync::Arc;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        #[derive(Default)]
+        struct SettingsVisitor {
+            setting: Option<String>,
+        }
+
+        impl SettingsVisitor {
+            fn record(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "setting" {
+                    self.setting = Some(format!("{value:?}").trim_matches('"').to_string());
+                }
+            }
+        }
+
+        impl Visit for SettingsVisitor {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.record(field, &value);
+            }
+
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.record(field, value);
+            }
+        }
+
+        struct SettingsCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> Layer<S> for SettingsCapture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = SettingsVisitor::default();
+                event.record(&mut visitor);
+                if let Some(setting) = visitor.setting {
+                    self.0.lock().push(setting);
+                }
+            }
+        }
+
+        let captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let capture = SettingsCapture(Arc::clone(&captured));
+        let subscriber = tracing_subscriber::registry().with(capture);
+
+        let resolved = resolved_defaults(reference_host(), PerformanceFlags::default());
+        tracing::subscriber::with_default(subscriber, || {
+            resolved.emit(reference_host());
+        });
+
+        let settings = captured.lock();
+        let expected = [
+            "fetch_concurrency",
+            "store_get_concurrency",
+            "sql_partition_count",
+            "promql_fetch_fanout",
+            "max_segments",
+            "memory_budget_bytes",
+            "memory_budget_overhead_reserve_bytes",
+            "cache_max_bytes",
+            "catalog_cache_max_bytes",
+            "memory_budget_remainder_bytes",
+            "sql_max_query_bytes",
+            "sql_tenant_max_bytes",
+            "gc_max_query_duration",
+        ];
+        for setting in expected {
+            let count = settings.iter().filter(|s| s.as_str() == setting).count();
+            assert_eq!(
+                count, 1,
+                "setting {setting:?} must be emitted exactly once, was emitted {count} times: \
+                 {settings:?}"
+            );
+        }
+        assert_eq!(
+            settings.len(),
+            expected.len(),
+            "no setting outside the expected list may be emitted: {settings:?}"
+        );
     }
 
     /// An explicit flag wins over the derived value, one field at a time: each
@@ -6434,12 +6853,12 @@ mod tests {
     /// Prove-the-test: drop the `Some(n) => (n, PERF_SOURCE_FLAG)` arm from any
     /// one match in `resolve_performance_defaults` and that field's assertion
     /// reads its derived value against the expected flag value (for
-    /// `cache_max_bytes`: 8,053,063,680 against the expected 4096).
+    /// `cache_max_bytes`: 7,784,628,224 against the expected 4096).
     #[test]
     fn an_explicit_flag_overrides_each_derived_value_independently() {
-        let derived = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        let derived = resolved_defaults(reference_host(), PerformanceFlags::default());
 
-        let with_fetch = resolve_performance_defaults(
+        let with_fetch = resolved_defaults(
             reference_host(),
             PerformanceFlags {
                 fetch_concurrency: Some(3),
@@ -6451,7 +6870,7 @@ mod tests {
         assert_eq!(with_fetch.cache_max_bytes, derived.cache_max_bytes);
         assert_eq!(with_fetch.max_segments, derived.max_segments);
 
-        let with_segments = resolve_performance_defaults(
+        let with_segments = resolved_defaults(
             reference_host(),
             PerformanceFlags {
                 max_segments: Some(1024),
@@ -6462,7 +6881,7 @@ mod tests {
         assert_eq!(with_segments.sources.max_segments, PERF_SOURCE_FLAG);
         assert_eq!(with_segments.fetch_concurrency, derived.fetch_concurrency);
 
-        let with_cache = resolve_performance_defaults(
+        let with_cache = resolved_defaults(
             reference_host(),
             PerformanceFlags {
                 cache_max_bytes: Some(4096),
@@ -6480,7 +6899,7 @@ mod tests {
             "the cache flag must not disturb the SQL pools"
         );
 
-        let with_query_pool = resolve_performance_defaults(
+        let with_query_pool = resolved_defaults(
             reference_host(),
             PerformanceFlags {
                 sql_max_query_bytes: Some(7 * 1024 * 1024),
@@ -6499,7 +6918,7 @@ mod tests {
         assert!(!with_query_pool.sql_max_query_bytes_clamped);
         assert!(!with_query_pool.sql_tenant_max_bytes_raised);
 
-        let with_tenant_pool = resolve_performance_defaults(
+        let with_tenant_pool = resolved_defaults(
             reference_host(),
             PerformanceFlags {
                 sql_tenant_max_bytes: Some(20 * 1024 * 1024 * 1024),
@@ -6519,7 +6938,7 @@ mod tests {
             "a tenant ceiling above the derived per-query pool leaves it alone"
         );
 
-        let with_deadline = resolve_performance_defaults(
+        let with_deadline = resolved_defaults(
             reference_host(),
             PerformanceFlags {
                 query_deadline: Some(Duration::from_secs(30)),
@@ -6544,7 +6963,7 @@ mod tests {
     /// assertion reads 8,053,063,680 against the expected 1,048,576.
     #[test]
     fn the_per_query_sql_pool_is_clamped_to_the_per_tenant_ceiling() {
-        let clamped = resolve_performance_defaults(
+        let clamped = resolved_defaults(
             reference_host(),
             PerformanceFlags {
                 sql_tenant_max_bytes: Some(1024 * 1024),
@@ -6565,7 +6984,7 @@ mod tests {
         assert!(clamped.sql_max_query_bytes_clamped);
 
         // Both set, crossed: the same rule applies to two explicit flags.
-        let both = resolve_performance_defaults(
+        let both = resolved_defaults(
             reference_host(),
             PerformanceFlags {
                 sql_max_query_bytes: Some(8 * 1024 * 1024),
@@ -6586,26 +7005,25 @@ mod tests {
     /// pre-#1141 coupling. Exact integers, one host shape each.
     ///
     /// Prove-the-test: change [`CATALOG_CACHE_MEMORY_PERCENT`] from 5 to 80 and
-    /// the reference assertion reads 8,053,063,680 against the expected
-    /// 1,610,612,736; drop the `(Some(n), _)` arm of the catalog match and the
-    /// explicit-flag case reads the derived 1,610,612,736 against 12,345,678.
+    /// the reference assertion reads 7,784,628,224 against the expected
+    /// 1,556,925,644; drop the `(Some(n), _)` arm of the catalog match and the
+    /// explicit-flag case reads the derived 1,556,925,644 against 12,345,678.
     #[test]
     fn the_catalog_cache_derives_at_its_own_share_and_the_flag_couples_both() {
-        // Reference profile: fetcher 25%, catalog 5% of the same total.
-        let reference = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
-        assert_eq!(reference.cache_max_bytes, 8_053_063_680);
-        assert_eq!(reference.catalog_cache_max_bytes, 1_610_612_736);
+        // Reference profile: fetcher 25%, catalog 5% of the same budget.
+        let reference = resolved_defaults(reference_host(), PerformanceFlags::default());
+        assert_eq!(reference.cache_max_bytes, 7_784_628_224);
+        assert_eq!(reference.catalog_cache_max_bytes, 1_556_925_644);
 
         // 4 cores / 8 GiB.
-        let small = resolve_performance_defaults(
+        let small = resolved_defaults(
             HostProfile::new(4, Some(8 * 1024 * 1024 * 1024)),
             PerformanceFlags::default(),
         );
-        assert_eq!(small.catalog_cache_max_bytes, 429_496_729);
+        assert_eq!(small.catalog_cache_max_bytes, 375_809_638);
 
         // Unknown memory: both fall back to the compiled-in constant.
-        let unknown =
-            resolve_performance_defaults(HostProfile::new(16, None), PerformanceFlags::default());
+        let unknown = resolved_defaults(HostProfile::new(16, None), PerformanceFlags::default());
         assert_eq!(unknown.catalog_cache_max_bytes, 268_435_456);
         assert_eq!(
             unknown.sources.catalog_cache_max_bytes,
@@ -6613,7 +7031,7 @@ mod tests {
         );
 
         // Explicit flag: both caches take the flag value verbatim.
-        let flagged = resolve_performance_defaults(
+        let flagged = resolved_defaults(
             reference_host(),
             PerformanceFlags {
                 cache_max_bytes: Some(12_345_678),
@@ -6638,7 +7056,7 @@ mod tests {
     fn an_explicit_query_pool_raises_a_non_explicit_tenant_ceiling() {
         // Flag per-query 8 GiB against the FALLBACK tenant ceiling (memory
         // unknown, so tenant is the 1 GiB compiled-in default).
-        let raised_over_fallback = resolve_performance_defaults(
+        let raised_over_fallback = resolved_defaults(
             HostProfile::new(16, None),
             PerformanceFlags {
                 sql_max_query_bytes: Some(8 * 1024 * 1024 * 1024),
@@ -6661,7 +7079,7 @@ mod tests {
 
         // Flag per-query 20 GiB against the DERIVED tenant ceiling on the
         // reference host (16 GiB): the derived ceiling is raised to 20 GiB.
-        let raised_over_derived = resolve_performance_defaults(
+        let raised_over_derived = resolved_defaults(
             reference_host(),
             PerformanceFlags {
                 sql_max_query_bytes: Some(20 * 1024 * 1024 * 1024),
@@ -6692,7 +7110,7 @@ mod tests {
     fn an_explicit_tenant_ceiling_clamps_an_explicit_query_pool() {
         // Both explicit, crossed: the tenant ceiling wins and the per-query
         // pool is clamped to it.
-        let clamped = resolve_performance_defaults(
+        let clamped = resolved_defaults(
             reference_host(),
             PerformanceFlags {
                 sql_max_query_bytes: Some(8 * 1024 * 1024 * 1024),
@@ -6711,7 +7129,7 @@ mod tests {
 
         // Derived vs derived on the reference host: 25% <= 50% by construction,
         // so no crossing and neither flag fires.
-        let derived = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        let derived = resolved_defaults(reference_host(), PerformanceFlags::default());
         assert_eq!(derived.sql_max_query_bytes, 8_053_063_680);
         assert_eq!(derived.sql_tenant_max_bytes, 16_106_127_360);
         assert!(!derived.sql_max_query_bytes_clamped);
@@ -6819,7 +7237,7 @@ mod tests {
     ///
     /// Prove-the-test: change `main`'s `cache_max_bytes: performance.cache_max_bytes`
     /// back to a raw flag read and the unset case can no longer produce
-    /// 8,053,063,680 at all.
+    /// 7,784,628,224 at all.
     #[test]
     fn cache_max_bytes_resolves_from_the_flag_or_the_host() {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
@@ -6887,9 +7305,17 @@ mod tests {
     /// literal integers rather than recomputed from the percentages, so a
     /// change to the rule has to restate the number it produces.
     const REFERENCE_FETCH_CONCURRENCY: usize = 32;
-    const REFERENCE_CACHE_MAX_BYTES: u64 = 8_053_063_680;
+    /// 25% of the reference host's memory_budget_bytes (30 GiB minus the 1
+    /// GiB overhead reserve), not of raw `REFERENCE_MEM_BYTES`: ADR-1170
+    /// decision 3 carves the fetcher cache from the budget.
+    const REFERENCE_CACHE_MAX_BYTES: u64 = 7_784_628_224;
+    /// Unaffected by ADR-1170: the SQL ceilings still derive from raw
+    /// `REFERENCE_MEM_BYTES`, not the carved budget.
     const REFERENCE_SQL_MAX_QUERY_BYTES: usize = 8_053_063_680;
     const REFERENCE_SQL_TENANT_MAX_BYTES: usize = 16_106_127_360;
+    /// The reference host's memory_budget_bytes: `REFERENCE_MEM_BYTES` minus
+    /// [`OVERHEAD_RESERVE_BYTES`].
+    const REFERENCE_MEMORY_BUDGET_BYTES: u64 = 31_138_512_896;
 
     /// The reference [`HostProfile`], injected.
     fn reference_host() -> HostProfile {
