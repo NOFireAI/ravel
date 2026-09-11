@@ -31,6 +31,16 @@ replica still acknowledges a strict write the moment its own commit PUT returns.
 The saving compounds with the other levers on the same bill (shard count,
 flush cadence), because they are different terms of the same product.
 
+Affinity narrows which *replicas* a tenant reaches, not which *shards*. Within
+a replica a tenant's series still hash across all of that replica's shards, so
+affinity does not isolate a tenant from a per-shard object-store stall: if one
+tenant's key prefix is being throttled (`503 SlowDown`, which the store applies
+per prefix) and its flush wedges a shard, co-resident tenants on that shard are
+affected on every replica in the subset, and a smaller or different subset does
+not change that. The control for cross-tenant flush isolation on a shard is
+`max_inflight_flushes` (docs/ingest.md "Shard actor"), not the subset size and
+not the shard count.
+
 There is a read-side benefit too. Fewer, larger L0 objects mean fewer open-hour
 segments for a query to open, which lowers the per-query request budget.
 

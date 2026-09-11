@@ -475,6 +475,14 @@ impl StallingStore {
         self.gate.notify_waiters();
     }
 
+    /// Number of matching `put`s seen so far, i.e. how many times the fault
+    /// site fired. Tests assert an exact value so a passing test proves the
+    /// stall was actually hit (and hit the expected number of times), not that
+    /// the store was merely constructed.
+    pub fn stall_hits(&self) -> u64 {
+        self.hits.load(Ordering::SeqCst)
+    }
+
     /// Park until the `stall_on`-th matching `put` has entered the stall, so a
     /// test can act on "the actor is now held mid-flush" as a fact rather than
     /// sleeping for a while and hoping. Mirrors
