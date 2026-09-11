@@ -37,6 +37,15 @@
 //! The reference is proved to be a reordering of the unpaged result, and
 //! nothing else, by a multiset comparison against it.
 //!
+//! That reference is built by PARSING the caller's statement and appending the
+//! tiebreak terms to its `ORDER BY` in the AST, not by concatenating text onto
+//! it. Independence from the plan is the only reason the reference is worth
+//! having, and string surgery is not independent: `", ts ASC"` appended to a
+//! statement whose text does not end where the appender assumed lands inside
+//! something else, and the reference is then wrong in the same direction as
+//! the plan it is checking. A parse that fails, or a statement whose ordering
+//! has no term list to append to, is a panic rather than a fallback spelling.
+//!
 //! Two more properties fall out of asserting per page rather than over the
 //! concatenation: a page that returns fewer rows than the cap while rows
 //! remain is a finding (it breaks the indexing the claim rests on), and a walk
@@ -45,11 +54,17 @@
 //!
 //! # The fixture has to be able to fail
 //!
-//! [`FIXTURE`] is six rows in deliberately unsorted insertion order, each
+//! [`FIXTURE`] is seven rows in deliberately unsorted insertion order, each
 //! property present because a mutation of the planner survives without it:
 //!
 //! - two rows share `(ts, value)` under distinct `series_id`, so a keyset
 //!   predicate over the wrong pair of columns cannot walk the tie;
+//! - that tied pair is stored in DESCENDING `series_id` order, so its
+//!   insertion order is not its tiebreak order: a wrapper `ORDER BY` that
+//!   drops a term the keyset predicate still carries returns the pair the
+//!   other way round rather than the same way round by luck;
+//! - two rows share one `series_id` under distinct `ts`, so a row identity
+//!   declared as `series_id` alone is not a key over this fixture;
 //! - one `value` is `0.0`, so a projected `nullif(value, 0)` is NULL for it
 //!   and a projection that shadows a NOT NULL name with a nullable expression
 //!   loses rows;
@@ -72,6 +87,8 @@
 //! fails there rather than quietly turning the walks into a statement about
 //! nothing.
 //!
+//! # Two tables, because one table hides a whole class of mutation
+//!
 //! `samples` is registered as a plain in-memory table over
 //! `ravel_sql::public_schema()`. The planner's row-identity claim is about what
 //! the `samples` scan emits (at most one row per `(series_id, ts)`, which the
@@ -79,6 +96,28 @@
 //! resolution, wildcard expansion, positional column aliases, keyset
 //! comparison, NULL semantics -- is DataFusion's, which a `MemTable` exercises
 //! exactly as the real provider would.
+//!
+//! `logs` is registered beside it, over `ravel_sql::logs_schema()`, and its
+//! fixture carries the duplicate row that makes `logs` have no row identity in
+//! the first place: ingest is at-least-once, so the same record can arrive
+//! twice and two rows can tie on every orderable column. Nothing in
+//! [`STATEMENTS`] over `logs` is walked today, because the planner reports
+//! [`ravel_sql::NotTotalOrder::NoRowIdentity`] for all four RLOG- and
+//! RSPAN-backed tables and the walk is a statement about total-order claims
+//! only. Registering it is what makes the reverse direction fail: a planner
+//! that starts claiming a total order over one of those tables walks these
+//! statements, and the duplicate row then leaves a row on no page. Without a
+//! second table the harness cannot execute such a statement at all, so that
+//! whole class of mutation passes every test here by construction.
+//!
+//! The walked set is not row-wise selects alone either. Two window statements
+//! are in it, because a window statement DOES plan with a total-order claim in
+//! production and the wrap is what makes it page correctly: the window runs
+//! inside the derived table over all the statement's rows while the keyset
+//! predicate filters outside it, so `count(*) OVER ()` reports the same total
+//! on every page rather than counting down as the walk advances. A statement
+//! whose result depends on rows a keyset filter would remove and which the
+//! planner cannot page is asserted as a refusal rather than omitted.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -88,15 +127,20 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, FixedSizeBinaryArray,
     Float64Array, Int32Array, Int64Array, MapArray, MapBuilder, RecordBatch, StringArray,
-    StringBuilder, TimestampNanosecondArray, UInt64Array,
+    StringBuilder, TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::SessionConfig;
+use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use datafusion::sql::sqlparser::ast::{
+    Expr as SqlExpr, Ident, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, Statement,
+};
 use ravel_sql::{
-    PagePlan, PagePlanError, ResumePosition, ResumeValue, SAMPLES_TABLE, plan_page, public_schema,
+    LOGS_TABLE, NotTotalOrder, PagePlan, PagePlanError, ResumePosition, ResumeValue, SAMPLES_TABLE,
+    logs_schema, plan_page, public_schema,
 };
 
 /// The `ts` the two tied rows share.
@@ -105,6 +149,22 @@ const TIED_TS: i64 = 1_000;
 /// The `value` the two tied rows share. Non-zero, so `nullif(value, 0)` is
 /// this same number rather than NULL for both.
 const TIED_VALUE: f64 = 1.0;
+
+/// The `series_id` two rows carry under distinct `ts`, so `series_id` alone is
+/// not a key over this fixture. It is also the lower half of the tied pair,
+/// which is stored second.
+const REPEATED_SERIES: [u8; 16] = [1u8; 16];
+
+/// Its hex rendering, spelled out rather than recomputed, so an assertion pins
+/// the literal text a walk returns.
+const REPEATED_SERIES_HEX: &str = "01010101010101010101010101010101";
+
+/// The upper half of the tied pair, stored FIRST, so the pair's insertion
+/// order is the reverse of its tiebreak order.
+const TIED_HIGH_SERIES: [u8; 16] = [2u8; 16];
+
+/// Its hex rendering. See [`REPEATED_SERIES_HEX`].
+const TIED_HIGH_SERIES_HEX: &str = "02020202020202020202020202020202";
 
 /// The `value` that a projected `nullif(value, 0)` turns into NULL.
 const NULLING_VALUE: f64 = 0.0;
@@ -116,6 +176,11 @@ const NEGATIVE_ZERO: f64 = -0.0;
 
 /// A `ts` distinct from [`TIED_TS`], on the row carrying [`NULLING_VALUE`].
 const LONE_TS: i64 = 2_000;
+
+/// The `ts` of the second row carrying [`REPEATED_SERIES`]. Larger than
+/// [`TIED_TS`], so under `ORDER BY series_id` the two rows of that series are
+/// adjacent and a keyset predicate over `series_id` alone skips the second.
+const REPEATED_SERIES_TS: i64 = 4_000;
 
 /// The smallest `ts` in the fixture, on the row carrying the largest
 /// `series_id`. That anti-correlation is what makes ordering on `ts` and
@@ -133,7 +198,7 @@ const ODD_TS: i64 = 1_234_567;
 const PAGE_CAP: usize = 1;
 
 /// How many pages a walk may take before it is treated as non-terminating.
-/// Six rows at a cap of one needs seven pages including the empty last one;
+/// Seven rows at a cap of one needs eight pages including the empty last one;
 /// anything near this bound is a planner that is not advancing.
 const MAX_PAGES: usize = 32;
 
@@ -146,18 +211,21 @@ struct FixtureRow {
     series_id: [u8; 16],
 }
 
-/// The six-row fixture, in insertion order, which is deliberately not the
+/// The seven-row fixture, in insertion order, which is deliberately not the
 /// order any statement below asks for.
 const FIXTURE: &[FixtureRow] = &[
+    // The tied pair, stored in DESCENDING `series_id` order: a wrapper
+    // ordering that drops `series_id` returns these two the other way round
+    // from the reference, rather than agreeing with it by luck.
     FixtureRow {
         ts: TIED_TS,
         value: TIED_VALUE,
-        series_id: [1u8; 16],
+        series_id: TIED_HIGH_SERIES,
     },
     FixtureRow {
         ts: TIED_TS,
         value: TIED_VALUE,
-        series_id: [2u8; 16],
+        series_id: REPEATED_SERIES,
     },
     FixtureRow {
         ts: LONE_TS,
@@ -180,17 +248,65 @@ const FIXTURE: &[FixtureRow] = &[
         value: NEGATIVE_ZERO,
         series_id: [5u8; 16],
     },
+    // Shares `REPEATED_SERIES` with the second row under a different `ts`, so
+    // a row identity of `series_id` alone ties here and loses a row.
+    FixtureRow {
+        ts: REPEATED_SERIES_TS,
+        value: 2.0,
+        series_id: REPEATED_SERIES,
+    },
 ];
 
 /// One row, so a walk's second page is the empty one.
 const ONE_ROW: &[FixtureRow] = &[FixtureRow {
     ts: TIED_TS,
     value: TIED_VALUE,
-    series_id: [1u8; 16],
+    series_id: REPEATED_SERIES,
 }];
 
 /// No rows, so a walk's first page is the empty one.
 const NO_ROWS: &[FixtureRow] = &[];
+
+/// One `logs` fixture row. Every other column of the public `logs` schema is
+/// constant or NULL across the fixture: what this table is here for is the
+/// absence of a row identity, not the breadth of its schema.
+#[derive(Clone, Copy)]
+struct LogRow {
+    ts: i64,
+    severity_num: u8,
+    body: &'static str,
+}
+
+/// The `ts` the duplicate `logs` rows share.
+const LOG_DUPLICATE_TS: i64 = 1_000;
+
+/// The body the duplicate `logs` rows share.
+const LOG_DUPLICATE_BODY: &str = "the record that arrived twice";
+
+/// The `logs` fixture: three rows, two of which are equal in EVERY column.
+///
+/// That duplicate is the reason `logs` has no row identity (ingest is
+/// at-least-once and nothing above the RLOG scan dedups), so it is the thing a
+/// planner that wrongly claimed one would lose: no ordering over these columns
+/// separates the pair, and a strict keyset predicate positioned at either one
+/// excludes both.
+const LOG_FIXTURE: &[LogRow] = &[
+    LogRow {
+        ts: LOG_DUPLICATE_TS,
+        severity_num: 9,
+        body: LOG_DUPLICATE_BODY,
+    },
+    LogRow {
+        ts: LOG_DUPLICATE_TS,
+        severity_num: 9,
+        body: LOG_DUPLICATE_BODY,
+    },
+    LogRow {
+        ts: 2_000,
+        severity_num: 17,
+        body: "a later record",
+    },
+];
 
 /// `rows` as a `samples` batch.
 fn samples_batch(rows: &[FixtureRow]) -> RecordBatch {
@@ -227,17 +343,77 @@ fn samples_batch(rows: &[FixtureRow]) -> RecordBatch {
     .expect("fixture batch")
 }
 
-/// A context with `rows` registered as `samples`.
+/// `rows` as a `logs` batch, over the public `logs` schema in its field order.
+fn logs_batch(rows: &[LogRow]) -> RecordBatch {
+    let ts = TimestampNanosecondArray::from(rows.iter().map(|row| row.ts).collect::<Vec<i64>>());
+    let observed_ts =
+        TimestampNanosecondArray::from(rows.iter().map(|row| row.ts).collect::<Vec<i64>>());
+    let severity_num =
+        UInt8Array::from(rows.iter().map(|row| row.severity_num).collect::<Vec<u8>>());
+    let severity_text = StringArray::from(rows.iter().map(|_| "INFO").collect::<Vec<&str>>());
+    let body = StringArray::from(rows.iter().map(|row| row.body).collect::<Vec<&str>>());
+    // Both id columns are nullable on the public schema, and an absent id is a
+    // NULL cell: the fixture carries no trace context at all.
+    let trace_id = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        rows.iter().map(|_| None::<[u8; 16]>),
+        16,
+    )
+    .expect("trace id array");
+    let span_id = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        rows.iter().map(|_| None::<[u8; 8]>),
+        8,
+    )
+    .expect("span id array");
+    let flags = UInt32Array::from(rows.iter().map(|_| 0u32).collect::<Vec<u32>>());
+
+    let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    for _ in rows {
+        maps.append(true).expect("attrs map append");
+    }
+    let attrs: MapArray = maps.finish();
+
+    RecordBatch::try_new(
+        logs_schema(),
+        vec![
+            Arc::new(ts),
+            Arc::new(observed_ts),
+            Arc::new(severity_num),
+            Arc::new(severity_text),
+            Arc::new(body),
+            Arc::new(trace_id),
+            Arc::new(span_id),
+            Arc::new(flags),
+            Arc::new(attrs),
+        ],
+    )
+    .expect("logs fixture batch")
+}
+
+/// A context with `rows` registered as `samples` and [`LOG_FIXTURE`]
+/// registered as `logs`.
+///
+/// The `logs` table does not vary with `rows`: it is the no-row-identity
+/// target, and what it contributes is the duplicate row, not a row count that
+/// tracks the `samples` fixture.
 ///
 /// One target partition, so `collect` returns the sorted rows in the order the
 /// `ORDER BY` produced them and "the first row of the result" is the row a
-/// page cap of one would keep.
+/// page cap of one would keep. Multi-partition execution is deliberately out
+/// of scope here: with more than one partition a statement with no total order
+/// has no single answer to compare a walk against, so the pinned partition is
+/// what makes "page k holds rows k of the ordering" a statement at all. A
+/// harness for the multi-partition case is separate work, not a widening of
+/// this one.
 fn context_of(rows: &[FixtureRow]) -> SessionContext {
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-    let table =
+    let samples =
         MemTable::try_new(public_schema(), vec![vec![samples_batch(rows)]]).expect("mem table");
-    ctx.register_table(SAMPLES_TABLE, Arc::new(table))
+    ctx.register_table(SAMPLES_TABLE, Arc::new(samples))
         .expect("registered samples");
+    let logs = MemTable::try_new(logs_schema(), vec![vec![logs_batch(LOG_FIXTURE)]])
+        .expect("logs mem table");
+    ctx.register_table(LOGS_TABLE, Arc::new(logs))
+        .expect("registered logs");
     ctx
 }
 
@@ -303,21 +479,59 @@ fn multiset(rows: &[Vec<String>]) -> BTreeMap<Vec<String>, usize> {
 /// `order_by`, and a reference built from that would be ascending too and
 /// agree with the walk. Handing the caller's text to DataFusion instead means
 /// the direction under test is never the planner's own reading of it.
+///
+/// The appending is done in the AST and rendered back, not spliced into the
+/// text. A reference assembled by string concatenation is independent of the
+/// plan only for statements whose text happens to end where the concatenation
+/// assumed: a term list appended after a trailing comment, inside a quoted
+/// alias, or onto an `ORDER BY` the scan for one did not find lands somewhere
+/// other than the ordering, and the resulting reference is wrong in the same
+/// direction as a plan that misread the same text. Parsing is what makes the
+/// two readings independent.
 fn reference_statement(sql: &str, plan: &PagePlan) -> String {
     if plan.tiebreak_appended.is_empty() {
         return sql.to_string();
     }
-    let appended = plan
+    let mut statements = DFParser::parse_sql(sql)
+        .unwrap_or_else(|e| panic!("the reference for {sql:?} does not parse: {e}"));
+    let Some(DFStatement::Statement(statement)) = statements.pop_front() else {
+        panic!("the reference for {sql:?} is not one plain SQL statement");
+    };
+    let Statement::Query(mut query) = *statement else {
+        panic!("the reference for {sql:?} is not a query");
+    };
+
+    let appended: Vec<OrderByExpr> = plan
         .tiebreak_appended
         .iter()
-        .map(|column| format!("\"{column}\" ASC"))
-        .collect::<Vec<String>>()
-        .join(", ");
-    if sql.to_ascii_uppercase().contains(" ORDER BY ") {
-        format!("{sql}, {appended}")
-    } else {
-        format!("{sql} ORDER BY {appended}")
+        .map(|column| OrderByExpr {
+            expr: SqlExpr::Identifier(Ident::with_quote('"', column.as_str())),
+            options: OrderByOptions {
+                asc: Some(true),
+                nulls_first: None,
+            },
+            with_fill: None,
+        })
+        .collect();
+    match query.order_by.as_mut() {
+        Some(OrderBy {
+            kind: OrderByKind::Expressions(exprs),
+            ..
+        }) => exprs.extend(appended),
+        // `ORDER BY ALL` has no term list to append to, and `plan_page` refuses
+        // it outright, so a plan that reached here carrying a tiebreak over one
+        // is a finding rather than a case to spell.
+        Some(OrderBy { kind, .. }) => {
+            panic!("the reference for {sql:?} orders by {kind:?}, which has no term list")
+        }
+        None => {
+            query.order_by = Some(OrderBy {
+                kind: OrderByKind::Expressions(appended),
+                interpolate: None,
+            });
+        }
     }
+    query.to_string()
 }
 
 /// The resume value for one order-term column of one row, or `None` when that
@@ -367,6 +581,20 @@ fn resume_value(array: &ArrayRef, index: usize) -> Option<ResumeValue> {
                 .expect("uint64 array")
                 .value(index),
         ),
+        DataType::UInt8 => ResumeValue::UInt(u64::from(
+            array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .expect("uint8 array")
+                .value(index),
+        )),
+        DataType::UInt32 => ResumeValue::UInt(u64::from(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("uint32 array")
+                .value(index),
+        )),
         DataType::Boolean => ResumeValue::Bool(
             array
                 .as_any()
@@ -540,8 +768,18 @@ fn sequence_finding(reference: &[Vec<String>], found: &Walk) -> Option<String> {
         .map(|column| format!("the walk delivered every row but stopped at a NULL {column}"))
 }
 
-/// The four statements this round exists for, plus the shapes that must keep
-/// walking so a fix cannot be a blanket refusal.
+/// The `DISTINCT ON` statement, which asks for the LAST sample of each series.
+///
+/// Its own `ORDER BY` is what chooses the surviving row of each group, so it
+/// is the one statement here whose answer changes when the wrap drops that
+/// ordering. Over [`FIXTURE`] the choice is observable on exactly one series:
+/// [`REPEATED_SERIES`] carries `ts` [`TIED_TS`] and [`REPEATED_SERIES_TS`],
+/// and this statement asks for the second.
+const DISTINCT_ON_STATEMENT: &str =
+    "SELECT DISTINCT ON (series_id) ts, series_id FROM samples ORDER BY series_id, ts DESC";
+
+/// The statements this suite walks, plus the shapes that must keep walking so
+/// a fix cannot be a blanket refusal.
 ///
 /// Each is a caller-plausible statement, not a contrived one: an alias that
 /// happens to take a row-identity column's name, a positional column-rename
@@ -567,6 +805,20 @@ const STATEMENTS: &[&str] = &[
     "SELECT ts, series_id, value FROM samples ORDER BY ts DESC, series_id",
     "SELECT ts, series_id FROM samples ORDER BY series_id",
     "SELECT * FROM samples WHERE value > 0.5 ORDER BY ts",
+    // An order term whose output name is a reserved word under a quoted alias
+    // that is not all lowercase. The rewrite quotes every name it emits, and
+    // this is what asserts that behaviourally rather than by reading the
+    // rendered text: emitted bare, `ORDER BY Select ASC` re-parses as syntax
+    // and the page does not plan at all.
+    "SELECT ts, series_id, ts AS \"Select\" FROM samples ORDER BY \"Select\", ts, series_id",
+    // Two window statements. Both plan with a total-order claim, and both are
+    // correct only because the keyset predicate sits OUTSIDE the derived
+    // table: the window sees all the statement's rows on every page. A
+    // `count(*) OVER ()` that counted down as the walk advanced, or a `rank()`
+    // that restarted at 1, is a different result per page rather than a
+    // differently ordered one.
+    "SELECT ts, series_id, count(*) OVER () AS n FROM samples ORDER BY ts, series_id",
+    "SELECT ts, series_id, rank() OVER (ORDER BY ts) AS rk FROM samples ORDER BY ts, series_id",
     // Refused now rather than walked, both for a term whose values no cursor
     // carries. `value` is a float, so it admits the NaN that
     // `ResumeValue::Float` refuses; `labels` is a `Dictionary` over a `Map`,
@@ -575,6 +827,13 @@ const STATEMENTS: &[&str] = &[
     // one reaches the cursor mint and dies there.
     "SELECT ts, series_id, value FROM samples ORDER BY value DESC, ts",
     "SELECT * FROM samples ORDER BY labels, ts, series_id",
+    // The no-row-identity target. Not walked today: the planner reports
+    // `NoRowIdentity` for `logs`, so these are outside the total-order claim.
+    // They are here for the reverse direction, which no plan assertion can
+    // make: a planner that starts claiming a total order over `logs` walks
+    // these, and `LOG_FIXTURE`'s duplicate row then appears on no page.
+    "SELECT ts, body FROM logs ORDER BY ts",
+    "SELECT ts, severity_num, body FROM logs ORDER BY ts DESC, severity_num",
 ];
 
 /// Walk every total-order statement over one fixture, returning how many were
@@ -639,7 +898,7 @@ async fn walk_findings(rows: &[FixtureRow]) -> (usize, Vec<String>) {
 #[tokio::test]
 async fn a_total_order_claim_survives_an_executed_page_walk() {
     let fixtures: [(&str, &[FixtureRow]); 3] = [
-        ("the six-row fixture", FIXTURE),
+        ("the seven-row fixture", FIXTURE),
         ("a one-row table", ONE_ROW),
         ("an empty table", NO_ROWS),
     ];
@@ -660,17 +919,21 @@ async fn a_total_order_claim_survives_an_executed_page_walk() {
         findings.len(),
         findings.join("\n  "),
     );
-    assert!(
-        walked > 0,
-        "no statement in the table claimed a total order, so the gate asserted \
-         nothing",
+    // Nine per fixture, three fixtures. Pinned exactly rather than as
+    // `walked > 0`: a change that drops a statement out of the total-order
+    // class leaves this gate passing over a smaller set, which is the way a
+    // suite of this shape goes quiet without going red.
+    assert_eq!(
+        walked, 27,
+        "the walked set changed size, so this gate is asserting about a different \
+         set of statements than the one it was sized for",
     );
 }
 
 /// A one-row table ends the walk on an empty SECOND page, and a zero-row table
 /// on an empty FIRST one.
 ///
-/// Both are page counts the six-row fixture cannot produce, and both are the
+/// Both are page counts the seven-row fixture cannot produce, and both are the
 /// boundary a resume position is never built at: the first has exactly one
 /// cursor mint and the second has none.
 #[tokio::test]
@@ -696,6 +959,56 @@ async fn a_walk_terminates_on_an_empty_page_at_both_table_boundaries() {
     assert_eq!(none.stopped_at_null, None);
 }
 
+/// A `DISTINCT ON` page delivers the rows the caller's own statement delivers.
+///
+/// The statement's `ORDER BY` chooses WHICH row of each `ON` group survives,
+/// so it is not a sort the wrap can drop and re-impose from outside: dropped,
+/// the group keeps a different row and the page is a wrong answer rather than
+/// a differently ordered one. The assertion is behavioural on purpose --
+/// nothing here reads the rendered statement -- because the defect was a
+/// delivered row, not a rendering.
+///
+/// The walk is asserted as well as the first page: with one row per `ON`
+/// group, `series_id` is unique over the result, so a strict keyset predicate
+/// over the effective ordering is sound and every page has to keep choosing
+/// the same row of the group it lands in.
+#[tokio::test]
+async fn a_distinct_on_page_delivers_the_rows_the_statement_itself_returns() {
+    let ctx = context();
+    let plan = plan_page(DISTINCT_ON_STATEMENT, None).expect("planned");
+    // `DISTINCT` does not preserve the scan's rows one-for-one, so the plan
+    // says so. The fix is to page it correctly, not to claim a total order.
+    assert_eq!(
+        plan.not_total,
+        Some(NotTotalOrder::ShapeNotIdentityPreserving { shape: "DISTINCT" }),
+    );
+
+    let direct = rows_of(&execute(&ctx, DISTINCT_ON_STATEMENT).await);
+    // The series the choice is observable on: the one carrying two rows.
+    assert_eq!(
+        direct.first().map(Vec::as_slice),
+        Some(
+            [
+                "1970-01-01T00:00:00.000004".to_string(),
+                REPEATED_SERIES_HEX.to_string(),
+            ]
+            .as_slice()
+        ),
+        "the statement itself does not return the LAST sample of the repeated \
+         series, so this statement cannot show the ordering being dropped",
+    );
+
+    let paged = rows_of(&execute(&ctx, &plan.statement).await);
+    assert_eq!(
+        paged, direct,
+        "the page statement delivered different rows than the caller's own statement",
+    );
+
+    let found = walk(&ctx, DISTINCT_ON_STATEMENT).await;
+    assert_eq!(sequence_finding(&direct, &found), None);
+    assert_eq!(found.rows(), direct, "the walked sequence");
+}
+
 /// The fixture can actually expose the defects it is here to expose.
 ///
 /// Pinned as exact counts. A fixture edit that drops one of these leaves every
@@ -706,7 +1019,7 @@ async fn the_fixture_can_expose_a_broken_keyset_predicate() {
     let ctx = context();
 
     let rows = rows_of(&execute(&ctx, "SELECT ts, value, series_id FROM samples").await);
-    assert_eq!(rows.len(), 6, "fixture row count");
+    assert_eq!(rows.len(), 7, "fixture row count");
 
     let tied = rows_of(
         &execute(
@@ -730,6 +1043,51 @@ async fn the_fixture_can_expose_a_broken_keyset_predicate() {
         tied_rows,
         vec![vec!["2".to_string()]],
         "rows sharing one (ts, value)",
+    );
+
+    // The tied pair's stored order is the reverse of its tiebreak order. A
+    // wrapper `ORDER BY` that drops `series_id` sorts on `ts` alone, which
+    // leaves these two in the order the scan produced them, and that has to be
+    // the WRONG order for the walk to see it.
+    let scan_order = rows_of(&execute(&ctx, "SELECT series_id FROM samples").await);
+    assert_eq!(
+        &scan_order[..2],
+        &[
+            vec![TIED_HIGH_SERIES_HEX.to_string()],
+            vec![REPEATED_SERIES_HEX.to_string()],
+        ],
+        "the tied pair is not stored in descending series_id order, so dropping \
+         the series_id term from the wrapper ordering returns the same sequence \
+         anyway",
+    );
+
+    // One series carries two rows, so `series_id` alone is not a key here.
+    let repeated_series = rows_of(
+        &execute(
+            &ctx,
+            "SELECT count(*) AS n FROM (SELECT series_id FROM samples GROUP BY series_id \
+             HAVING count(*) > 1)",
+        )
+        .await,
+    );
+    assert_eq!(
+        repeated_series,
+        vec![vec!["1".to_string()]],
+        "series carrying more than one row",
+    );
+    let repeated_series_rows = rows_of(
+        &execute(
+            &ctx,
+            "SELECT count(*) AS n FROM samples WHERE series_id = \
+             arrow_cast(decode('01010101010101010101010101010101', 'hex'), \
+             'FixedSizeBinary(16)')",
+        )
+        .await,
+    );
+    assert_eq!(
+        repeated_series_rows,
+        vec![vec!["2".to_string()]],
+        "rows sharing one series_id",
     );
 
     // One, not two: DataFusion compares floats by a total order, so `-0.0 = 0`
@@ -769,7 +1127,7 @@ async fn the_fixture_can_expose_a_broken_keyset_predicate() {
     );
     assert_eq!(
         distinct_identity,
-        vec![vec!["6".to_string()]],
+        vec![vec!["7".to_string()]],
         "the fixture respects the samples row identity",
     );
 
@@ -807,6 +1165,25 @@ async fn the_fixture_can_expose_a_broken_keyset_predicate() {
         by_ts, by_series,
         "the smallest ts does not carry the largest series_id, so the fixture is \
          not anti-correlated",
+    );
+
+    // The `logs` fixture's own property: two rows equal in every column, which
+    // is what no ordering over the table can separate.
+    let log_rows = rows_of(&execute(&ctx, "SELECT ts, severity_num, body FROM logs").await);
+    assert_eq!(log_rows.len(), 3, "logs fixture row count");
+    let log_duplicates = rows_of(
+        &execute(
+            &ctx,
+            "SELECT count(*) AS n FROM (SELECT ts, observed_ts, severity_num, severity_text, \
+             body, trace_id, span_id, flags FROM logs GROUP BY ts, observed_ts, severity_num, \
+             severity_text, body, trace_id, span_id, flags HAVING count(*) > 1)",
+        )
+        .await,
+    );
+    assert_eq!(
+        log_duplicates,
+        vec![vec!["1".to_string()]],
+        "groups of logs rows equal on every orderable column",
     );
 }
 
@@ -861,6 +1238,9 @@ fn the_four_defect_statements_are_classified_exactly() {
         "SELECT ts, series_id, value FROM samples ORDER BY ts DESC, series_id",
         "SELECT ts, series_id FROM samples ORDER BY series_id",
         "SELECT * FROM samples WHERE value > 0.5 ORDER BY ts",
+        "SELECT ts, series_id, ts AS \"Select\" FROM samples ORDER BY \"Select\", ts, series_id",
+        "SELECT ts, series_id, count(*) OVER () AS n FROM samples ORDER BY ts, series_id",
+        "SELECT ts, series_id, rank() OVER (ORDER BY ts) AS rk FROM samples ORDER BY ts, series_id",
     ];
     for sql in must_stay_total {
         let plan = plan_page(sql, None).unwrap_or_else(|e| panic!("{sql:?} refused: {e}"));
@@ -869,4 +1249,54 @@ fn the_four_defect_statements_are_classified_exactly() {
             "{sql:?} lost its total order, so the fix is a blanket refusal",
         );
     }
+}
+
+/// What the harness's second table is registered for: the statements over it
+/// must never be claimed as a total order, and the ones whose result depends
+/// on rows a keyset filter would remove must be refused or reported not-total
+/// rather than paged.
+///
+/// This is the direction the walk itself cannot assert. The walk skips a
+/// not-total plan by construction, so `logs` contributes nothing to it until a
+/// planner starts claiming otherwise -- at which point these statements are
+/// walked, over a fixture whose duplicate row no ordering separates.
+#[test]
+fn the_no_row_identity_target_is_never_claimed_as_a_total_order() {
+    for sql in [
+        "SELECT ts, body FROM logs ORDER BY ts",
+        "SELECT ts, severity_num, body FROM logs ORDER BY ts DESC, severity_num",
+    ] {
+        let plan = plan_page(sql, None).unwrap_or_else(|e| panic!("{sql:?} refused: {e}"));
+        assert_eq!(
+            plan.not_total,
+            Some(NotTotalOrder::NoRowIdentity { table: LOGS_TABLE }),
+            "{sql:?}",
+        );
+        assert!(plan.tiebreak_appended.is_empty(), "{sql:?}");
+    }
+
+    // A result the keyset predicate would change if it reached the scanned
+    // rows: every row of the input contributes to the one row out. There is
+    // nothing to order by, so it is refused, and a refusal is a pass.
+    assert!(
+        matches!(
+            plan_page("SELECT count(*) AS n FROM samples", None),
+            Err(PagePlanError::NoOrdering {
+                target: SAMPLES_TABLE
+            })
+        ),
+        "an aggregate over every row was not refused",
+    );
+    // The grouped form has something to order by and is reported not-total,
+    // which is the other acceptable answer: D5 pages it under the equal-group
+    // rule, never under a strict keyset predicate.
+    let grouped = plan_page(
+        "SELECT ts, count(*) AS n FROM samples GROUP BY ts ORDER BY ts",
+        None,
+    )
+    .expect("planned");
+    assert_eq!(
+        grouped.not_total,
+        Some(NotTotalOrder::ShapeNotIdentityPreserving { shape: "GROUP BY" }),
+    );
 }
