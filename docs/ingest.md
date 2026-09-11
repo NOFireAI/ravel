@@ -165,22 +165,39 @@ Single task per shard. No locks on the hot path; all state actor-local:
 - `buf: HashMap<SeriesId, SeriesBuf { labels: LabelSet, samples: Vec<Sample> }>`
 - `exemplars: Vec<IngestExemplar>` in arrival order, one per exemplar the wire
   admitted for a series routed to this shard (ADR-0047)
-- `est_bytes`: running estimate (samples * 16 + label bytes on first sight,
-  plus the `IngestExemplar` struct width and its attribute bytes per buffered
-  exemplar). "Label bytes" means what the buffer holds, not what the object
-  will hold: each label costs `size_of::<Label>()` (two `String` headers, 48
-  bytes) plus its name and value bytes. Leaving the header term out
-  understates a ten-label series by roughly 480 bytes against the 200 it
-  counts, so both flush triggers and the process-wide budget below fire late
-  on exactly the label-heavy workloads they exist to bound.
+- `est_bytes`: running estimate of what the BUFFER holds (samples * 16 + label
+  bytes on first sight, plus the `IngestExemplar` struct width and its
+  attribute bytes per buffered exemplar). "Label bytes" means what the buffer
+  holds, not what the object will hold: each label costs `size_of::<Label>()`
+  (two `String` headers, 48 bytes) plus its name and value bytes. Leaving the
+  header term out understates a ten-label series by roughly 480 bytes against
+  the 200 it counts, so the process-wide memory budget below would fire late
+  on exactly the label-heavy workloads it exists to bound.
+- `flush_est_bytes`: running estimate of what the OBJECT will hold, the figure
+  the size trigger reads. Same points, different model: label and attribute
+  text once per series, no struct headers, 16 bytes per scalar sample, and a
+  per-series and per-record fixed term for the columns a writer always
+  emits. The two estimates are not interchangeable. On a ten-label series the
+  buffered figure is roughly 750 bytes per sample against the object figure's
+  16 to 210, so a size trigger reading `est_bytes` fires at a few percent of
+  `target_bytes` and writes objects that multiply the request cost of every
+  stored terabyte. The same split applies on all three signals
+  (`est_record_bytes`/`est_record_object_bytes` for logs,
+  `est_span_bytes`/`est_span_object_bytes` for spans).
 - `oldest_ns`: ingest-arrival time of the oldest buffered point
 - `waiters: Vec<oneshot::Sender<...>>` for strict-mode acks in this flush window
 - writer identity: (writer_id uuid, epoch, next_seq) owned by the process
 
 Loop over `select!`:
 - message received: merge points, push `ack` to waiters (strict) or reply
-  immediately (buffered), flush if `est_bytes >= target_bytes` (default
-  8 MiB). Before merging, each point's series_id is checked against the
+  immediately (buffered), flush if `flush_est_bytes >= target_bytes` (default
+  8 MiB), which is an estimate of the object this flush would write, not of
+  the memory the buffer holds. A memory backstop fires the same flush when
+  `est_bytes` reaches `max(64 MiB, target_bytes)`, so a tenant whose struct
+  headers dwarf its payload still flushes before one buffer can hold an
+  unbounded amount of resident memory; the process-wide ceiling below is the
+  admission-side bound and sheds rather than flushes, so it cannot stand in
+  for this one. Before merging, each point's series_id is checked against the
   canonical label set that id already claims in the buffer; a mismatch
   (hash collision) rejects the point with a typed error and increments
   the series_id_collisions counter instead of silently merging
@@ -188,11 +205,17 @@ Loop over `select!`:
 - flush tick (interval default 200 ms): flush if `oldest_ns` older than an
   age threshold, and buffer non-empty. The threshold is `max_flush_delay`
   (default 2 s) when the buffer has a strict-mode waiter or already holds
-  at least `min_flush_bytes` (default 256 KiB); otherwise the buffer is idle
+  at least `min_flush_bytes` (default 256 KiB) of object bytes, on the same
+  `flush_est_bytes` estimate the size trigger reads; otherwise the buffer is idle
   and the threshold is `max_flush_delay_idle` (default 40 s) instead
   (ADR-0051 section 7). Strict-mode ack latency is unaffected, since a
   strict write always leaves a waiter in the buffer for its whole flush
   window; only a low-volume buffered-mode tenant's PUT cadence changes.
+  ADR-0076 decision 4 sized this tier against a buffer fill rate stated in
+  buffered-memory units, so its worked example reaches `min_flush_bytes`
+  sooner than a buffer does today: the knob is unchanged, the unit it counts
+  is not. Reasoning about how long a tenant takes to reach either threshold
+  starts from the object-bytes model above.
 - channel closed (router dropped): flush the remaining buffer before
   exiting rather than discarding it; points that still fail to flush are
   counted, never silently lost. The drain (`flush_all`, shared with
@@ -585,7 +608,12 @@ Each ingest write charges its estimated buffered bytes into the gauge in the
 router's write path, after decode/normalize/admission and before any shard
 buffer is touched (`IngestPoint::est_charge_bytes`: 16 bytes per sample plus,
 per label, the `Label` struct header and the name/value bytes, plus each
-exemplar's buffered width). The log and span routers charge the same gauge with
+exemplar's buffered width). This ceiling is charged separately from the size
+trigger, which reads the object-bytes estimate described under "Shard actor";
+the two figures answer different questions (how much memory is held, versus
+how large an object a flush would write) and neither substitutes for the
+other. The charge here stays deliberately conservative: undercharging a
+memory ceiling is the unsafe direction. The log and span routers charge the same gauge with
 `est_record_bytes`/`est_span_bytes`, and those apply the identical per-attribute
 rule: each attribute costs its pair struct header (`(String, AttrValue)` for a
 log attribute, `(String, String)` for a span attribute, the latter byte-for-byte
@@ -841,10 +869,10 @@ carries max token per shard).
 |---|---|
 | shard_count | 4 (dev), scale with cores |
 | channel depth | 256 msgs |
-| target_bytes | 8 MiB |
+| target_bytes (object bytes, not buffered memory) | 8 MiB |
 | max_flush_delay | 2 s (`--max-flush-delay`) |
 | max_flush_delay_idle | 40 s (`--max-flush-delay-idle`) |
-| min_flush_bytes | 256 KiB (`--min-flush-bytes`) |
+| min_flush_bytes (object bytes, not buffered memory) | 256 KiB (`--min-flush-bytes`) |
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |

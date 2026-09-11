@@ -8,8 +8,53 @@
 
 use std::sync::Arc;
 
-use ravel_segment::{ExemplarInput, HistogramSample};
+use ravel_segment::{ExemplarInput, HistogramCounts, HistogramSample, HistogramValue};
 use ravel_types::{Exemplar, Label, LabelSet, Sample, SeriesId};
+
+/// Bytes one buffered scalar sample contributes to the object a flush writes,
+/// before any codec runs: the `(i64, f64)` pair ADR-0092 measures as "Raw
+/// `(i64, f64)` is 16 bytes per sample".
+pub(crate) const SCALAR_SAMPLE_OBJECT_BYTES: usize = 16;
+
+/// Bytes one series contributes to the object a flush writes, on top of its
+/// samples and its label bytes: the 16-byte `SERIES_IDS` row and the series'
+/// `SERIES_META` row. ADR-0092 measures the marginal catalog cost at 11.04
+/// bytes per run after zstd, so 32 stays above what the object holds.
+pub(crate) const SERIES_OBJECT_OVERHEAD_BYTES: usize = 32;
+
+/// Bytes one admitted exemplar contributes to the object a flush writes,
+/// before its attributes: ADR-0047's "roughly 40 bytes plus attributes" (the
+/// trace id, the span id, the timestamp, and the value).
+const EXEMPLAR_OBJECT_BYTES: usize = 40;
+
+/// Fixed per-sample cost of a native histogram in the object, before its
+/// buckets: timestamp, scale, zero threshold, sum, count, and zero count.
+const HISTOGRAM_SAMPLE_FIXED_BYTES: usize = 32;
+
+/// Widest stored form of one histogram bucket count, span, or custom boundary.
+/// The writer varint-encodes counts and delta-encodes boundaries, so a flat 8
+/// per element stays above what the object holds.
+const HISTOGRAM_ELEMENT_BYTES: usize = 8;
+
+/// The object-side size of one native-histogram sample, counting each bucket
+/// count, span, and custom boundary at its widest stored width.
+fn histogram_object_bytes(value: &HistogramValue) -> usize {
+    let buckets = match &value.counts {
+        HistogramCounts::Int {
+            positive, negative, ..
+        } => positive.len() + negative.len(),
+        HistogramCounts::Float {
+            positive, negative, ..
+        } => positive.len() + negative.len(),
+    };
+    let spans = value.positive_spans.len() + value.negative_spans.len();
+    let custom = value
+        .custom_values
+        .as_ref()
+        .map(Vec::len)
+        .unwrap_or_default();
+    HISTOGRAM_SAMPLE_FIXED_BYTES + HISTOGRAM_ELEMENT_BYTES * (buckets + spans + custom)
+}
 
 /// One point's value: scalar or native histogram.
 #[derive(Debug, Clone)]
@@ -96,6 +141,27 @@ impl IngestExemplar {
         size_of::<Self>() + attrs
     }
 
+    /// Estimated bytes this exemplar contributes to the object a flush writes,
+    /// for the size trigger only (issue #1305). The memory-side figure is
+    /// [`IngestExemplar::est_bytes`] and stays what the byte budget charges:
+    /// this one drops the `Label` and `Vec` struct headers, which the buffer
+    /// holds and the object never stores, and keeps only the attribute bytes
+    /// that reach LABEL_DICT.
+    ///
+    /// An over-estimate on two counts, both in the chosen direction (see
+    /// [`IngestPoint::est_object_sample_bytes`]): the flush-scoped cap
+    /// (`FlushCtx::admit_exemplars`) drops exemplars this figure already
+    /// counted, and the stored attributes are interned and compressed.
+    pub(crate) fn est_object_bytes(&self) -> usize {
+        let attrs: usize = self
+            .exemplar
+            .filtered_attributes
+            .iter()
+            .map(|l| l.name.len() + l.value.len())
+            .sum();
+        EXEMPLAR_OBJECT_BYTES + attrs
+    }
+
     /// The writer-facing shape: the sample value comes back from its stored
     /// bit pattern (never a decimal round trip, so a NaN payload and -0.0
     /// survive), and attributes flatten to the `(name, value)` pairs the
@@ -163,6 +229,60 @@ impl IngestPoint {
             .sum();
         16 + label_bytes
     }
+
+    /// Estimated bytes this point's sample contributes to the object a flush
+    /// writes, for the size trigger only (`target_bytes` and `min_flush_bytes`,
+    /// issue #1305). Never the memory ceiling: that is
+    /// [`IngestPoint::est_charge_bytes`], which charges what the buffer holds in
+    /// RAM, and the two differ by more than an order of magnitude on a
+    /// label-heavy series. A ten-label series with short values charges about
+    /// 766 bytes per sample to the ceiling and contributes 16 here, so a size
+    /// trigger reading the ceiling figure fires at a few hundred KB of data on a
+    /// nominal 8 MiB `target_bytes` and the mean object size (which sets the
+    /// request cost per stored terabyte) collapses.
+    ///
+    /// Model: the unencoded payload the RSEG writer is handed. One `(i64, f64)`
+    /// pair per scalar sample; for a native histogram, its fixed fields plus its
+    /// bucket counts, spans, and custom boundaries at their widest stored width.
+    /// No `String`, `Vec`, or `Label` struct header appears, because none of
+    /// them reach the object; the series' label bytes and its per-series rows
+    /// are counted once per series by
+    /// [`IngestPoint::est_object_series_bytes`], not per sample.
+    ///
+    /// Direction: this is an UPPER bound on the bytes the flush writes. Every
+    /// codec in the write path moves in one direction from the unencoded
+    /// payload -- delta-plus-zigzag varint timestamps, the integer-model and
+    /// Gorilla value codecs, zstd over the catalog sections, LZ4 over the pages
+    /// -- so the object lands at or under `target_bytes`, never over. That is
+    /// the chosen failure: an object below target costs some request overhead,
+    /// while an object over target costs buffered memory the operator did not
+    /// ask for, on a compressibility ratio the client controls. The other side
+    /// is bounded by the codecs' own reach: ADR-0092's amendment measures 2.50
+    /// to 3.00 bytes per sample on representative value shapes, so the
+    /// overshoot against the 16 counted here is bounded by about 6x rather than
+    /// being open-ended, and the age triggers still bound how long a partly
+    /// filled buffer waits.
+    pub(crate) fn est_object_sample_bytes(&self) -> usize {
+        match &self.value {
+            IngestValue::Scalar(_) => SCALAR_SAMPLE_OBJECT_BYTES,
+            IngestValue::Histogram(sample) => histogram_object_bytes(&sample.value),
+        }
+    }
+
+    /// Estimated bytes this point's series contributes to the object a flush
+    /// writes, charged once per series at its first sighting in a buffer (the
+    /// object holds one label-dictionary entry and one series row per series,
+    /// however many samples that series carries). Label bytes without their
+    /// `Label` headers, for the reason
+    /// [`IngestPoint::est_object_sample_bytes`] gives.
+    pub(crate) fn est_object_series_bytes(&self) -> usize {
+        let label_bytes: usize = self
+            .labels
+            .iter()
+            .map(|l| l.name.len() + l.value.len())
+            .sum();
+        SERIES_OBJECT_OVERHEAD_BYTES + label_bytes
+    }
 }
 
 #[cfg(test)]
@@ -171,11 +291,12 @@ mod tests {
     use super::*;
     use ravel_types::Exemplar;
 
-    use crate::log_shard::est_record_bytes;
-    use crate::span_shard::est_span_bytes;
+    use crate::log_shard::{est_record_bytes, est_record_object_bytes};
+    use crate::span_shard::{est_span_bytes, est_span_object_bytes};
     use ravel_otlp::logs_normalize::NormalizedLogRecord;
     use ravel_otlp::traces_normalize::NormalizedSpan;
     use ravel_rspan::StatusCode;
+    use ravel_segment::{HistogramSpan, ResetHint};
     use ravel_types::logstream::{AttrValue, LogStreamId};
 
     fn labels_of(count: usize) -> LabelSet {
@@ -379,6 +500,95 @@ mod tests {
             "attr_value_len dropped the per-entry header inside a nested Map: \
              {nested_hdr} != {}",
             W * log_pair
+        );
+    }
+
+    /// The size trigger's estimators count payload only. Where the ceiling
+    /// charges a struct header per label, attribute, or span attribute, the
+    /// object-side figure charges the bytes that reach the object and a fixed
+    /// per-record term, on every signal. Exact figures, so widening either
+    /// model has to come here and restate them.
+    #[test]
+    fn object_estimators_count_payload_not_struct_headers() {
+        const W: usize = 8;
+        // `labels_of(8)`: names `k0..k7` (2 bytes) with value "v" (1 byte),
+        // so 24 bytes of label text and 8 * 48 bytes of `Label` headers.
+        let point = point_with(labels_of(W));
+        assert_eq!(point.est_charge_bytes(), 16 + 8 * 48 + 24);
+        assert_eq!(
+            point.est_object_series_bytes(),
+            32 + 24,
+            "series overhead plus label text, no `Label` headers"
+        );
+        assert_eq!(
+            point.est_object_sample_bytes(),
+            16,
+            "one scalar sample is a timestamp and a value"
+        );
+
+        // A ten-label series is the shape issue #1305 measured: the ceiling
+        // charges 480 bytes of headers per point that no object ever holds.
+        let wide = point_with(labels_of(10));
+        let charged = wide.est_charge_bytes() as usize;
+        let object = wide.est_object_series_bytes() + wide.est_object_sample_bytes();
+        assert_eq!(charged, 526);
+        assert_eq!(object, 78);
+
+        // Log record: 8 attributes of ("attr", Str("v")), everything else
+        // empty, so 8 * 5 payload bytes plus the fixed per-record term.
+        let record = log_record_with(W);
+        assert_eq!(est_record_object_bytes(&record), 8 * 5 + 48);
+        assert!(
+            est_record_bytes(&record) > est_record_object_bytes(&record),
+            "the ceiling stays above the object-side figure"
+        );
+
+        // Span: same 8 attributes, empty name and status message.
+        let span = span_with(W);
+        assert_eq!(est_span_object_bytes(&span), 8 * 5 + 64);
+        assert!(
+            est_span_bytes(&span) > est_span_object_bytes(&span),
+            "the ceiling stays above the object-side figure"
+        );
+    }
+
+    /// A native histogram's object cost grows with its buckets, spans, and
+    /// custom boundaries. The flat 16 bytes the ceiling charges a histogram
+    /// point would make a bucket-heavy tenant's objects arbitrarily larger
+    /// than `target_bytes` if the trigger reused it.
+    #[test]
+    fn histogram_object_bytes_counts_every_element() {
+        let mut value = HistogramValue {
+            scale: 2,
+            zero_threshold: 1e-9,
+            sum: Some(42.5),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 3,
+            }],
+            negative_spans: vec![],
+            counts: HistogramCounts::Int {
+                zero_count: 1,
+                count: 7,
+                positive: vec![2, 3, 1],
+                negative: vec![],
+            },
+            reset_hint: ResetHint::Unknown,
+        };
+        // 32 fixed, plus 8 per element over 3 bucket counts and 1 span.
+        assert_eq!(histogram_object_bytes(&value), 32 + 8 * 4);
+
+        value.counts = HistogramCounts::Int {
+            zero_count: 1,
+            count: 7,
+            positive: vec![2; 100],
+            negative: vec![1; 20],
+        };
+        assert_eq!(
+            histogram_object_bytes(&value),
+            32 + 8 * (100 + 20 + 1),
+            "a wide histogram costs more than a narrow one"
         );
     }
 
