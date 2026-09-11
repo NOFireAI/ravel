@@ -122,8 +122,10 @@ new_scenario() {
   printf '10 feature-a aaaaaaaaaaaa\n' >"${SCN_DIR}/prs.txt"
 }
 
-# A single job row: name, start, end (ISO-8601).
-job_row() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
+# A single job row: name, conclusion, start, end (ISO-8601). Matches the
+# order ci-sweep-cancelled.sh's jq filter emits from `gh run view --json
+# jobs`.
+job_row() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4"; }
 
 cleanup_dirs=()
 cleanup() { for d in "${cleanup_dirs[@]:-}"; do [[ -n "${d}" ]] && rm -rf "${d}"; done; }
@@ -134,7 +136,7 @@ trap cleanup EXIT
 new_scenario; cleanup_dirs+=("${SCN_DIR}")
 printf '100 ci\n' >"${SCN_DIR}/runs.txt"
 printf '.github/workflows/ci.yml\taaaaaaaaaaaa\n' >"${SCN_DIR}/run-100.meta"
-job_row features 2026-09-10T06:00:00Z 2026-09-10T06:29:30Z >"${SCN_DIR}/run-100.jobs"
+job_row features cancelled 2026-09-10T06:00:00Z 2026-09-10T06:29:30Z >"${SCN_DIR}/run-100.jobs"
 run_sweep -y
 check_eq "A: near-cap run is not rerun" "" "${RERUNS}"
 check_eq "A: near-cap run refusal exits 3" "3" "${RC}"
@@ -150,7 +152,7 @@ check_eq "A: output quotes the 30m cap" "1" "${a_cap}"
 new_scenario; cleanup_dirs+=("${SCN_DIR}")
 printf '200 ci\n' >"${SCN_DIR}/runs.txt"
 printf '.github/workflows/ci.yml\taaaaaaaaaaaa\n' >"${SCN_DIR}/run-200.meta"
-job_row features 2026-09-10T06:00:00Z 2026-09-10T06:12:00Z >"${SCN_DIR}/run-200.jobs"
+job_row features cancelled 2026-09-10T06:00:00Z 2026-09-10T06:12:00Z >"${SCN_DIR}/run-200.jobs"
 run_sweep -y
 check_eq "B: far-below run is rerun (exactly once)" "200" "${RERUNS}"
 check_eq "B: far-below run exits 0" "0" "${RC}"
@@ -160,7 +162,7 @@ check_eq "B: far-below run exits 0" "0" "${RC}"
 new_scenario; cleanup_dirs+=("${SCN_DIR}")
 printf '300 ci\n' >"${SCN_DIR}/runs.txt"
 printf '.github/workflows/ci.yml\taaaaaaaaaaaa\n' >"${SCN_DIR}/run-300.meta"
-job_row nocap 2026-09-10T06:00:00Z 2026-09-10T06:20:00Z >"${SCN_DIR}/run-300.jobs"
+job_row nocap cancelled 2026-09-10T06:00:00Z 2026-09-10T06:20:00Z >"${SCN_DIR}/run-300.jobs"
 run_sweep -y
 check_eq "C1: no-cap job far below the 360m default is rerun" "300" "${RERUNS}"
 check_eq "C1: no-cap far-below exits 0" "0" "${RC}"
@@ -170,7 +172,7 @@ check_eq "C1: no-cap far-below exits 0" "0" "${RC}"
 new_scenario; cleanup_dirs+=("${SCN_DIR}")
 printf '350 ci\n' >"${SCN_DIR}/runs.txt"
 printf '.github/workflows/ci.yml\taaaaaaaaaaaa\n' >"${SCN_DIR}/run-350.meta"
-job_row nocap 2026-09-10T06:00:00Z 2026-09-10T11:59:50Z >"${SCN_DIR}/run-350.jobs"
+job_row nocap cancelled 2026-09-10T06:00:00Z 2026-09-10T11:59:50Z >"${SCN_DIR}/run-350.jobs"
 run_sweep -y
 check_eq "C2: no-cap job near the 360m default is not rerun" "" "${RERUNS}"
 check_eq "C2: no-cap near-default refusal exits 3" "3" "${RC}"
@@ -181,12 +183,45 @@ check_eq "C2: output quotes the 360m default cap" "1" "${c_def}"
 new_scenario; cleanup_dirs+=("${SCN_DIR}")
 printf '400 ci\n' >"${SCN_DIR}/runs.txt"
 printf '.github/workflows/ci.yml\taaaaaaaaaaaa\n' >"${SCN_DIR}/run-400.meta"
-job_row features 2026-09-10T06:00:00Z 2026-09-10T06:12:00Z >"${SCN_DIR}/run-400.jobs"
+job_row features cancelled 2026-09-10T06:00:00Z 2026-09-10T06:12:00Z >"${SCN_DIR}/run-400.jobs"
 run_sweep ""
 check_eq "D: dry run reruns nothing" "" "${RERUNS}"
 check_eq "D: dry run exits 0" "0" "${RC}"
 grep -q "dry run" "${SCN_DIR}/out.txt" && d_dry=1 || d_dry=0
 check_eq "D: dry run says so" "1" "${d_dry}"
+
+# === Case E: a job cancelled before it ever started has the Go zero-value
+#     startedAt ("0001-01-01T00:00:00Z"), not a blank one. A second job in
+#     the same run has normal timestamps far below its cap. Neither should
+#     read as a timeout -> RERUN. Before the fix, the zero value parsed as
+#     a huge negative epoch, so the arithmetic difference against a normal
+#     completedAt came out as an enormous (but well-formed) duration,
+#     tripping the near-cap check on the first job.
+new_scenario; cleanup_dirs+=("${SCN_DIR}")
+printf '500 ci\n' >"${SCN_DIR}/runs.txt"
+printf '.github/workflows/ci.yml\taaaaaaaaaaaa\n' >"${SCN_DIR}/run-500.meta"
+{
+  job_row features cancelled 0001-01-01T00:00:00Z 2026-09-10T06:00:05Z
+  job_row quick cancelled 2026-09-10T06:00:00Z 2026-09-10T06:05:00Z
+} >"${SCN_DIR}/run-500.jobs"
+run_sweep -y
+check_eq "E: zero-value startedAt run is rerun (exactly once)" "500" "${RERUNS}"
+check_eq "E: zero-value startedAt run exits 0" "0" "${RC}"
+
+# === Case F: a job that finished successfully within the near-cap margin
+#     must not refuse the run; only a job that could actually have timed
+#     out (not concluded success/skipped) counts. A second, cancelled job
+#     in the same run sits far below its own cap. -> RERUN.
+new_scenario; cleanup_dirs+=("${SCN_DIR}")
+printf '600 ci\n' >"${SCN_DIR}/runs.txt"
+printf '.github/workflows/ci.yml\taaaaaaaaaaaa\n' >"${SCN_DIR}/run-600.meta"
+{
+  job_row features success 2026-09-10T06:00:00Z 2026-09-10T06:29:50Z
+  job_row quick cancelled 2026-09-10T06:00:00Z 2026-09-10T06:05:00Z
+} >"${SCN_DIR}/run-600.jobs"
+run_sweep -y
+check_eq "F: near-cap successful job run is rerun (exactly once)" "600" "${RERUNS}"
+check_eq "F: near-cap successful job run exits 0" "0" "${RC}"
 
 echo
 echo "passed: ${pass}  failed: ${fail}"

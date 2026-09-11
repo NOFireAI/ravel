@@ -70,13 +70,22 @@ parse_job_timeouts() {
   ' "${yaml}"
 }
 
-# Seconds between two ISO-8601 timestamps, or empty if either is blank.
+# Seconds between two ISO-8601 timestamps, or empty if either is blank,
+# unparseable, or the Go zero value. `gh run view --json jobs` decodes a
+# job's timestamps into Go `time.Time`; a job cancelled before it started
+# has a null `startedAt`, which Go's JSON encoding renders as the zero
+# value "0001-01-01T00:00:00Z" rather than an empty string. `date` parses
+# that value fine, as a huge negative epoch, so it must be rejected by
+# value, not by parse failure: a real parse failure (caught below) leaves
+# `s`/`e` empty, but this sentinel does not.
 duration_seconds() {
   local started="$1" completed="$2"
   [[ -z "${started}" || -z "${completed}" ]] && return 0
+  [[ "${started}" == "0001-01-01T00:00:00Z" ||
+    "${completed}" == "0001-01-01T00:00:00Z" ]] && return 0
   local s e
-  s=$(date -d "${started}" +%s)
-  e=$(date -d "${completed}" +%s)
+  s=$(date -d "${started}" +%s 2>/dev/null) || return 0
+  e=$(date -d "${completed}" +%s 2>/dev/null) || return 0
   echo $((e - s))
 }
 
@@ -113,6 +122,9 @@ while IFS= read -r row; do
       --jq '"\(.path)\t\(.head_sha)"' 2>/dev/null || true)
     wf_path="${meta%%$'\t'*}"
     wf_sha="${meta##*$'\t'}"
+    if [[ -z "${wf_path}" || -z "${wf_sha}" ]]; then
+      echo "PR #${pr_num}: run ${run_id}: could not read run metadata; timeout check skipped, every job takes the ${GITHUB_DEFAULT_TIMEOUT_MINUTES}m default" >&2
+    fi
 
     caps_file=""
     if [[ -n "${wf_path}" && -n "${wf_sha}" ]]; then
@@ -121,9 +133,16 @@ while IFS= read -r row; do
       if [[ -n "${wf_yaml}" ]]; then
         caps_file=$(mktemp)
         printf '%s\n' "${wf_yaml}" >"${caps_file}"
+      else
+        echo "PR #${pr_num}: run ${run_id}: could not read ${wf_path}@${wf_sha:0:12}; timeout check skipped, every job takes the ${GITHUB_DEFAULT_TIMEOUT_MINUTES}m default" >&2
       fi
     fi
 
+    # Keyed on the workflow job key (the YAML key under `jobs:`), not on
+    # `.name` below, which is the job's display name. The two differ only
+    # when a job sets its own `name:`; no job in ci.yml does today, so a
+    # lookup miss here is latent, but a future job that sets one would
+    # fall through silently to the default cap.
     declare -A cap_map=()
     if [[ -n "${caps_file}" ]]; then
       while IFS=$'\t' read -r jk cap; do
@@ -134,16 +153,26 @@ while IFS= read -r row; do
     fi
 
     # Inspect each job's duration against its cap. A job within the margin
-    # of its cap marks the whole run as a timeout.
+    # of its cap marks the whole run as a timeout. Only a job that actually
+    # ran to its own conclusion can have timed out; a job that finished
+    # successfully (or was skipped outright) is excluded regardless of how
+    # close its duration sits to the cap.
     timed_out_report=""
     jobs=$(gh run view "${run_id}" --json jobs \
-      --jq '.jobs[] | "\(.name)\t\(.startedAt)\t\(.completedAt)"' \
+      --jq '.jobs[] | "\(.name)\t\(.conclusion)\t\(.startedAt)\t\(.completedAt)"' \
       2>/dev/null || true)
+    if [[ -z "${jobs}" ]]; then
+      echo "PR #${pr_num}: run ${run_id}: could not read job list; timeout check skipped" >&2
+    fi
     if [[ -n "${jobs}" ]]; then
-      while IFS=$'\t' read -r job_name started completed; do
+      while IFS=$'\t' read -r job_name job_conclusion started completed; do
         [[ -z "${job_name}" ]] && continue
+        case "${job_conclusion}" in
+        success | skipped) continue ;;
+        esac
         dur=$(duration_seconds "${started}" "${completed}")
         [[ -z "${dur}" ]] && continue
+        ((dur <= 0)) && continue
 
         cap_min="${cap_map[${job_name}]:-}"
         if [[ -z "${cap_min}" ]]; then
