@@ -1221,6 +1221,7 @@ fn remote_write_state(
     provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
     ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
     metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
+    ingest_buffer_budget: &Arc<ravel_ingest::IngestByteBudget>,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
         tenant_resolver,
@@ -1234,6 +1235,7 @@ fn remote_write_state(
         ingest_concurrency: ingest_concurrency.clone(),
         clock: Arc::new(SystemClock),
         metadata_sink: metadata_sink.clone(),
+        budget: ingest_buffer_budget.clone(),
     })
 }
 
@@ -1632,6 +1634,7 @@ pub async fn start(
             &provisioning_writer,
             &ingest_concurrency,
             &metadata_sink,
+            &ingest_buffer_budget,
         );
         http_router = http_router.merge(remote_write::router(rw_state));
 
@@ -1659,6 +1662,7 @@ pub async fn start(
                 &provisioning_writer,
                 &ingest_concurrency,
                 &metadata_sink,
+                &ingest_buffer_budget,
             );
             mtls_router = mtls_router
                 .merge(otlp_http::router(mtls_state))

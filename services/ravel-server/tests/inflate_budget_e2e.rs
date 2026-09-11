@@ -41,6 +41,9 @@ use prost::Message;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{FaultStore, GateHandle, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
+use ravel_remote_write::proto::write_v2::{
+    Request as ProtoRequestV2, Sample as ProtoSampleV2, TimeSeries as ProtoTimeSeriesV2,
+};
 use ravel_server::IngestByteBudgetLimit;
 use ravel_server::ingest_concurrency::IngestConcurrencyLimit;
 use ravel_server::{FoldTaskConfig, LimitsConfig, Mode, ServerConfig};
@@ -82,6 +85,72 @@ fn compressible_request(points: usize) -> ExportMetricsServiceRequest {
             ..Default::default()
         }],
     }
+}
+
+/// A Remote Write 2.0 request of `points` samples on a single series, snappy
+/// compressed, plus the exact length it inflates to. Samples one millisecond
+/// apart on one series compress well, so the inflated length is many times the
+/// compressed length: that gap is what makes the budget's job (and any charge
+/// of the wrong quantity) visible. Issue #1419.
+///
+/// `pad_bytes` adds that many bytes of unreferenced symbol table, so the
+/// inflated body can be made large relative to the normalized batch it decodes
+/// to. Remote Write's router charge is dominated by the point count (roughly
+/// 142 bytes per point), so an unpadded body's inflate is a small fraction of
+/// its batch charge; a test that needs the inflate charge to be the only thing
+/// that can shed a request sizes the two terms with this.
+fn rw2_snappy_body_padded(points: usize, pad_bytes: usize) -> (Vec<u8>, u64) {
+    let ts_ms = now_ns() / 1_000_000;
+    let mut symbols = vec![
+        String::new(),
+        "__name__".to_string(),
+        "requests_total".to_string(),
+        "job".to_string(),
+        "bench".to_string(),
+    ];
+    if pad_bytes > 0 {
+        symbols.push("a".repeat(pad_bytes));
+    }
+    let request = ProtoRequestV2 {
+        symbols,
+        timeseries: vec![ProtoTimeSeriesV2 {
+            labels_refs: vec![1, 2, 3, 4],
+            samples: (0..points)
+                .map(|i| ProtoSampleV2 {
+                    value: 1.0,
+                    timestamp: ts_ms - i as i64,
+                    start_timestamp: 0,
+                })
+                .collect(),
+            histograms: vec![],
+            exemplars: vec![],
+            metadata: None,
+        }],
+    };
+    let plain = request.encode_to_vec();
+    (snappy(&plain), plain.len() as u64)
+}
+
+/// Snappy block-format compression, the only encoding Remote Write accepts.
+fn snappy(data: &[u8]) -> Vec<u8> {
+    snap::raw::Encoder::new()
+        .compress_vec(data)
+        .expect("snappy compress")
+}
+
+fn post_remote_write(
+    client: &reqwest::Client,
+    base: &str,
+    body: Vec<u8>,
+) -> reqwest::RequestBuilder {
+    client
+        .post(format!("{base}/api/v1/write"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header(
+            "content-type",
+            "application/x-protobuf;proto=io.prometheus.write.v2.Request",
+        )
+        .body(body)
 }
 
 /// One-member gzip of `data`.
@@ -608,6 +677,361 @@ async fn second_concurrent_inflate_sheds_when_the_sum_would_cross_the_ceiling() 
         alone_task.await.expect("task joins").status(),
         200,
         "the second body fits on its own, so it only shed because of the concurrent sum"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// The router buffered charge a normalized Remote Write batch of `points`
+/// samples holds, measured the same way [`measured_router_charge`] measures the
+/// OTLP one: park one request on a held flush with a generous budget and read
+/// the gauge. Remote Write has no identity encoding (snappy is mandatory), so
+/// the request does take an inflate charge, but that charge is released before
+/// the router takes its own, which is exactly what the reading here shows and
+/// what `remote_write_inflate_charge_is_released_before_the_router_charge`
+/// pins independently.
+async fn measured_remote_write_router_charge(points: usize, pad_bytes: usize) -> u64 {
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
+    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+    let running = start_test_server(store, IngestByteBudgetLimit::Bounded(256 * 1024 * 1024)).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
+    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
+    let (body, _) = rw2_snappy_body_padded(points, pad_bytes);
+    let task = {
+        let client = client.clone();
+        let base = base.clone();
+        tokio::spawn(async move {
+            post_remote_write(&client, &base, body)
+                .send()
+                .await
+                .expect("measurement write completes once released")
+        })
+    };
+    assert!(
+        wait_for_buffered_items(&client, &base, points as u64).await >= points as u64,
+        "the measurement request must buffer its points and hold its charge"
+    );
+    let charge = metric_value(&client, &base, "ravel_ingest_buffer_bytes{mode=\"all\"}").await;
+    assert!(
+        charge > 0,
+        "the buffered batch holds a nonzero router charge"
+    );
+    drain_until_done(&gate, std::slice::from_ref(&task)).await;
+    assert_eq!(task.await.expect("task joins").status(), 204);
+    running.shutdown().await.expect("graceful shutdown");
+    charge
+}
+
+/// Issue #1419: a Remote Write body whose snappy expansion crosses the ceiling
+/// is shed with 429 + Retry-After BEFORE the decompressed buffer is allocated,
+/// and the buffer-budget shed counter reads exactly 1.
+///
+/// The body is a zeros bomb: it inflates far past the 1 MiB ceiling but is not
+/// valid Remote Write protobuf, so if the charge did not happen before decode
+/// the bytes would inflate in full and then fail protobuf decode with 400.
+/// Asserting 429 rather than 400 is what proves the charge is taken ahead of
+/// the allocation it pays for.
+///
+/// Non-vacuity: remove the `charge_snappy_inflate` call from
+/// `decode_body_charged` in `src/remote_write.rs` and this returns 400.
+#[tokio::test]
+async fn remote_write_body_is_charged_against_the_budget_before_it_inflates() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_test_server(store, IngestByteBudgetLimit::Bounded(1024 * 1024)).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    // 8 MiB of zeros compresses to a few hundred KiB of snappy and inflates far
+    // past the 1 MiB ceiling.
+    let compressed = snappy(&vec![0u8; 8 * 1024 * 1024]);
+    assert!(
+        compressed.len() < 1024 * 1024,
+        "the compressed bomb must stay small: {}",
+        compressed.len()
+    );
+
+    let response = post_remote_write(&client, &base, compressed)
+        .send()
+        .await
+        .expect("shed request still gets an HTTP response");
+
+    assert_eq!(
+        response.status(),
+        429,
+        "a snappy inflate over the buffer budget must be shed with 429 before it is allocated"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .expect("a shed response carries Retry-After")
+            .to_str()
+            .expect("ascii header value"),
+        "1",
+    );
+
+    let shed = metric_value(
+        &client,
+        &base,
+        "ravel_ingest_buffer_shed_total{mode=\"all\"}",
+    )
+    .await;
+    assert_eq!(shed, 1, "exactly one request shed by the buffer budget");
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Issue #1419, the Remote Write complement of
+/// `second_concurrent_inflate_sheds_when_the_sum_would_cross_the_ceiling`: a
+/// request whose inflate would cross the ceiling *given what is already in
+/// flight* is shed with 429, and the charge is released afterwards, so the
+/// exact same body succeeds once the concurrent pressure is gone.
+///
+/// One Remote Write request is held mid-flush, holding its router buffered
+/// charge; a second request of the same shape is shed. Released, the first
+/// completes 204 and the second body then succeeds on its own with a 204,
+/// which is what proves the shed released everything it took.
+///
+/// Non-vacuity: remove the `charge_snappy_inflate` call from
+/// `decode_body_charged` and the second request is never shed, so both the 429
+/// and the shed-counter delta fail.
+#[tokio::test]
+async fn remote_write_shed_releases_its_charge_so_the_same_body_later_succeeds() {
+    // Few points, a large unreferenced symbol: the inflate dominates the
+    // router's batch charge, which is what lets the ceiling below isolate the
+    // inflate charge as the only thing that can shed the second request.
+    let points = 100;
+    let pad_bytes = 4 * 1024 * 1024;
+    let router_charge = measured_remote_write_router_charge(points, pad_bytes).await;
+    let (compressed, inflated_len) = rw2_snappy_body_padded(points, pad_bytes);
+    assert!(
+        (compressed.len() as u64) < inflated_len,
+        "fixture must compress: compressed={} inflated={inflated_len}",
+        compressed.len()
+    );
+
+    // The ceiling must isolate the inflate charge as the only thing that can
+    // shed the second request: it clears two concurrent router charges (so the
+    // router's own budget check cannot be what refuses it) but not the held
+    // router charge plus a second body's inflate.
+    let ceiling = inflated_len.max(2 * router_charge) + 1;
+    assert!(
+        router_charge > 0 && inflated_len > 0,
+        "both terms must be nonzero to size the ceiling"
+    );
+    assert!(
+        ceiling >= inflated_len && ceiling > 2 * router_charge,
+        "ceiling {ceiling} must clear one inflate and two router charges (router={router_charge}, inflate={inflated_len})"
+    );
+    assert!(
+        ceiling < router_charge + inflated_len,
+        "ceiling {ceiling} must not clear a held router charge plus a second inflate (router={router_charge}, inflate={inflated_len})"
+    );
+
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
+    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+    let running = start_test_server(store, IngestByteBudgetLimit::Bounded(ceiling)).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
+    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
+    let held_body = compressed.clone();
+    let held_task = {
+        let client = client.clone();
+        let base = base.clone();
+        tokio::spawn(async move {
+            post_remote_write(&client, &base, held_body)
+                .send()
+                .await
+                .expect("held write completes once released")
+        })
+    };
+    assert!(
+        wait_for_buffered_items(&client, &base, points as u64).await >= points as u64,
+        "the first write buffers and holds its router charge"
+    );
+    assert!(
+        !held_task.is_finished(),
+        "the first request is parked on the held flush"
+    );
+
+    let shed_before = metric_value(
+        &client,
+        &base,
+        "ravel_ingest_buffer_shed_total{mode=\"all\"}",
+    )
+    .await;
+
+    let second = post_remote_write(&client, &base, compressed.clone())
+        .send()
+        .await
+        .expect("second request still gets an HTTP response");
+    assert_eq!(
+        second.status(),
+        429,
+        "the second concurrent Remote Write inflate crosses the ceiling and is shed"
+    );
+    assert!(
+        second
+            .headers()
+            .get("x-prometheus-remote-write-samples-written")
+            .is_none(),
+        "a shed request wrote nothing and reports no written samples"
+    );
+
+    let shed_after = metric_value(
+        &client,
+        &base,
+        "ravel_ingest_buffer_shed_total{mode=\"all\"}",
+    )
+    .await;
+    assert_eq!(
+        shed_after - shed_before,
+        1,
+        "exactly one additional request shed by the buffer budget"
+    );
+
+    drain_until_done(&gate, std::slice::from_ref(&held_task)).await;
+    assert_eq!(
+        held_task.await.expect("task joins").status(),
+        204,
+        "the first request succeeds once released"
+    );
+    for _ in 0..1_000 {
+        if metric_value(&client, &base, "ravel_ingest_buffer_bytes{mode=\"all\"}").await == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The shed released every byte it took, so the same body now fits.
+    let alone_body = compressed.clone();
+    let alone_task = {
+        let client = client.clone();
+        let base = base.clone();
+        tokio::spawn(async move {
+            post_remote_write(&client, &base, alone_body)
+                .send()
+                .await
+                .expect("solo request completes")
+        })
+    };
+    drain_until_done(&gate, std::slice::from_ref(&alone_task)).await;
+    assert_eq!(
+        alone_task.await.expect("task joins").status(),
+        204,
+        "a request of the same size succeeds after the shed, so the charge was released"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Issue #1419, the Remote Write complement of
+/// `a_request_whose_inflate_and_batch_each_fit_is_not_shed_for_their_sum`: the
+/// handler releases the inflate charge before the router takes its buffered
+/// charge, so the two never coexist and a single request whose inflate and
+/// batch each fit but whose sum exceeds the ceiling is still admitted.
+///
+/// The ordering is pinned by a differential rather than by one reading against
+/// a measured baseline, because Remote Write has no identity encoding: every
+/// request inflates, so a baseline measured through this same surface moves
+/// with the very bug it is supposed to detect. Two bodies that normalize to the
+/// SAME batch (the padding is an unreferenced symbol, so it decodes to no
+/// points) but differ by 4 MiB of inflate must hold the same in-flight bytes
+/// while parked mid-flush. If the inflate charge were still live at that point,
+/// the padded body would read 4 MiB higher.
+///
+/// Non-vacuity: move the `drop(inflate_charge)` in `src/remote_write.rs` to
+/// after `router.write_values` and the two readings differ by the padding,
+/// while the padded request also sheds instead of buffering under a ceiling
+/// that only clears one term at a time.
+#[tokio::test]
+async fn remote_write_inflate_charge_is_released_before_the_router_charge() {
+    let points = 20_000;
+    let pad_bytes = 4 * 1024 * 1024;
+
+    let plain_reading = measured_remote_write_router_charge(points, 0).await;
+    let padded_reading = measured_remote_write_router_charge(points, pad_bytes).await;
+    assert_eq!(
+        plain_reading, padded_reading,
+        "two bodies with the same batch and a {pad_bytes}-byte difference in inflate must hold \
+         the same in-flight bytes once parked: the inflate charge is released before the router \
+         charge, so the reading does not depend on how large the body was"
+    );
+    let router_charge = plain_reading;
+
+    // The padded body, whose inflate (over 4 MiB) is larger than its batch: a
+    // ceiling above the inflate and above the batch but below their sum admits
+    // it only because the two terms never coexist.
+    let (compressed, inflated_len) = rw2_snappy_body_padded(points, pad_bytes);
+    let hi = router_charge.max(inflated_len);
+    let lo = router_charge.min(inflated_len);
+    assert!(lo >= 2, "both terms must be nonzero to size the ceiling");
+    let ceiling = hi + lo / 2;
+    assert!(
+        ceiling > hi && ceiling < router_charge + inflated_len,
+        "ceiling {ceiling} must sit strictly between max({router_charge}, {inflated_len}) and their sum"
+    );
+
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
+    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+    let running = start_test_server(store, IngestByteBudgetLimit::Bounded(ceiling)).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
+    let shed_before = metric_value(
+        &client,
+        &base,
+        "ravel_ingest_buffer_shed_total{mode=\"all\"}",
+    )
+    .await;
+
+    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
+    let task = {
+        let client = client.clone();
+        let base = base.clone();
+        tokio::spawn(async move {
+            post_remote_write(&client, &base, compressed)
+                .send()
+                .await
+                .expect("write completes once released")
+        })
+    };
+    assert!(
+        wait_for_buffered_items(&client, &base, points as u64).await >= points as u64,
+        "the single write buffers: it is not shed for the sum of its two terms"
+    );
+    assert!(
+        !task.is_finished(),
+        "the request is parked on the held flush, not shed"
+    );
+
+    let in_flight = metric_value(&client, &base, "ravel_ingest_buffer_bytes{mode=\"all\"}").await;
+    assert_eq!(
+        in_flight, router_charge,
+        "the in-flight gauge equals the single live (router) charge exactly; the inflate charge is gone"
+    );
+
+    drain_until_done(&gate, std::slice::from_ref(&task)).await;
+    assert_eq!(
+        task.await.expect("task joins").status(),
+        204,
+        "the request completes 204 once released"
+    );
+    let shed_after = metric_value(
+        &client,
+        &base,
+        "ravel_ingest_buffer_shed_total{mode=\"all\"}",
+    )
+    .await;
+    assert_eq!(
+        shed_after, shed_before,
+        "the shed counter is unchanged: a request whose inflate and batch each fit is not shed for their sum"
     );
 
     running.shutdown().await.expect("graceful shutdown");

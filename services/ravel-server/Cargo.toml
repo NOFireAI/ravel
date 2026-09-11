@@ -136,6 +136,13 @@ bytes = { workspace = true }
 # for its `MultiGzDecoder`, which decodes concatenated multi-member streams
 # under one capped reader.
 flate2 = { workspace = true }
+# Snappy block-format header parsing for the Remote Write ingest byte charge
+# (ADR-0069 amendment, issue #1419). Used only for `raw::decompress_len`, which
+# reads the varint header to report the decompressed size without allocating,
+# so the charge is taken before `ravel-remote-write` allocates the output
+# buffer. Already resolved in Cargo.lock through ravel-remote-write; the same
+# workspace pin, not a new external crate.
+snap = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
 # The alert evaluator hashes the RLOG object it writes to build the commit
