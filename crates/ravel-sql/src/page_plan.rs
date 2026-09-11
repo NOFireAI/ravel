@@ -77,20 +77,29 @@
 //! and is therefore what resumes both. `not_total: Some(..)` rescues nothing
 //! here: reporting is not a substitute for refusing.
 //!
-//! Only a term the text proves NON NULL is admitted, and the proof is a
-//! schema lookup that holds end to end only when the output name is a bare
-//! reference to a column of the `FROM` relation AND that relation is the
-//! target base table itself. [`SchemaBasis`] is what settles the second half:
-//! a derived table, a CTE, a join, or a `ROLLUP`/`CUBE`/`GROUPING SETS`
-//! grouping each leave the schema answering about a column the ordered value
-//! did not come from.
+//! Only a term the text proves NON NULL is admitted, and a term reaches that
+//! proof by one of two routes.
+//!
+//! A bare column reference goes through the target table's public schema, and
+//! that lookup holds end to end only when the output name is a bare reference
+//! to a column of the `FROM` relation AND that relation is the target base
+//! table itself. [`SchemaBasis`] is what settles the second half: a derived
+//! table, a CTE, a join, or a `ROLLUP`/`CUBE`/`GROUPING SETS` grouping each
+//! leave the schema answering about a column the ordered value did not come
+//! from.
+//!
+//! An alias over an expression is answered by the expression itself
+//! ([`expression_is_non_null`]), with no schema involved: a literal and a
+//! `count(...)` are NON NULL wherever they are selected from. `SUM`, `MIN`,
+//! `MAX` and `AVG` are not, and keep refusing, because each is NULL over
+//! empty and over all-NULL input.
 //!
 //! The refusal says which of two things went wrong.
 //! [`PagePlanError::OrderTermNullable`] means the term CAN be NULL: the
 //! schema declares that column nullable, and the caller has to order by
 //! something else. [`PagePlanError::OrderTermNullabilityUnknown`] means the
 //! text does not settle it, and names the missing link, because a caller told
-//! that `count(*)` "is not known to be NON NULL" has no repair to make.
+//! that `sum(value)` "is not known to be NON NULL" has no repair to make.
 //!
 //! # The rewrite
 //!
@@ -121,7 +130,7 @@ use std::ops::ControlFlow;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
     Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByKind, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor,
+    SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
 };
 
 use crate::alerts_schema::alerts_schema;
@@ -644,16 +653,22 @@ fn page_target(sql: &str) -> Result<PageTarget, PagePlanError> {
 
 /// What one output column of a `SELECT` list is built from, as far as the
 /// text says. The distinction exists for nullability: a schema lookup answers
-/// for a bare column reference and for nothing else.
+/// for a bare column reference and for nothing else, and an expression
+/// answers for itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutputSource {
     /// A bare reference to this column of the `FROM` relation, under its own
     /// name or an alias.
     Column(String),
-    /// Anything else: a computed expression, or an output name the projection
-    /// gives twice from different sources. Neither has a column in the
-    /// target's schema to look up.
-    Opaque,
+    /// A computed expression, carried rather than discarded: no schema
+    /// describes it, but the expression itself settles some cases outright.
+    /// A literal is NON NULL whatever it is selected from. Boxed: a
+    /// sqlparser `Expr` is an order of magnitude larger than the other
+    /// variants, and one is held per projected output name.
+    Expression(Box<SqlExpr>),
+    /// An output name the projection gives twice from different sources.
+    /// Which of them an order term means is not readable from the text.
+    Ambiguous,
 }
 
 /// What the statement projects, as far as its text says.
@@ -683,29 +698,41 @@ impl Projection {
         }
     }
 
-    /// The column of the `FROM` RELATION that the output column `column` is a
-    /// bare reference to, or `None` when the text does not name one.
+    /// What the output column `column` is built from, as far as the text
+    /// says.
     ///
     /// A wildcard answers with the name itself: every output column of a
-    /// `SELECT *` is a column of the `FROM` relation under its own name.
-    /// `Unknown` answers `None` rather than guessing, which is what makes a
-    /// set-operation body fail the nullability check instead of passing it
+    /// `SELECT *` is a column of the `FROM` relation under its own name. A
+    /// set-operation body answers `Unreadable` rather than guessing, which is
+    /// what makes it fail the nullability check instead of passing it
     /// unexamined.
     ///
-    /// The name this returns is a name in the `FROM` relation, which is the
-    /// target table's own column only when that relation IS the target table.
-    /// [`SchemaBasis`] is what settles that, and every caller has to consult
-    /// it before turning this name into a schema lookup.
-    fn source_column<'a>(&'a self, column: &'a str) -> Option<&'a str> {
+    /// A [`TermSource::Column`] name is a name in the `FROM` relation, which
+    /// is the target table's own column only when that relation IS the target
+    /// table. [`SchemaBasis`] is what settles that, and every caller has to
+    /// consult it before turning this name into a schema lookup.
+    fn term_source<'a>(&'a self, column: &'a str) -> TermSource<'a> {
         match self {
-            Projection::Wildcard => Some(column),
-            Projection::Unknown => None,
+            Projection::Wildcard => TermSource::Column(column),
+            Projection::Unknown => TermSource::Unreadable(unproven::SET_OPERATION),
             Projection::Columns(items) => match items.get(column) {
-                Some(OutputSource::Column(name)) => Some(name.as_str()),
-                Some(OutputSource::Opaque) | None => None,
+                Some(OutputSource::Column(name)) => TermSource::Column(name.as_str()),
+                Some(OutputSource::Expression(expr)) => TermSource::Expression(expr),
+                Some(OutputSource::Ambiguous) => TermSource::Unreadable(unproven::AMBIGUOUS_NAME),
+                None => TermSource::Unreadable(unproven::NOT_A_BARE_COLUMN),
             },
         }
     }
+}
+
+/// What an `ORDER BY` term resolves to in the projection that produced it.
+enum TermSource<'a> {
+    /// A bare reference to this column of the `FROM` relation.
+    Column(&'a str),
+    /// A computed expression, which the text carries in full.
+    Expression(&'a SqlExpr),
+    /// Neither, for this reason.
+    Unreadable(&'static str),
 }
 
 fn projection_of(query: &Query) -> Projection {
@@ -715,11 +742,11 @@ fn projection_of(query: &Query) -> Projection {
     let mut names: BTreeMap<String, OutputSource> = BTreeMap::new();
     let mut record = |name: String, source: OutputSource| {
         // A name the projection gives twice is ambiguous here even when both
-        // sources are columns, so it degrades to opaque rather than to
+        // sources are columns, so it degrades rather than resolving to
         // whichever item came last.
         let entry = names.entry(name).or_insert_with(|| source.clone());
         if *entry != source {
-            *entry = OutputSource::Opaque;
+            *entry = OutputSource::Ambiguous;
         }
     };
     for item in &select.projection {
@@ -728,7 +755,10 @@ fn projection_of(query: &Query) -> Projection {
                 return Projection::Wildcard;
             }
             SelectItem::ExprWithAlias { expr, alias } => {
-                let source = column_of(expr).map_or(OutputSource::Opaque, OutputSource::Column);
+                let source = match column_of(expr) {
+                    Some(name) => OutputSource::Column(name),
+                    None => OutputSource::Expression(Box::new(expr.clone())),
+                };
                 record(ident_name(alias), source);
             }
             SelectItem::UnnamedExpr(expr) => {
@@ -782,6 +812,10 @@ mod unproven {
     pub(super) const NOT_A_SCHEMA_COLUMN: &str = "it is not a column of the target table's public schema, so it is a declared \
          column whose nullability the text does not carry";
     pub(super) const NO_PUBLIC_SCHEMA: &str = "the target table has no public schema here";
+    pub(super) const AMBIGUOUS_NAME: &str =
+        "the projection gives that output name twice, from different sources";
+    pub(super) const EXPRESSION_NOT_PROVABLE: &str = "the expression it is defined by is not one this planner proves NON NULL, and \
+         SUM, MIN, MAX and AVG are NULL over empty or all-NULL input";
 }
 
 /// Whether the statement's own `FROM` relation is the target base table, so
@@ -877,16 +911,34 @@ enum NullProof {
 
 /// What the text says about the effective term `column`.
 ///
-/// The proof has to hold end to end: the output column has to be a bare
-/// reference to a column of the `FROM` relation, that relation has to be the
-/// target base table itself (see [`schema_basis`]), and the column has to be
-/// declared non-nullable in the table's public schema. A declared column is
-/// absent from the static schema, and whether it exists at all depends on the
-/// tenant's declarations rather than on the text, so it is `Unproven` rather
-/// than either answer.
+/// There are two routes to a proof and the term takes whichever one its
+/// projection offers.
+///
+/// A bare column reference goes through the schema, and that proof has to hold
+/// end to end: the name has to be a column of the `FROM` relation, that
+/// relation has to be the target base table itself (see [`schema_basis`]), and
+/// the column has to be declared non-nullable in the table's public schema. A
+/// declared column is absent from the static schema, and whether it exists at
+/// all depends on the tenant's declarations rather than on the text, so it is
+/// `Unproven` rather than either answer.
+///
+/// An alias over an expression is answered by
+/// [`expression_is_non_null`] reading the expression itself, with no schema
+/// consulted and no basis required: a literal and a `count(...)` are NON NULL
+/// whatever relation they are selected from, including under an outer join or
+/// a `ROLLUP`, because neither is a grouping column that a super-aggregate row
+/// can null.
 fn term_nullability(basis: &SchemaBasis, projection: &Projection, column: &str) -> NullProof {
-    let Some(source) = projection.source_column(column) else {
-        return NullProof::Unproven(unproven::NOT_A_BARE_COLUMN);
+    let source = match projection.term_source(column) {
+        TermSource::Column(source) => source,
+        TermSource::Expression(expr) => {
+            return if expression_is_non_null(expr) {
+                NullProof::NonNull
+            } else {
+                NullProof::Unproven(unproven::EXPRESSION_NOT_PROVABLE)
+            };
+        }
+        TermSource::Unreadable(reason) => return NullProof::Unproven(reason),
     };
     let table = match basis {
         SchemaBasis::Resolvable(table) => *table,
@@ -906,6 +958,50 @@ fn term_nullability(basis: &SchemaBasis, projection: &Projection, column: &str) 
         Err(_) => NullProof::Unproven(unproven::NOT_A_SCHEMA_COLUMN),
     }
 }
+
+/// Whether an expression is NON NULL for every row, from the expression alone.
+///
+/// Deliberately narrow, and the narrowness is the point: this answers only
+/// where the answer needs no schema, no statistics and no knowledge of what
+/// the inputs contain. What it admits:
+///
+/// - a literal other than `NULL`, and other than a placeholder, whose value
+///   arrives at execution time;
+/// - `count(...)` in any spelling, `count(*)` and `count(DISTINCT x)`
+///   included, which returns 0 rather than NULL over empty and over all-NULL
+///   input;
+/// - parentheses, and a unary `+` or `-`, which are NULL exactly when their
+///   operand is.
+///
+/// `SUM`, `MIN`, `MAX` and `AVG` are NOT admitted, and this is a decision
+/// rather than an omission. Each returns NULL over empty input and over input
+/// that is entirely NULL, so an ordering on one can carry a NULL row that the
+/// keyset predicate would drop from every page. Telling the safe uses apart
+/// means knowing whether the statement is grouped and whether any group can be
+/// empty or all-NULL, which is a different analysis from this one; until it
+/// exists all four keep refusing.
+///
+/// Anything else answers `false`, which is a refusal rather than a plan. A
+/// case added here has to hold for every input, not merely for the inputs a
+/// caller had in mind.
+fn expression_is_non_null(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::Value(value) => !matches!(value.value, Value::Null | Value::Placeholder(_)),
+        SqlExpr::Nested(inner) => expression_is_non_null(inner),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus | UnaryOperator::Minus,
+            expr,
+        } => expression_is_non_null(expr),
+        SqlExpr::Function(function) => {
+            bare_name(&function.name).is_some_and(|name| name.eq_ignore_ascii_case(COUNT_FUNCTION))
+        }
+        _ => false,
+    }
+}
+
+/// The one aggregate this planner proves NON NULL. Lowercase: [`bare_name`]
+/// lowercases an unquoted identifier.
+const COUNT_FUNCTION: &str = "count";
 
 /// The parts of a single `SELECT` body that decide whether it projects the
 /// scanned rows one-for-one.
@@ -1572,7 +1668,7 @@ mod tests {
                 "SELECT nullif(value, 0) AS v, ts, series_id FROM samples ORDER BY v",
                 PagePlanError::OrderTermNullabilityUnknown {
                     column: "v".to_string(),
-                    reason: unproven::NOT_A_BARE_COLUMN,
+                    reason: unproven::EXPRESSION_NOT_PROVABLE,
                 },
             ),
             (
@@ -1799,7 +1895,7 @@ mod tests {
             (
                 "SELECT nullif(value, 0) AS v, ts, series_id FROM samples ORDER BY v",
                 "v",
-                unproven::NOT_A_BARE_COLUMN,
+                unproven::EXPRESSION_NOT_PROVABLE,
             ),
             // An output name the projection gives twice from different
             // columns: both are columns, but which one the term means is not
@@ -1807,16 +1903,14 @@ mod tests {
             (
                 "SELECT ts AS a, trace_id AS a FROM logs ORDER BY a",
                 "a",
-                unproven::NOT_A_BARE_COLUMN,
+                unproven::AMBIGUOUS_NAME,
             ),
             // A set-operation body carries no readable projection at all.
             (
                 "SELECT ts FROM logs UNION ALL SELECT ts FROM logs ORDER BY ts",
                 "ts",
-                unproven::NOT_A_BARE_COLUMN,
+                unproven::SET_OPERATION,
             ),
-            // A literal, which no schema lookup reaches.
-            ("SELECT 1 AS a ORDER BY a", "a", unproven::NOT_A_BARE_COLUMN),
         ];
         for (sql, column, reason) in unproven_cases {
             let err = plan_page(sql, None).expect_err("refused");
@@ -2079,6 +2173,159 @@ mod tests {
         );
     }
 
+    /// A literal order term plans: no schema describes it and none needs to.
+    ///
+    /// The prover reached a defining COLUMN REFERENCE or nothing, so an alias
+    /// over `1` refused with the same message as a term that can really be
+    /// NULL. A literal is NON NULL in every row of every relation.
+    #[test]
+    fn a_literal_order_term_plans() {
+        for sql in [
+            "SELECT 1 AS a ORDER BY a",
+            "SELECT 'x' AS a ORDER BY a",
+            "SELECT -1 AS a ORDER BY a",
+            "SELECT (1) AS a ORDER BY a",
+            "SELECT 1 AS a, ts, series_id FROM samples ORDER BY a, ts, series_id",
+        ] {
+            let plan = plan_page(sql, None);
+            assert!(plan.is_ok(), "refused {sql:?}: {plan:?}");
+        }
+
+        // A literal NULL and a placeholder are not literals this admits: the
+        // first IS the hazard, and the second carries a value that only
+        // arrives at execution time.
+        for (sql, column) in [
+            ("SELECT NULL AS a ORDER BY a", "a"),
+            ("SELECT $1 AS a ORDER BY a", "a"),
+        ] {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermNullabilityUnknown {
+                    column: column.to_string(),
+                    reason: unproven::EXPRESSION_NOT_PROVABLE,
+                },
+                "unexpected refusal for {sql:?}"
+            );
+        }
+    }
+
+    /// `count(...)` is NON NULL in every spelling: it returns 0, never NULL,
+    /// over empty and over all-NULL input.
+    ///
+    /// Ordering on the bare call is still refused, one step earlier and for a
+    /// different reason: every effective term has to be a projected output
+    /// column so the wrap can reference it, and `PagePlanError::
+    /// OrderTermNotColumn` is that rule. The alias is the spelling that
+    /// reaches this prover.
+    #[test]
+    fn count_star_plans_through_an_alias() {
+        for sql in [
+            "SELECT count(*) AS c FROM logs GROUP BY severity_text ORDER BY c",
+            "SELECT COUNT(*) AS c FROM logs GROUP BY severity_text ORDER BY c",
+            "SELECT count(DISTINCT trace_id) AS c FROM logs GROUP BY severity_text ORDER BY c",
+            "SELECT count(trace_id) AS c FROM logs GROUP BY severity_text ORDER BY c",
+            // A grouping construct nulls a grouping COLUMN, never an
+            // aggregate, so ordering on the count alone still plans.
+            "SELECT count(*) AS c FROM logs GROUP BY ROLLUP(severity_text) ORDER BY c",
+        ] {
+            let plan = plan_page(sql, None);
+            assert!(plan.is_ok(), "refused {sql:?}: {plan:?}");
+        }
+
+        let bare =
+            plan_page("SELECT count(*) FROM logs ORDER BY count(*)", None).expect_err("refused");
+        assert_eq!(
+            bare,
+            PagePlanError::OrderTermNotColumn {
+                term: "count(*)".to_string(),
+            },
+        );
+    }
+
+    /// An alias resolves through to the expression that defines it, so the
+    /// answer is about that expression and not about the alias being an
+    /// alias.
+    #[test]
+    fn an_alias_resolves_through_to_its_defining_expression() {
+        // Same alias, same statement shape, opposite answers: the defining
+        // expression is the only thing that differs.
+        let provable = plan_page(
+            "SELECT count(*) AS ordering FROM logs GROUP BY severity_text ORDER BY ordering",
+            None,
+        );
+        assert!(provable.is_ok(), "refused the count: {provable:?}");
+
+        let not_provable = plan_page(
+            "SELECT nullif(count(*), 0) AS ordering FROM logs GROUP BY severity_text \
+             ORDER BY ordering",
+            None,
+        )
+        .expect_err("refused");
+        assert_eq!(
+            not_provable,
+            PagePlanError::OrderTermNullabilityUnknown {
+                column: "ordering".to_string(),
+                reason: unproven::EXPRESSION_NOT_PROVABLE,
+            },
+        );
+
+        // Unary `+`/`-` and parentheses are NULL exactly when their operand
+        // is, so the answer passes through them in both directions.
+        let through = plan_page(
+            "SELECT -count(*) AS ordering FROM logs GROUP BY severity_text ORDER BY ordering",
+            None,
+        );
+        assert!(through.is_ok(), "refused the negated count: {through:?}");
+
+        let through_null =
+            plan_page("SELECT -(NULL) AS ordering ORDER BY ordering", None).expect_err("refused");
+        assert_eq!(
+            through_null,
+            PagePlanError::OrderTermNullabilityUnknown {
+                column: "ordering".to_string(),
+                reason: unproven::EXPRESSION_NOT_PROVABLE,
+            },
+        );
+    }
+
+    /// `SUM`, `MIN`, `MAX` and `AVG` keep refusing, deliberately.
+    ///
+    /// Each returns NULL over empty input and over input that is entirely
+    /// NULL, so an ordering on one can carry a row the keyset predicate drops
+    /// from every page. Admitting them needs the grouped-versus-ungrouped
+    /// analysis this prover does not do; until that exists the refusal is the
+    /// correct answer and this test is what stops it being widened by
+    /// analogy with `count`.
+    #[test]
+    fn sum_min_max_and_avg_still_refuse() {
+        for call in [
+            "sum(value)",
+            "min(value)",
+            "max(value)",
+            "avg(value)",
+            "SUM(value)",
+        ] {
+            let sql = format!(
+                "SELECT {call} AS ordering FROM samples GROUP BY series_id ORDER BY ordering"
+            );
+            let err = plan_page(&sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermNullabilityUnknown {
+                    column: "ordering".to_string(),
+                    reason: unproven::EXPRESSION_NOT_PROVABLE,
+                },
+                "unexpected refusal for {sql:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("SUM, MIN, MAX and AVG are NULL over empty or all-NULL input"),
+                "the message does not say why: {err}"
+            );
+        }
+    }
+
     /// The ClickBench corpus, the largest body of real statements this
     /// repository holds, read from where the benchmarks keep it rather than
     /// copied, so a corpus edit shows up here as a failing count.
@@ -2181,7 +2428,11 @@ mod tests {
     /// Two passes. The first is the corpus as written, where 32 of the 43
     /// statements carry their own `LIMIT` and are refused for that alone.
     /// The second strips a trailing `LIMIT n [OFFSET m]`, which is what
-    /// exposes the nullability prover underneath.
+    /// exposes the nullability prover underneath: 22 of the 43 plan, and 3
+    /// of the 21 refusals are about nullability. The remaining 18 are about
+    /// the ordering itself, not about NULLs -- no `ORDER BY` at all, a term
+    /// that is not a column, a term the statement does not project -- and
+    /// each is a separate piece of work.
     #[test]
     fn the_clickbench_corpus_page_plan_outcomes_are_pinned() {
         let corpus: serde_json::Value =
@@ -2228,14 +2479,14 @@ mod tests {
             ("NoOrdering", 11),
             ("OrderTermNotColumn", 5),
             ("OrderTermNotProjected", 2),
-            ("plans, not a total order", 1),
+            ("plans, not a total order", 22),
         ]);
         want.insert(
             format!(
                 "OrderTermNullabilityUnknown: {}",
-                unproven::NOT_A_BARE_COLUMN
+                unproven::EXPRESSION_NOT_PROVABLE
             ),
-            23,
+            2,
         );
         want.insert(
             format!(
@@ -2250,17 +2501,17 @@ mod tests {
         );
         assert_eq!(
             tally(&without_row_limit, "plans"),
-            1,
+            22,
             "plans, row limit set aside",
         );
         assert_eq!(
             statements - tally(&without_row_limit, "plans"),
-            42,
+            21,
             "refusals, row limit set aside",
         );
         assert_eq!(
             tally(&without_row_limit, "OrderTermNullab"),
-            24,
+            3,
             "nullability refusals, row limit set aside",
         );
     }
