@@ -216,7 +216,9 @@
 //!   `|> order_by` cannot reshape the rows after the body;
 //! - `WITH FILL` is [`PagePlanError::UnsupportedOrderOption`], which is the
 //!   only ClickHouse ordering form that adds rows, and its clause-level
-//!   sibling `INTERPOLATE` is [`PagePlanError::UnsupportedOrderingClause`];
+//!   sibling `INTERPOLATE` is [`PagePlanError::UnsupportedOrderingClause`] at
+//!   every depth: the clause is refused rather than reproduced, and only the
+//!   outermost `ORDER BY` reaches [`statement_order_terms`];
 //! - the four dialect clauses that hang off a `Query` rather than off its
 //!   body -- `SETTINGS`, `FORMAT`, a `FOR UPDATE`/`FOR SHARE` lock, and
 //!   `FOR XML`/`FOR JSON` -- are
@@ -433,6 +435,11 @@ pub enum PagePlanError {
     /// so the page was not a differently ordered answer: it was a success
     /// where the caller's own statement is an error, under semantics the
     /// caller never asked for.
+    ///
+    /// Raised at every depth, by [`NestedShapeGuard`] rather than by
+    /// [`statement_order_terms`], because that reads the outermost `ORDER BY`
+    /// alone: a clause on a subquery's ordering went into the derived table
+    /// verbatim and the same false total-order claim came back one level down.
     #[error("the ORDER BY clause `{clause}` cannot be paged")]
     UnsupportedOrderingClause { clause: &'static str },
 
@@ -777,6 +784,11 @@ impl Visitor for NestedShapeGuard<'_> {
     /// place the rewrite decided about a node from a subset of it. It read
     /// three of the ten fields, and the four dialect clauses it did not read
     /// are re-emitted verbatim by `Display for Query` into the derived table.
+    ///
+    /// `order_by` is read here for its `INTERPOLATE` alone, which is the one
+    /// part of an ordering this module refuses rather than reproduces. The
+    /// terms are [`statement_order_terms`]'s, and that reads the outermost
+    /// `Query` only.
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
         let Query {
             // Each CTE carries its own `Query`, which this same visitor
@@ -787,12 +799,13 @@ impl Visitor for NestedShapeGuard<'_> {
             // Visited in turn. Its `SELECT` bodies are `pre_visit_select`
             // below, which is where `TOP` and `INTO` are read.
             body: _,
-            // The outermost one is the effective ordering, read by
-            // `statement_order_terms`. An inner one is re-emitted verbatim, so
-            // every page runs the same ordering over the same rows: it cannot
-            // make consecutive pages be pages of different results, which is
-            // what this guard refuses.
-            order_by: _,
+            // The ordering ITSELF is not this guard's business: the outermost
+            // one is the effective ordering, read by `statement_order_terms`,
+            // and an inner one is re-emitted verbatim, so every page runs the
+            // same ordering over the same rows. Its `INTERPOLATE` is, because
+            // that clause is refused rather than reproduced and only the
+            // outermost `OrderBy` reaches `statement_order_terms`.
+            order_by,
             limit_clause,
             fetch,
             locks,
@@ -826,6 +839,15 @@ impl Visitor for NestedShapeGuard<'_> {
         };
         if let Some(clause) = clause {
             *self.found = Some(PagePlanError::UnsupportedQueryClause { clause });
+            return ControlFlow::Break(());
+        }
+        // Last, so the clause a statement spells alongside this one still
+        // reports itself: `SETTINGS limit = 2` is the row limit, and naming
+        // the `INTERPOLATE` instead would point the caller at the wrong repair.
+        if order_by.as_ref().is_some_and(|o| o.interpolate.is_some()) {
+            *self.found = Some(PagePlanError::UnsupportedOrderingClause {
+                clause: "INTERPOLATE",
+            });
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
@@ -1797,19 +1819,21 @@ fn shape_of<'a>(query: &'a Query) -> Option<SelectShape<'a>> {
 /// whenever it only orders, so the clause was dropped with it and the page
 /// ran under an ordering the caller had not written.
 fn statement_order_terms(query: &Query) -> Result<Vec<OrderTerm>, PagePlanError> {
-    let Some(OrderBy { kind, interpolate }) = &query.order_by else {
+    let Some(OrderBy {
+        kind,
+        // `INTERPOLATE` is defined only in terms of a `WITH FILL`, which is
+        // refused per term below, so it cannot add a row on its own. It is
+        // still refused rather than ignored, because DataFusion rejects the
+        // statement and a page that silently drops the clause answers a
+        // statement the engine itself calls an error. The refusal is
+        // `NestedShapeGuard`'s, which has already run over this same `Query`:
+        // this function sees the outermost `ORDER BY` only, and the clause
+        // reaches the derived table from any depth.
+        interpolate: _,
+    }) = &query.order_by
+    else {
         return Ok(Vec::new());
     };
-    // `INTERPOLATE` is defined only in terms of a `WITH FILL`, which is
-    // refused per term below, so it cannot add a row on its own. That is why
-    // it is refused rather than ignored: DataFusion rejects the statement, and
-    // a page that silently drops the clause answers a statement the engine
-    // itself calls an error.
-    if interpolate.is_some() {
-        return Err(PagePlanError::UnsupportedOrderingClause {
-            clause: "INTERPOLATE",
-        });
-    }
     let exprs = match kind {
         OrderByKind::All(_) => return Err(PagePlanError::OrderByAll),
         OrderByKind::Expressions(exprs) => exprs,
@@ -2944,6 +2968,10 @@ mod tests {
     /// [`interpolate_is_an_error_datafusion_raises_and_the_page_would_not`]
     /// is the half of this that text cannot settle: the dropped clause turns
     /// an engine error into a success.
+    ///
+    /// [`refuses_an_interpolate_clause_at_every_nesting_depth`] is the other
+    /// half: the outermost `ORDER BY` is one of five positions the clause
+    /// reaches the derived table from.
     #[test]
     fn refuses_an_interpolate_clause_on_the_ordering() {
         let sql = "SELECT ts, series_id FROM samples ORDER BY ts, series_id \
@@ -2982,6 +3010,65 @@ mod tests {
         )
         .expect("the same ordering without the clause pages");
         assert_eq!(plan.not_total, None);
+    }
+
+    /// `INTERPOLATE` is refused wherever the clause sits, not on the outermost
+    /// `ORDER BY` alone.
+    ///
+    /// [`statement_order_terms`] reads the outermost `ORDER BY` and nothing
+    /// else, so the refusal above covered one position out of five. Every
+    /// other position is a `Query` of its own that `Display for Query`
+    /// re-emits verbatim into the derived table, and the page then planned
+    /// with `not_total: None` over a statement DataFusion raises on. The
+    /// derived-table and CTE spellings were refused before this, but by the
+    /// nullability guards on an unrelated term, so neither said anything about
+    /// the clause.
+    #[test]
+    fn refuses_an_interpolate_clause_at_every_nesting_depth() {
+        let inner = "SELECT ts FROM samples ORDER BY ts INTERPOLATE (value AS value)";
+        let cases = [
+            // The outermost position, which `statement_order_terms` already
+            // covered. Here so the case list is every position rather than
+            // every position the guard added.
+            "SELECT ts, series_id FROM samples ORDER BY ts INTERPOLATE (value AS value)"
+                .to_string(),
+            // A subquery in `WHERE`.
+            format!("SELECT * FROM samples WHERE ts IN ({inner})"),
+            // A scalar subquery in the projection.
+            format!("SELECT ts, series_id, ({inner}) AS m FROM samples ORDER BY ts, series_id"),
+            // A derived table in `FROM`.
+            format!("SELECT ts FROM ({inner}) AS d ORDER BY ts"),
+            // A CTE.
+            format!("WITH c AS ({inner}) SELECT ts FROM samples ORDER BY ts"),
+            // An arm of a set operation.
+            format!("SELECT ts FROM samples UNION ALL {inner}"),
+        ];
+        for sql in cases {
+            let err = plan_page(&sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::UnsupportedOrderingClause {
+                    clause: "INTERPOLATE",
+                },
+                "unexpected refusal for {sql:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "the ORDER BY clause `INTERPOLATE` cannot be paged"
+            );
+        }
+
+        // The same statements with the clause gone are not refused for this
+        // reason, so the refusal is about the clause rather than about the
+        // nesting it was written in.
+        let clean = "SELECT ts FROM samples ORDER BY ts";
+        for sql in [
+            format!("SELECT * FROM samples WHERE ts IN ({clean})"),
+            format!("SELECT ts, series_id, ({clean}) AS m FROM samples ORDER BY ts, series_id"),
+        ] {
+            let plan = plan_page(&sql, None).expect("the same nesting without the clause pages");
+            assert_eq!(plan.not_total, None, "{sql:?}");
+        }
     }
 
     /// The four dialect clauses that hang off a `Query` are refused at every
