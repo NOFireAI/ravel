@@ -5,7 +5,7 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -421,6 +421,29 @@ pub struct Catalog {
     /// these also fails the query: the count is a record of hard failures,
     /// not a harmless-overlap anomaly tally.
     isolation_breaches: AtomicU64,
+    /// Count of [`Catalog::fold`] calls that returned `Ok`, including the
+    /// no-op folds that are the healthy steady state. This counts fold
+    /// *cycles*, not published snapshots: a fold seals an ingest hour only
+    /// once `max_flush_lifetime + clock_skew_allowance + fold_safety_margin`
+    /// has elapsed past that hour, so most cycles legitimately publish
+    /// nothing, and a counter that moved only on publish would read as a
+    /// stopped fold on any quiet tenant.
+    fold_cycles: AtomicU64,
+    /// Count of [`Catalog::fold`] calls that returned `Err`. Before this
+    /// counter the fold's failure path was `tracing` only, so a fold failing
+    /// every cycle was indistinguishable at `/metrics` from a fold that was
+    /// succeeding: the unsealed span grows either way and the first visible
+    /// symptom was a recent-window query exceeding its request budget.
+    fold_failures: AtomicU64,
+    /// Caller-supplied `now_ns` of the most recent [`Catalog::fold`] call
+    /// that returned `Ok`, or `0` when no fold has succeeded in this process.
+    /// This crate reads no clock: the value is whatever `now_ns` the caller
+    /// passed into `fold`, which is that caller's injected clock.
+    ///
+    /// Updated with `fetch_max`, never a plain store, so a fold whose caller
+    /// holds a clock behind another caller's cannot walk the value backwards
+    /// and make a healthy fold look stalled.
+    fold_last_success_unix_ns: AtomicI64,
     /// Bounds the object-store requests one resolve keeps in flight. Ephemeral, process-local, correctness-free: it changes only
     /// how many round trips overlap, never which segments a resolve returns.
     request_semaphore: Arc<tokio::sync::Semaphore>,
@@ -573,6 +596,9 @@ impl Catalog {
             compaction_input_set_conflicts: AtomicU64::new(0),
             rewrite_sibling_conflicts: AtomicU64::new(0),
             isolation_breaches: AtomicU64::new(0),
+            fold_cycles: AtomicU64::new(0),
+            fold_failures: AtomicU64::new(0),
+            fold_last_success_unix_ns: AtomicI64::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.resolve_get_concurrency,
             )),
@@ -1013,6 +1039,43 @@ impl Catalog {
     /// returning the hard `CatalogError::FieldMismatch`.
     pub(crate) fn record_isolation_breach(&self) {
         self.isolation_breaches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [`Catalog::fold`] calls that returned `Ok` across this catalog's
+    /// lifetime, no-op cycles included. See the field docs for why a no-op
+    /// counts.
+    pub fn fold_cycles(&self) -> u64 {
+        self.fold_cycles.load(Ordering::Relaxed)
+    }
+
+    /// [`Catalog::fold`] calls that returned `Err` across this catalog's
+    /// lifetime.
+    pub fn fold_failures(&self) -> u64 {
+        self.fold_failures.load(Ordering::Relaxed)
+    }
+
+    /// The `now_ns` of the most recent successful [`Catalog::fold`] call, or
+    /// `0` if none has succeeded in this process. The age of this value is
+    /// the one figure that moves when the fold STOPS rather than when it
+    /// runs, which is what an operator alerts on.
+    pub fn fold_last_success_unix_ns(&self) -> i64 {
+        self.fold_last_success_unix_ns.load(Ordering::Relaxed)
+    }
+
+    /// `pub(crate)`: the single accounting point every [`Catalog::fold`]
+    /// outcome passes through, called from the wrapper in `fold.rs` rather
+    /// than from each of the fold body's many exits. Keeping it in one place
+    /// is what makes the counters cover every fold call path (the server's
+    /// scheduled loop, its on-demand admin route, the CLI, the bench) with no
+    /// per-call-site wiring to forget.
+    pub(crate) fn record_fold_outcome(&self, now_ns: i64, succeeded: bool) {
+        if succeeded {
+            self.fold_cycles.fetch_add(1, Ordering::Relaxed);
+            self.fold_last_success_unix_ns
+                .fetch_max(now_ns, Ordering::Relaxed);
+        } else {
+            self.fold_failures.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// `pub(crate)`: lets `fold` issue
