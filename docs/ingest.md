@@ -193,11 +193,19 @@ Loop over `select!`:
   immediately (buffered), flush if `flush_est_bytes >= target_bytes` (default
   8 MiB), which is an estimate of the object this flush would write, not of
   the memory the buffer holds. A memory backstop fires the same flush when
-  `est_bytes` reaches `max(64 MiB, target_bytes)`, so a tenant whose struct
-  headers dwarf its payload still flushes before one buffer can hold an
+  `est_bytes` reaches `max(target_bytes, min(64 MiB, ceiling / 8))`, where
+  `ceiling` is the configured `--max-ingest-buffer-bytes`, so a tenant whose
+  struct headers dwarf its payload still flushes before one buffer can hold an
   unbounded amount of resident memory; the process-wide ceiling below is the
   admission-side bound and sheds rather than flushes, so it cannot stand in
-  for this one. Before merging, each point's series_id is checked against the
+  for this one. The backstop is a share of the ceiling rather than a constant
+  because a constant calibrated against the default ceiling inverts on a
+  replica sized below it: one buffer would fill past the whole budget and shed
+  every other tenant's write, and shedding is what the backstop exists to
+  avoid. `--max-ingest-buffer-bytes 0` (unlimited) has no ceiling to take a
+  share of, so the 64 MiB cap applies alone. A ceiling under `8 *
+  target_bytes` leaves `target_bytes` as the backstop, because a backstop
+  under the target would become the effective size trigger. Before merging, each point's series_id is checked against the
   canonical label set that id already claims in the buffer; a mismatch
   (hash collision) rejects the point with a typed error and increments
   the series_id_collisions counter instead of silently merging
@@ -597,12 +605,21 @@ active-series-cap breach.
 
 ## Process-wide ingest buffer byte budget (ADR-0069)
 
-The per-(tenant, shard, signal) buffer cap (~`target_bytes`) bounds each
-tenant, but not their *sum*: a burst of active tenants can grow resident
-memory without any per-tenant limit tripping (ADR-0069). One process-wide
-atomic gauge (`ravel_ingest::IngestByteBudget`) bounds that sum. It is shared
-by `Arc` across the metrics, log, and span routers, so a single ceiling
-covers every signal.
+The per-(tenant, shard, signal) memory backstop described under "Shard actor"
+(`max(target_bytes, min(64 MiB, ceiling / 8))`) bounds each buffer, but not
+their *sum*: a burst of active tenants can grow resident memory without any
+per-tenant limit tripping (ADR-0069). One process-wide atomic gauge
+(`ravel_ingest::IngestByteBudget`) bounds that sum. It is shared by `Arc`
+across the metrics, log, and span routers, so a single ceiling covers every
+signal.
+
+The two are coupled in one direction: the backstop is derived from this
+ceiling, so lowering `--max-ingest-buffer-bytes` lowers the per-buffer bound
+with it and no single buffer can hold a large share of the budget. Sizing a
+replica therefore starts from the ceiling; the per-buffer bound follows. Note
+the worst case is stated over the backstop, not over `target_bytes`: the two
+differ by up to eightfold at the default sizing, so a formula using
+`target_bytes` under-provisions.
 
 Each ingest write charges its estimated buffered bytes into the gauge in the
 router's write path, after decode/normalize/admission and before any shard
@@ -870,6 +887,7 @@ carries max token per shard).
 | shard_count | 4 (dev), scale with cores |
 | channel depth | 256 msgs |
 | target_bytes (object bytes, not buffered memory) | 8 MiB |
+| per-buffer memory backstop (buffered memory, not object bytes) | `max(target_bytes, min(64 MiB, max ingest buffer bytes / 8))`, so 64 MiB at these defaults |
 | max_flush_delay | 2 s (`--max-flush-delay`) |
 | max_flush_delay_idle | 40 s (`--max-flush-delay-idle`) |
 | min_flush_bytes (object bytes, not buffered memory) | 256 KiB (`--min-flush-bytes`) |

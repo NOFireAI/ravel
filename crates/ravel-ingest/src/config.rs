@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::budget::IngestByteBudgetLimit;
+
 /// RSEG trailer version every flush emits. ADR-0027 leaves v7 the only
 /// writable version (ADR-0092 bumped it from v6), so this is no longer a
 /// configurable knob; it mirrors `ravel_segment`'s `VERSION_V7` constant, and
@@ -227,11 +229,17 @@ pub(crate) enum FlushClockError {
     RegressionRefused(String),
 }
 
-/// Floor under the per-buffer memory backstop
-/// ([`buffer_memory_backstop_bytes`]). One eighth of the 512 MiB process
-/// ceiling (ADR-0069), so no single (shard, tenant) buffer can take a large
-/// share of the shared budget while it fills toward `target_bytes`.
-const BUFFER_MEMORY_BACKSTOP_FLOOR_BYTES: usize = 64 * 1024 * 1024;
+/// Share of the process-wide ADR-0069 ceiling that one (shard, tenant) buffer
+/// may hold before the memory backstop fires: an eighth, so seven eighths of
+/// the budget stay available to every other tenant while one buffer fills
+/// toward `target_bytes`.
+const BUFFER_MEMORY_BACKSTOP_BUDGET_DIVISOR: u64 = 8;
+
+/// Cap on the per-buffer memory backstop, so an operator who raises
+/// `--max-ingest-buffer-bytes` to tens of gigabytes does not thereby let one
+/// buffer hold gigabytes of RAM. An eighth of the 512 MiB default ceiling, so
+/// the default sizing is unchanged by the cap.
+const BUFFER_MEMORY_BACKSTOP_CAP_BYTES: usize = 64 * 1024 * 1024;
 
 /// The memory a single (shard, tenant) buffer may hold before the size trigger
 /// fires regardless of how few object bytes it would write.
@@ -241,25 +249,63 @@ const BUFFER_MEMORY_BACKSTOP_FLOOR_BYTES: usize = 64 * 1024 * 1024;
 /// labels holds roughly twenty times more RAM than the bytes it contributes to
 /// the object. Without this backstop such a tenant would fill RAM toward the
 /// ADR-0069 shed ceiling instead of flushing, and shedding a write is worse
-/// than writing a smaller object. Never below `target_bytes`, because the
-/// buffered memory of a flush is always at least the object bytes it writes,
-/// so a lower backstop would pre-empt the target it is meant to protect.
-pub(crate) fn buffer_memory_backstop_bytes(config: &IngestConfig) -> usize {
-    BUFFER_MEMORY_BACKSTOP_FLOOR_BYTES.max(config.target_bytes)
+/// than writing a smaller object.
+///
+/// Derived from the ceiling the operator configured, not from the default one:
+/// `--max-ingest-buffer-bytes` is what a shed is measured against, so a
+/// constant backstop calibrated against the default inverts this rationale on
+/// any replica sized below it. At `Bounded(64 MiB)` a constant 64 MiB backstop
+/// lets one label-heavy buffer hold the entire process budget and shed every
+/// other tenant's write until an age trigger releases it.
+/// [`IngestByteBudgetLimit::Unlimited`] has no ceiling to take a share of, so
+/// the cap applies alone: nothing sheds under it, and the cap is what keeps one
+/// buffer's resident memory bounded.
+///
+/// Never below `target_bytes`: a backstop under the target would fire first on
+/// every buffer and make the memory figure, not the object estimate, the
+/// effective size trigger, which is the defect issue #1305 fixed. When an
+/// eighth of the ceiling is itself below `target_bytes` (a ceiling under
+/// `8 * target_bytes`, so under 64 MiB at the default target) `target_bytes`
+/// wins and one buffer's share of the budget is larger than an eighth. That
+/// configuration is already degenerate: a ceiling that holds only a few
+/// target-sized objects sheds on tenant count whatever the backstop does.
+pub(crate) fn buffer_memory_backstop_bytes(
+    config: &IngestConfig,
+    ceiling: IngestByteBudgetLimit,
+) -> usize {
+    let share = match ceiling {
+        IngestByteBudgetLimit::Unlimited => BUFFER_MEMORY_BACKSTOP_CAP_BYTES,
+        IngestByteBudgetLimit::Bounded(limit) => {
+            usize::try_from(limit / BUFFER_MEMORY_BACKSTOP_BUDGET_DIVISOR)
+                .unwrap_or(usize::MAX)
+                .min(BUFFER_MEMORY_BACKSTOP_CAP_BYTES)
+        }
+    };
+    share.max(config.target_bytes)
 }
 
 /// The size trigger, shared by the metrics, log, and span shard actors:
 /// `flush_est_bytes` is the object-bytes estimate for the flush this buffer
 /// would write and gates `target_bytes`; `est_bytes` is the conservative
 /// buffered-memory figure the ADR-0069 ceiling charges and gates only the
-/// memory backstop. Keeping both here keeps one rule in one place rather than
-/// three copies that drift (issue #1305).
+/// memory backstop, whose bound comes from `ceiling`. Keeping both here keeps
+/// one rule in one place rather than three copies that drift (issue #1305).
+///
+/// The backstop can only pre-empt the target when a buffer holds more memory
+/// than the object bytes it would write, which is the case it exists for. The
+/// reverse happens too and the backstop is silent there: a native histogram
+/// charges a flat 16 bytes per point to `est_bytes` while contributing up to
+/// `32 + 8 * (buckets + spans + custom_values)` object bytes, and a log record
+/// with no attributes charges 32 against 48 object bytes. Those buffers reach
+/// `target_bytes` on the object estimate first, which is the intended trigger.
 pub(crate) fn size_trigger_fires(
     flush_est_bytes: usize,
     est_bytes: usize,
     config: &IngestConfig,
+    ceiling: IngestByteBudgetLimit,
 ) -> bool {
-    flush_est_bytes >= config.target_bytes || est_bytes >= buffer_memory_backstop_bytes(config)
+    flush_est_bytes >= config.target_bytes
+        || est_bytes >= buffer_memory_backstop_bytes(config, ceiling)
 }
 
 /// All fields are overridable; defaults match the dev-sizing table.
@@ -403,28 +449,100 @@ mod tests {
             target_bytes: 8 * 1024 * 1024,
             ..IngestConfig::default()
         };
-        let backstop = buffer_memory_backstop_bytes(&cfg);
+        let default_ceiling = IngestByteBudgetLimit::Bounded(512 * 1024 * 1024);
+        let backstop = buffer_memory_backstop_bytes(&cfg, default_ceiling);
         assert_eq!(backstop, 64 * 1024 * 1024);
 
         // Object bytes decide, whatever the buffer holds.
-        assert!(!size_trigger_fires(cfg.target_bytes - 1, 0, &cfg));
-        assert!(size_trigger_fires(cfg.target_bytes, 0, &cfg));
+        assert!(!size_trigger_fires(
+            cfg.target_bytes - 1,
+            0,
+            &cfg,
+            default_ceiling
+        ));
+        assert!(size_trigger_fires(
+            cfg.target_bytes,
+            0,
+            &cfg,
+            default_ceiling
+        ));
         assert!(
-            !size_trigger_fires(0, cfg.target_bytes, &cfg),
+            !size_trigger_fires(0, cfg.target_bytes, &cfg, default_ceiling),
             "buffered bytes at target_bytes no longer fire the trigger"
         );
 
         // Backstop decides when the buffer runs far past the payload it holds.
-        assert!(!size_trigger_fires(0, backstop - 1, &cfg));
-        assert!(size_trigger_fires(0, backstop, &cfg));
+        assert!(!size_trigger_fires(0, backstop - 1, &cfg, default_ceiling));
+        assert!(size_trigger_fires(0, backstop, &cfg, default_ceiling));
 
-        // A target above the floor raises the backstop with it, so the
+        // A target above the cap raises the backstop with it, so the
         // backstop can never pre-empt the trigger it backs.
         let wide = IngestConfig {
             target_bytes: 256 * 1024 * 1024,
             ..IngestConfig::default()
         };
-        assert_eq!(buffer_memory_backstop_bytes(&wide), 256 * 1024 * 1024);
+        assert_eq!(
+            buffer_memory_backstop_bytes(&wide, default_ceiling),
+            256 * 1024 * 1024
+        );
+    }
+
+    /// The backstop is a share of the ceiling an operator configured, not of
+    /// the default one. A replica sized with `--max-ingest-buffer-bytes
+    /// 67108864` must not let one (shard, tenant) buffer hold the whole process
+    /// budget and shed every other tenant's write.
+    #[test]
+    fn memory_backstop_is_a_share_of_the_configured_ceiling() {
+        let cfg = IngestConfig {
+            target_bytes: 8 * 1024 * 1024,
+            ..IngestConfig::default()
+        };
+        let small = 64 * 1024 * 1024_u64;
+        let backstop = buffer_memory_backstop_bytes(&cfg, IngestByteBudgetLimit::Bounded(small));
+        assert_eq!(
+            backstop,
+            8 * 1024 * 1024,
+            "an eighth of the configured ceiling, not the 64 MiB the default ceiling earns"
+        );
+        assert_eq!(
+            backstop as u64 * BUFFER_MEMORY_BACKSTOP_BUDGET_DIVISOR,
+            small,
+            "one buffer holds an eighth of the budget, leaving seven eighths"
+        );
+        assert!(
+            size_trigger_fires(0, backstop, &cfg, IngestByteBudgetLimit::Bounded(small)),
+            "the buffer flushes at an eighth of the budget"
+        );
+        assert!(
+            size_trigger_fires(
+                0,
+                small as usize - 1,
+                &cfg,
+                IngestByteBudgetLimit::Bounded(small)
+            ),
+            "a buffer one byte short of the whole ceiling has long since flushed"
+        );
+
+        // Unlimited has no ceiling to take a share of: the cap alone bounds a
+        // buffer's resident memory, and nothing sheds under it.
+        assert_eq!(
+            buffer_memory_backstop_bytes(&cfg, IngestByteBudgetLimit::Unlimited),
+            64 * 1024 * 1024
+        );
+        // A ceiling far above the default does not raise the backstop with it.
+        assert_eq!(
+            buffer_memory_backstop_bytes(
+                &cfg,
+                IngestByteBudgetLimit::Bounded(64 * 1024 * 1024 * 1024)
+            ),
+            64 * 1024 * 1024
+        );
+        // `Bounded(0)` sheds every non-empty write, so nothing can buffer to a
+        // backstop at all; `target_bytes` is the floor that remains.
+        assert_eq!(
+            buffer_memory_backstop_bytes(&cfg, IngestByteBudgetLimit::Bounded(0)),
+            8 * 1024 * 1024
+        );
     }
 
     #[test]

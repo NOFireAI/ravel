@@ -49,7 +49,7 @@ use tokio::task::JoinSet;
 use tokio::time::Duration;
 use uuid::Uuid;
 
-use crate::budget::IngestByteCharge;
+use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
@@ -557,6 +557,11 @@ pub(crate) struct SpanShardActor {
     flushes: JoinSet<()>,
     rx: mpsc::Receiver<SpanShardMsg>,
     tenants: HashMap<TenantId, SpanTenantBuf>,
+    /// The configured ADR-0069 ceiling, shared live with the router so the
+    /// per-buffer memory backstop is a fraction of the limit the operator set.
+    /// Read at trigger time rather than resolved once, because the router
+    /// installs the budget after the actors are spawned.
+    backstop_ceiling: BufferBudgetCeiling,
 }
 
 impl SpanShardActor {
@@ -571,6 +576,7 @@ impl SpanShardActor {
         config: IngestConfig,
         metrics: Arc<SpanIngestMetrics>,
         rx: mpsc::Receiver<SpanShardMsg>,
+        backstop_ceiling: BufferBudgetCeiling,
     ) -> Self {
         let ctx = Arc::new(SpanFlushCtx {
             shard,
@@ -596,6 +602,7 @@ impl SpanShardActor {
             flushes: JoinSet::new(),
             rx,
             tenants: HashMap::new(),
+            backstop_ceiling,
         }
     }
 
@@ -694,7 +701,14 @@ impl SpanShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| size_trigger_fires(b.flush_est_bytes, b.est_bytes, &self.config))
+            .map(|b| {
+                size_trigger_fires(
+                    b.flush_est_bytes,
+                    b.est_bytes,
+                    &self.config,
+                    self.backstop_ceiling.get(),
+                )
+            })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
             self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
@@ -1167,6 +1181,7 @@ mod tests {
                 config,
                 Arc::clone(&metrics),
                 rx,
+                BufferBudgetCeiling::unlimited(),
             );
             let task = tokio::spawn(actor.run());
             Harness {
@@ -1746,6 +1761,7 @@ mod tests {
             exhaustion_config(4),
             Arc::clone(&metrics),
             rx,
+            BufferBudgetCeiling::unlimited(),
         );
         let task = tokio::spawn(actor.run());
 
