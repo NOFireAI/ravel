@@ -43,8 +43,12 @@ ShardMsg::Write { tenant, points: Vec<NormalizedPoint>, ack: Option<oneshot::Sen
 ```
 
 Channel: `tokio::sync::mpsc` bounded (default 256 messages per shard).
-`send` awaiting on a full channel IS the backpressure mechanism; the gateway
-holds the request open while it awaits.
+`send` awaiting on a full channel IS a backpressure mechanism; the gateway
+holds the request open while it awaits. A stalled flush no longer fills this
+channel, though: the actor never parks on the flush permit (see "Shard actor"),
+so the channel fills only when the actor genuinely cannot keep up with merge
+work. Backpressure from a shard wedged on a throttled key prefix instead
+propagates through the ADR-0069 byte budget, which sheds at its ceiling.
 
 What actually bounds gateway memory is a process-wide in-flight
 ingest-request ceiling, `--max-inflight-ingest-requests`
@@ -332,27 +336,49 @@ resolves to its own token regardless of which flush's PUT the store lets
 through first.
 
 `max_inflight_flushes` (`IngestConfig::max_inflight_flushes`) bounds how
-many such spawned tasks one shard may have outstanding at once, via a
-per-shard `tokio::sync::Semaphore`. It is the only thing a flush trigger
-can now block on. It has two defaults, because it has two callers with
-different memory owners: **1** on `ravel-server`
-(`--max-inflight-flushes`, ADR-0067 decision 2), where nothing upstream
-caps the work a shard is offered, so raising it trades bounded extra
-per-shard memory (buffers held open by the extra in-flight flushes, up to
-`max_inflight_flushes - 1` flush windows' worth) for overlapped PUT
-latency and should be a measured decision; and **4** on `ravel-cli load`
-(`--max-inflight-flushes`, ADR-0807 as amended), where
-`--pipeline-depth` already caps the outstanding batches, so the flush
-window costs no further memory and only decides whether that bounded set
-of objects is written concurrently. `0` is rejected at the CLI edge
-(`Cli::validate` on the server, a typed `LoadError::Setup` on the
-loader): it would deadlock every flush, since a shard could never acquire
-a permit to run one.
+many spawned flush tasks may hold a permit at once on one shard, via a
+per-shard `tokio::sync::Semaphore`. The permit is acquired INSIDE the
+spawned flush task, not on the actor: a flush that stalls in its PUT retry
+loop -- a tenant whose S3 key prefix is being throttled with `503 SlowDown`,
+which S3 applies per prefix -- parks only its own task on the permit. The
+actor never parks on it. It keeps draining its mailbox and firing its age
+tick for every co-resident tenant on the shard for the whole duration of the
+stall.
 
-Whether the semaphore is actually the constraint is observable rather
-than inferred: `flush_permit_wait_ns` in the per-shard skew stats below
-accrues only when a trigger parks at the bound, so a zero there means the
-window is not being asked for anything, not that it is coping.
+That makes `max_inflight_flushes` the per-shard flush **isolation** control,
+not only a memory/latency knob. At the default **1** on `ravel-server`, one
+tenant's stalled flush holds the shard's only permit, so every co-resident
+tenant's flush queues behind it until the stall clears or its
+`max_flush_lifetime` abandons it (their writes are still accepted and their
+age triggers still fire -- the actor is alive -- but no second flush can run
+in the meantime). Raising it gives healthy tenants a permit to flush on while
+one prefix is throttled, at the cost of bounded extra per-shard memory
+(buffers held open by the extra in-flight flushes, up to
+`max_inflight_flushes - 1` flush windows' worth), all held under the ADR-0069
+byte budget. This is the lever for cross-tenant flush isolation on a shard;
+raising `--shards` is not (a strict write fans out to every shard its series
+hash to, so a wider shard set only raises the chance a write touches the
+throttled shard), and per-replica ingest affinity is not
+(docs/guides/ingest-affinity.md: within a replica every tenant still hashes
+across all that replica's shards). The two defaults differ because the two
+callers have different memory owners: **1** on `ravel-server`
+(`--max-inflight-flushes`, ADR-0067 decision 2 as amended for isolation),
+where nothing upstream caps the work a shard is offered; and **4** on
+`ravel-cli load` (`--max-inflight-flushes`, ADR-0807 as amended), where
+`--pipeline-depth` already caps the outstanding batches, so the flush window
+costs no further memory and only decides whether that bounded set of objects
+is written concurrently. `0` is rejected at the CLI edge (`Cli::validate` on
+the server, a typed `LoadError::Setup` on the loader): it would deadlock every
+flush, since a shard could never acquire a permit to run one.
+
+Backpressure at the bound now propagates through the ADR-0069 global byte
+budget rather than by parking the actor and filling the bounded channel: each
+in-flight flush holds its byte charge until it completes, so a shard wedged on
+a throttled prefix drains the budget and admission sheds at the ceiling.
+Whether the permit is the constraint is observable rather than inferred:
+`flush_permit_wait_ns` in the per-shard skew stats below accrues, in the flush
+task, whenever a task waits for a permit, so a rising value while the actor
+keeps draining means flushes are backed up on the bound.
 
 Pipelining does not change what the catalog already tolerates: a
 flush's seq is allocated at pin time, not at commit time, so two
