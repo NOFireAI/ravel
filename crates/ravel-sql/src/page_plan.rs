@@ -60,22 +60,34 @@
 //! kinds, so a pipe kind added by a later sqlparser is refused too instead of
 //! being silently admitted.
 //!
-//! Both that refusal and the row-limit one
-//! ([`PagePlanError::RowLimitInStatement`]) are taken over EVERY `Query` in
-//! the statement, not the outermost one alone. The wrap re-emits the caller's
-//! text verbatim, so a `LIMIT` inside a `WHERE` subquery, a scalar subquery,
-//! a derived table, an arm of a set operation, or a CTE is still there on
-//! every page, picking a fresh arbitrary set of rows each time it runs. See
-//! [`reject_nested_pipes_and_row_limits`] for what that walk covers and for
-//! why a nested limit is refused even when its own subquery is deterministic.
+//! That refusal, the row-limit one ([`PagePlanError::RowLimitInStatement`])
+//! and the `SELECT ... INTO` one ([`PagePlanError::SelectInto`]) are taken
+//! over EVERY `Query` in the statement, not the outermost one alone. The wrap
+//! re-emits the caller's text verbatim, so a `LIMIT` inside a `WHERE`
+//! subquery, a scalar subquery, a derived table, an arm of a set operation,
+//! or a CTE is still there on every page, picking a fresh arbitrary set of
+//! rows each time it runs. See [`reject_nested_unpageable_clauses`] for what
+//! that walk covers and for why a nested limit is refused even when its own
+//! subquery is deterministic.
 //!
-//! An `ORDER BY` term that can be NULL is refused as well
+//! # What an effective order term has to be
+//!
+//! One rule, and every refusal below is a way of failing it: **a term may
+//! participate in the effective ordering only if the text proves it NON NULL,
+//! a [`ResumeValue`] variant can carry every value its column admits, and the
+//! keyset comparison over that variant is exact for every one of them.**
+//!
+//! All three clauses fail the same way, which is why they are one rule: a row
+//! the keyset predicate cannot place is a row that appears on no page, with no
+//! error. And all three are refusals rather than `not_total: Some(..)`,
+//! because the keyset predicate is rendered whenever a resume is given and is
+//! therefore what resumes BOTH the total and the not-total path. Reporting is
+//! not a substitute for refusing.
+//!
+//! An `ORDER BY` term that can be NULL fails the first clause
 //! ([`PagePlanError::OrderTermNullable`]): a keyset comparison against NULL is
 //! NULL, so the rows whose term is NULL match no disjunct and appear on no
-//! page at all. That is a wrong answer on both the total and the not-total
-//! path, because the keyset predicate is rendered whenever a resume is given
-//! and is therefore what resumes both. `not_total: Some(..)` rescues nothing
-//! here: reporting is not a substitute for refusing.
+//! page at all.
 //!
 //! Only a term the text proves NON NULL is admitted, and a term reaches that
 //! proof by one of two routes.
@@ -94,6 +106,45 @@
 //! `count(...)` are NON NULL wherever they are selected from. `SUM`, `MIN`,
 //! `MAX` and `AVG` are not, and keep refusing, because each is NULL over
 //! empty and over all-NULL input.
+//!
+//! The other two clauses of the rule are read off the term's TYPE, from the
+//! same two routes: the public schema's field type for a base column
+//! ([`cursor_support`]), and the expression itself
+//! ([`expression_cursor_support`]).
+//!
+//! [`PagePlanError::OrderTermNotRepresentable`] is the second clause. No
+//! [`ResumeValue`] variant carries a `Dictionary`, a `Map`, a `Struct`, a
+//! list, a decimal, or a timestamp of any unit but nanoseconds, so a page's
+//! last row cannot be recorded as a cursor position at all: `samples.labels`
+//! and the four `attrs` columns are the reachable cases, and each of them used
+//! to produce a plan whose first page could never be redeemed for a second.
+//!
+//! [`PagePlanError::OrderTermNotExactlyComparable`] is the third. A float
+//! column admits NaN, NaN compares false against every bound, and
+//! [`ResumeValue::Float`] refuses a non-finite value outright, so the rows
+//! whose term is NaN land on no page for exactly the reason a NULL does.
+//! Making the predicate NaN-aware instead of refusing was considered and is
+//! not small: it needs a cursor representation for NaN, an `is_nan` arm per
+//! disjunct so NaN sorts where DataFusion sorts it, and a bit-exact equality
+//! conjunct, because `-0.0 = 0.0` is TRUE in SQL and would make the
+//! lexicographic nesting match the wrong group. Until that exists, every
+//! float term is refused; `samples.value` is the one reachable case.
+//!
+//! # Every clause of the body is read, or discarded by name
+//!
+//! Three classifications here read the parser's AST, and each one names every
+//! field it decides about with no `..` pattern: [`relation_of`] over
+//! `TableFactor::Table`, `resolution::projection_of` over the `SELECT` list,
+//! and [`shape_of`] over the `SELECT` body itself. A field that cannot change
+//! the row set is discarded by name with the reason, not by a wildcard.
+//!
+//! The cost of the wildcard has been paid three times, most recently by
+//! [`shape_of`], which read thirteen of the body's twenty-four fields: `SELECT
+//! ts, series_id INTO t2 FROM samples ORDER BY ts` was planned as a total
+//! order and `Display for Query` re-emitted the `INTO` into the derived table,
+//! so every page would have written the table again. What the naming buys is
+//! not the nine or eleven fields that were missed: it is that field
+//! twenty-five of a later sqlparser is a compile error rather than silence.
 //!
 //! # One resolution from an output name
 //!
@@ -143,6 +194,7 @@
 
 use std::ops::ControlFlow;
 
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
     Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByKind, Query, Select,
@@ -351,6 +403,50 @@ pub enum PagePlanError {
         reason: &'static str,
     },
 
+    /// An `ORDER BY` term whose type no [`ResumeValue`] variant can carry.
+    ///
+    /// The second clause of the one rule in the module docs. A page's cursor
+    /// position is the previous page's last row read back as a resume tuple,
+    /// so a term whose value has no variant to be read back into cannot be
+    /// resumed at: the caller either cannot build the second page's position
+    /// at all, or builds it out of something that is not the ordered value.
+    /// The reachable cases are `samples.labels` and the four `attrs` columns,
+    /// all of them `Map` or `Dictionary`.
+    #[error(
+        "the ORDER BY term `{column}` has no cursor representation ({kind}), so \
+         no resume position can carry the value a page ends at"
+    )]
+    OrderTermNotRepresentable { column: String, kind: String },
+
+    /// An `ORDER BY` term a [`ResumeValue`] variant carries, but whose keyset
+    /// comparison is not exact for every value the column admits.
+    ///
+    /// The third clause of the one rule. A float column admits NaN, and NaN
+    /// compares false against every value including itself, so a NaN row
+    /// satisfies no disjunct of the keyset predicate and lands on no page at
+    /// all. That is the same dropped-row failure
+    /// [`Self::OrderTermNullable`] refuses, arriving through the comparison
+    /// rather than through NULL. `samples.value` is the one reachable case.
+    #[error(
+        "the ORDER BY term `{column}` is not exactly comparable ({kind}), so the \
+         keyset predicate cannot place every value it admits and the rows it \
+         cannot place would appear on no page"
+    )]
+    OrderTermNotExactlyComparable { column: String, kind: String },
+
+    /// `SELECT ... INTO ...` at any depth.
+    ///
+    /// The page statement re-emits the caller's text verbatim into a derived
+    /// table, so the `INTO` is re-emitted with it and every page of the walk
+    /// would try to create the same table again. Refused at every depth for
+    /// the same reason a nested row limit is: an inner `Query` is re-emitted
+    /// as faithfully as the outer one.
+    #[error(
+        "a statement carrying SELECT ... INTO cannot be paged; every page \
+         re-emits the INTO and would write the table again"
+    )]
+    SelectInto,
+
     /// The resume tuple does not have one value per effective term.
     #[error("the resume position has {found} values for {expected} ORDER BY terms")]
     ResumeArity { expected: usize, found: usize },
@@ -482,10 +578,11 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
     let query = parse_query(sql)?;
 
     // Before anything else reads the `SELECT` body: a pipe operator makes that
-    // body an incomplete description of the statement, and a row limit at any
-    // depth re-evaluates per page, so every check below either answers about
-    // the wrong rows or answers about rows that change under it.
-    reject_nested_pipes_and_row_limits(&query)?;
+    // body an incomplete description of the statement, a row limit at any depth
+    // re-evaluates per page, and an `INTO` writes a table per page. So every
+    // check below either answers about the wrong rows, answers about rows that
+    // change under it, or answers about a statement that is not a read.
+    reject_nested_unpageable_clauses(&query)?;
 
     let target = page_target(sql)?;
     // The one resolution from an output name to what the text proves it holds.
@@ -511,17 +608,33 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
             target: target.describe(),
         });
     }
-    // Every effective term, the appended tiebreak included: a NULL anywhere in
-    // the ordering drops the rows it covers from every page.
+    // Every effective term, the appended tiebreak included. One rule in three
+    // clauses (see the module docs): a term participates only if the text
+    // proves it NON NULL, a `ResumeValue` variant carries every value its
+    // column admits, and the keyset comparison over that variant is exact for
+    // every one of them. Each clause fails the same way, by leaving a row on
+    // no page with no error raised.
     for term in &terms {
-        match term_nullability(&names, &term.column) {
-            NullProof::NonNull => {}
-            NullProof::Nullable => {
+        match term_admissibility(&names, &term.column) {
+            TermProof::Admissible => {}
+            TermProof::Nullable => {
                 return Err(PagePlanError::OrderTermNullable {
                     column: term.column.clone(),
                 });
             }
-            NullProof::Unproven(reason) => {
+            TermProof::NotRepresentable(kind) => {
+                return Err(PagePlanError::OrderTermNotRepresentable {
+                    column: term.column.clone(),
+                    kind,
+                });
+            }
+            TermProof::NotExactlyComparable(kind) => {
+                return Err(PagePlanError::OrderTermNotExactlyComparable {
+                    column: term.column.clone(),
+                    kind,
+                });
+            }
+            TermProof::Unproven(reason) => {
                 return Err(PagePlanError::OrderTermNullabilityUnknown {
                     column: term.column.clone(),
                     reason,
@@ -555,11 +668,11 @@ fn parse_query(sql: &str) -> Result<Query, PagePlanError> {
     }
 }
 
-/// Refuse a pipe operator and a row limit wherever either sits, not only on
-/// the outermost `Query`.
+/// Refuse a pipe operator, a row limit and a `SELECT ... INTO` wherever any of
+/// them sits, not only on the outermost `Query`.
 ///
-/// Both used to be read off the top-level `Query` alone, which made a pipe or
-/// a limit on any inner query invisible: a subquery in `WHERE`, a scalar
+/// The first two used to be read off the top-level `Query` alone, which made a
+/// pipe or a limit on any inner query invisible: a subquery in `WHERE`, a scalar
 /// subquery in the projection, a derived table in `FROM`, an arm of a set
 /// operation, and a CTE all carry their own `Query`, and `Display for Query`
 /// re-emits every one of them verbatim into the derived table the rewrite
@@ -573,9 +686,12 @@ fn parse_query(sql: &str) -> Result<Query, PagePlanError> {
 /// is a design change; this is a correctness fix, so the conservative refusal
 /// is the decision.
 ///
+/// `SELECT ... INTO` is refused on the same reasoning one level down: it is a
+/// write, and the wrap re-emits it once per page.
+///
 /// The pipe check is keyed on a pipe being PRESENT rather than on a list of
 /// pipe kinds, so a kind a later sqlparser adds fails closed.
-fn reject_nested_pipes_and_row_limits(query: &Query) -> Result<(), PagePlanError> {
+fn reject_nested_unpageable_clauses(query: &Query) -> Result<(), PagePlanError> {
     let mut found: Option<PagePlanError> = None;
     let _ = query.visit(&mut NestedShapeGuard { found: &mut found });
     match found {
@@ -603,12 +719,17 @@ impl Visitor for NestedShapeGuard<'_> {
         ControlFlow::Continue(())
     }
 
-    /// `TOP` hangs off the `SELECT` body rather than the `Query`, and an arm
-    /// of a set operation is a bare `SetExpr::Select` with no `Query` of its
-    /// own, so it needs its own hook to be seen in every position.
+    /// `TOP` and `INTO` hang off the `SELECT` body rather than the `Query`,
+    /// and an arm of a set operation is a bare `SetExpr::Select` with no
+    /// `Query` of its own, so they need their own hook to be seen in every
+    /// position.
     fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
         if select.top.is_some() {
             *self.found = Some(PagePlanError::RowLimitInStatement);
+            return ControlFlow::Break(());
+        }
+        if select.into.is_some() {
+            *self.found = Some(PagePlanError::SelectInto);
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
@@ -1188,20 +1309,154 @@ fn grouping_can_null_a_grouping_column(group_by: &GroupByExpr) -> bool {
         })
 }
 
-/// What the statement's text says about whether an effective term can be
-/// NULL.
+/// What the statement's text says about whether an effective term may
+/// participate in the effective ordering at all.
 ///
-/// The two negative answers are kept apart because they call for different
-/// repairs: `Nullable` says the term CAN be NULL and the caller has to order
-/// by something else, while `Unproven` says the text does not settle it, and
-/// names what would.
-enum NullProof {
-    /// Provably NON NULL from the text alone.
-    NonNull,
+/// One rule in three clauses, and each negative answer names which clause
+/// failed, because each calls for a different repair: `Nullable` says the term
+/// CAN be NULL, `NotRepresentable` says no cursor value can carry it,
+/// `NotExactlyComparable` says a cursor can carry it but the keyset comparison
+/// is not exact over every value it admits, and `Unproven` says the text does
+/// not settle the question and names what would.
+enum TermProof {
+    /// NON NULL, carried exactly by a [`ResumeValue`] variant, and exactly
+    /// comparable over every value the column admits.
+    Admissible,
     /// The target table's public schema declares this column nullable.
     Nullable,
-    /// Neither proved. The string is the reason the refusal quotes.
+    /// No [`ResumeValue`] variant carries a value of this term's type. The
+    /// string names the type.
+    NotRepresentable(String),
+    /// A variant carries it, but `=`, `<` and `>` over that variant do not
+    /// place every value the term admits. The string names the type.
+    NotExactlyComparable(String),
+    /// None of the above is proved. The string is the reason the refusal
+    /// quotes.
     Unproven(&'static str),
+}
+
+/// Whether a cursor can carry a value of an arrow type, and whether the keyset
+/// comparison over the variant that carries it is exact.
+///
+/// The distinction is the point. A `Map` column has no variant at all, so the
+/// caller cannot even read the position a page ended at. A `Float64` column
+/// has one, and the failure arrives one step later: NaN renders no literal
+/// that compares true against itself, so the row carrying it satisfies no
+/// disjunct. Both leave a row on no page; naming which one happened is what
+/// tells the caller whether to project a different column or to order by one.
+enum CursorSupport {
+    /// A [`ResumeValue`] variant carries every value of the type, and `=`, `<`
+    /// and `>` over it agree with the sort for every one of them.
+    Exact,
+    /// A variant carries the value, but the comparison is not exact over every
+    /// value the type admits. The string names the type.
+    Inexact(String),
+    /// No variant carries a value of this type. The string names the type.
+    Unrepresentable(String),
+}
+
+/// The cursor support of an arrow type.
+///
+/// Listed positively, with the catch-all on the unrepresentable side: a type a
+/// later arrow adds, or a schema column whose type changes, is refused rather
+/// than assumed to have a variant. The `Timestamp` arm is pinned to
+/// `Nanosecond` with no timezone because that is what
+/// [`ResumeValue::TimestampNanos`] renders; another unit or a timezone would
+/// compare a nanosecond count against a differently scaled column.
+fn cursor_support(data_type: &DataType) -> CursorSupport {
+    match data_type {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::FixedSizeBinary(_)
+        | DataType::Timestamp(TimeUnit::Nanosecond, None) => CursorSupport::Exact,
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+            CursorSupport::Inexact(format!("type {}", type_label(data_type)))
+        }
+        other => CursorSupport::Unrepresentable(format!("type {}", type_label(other))),
+    }
+}
+
+/// An arrow type as a refusal message names it.
+///
+/// `Display for DataType` is `Debug`, and the `Debug` of the one type a caller
+/// actually hits here (`samples.labels`, a `Dictionary` over a `Map`) prints
+/// every `Field` of the map's entry struct. A refusal a caller has to scroll
+/// is a refusal a caller does not read, so the nested types are named and not
+/// expanded.
+fn type_label(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Dictionary(key, value) => {
+            format!("Dictionary({}, {})", type_label(key), type_label(value))
+        }
+        DataType::Map(..) => "Map".to_string(),
+        DataType::Struct(_) => "Struct".to_string(),
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..) => {
+            "List".to_string()
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+/// The cursor support of an expression term, from the expression alone.
+///
+/// Only reached for an expression [`expression_is_non_null`] admits, so the
+/// shapes that arrive are a non-NULL literal, a `count(...)`, parentheses and
+/// a unary sign. Everything else is unrepresentable rather than assumed, on
+/// the same fail-closed reading as [`cursor_support`]'s catch-all.
+fn expression_cursor_support(expr: &SqlExpr) -> CursorSupport {
+    match expr {
+        SqlExpr::Value(value) => literal_cursor_support(&value.value),
+        SqlExpr::Nested(inner) => expression_cursor_support(inner),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus | UnaryOperator::Minus,
+            expr,
+        } => expression_cursor_support(expr),
+        // `count(...)` is a row count: a non-negative integer, which
+        // `ResumeValue::Int` carries exactly. The name is re-checked here
+        // rather than inherited from the nullability proof, so the two cannot
+        // drift into admitting different function sets.
+        SqlExpr::Function(function)
+            if bare_name(&function.name)
+                .is_some_and(|name| name.eq_ignore_ascii_case(COUNT_FUNCTION)) =>
+        {
+            CursorSupport::Exact
+        }
+        other => CursorSupport::Unrepresentable(format!("the expression `{other}`")),
+    }
+}
+
+/// The cursor support of a literal term.
+///
+/// A literal column admits exactly the one value written, so the question is
+/// only whether a variant renders that value back identically. An integer
+/// does. A decimal or exponent literal is parsed to a type the dialect
+/// chooses, `Decimal128` among them, and comparing it against a rendered
+/// float is neither of this planner's decisions to make, so it is refused.
+fn literal_cursor_support(value: &Value) -> CursorSupport {
+    match value {
+        Value::Number(text, _) => {
+            if text.parse::<i64>().is_ok() || text.parse::<u64>().is_ok() {
+                CursorSupport::Exact
+            } else {
+                CursorSupport::Unrepresentable(format!("the numeric literal {text}"))
+            }
+        }
+        Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) | Value::Boolean(_) => {
+            CursorSupport::Exact
+        }
+        other => CursorSupport::Unrepresentable(format!("the literal {other}")),
+    }
 }
 
 /// What the text says about the effective term `column`.
@@ -1213,32 +1468,37 @@ enum NullProof {
 /// end to end by construction of the variant: it exists only where the name is
 /// a column of the `FROM` relation AND that relation is the target base table
 /// itself under its own column names. What is left for this function is the
-/// declaration. A declared column is absent from the static schema, and
-/// whether it exists at all depends on the tenant's declarations rather than
-/// on the text, so it is `Unproven` rather than either answer.
+/// declaration and the declared type. A declared column is absent from the
+/// static schema, and whether it exists at all depends on the tenant's
+/// declarations rather than on the text, so it is `Unproven` rather than any
+/// other answer.
 ///
-/// A [`Provenance::Expression`] is answered by [`expression_is_non_null`]
-/// reading the expression itself, with no schema consulted and no basis
-/// required: a literal and a `count(...)` are NON NULL whatever relation they
-/// are selected from, including under an outer join or a `ROLLUP`, because
-/// neither is a grouping column that a super-aggregate row can null.
-fn term_nullability(names: &OutputResolution, column: &str) -> NullProof {
+/// A [`Provenance::Expression`] is answered by [`expression_is_non_null`] and
+/// [`expression_cursor_support`] reading the expression itself, with no schema
+/// consulted and no basis required: a literal and a `count(...)` are NON NULL
+/// whatever relation they are selected from, including under an outer join or
+/// a `ROLLUP`, because neither is a grouping column that a super-aggregate row
+/// can null.
+fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
     let (table, source) = match names.resolve(column) {
         Provenance::BaseColumn { table, column } => (table, column),
         Provenance::Expression(expr) => {
-            return if expression_is_non_null(expr) {
-                NullProof::NonNull
-            } else {
-                NullProof::Unproven(unproven::EXPRESSION_NOT_PROVABLE)
+            if !expression_is_non_null(expr) {
+                return TermProof::Unproven(unproven::EXPRESSION_NOT_PROVABLE);
+            }
+            return match expression_cursor_support(expr) {
+                CursorSupport::Exact => TermProof::Admissible,
+                CursorSupport::Inexact(kind) => TermProof::NotExactlyComparable(kind),
+                CursorSupport::Unrepresentable(kind) => TermProof::NotRepresentable(kind),
             };
         }
-        Provenance::Opaque(reason) => return NullProof::Unproven(reason),
+        Provenance::Opaque(reason) => return TermProof::Unproven(reason),
         // `plan_page` refuses an order term the statement does not project
-        // before it asks about nullability, and `tiebreak` reports a tiebreak
-        // column it cannot find as not-a-total-order rather than appending it.
-        // Answering rather than asserting keeps that ordering a property of
-        // the code above instead of a panic on a production path.
-        Provenance::NotProjected => return NullProof::Unproven(unproven::NOT_A_BARE_COLUMN),
+        // before it asks this, and `tiebreak` reports a tiebreak column it
+        // cannot find as not-a-total-order rather than appending it. Answering
+        // rather than asserting keeps that ordering a property of the code
+        // above instead of a panic on a production path.
+        Provenance::NotProjected => return TermProof::Unproven(unproven::NOT_A_BARE_COLUMN),
     };
     let schema = match table {
         SAMPLES_TABLE => public_schema(),
@@ -1246,12 +1506,18 @@ fn term_nullability(names: &OutputResolution, column: &str) -> NullProof {
         SPANS_TABLE => spans_schema(),
         ALERTS_TABLE => alerts_schema(),
         AUDIT_TABLE => audit_schema(),
-        _ => return NullProof::Unproven(unproven::NO_PUBLIC_SCHEMA),
+        _ => return TermProof::Unproven(unproven::NO_PUBLIC_SCHEMA),
     };
-    match schema.field_with_name(source) {
-        Ok(field) if !field.is_nullable() => NullProof::NonNull,
-        Ok(_) => NullProof::Nullable,
-        Err(_) => NullProof::Unproven(unproven::NOT_A_SCHEMA_COLUMN),
+    let Ok(field) = schema.field_with_name(source) else {
+        return TermProof::Unproven(unproven::NOT_A_SCHEMA_COLUMN);
+    };
+    if field.is_nullable() {
+        return TermProof::Nullable;
+    }
+    match cursor_support(field.data_type()) {
+        CursorSupport::Exact => TermProof::Admissible,
+        CursorSupport::Inexact(kind) => TermProof::NotExactlyComparable(kind),
+        CursorSupport::Unrepresentable(kind) => TermProof::NotRepresentable(kind),
     }
 }
 
@@ -1309,14 +1575,78 @@ struct SelectShape<'a> {
     grouped: bool,
     having: bool,
     qualify: bool,
+    into: bool,
+    exclude: bool,
+    select_modifier: bool,
+    value_table_mode: bool,
     other_clause: bool,
 }
 
+/// Read the whole `SELECT` body, naming every field.
+///
+/// [`relation_of`] already destructures `TableFactor::Table` with no `..`, and
+/// [`resolution::projection_of`] already reads every `SelectItem`; this was the
+/// one classification left reading a subset of what it decided about. It read
+/// thirteen of the body's twenty-four fields and said nothing about the other
+/// eleven, so `SELECT ts INTO t2 FROM samples ORDER BY ts` was planned as a
+/// total order and the `INTO` was re-emitted into the derived table, once per
+/// page.
+///
+/// So the pattern below binds every field, with no `..`. Each one is either
+/// classified or discarded by name with the reason it cannot change the row
+/// set. Field twenty-five of a later sqlparser is then a compile error here
+/// rather than another clause this function silently did not read.
 fn shape_of<'a>(query: &'a Query) -> Option<SelectShape<'a>> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return None;
     };
-    let (from_table, joined) = match select.from.as_slice() {
+    let Select {
+        // Source span of the `SELECT` keyword. Carries no semantics.
+        select_token: _,
+        // Advisory. A hint may change the plan a statement runs under, never
+        // which rows it returns, and `Display` re-emits it into the derived
+        // table unchanged, so every page runs under the same hint.
+        optimizer_hints: _,
+        distinct,
+        select_modifiers,
+        top,
+        // Says only where a `TOP` was written relative to `DISTINCT`. `top`
+        // itself is the reason, and is refused outright before this runs.
+        top_before_distinct: _,
+        // Read by `resolution::projection_of`, which is the one place an
+        // output name resolves to what it is built from. Reading it a second
+        // time here is exactly how the same wrong answer came back through a
+        // second door in earlier rounds.
+        projection: _,
+        exclude,
+        into,
+        from,
+        lateral_views,
+        prewhere,
+        // `WHERE` selects a subset of the target's rows, and each surviving row
+        // is still one scanned row under its own identity, so it does not
+        // change this classification. The keyset predicate is applied outside
+        // the derived table, so it composes with this rather than replacing it.
+        selection: _,
+        connect_by,
+        group_by,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having,
+        named_window,
+        qualify,
+        // Says only where `QUALIFY` was written relative to `WINDOW`. Both
+        // clauses are reasons in their own right below.
+        window_before_qualify: _,
+        value_table_mode,
+        // `FROM t SELECT ...` is this same body written the other way round.
+        // It selects the same rows, and `Display` re-emits whichever spelling
+        // it read, so the derived table is the caller's statement either way.
+        flavor: _,
+    } = select.as_ref();
+
+    let (from_table, joined) = match from.as_slice() {
         [only] => (
             match relation_of(&only.relation) {
                 Relation::BareTable(name) => Some(name),
@@ -1324,27 +1654,31 @@ fn shape_of<'a>(query: &'a Query) -> Option<SelectShape<'a>> {
             },
             !only.joins.is_empty(),
         ),
-        _ => (None, select.from.len() > 1),
+        _ => (None, from.len() > 1),
     };
-    let grouped = match &select.group_by {
+    let grouped = match group_by {
         GroupByExpr::All(_) => true,
         GroupByExpr::Expressions(exprs, modifiers) => !exprs.is_empty() || !modifiers.is_empty(),
     };
     Some(SelectShape {
-        top: select.top.as_ref().map(|_| ()),
+        top: top.as_ref().map(|_| ()),
         from_table,
         joined,
-        distinct: select.distinct.as_ref(),
+        distinct: distinct.as_ref(),
         grouped,
-        having: select.having.is_some(),
-        qualify: select.qualify.is_some(),
-        other_clause: !select.cluster_by.is_empty()
-            || !select.distribute_by.is_empty()
-            || !select.sort_by.is_empty()
-            || !select.lateral_views.is_empty()
-            || !select.connect_by.is_empty()
-            || select.prewhere.is_some()
-            || !select.named_window.is_empty(),
+        having: having.is_some(),
+        qualify: qualify.is_some(),
+        into: into.is_some(),
+        exclude: exclude.is_some(),
+        select_modifier: select_modifiers.is_some(),
+        value_table_mode: value_table_mode.is_some(),
+        other_clause: !cluster_by.is_empty()
+            || !distribute_by.is_empty()
+            || !sort_by.is_empty()
+            || !lateral_views.is_empty()
+            || !connect_by.is_empty()
+            || prewhere.is_some()
+            || !named_window.is_empty(),
     })
 }
 
@@ -1458,11 +1792,11 @@ fn tiebreak(
 /// passes is one whose result rows are the scan's rows, so the scan's row
 /// identity is the result's.
 ///
-/// A pipe operator and a `TOP` clause are refused outright by [`plan_page`]
-/// before this runs, so neither reason can reach a returned plan. They are
-/// named here anyway: this classification has to be complete on its own
-/// reading, not only in combination with what its one caller happens to check
-/// first.
+/// A pipe operator, a `TOP` clause and a `SELECT ... INTO` are refused
+/// outright by [`plan_page`] before this runs, so none of those reasons can
+/// reach a returned plan. They are named here anyway: this classification has
+/// to be complete on its own reading, not only in combination with what its
+/// one caller happens to check first.
 fn non_identity_shape(query: &Query, target: PageTarget) -> Option<&'static str> {
     if query.with.is_some() {
         return Some("a WITH clause");
@@ -1490,6 +1824,29 @@ fn non_identity_shape(query: &Query, target: PageTarget) -> Option<&'static str>
     }
     if shape.qualify {
         return Some("QUALIFY");
+    }
+    if shape.into {
+        return Some("SELECT ... INTO");
+    }
+    // An `EXCLUDE` list drops columns from the projection, so an output name
+    // the resolution answered for may not be projected at all. Its own reason
+    // rather than the alias-column-list one the generic dialect's misparse
+    // produces today: the refusal has to still be right when a dialect that
+    // parses `EXCLUDE` as `EXCLUDE` reaches here.
+    if shape.exclude {
+        return Some("an EXCLUDE list");
+    }
+    // MySQL's `SQL_CALC_FOUND_ROWS`, `HIGH_PRIORITY` and `STRAIGHT_JOIN`.
+    // Refused rather than modelled: one of them is defined in terms of a
+    // `LIMIT` this planner owns.
+    if shape.select_modifier {
+        return Some("a dialect SELECT modifier");
+    }
+    // `SELECT AS VALUE` and `SELECT AS STRUCT` re-wrap each row into one
+    // struct-valued column, so the output names the resolution resolved are
+    // not the output names at all.
+    if shape.value_table_mode {
+        return Some("SELECT AS VALUE or AS STRUCT");
     }
     if shape.other_clause {
         return Some("a row-reshaping clause");
@@ -1833,27 +2190,33 @@ mod tests {
              ORDER BY \"writer_seq\" ASC",
         );
 
-        let floats = plan_page(
-            "SELECT * FROM samples ORDER BY value, ts, series_id",
+        // The fixed-width binary variant, on `samples.series_id`.
+        let fixed = plan_page(
+            "SELECT * FROM samples ORDER BY series_id, ts",
             Some(&ResumePosition::new(vec![
-                ResumeValue::Float(-0.5),
-                ResumeValue::TimestampNanos(1),
                 ResumeValue::FixedSizeBinary(SERIES_ID.to_vec()),
+                ResumeValue::TimestampNanos(1),
             ])),
         )
         .expect("planned");
         assert!(
-            floats.statement.contains("\"value\" > -0.5"),
-            "unexpected float literal in {}",
-            floats.statement
+            fixed.statement.contains(&format!(
+                "\"series_id\" > arrow_cast(decode('{SERIES_ID_HEX}', 'hex'), \
+                 'FixedSizeBinary(16)')"
+            )),
+            "unexpected fixed size binary literal in {}",
+            fixed.statement
         );
 
+        // `NonFiniteResumeValue` stays reachable through `plan_page` even
+        // though no float column can be an order term any more: the resume
+        // tuple is the caller's, and nothing binds a tuple position's variant
+        // to the type of the term it is compared against.
         let err = plan_page(
-            "SELECT * FROM samples ORDER BY value, ts, series_id",
+            "SELECT * FROM logs ORDER BY severity_text, ts",
             Some(&ResumePosition::new(vec![
                 ResumeValue::Float(f64::NAN),
                 ResumeValue::TimestampNanos(1),
-                ResumeValue::FixedSizeBinary(SERIES_ID.to_vec()),
             ])),
         )
         .expect_err("refused");
@@ -1866,10 +2229,13 @@ mod tests {
     /// `Bool` and `Binary` describe declared attribute columns, and `UInt`
     /// beyond `alerts.writer_seq` likewise: a declared column is nullable, so
     /// [`PagePlanError::OrderTermNullable`] refuses an ordering on one and no
-    /// page statement can carry the literal. The literal is still this
-    /// module's contract with whatever mints a cursor, so it is pinned here
-    /// rather than left unasserted until a NULL-aware ordering makes those
-    /// columns pageable.
+    /// page statement can carry the literal. `Float` is now in the same
+    /// position for a different reason:
+    /// [`PagePlanError::OrderTermNotExactlyComparable`] refuses every float
+    /// order term, so no page statement renders one either. The literal is
+    /// still this module's contract with whatever mints a cursor, and a
+    /// caller-supplied tuple can still carry any variant against any term, so
+    /// it is pinned here rather than left unasserted.
     #[test]
     fn every_resume_variant_renders_its_exact_sql_literal() {
         let cases: Vec<(ResumeValue, String)> = vec![
@@ -2112,7 +2478,7 @@ mod tests {
     /// rows, and it is re-evaluated on every page because the wrap re-emits
     /// it: page 2 resumes past page 1's last row of a relation that no longer
     /// contains the same rows. The refusal covers a nested limit that WOULD be
-    /// deterministic too; see [`reject_nested_pipes_and_row_limits`].
+    /// deterministic too; see [`reject_nested_unpageable_clauses`].
     #[test]
     fn refuses_a_row_limit_at_every_nesting_depth() {
         let cases = [
@@ -2249,6 +2615,234 @@ mod tests {
             let plan = plan_page(sql, None);
             assert!(plan.is_ok(), "{sql:?} should plan, got {plan:?}");
         }
+    }
+
+    /// An order term whose type no [`ResumeValue`] variant can carry is
+    /// refused.
+    ///
+    /// The second clause of the one rule. Before this, the term-type set was
+    /// never checked against the cursor's at all: `ORDER BY labels` planned
+    /// with `not_total: None`, so the planner claimed a total order over a
+    /// term no caller could read a resume position off. The failure surfaced
+    /// one layer out, in the page-walk harness, as `no resume value for an
+    /// order term of type Dictionary(Int32, Map(...))`: the harness was
+    /// panicking on a plan the planner had already blessed.
+    #[test]
+    fn refuses_an_order_term_no_cursor_value_can_carry() {
+        let cases: Vec<(&str, &str, &str)> = vec![
+            (
+                "SELECT * FROM samples ORDER BY labels",
+                "labels",
+                "type Dictionary(Int32, Map)",
+            ),
+            ("SELECT * FROM logs ORDER BY attrs, ts", "attrs", "type Map"),
+            (
+                "SELECT * FROM spans ORDER BY attrs, trace_id",
+                "attrs",
+                "type Map",
+            ),
+            (
+                "SELECT * FROM alerts ORDER BY attrs, ts_ns",
+                "attrs",
+                "type Map",
+            ),
+            (
+                "SELECT * FROM audit ORDER BY attrs, ts_ns",
+                "attrs",
+                "type Map",
+            ),
+            // A projected literal is NON NULL, so it passes the first clause
+            // and reaches this one. An integer literal has a variant; a
+            // decimal literal's type is the dialect's choice, so it does not.
+            (
+                "SELECT 1.5 AS a, ts, series_id FROM samples ORDER BY a",
+                "a",
+                "the numeric literal 1.5",
+            ),
+        ];
+        for (sql, column, kind) in cases {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermNotRepresentable {
+                    column: column.to_string(),
+                    kind: kind.to_string(),
+                },
+                "unexpected refusal for {sql:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "the ORDER BY term `{column}` has no cursor representation \
+                     ({kind}), so no resume position can carry the value a page \
+                     ends at"
+                ),
+            );
+        }
+
+        // An integer literal still plans, so the refusal is about the cursor's
+        // variant set and not about literals.
+        let plan = plan_page("SELECT 1 AS a, ts, series_id FROM samples ORDER BY a", None)
+            .expect("an integer literal term plans");
+        assert_eq!(plan.order_by.len(), 3, "a, ts, series_id");
+    }
+
+    /// A float order term is refused, because the keyset comparison over it is
+    /// not exact for every value the column admits.
+    ///
+    /// The third clause of the one rule, and the one where a variant EXISTS.
+    /// `ResumeValue::Float` carries any finite float, so nothing upstream
+    /// refuses `ORDER BY value`; the failure is in the comparison. NaN is
+    /// false against every value including itself, so a NaN row satisfies no
+    /// disjunct of `(value > v) OR (value = v AND ...)` and appears on no
+    /// page, exactly as a NULL would.
+    ///
+    /// Refusal rather than a NaN-aware predicate, and the cost is why: NaN
+    /// awareness needs a cursor representation for NaN (the variant refuses
+    /// one today), an `is_nan` arm per disjunct so NaN sorts where DataFusion
+    /// sorts it, and a bit-exact equality conjunct, because `-0.0 = 0.0` is
+    /// TRUE in SQL and would make the lexicographic nesting descend into the
+    /// wrong equal group.
+    #[test]
+    fn refuses_a_float_order_term_because_nan_lands_on_no_page() {
+        for sql in [
+            "SELECT * FROM samples ORDER BY value, ts, series_id",
+            "SELECT ts, series_id, value FROM samples ORDER BY value DESC, ts",
+            "SELECT value AS v, ts, series_id FROM samples ORDER BY v",
+        ] {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermNotExactlyComparable {
+                    column: match sql.contains(" AS v") {
+                        true => "v".to_string(),
+                        false => "value".to_string(),
+                    },
+                    kind: "type Float64".to_string(),
+                },
+                "unexpected refusal for {sql:?}"
+            );
+        }
+
+        let err = plan_page("SELECT * FROM samples ORDER BY value", None).expect_err("refused");
+        assert_eq!(
+            err.to_string(),
+            "the ORDER BY term `value` is not exactly comparable (type Float64), \
+             so the keyset predicate cannot place every value it admits and the \
+             rows it cannot place would appear on no page",
+        );
+
+        // The same table still pages on its identity columns, so the refusal
+        // is about the term's type and not about `samples`.
+        let plan = plan_page("SELECT * FROM samples ORDER BY ts DESC, series_id", None)
+            .expect("the identity columns still page");
+        assert_eq!(plan.not_total, None);
+    }
+
+    /// `SELECT ... INTO` is refused at every depth.
+    ///
+    /// The one field of the `SELECT` body this dialect reaches that the shape
+    /// classification did not read. `SELECT ts, series_id INTO t2 FROM samples
+    /// ORDER BY ts` planned with `not_total: None` and re-emitted `INTO t2`
+    /// into the derived table, so every page of the walk would have tried to
+    /// write the table again.
+    #[test]
+    fn refuses_select_into_at_every_nesting_depth() {
+        for sql in [
+            "SELECT ts, series_id INTO t2 FROM samples ORDER BY ts",
+            "SELECT * FROM samples WHERE ts IN (SELECT ts INTO t3 FROM samples) ORDER BY ts",
+            "WITH c AS (SELECT ts INTO t4 FROM samples) SELECT * FROM samples ORDER BY ts",
+        ] {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::SelectInto,
+                "unexpected refusal for {sql:?}"
+            );
+        }
+        assert_eq!(
+            PagePlanError::SelectInto.to_string(),
+            "a statement carrying SELECT ... INTO cannot be paged; every page \
+             re-emits the INTO and would write the table again",
+        );
+    }
+
+    /// The three `SELECT` body fields this front end cannot reach still carry
+    /// their own shape reason.
+    ///
+    /// `EXCLUDE`, MySQL's `SELECT` modifiers and BigQuery's `SELECT AS
+    /// VALUE`/`AS STRUCT` are each gated on a dialect `DFParser` does not use,
+    /// so none of them can arrive through [`plan_page`] today. They are
+    /// classified anyway, and parsed here through the dialect that produces
+    /// them, because the alternative to a reason is silence: a front end that
+    /// later admits one of these would otherwise page it as a total order
+    /// without anything failing.
+    ///
+    /// `EXCLUDE` is the case that shows why the reason has to be its own.
+    /// Through this front end, `SELECT ts, series_id FROM samples EXCLUDE
+    /// (value) ORDER BY ts` is not an `EXCLUDE` at all: the generic dialect
+    /// reads `EXCLUDE` as a table alias with a positional column list, so it
+    /// is refused as `RENAMED_COLUMNS`, which is the right outcome for the
+    /// wrong statement.
+    #[test]
+    fn every_unreachable_select_body_field_still_carries_a_reason() {
+        use datafusion::sql::sqlparser::dialect::{
+            BigQueryDialect, Dialect, MySqlDialect, RedshiftSqlDialect,
+        };
+        use datafusion::sql::sqlparser::parser::Parser;
+
+        fn query_of(dialect: &dyn Dialect, sql: &str) -> Query {
+            let statements = Parser::parse_sql(dialect, sql).expect("parsed");
+            match statements.first() {
+                Some(Statement::Query(query)) => query.as_ref().clone(),
+                other => panic!("{sql:?} did not parse as a query: {other:?}"),
+            }
+        }
+
+        let cases: Vec<(&dyn Dialect, &str, &str)> = vec![
+            (
+                // After a non-wildcard projection: an `EXCLUDE` straight after
+                // a wildcard is a `WildcardAdditionalOptions` field instead,
+                // which `resolution::wildcard_rest` already reads.
+                &RedshiftSqlDialect {},
+                "SELECT ts, series_id EXCLUDE (value) FROM samples",
+                "an EXCLUDE list",
+            ),
+            (
+                &MySqlDialect {},
+                "SELECT SQL_CALC_FOUND_ROWS ts, series_id FROM samples",
+                "a dialect SELECT modifier",
+            ),
+            (
+                &BigQueryDialect {},
+                "SELECT AS STRUCT ts, series_id FROM samples",
+                "SELECT AS VALUE or AS STRUCT",
+            ),
+        ];
+        for (dialect, sql, reason) in cases {
+            let query = query_of(dialect, sql);
+            assert_eq!(
+                non_identity_shape(&query, PageTarget::Samples),
+                Some(reason),
+                "unexpected shape reason for {sql:?}",
+            );
+        }
+
+        // The same three statements through this front end's own dialect: two
+        // do not parse as those constructs at all, and the third is refused
+        // for a different reason. That is what makes the classifications above
+        // unreachable today rather than redundant.
+        assert_eq!(
+            plan_page(
+                "SELECT ts, series_id FROM samples EXCLUDE (value) ORDER BY ts",
+                None
+            ),
+            Err(PagePlanError::OrderTermNullabilityUnknown {
+                column: "ts".to_string(),
+                reason: unproven::RENAMED_COLUMNS,
+            }),
+            "the generic dialect reads EXCLUDE as a positional alias list",
+        );
     }
 
     /// A wildcard over a derived table or a CTE resolves against the inner
@@ -2700,6 +3294,13 @@ mod tests {
             Err(PagePlanError::OrderTermNullabilityUnknown { reason, .. }) => {
                 format!("OrderTermNullabilityUnknown: {reason}")
             }
+            Err(PagePlanError::OrderTermNotRepresentable { .. }) => {
+                "OrderTermNotRepresentable".to_string()
+            }
+            Err(PagePlanError::OrderTermNotExactlyComparable { .. }) => {
+                "OrderTermNotExactlyComparable".to_string()
+            }
+            Err(PagePlanError::SelectInto) => "SelectInto".to_string(),
             Err(PagePlanError::ResumeArity { .. }) => "ResumeArity".to_string(),
             Err(PagePlanError::NonFiniteResumeValue) => "NonFiniteResumeValue".to_string(),
         }
