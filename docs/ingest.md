@@ -56,15 +56,19 @@ not get a permit is shed immediately, never queued: HTTP 429 with
 not covered.
 
 Worst-case memory bound at the default: each in-flight request holds at most
-one decoded request body. The largest single-request cap on any covered
-route is Remote Write's post-decompression limit
-(`MAX_DECOMPRESSED_PAYLOAD_BYTES`, 64 MiB); OTLP's per-request cap is smaller
+one decoded request body. The largest such body on any covered route is not
+Remote Write's 64 MiB post-decompression cap (`MAX_DECOMPRESSED_PAYLOAD_BYTES`)
+but the resolved label bytes the RW2 decoder retains after expanding symbol
+references, bounded at `RESOLVED_LABEL_BUDGET_MULTIPLIER` (16) times that cap,
+so as much as 1 GiB per request (see "Worst-case resident memory" below for the
+resolve expansion); OTLP's per-request body is smaller
 (`MAX_DECODED_MESSAGE_BYTES`/`MAX_REQUEST_BODY_BYTES`, 16 MiB). So the
-process-wide worst case is 1024 * 64 MiB = 64 GiB if every in-flight slot
-happens to be a max-size Remote Write request, or 1024 * 16 MiB = 16 GiB if
-all are OTLP. This is a coarse ceiling, not a target: it bounds the worst
-case the operator is exposed to, not typical usage, which is why the default
-is sized for concurrency headroom rather than to fit a specific memory
+process-wide worst case is on the order of 1024 * 1 GiB = 1 TiB if every
+in-flight slot happens to be a max-size Remote Write RW2 request, or
+1024 * 16 MiB = 16 GiB if all are OTLP. This is a coarse ceiling, not a
+target: it bounds the worst case the operator is exposed to, not typical
+usage, which is why the default is sized for concurrency headroom rather than
+to fit a specific memory
 budget. Operators tune `--max-inflight-ingest-requests` down to bring the
 worst case in line with available memory.
 
