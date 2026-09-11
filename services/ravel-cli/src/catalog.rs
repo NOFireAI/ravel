@@ -71,8 +71,10 @@ fn seal_margin_ns(config: &CatalogConfig) -> anyhow::Result<i64> {
 ///
 /// `json`, when `true`, prints the whole [`FoldReport`] as JSON instead of
 /// the human-readable field-by-field report. Both forms carry every field
-/// (#1598): the human-readable report used to print 13 of 23 and silently
-/// omit the rest.
+/// (#1598): the human-readable report used to print 10 of `FoldReport`'s 23
+/// fields and silently omit the other 13. (An earlier version of this comment
+/// said "13 of 23", counting the report's printed LINES, three of which
+/// (`store`, `signal`, `seal_margin`) are not `FoldReport` fields at all.)
 #[allow(clippy::too_many_arguments)]
 pub async fn fold(
     store: Arc<dyn ObjectStoreBackend>,
@@ -190,9 +192,28 @@ fn render_fold_report(
         let store_value = header.strip_prefix("store: ").unwrap_or(&header);
         match value.as_object_mut() {
             Some(obj) => {
+                // The three lines the human report carries that are not
+                // `FoldReport` fields. All three belong in the machine-readable
+                // form too: `--json` exists for a harness reading these
+                // counters, and a report that does not say WHICH signal was
+                // folded cannot be filed against a tenant that has more than
+                // one.
                 obj.insert(
                     "store".to_string(),
                     serde_json::Value::String(store_value.to_string()),
+                );
+                obj.insert(
+                    "signal".to_string(),
+                    serde_json::Value::String(signal_word(signal.to_signal()).to_string()),
+                );
+                obj.insert(
+                    "seal_margin".to_string(),
+                    serde_json::Value::String(
+                        humantime::format_duration(Duration::from_nanos(
+                            u64::try_from(seal_margin_ns).unwrap_or(0),
+                        ))
+                        .to_string(),
+                    ),
                 );
             }
             // `FoldReport` is a struct, so this is unreachable today. Fail
