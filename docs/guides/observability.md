@@ -236,6 +236,121 @@ The first two counters tally an anomaly the query resolves past. Each
 `ravel_catalog_isolation_breach_total` increment is a query that failed with
 an explicit isolation-fault error. [Troubleshooting](operations/troubleshooting.md) gives its alert rule.
 
+### Catalog fold liveness (`ravel_catalog_fold_*`)
+
+Labels: `mode`. All three families render in every mode, but only the modes
+that fold ever move them: the background fold loop runs in every mode except
+`maintain`, and the on-demand fold route is mounted only in `all` and
+`query`. A `maintain` process therefore reports zeros permanently, which is
+why the alert below excludes it by label rather than by aggregation.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_catalog_fold_cycles_total` | Catalog folds that completed successfully, no-op folds included. |
+| `ravel_catalog_fold_failures_total` | Catalog folds that failed. The fold retries on the next tick and never fails a query directly. |
+| `ravel_catalog_fold_last_success_timestamp_seconds` | Gauge. Unix time of the last successful fold in this process, `0` if none has succeeded since it started. |
+
+A no-op fold counts as a cycle and advances the gauge. That is deliberate: a
+fold seals an ingest hour only once `max_flush_lifetime +
+clock_skew_allowance + fold_safety_margin` has elapsed past the end of that
+hour, so on a quiet tenant almost every cycle legitimately publishes nothing.
+A counter that moved only on a published snapshot would read as a stopped
+fold on exactly the tenants where nothing is wrong.
+
+The gauge is the family's point. The two counters move when the fold runs;
+only the gauge's age moves when the fold stops, and a stopped fold is the
+self-worsening failure here. The unsealed span grows for as long as nothing
+seals it, and a cold recent-window query over a wide enough unsealed span
+eventually exceeds its per-query object-store request budget and is refused
+outright. Until this gauge existed the first operator-visible symptom of a
+stopped fold was that refusal, because the fold reported its failures through
+logs alone.
+
+#### The fold-stalled alert
+
+```yaml
+groups:
+  - name: ravel-catalog-fold
+    rules:
+      - alert: RavelCatalogFoldStalled
+        expr: |
+          time() - max(
+            ravel_catalog_fold_last_success_timestamp_seconds{mode!="maintain"}
+          ) > 4800
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            No Ravel process has completed a catalog fold for longer than the
+            unsealed ingest span the configuration allows
+          description: >-
+            The unsealed span grows for as long as this holds, and a cold
+            recent-window query over a wide enough span is refused for
+            exceeding its object-store request budget. Check
+            ravel_catalog_fold_failures_total for a fold that is running and
+            failing, and the fold task's logs for the underlying store error.
+      - alert: RavelCatalogFoldFailing
+        expr: |
+          sum(rate(ravel_catalog_fold_failures_total[15m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ravel catalog folds are failing
+          description: >-
+            The fold retries each tick, so a transient store fault clears on
+            its own. A sustained failure rate does not, and it precedes
+            RavelCatalogFoldStalled by however long the threshold there
+            allows.
+```
+
+`max()` over the whole deployment, not a per-instance comparison, because the
+fold loop skips its tick entirely when `HEAD` is already fresher than
+`fold_interval`. A replica whose peers are folding on schedule correctly does
+no folding of its own, and its own gauge is correctly stale; the fleet-wide
+maximum is the figure that answers "is this catalog being folded."
+
+The threshold is the unsealed span the catalog configuration implies, in
+seconds:
+
+| Term | Default | Seconds |
+|---|---|---|
+| `max_flush_lifetime` | 1 hour | 3600 |
+| `clock_skew_allowance` | 5 minutes | 300 |
+| `fold_safety_margin` | 15 minutes | 900 |
+| **Sum** | **1 h 20 min** | **4800** |
+
+3600 + 300 + 900 = 4800 seconds is the span behind the present that a fold is
+never allowed to seal, however healthy it is. A fold that has not succeeded
+for longer than that has left more history unsealed than the configuration
+ever intends to be unsealed: below the threshold the growth is inside a
+window the deployment has already accepted as un-indexed, above it every
+further second is history that should have been sealed and was not. Raise or
+lower the threshold with those three settings, not independently of them.
+
+The headroom that keeps it quiet: `fold_interval` defaults to 5 minutes and
+the loop adds up to 10% jitter, so a healthy gauge is never older than 330
+seconds. 4800 is about 14 missed ticks of margin, which no single slow cycle,
+restart, or rolling deploy reaches.
+
+`for: 10m` covers process start rather than the stall itself. The gauge reads
+`0` until the first fold succeeds, which makes `time() - 0` exceed any
+threshold instantly, and the first scheduled fold lands one `fold_interval`
+plus jitter after start. Ten minutes is a little under two intervals of
+grace. Keeping the `0` rather than omitting the series is what lets the one
+expression cover both a fold that stopped and a fold that never worked at
+all.
+
+Two limits to know before relying on it. The gauge is process-global, not
+per-tenant or per-signal: it goes stale when the fold job stops, not when one
+tenant's fold is stuck behind a permanent fault while every other tenant
+folds normally. Tenant-labelled fold series would carry unbounded
+cardinality, so a stuck single tenant is found through
+`ravel_catalog_fold_failures_total` and the fold task's per-tenant logs
+instead. And a deployment that has discovered no tenants at all folds nothing
+and so trips this rule; scope the group to deployments that serve traffic.
+
 ### Tenancy adoption (`ravel_tenancy_v1_unkeyed_adoptions_total`)
 
 Labels: `mode`. Counts buckets this process pinned to the unkeyed tenant hash

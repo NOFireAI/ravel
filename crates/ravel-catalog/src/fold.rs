@@ -886,6 +886,33 @@ impl Catalog {
         signal: Signal,
         folder_id: Uuid,
         now_ns: i64,
+        transactions: &[Transaction],
+        default_retention_ns: Option<i64>,
+    ) -> Result<FoldReport, CatalogError> {
+        let result = self
+            .fold_inner(
+                tenant,
+                signal,
+                folder_id,
+                now_ns,
+                transactions,
+                default_retention_ns,
+            )
+            .await;
+        self.record_fold_outcome(now_ns, result.is_ok());
+        result
+    }
+
+    /// The fold body. Wrapped by [`Catalog::fold`] rather than instrumented
+    /// in place because the body returns from a dozen points and through `?`,
+    /// and a counter maintained at each of those is a counter that a later
+    /// early return silently stops feeding.
+    async fn fold_inner(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        folder_id: Uuid,
+        now_ns: i64,
         _transactions: &[Transaction],
         default_retention_ns: Option<i64>,
     ) -> Result<FoldReport, CatalogError> {
@@ -6756,5 +6783,191 @@ mod tests {
             0,
             "each fold attempt performs exactly one HEAD CAS write"
         );
+    }
+
+    /// The fold-liveness gauge and cycle counter (issue #1306). A successful
+    /// fold stamps the caller's `now_ns` into `fold_last_success_unix_ns`
+    /// exactly, and counts exactly one cycle. Exact equality, not a band: the
+    /// value IS the injected clock reading the caller passed in, since this
+    /// crate reads no clock of its own.
+    #[tokio::test]
+    async fn successful_fold_stamps_last_success_and_counts_one_cycle() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        assert_eq!(catalog.fold_cycles(), 0);
+        assert_eq!(catalog.fold_failures(), 0);
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(),
+            0,
+            "no fold has succeeded yet, so the gauge is the zero sentinel"
+        );
+
+        let now_ns = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_ns - NS_PER_HOUR).await;
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold succeeds");
+        assert!(!report.no_op, "the fold folded the sealed hour");
+
+        assert_eq!(catalog.fold_cycles(), 1);
+        assert_eq!(catalog.fold_failures(), 0);
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(),
+            now_ns,
+            "the gauge is exactly the now_ns the caller folded at"
+        );
+
+        // A second successful fold at a later clock reading advances the gauge
+        // to that reading and counts a second cycle. This one is a no-op fold
+        // (nothing new has sealed), which is the healthy steady state: the
+        // gauge must move for it, or a quiet tenant reads as a stopped fold.
+        let later_ns = now_ns + 7_000_000_000;
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                later_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold succeeds");
+        assert!(second.no_op, "nothing newly sealed between the two folds");
+        assert_eq!(catalog.fold_cycles(), 2);
+        assert_eq!(catalog.fold_failures(), 0);
+        assert_eq!(catalog.fold_last_success_unix_ns(), later_ns);
+    }
+
+    /// The other half of the same claim (issue #1306): a fold that returns
+    /// `Err` counts exactly one failure and leaves the liveness gauge where
+    /// the last SUCCESS left it. Without this half, a gauge that advanced on
+    /// every call regardless of outcome would pass the success test above and
+    /// still report a fold failing every cycle as healthy.
+    #[tokio::test]
+    async fn failing_fold_counts_a_failure_and_leaves_the_gauge_where_it_was() {
+        // Fail the second HEAD PUT: the first fold establishes a real HEAD and
+        // a real gauge value, the second fold's CAS write fails. No other PUT
+        // key contains "HEAD".
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("head cas failure".into()))
+                .with_key_contains("HEAD")
+                .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let first_ns = now_at_seal(11);
+        publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            11,
+            first_ns - NS_PER_HOUR,
+        )
+        .await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                first_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold succeeds");
+        assert_eq!(catalog.fold_cycles(), 1);
+        assert_eq!(catalog.fold_last_success_unix_ns(), first_ns);
+
+        let failing_ns = now_at_seal(13);
+        publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            13,
+            failing_ns - NS_PER_HOUR,
+        )
+        .await;
+        let err = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                failing_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect_err("the HEAD CAS fault must surface as an error");
+        assert!(matches!(err, CatalogError::Store(_)), "got {err:?}");
+
+        // The fault fired exactly once, so exactly one fold failed.
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Permanent), 1);
+        assert_eq!(catalog.fold_failures(), 1);
+        assert_eq!(
+            catalog.fold_cycles(),
+            1,
+            "the failing fold is not a cycle: the cycle count is still the one successful fold"
+        );
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(),
+            first_ns,
+            "a failing fold must not advance the liveness gauge, even though its now_ns is later"
+        );
+    }
+
+    /// `fetch_max`, not a plain store: a fold whose caller holds a clock
+    /// behind an earlier caller's cannot walk the liveness gauge backwards
+    /// and make a healthy fold look stalled.
+    #[tokio::test]
+    async fn a_backwards_clock_never_lowers_the_last_success_gauge() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let ahead_ns = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, ahead_ns - NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                ahead_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold from the ahead clock");
+        assert_eq!(catalog.fold_last_success_unix_ns(), ahead_ns);
+
+        let behind_ns = ahead_ns - 60_000_000_000;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                behind_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold from the behind clock");
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(),
+            ahead_ns,
+            "the gauge holds the highest successful now_ns, never the latest caller's"
+        );
+        assert_eq!(catalog.fold_cycles(), 2, "both folds are still cycles");
     }
 }
