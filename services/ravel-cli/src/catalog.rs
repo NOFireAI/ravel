@@ -198,23 +198,31 @@ fn render_fold_report(
                 // counters, and a report that does not say WHICH signal was
                 // folded cannot be filed against a tenant that has more than
                 // one.
-                obj.insert(
-                    "store".to_string(),
-                    serde_json::Value::String(store_value.to_string()),
-                );
-                obj.insert(
-                    "signal".to_string(),
-                    serde_json::Value::String(signal_word(signal.to_signal()).to_string()),
-                );
-                obj.insert(
-                    "seal_margin".to_string(),
-                    serde_json::Value::String(
-                        humantime::format_duration(Duration::from_nanos(
-                            u64::try_from(seal_margin_ns).unwrap_or(0),
-                        ))
-                        .to_string(),
-                    ),
-                );
+                let seal_margin = humantime::format_duration(Duration::from_nanos(
+                    u64::try_from(seal_margin_ns).unwrap_or(0),
+                ))
+                .to_string();
+                for (key, value) in [
+                    ("store", store_value.to_string()),
+                    ("signal", signal_word(signal.to_signal()).to_string()),
+                    ("seal_margin", seal_margin),
+                ] {
+                    // Refuse rather than overwrite. These three are not
+                    // `FoldReport` fields today; if the struct ever gains one
+                    // of these names, silently replacing its value would make
+                    // `--json` disagree with the human report about a real
+                    // counter, which is the class of drift this flag exists to
+                    // end.
+                    if obj
+                        .insert(key.to_string(), serde_json::Value::String(value))
+                        .is_some()
+                    {
+                        anyhow::bail!(
+                            "FoldReport now has a `{key}` field, which collides with the \
+                             report-level key of the same name; rename one of them"
+                        );
+                    }
+                }
             }
             // `FoldReport` is a struct, so this is unreachable today. Fail
             // loudly rather than silently dropping the store from the output.
