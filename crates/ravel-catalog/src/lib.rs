@@ -89,8 +89,7 @@ pub use snapshot_format::{
     DecodedColumnStats, DecodedPart, DecodedPostings, HEAD_FORMAT_VERSION, MAGIC, NamePostings,
     PartLimits, PostingsLimits, SnapshotFormatError, VERSION, column_stats_segments_concat,
     decode_column_stats, decode_column_stats_header, decode_head, decode_part, decode_postings,
-    encode_column_stats, encode_column_stats_v3, encode_head, encode_part, encode_postings,
-    validate_min_max_presence,
+    encode_column_stats_v3, encode_head, encode_part, encode_postings, validate_min_max_presence,
 };
 pub use tenant_config::{
     DeclaredColumnType, DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS,

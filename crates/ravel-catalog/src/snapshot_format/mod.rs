@@ -10,13 +10,12 @@ mod head;
 mod part;
 mod postings;
 
-#[cfg(test)]
-pub use column_stats::encode_column_stats_v2;
 pub use column_stats::{
     ColumnStatsHeaderPeek, DecodedColumnStats, column_stats_segments_concat, decode_column_stats,
-    decode_column_stats_header, encode_column_stats, encode_column_stats_v3,
-    validate_min_max_presence,
+    decode_column_stats_header, encode_column_stats_v3, validate_min_max_presence,
 };
+#[cfg(test)]
+pub use column_stats::{encode_column_stats, encode_column_stats_v2};
 pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
 pub use part::{DecodedPart, decode_part, encode_part, encode_part_ranged};
