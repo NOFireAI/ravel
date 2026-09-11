@@ -371,32 +371,21 @@ jobs:
   # alternatives ruled out serializing them behind a prior job.
   #
   # No free-disk-space: this job builds no images and runs no tests, so it does
-  # not need the headroom the heavier lanes clear. It DOES keep sccache and
-  # rust-cache: `cargo clippy --all-targets` over a 26-member workspace is a
-  # near-full compile of every crate's lib and test targets, so a cold run
-  # without the shared caches would be ~15-20m (far past the ~4-5m warm
-  # estimate ADR-0053 D3 assumes), which would undercut the whole point of a
-  # fast first-stage kill. With the caches warm from sibling jobs it lands in
-  # the ADR's window.
+  # not need the headroom the heavier lanes clear. It DOES keep rust-cache:
+  # `cargo clippy --all-targets` over a 26-member workspace is a near-full
+  # compile of every crate's lib and test targets, so a cold run without the
+  # shared cache would be ~15-20m (far past the ~4-5m warm estimate ADR-0053
+  # D3 assumes), which would undercut the whole point of a fast first-stage
+  # kill. With the cache warm from sibling jobs it lands in the ADR's window.
   lint:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Format
         run: cargo fmt --all --check
@@ -414,24 +403,11 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
-    env:
-      # Share compiled objects across the six workspace-compiling jobs via the
-      # GitHub Actions cache backend. rust-cache only restores the dependency
-      # registry; sccache reuses the built artifacts themselves.
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
@@ -469,21 +445,11 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
@@ -520,21 +486,11 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
@@ -588,21 +544,11 @@ jobs:
     # all appear across them) with no shared incremental state, and the otap
     # lane now also builds ravel-server's test targets and runs them.
     timeout-minutes: 40
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         # LINTED and RUN, not compile-probed. `cargo check -p ravel-server
         # --features otap` never built the crate's test targets, so every test
@@ -695,31 +641,20 @@ jobs:
     runs-on: ubuntu-latest
     # 20 rather than 15 as headroom for a cold compile of ravel-logseg and
     # ravel-rspan plus their test binaries, which this job did not build
-    # before. Observed 4m21s on a cache hit (sccache plus rust-cache) for the
-    # run on 4045c1e978865d313329d93b4af230f63fa85396, so 20 is roughly four
-    # times that rather than a measured ceiling. It is sized for the misses:
-    # a Cargo.lock change, a toolchain bump, an evicted cache, or the sccache
-    # install taking its continue-on-error path, which clears RUSTC_WRAPPER
-    # and compiles the job unwrapped. Nothing declares `needs: fuzz`, so a
-    # generous ceiling blocks no other job.
+    # before. Observed 4m21s on a cache hit (rust-cache) for the run on
+    # 4045c1e978865d313329d93b4af230f63fa85396, so 20 is roughly four times
+    # that rather than a measured ceiling. It is sized for the misses: a
+    # Cargo.lock change, a toolchain bump, or an evicted cache. Nothing
+    # declares `needs: fuzz`, so a generous ceiling blocks no other job.
     timeout-minutes: 20
     env:
       # Bounded case count keeps wall-clock in check while exploring far more
       # of the corrupt-input space than the 256-case default.
       PROPTEST_CASES: 4096
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
@@ -771,21 +706,11 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
@@ -944,21 +869,11 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
@@ -1039,20 +954,10 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.promql_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
@@ -1112,9 +1017,9 @@ jobs:
   # The release binaries are built on the runner and the images assembled from
   # them (Dockerfile.prebuilt) instead of letting kind-up.sh run the root
   # Dockerfile's builder stage: that stage recompiles the whole workspace inside
-  # Docker with CARGO_BUILD_JOBS=2 and no access to this workflow's caches (57
+  # Docker with CARGO_BUILD_JOBS=2 and no access to this workflow's cache (57
   # minutes measured on an 8 GiB arm64 host). RAVEL_SKIP_IMAGE_BUILD=1 exists
-  # for exactly this split, and the sccache/rust-cache setup here is the same one
+  # for exactly this split, and the rust-cache setup here is the same one
   # `check` uses, so the release build starts warm.
   k8s-build:
     needs: changes
@@ -1133,12 +1038,10 @@ jobs:
     runs-on: ubuntu-latest
     # 55m: the original single job's 60m covered the release build plus the
     # kind half; this half is build + docker save + artifact upload only, but
-    # a cold-sccache release build alone has been observed near 45m, and the
+    # a cold release build alone has been observed near 45m, and the
     # save/upload adds real minutes on top of that, not headroom to spend.
     timeout-minutes: 55
     env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
       # The tags the assembly step writes; k8s-integration loads them into the
       # cluster and points the RavelCluster at them, so both jobs set the same
       # values. Not the script's `:kind-dev` default on purpose: a developer's
@@ -1153,13 +1056,6 @@ jobs:
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Exactly what the root Dockerfile's builder stage compiles for these
       # images, including ravel-cli: scripts/kind-up.sh's store-qualification
@@ -1236,8 +1132,8 @@ jobs:
       # land on this runner even though the release build moved to k8s-build.
       - uses: ./.github/actions/free-disk-space
       # This job compiles nothing (kind-up.sh runs with RAVEL_SKIP_IMAGE_BUILD=1
-      # and the node-image resolve step is a sed), so it carries no toolchain,
-      # sccache, or rust-cache setup -- only the images k8s-build produced.
+      # and the node-image resolve step is a sed), so it carries no toolchain
+      # or rust-cache setup -- only the images k8s-build produced.
       - name: Download the assembled images
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -1392,7 +1288,7 @@ jobs:
   #
   # Path-gated rather than run on every push. This Dockerfile recompiles the
   # whole workspace inside Docker at CARGO_BUILD_JOBS=2 (the cap that keeps it
-  # from OOM-killing) with no access to this workflow's sccache --
+  # from OOM-killing) with no access to this workflow's cache --
   # 57 minutes measured on an 8 GiB arm64 host, per k8s-integration's notes --
   # so running it on every PR push would be by far the most expensive job here.
   # Every regression the issue names (a broken COPY path, a bad stage name, a
@@ -1410,7 +1306,7 @@ jobs:
     runs-on: ubuntu-latest
     # 60m, not the ~10m the no-op path suggests: when Dockerfile/.dockerignore
     # actually change this job runs a full workspace compile inside Docker at
-    # CARGO_BUILD_JOBS=2 with no access to this workflow's sccache (~57m
+    # CARGO_BUILD_JOBS=2 with no access to this workflow's cache (~57m
     # measured on a constrained host per the notes below). A single timeout
     # covers the whole job regardless of which path it takes, so it must be
     # sized to the build path or it would kill every real Dockerfile change;
@@ -1488,21 +1384,11 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
@@ -1532,7 +1418,7 @@ jobs:
   # Container-first quickstart verification (ADR-0081 decisions 5, 6, 7). Builds
   # the pull request's OWN ravel-server (the shipping `--features
   # sql,flight-sql,otap`) and ravel-cli on the
-  # runner with the shared sccache/rust-cache, assembles a runtime image from
+  # runner with the shared rust-cache, assembles a runtime image from
   # them via Dockerfile.prebuilt (both binaries, because that file's `server`
   # target COPYs ravel-cli for the store-qualification path too), brings up
   # deploy/docker-compose/ravel.yml pointed at that image, drives real telemetry
@@ -1556,8 +1442,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
       # The tag the assemble step writes and compose consumes via RAVEL_IMAGE.
       RAVEL_IMAGE: ravel-server:quickstart-ci
       COMPOSE_FILE: deploy/docker-compose/ravel.yml
@@ -1605,14 +1489,6 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         if: steps.filter.outputs.run == 'true'
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        if: steps.filter.outputs.run == 'true'
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.filter.outputs.run == 'true' && steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.filter.outputs.run == 'true'
       # Both binaries: Dockerfile.prebuilt's `server` target COPYs ravel-server
