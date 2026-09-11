@@ -533,8 +533,8 @@ such a part, it is scanned (ADR-1413 decision 6). Absence is never an error.
 
 The whole-tenant v1 (`SnapshotColumnStatsRef`, formerly HEAD field 11,
 ADR-0850) and v2 (`SnapshotColumnStatsPartRef` at the whole-tenant scope,
-formerly HEAD field 13, ADR-0942) forms are retired by ADR-1413 decision 6
-(#1600): the fold no longer publishes either at any size, fields 11 and 13
+formerly HEAD field 13, ADR-0942) forms are retired by ADR-1413 decision 6:
+the fold no longer publishes either at any size, fields 11 and 13
 are `reserved` on `SnapshotHead` (never reused), and the decoder's accepted
 set of `.cstat` envelope versions is exactly `{3}` -- a v1 or v2 object, if
 one somehow still existed, is rejected as an unsupported version rather than
@@ -560,8 +560,8 @@ alone.
 Cost, in accounted GETs: one HEAD GET, plus exactly one GET per covered part
 that carries its own field-7 ref, and nothing else. A part without a field-7
 ref, or whose v3 object is absent or refused, costs no additional GET beyond
-the one already spent (or not spent) on it; the query simply scans that
-part's segments directly.
+the one already spent (or not spent) on it; the query scans that part's
+segments directly.
 
 The fold writes one v3 object per part it actually re-encodes this fold
 (never for a part carried forward by reference, since that part's `.csnap`
@@ -605,7 +605,7 @@ the error (`SnapshotFormatError::ColumnStatsPartOverBound`/
 `CatalogError::ColumnStatsPartOverBound`) and write no object -- there is no
 truncated object for a reader to silently trust.
 
-**Retirement of the whole-object forms (ADR-1413 decision 6, #1600).** The
+**Retirement of the whole-object forms (ADR-1413 decision 6).** The
 fold no longer writes the v1 or v2 whole-tenant statistics at any size: v3
 per-part objects at field 7 are the only form published. `SnapshotHead`
 fields 11 and 13 are `reserved`, so there is no struct field left to set or
