@@ -61,16 +61,16 @@ pub struct DecodedColumnStats {
 }
 
 /// Encodes a **v1** (ADR-0850, L0-tuple-keyed) column-statistics object, the
-/// `SnapshotHead.column_stats` (field 11) artifact. Validates `segments`
+/// former `SnapshotHead.column_stats` (field 11) artifact. Validates `segments`
 /// against the same rules `decode_column_stats` enforces for v1 (writer_id
 /// width, tuple sort order, no duplicate identity), mirroring `encode_part`'s
 /// defensive-validation precedent: an object this function writes can never
 /// fail its own decode.
 ///
-/// Stamps envelope version 1 explicitly, NOT [`COLUMN_STATS_WRITE_VERSION`]:
-/// the ADR-0942 dual-publish window keeps writing the v1 object byte-for-byte
-/// as before even after the write version moves to 2. The v2 (part-keyed)
-/// artifact is written by [`encode_column_stats_v2`].
+/// Retired format. ADR-1413 decision 6 removed the whole-object publish, so no
+/// production path calls this: it survives to build v1 bytes for the tests that
+/// prove the decoder now rejects them, the read set being exactly `{3}`. Stamps
+/// envelope version 1 explicitly, never [`COLUMN_STATS_WRITE_VERSION`].
 pub fn encode_column_stats(
     tenant_hash: [u8; 16],
     signal: u32,
@@ -81,11 +81,15 @@ pub fn encode_column_stats(
 }
 
 /// Encodes a **v2** (ADR-0942, part-hash-keyed) column-statistics object, the
-/// `SnapshotHead.column_stats_part` (field 13) artifact. Each segment record
-/// must carry its covered part's content hash (blake3) in its `writer_id` slot
-/// as 32 bytes; records are sorted and deduplicated by that hash, not the
-/// five-field identity tuple, so L0 and L1 parts are named uniformly and two L1
-/// parts of one bucket never collide. Stamps [`COLUMN_STATS_WRITE_VERSION`].
+/// former `SnapshotHead.column_stats_part` (field 13) artifact. Each segment
+/// record must carry its covered part's content hash (blake3) in its
+/// `writer_id` slot as 32 bytes; records are sorted and deduplicated by that
+/// hash, not the five-field identity tuple, so L0 and L1 parts are named
+/// uniformly and two L1 parts of one bucket never collide.
+///
+/// Retired format, on the same ADR-1413 decision 6 as [`encode_column_stats`],
+/// and `#[cfg(test)]` because nothing outside the tests that prove the decoder
+/// rejects v2 constructs one.
 #[cfg(test)]
 pub fn encode_column_stats_v2(
     tenant_hash: [u8; 16],
