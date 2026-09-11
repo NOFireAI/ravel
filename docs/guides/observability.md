@@ -338,13 +338,18 @@ catalog being folded."
 
 The grouping is by `signal` because there is no such thing as "the fold" to be
 alive or dead. There are three independent fold loops per process, one per
-signal, and each is a single point of failure for its own signal's sealed
-history. An ungrouped `max()` collapses all three into one number that two
-healthy loops keep fresh while the third is dead, which is the same
-hides-a-dead-component shape as reading a process-global gauge across a
-split-role fleet. Grouping by `signal` produces one sample per signal, and any
-one of them crossing the threshold fires with `signal` on the alert, so the
-page names which history has stopped sealing.
+signal, and one replica's loop going idle is the healthy case described
+above, not a failure: the fleet stays covered for that signal as long as one
+peer still folds and stamps it. A single process's loop is a point of
+failure for a signal's sealed history only in a single-folding-replica
+deployment, or fleet-wide when a signal-specific fault kills that loop on
+every replica at once -- and that fleet-wide case is what the grouping
+exists to catch. An ungrouped `max()` collapses all three signals into one
+number that two healthy loops keep fresh while the third is dead fleet-wide,
+which is the same hides-a-dead-component shape as reading a process-global
+gauge across a split-role fleet. Grouping by `signal` produces one sample per
+signal, and any one of them crossing the threshold fires with `signal` on the
+alert, so the page names which history has stopped sealing.
 
 The `or absent(...)` branch covers the outage the staleness comparison alone
 cannot see. `max by (signal)` of an empty instant vector is empty, and
@@ -397,7 +402,7 @@ Yes, two pairs, and both are deliberate:
   co-scraped `maintain` alive" are byte-for-byte identical at the scrape: three
   `mode="maintain"` series at `0` and nothing else. No arrangement of these
   operands can tell an intended topology from a fleet-wide death, because the
-  dead processes' series are simply gone and absence carries no intent.
+  dead processes' series are gone and absence carries no intent.
 - "`--disable-fold` everywhere" and "every fold loop crashed before its first
   success" are likewise identical: every gauge at its `0` sentinel under a full
   set of non-`maintain` series.
