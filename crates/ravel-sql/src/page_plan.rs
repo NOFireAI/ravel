@@ -74,12 +74,14 @@
 //!
 //! One rule, and every refusal below is a way of failing it: **a term may
 //! participate in the effective ordering only if the text proves it NON NULL,
-//! a [`ResumeValue`] variant can carry every value its column admits, and the
-//! keyset comparison over that variant is exact for every one of them.**
+//! and a [`ResumeValue`] variant can carry every value its column admits,
+//! exactly -- rendered to a literal the engine reads back as the same value,
+//! so the keyset comparison against it is the comparison the sort made.**
 //!
-//! All three clauses fail the same way, which is why they are one rule: a row
-//! the keyset predicate cannot place is a row that appears on no page, with no
-//! error. And all three are refusals rather than `not_total: Some(..)`,
+//! Both clauses fail the same way, which is why they are one rule: a row the
+//! keyset predicate cannot place, or cannot resume from, is a row that appears
+//! on no page, with no error. And both are refusals rather than
+//! `not_total: Some(..)`,
 //! because the keyset predicate is rendered whenever a resume is given and is
 //! therefore what resumes BOTH the total and the not-total path. Reporting is
 //! not a substitute for refusing.
@@ -107,28 +109,34 @@
 //! `MAX` and `AVG` are not, and keep refusing, because each is NULL over
 //! empty and over all-NULL input.
 //!
-//! The other two clauses of the rule are read off the term's TYPE, from the
-//! same two routes: the public schema's field type for a base column
+//! The other clauses of the rule are read off the term's TYPE, from the same
+//! two routes: the public schema's field type for a base column
 //! ([`cursor_support`]), and the expression itself
-//! ([`expression_cursor_support`]).
+//! ([`expression_cursor_support`]). Both answer
+//! [`PagePlanError::OrderTermNotRepresentable`], and a type fails that check
+//! in either of two ways.
 //!
-//! [`PagePlanError::OrderTermNotRepresentable`] is the second clause. No
-//! [`ResumeValue`] variant carries a `Dictionary`, a `Map`, a `Struct`, a
-//! list, a decimal, or a timestamp of any unit but nanoseconds, so a page's
-//! last row cannot be recorded as a cursor position at all: `samples.labels`
-//! and the four `attrs` columns are the reachable cases, and each of them used
-//! to produce a plan whose first page could never be redeemed for a second.
+//! It can have no [`ResumeValue`] variant at all. Nothing carries a
+//! `Dictionary`, a `Map`, a `Struct`, a list, a decimal, or a timestamp of any
+//! unit but nanoseconds, so a page's last row cannot be recorded as a cursor
+//! position: `samples.labels` and the four `attrs` columns are the reachable
+//! cases, and each of them used to produce a plan whose first page could never
+//! be redeemed for a second.
 //!
-//! [`PagePlanError::OrderTermNotExactlyComparable`] is the third. A float
-//! column admits NaN, NaN compares false against every bound, and
-//! [`ResumeValue::Float`] refuses a non-finite value outright, so the rows
-//! whose term is NaN land on no page for exactly the reason a NULL does.
-//! Making the predicate NaN-aware instead of refusing was considered and is
-//! not small: it needs a cursor representation for NaN, an `is_nan` arm per
-//! disjunct so NaN sorts where DataFusion sorts it, and a bit-exact equality
-//! conjunct, because `-0.0 = 0.0` is TRUE in SQL and would make the
-//! lexicographic nesting match the wrong group. Until that exists, every
-//! float term is refused; `samples.value` is the one reachable case.
+//! Or it can have a variant that does not carry every value the column admits,
+//! which is the float case. A `Float64` column admits NaN and the infinities,
+//! and [`ResumeValue::Float`] refuses all three
+//! ([`PagePlanError::NonFiniteResumeValue`]), because none has a SQL literal
+//! to splice. Comparison is not the problem: DataFusion orders floats totally,
+//! so `NaN = NaN` is TRUE, `NaN` sorts after every number, `-0.0` sorts before
+//! `0.0`, and a keyset predicate does place a NaN row on a page. What it
+//! cannot do is resume FROM one. A page whose last row carries NaN mints no
+//! cursor, so under `ORDER BY value` the walk dies on the last page and under
+//! `ORDER BY value DESC` it dies on the first, and every row it had not
+//! reached appears on no page. Carrying NaN in a cursor instead of refusing
+//! the term needs a literal DataFusion parses back to the same bit pattern and
+//! a disjunct that places it where the sort does; until that exists, every
+//! float term is refused, and `samples.value` is the one reachable case.
 //!
 //! # Every clause of the body is read, or discarded by name
 //!
@@ -403,36 +411,26 @@ pub enum PagePlanError {
         reason: &'static str,
     },
 
-    /// An `ORDER BY` term whose type no [`ResumeValue`] variant can carry.
+    /// An `ORDER BY` term whose values a [`ResumeValue`] cannot carry.
     ///
     /// The second clause of the one rule in the module docs. A page's cursor
     /// position is the previous page's last row read back as a resume tuple,
-    /// so a term whose value has no variant to be read back into cannot be
+    /// so a term whose value cannot be read back into a variant cannot be
     /// resumed at: the caller either cannot build the second page's position
     /// at all, or builds it out of something that is not the ordered value.
-    /// The reachable cases are `samples.labels` and the four `attrs` columns,
-    /// all of them `Map` or `Dictionary`.
+    ///
+    /// Two shapes fail it. A type with no variant at all: `samples.labels` and
+    /// the four `attrs` columns, all of them `Map` or `Dictionary`. And a type
+    /// whose variant does not cover it, which is every float column, because
+    /// `Float64` admits NaN and the infinities and
+    /// [`Self::NonFiniteResumeValue`] refuses all three. `samples.value` is
+    /// the reachable case of the second shape.
     #[error(
-        "the ORDER BY term `{column}` has no cursor representation ({kind}), so \
-         no resume position can carry the value a page ends at"
+        "the ORDER BY term `{column}` has values no resume position can carry \
+         ({kind}), so a page ending on one would mint no cursor and every row \
+         after it would appear on no page"
     )]
     OrderTermNotRepresentable { column: String, kind: String },
-
-    /// An `ORDER BY` term a [`ResumeValue`] variant carries, but whose keyset
-    /// comparison is not exact for every value the column admits.
-    ///
-    /// The third clause of the one rule. A float column admits NaN, and NaN
-    /// compares false against every value including itself, so a NaN row
-    /// satisfies no disjunct of the keyset predicate and lands on no page at
-    /// all. That is the same dropped-row failure
-    /// [`Self::OrderTermNullable`] refuses, arriving through the comparison
-    /// rather than through NULL. `samples.value` is the one reachable case.
-    #[error(
-        "the ORDER BY term `{column}` is not exactly comparable ({kind}), so the \
-         keyset predicate cannot place every value it admits and the rows it \
-         cannot place would appear on no page"
-    )]
-    OrderTermNotExactlyComparable { column: String, kind: String },
 
     /// `SELECT ... INTO ...` at any depth.
     ///
@@ -451,9 +449,8 @@ pub enum PagePlanError {
     #[error("the resume position has {found} values for {expected} ORDER BY terms")]
     ResumeArity { expected: usize, found: usize },
 
-    /// A NaN or infinite resume value. Neither has a SQL literal, and NaN
-    /// compares false against everything, so a page resumed at one would be
-    /// empty rather than wrong-by-a-row.
+    /// A NaN or infinite resume value. Neither has a SQL literal to splice, so
+    /// there is no page to plan rather than a page that is wrong by a row.
     #[error("a resume value is not finite, so it has no SQL literal")]
     NonFiniteResumeValue,
 }
@@ -608,12 +605,11 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
             target: target.describe(),
         });
     }
-    // Every effective term, the appended tiebreak included. One rule in three
+    // Every effective term, the appended tiebreak included. One rule in two
     // clauses (see the module docs): a term participates only if the text
-    // proves it NON NULL, a `ResumeValue` variant carries every value its
-    // column admits, and the keyset comparison over that variant is exact for
-    // every one of them. Each clause fails the same way, by leaving a row on
-    // no page with no error raised.
+    // proves it NON NULL, and a `ResumeValue` variant carries every value its
+    // column admits, exactly. Both fail the same way, by leaving a row on no
+    // page with no error raised.
     for term in &terms {
         match term_admissibility(&names, &term.column) {
             TermProof::Admissible => {}
@@ -624,12 +620,6 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
             }
             TermProof::NotRepresentable(kind) => {
                 return Err(PagePlanError::OrderTermNotRepresentable {
-                    column: term.column.clone(),
-                    kind,
-                });
-            }
-            TermProof::NotExactlyComparable(kind) => {
-                return Err(PagePlanError::OrderTermNotExactlyComparable {
                     column: term.column.clone(),
                     kind,
                 });
@@ -1312,46 +1302,41 @@ fn grouping_can_null_a_grouping_column(group_by: &GroupByExpr) -> bool {
 /// What the statement's text says about whether an effective term may
 /// participate in the effective ordering at all.
 ///
-/// One rule in three clauses, and each negative answer names which clause
+/// One rule in two clauses, and each negative answer names which clause
 /// failed, because each calls for a different repair: `Nullable` says the term
-/// CAN be NULL, `NotRepresentable` says no cursor value can carry it,
-/// `NotExactlyComparable` says a cursor can carry it but the keyset comparison
-/// is not exact over every value it admits, and `Unproven` says the text does
-/// not settle the question and names what would.
+/// CAN be NULL, `NotRepresentable` says no cursor value can carry every value
+/// it admits, and `Unproven` says the text does not settle the question and
+/// names what would.
 enum TermProof {
-    /// NON NULL, carried exactly by a [`ResumeValue`] variant, and exactly
-    /// comparable over every value the column admits.
+    /// NON NULL, and carried exactly by a [`ResumeValue`] variant for every
+    /// value the column admits.
     Admissible,
     /// The target table's public schema declares this column nullable.
     Nullable,
-    /// No [`ResumeValue`] variant carries a value of this term's type. The
-    /// string names the type.
+    /// No [`ResumeValue`] variant carries every value of this term's type. The
+    /// string names the type and, where the type is partly carried, what it
+    /// admits that no variant holds.
     NotRepresentable(String),
-    /// A variant carries it, but `=`, `<` and `>` over that variant do not
-    /// place every value the term admits. The string names the type.
-    NotExactlyComparable(String),
-    /// None of the above is proved. The string is the reason the refusal
+    /// Neither of the above is proved. The string is the reason the refusal
     /// quotes.
     Unproven(&'static str),
 }
 
-/// Whether a cursor can carry a value of an arrow type, and whether the keyset
-/// comparison over the variant that carries it is exact.
+/// Whether a cursor can carry every value of an arrow type.
 ///
-/// The distinction is the point. A `Map` column has no variant at all, so the
-/// caller cannot even read the position a page ended at. A `Float64` column
-/// has one, and the failure arrives one step later: NaN renders no literal
-/// that compares true against itself, so the row carrying it satisfies no
-/// disjunct. Both leave a row on no page; naming which one happened is what
-/// tells the caller whether to project a different column or to order by one.
+/// `Exact` is the whole domain of the type, rendered to a literal the engine
+/// reads back as the same value. Anything short of that is
+/// `Unrepresentable`, whether the type has no [`ResumeValue`] variant at all
+/// (a `Map`) or has one that does not cover it (a `Float64`, whose NaN and
+/// infinities [`ResumeValue::Float`] refuses). The two are one answer here
+/// because they have one consequence: a page ending on such a value mints no
+/// cursor, so the string carries the distinction into the refusal instead.
 enum CursorSupport {
-    /// A [`ResumeValue`] variant carries every value of the type, and `=`, `<`
-    /// and `>` over it agree with the sort for every one of them.
+    /// A [`ResumeValue`] variant carries every value of the type, and the
+    /// literal it renders reads back as the same value.
     Exact,
-    /// A variant carries the value, but the comparison is not exact over every
-    /// value the type admits. The string names the type.
-    Inexact(String),
-    /// No variant carries a value of this type. The string names the type.
+    /// Some value of the type reaches no [`ResumeValue`]. The string names the
+    /// type and what it admits that no variant holds.
     Unrepresentable(String),
 }
 
@@ -1381,7 +1366,10 @@ fn cursor_support(data_type: &DataType) -> CursorSupport {
         | DataType::FixedSizeBinary(_)
         | DataType::Timestamp(TimeUnit::Nanosecond, None) => CursorSupport::Exact,
         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-            CursorSupport::Inexact(format!("type {}", type_label(data_type)))
+            CursorSupport::Unrepresentable(format!(
+                "type {} admits NaN and the infinities, which no resume value carries",
+                type_label(data_type),
+            ))
         }
         other => CursorSupport::Unrepresentable(format!("type {}", type_label(other))),
     }
@@ -1488,7 +1476,6 @@ fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
             }
             return match expression_cursor_support(expr) {
                 CursorSupport::Exact => TermProof::Admissible,
-                CursorSupport::Inexact(kind) => TermProof::NotExactlyComparable(kind),
                 CursorSupport::Unrepresentable(kind) => TermProof::NotRepresentable(kind),
             };
         }
@@ -1516,7 +1503,6 @@ fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
     }
     match cursor_support(field.data_type()) {
         CursorSupport::Exact => TermProof::Admissible,
-        CursorSupport::Inexact(kind) => TermProof::NotExactlyComparable(kind),
         CursorSupport::Unrepresentable(kind) => TermProof::NotRepresentable(kind),
     }
 }
@@ -2231,7 +2217,7 @@ mod tests {
     /// [`PagePlanError::OrderTermNullable`] refuses an ordering on one and no
     /// page statement can carry the literal. `Float` is now in the same
     /// position for a different reason:
-    /// [`PagePlanError::OrderTermNotExactlyComparable`] refuses every float
+    /// [`PagePlanError::OrderTermNotRepresentable`] refuses every float
     /// order term, so no page statement renders one either. The literal is
     /// still this module's contract with whatever mints a cursor, and a
     /// caller-supplied tuple can still carry any variant against any term, so
@@ -2673,9 +2659,9 @@ mod tests {
             assert_eq!(
                 err.to_string(),
                 format!(
-                    "the ORDER BY term `{column}` has no cursor representation \
-                     ({kind}), so no resume position can carry the value a page \
-                     ends at"
+                    "the ORDER BY term `{column}` has values no resume position can \
+                     carry ({kind}), so a page ending on one would mint no cursor \
+                     and every row after it would appear on no page"
                 ),
             );
         }
@@ -2687,24 +2673,25 @@ mod tests {
         assert_eq!(plan.order_by.len(), 3, "a, ts, series_id");
     }
 
-    /// A float order term is refused, because the keyset comparison over it is
-    /// not exact for every value the column admits.
+    /// A float order term is refused, because no cursor can carry the NaN and
+    /// the infinities the column admits.
     ///
-    /// The third clause of the one rule, and the one where a variant EXISTS.
-    /// `ResumeValue::Float` carries any finite float, so nothing upstream
-    /// refuses `ORDER BY value`; the failure is in the comparison. NaN is
-    /// false against every value including itself, so a NaN row satisfies no
-    /// disjunct of `(value > v) OR (value = v AND ...)` and appears on no
-    /// page, exactly as a NULL would.
+    /// The half of the second clause where a variant EXISTS and does not cover
+    /// the type. `ResumeValue::Float` carries any FINITE float, so nothing
+    /// upstream refuses `ORDER BY value`, and the comparison is not the
+    /// problem: DataFusion orders floats totally, so `NaN = NaN` is TRUE and a
+    /// keyset disjunct does place a NaN row on a page. What no caller can do
+    /// is resume FROM that row. Rendering its cursor position hits
+    /// [`PagePlanError::NonFiniteResumeValue`], so the page after it is never
+    /// planned and every row the walk had not reached appears on no page.
     ///
-    /// Refusal rather than a NaN-aware predicate, and the cost is why: NaN
-    /// awareness needs a cursor representation for NaN (the variant refuses
-    /// one today), an `is_nan` arm per disjunct so NaN sorts where DataFusion
-    /// sorts it, and a bit-exact equality conjunct, because `-0.0 = 0.0` is
-    /// TRUE in SQL and would make the lexicographic nesting descend into the
-    /// wrong equal group.
+    /// Refusal rather than a NaN-carrying cursor, and the cost is why: it
+    /// needs a literal DataFusion parses back to the same bit pattern (the
+    /// variant renders none today, and `'NaN'::double` is not `{:?}` output),
+    /// plus a disjunct that places it where the sort does, at the DESC end
+    /// under `ORDER BY value` and at the ASC end under `DESC`.
     #[test]
-    fn refuses_a_float_order_term_because_nan_lands_on_no_page() {
+    fn refuses_a_float_order_term_because_no_cursor_carries_nan() {
         for sql in [
             "SELECT * FROM samples ORDER BY value, ts, series_id",
             "SELECT ts, series_id, value FROM samples ORDER BY value DESC, ts",
@@ -2713,23 +2700,30 @@ mod tests {
             let err = plan_page(sql, None).expect_err("refused");
             assert_eq!(
                 err,
-                PagePlanError::OrderTermNotExactlyComparable {
+                PagePlanError::OrderTermNotRepresentable {
                     column: match sql.contains(" AS v") {
                         true => "v".to_string(),
                         false => "value".to_string(),
                     },
-                    kind: "type Float64".to_string(),
+                    kind: "type Float64 admits NaN and the infinities, which no \
+                           resume value carries"
+                        .to_string(),
                 },
                 "unexpected refusal for {sql:?}"
             );
         }
 
-        let err = plan_page("SELECT * FROM samples ORDER BY value", None).expect_err("refused");
+        // The refusal's own premise: the value a page over a float term would
+        // end at is exactly the one no cursor renders.
         assert_eq!(
-            err.to_string(),
-            "the ORDER BY term `value` is not exactly comparable (type Float64), \
-             so the keyset predicate cannot place every value it admits and the \
-             rows it cannot place would appear on no page",
+            ResumeValue::Float(f64::NAN).render().expect_err("refused"),
+            PagePlanError::NonFiniteResumeValue,
+        );
+        assert_eq!(
+            ResumeValue::Float(f64::INFINITY)
+                .render()
+                .expect_err("refused"),
+            PagePlanError::NonFiniteResumeValue,
         );
 
         // The same table still pages on its identity columns, so the refusal
@@ -3296,9 +3290,6 @@ mod tests {
             }
             Err(PagePlanError::OrderTermNotRepresentable { .. }) => {
                 "OrderTermNotRepresentable".to_string()
-            }
-            Err(PagePlanError::OrderTermNotExactlyComparable { .. }) => {
-                "OrderTermNotExactlyComparable".to_string()
             }
             Err(PagePlanError::SelectInto) => "SelectInto".to_string(),
             Err(PagePlanError::ResumeArity { .. }) => "ResumeArity".to_string(),
