@@ -1939,10 +1939,11 @@ pub struct CatalogSweepOutcome {
 ///   between the two reads -- is dropped, so a part a completed fold just
 ///   published is never swept.
 /// - **Reference set from a present, decodable HEAD only.** The referenced set
-///   is HEAD's `parts[].key`, its optional `postings.key`, and its optional
-///   column-statistics keys (`column_stats.key` field 11, `column_stats_part.key`
-///   field 13). An object under the two prefixes but not in that set is
-///   superseded or orphaned.
+///   is HEAD's `parts[].key`, its optional `postings.key`, and each part's
+///   optional per-part column-statistics key (`parts[].column_stats.key`,
+///   field 7). An object under the two prefixes but not in that set is
+///   superseded or orphaned. ADR-1413 decision 6 retired the whole-object
+///   forms, so a legacy v1/v2 `.cstat` is named by no HEAD and is swept.
 /// - **No anchor, no sweep.** An absent HEAD sweeps nothing for the
 ///   (tenant, signal), matching rule 3's neither-record-nor-tombstone bucket
 ///   exactly. This is not an over-abundance of caution: a recovery fold with no
