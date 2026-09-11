@@ -71,6 +71,11 @@ pub struct DecodedColumnStats {
 /// production path calls this: it survives to build v1 bytes for the tests that
 /// prove the decoder now rejects them, the read set being exactly `{3}`. Stamps
 /// envelope version 1 explicitly, never [`COLUMN_STATS_WRITE_VERSION`].
+///
+/// `#[cfg(test)]` for the same reason as [`encode_column_stats_v2`]: the bytes
+/// it produces are rejected by `decode_column_stats`, so a non-test caller
+/// could only write an object nothing in the system can read.
+#[cfg(test)]
 pub fn encode_column_stats(
     tenant_hash: [u8; 16],
     signal: u32,
@@ -164,11 +169,15 @@ pub fn encode_column_stats_v3(
     )
 }
 
-/// Envelope framing shared by the public writers and the tests. Parameterised
-/// on `version`, which selects both the stamped version byte and the segment
-/// key model `validate_segments` enforces (v1: five-field tuple; v2:
-/// `content_hash`). Stamps `version` into both the envelope version byte and
-/// the header `format_version`, so the two always agree by construction.
+/// Envelope framing for the retired v1 and v2 writers and the tests.
+/// Parameterised on `version`, which selects both the stamped version byte and
+/// the segment key model `validate_segments` enforces (v1: five-field tuple;
+/// v2: `content_hash`). Stamps `version` into both the envelope version byte
+/// and the header `format_version`, so the two always agree by construction.
+///
+/// `#[cfg(test)]` follows from its only callers being so: v3 frames itself via
+/// [`frame_column_stats_body`], not through this wrapper.
+#[cfg(test)]
 fn encode_column_stats_versioned(
     version: u8,
     tenant_hash: [u8; 16],
@@ -186,6 +195,10 @@ fn encode_column_stats_versioned(
 /// way to reach `decode_column_stats`'s own validation call with hostile input
 /// (every public writer validates first, so an encoder-side test proves
 /// nothing about the decoder).
+///
+/// `#[cfg(test)]` for the same reason as its caller: the live v3 writer frames
+/// through [`frame_column_stats_body`] directly.
+#[cfg(test)]
 fn frame_column_stats(
     version: u8,
     tenant_hash: [u8; 16],
