@@ -178,9 +178,30 @@ fn render_fold_report(
     json: bool,
 ) -> anyhow::Result<String> {
     if json {
-        let body = serde_json::to_string_pretty(report)
+        // stdout must be ONE JSON document: `--json | jq .put_requests` is the
+        // whole point of the flag, and a `store:` line above the body makes
+        // every consumer skip a first line by undocumented convention. The
+        // store selection still has to be visible (#1024), so it becomes a
+        // field instead: `jq .store` reads `memory (default)`, which is harder
+        // to miss than a header line, not easier.
+        let mut value = serde_json::to_value(report)
             .map_err(|err| anyhow::anyhow!("failed to serialize fold report: {err}"))?;
-        return Ok(format!("{}\n{body}\n", selection.header()));
+        let header = selection.header();
+        let store_value = header.strip_prefix("store: ").unwrap_or(&header);
+        match value.as_object_mut() {
+            Some(obj) => {
+                obj.insert(
+                    "store".to_string(),
+                    serde_json::Value::String(store_value.to_string()),
+                );
+            }
+            // `FoldReport` is a struct, so this is unreachable today. Fail
+            // loudly rather than silently dropping the store from the output.
+            None => anyhow::bail!("fold report did not serialize to a JSON object"),
+        }
+        let body = serde_json::to_string_pretty(&value)
+            .map_err(|err| anyhow::anyhow!("failed to serialize fold report: {err}"))?;
+        return Ok(format!("{body}\n"));
     }
     let mut out = String::new();
     out.push_str(&format!("{}\n", selection.header()));
@@ -349,6 +370,17 @@ pub async fn render_inspect(
             part_ref.size,
             part_ref.entry_count
         ));
+        // Before the fetch, for the same reason the `range=` line above is:
+        // `part_ref.column_stats` comes from the HEAD protobuf already in hand
+        // and needs neither the object nor a successful decode. Emitting it
+        // after the `?`-returning fetch would omit the line entirely for a part
+        // whose object is missing or corrupt, which is the omitted-line-versus-
+        // unset-field ambiguity this output exists to remove, on exactly the
+        // parts worth inspecting.
+        out.push_str(&format!(
+            "    column_stats (field 7): {}\n",
+            format_column_stats_part_ref(part_ref.column_stats.as_ref())
+        ));
         let got = store
             .get(&part_ref.key, GetRange::Full)
             .await
@@ -367,10 +399,6 @@ pub async fn render_inspect(
         out.push_str(&format!(
             "    entries (decoded): {}\n",
             decoded.entries.len()
-        ));
-        out.push_str(&format!(
-            "    column_stats (field 7): {}\n",
-            format_column_stats_part_ref(part_ref.column_stats.as_ref())
         ));
     }
     Ok(())
