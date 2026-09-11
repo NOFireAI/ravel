@@ -140,19 +140,25 @@
 //!
 //! # Every clause of the body is read, or discarded by name
 //!
-//! Three classifications here read the parser's AST, and each one names every
+//! Five classifications here read the parser's AST, and each one names every
 //! field it decides about with no `..` pattern: [`relation_of`] over
 //! `TableFactor::Table`, `resolution::projection_of` over the `SELECT` list,
-//! and [`shape_of`] over the `SELECT` body itself. A field that cannot change
-//! the row set is discarded by name with the reason, not by a wildcard.
+//! [`shape_of`] over the `SELECT` body itself, [`NestedShapeGuard`] over the
+//! `Query`, and [`statement_order_terms`] over the `OrderBy`. A field that
+//! cannot change the row set is discarded by name with the reason, not by a
+//! wildcard.
 //!
-//! The cost of the wildcard has been paid three times, most recently by
-//! [`shape_of`], which read thirteen of the body's twenty-four fields: `SELECT
-//! ts, series_id INTO t2 FROM samples ORDER BY ts` was planned as a total
-//! order and `Display for Query` re-emitted the `INTO` into the derived table,
-//! so every page would have written the table again. What the naming buys is
-//! not the nine or eleven fields that were missed: it is that field
-//! twenty-five of a later sqlparser is a compile error rather than silence.
+//! The cost of the wildcard has been paid five times. [`shape_of`] read
+//! thirteen of the body's twenty-four fields, so `SELECT ts, series_id INTO t2
+//! FROM samples ORDER BY ts` was planned as a total order and `Display for
+//! Query` re-emitted the `INTO` into the derived table, and every page would
+//! have written the table again. [`NestedShapeGuard`] read three of the
+//! `Query`'s ten, so `SETTINGS limit = 2` was a row limit nothing refused, and
+//! three more dialect clauses went into the derived table unread.
+//! [`statement_order_terms`] read one of the `OrderBy`'s two, so an
+//! `INTERPOLATE` was dropped along with the ordering it hangs off. What the
+//! naming buys is not the fields that were missed: it is that the field a
+//! later sqlparser adds is a compile error rather than silence.
 //!
 //! # One resolution from an output name
 //!
@@ -209,8 +215,14 @@
 //! - a pipe operator is [`PagePlanError::PipeOperator`], so a `|> limit` or a
 //!   `|> order_by` cannot reshape the rows after the body;
 //! - `WITH FILL` is [`PagePlanError::UnsupportedOrderOption`], which is the
-//!   only ClickHouse ordering form that adds rows (an `INTERPOLATE` is defined
-//!   only in terms of one, so it cannot change a row set on its own).
+//!   only ClickHouse ordering form that adds rows, and its clause-level
+//!   sibling `INTERPOLATE` is [`PagePlanError::UnsupportedOrderingClause`];
+//! - the four dialect clauses that hang off a `Query` rather than off its
+//!   body -- `SETTINGS`, `FORMAT`, a `FOR UPDATE`/`FOR SHARE` lock, and
+//!   `FOR XML`/`FOR JSON` -- are
+//!   [`PagePlanError::UnsupportedQueryClause`] at every depth, because the
+//!   wrap re-emits each of them verbatim and `SETTINGS limit = 2` is a row
+//!   limit spelled in a way the row-limit refusal does not recognise.
 //!
 //! A window function is NOT in the class: `OVER (ORDER BY ...)` carries its
 //! own ordering and no SQL window inherits the statement's. It is still paged
@@ -407,6 +419,37 @@ pub enum PagePlanError {
         column: String,
         option: &'static str,
     },
+
+    /// A clause hanging off the `ORDER BY` itself rather than off one of its
+    /// terms. `INTERPOLATE (...)` is the only spelling this dialect produces.
+    ///
+    /// Its sibling [`Self::UnsupportedOrderOption`] refuses the TERM-level
+    /// options, which is where this refusal was missing: the clause-level one
+    /// sat behind an `OrderBy { kind, .. }` pattern and was neither read nor
+    /// reproduced. The rewrite drops the statement's own `ORDER BY` when it
+    /// only orders, so the clause went with it, and `SELECT ts, series_id FROM
+    /// samples ORDER BY ts, series_id INTERPOLATE (value AS value)` planned
+    /// with a total-order claim. DataFusion refuses that statement outright,
+    /// so the page was not a differently ordered answer: it was a success
+    /// where the caller's own statement is an error, under semantics the
+    /// caller never asked for.
+    #[error("the ORDER BY clause `{clause}` cannot be paged")]
+    UnsupportedOrderingClause { clause: &'static str },
+
+    /// A dialect clause on a `Query` at any depth that the rewrite re-emits
+    /// verbatim into the derived table: ClickHouse's `SETTINGS` and `FORMAT`,
+    /// a `FOR UPDATE`/`FOR SHARE` lock, and MSSQL's `FOR XML`/`FOR JSON`.
+    ///
+    /// `SETTINGS` is the one that shows why a wildcard over the `Query` fields
+    /// is not good enough here: `SETTINGS limit = 2` is a row limit under a
+    /// name [`Self::RowLimitInStatement`] does not recognise, so the statement
+    /// that caps its own rows was reported as a pageable total order. `FORMAT`
+    /// reshapes the result, `FOR XML`/`FOR JSON` collapse it into one value,
+    /// and a lock clause is not a read. All four are inert against today's
+    /// engine only because DataFusion's planner drops what it does not
+    /// implement, which is not a property of this planner to rely on.
+    #[error("the `{clause}` clause cannot be paged")]
+    UnsupportedQueryClause { clause: &'static str },
 
     /// An `ORDER BY` term the text does not prove NON NULL.
     ///
@@ -729,13 +772,60 @@ struct NestedShapeGuard<'a> {
 impl Visitor for NestedShapeGuard<'_> {
     type Break = ();
 
+    /// Read every field of the `Query`, naming each one, for the same reason
+    /// [`shape_of`] names every field of the `SELECT` body: this was the other
+    /// place the rewrite decided about a node from a subset of it. It read
+    /// three of the ten fields, and the four dialect clauses it did not read
+    /// are re-emitted verbatim by `Display for Query` into the derived table.
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
-        if !query.pipe_operators.is_empty() {
+        let Query {
+            // Each CTE carries its own `Query`, which this same visitor
+            // reaches on its own; a statement carrying a `WITH` at the top is
+            // separately outside the row-identity claim
+            // (`non_identity_shape`).
+            with: _,
+            // Visited in turn. Its `SELECT` bodies are `pre_visit_select`
+            // below, which is where `TOP` and `INTO` are read.
+            body: _,
+            // The outermost one is the effective ordering, read by
+            // `statement_order_terms`. An inner one is re-emitted verbatim, so
+            // every page runs the same ordering over the same rows: it cannot
+            // make consecutive pages be pages of different results, which is
+            // what this guard refuses.
+            order_by: _,
+            limit_clause,
+            fetch,
+            locks,
+            for_clause,
+            settings,
+            format_clause,
+            pipe_operators,
+        } = query;
+
+        if !pipe_operators.is_empty() {
             *self.found = Some(PagePlanError::PipeOperator);
             return ControlFlow::Break(());
         }
-        if query.limit_clause.is_some() || query.fetch.is_some() {
+        if limit_clause.is_some() || fetch.is_some() {
             *self.found = Some(PagePlanError::RowLimitInStatement);
+            return ControlFlow::Break(());
+        }
+        // ClickHouse's `SETTINGS` first, because it is the one that carries a
+        // row limit (`SETTINGS limit = 2`) under a name the check above does
+        // not recognise.
+        let clause = if settings.is_some() {
+            Some("SETTINGS")
+        } else if format_clause.is_some() {
+            Some("FORMAT")
+        } else if !locks.is_empty() {
+            Some("FOR UPDATE/FOR SHARE")
+        } else if for_clause.is_some() {
+            Some("FOR XML/FOR JSON")
+        } else {
+            None
+        };
+        if let Some(clause) = clause {
+            *self.found = Some(PagePlanError::UnsupportedQueryClause { clause });
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
@@ -1701,10 +1791,25 @@ fn shape_of<'a>(query: &'a Query) -> Option<SelectShape<'a>> {
 }
 
 /// The statement's own `ORDER BY`, as effective terms.
+///
+/// Both fields of the `OrderBy` are named, with no `..`. The wildcard hid
+/// `interpolate`, and the rewrite drops the statement's own `ORDER BY`
+/// whenever it only orders, so the clause was dropped with it and the page
+/// ran under an ordering the caller had not written.
 fn statement_order_terms(query: &Query) -> Result<Vec<OrderTerm>, PagePlanError> {
-    let Some(OrderBy { kind, .. }) = &query.order_by else {
+    let Some(OrderBy { kind, interpolate }) = &query.order_by else {
         return Ok(Vec::new());
     };
+    // `INTERPOLATE` is defined only in terms of a `WITH FILL`, which is
+    // refused per term below, so it cannot add a row on its own. That is why
+    // it is refused rather than ignored: DataFusion rejects the statement, and
+    // a page that silently drops the clause answers a statement the engine
+    // itself calls an error.
+    if interpolate.is_some() {
+        return Err(PagePlanError::UnsupportedOrderingClause {
+            clause: "INTERPOLATE",
+        });
+    }
     let exprs = match kind {
         OrderByKind::All(_) => return Err(PagePlanError::OrderByAll),
         OrderByKind::Expressions(exprs) => exprs,
@@ -2826,6 +2931,169 @@ mod tests {
         );
     }
 
+    /// An `INTERPOLATE` on the `ORDER BY` is refused, because the rewrite drops
+    /// the ordering it hangs off.
+    ///
+    /// The clause-level half of what [`PagePlanError::UnsupportedOrderOption`]
+    /// refuses per term. It sat behind an `OrderBy { kind, .. }` pattern, so
+    /// nothing read it and nothing reproduced it: `render_statement` removes
+    /// the statement's own `ORDER BY` whenever it only orders, which took the
+    /// `INTERPOLATE` with it, and the plan reported a total order over an
+    /// ordering the caller had not written.
+    ///
+    /// [`interpolate_is_an_error_datafusion_raises_and_the_page_would_not`]
+    /// is the half of this that text cannot settle: the dropped clause turns
+    /// an engine error into a success.
+    #[test]
+    fn refuses_an_interpolate_clause_on_the_ordering() {
+        let sql = "SELECT ts, series_id FROM samples ORDER BY ts, series_id \
+                   INTERPOLATE (value AS value)";
+        let err = plan_page(sql, None).expect_err("refused");
+        assert_eq!(
+            err,
+            PagePlanError::UnsupportedOrderingClause {
+                clause: "INTERPOLATE",
+            },
+        );
+        assert_eq!(
+            err.to_string(),
+            "the ORDER BY clause `INTERPOLATE` cannot be paged"
+        );
+
+        // An empty `INTERPOLATE` is the same clause with no expression list,
+        // and is refused on the same reading rather than on the list's
+        // contents.
+        assert_eq!(
+            plan_page(
+                "SELECT ts, series_id FROM samples ORDER BY ts, series_id INTERPOLATE",
+                None,
+            )
+            .expect_err("refused"),
+            PagePlanError::UnsupportedOrderingClause {
+                clause: "INTERPOLATE",
+            },
+        );
+
+        // Without the clause the same statement still pages, so the refusal is
+        // about the clause and not about the ordering it was written on.
+        let plan = plan_page(
+            "SELECT ts, series_id FROM samples ORDER BY ts, series_id",
+            None,
+        )
+        .expect("the same ordering without the clause pages");
+        assert_eq!(plan.not_total, None);
+    }
+
+    /// The four dialect clauses that hang off a `Query` are refused at every
+    /// depth.
+    ///
+    /// `SETTINGS` is why this is not a tidiness: `SETTINGS limit = 2` caps the
+    /// statement's rows under a name [`PagePlanError::RowLimitInStatement`]
+    /// does not match, and `Display for Query` re-emits it into the derived
+    /// table, so every page would have re-applied it. The other three are
+    /// refused on the reasoning that put them in the same pattern: a `FORMAT`
+    /// reshapes the result, a `FOR XML`/`FOR JSON` collapses it into one
+    /// value, and a lock clause is not a read.
+    #[test]
+    fn refuses_every_dialect_query_clause_at_every_nesting_depth() {
+        let cases = [
+            (
+                "SELECT ts, series_id FROM samples ORDER BY ts SETTINGS limit = 2",
+                "SETTINGS",
+            ),
+            (
+                "SELECT ts, series_id FROM samples ORDER BY ts FORMAT JSONCompact",
+                "FORMAT",
+            ),
+            (
+                "SELECT ts, series_id FROM samples ORDER BY ts FOR UPDATE",
+                "FOR UPDATE/FOR SHARE",
+            ),
+            (
+                "SELECT ts, series_id FROM samples ORDER BY ts FOR XML RAW",
+                "FOR XML/FOR JSON",
+            ),
+            // The same four one level down, where the wrap re-emits them just
+            // as faithfully.
+            (
+                "SELECT * FROM samples WHERE ts IN (SELECT ts FROM samples SETTINGS limit = 2) \
+                 ORDER BY ts",
+                "SETTINGS",
+            ),
+            (
+                "WITH c AS (SELECT ts FROM samples FORMAT JSONCompact) SELECT * FROM samples \
+                 ORDER BY ts",
+                "FORMAT",
+            ),
+            (
+                "SELECT * FROM samples WHERE ts IN (SELECT ts FROM samples FOR UPDATE) \
+                 ORDER BY ts",
+                "FOR UPDATE/FOR SHARE",
+            ),
+            (
+                "SELECT * FROM samples WHERE ts IN (SELECT ts FROM samples FOR XML RAW) \
+                 ORDER BY ts",
+                "FOR XML/FOR JSON",
+            ),
+        ];
+        for (sql, clause) in cases {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::UnsupportedQueryClause { clause },
+                "unexpected refusal for {sql:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!("the `{clause}` clause cannot be paged")
+            );
+        }
+
+        // The row-limit refusal still wins where both are written, so
+        // `SETTINGS` did not become the answer for an ordinary `LIMIT`.
+        assert_eq!(
+            plan_page(
+                "SELECT ts, series_id FROM samples ORDER BY ts LIMIT 2",
+                None
+            )
+            .expect_err("refused"),
+            PagePlanError::RowLimitInStatement,
+        );
+    }
+
+    /// The premise behind refusing `INTERPOLATE` rather than ignoring it:
+    /// DataFusion raises on the caller's statement, and the page the planner
+    /// used to render succeeds.
+    ///
+    /// Answered against the real planner, because it is a claim about what
+    /// DataFusion implements rather than about this module's text. Without the
+    /// refusal the caller hands in an error and gets a page back, under an
+    /// ordering the engine never agreed to.
+    #[tokio::test]
+    async fn interpolate_is_an_error_datafusion_raises_and_the_page_would_not() {
+        let ctx = SessionContext::new();
+        let table = MemTable::try_new(public_schema(), vec![vec![]]).expect("mem table");
+        ctx.register_table(SAMPLES_TABLE, Arc::new(table))
+            .expect("registered");
+
+        let sql = "SELECT ts, series_id FROM samples ORDER BY ts, series_id \
+                   INTERPOLATE (value AS value)";
+        ctx.state()
+            .create_logical_plan(sql)
+            .await
+            .expect_err("DataFusion refuses an INTERPOLATE clause");
+
+        // The statement the rewrite would have produced for it, which is the
+        // same text with the clause gone.
+        ctx.state()
+            .create_logical_plan(&format!(
+                "SELECT * FROM (SELECT ts, series_id FROM samples) AS {PAGE_ALIAS} \
+                 ORDER BY \"ts\" ASC, \"series_id\" ASC"
+            ))
+            .await
+            .expect("the page the dropped clause would have planned");
+    }
+
     /// The three `SELECT` body fields this front end cannot reach still carry
     /// their own shape reason.
     ///
@@ -3349,6 +3617,12 @@ mod tests {
             Err(PagePlanError::UnsupportedOrderOption { .. }) => {
                 "UnsupportedOrderOption".to_string()
             }
+            Err(PagePlanError::UnsupportedOrderingClause { .. }) => {
+                "UnsupportedOrderingClause".to_string()
+            }
+            Err(PagePlanError::UnsupportedQueryClause { .. }) => {
+                "UnsupportedQueryClause".to_string()
+            }
             Err(PagePlanError::OrderTermNullable { .. }) => "OrderTermNullable".to_string(),
             Err(PagePlanError::OrderTermNullabilityUnknown { reason, .. }) => {
                 format!("OrderTermNullabilityUnknown: {reason}")
@@ -3402,10 +3676,10 @@ mod tests {
     /// that path can move a number here. The coverage for it is the executed
     /// page walk in `crates/ravel-sql/tests/page_walk.rs`, which pages a
     /// `samples` fixture with deliberate ties one row at a time and asserts
-    /// multiset equality against the same statement run unpaged. A
-    /// total-order claim is proven there and nowhere else: a plan assertion
-    /// cannot tell a correct claim from one that drops a tied row from every
-    /// page.
+    /// that page k holds rows k of the same statement's ordering, as a
+    /// sequence. A total-order claim is proven there and nowhere else: a plan
+    /// assertion cannot tell a correct claim from one that drops a tied row
+    /// from every page.
     #[test]
     fn the_clickbench_corpus_page_plan_outcomes_are_pinned() {
         let corpus: serde_json::Value =
