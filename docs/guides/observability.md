@@ -242,15 +242,15 @@ Labels: `mode`. All three families render in every mode, but only the modes
 that fold ever move them: the background fold loop runs in every mode except
 `maintain`, and the on-demand fold route is mounted only in `all` and
 `query`. A `maintain` process therefore reports zeros permanently. That is
-not why the alert filters `maintain` out under `max()`: a permanent `0` can
-never be the maximum of a set that holds any nonzero sample, and when every
-sample is `0` the filtered and unfiltered maxima are both `0`, so on a mixed
-fleet the filter changes nothing. The filter earns its place in the one case
-below where it does change behaviour: a legitimate maintain-only deployment.
-There the staleness comparison must see no folding series to compare (so it
-cannot trip on those permanent zeros), while the `absent()` branch still sees
-the maintain series exist and so stays silent, distinguishing a maintain-only
-fleet from one that is not being scraped at all.
+not why the alert filters `maintain` out: a permanent `0` can never be the
+maximum of a set that holds any nonzero sample, and when every sample is `0`
+the filtered and unfiltered maxima are both `0`, so on a healthy mixed fleet
+the filter changes nothing under `max()`. The filter earns its place in a
+split-role deployment that co-scrapes dedicated `maintain` nodes alongside
+its folding nodes: there it lets the alert treat a dead folding fleet as an
+outage even while the `maintain` series survive. The alert applies the same
+filter to both of its operands for that reason; the alert section below works
+it through state by state.
 
 | Metric | Meaning |
 |---|---|
@@ -279,6 +279,10 @@ logs alone.
 ```yaml
 groups:
   - name: ravel-catalog-fold
+    # RavelCatalogFoldStalled fires on any deployment with no live folding
+    # series, which includes an intentionally maintain-only fleet. Such a
+    # fleet must drop this rule or inhibit it; the state walkthrough below
+    # explains why that opt-out is deliberate.
     rules:
       - alert: RavelCatalogFoldStalled
         expr: |
@@ -288,7 +292,7 @@ groups:
             ) > 4800
           )
           or
-          absent(ravel_catalog_fold_last_success_timestamp_seconds)
+          absent(ravel_catalog_fold_last_success_timestamp_seconds{mode!="maintain"})
         for: 10m
         labels:
           severity: critical
@@ -325,28 +329,55 @@ maximum is the figure that answers "is this catalog being folded."
 
 The `or absent(...)` branch covers the outage the staleness comparison alone
 cannot see. `max()` of an empty instant vector is empty, and `time() - <empty>`
-is empty, so when nothing with `mode!="maintain"` is being scraped the first
-operand produces no sample and a rule of only that operand stays silent through
-the exact outage it exists to catch: a query fleet scaled to zero, a fleet
-crash-looping fast enough that its targets go stale, a scrape-config edit that
-drops the job. `absent()` returns `1` precisely when its argument matches no
-series, so it fires on that absence. It reads the metric family *without* the
-`mode!="maintain"` filter on purpose, so it fires only when no Ravel process is
-scraped at all, not when a legitimate maintain-only fleet is scraped (whose
-`mode="maintain"` series still exist). The one expression then reads as four
-states:
+is empty, so when no folding series is being scraped the first operand produces
+no sample and a rule of only that operand stays silent through the exact outage
+it exists to catch: a query fleet scaled to zero, a fleet crash-looping fast
+enough that its targets go stale, a scrape-config edit that drops the job, or a
+folding fleet that has died outright. `absent()` returns `1` precisely when its
+argument matches no series, so it fires on that absence.
 
-| State | `max(...{mode!="maintain"})` operand | `absent(...)` operand | Alert |
+The `absent()` argument carries the same `mode!="maintain"` filter as the
+staleness operand, and that is a deliberate trade. An unfiltered
+`absent(<family>)` stays silent whenever *any* series of the family exists,
+including the `mode="maintain"` series of a split-role deployment that
+co-scrapes dedicated maintain nodes alongside its folding nodes. In that
+topology, if the entire folding fleet dies or goes stale, the `mode!="maintain"`
+series vanish (so the staleness operand is empty) while the maintain series
+remain (so an unfiltered `absent()` is also silent), and the alert falls silent
+through the fleet-wide, self-worsening outage it was written for. Filtering the
+`absent()` argument closes that hole: it fires whenever no *folding* series is
+scraped, whether none is scraped at all or the folding half of a split-role
+fleet has died while its maintain half survives.
+
+The cost is that those two states are metrics-identical from this family alone:
+"the folding fleet died" and "this deployment intentionally runs maintain-only"
+both present as no `mode!="maintain"` series with `mode="maintain"` series
+alongside. No arrangement of these two operands can tell them apart, so the rule
+fires loud on both, and a genuinely maintain-only deployment must opt out by
+dropping `RavelCatalogFoldStalled` or inhibiting it (the group comment on the
+rule marks this). Firing on a real outage and forcing one deliberate silencing
+on a fleet that never folds is the safer default than staying silent on the
+outage to spare that fleet the page: an alert that is silent in the case it
+exists for manufactures confidence.
+
+The expression then reads as five states of the deployment, not of the
+expression:
+
+| Deployment state | `max(...{mode!="maintain"})` operand | `absent(...{mode!="maintain"})` operand | Alert |
 |---|---|---|---|
-| Nothing scraped at all | empty (no sample) | fires (family absent) | **fires** |
-| Maintain-only fleet scraped | empty (filter removes all) | silent (maintain series exist) | silent |
-| Healthy folding fleet | gauge fresh, `time() - gauge` under threshold | silent | silent |
-| Folding fleet whose fold stopped | gauge stale, over threshold | silent | **fires** |
+| Nothing scraped at all | empty (no series) | fires (no folding series) | **fires** |
+| Intentionally maintain-only fleet | empty (only maintain series) | fires (no folding series) | **fires** (opt out) |
+| Healthy folding fleet | gauge fresh, `time() - gauge` under threshold | silent (folding series exist) | silent |
+| Folding fleet scraped but fold stopped | gauge stale, over threshold | silent (folding series exist) | **fires** |
+| Folding fleet died, co-scraped maintain survives | empty (folding series gone) | fires (no folding series) | **fires** |
 
-A maintain-only deployment stays silent forever, which is correct only if
-running one is legitimate; if a deployment is expected to fold, it should be
-running a folding mode, and that fleet's absence is then the first row, not the
-second.
+Rows 1, 2 and 5 all fire through the `absent()` operand and are
+indistinguishable from this family alone. Row 2 is the deliberate false page
+the opt-out exists for; row 5 is the co-scraped-death outage an unfiltered
+`absent()` left silent, and closing it is what the filter on the `absent()`
+argument buys. Row 4 fires through the staleness operand while the folding
+series are still scraped but stale. Only the healthy fleet, row 3, stays
+silent.
 
 The threshold is the unsealed span the catalog configuration implies, in
 seconds:
