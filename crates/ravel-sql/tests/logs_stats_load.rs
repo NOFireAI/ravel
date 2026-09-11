@@ -14,7 +14,7 @@
 //!   an eligible plan would silently turn ADR-0850 off.
 //!
 //! The HEAD and `.cstat` objects are built directly with the public
-//! `encode_head`/`encode_column_stats` codecs (no fold runs), exactly as
+//! `encode_head`/`encode_column_stats_v3` codecs (no fold runs), exactly as
 //! `ravel-catalog`'s own `load_column_stats` test builds them. The metadata
 //! path never fetches a snapshot part or a data object, so neither needs to
 //! exist: the only reads a metadata-answered eligible query makes are the two
@@ -29,14 +29,14 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::displayable;
 use futures::StreamExt;
 use ravel_catalog::{
-    Catalog, CatalogConfig, HEAD_FORMAT_VERSION, SegmentLevel, SegmentRef, Snapshot,
-    encode_column_stats, encode_head,
+    Catalog, CatalogConfig, DEFAULT_MAX_COLUMN_STATS_BYTES, HEAD_FORMAT_VERSION, SegmentLevel,
+    SegmentRef, Snapshot, encode_column_stats_v3, encode_head,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::catalog::v1::{
-    ColumnStat, ColumnStatsSegment, ColumnValue, DictEntry, SnapshotColumnStatsRef, SnapshotHead,
-    SnapshotPartRef,
+    ColumnStat, ColumnStatsSegment, ColumnValue, DictEntry, SnapshotColumnStatsPartRef,
+    SnapshotHead, SnapshotPartRef,
 };
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig, SqlExecutor};
@@ -54,8 +54,8 @@ const TENANT: TenantHash = TenantHash([7u8; 16]);
 const DECLARED_TYPE_I64: u32 = 2;
 
 /// A fabricated L0 [`SegmentRef`]; the metadata path never fetches the object,
-/// so `data_object_key` need not name a real object. Only the identity fields
-/// join it to the injected `ColumnStatsSegment`.
+/// so `data_object_key` need not name a real object. Only `content_hash` joins
+/// it to the injected `ColumnStatsSegment` (v3 keying, ADR-1413).
 fn seg_ref(seq: u64, sample_count: u64) -> SegmentRef {
     SegmentRef {
         data_object_key: format!("logs/seg-{seq}.rlog"),
@@ -130,7 +130,7 @@ fn stats_segment(seg: &SegmentRef, columns: Vec<ColumnStat>) -> ColumnStatsSegme
     ColumnStatsSegment {
         ingest_hour_bucket: seg.ingest_hour_bucket,
         shard: seg.shard,
-        writer_id: seg.writer_id.as_bytes().to_vec(),
+        writer_id: seg.content_hash.to_vec(),
         writer_epoch: seg.writer_epoch,
         writer_seq: seg.writer_seq,
         columns,
@@ -164,8 +164,14 @@ async fn install_head_and_stats(store: &dyn ObjectStoreBackend, segments: &[Colu
     // object itself is never fetched by the load, so it is not written.
     let part_hash = *blake3::hash(b"part-0").as_bytes();
 
-    let stats_bytes = encode_column_stats(TENANT.0, signal_num, vec![part_hash.to_vec()], segments)
-        .expect("encode column stats");
+    let stats_bytes = encode_column_stats_v3(
+        TENANT.0,
+        signal_num,
+        part_hash,
+        segments,
+        DEFAULT_MAX_COLUMN_STATS_BYTES,
+    )
+    .expect("encode column stats");
     let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
     let stats_key = format!("t/{}/catalog/l/cstat/one.cstat", TENANT.to_hex());
     store
@@ -190,20 +196,18 @@ async fn install_head_and_stats(store: &dyn ObjectStoreBackend, segments: &[Colu
             entry_count: 0,
             watermark_hour: 10,
             min_hour: 0,
-            column_stats: None,
+            column_stats: Some(SnapshotColumnStatsPartRef {
+                key: stats_key,
+                blake3: stats_hash.to_vec(),
+                size: stats_bytes.len() as u64,
+                segment_count: segments.len() as u32,
+                part_blake3: vec![part_hash.to_vec()],
+            }),
         }],
         folder_id: Uuid::new_v4().into_bytes().to_vec(),
         created_unix_ns: 0,
         postings: None,
         shard_generation_count: 1,
-        column_stats: Some(SnapshotColumnStatsRef {
-            key: stats_key,
-            blake3: stats_hash.to_vec(),
-            size: stats_bytes.len() as u64,
-            segment_count: segments.len() as u32,
-            part_blake3: vec![part_hash.to_vec()],
-        }),
-        column_stats_part: None,
     };
     let head_bytes = encode_head(&head).expect("encode head");
     store
@@ -513,9 +517,14 @@ async fn plan_pinned_loads_stats_when_ingest_hour_diverges_from_event_time() {
 
     let signal_num = ravel_commit::signal::to_proto(Signal::Logs) as u32;
     let part_hash = *blake3::hash(b"part-backfilled").as_bytes();
-    let stats_bytes =
-        encode_column_stats(TENANT.0, signal_num, vec![part_hash.to_vec()], &[seg_stats])
-            .expect("encode column stats");
+    let stats_bytes = encode_column_stats_v3(
+        TENANT.0,
+        signal_num,
+        part_hash,
+        &[seg_stats],
+        DEFAULT_MAX_COLUMN_STATS_BYTES,
+    )
+    .expect("encode column stats");
     let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
     let stats_key = format!("t/{}/catalog/l/cstat/backfilled.cstat", TENANT.to_hex());
     store
@@ -545,20 +554,18 @@ async fn plan_pinned_loads_stats_when_ingest_hour_diverges_from_event_time() {
             entry_count: 0,
             watermark_hour: 500_010,
             min_hour: 499_990,
-            column_stats: None,
+            column_stats: Some(SnapshotColumnStatsPartRef {
+                key: stats_key,
+                blake3: stats_hash.to_vec(),
+                size: stats_bytes.len() as u64,
+                segment_count: 1,
+                part_blake3: vec![part_hash.to_vec()],
+            }),
         }],
         folder_id: Uuid::new_v4().into_bytes().to_vec(),
         created_unix_ns: 0,
         postings: None,
         shard_generation_count: 1,
-        column_stats: Some(SnapshotColumnStatsRef {
-            key: stats_key,
-            blake3: stats_hash.to_vec(),
-            size: stats_bytes.len() as u64,
-            segment_count: 1,
-            part_blake3: vec![part_hash.to_vec()],
-        }),
-        column_stats_part: None,
     };
     let head_bytes = encode_head(&head).expect("encode head");
     store
