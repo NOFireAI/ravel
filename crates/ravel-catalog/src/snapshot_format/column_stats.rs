@@ -44,10 +44,12 @@ use prost::Message;
 use ravel_proto::catalog::v1::column_value::Kind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsHeader, ColumnStatsSegment, ColumnValue};
 
+#[cfg(test)]
+use super::COLUMN_STATS_WRITE_VERSION;
 use super::error::SnapshotFormatError;
 use super::{
-    COLUMN_STATS_MAGIC, COLUMN_STATS_RESERVED, COLUMN_STATS_WRITE_VERSION,
-    MIN_COLUMN_STATS_ENVELOPE_LEN, ZSTD_LEVEL, column_stats_version_accepted,
+    COLUMN_STATS_MAGIC, COLUMN_STATS_RESERVED, MIN_COLUMN_STATS_ENVELOPE_LEN, ZSTD_LEVEL,
+    column_stats_version_accepted,
 };
 use crate::snapshot_format::ColumnStatsLimits;
 
@@ -84,6 +86,7 @@ pub fn encode_column_stats(
 /// as 32 bytes; records are sorted and deduplicated by that hash, not the
 /// five-field identity tuple, so L0 and L1 parts are named uniformly and two L1
 /// parts of one bucket never collide. Stamps [`COLUMN_STATS_WRITE_VERSION`].
+#[cfg(test)]
 pub fn encode_column_stats_v2(
     tenant_hash: [u8; 16],
     signal: u32,
@@ -758,9 +761,21 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let segments = vec![segment(1, 0, 1), segment(1, 0, 2), segment(2, 0, 1)];
-        let bytes =
-            encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &segments).expect("encodes");
+        let mut a = segment(1, 0, 1);
+        a.writer_id = vec![0x10; 32];
+        let mut b = segment(1, 0, 2);
+        b.writer_id = vec![0x20; 32];
+        let mut c = segment(2, 0, 1);
+        c.writer_id = vec![0x30; 32];
+        let segments = vec![a, b, c];
+        let bytes = encode_column_stats_v3(
+            [0x11; 16],
+            3,
+            [0x22; 32],
+            &segments,
+            crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
+        )
+        .expect("encodes");
         let decoded = decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("decodes");
         assert_eq!(decoded.segments, segments);
         assert_eq!(decoded.header.segment_count, 3);
@@ -915,9 +930,11 @@ mod tests {
     #[test]
     fn decode_refuses_duplicate_column_name_in_unvalidated_bytes() {
         let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0xAA; 32];
         let dup = seg.columns[0].clone();
         seg.columns.push(dup);
-        let bytes = frame_column_stats(1, [0x11; 16], 3, vec![], &[seg]).expect("frames");
+        let bytes =
+            frame_column_stats(3, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg]).expect("frames");
         let err =
             decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect_err("decode refuses");
         assert_eq!(
@@ -938,13 +955,15 @@ mod tests {
     #[test]
     fn decode_refuses_min_max_with_zero_non_null_in_unvalidated_bytes() {
         let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0xAA; 32];
         seg.columns[0].non_null_count = 0;
         seg.columns[0].null_count = 10;
         seg.columns[0].dictionary = vec![];
         seg.columns[0].dictionary_present = false;
         seg.columns[0].sum = None;
         // min/max still populated: inconsistent with an all-null column.
-        let bytes = frame_column_stats(1, [0x11; 16], 3, vec![], &[seg]).expect("frames");
+        let bytes =
+            frame_column_stats(3, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg]).expect("frames");
         let err =
             decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect_err("decode refuses");
         assert_eq!(
@@ -963,9 +982,11 @@ mod tests {
     #[test]
     fn decode_refuses_missing_min_max_with_non_null_rows_in_unvalidated_bytes() {
         let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0xAA; 32];
         seg.columns[0].min = None;
         seg.columns[0].max = None;
-        let bytes = frame_column_stats(1, [0x11; 16], 3, vec![], &[seg]).expect("frames");
+        let bytes =
+            frame_column_stats(3, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg]).expect("frames");
         let err =
             decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect_err("decode refuses");
         assert_eq!(
@@ -1058,11 +1079,18 @@ mod tests {
     #[test]
     fn sum_without_dictionary_round_trips() {
         let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0x77; 32];
         seg.columns[0].dictionary_present = false;
         seg.columns[0].dictionary = vec![];
         seg.columns[0].sum = Some(45);
-        let bytes = encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &[seg.clone()])
-            .expect("encodes");
+        let bytes = encode_column_stats_v3(
+            [0x11; 16],
+            3,
+            [0x22; 32],
+            &[seg.clone()],
+            crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
+        )
+        .expect("encodes");
         let decoded = decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("decodes");
         assert_eq!(decoded.segments[0].columns[0].sum, Some(45));
     }
@@ -1108,97 +1136,6 @@ mod tests {
         seg.columns[0].sum = None;
         encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
             .expect("an all-null column may carry no sum");
-    }
-
-    /// The regression that matters for ADR-0942 A1: the existing L0 path must
-    /// stay byte-for-byte readable after the version split. A v1 object decodes
-    /// with EXACT expected field values, not merely `is_ok()`.
-    #[test]
-    fn v1_object_decodes_with_exact_field_values() {
-        let seg = segment(1, 0, 1);
-        let bytes = encode_column_stats(
-            [0x11; 16],
-            3,
-            vec![vec![0x22; 32]],
-            std::slice::from_ref(&seg),
-        )
-        .expect("v1 encodes");
-        // The public writer stamps the write version, which is 1 in A1.
-        assert_eq!(bytes[4], 1, "envelope version byte is the v1 write version");
-        let decoded =
-            decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("v1 decodes");
-        assert_eq!(decoded.header.format_version, 1);
-        assert_eq!(decoded.header.tenant_hash, vec![0x11; 16]);
-        assert_eq!(decoded.header.signal, 3);
-        assert_eq!(decoded.header.part_blake3, vec![vec![0x22; 32]]);
-        assert_eq!(decoded.header.segment_count, 1);
-        assert_eq!(decoded.segments.len(), 1);
-        let out = &decoded.segments[0];
-        assert_eq!(out.ingest_hour_bucket, 1);
-        assert_eq!(out.shard, 0);
-        assert_eq!(out.writer_id, vec![0xAA; 16]);
-        assert_eq!(out.writer_epoch, 1);
-        assert_eq!(out.writer_seq, 1);
-        assert_eq!(out.columns.len(), 1);
-        let col = &out.columns[0];
-        assert_eq!(col.name, "AdvEngineID");
-        assert_eq!(col.declared_type, 2);
-        assert_eq!(col.non_null_count, 10);
-        assert_eq!(col.null_count, 0);
-        assert_eq!(col.min, Some(i64_value(0)));
-        assert_eq!(col.max, Some(i64_value(9)));
-        assert!(col.dictionary_present);
-        assert_eq!(col.dictionary.len(), 10);
-        assert_eq!(col.sum, Some(45));
-    }
-
-    /// ADR-0942: a v2-stamped object must decode today, even though nothing
-    /// writes one, so A2's writer and this decoder cannot disagree the moment
-    /// v2 first appears. Constructed directly via the versioned framing helper
-    /// (no v2 writer needed). This is also the test the "prove-the-test"
-    /// demonstration flips the decoder to break: change the `:115`
-    /// `column_stats_version_accepted(version)` membership check back to
-    /// `version != COLUMN_STATS_WRITE_VERSION` and this fails with
-    /// `ColumnStatsUnsupportedVersion(2)`.
-    #[test]
-    fn v2_stamped_object_decodes() {
-        // A v2 record is keyed by its covered part's content hash, carried in
-        // writer_id as 32 bytes.
-        let mut seg = segment(1, 0, 1);
-        seg.writer_id = vec![0x77; 32];
-        let bytes = encode_column_stats_versioned(
-            2,
-            [0x11; 16],
-            3,
-            vec![vec![0x22; 32]],
-            std::slice::from_ref(&seg),
-        )
-        .expect("v2 framing encodes");
-        assert_eq!(bytes[4], 2, "envelope version byte is v2");
-        let decoded =
-            decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("v2 decodes");
-        assert_eq!(decoded.header.format_version, 2);
-        assert_eq!(decoded.segments, vec![seg]);
-    }
-
-    /// v2 keys by the content hash carried in writer_id, not the rest of the
-    /// tuple: two records sharing every other tuple field but carrying distinct
-    /// content hashes are a valid v2 object with two distinct records (the
-    /// collision the v1 tuple key could not represent for L1, where the reader
-    /// side has no distinguishing writer identity). Codec-level analogue of the
-    /// fold test's "two L1 parts of one bucket produce two distinct records".
-    #[test]
-    fn v2_distinct_content_hash_round_trips() {
-        let mut a = segment(1, 0, 1);
-        a.writer_id = vec![0xA0; 32];
-        let mut b = segment(1, 0, 1); // identical remaining tuple to `a`
-        b.writer_id = vec![0xB0; 32]; // sorts after `a`
-        let bytes =
-            encode_column_stats_v2([0x11; 16], 3, vec![vec![0x22; 32]], &[a.clone(), b.clone()])
-                .expect("two distinct-part records encode under v2");
-        let decoded = decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("decodes");
-        assert_eq!(decoded.segments, vec![a, b]);
-        assert_eq!(decoded.header.format_version, 2);
     }
 
     /// A v2 record whose writer_id is not the 32-byte content hash (here the
@@ -1270,13 +1207,13 @@ mod tests {
         }
     }
 
-    /// The accepted read set is exactly {1, 2, 3} and nothing else across the
-    /// whole u8 domain. The expectation is a hardcoded `1 | 2 | 3`,
+    /// The accepted read set is exactly {3} and nothing else across the
+    /// whole u8 domain. The expectation is a hardcoded `3`,
     /// deliberately NOT `COLUMN_STATS_ACCEPTED_READ_VERSIONS.contains(..)`:
     /// adding a version to the constant later cannot silently widen what is
     /// accepted without this literal changing too.
     #[test]
-    fn accepted_read_set_is_exactly_v1_v2_and_v3() {
+    fn accepted_read_set_is_exactly_v3() {
         for version in 0u8..=255 {
             // The framing helper validates in the version's key model, so give
             // writer_id the width that model requires (v1: 16, v2+: 32).
@@ -1290,11 +1227,11 @@ mod tests {
                 encode_column_stats_versioned(version, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
                     .expect("framing encodes any version byte");
             let decoded = decode_column_stats(&bytes, &ColumnStatsLimits::default());
-            let expected_accept = matches!(version, 1..=3);
+            let expected_accept = version == 3;
             assert_eq!(
                 decoded.is_ok(),
                 expected_accept,
-                "version {version} acceptance must match the hardcoded {{1, 2, 3}} set"
+                "version {version} acceptance must match the hardcoded {{3}} set"
             );
             if !expected_accept {
                 assert_eq!(
@@ -1306,17 +1243,17 @@ mod tests {
     }
 
     /// A header whose self-declared `format_version` disagrees with its accepted
-    /// envelope version byte is rejected: a v2 envelope must not carry a v1
-    /// header. Built by decoding a v2 object, rewriting only the header's
-    /// `format_version` to 1, and re-stamping both CRCs so the object is
-    /// otherwise well-formed and the version disagreement is the sole defect.
+    /// envelope version byte is rejected: a v3 envelope must not carry a header
+    /// claiming a different version. Built by hand-framing a v3 envelope whose
+    /// header's `format_version` is stamped 1, so the version disagreement is
+    /// the sole defect.
     #[test]
     fn header_envelope_version_disagreement_rejected() {
         let seg = segment(1, 0, 1);
-        // Encode a v2 object, then rebuild the envelope with the header claiming
-        // v1 while the envelope byte stays v2.
+        // Hand-frame a v3 envelope, but with the header claiming v1 while the
+        // envelope byte stays v3.
         let header = ColumnStatsHeader {
-            format_version: 1, // disagrees with the v2 envelope byte below
+            format_version: 1, // disagrees with the v3 envelope byte below
             tenant_hash: vec![0x11; 16],
             signal: 3,
             part_blake3: vec![vec![0x22; 32]],
@@ -1328,7 +1265,7 @@ mod tests {
         let body = zstd::bulk::compress(&segments_raw, ZSTD_LEVEL).expect("compress");
         let mut out = Vec::new();
         out.extend_from_slice(&COLUMN_STATS_MAGIC);
-        out.push(2); // v2 envelope
+        out.push(3); // v3 envelope
         out.extend_from_slice(&COLUMN_STATS_RESERVED);
         out.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(&header_bytes);
@@ -1344,7 +1281,7 @@ mod tests {
             err,
             SnapshotFormatError::ColumnStatsHeaderVersionMismatch {
                 header: 1,
-                envelope: 2,
+                envelope: 3,
             }
         );
     }
@@ -1367,15 +1304,15 @@ mod tests {
         }
     }
 
-    /// A corrupted body under a v2 envelope is caught by the body CRC, a typed
+    /// A corrupted body under a v3 envelope is caught by the body CRC, a typed
     /// error rather than a decode of wrong data.
     #[test]
-    fn corrupt_v2_body_is_typed_error() {
+    fn corrupt_v3_body_is_typed_error() {
         let mut seg = segment(1, 0, 1);
         seg.writer_id = vec![0x77; 32];
         let mut bytes =
-            encode_column_stats_versioned(2, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
-                .expect("v2 framing encodes");
+            encode_column_stats_versioned(3, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
+                .expect("v3 framing encodes");
         // Flip a byte inside the compressed body region (past the header,
         // before the trailing CRCs).
         let mid = bytes.len() / 2;
@@ -1397,8 +1334,17 @@ mod tests {
 
     #[test]
     fn oversized_declared_length_rejected_before_decompress() {
-        let segments = vec![segment(1, 0, 1)];
-        let bytes = encode_column_stats([0x11; 16], 3, vec![], &segments).expect("encodes");
+        let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0x77; 32];
+        let segments = vec![seg];
+        let bytes = encode_column_stats_v3(
+            [0x11; 16],
+            3,
+            [0x22; 32],
+            &segments,
+            crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
+        )
+        .expect("encodes");
         let tiny_limit = ColumnStatsLimits {
             max_column_stats_bytes: 1,
         };

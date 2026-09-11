@@ -10,10 +10,12 @@ mod head;
 mod part;
 mod postings;
 
+#[cfg(test)]
+pub use column_stats::encode_column_stats_v2;
 pub use column_stats::{
     ColumnStatsHeaderPeek, DecodedColumnStats, column_stats_segments_concat, decode_column_stats,
-    decode_column_stats_header, encode_column_stats, encode_column_stats_v2,
-    encode_column_stats_v3, validate_min_max_presence,
+    decode_column_stats_header, encode_column_stats, encode_column_stats_v3,
+    validate_min_max_presence,
 };
 pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
@@ -94,28 +96,27 @@ impl Default for PostingsLimits {
 /// (ADR-0850).
 pub const COLUMN_STATS_MAGIC: [u8; 4] = *b"RCST";
 
-/// Column-statistics envelope WRITE version: the version the fold stamps into
-/// every part-hash-keyed (v2) `.cstat` object it writes (ADR-0942 A2). Single
-/// source for the stamped v2 version so a later bump edits one literal.
-///
-/// The field-11 v1 object is NOT stamped from this constant: during the
-/// ADR-0942 dual-publish window the fold keeps writing a v1 (L0-tuple-keyed)
-/// `.cstat` under `SnapshotHead.column_stats` byte-for-byte as before, so
-/// [`column_stats::encode_column_stats`] stamps envelope version 1 explicitly.
-/// This constant governs only the new field-13 v2 object.
+/// Column-statistics envelope version [`column_stats::encode_column_stats_v2`]
+/// stamps. ADR-1413 decision 6 (#1600) retired the v2 whole-object write path
+/// from production: this constant, and `encode_column_stats_v2` itself, exist
+/// only for fixtures exercising `decode_column_stats`'s continued acceptance
+/// (or, pre-#1600 test simulation) of the format a v2 object once carried.
+#[cfg(test)]
 pub const COLUMN_STATS_WRITE_VERSION: u8 = 2;
 
 /// Column-statistics envelope ACCEPTED READ SET: the versions
-/// `decode_column_stats` accepts. v1 is ADR-0850's L0-tuple keying; v2 is
-/// ADR-0942's part-hash keying; v3 is ADR-1413's per-part keying (one part per
-/// object, same content-hash keying as v2). The decoder checks MEMBERSHIP
-/// against this set, never equality against [`COLUMN_STATS_WRITE_VERSION`]:
-/// bumping the write version must not make the decoder reject the older
-/// objects the dual-publish/reader-fallback rule still depends on. Single
+/// `decode_column_stats` accepts. v3 is ADR-1413's per-part keying (one part
+/// per object) and, as of ADR-1413 decision 6 (#1600), the only published
+/// form: v1 (ADR-0850's L0-tuple keying) and v2 (ADR-0942's part-hash keying)
+/// whole-object envelopes are retired from the read path, so a legacy
+/// whole-object `.cstat` a pre-#1600 fold once wrote is never decoded, only
+/// ever left unread. The decoder checks MEMBERSHIP against this set, never
+/// equality against [`COLUMN_STATS_WRITE_VERSION`]: bumping the write version
+/// must not make the decoder reject an object this set still accepts. Single
 /// source for the accepted set so a later version is added in one place. Each
 /// new version is accepted before anything writes one, so a writer and this
 /// decoder cannot disagree the moment it first appears.
-pub const COLUMN_STATS_ACCEPTED_READ_VERSIONS: [u8; 3] = [1, 2, 3];
+pub const COLUMN_STATS_ACCEPTED_READ_VERSIONS: [u8; 1] = [3];
 
 /// Whether `version` is an accepted `.cstat` envelope read version. Membership,
 /// not equality against the write version (ADR-0942).
@@ -189,8 +190,6 @@ mod tests {
             folder_id: vec![0x33; 16],
             created_unix_ns: 0,
             shard_generation_count: 1,
-            column_stats: None,
-            column_stats_part: None,
         }
     }
 
@@ -404,7 +403,7 @@ mod tests {
         assert_eq!(DEFAULT_MAX_POSTINGS_BYTES, 256 << 20);
         assert_eq!(COLUMN_STATS_MAGIC, *b"RCST");
         assert_eq!(COLUMN_STATS_WRITE_VERSION, 2);
-        assert_eq!(COLUMN_STATS_ACCEPTED_READ_VERSIONS, [1, 2, 3]);
+        assert_eq!(COLUMN_STATS_ACCEPTED_READ_VERSIONS, [3]);
         assert_eq!(COLUMN_STATS_RESERVED, [0, 0, 0]);
         assert_eq!(DEFAULT_MAX_COLUMN_STATS_BYTES, 256 << 20);
         assert_eq!(DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES, 10_000);

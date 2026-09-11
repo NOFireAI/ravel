@@ -707,8 +707,6 @@ mod tests {
             folder_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
             shard_generation_count: 1,
-            column_stats: None,
-            column_stats_part: None,
         }
     }
 
