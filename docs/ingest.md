@@ -220,13 +220,24 @@ double-count it, and:
    dead actor's buffered points, which are lost (documented at-least-once:
    nothing buffered was acknowledged). The write that observed the death
    still returns the typed shard-unavailable error; the client retries and
-   the retry lands on the fresh actor.
-2. Once a shard has spent its respawn budget, the next death condemns it:
+   the retry lands on the fresh actor. The replacement continues the same
+   monotonic flush-open floor (ADR-1307): the floor belongs to the shard, not
+   to one actor, so a respawn cannot stamp a `created_unix_ns` behind what
+   the dead incarnation already committed for that shard.
+2. The budget is spent within a window, not over the process lifetime. A
+   shard that runs a whole `max_flush_lifetime` (1 hour by default) without
+   dying has its spent respawns decay to zero, so three unrelated transients
+   hours apart never accumulate into a condemnation while a crash loop still
+   exhausts the budget in seconds. The decay does not un-condemn a shard.
+3. Once a shard has spent its respawn budget, the next death condemns it:
    the router stops respawning, increments `shards_condemned` once for that
    shard, and `IngestRouter::ready()` turns false. `services/ravel-server`
    ANDs that into `/readyz`, so a condemned shard makes the process report
-   not-ready and the orchestrator replaces the replica (a condemned shard
-   cannot recover in-process). Surviving shards keep serving until then.
+   not-ready. That sheds traffic (Kubernetes removes the pod from its Service
+   endpoints) but does not restart or reschedule it: `/healthz` is
+   deliberately independent of ingest health, so an operator has to roll the
+   pod. A condemned shard cannot recover in-process. Surviving shards keep
+   serving until then.
 
 Surviving shards keep working throughout.
 
@@ -237,7 +248,8 @@ transient recovery, a sustained climb on one shard is a poison-pill
 input. `shards_condemned` counts each condemned shard at most once per live
 generation, so under resharding it is bounded by `live_generations *
 shard_count` rather than `shard_count`; any nonzero value means the process is
-not-ready and is being replaced, so alert on `shards_condemned > 0`.
+not-ready and will stay that way until someone rolls it, so alert on
+`shards_condemned > 0`.
 
 Flush (still inside the actor; ingest-ordering per shard is the point):
 1. Build RSEG via `ravel-segment::SegmentWriter` (one segment per tenant in
@@ -1031,12 +1043,14 @@ Counters recorded today:
 - `shard_deaths`: shard-actor deaths observed by the router, counted once per
   death including each respawned incarnation, so it can exceed
   `shard_count`.
-- `shards_condemned`: shards that exhausted their respawn budget and were
-  condemned, counted at most once per shard per live generation and bounded by
+- `shards_condemned`: shards that exhausted their respawn budget within one
+  decay window and were condemned, counted at most once per shard per live
+  generation and bounded by
   `live_generations * shard_count`, not `shard_count`: under resharding each
   generation's handle for a shard index can condemn independently.
   Nonzero turns `IngestRouter::ready()` false and, through
-  `services/ravel-server`, `/readyz` to 503.
+  `services/ravel-server`, `/readyz` to 503, and nothing recovers it in
+  process.
 - `in_flight_flushes_total`: gauge, sum across shards of flush tasks spawned
   but not yet acked (ADR-0067 decision 2 consequence of pipelining). Unlike
   every other counter here it is per-shard underneath

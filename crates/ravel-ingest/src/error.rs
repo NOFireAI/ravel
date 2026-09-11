@@ -19,13 +19,14 @@ pub enum WriteError {
     /// so the degraded state is observable rather than silent (issue #1299).
     /// Retryable at the client, and usually transient: the router respawns the
     /// dead shard with a fresh writer identity (up to
-    /// [`crate::IngestRouter::MAX_SHARD_RESPAWNS`]), so a retry routed after the
-    /// respawn reaches a live actor. The buffered points the dead actor held
+    /// [`crate::IngestRouter::MAX_SHARD_RESPAWNS`] within one decay window), so
+    /// a retry routed after the respawn reaches a live actor. The buffered points the dead actor held
     /// are not recovered by the respawn, which is why even a buffered-mode
     /// writer's already-acked points for that flush are lost. Once a shard
     /// exhausts its respawn budget it is condemned: writes to it keep failing,
-    /// and the router reports not-ready (`IngestRouter::ready`) so the
-    /// orchestrator replaces the replica.
+    /// and the router reports not-ready (`IngestRouter::ready`), which sheds
+    /// traffic from this replica but does not replace it. Recovering the shard
+    /// needs the process rolled.
     #[error("shard actor unavailable")]
     ShardUnavailable,
     /// A strict-mode ack did not arrive within the caller's `ack_deadline`.

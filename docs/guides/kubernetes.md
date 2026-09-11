@@ -370,10 +370,16 @@ service and gets no probe.
 - `/healthz` (liveness): 200 whenever the HTTP listener is serving. It means
   the event loop is alive, and it never depends on store reachability, so a
   store outage cannot get healthy pods killed.
-- `/readyz` (readiness): 200 after startup completes (config parsed, the store
-  capability gate passed, listeners bound) and while the background
-  store-reachability probe is healthy. 503 before startup completes, and after
-  four consecutive failed probes until the next successful one.
+- `/readyz` (readiness): the AND of four conditions. 200 once startup completes
+  (config parsed, the store capability gate passed, listeners bound), while the
+  background store-reachability probe is healthy, while no ingest shard has been
+  condemned, and until SIGTERM flips the drain latch. 503 before startup
+  completes, after four consecutive failed probes until the next successful one,
+  once a shard actor exhausts its respawn budget, and for the whole drain. Only
+  the store-probe condition recovers on its own; a condemned shard holds the pod
+  out of its Service until someone rolls it, because readiness sheds traffic and
+  never restarts or reschedules a pod
+  ([troubleshooting](operations/troubleshooting.md)).
 
 `/-/healthy` and `/-/ready` are aliases for `/healthz` and `/readyz`, served by
 the same handlers for clients that probe Prometheus' own paths. Either

@@ -107,7 +107,14 @@ depends on store reachability, so a store outage cannot get healthy processes
 killed. `/readyz` gates on completed startup and then follows a background
 store probe with asymmetric hysteresis: four consecutive probe failures flip
 it to 503 and one success recovers it, and the kubelet path reads an
-in-memory atomic rather than touching the store. On SIGTERM this same
+in-memory atomic rather than touching the store. A third input is ingest
+health: once a shard actor exhausts its respawn budget and is condemned, this
+process's `/readyz` is 503 for good. Readiness only sheds traffic (a 503
+removes the pod from its Service endpoints); it never restarts or reschedules
+the pod, which is why liveness is a separate route and why a condemned shard
+needs an operator to roll the process
+([guides/operations/troubleshooting.md](guides/operations/troubleshooting.md)).
+On SIGTERM this same
 `/readyz` is the drain signal: the process flips it to 503 first and deletes
 its distributed query heartbeat record while it waits a short settle interval,
 so a probe observes the 503 and a sibling coordinator drops this worker from

@@ -192,12 +192,20 @@ Unauthenticated, and served in every mode, including maintain mode.
 handler proves the server task can route, so it is 200 whenever it answers, and a
 store outage never makes it fail.
 
-`/readyz` (and `/-/ready`) is readiness: 503 until startup has completed (config
-parsed, the object-store capability gate passed, listeners bound), then 200 for
-as long as the store also stays reachable. It reads only an atomic per probe and
-issues no object-store request itself. A background store probe with hysteresis
-supplies that atomic: four consecutive failed probes flip readiness to 503, and a
-single success recovers it.
+`/readyz` (and `/-/ready`) is readiness, the AND of four conditions: startup has
+completed (config parsed, the object-store capability gate passed, listeners
+bound), the process is not draining, the store is reachable, and no ingest shard
+actor has been condemned after exhausting its respawn budget. It issues no
+object-store request itself and takes no lock: each condition is an atomic load,
+including the ingest one, which reads the condemned-shard counter. A background
+store probe with hysteresis supplies the store atomic: four consecutive failed
+probes flip readiness to 503, and a single success recovers it.
+
+Only the store condition recovers on its own. The startup latch and the drain
+latch are one-way, and a condemned ingest shard cannot recover in-process, so a
+503 from that cause persists until the process is rolled. Readiness never
+restarts the process: a 503 sheds traffic (Kubernetes removes the pod from its
+Service endpoints), which is why liveness is the separate `/healthz` route.
 
 `/metrics` is the Prometheus scrape endpoint. It is unauthenticated, so
 per-tenant labels on the admission and query families are opt-in
