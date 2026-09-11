@@ -149,20 +149,6 @@ pub enum SnapshotFormatError {
     #[error("malformed varint in postings body")]
     PostingsBadVarint,
 
-    #[error("head column-stats ref blake3 must be 32 bytes, got {0}")]
-    BadColumnStatsRefBlake3Len(usize),
-    #[error("head column-stats ref has an empty key")]
-    EmptyColumnStatsKey,
-    #[error("head column-stats ref part_blake3[{index}] must be 32 bytes, got {actual}")]
-    BadColumnStatsRefPartBlake3Len { index: usize, actual: usize },
-    #[error("head column-stats ref names {stats_parts} parts but head has {head_parts} parts")]
-    ColumnStatsRefPartCountMismatch {
-        stats_parts: usize,
-        head_parts: usize,
-    },
-    #[error("head column-stats ref part_blake3[{index}] does not match parts[{index}].blake3")]
-    ColumnStatsRefPartBlake3Mismatch { index: usize },
-
     #[error("column-stats object is smaller than the minimum envelope prefix: {size} bytes")]
     ColumnStatsTooSmall { size: usize },
     #[error("bad column-stats magic bytes")]

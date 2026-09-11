@@ -122,22 +122,19 @@ message SnapshotHead {
   // record view. Absent/0 = pre-reshard head; readers must never treat
   // absence as an error.
   uint32 shard_generation_count = 10;
-  // Additive, ADR-0850 (logs typed-column statistics). Absent when the
-  // tenant has no configured typed columns (ADR-0090), no eligible L0
-  // segment has been folded yet, or the last fold's column-stats build
-  // failed; readers must never treat absence as an error, and must fall
-  // back to scanning for any statistic this ref does not cover.
-  SnapshotColumnStatsRef column_stats = 11;
-  // Additive, ADR-0942 (re-key .cstat column statistics to snapshot-part
-  // binding). Points at a part-hash-keyed .cstat (envelope v2), joined to a
-  // resolved segment by the covered part's SnapshotPartRef.blake3 rather than
-  // the ADR-0850 five-field identity tuple field 11 carries. Field 12 is
-  // deliberately skipped: ADR-0913 has claimed it for
-  // SnapshotMaterializationRef. Absent means no part-bound statistics have
-  // been built; readers must never treat absence as an error, and must fall
-  // back to scanning for any statistic this ref does not cover. Field 11 is
-  // neither renumbered nor redefined and keeps its ADR-0850 meaning.
-  SnapshotColumnStatsPartRef column_stats_part = 13;
+  // Retired, ADR-1413 decision 6 (#1600). Formerly SnapshotColumnStatsRef
+  // column_stats (ADR-0850 whole-object v1 statistics). The fold no longer
+  // publishes this object at any size; per-part statistics live at
+  // SnapshotPartRef.column_stats (field 7) instead. Never reused.
+  reserved 11;
+  // Field 12 is deliberately skipped: ADR-0913 has claimed it for
+  // SnapshotMaterializationRef.
+  //
+  // Retired, ADR-1413 decision 6 (#1600). Formerly SnapshotColumnStatsPartRef
+  // column_stats_part (ADR-0942 whole-object v2 statistics). The fold no
+  // longer publishes this object at any size; per-part statistics live at
+  // SnapshotPartRef.column_stats (field 7) instead. Never reused.
+  reserved 13;
 }
 
 message SnapshotPartRef {
@@ -154,9 +151,8 @@ message SnapshotPartRef {
   uint32 min_hour = 6;
   // Additive, ADR-1413. The per-part column-statistics object covering
   // exactly this part's segments. Absent (proto3 default) means this part
-  // has no per-part statistics; the reader falls back to the whole-object
-  // ref at SnapshotHead field 13 (ADR-0942), then field 11 (ADR-0850), then
-  // to scan. Absence is never an error.
+  // has no per-part statistics and is scanned: since ADR-1413 decision 6
+  // there is no whole-object fallback. Absence is never an error.
   SnapshotColumnStatsPartRef column_stats = 7;
 }
 
@@ -184,26 +180,14 @@ message SnapshotPostingsHeader {
   uint64 body_uncompressed_len = 7;
 }
 
-// Reference to a column-statistics object (RCST1 envelope), ADR-0850. Bound
-// to the exact set of parts it was built from, the same way
-// SnapshotPostingsRef binds a name-postings object: a column-stats object is
-// only trustworthy against the parts whose blake3 hashes it names here.
-message SnapshotColumnStatsRef {
-  string key = 1;              // full object key of the column-stats object
-  bytes blake3 = 2;             // 32, of the column-stats object's full bytes
-  uint64 size = 3;
-  uint32 segment_count = 4;     // number of segments with an entry in this object
-  repeated bytes part_blake3 = 5;  // covered parts' blake3, same order as parts
-}
-
 // Reference to a part-hash-keyed column-statistics object (RCST envelope,
-// v2), ADR-0942. Mirrors SnapshotColumnStatsRef (field 11) field-for-field;
-// the difference is semantic, not structural: the covered .cstat binds its
-// per-segment statistics to a part's blake3 rather than to the ADR-0850
-// five-field identity tuple, so it covers L1 (and rewrite-output) segments
-// that the tuple key cannot name uniquely. Like SnapshotColumnStatsRef it is
-// bound to the exact set of parts it was built from: it is only trustworthy
-// against the parts whose blake3 hashes it names here.
+// v2 shape, v3 when covering exactly one part), ADR-0942/ADR-1413. Bound to
+// the exact set of parts it was built from, the same way SnapshotPostingsRef
+// binds a name-postings object: a column-stats object is only trustworthy
+// against the parts whose blake3 hashes it names here. Used at
+// SnapshotPartRef.column_stats (field 7); the whole-object v1 and v2 forms
+// this message used to serve at SnapshotHead fields 11 and 13 were retired
+// by ADR-1413 decision 6 (#1600).
 message SnapshotColumnStatsPartRef {
   string key = 1;              // full object key of the column-stats object
   bytes blake3 = 2;             // 32, of the column-stats object's full bytes
