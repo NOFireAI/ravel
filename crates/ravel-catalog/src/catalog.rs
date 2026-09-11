@@ -440,9 +440,18 @@ pub struct Catalog {
     /// This crate reads no clock: the value is whatever `now_ns` the caller
     /// passed into `fold`, which is that caller's injected clock.
     ///
-    /// Updated with `fetch_max`, never a plain store, so a fold whose caller
-    /// holds a clock behind another caller's cannot walk the value backwards
-    /// and make a healthy fold look stalled.
+    /// Updated with a plain `store`, not `fetch_max`. Within one process every
+    /// fold caller reads the same host wall clock (the server's scheduled loop
+    /// and its on-demand route both pass `SystemClock`), so nothing here races
+    /// two callers with different clocks: the only thing that can move this
+    /// value backwards is an NTP step on that one host. The direction of that
+    /// trade is what picks `store` over `fetch_max`. `fetch_max` would latch a
+    /// forward NTP step permanently, leaving the gauge stuck at a future
+    /// reading it can never come down from, so `time() - gauge` stays small and
+    /// a later genuine stall is masked with no bound on how long. A plain
+    /// `store` lets a backward NTP step produce only a transient false stall
+    /// that the next successful fold clears. On a liveness signal a bounded
+    /// false positive is the safe side; an unbounded false negative is not.
     fold_last_success_unix_ns: AtomicI64,
     /// Bounds the object-store requests one resolve keeps in flight. Ephemeral, process-local, correctness-free: it changes only
     /// how many round trips overlap, never which segments a resolve returns.
@@ -1072,7 +1081,7 @@ impl Catalog {
         if succeeded {
             self.fold_cycles.fetch_add(1, Ordering::Relaxed);
             self.fold_last_success_unix_ns
-                .fetch_max(now_ns, Ordering::Relaxed);
+                .store(now_ns, Ordering::Relaxed);
         } else {
             self.fold_failures.fetch_add(1, Ordering::Relaxed);
         }
