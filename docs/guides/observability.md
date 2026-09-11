@@ -231,10 +231,78 @@ Labels: `mode`.
 | `ravel_catalog_interlock_violations_total` | Unlisted L0 commit records observed postdating a compaction record in their bucket. |
 | `ravel_catalog_compaction_input_set_conflicts_total` | Buckets observed holding two compaction records with different input_set_hash. |
 | `ravel_catalog_isolation_breach_total` | Hard-failed queries from a HEAD or postings tenant_hash mismatch or an out-of-prefix listing result. |
+| `ravel_catalog_fold_cycles_total` | Catalog fold cycles that completed successfully, including no-op cycles that sealed no new hour. |
+| `ravel_catalog_fold_failures_total` | Catalog fold cycles that returned an error. |
+| `ravel_catalog_fold_last_success_timestamp_seconds` | Gauge. Unix time of the most recent successful catalog fold, in seconds; 0 until the first fold succeeds. |
 
 The first two counters tally an anomaly the query resolves past. Each
 `ravel_catalog_isolation_breach_total` increment is a query that failed with
 an explicit isolation-fault error. [Troubleshooting](operations/troubleshooting.md) gives its alert rule.
+
+#### The fold-health family and its HEAD-age alert
+
+The catalog fold is the only thing that seals ingest hours. If it stops, the
+unsealed tail every recent-window query must scan grows without bound, and a
+cold recent-window query eventually exceeds its per-query request budget and
+returns HTTP 422 for every recent-window query, fleet-wide. That outage is the
+first symptom the fold's own logs give you, because the failure path is
+`tracing`-only otherwise. The gauge above is the signal that moves *before* the
+outage: it advances only when a fold cycle completes, so it goes stale exactly
+when the fold stops rather than when load changes.
+
+The periodic fold runs in the maintain role. Other roles fold only on demand,
+so their gauge is not a reliable liveness signal; alert on the maintain
+replica's series (`mode="maintain"`).
+
+Alert when the gauge is older than the unsealed span the catalog config already
+implies. That span is `max_flush_lifetime + clock_skew_allowance +
+fold_safety_margin`: with the shipped defaults `1h + 5m + 15m = 4800s` (80
+minutes). This is the age past which the fold has been silent for longer than
+one full sealing window, so at least one hour that should have sealed has not,
+and the unsealed tail has begun to grow past the size a healthy fold always
+leaves behind. A live fold republishes every fold interval (5 minutes by
+default), so in steady state the gauge's age sawtooths well under six minutes;
+4800s clears that healthy band by more than an order of magnitude while still
+firing long before the query-budget cliff. If you have raised any of the three
+config values, recompute the threshold as their sum in seconds.
+
+```yaml
+groups:
+  - name: ravel-catalog-fold
+    rules:
+      - alert: RavelCatalogFoldStalled
+        expr: |
+          (time() - ravel_catalog_fold_last_success_timestamp_seconds{mode="maintain"})
+            > 4800
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Catalog fold has not succeeded in over 80 minutes on {{ $labels.instance }}
+          description: >-
+            The catalog fold seals ingest hours. While it is stopped the
+            unsealed recent-window tail grows without bound, and cold
+            recent-window queries eventually fail with HTTP 422 fleet-wide.
+            Check the maintain replica's logs for the fold error. The 4800s
+            threshold is max_flush_lifetime + clock_skew_allowance +
+            fold_safety_margin (1h + 5m + 15m at the shipped defaults); raise it
+            in step if you raised those. The gauge is 0 until the first fold
+            succeeds, so the 15m `for` rides out a maintain-role restart, whose
+            first fold lands within the 5-minute fold interval.
+      - alert: RavelCatalogFoldFailing
+        expr: |
+          rate(ravel_catalog_fold_failures_total{mode="maintain"}[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Catalog fold is returning errors on {{ $labels.instance }}
+          description: >-
+            Folds are still being attempted but failing. This precedes a stalled
+            gauge: catch it here before RavelCatalogFoldStalled fires.
+```
 
 ### Tenancy adoption (`ravel_tenancy_v1_unkeyed_adoptions_total`)
 

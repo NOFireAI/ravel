@@ -1417,6 +1417,16 @@ pub struct CatalogCountersSnapshot {
     /// tenant_hash mismatch or an out-of-prefix listing result. Unlike the
     /// two counters above, each of these also failed its query.
     pub isolation_breaches: u64,
+    /// Fold cycles that returned `Ok` (`Catalog::fold`), including no-op
+    /// cycles that sealed nothing (#1306).
+    pub fold_cycles_total: u64,
+    /// Fold cycles that returned `Err` (`Catalog::fold`), otherwise
+    /// `tracing`-only (#1306).
+    pub fold_failures_total: u64,
+    /// `now_ns` of the most recent successful fold, in nanoseconds since the
+    /// Unix epoch, or `0` if none has succeeded in this process yet. Rendered
+    /// as a seconds gauge so an operator alerts on it going stale (#1306).
+    pub fold_last_success_unix_ns: i64,
 }
 
 fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCountersSnapshot) {
@@ -1457,6 +1467,45 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         "ravel_catalog_isolation_breach_total",
         &[Label::Mode(mode)],
         snapshot.isolation_breaches,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_fold_cycles_total",
+        "Catalog fold cycles that completed successfully, including no-op cycles that sealed no new hour.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_fold_cycles_total",
+        &[Label::Mode(mode)],
+        snapshot.fold_cycles_total,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_fold_failures_total",
+        "Catalog fold cycles that returned an error (the fold seals ingest hours; a stopped fold eventually forces recent-window queries over their request budget).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_fold_failures_total",
+        &[Label::Mode(mode)],
+        snapshot.fold_failures_total,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_fold_last_success_timestamp_seconds",
+        "Unix time of the most recent successful catalog fold, in seconds; 0 until the first fold succeeds. Advances only when a fold cycle completes, so it goes stale exactly when the fold stops.",
+        "gauge",
+    );
+    write_sample_f64(
+        out,
+        "ravel_catalog_fold_last_success_timestamp_seconds",
+        &[Label::Mode(mode)],
+        snapshot.fold_last_success_unix_ns as f64 / 1_000_000_000.0,
     );
 }
 
@@ -4022,6 +4071,9 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         interlock_violations: state.catalog.interlock_violations(),
         compaction_input_set_conflicts: state.catalog.compaction_input_set_conflicts(),
         isolation_breaches: state.catalog.isolation_breaches(),
+        fold_cycles_total: state.catalog.fold_cycles_total(),
+        fold_failures_total: state.catalog.fold_failures_total(),
+        fold_last_success_unix_ns: state.catalog.fold_last_success_unix_ns(),
     };
 
     let maintain_snapshot =
@@ -4673,6 +4725,7 @@ mod tests {
             interlock_violations: 1,
             compaction_input_set_conflicts: 2,
             isolation_breaches: 3,
+            ..Default::default()
         };
         let body = render(
             Mode::Gateway,
@@ -5290,6 +5343,7 @@ mod tests {
             interlock_violations: 0,
             compaction_input_set_conflicts: 0,
             isolation_breaches: 5,
+            ..Default::default()
         };
         let body = render(
             Mode::Gateway,
@@ -5324,6 +5378,65 @@ mod tests {
         assert!(
             body.contains("ravel_catalog_isolation_breach_total{mode=\"gateway\"} 5"),
             "isolation-breach counter must render its current value:\n{body}"
+        );
+    }
+
+    #[test]
+    fn fold_health_family_renders_with_driven_values() {
+        // 1_700_000_000 s since the epoch, as nanoseconds. A whole number of
+        // seconds so the ns -> seconds gauge conversion is exact.
+        let last_success_unix_ns = 1_700_000_000i64 * 1_000_000_000;
+        let catalog = CatalogCountersSnapshot {
+            interlock_violations: 0,
+            compaction_input_set_conflicts: 0,
+            isolation_breaches: 0,
+            fold_cycles_total: 7,
+            fold_failures_total: 2,
+            fold_last_success_unix_ns: last_success_unix_ns,
+        };
+        let body = render(
+            Mode::Maintain,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            body.contains("ravel_catalog_fold_cycles_total{mode=\"maintain\"} 7"),
+            "fold cycle counter must render its driven value:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_catalog_fold_failures_total{mode=\"maintain\"} 2"),
+            "fold failure counter must render its driven value:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_catalog_fold_last_success_timestamp_seconds{mode=\"maintain\"} 1700000000"
+            ),
+            "fold last-success gauge must render the driven timestamp in seconds:\n{body}"
         );
     }
 

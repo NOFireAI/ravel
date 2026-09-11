@@ -906,6 +906,44 @@ impl Catalog {
         signal: Signal,
         folder_id: Uuid,
         now_ns: i64,
+        transactions: &[Transaction],
+        default_retention_ns: Option<i64>,
+    ) -> Result<FoldReport, CatalogError> {
+        let result = self
+            .fold_inner(
+                tenant,
+                signal,
+                folder_id,
+                now_ns,
+                transactions,
+                default_retention_ns,
+            )
+            .await;
+        // Record the fold-health family on every exit, so both the maintain
+        // loop and the on-demand path (both funnel through this one method)
+        // feed the same metric; a metric fed by only one of them would read
+        // healthy while the other path is dead (#1306). A completed cycle,
+        // including a no-op that sealed nothing, advances the gauge to the
+        // caller's clock reading; every error path increments the failure
+        // counter. Recording here rather than inside `fold_inner` keeps it off
+        // that method's many `?` returns.
+        match &result {
+            Ok(_) => self.record_fold_success(now_ns),
+            Err(_) => self.record_fold_failure(),
+        }
+        result
+    }
+
+    /// The body of [`Self::fold`]; see that method's documentation for the
+    /// full contract. Split out so [`Self::fold`] can record the fold-health
+    /// metric family on every exit (success or error) without threading the
+    /// recording through this method's many `?` returns.
+    async fn fold_inner(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        folder_id: Uuid,
+        now_ns: i64,
         _transactions: &[Transaction],
         default_retention_ns: Option<i64>,
     ) -> Result<FoldReport, CatalogError> {
@@ -5492,6 +5530,96 @@ mod tests {
         assert!(second.no_op);
         assert_eq!(second.watermark_hour, Some(10));
         assert_eq!(second.put_requests, 0);
+    }
+
+    /// A successful fold advances the last-success gauge to exactly the
+    /// injected clock reading and increments the cycle counter by exactly one,
+    /// leaving the failure counter untouched (#1306). The gauge is what an
+    /// operator alerts on: it must carry the fold's own `now_ns`, not a
+    /// wall-clock read.
+    #[tokio::test]
+    async fn fold_success_advances_gauge_and_cycle_counter() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        // Before any fold: gauge and both counters read zero.
+        assert_eq!(catalog.fold_last_success_unix_ns(), 0);
+        assert_eq!(catalog.fold_cycles_total(), 0);
+        assert_eq!(catalog.fold_failures_total(), 0);
+
+        let now = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("fold");
+
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(),
+            now,
+            "gauge must advance to exactly the injected clock reading"
+        );
+        assert_eq!(
+            catalog.fold_cycles_total(),
+            1,
+            "one successful cycle must increment the cycle counter by exactly one"
+        );
+        assert_eq!(
+            catalog.fold_failures_total(),
+            0,
+            "a successful fold must record no failure"
+        );
+    }
+
+    /// A failing fold increments the failure counter by exactly one and leaves
+    /// the last-success gauge unmoved (#1306). Both halves matter: without the
+    /// gauge check, a gauge that wrongly advanced on failure would look
+    /// correct. A HEAD one format version ahead of this build makes the fold
+    /// return `Err(UnsupportedHeadVersion)` without ever CAS-writing.
+    #[tokio::test]
+    async fn fold_failure_increments_failure_counter_and_leaves_gauge_unmoved() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let newer_head = SnapshotHead {
+            format_version: HEAD_FORMAT_VERSION + 1,
+            ..Default::default()
+        };
+        store
+            .put(
+                &head_key,
+                Bytes::from(newer_head.encode_to_vec()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed newer-format head");
+
+        let now = now_at_seal(12);
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect_err("fold must fail on a newer-format HEAD");
+        assert!(
+            matches!(err, CatalogError::UnsupportedHeadVersion { .. }),
+            "expected UnsupportedHeadVersion, got {err:?}"
+        );
+
+        assert_eq!(
+            catalog.fold_failures_total(),
+            1,
+            "one failed fold must increment the failure counter by exactly one"
+        );
+        assert_eq!(
+            catalog.fold_cycles_total(),
+            0,
+            "a failed fold must not count as a successful cycle"
+        );
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(),
+            0,
+            "the success gauge must not move on a failed fold"
+        );
     }
 
     #[tokio::test]

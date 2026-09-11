@@ -5,7 +5,7 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -496,6 +496,28 @@ pub struct Catalog {
     /// `None` in every real production run; read through
     /// [`Catalog::column_stats_part_ceiling`].
     column_stats_part_ceiling_override: Option<u64>,
+    /// Number of [`Catalog::fold`] calls that returned `Ok`, counted whether
+    /// or not the cycle sealed a new hour: a no-op fold still proves the fold
+    /// job ran a full cycle. The catalog fold is the only thing that seals
+    /// ingest hours, and it reports failures through `tracing` alone, so a
+    /// stopped fold is invisible until a cold recent-window query eventually
+    /// exceeds its request budget. These three fields make the fold's health
+    /// exportable: paired with [`Self::fold_failures_total`] and
+    /// [`Self::fold_last_success_unix_ns`], an operator alerts on the gauge
+    /// going stale rather than on the outage it causes (#1306).
+    fold_cycles_total: AtomicU64,
+    /// Number of [`Catalog::fold`] calls that returned `Err` (every error
+    /// path, including exhausted HEAD CAS retries). The fold's error path is
+    /// otherwise `tracing`-only.
+    fold_failures_total: AtomicU64,
+    /// The `now_ns` of the most recent [`Catalog::fold`] call that returned
+    /// `Ok`, in nanoseconds since the Unix epoch, or `0` if no fold has
+    /// succeeded in this process yet. This is the value an operator actually
+    /// alerts on: it advances only when a fold cycle completes, so it goes
+    /// stale exactly when the fold stops, rather than moving with load like a
+    /// counter. Written from the caller-supplied clock reading, never a
+    /// wall-clock read in this crate.
+    fold_last_success_unix_ns: AtomicI64,
 }
 
 /// Adapts [`Catalog::guarded_get`] to the provisioning module's
@@ -583,6 +605,9 @@ impl Catalog {
             warned_decode_failures: Mutex::new(HashSet::new()),
             column_stats_decode_refusals: AtomicU64::new(0),
             column_stats_part_ceiling_override: None,
+            fold_cycles_total: AtomicU64::new(0),
+            fold_failures_total: AtomicU64::new(0),
+            fold_last_success_unix_ns: AtomicI64::new(0),
         })
     }
 
@@ -949,6 +974,43 @@ impl Catalog {
     /// row 11).
     pub fn compaction_input_set_conflicts(&self) -> u64 {
         self.compaction_input_set_conflicts.load(Ordering::Relaxed)
+    }
+
+    /// Number of [`Self::fold`] calls that returned `Ok` across this catalog's
+    /// lifetime, including no-op cycles that sealed nothing (#1306).
+    pub fn fold_cycles_total(&self) -> u64 {
+        self.fold_cycles_total.load(Ordering::Relaxed)
+    }
+
+    /// Number of [`Self::fold`] calls that returned `Err` across this catalog's
+    /// lifetime (#1306). The fold's error path is otherwise `tracing`-only.
+    pub fn fold_failures_total(&self) -> u64 {
+        self.fold_failures_total.load(Ordering::Relaxed)
+    }
+
+    /// The `now_ns` of the most recent successful [`Self::fold`], in
+    /// nanoseconds since the Unix epoch, or `0` if none has succeeded in this
+    /// process yet (#1306). Advances only when a fold cycle completes, so it
+    /// goes stale exactly when the fold stops.
+    pub fn fold_last_success_unix_ns(&self) -> i64 {
+        self.fold_last_success_unix_ns.load(Ordering::Relaxed)
+    }
+
+    /// Record a fold cycle that returned `Ok`: bump [`Self::fold_cycles_total`]
+    /// and advance [`Self::fold_last_success_unix_ns`] to `now_ns`, the
+    /// caller-supplied clock reading (#1306). Called by [`Self::fold`] on every
+    /// success, including a no-op cycle that sealed nothing.
+    pub(crate) fn record_fold_success(&self, now_ns: i64) {
+        self.fold_cycles_total.fetch_add(1, Ordering::Relaxed);
+        self.fold_last_success_unix_ns
+            .store(now_ns, Ordering::Relaxed);
+    }
+
+    /// Record a fold cycle that returned `Err`: bump
+    /// [`Self::fold_failures_total`] and leave the success gauge untouched
+    /// (#1306).
+    pub(crate) fn record_fold_failure(&self) {
+        self.fold_failures_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Number of buckets observed with two or more live (non-superseded)
