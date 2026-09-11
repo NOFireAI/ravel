@@ -133,9 +133,14 @@ async fn publish_real_segment(store: &MemoryStore, tenant: &str, shard: u32, cre
         .expect("publish");
 }
 
-/// Deliverable 1 (#1598): the pre-change human-readable report printed 13 of
-/// `FoldReport`'s 23 fields and silently omitted the rest, including
+/// Deliverable 1 (#1598): the pre-change human-readable report printed 10 of
+/// `FoldReport`'s 23 fields and silently omitted the other 13, including
 /// `column_stats_dictionaries_dropped`. Every field must now appear.
+///
+/// The count is 10, not 13: the pre-change report emitted 13 LINES, but
+/// `store`, `signal` and `seal_margin` are not `FoldReport` fields. Measured
+/// against the ADR-1413 T2 fold's own output, which printed exactly those 13
+/// lines.
 ///
 /// Prove-the-test: delete any one of the `push_str` lines this test checks
 /// for in `render_fold_report` (`services/ravel-cli/src/catalog.rs`) and the
@@ -219,9 +224,19 @@ async fn fold_human_report_prints_every_fold_report_field() {
          if FoldReport shrank, update this floor deliberately",
         keys.len()
     );
+    // Compare against the set of keys the report actually emits, not with
+    // `printed.contains("{key}:")`. A substring test is satisfied by a LONGER
+    // field's line, so it is vacuous for any key that is a suffix of another:
+    // `previous_watermark_hour:` contains `watermark_hour:`, and
+    // `column_stats_part_bytes:` contains `part_bytes:`. Deleting either of
+    // those two lines from the renderer left a substring check green.
+    let emitted: std::collections::HashSet<&str> = printed
+        .lines()
+        .filter_map(|line| line.trim_start().split_once(':').map(|(key, _)| key))
+        .collect();
     for key in keys.keys() {
         assert!(
-            printed.contains(&format!("{key}:")),
+            emitted.contains(key.as_str()),
             "FoldReport field {key} is serialized by --json but missing from \
              the human report:\n{printed}"
         );

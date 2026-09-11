@@ -351,6 +351,48 @@ numeric signal code (`1` = metrics). `ingest_hour_bucket` is the same hour
 encoded in the object's own key, and it is what the catalog groups listings
 by.
 
+## `inspect cstat`: what a column-statistics object declares
+
+```sh
+ravel-cli inspect cstat \
+  "t/3f2a.../catalog/l/idx/20260910T09.76b5680....cstat"
+```
+
+```
+envelope_version: 3
+header_len: 84
+format_version: 1
+tenant_hash: 3f2a...
+signal: logs
+part_blake3: [98c85b7a...]
+segment_count: 2617
+body_uncompressed_len: 268427456
+over_ceiling: false (limit 268435456)
+columns with dictionary_present=false: 104
+```
+
+A `.cstat` object carries the per-column minimum, maximum, count, sum and
+value dictionary a query uses to skip segments it cannot match. This command
+reads the envelope and header only.
+
+`body_uncompressed_len` against `over_ceiling` is the field worth reading
+first. A reader refuses any object declaring more than
+`DEFAULT_MAX_COLUMN_STATS_BYTES` (256 MiB) **before** decompressing it, so an
+over-ceiling object is undecodable by every reader and its statistics are not
+being used by anything, however healthy the object looks in a listing. That
+is why this command reports the verdict without decompressing: the objects
+most worth diagnosing are exactly the ones a full decode refuses.
+
+`columns with dictionary_present=false` counts the dictionaries the fold
+dropped to bring a part under the ceiling. The fold drops whole dictionaries,
+largest first, and never truncates one, so a column either has its full value
+dictionary or none of it. A high count on an object that is under the ceiling
+means the statistics survived but most of the value dictionaries did not, and
+predicate pruning falls back to min/max for those columns.
+
+A truncated, bad-magic, wrong-version or checksum-mismatched object fails
+with the specific reason rather than a generic error.
+
 ## `idem inspect`: what an idempotency marker says
 
 ```sh
