@@ -227,6 +227,41 @@ pub(crate) enum FlushClockError {
     RegressionRefused(String),
 }
 
+/// Floor under the per-buffer memory backstop
+/// ([`buffer_memory_backstop_bytes`]). One eighth of the 512 MiB process
+/// ceiling (ADR-0069), so no single (shard, tenant) buffer can take a large
+/// share of the shared budget while it fills toward `target_bytes`.
+const BUFFER_MEMORY_BACKSTOP_FLOOR_BYTES: usize = 64 * 1024 * 1024;
+
+/// The memory a single (shard, tenant) buffer may hold before the size trigger
+/// fires regardless of how few object bytes it would write.
+///
+/// The size trigger is stated in object bytes, and the ratio between object
+/// bytes and buffered memory is client-controlled: a series with many short
+/// labels holds roughly twenty times more RAM than the bytes it contributes to
+/// the object. Without this backstop such a tenant would fill RAM toward the
+/// ADR-0069 shed ceiling instead of flushing, and shedding a write is worse
+/// than writing a smaller object. Never below `target_bytes`, because the
+/// buffered memory of a flush is always at least the object bytes it writes,
+/// so a lower backstop would pre-empt the target it is meant to protect.
+pub(crate) fn buffer_memory_backstop_bytes(config: &IngestConfig) -> usize {
+    BUFFER_MEMORY_BACKSTOP_FLOOR_BYTES.max(config.target_bytes)
+}
+
+/// The size trigger, shared by the metrics, log, and span shard actors:
+/// `flush_est_bytes` is the object-bytes estimate for the flush this buffer
+/// would write and gates `target_bytes`; `est_bytes` is the conservative
+/// buffered-memory figure the ADR-0069 ceiling charges and gates only the
+/// memory backstop. Keeping both here keeps one rule in one place rather than
+/// three copies that drift (issue #1305).
+pub(crate) fn size_trigger_fires(
+    flush_est_bytes: usize,
+    est_bytes: usize,
+    config: &IngestConfig,
+) -> bool {
+    flush_est_bytes >= config.target_bytes || est_bytes >= buffer_memory_backstop_bytes(config)
+}
+
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestConfig {
@@ -236,7 +271,16 @@ pub struct IngestConfig {
     pub shard_count: u32,
     /// Bounded mpsc channel depth per shard.
     pub channel_depth: usize,
-    /// Flush a tenant's buffer once its estimated size reaches this many bytes.
+    /// Flush a tenant's buffer once the object that flush would write is
+    /// estimated to reach this many bytes.
+    ///
+    /// Estimated in object bytes, not in buffered memory (issue #1305): the
+    /// size trigger reads the per-signal flush-size estimator, while the
+    /// process-wide memory ceiling (ADR-0069) keeps charging its own
+    /// conservative figure. The two are no longer one number, so raising this
+    /// to get larger objects no longer weakens the memory ceiling.
+    /// [`buffer_memory_backstop_bytes`] is what bounds the memory a single
+    /// buffer may hold while filling toward this target.
     pub target_bytes: usize,
     /// Flush a tenant's buffer once its oldest point is at least this old.
     pub max_flush_delay: Duration,
@@ -251,9 +295,12 @@ pub struct IngestConfig {
     /// paying a PUT every `max_flush_delay` regardless of how little data it
     /// holds.
     pub max_flush_delay_idle: Duration,
-    /// A buffer at or above this many estimated bytes is never treated as
-    /// idle for the age trigger, even with no strict-mode waiter: it is
-    /// already worth the PUT cost `max_flush_delay` pays for.
+    /// A buffer whose flush would write at least this many object bytes is
+    /// never treated as idle for the age trigger, even with no strict-mode
+    /// waiter: it is already worth the PUT cost `max_flush_delay` pays for.
+    /// Same estimator and same units as `target_bytes` (issue #1305): "worth a
+    /// PUT" is a statement about the object, not about the RAM the buffer
+    /// occupies while building it.
     pub min_flush_bytes: usize,
     /// Retries after the first attempt for the data-object PUT (total
     /// attempts = this + 1). Also bounds retries of the commit-record PUT.
@@ -346,6 +393,39 @@ impl Default for IngestConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The trigger reads the object-bytes estimate, and the memory backstop is
+    /// the bound on the other side: a buffer whose struct headers dwarf its
+    /// payload still flushes before it can hold an unbounded amount of RAM.
+    #[test]
+    fn size_trigger_reads_object_bytes_with_a_memory_backstop() {
+        let cfg = IngestConfig {
+            target_bytes: 8 * 1024 * 1024,
+            ..IngestConfig::default()
+        };
+        let backstop = buffer_memory_backstop_bytes(&cfg);
+        assert_eq!(backstop, 64 * 1024 * 1024);
+
+        // Object bytes decide, whatever the buffer holds.
+        assert!(!size_trigger_fires(cfg.target_bytes - 1, 0, &cfg));
+        assert!(size_trigger_fires(cfg.target_bytes, 0, &cfg));
+        assert!(
+            !size_trigger_fires(0, cfg.target_bytes, &cfg),
+            "buffered bytes at target_bytes no longer fire the trigger"
+        );
+
+        // Backstop decides when the buffer runs far past the payload it holds.
+        assert!(!size_trigger_fires(0, backstop - 1, &cfg));
+        assert!(size_trigger_fires(0, backstop, &cfg));
+
+        // A target above the floor raises the backstop with it, so the
+        // backstop can never pre-empt the trigger it backs.
+        let wide = IngestConfig {
+            target_bytes: 256 * 1024 * 1024,
+            ..IngestConfig::default()
+        };
+        assert_eq!(buffer_memory_backstop_bytes(&wide), 256 * 1024 * 1024);
+    }
 
     #[test]
     fn defaults_match_sizing_table() {

@@ -45,7 +45,7 @@ use crate::budget::IngestByteCharge;
 use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
-    SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket,
+    SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket, size_trigger_fires,
 };
 use crate::error::WriteError;
 use crate::metrics::{FlushTrigger, IngestMetrics};
@@ -160,6 +160,13 @@ struct TenantBuf {
     /// arrival order that breaks ties.
     exemplars: Vec<IngestExemplar>,
     est_bytes: usize,
+    /// Estimated bytes the object this buffer's flush writes will hold, the
+    /// size trigger's own figure (issue #1305). `est_bytes` above stays the
+    /// buffered-memory charge the ADR-0069 ceiling reads; the two are not
+    /// interchangeable, and on a label-heavy series they differ by more than an
+    /// order of magnitude. See [`IngestPoint::est_object_sample_bytes`] for the
+    /// model and its bound direction.
+    flush_est_bytes: usize,
     oldest_arrival_ns: Option<i64>,
     min_ingest_ts_ns: Option<i64>,
     max_ingest_ts_ns: Option<i64>,
@@ -214,7 +221,12 @@ impl TenantBuf {
     /// [`IngestPoint::est_charge_bytes`] and [`IngestExemplar::est_bytes`]
     /// apply: a `Label` is two `String` headers whatever the strings hold, so
     /// leaving it out understates a label-heavy buffer by roughly an order of
-    /// magnitude and both flush triggers fire late.
+    /// magnitude and the memory ceiling is charged too little.
+    ///
+    /// The same pass also accumulates `flush_est_bytes`, the object-bytes
+    /// estimate the size trigger reads (issue #1305). The returned figure stays
+    /// the memory one: it is what the caller records on the buffered-bytes
+    /// gauge and what the ADR-0069 charge covers.
     ///
     /// Fails loud on a series-id collision (ADR-0005) or a value-kind
     /// mismatch (a series is scalar or
@@ -268,7 +280,9 @@ impl TenantBuf {
 
         self.note_arrival(arrival_ns);
         let mut bytes_added = 0usize;
+        let mut object_bytes_added = 0usize;
         for point in points {
+            object_bytes_added += point.est_object_sample_bytes();
             match self.series.entry(point.series_id) {
                 Entry::Occupied(mut occ) => {
                     occ.get_mut().values.try_push(point.value);
@@ -280,6 +294,7 @@ impl TenantBuf {
                         .map(|l| size_of::<Label>() + l.name.len() + l.value.len())
                         .sum();
                     bytes_added += label_bytes;
+                    object_bytes_added += point.est_object_series_bytes();
                     vac.insert(SeriesAccum {
                         labels: point.labels,
                         values: SeriesAccumValues::new_with(point.value),
@@ -289,6 +304,7 @@ impl TenantBuf {
             bytes_added += 16;
         }
         self.est_bytes += bytes_added;
+        self.flush_est_bytes += object_bytes_added;
         Ok(bytes_added)
     }
 
@@ -304,12 +320,15 @@ impl TenantBuf {
     /// once; keeping the cap costs a map entry per series forever.
     fn absorb_exemplars(&mut self, exemplars: Vec<IngestExemplar>) -> usize {
         let mut bytes_added = 0usize;
+        let mut object_bytes_added = 0usize;
         self.exemplars.reserve(exemplars.len());
         for e in exemplars {
             bytes_added += e.est_bytes();
+            object_bytes_added += e.est_object_bytes();
             self.exemplars.push(e);
         }
         self.est_bytes += bytes_added;
+        self.flush_est_bytes += object_bytes_added;
         bytes_added
     }
 }
@@ -1071,8 +1090,6 @@ impl ShardActor {
         }
         let arrival_ns = self.clock.now_ns();
         let points_len = points.len() as u64;
-        let target_bytes = self.config.target_bytes;
-
         // Grab the timing handle before the mutable buffer borrow so recording
         // `merge` does not clash with the `&mut self.tenants` borrow held below.
         #[cfg(feature = "stage-timing")]
@@ -1118,7 +1135,7 @@ impl ShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| b.est_bytes >= target_bytes)
+            .map(|b| size_trigger_fires(b.flush_est_bytes, b.est_bytes, &self.config))
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
             return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
@@ -1126,10 +1143,13 @@ impl ShardActor {
         0
     }
 
-    /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
+    /// A buffer with a strict-mode waiter, or one whose flush would write at
+    /// least `min_flush_bytes` of object,
     /// already justifies a PUT on the fast age clock; anything else is idle
     /// and waits for the slower `max_flush_delay_idle` instead (ADR-0051
-    /// section 7). Strict-mode ack latency is unaffected: a strict
+    /// section 7). "Worth a PUT" is a claim about the object, so this reads the
+    /// object-bytes estimate, not the buffered-memory charge (issue #1305).
+    /// Strict-mode ack latency is unaffected: a strict
     /// write always leaves `waiters` non-empty for its whole flush window.
     ///
     /// The fast clock itself is either the fixed `max_flush_delay` (2 s
@@ -1142,7 +1162,8 @@ impl ShardActor {
     /// from one that used the fixed value (`IngestMetrics`'s
     /// `flushes_by_age` vs `flushes_by_age_adaptive`).
     fn age_threshold_ns(&self, buf: &TenantBuf) -> (i64, FlushTrigger) {
-        let has_priority = !buf.waiters.is_empty() || buf.est_bytes >= self.config.min_flush_bytes;
+        let has_priority =
+            !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if !has_priority {
             return (
                 self.config.max_flush_delay_idle.as_nanos() as i64,
