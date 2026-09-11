@@ -190,10 +190,6 @@ async fn fold_human_report_prints_every_fold_report_field() {
         "parts_reused:",
         "postings_built:",
         "postings_bytes:",
-        "column_stats_built:",
-        "column_stats_bytes:",
-        "column_stats_part_built:",
-        "column_stats_part_bytes:",
         "column_stats_part_objects_built:",
         "column_stats_dictionaries_dropped:",
         "layout_drift_count:",
@@ -218,8 +214,13 @@ async fn fold_human_report_prints_every_fold_report_field() {
     let keys = value
         .as_object()
         .expect("FoldReport is a struct, so it serializes to an object");
+    // Deliberately lowered from 23 (ADR-1413 decision 6, #1600): the fold no
+    // longer publishes the whole-object v1/v2 column-stats forms, so
+    // `column_stats_built`/`column_stats_bytes`/`column_stats_part_built`/
+    // `column_stats_part_bytes` are gone from `FoldReport` outright, not
+    // merely renamed.
     assert!(
-        keys.len() >= 23,
+        keys.len() >= 19,
         "expected the derived key set to cover the whole struct, got {} keys; \
          if FoldReport shrank, update this floor deliberately",
         keys.len()
@@ -339,9 +340,7 @@ async fn fold_put_requests_counts_exactly_the_objects_this_fold_writes() {
         "this fixture's payload cannot decode as a real segment, so no postings object is built: {report:?}"
     );
     assert!(
-        !report.column_stats_built
-            && !report.column_stats_part_built
-            && report.column_stats_part_objects_built == 0,
+        report.column_stats_part_objects_built == 0,
         "fixture declares no typed columns, so no column-stats object is built: {report:?}"
     );
     assert_eq!(

@@ -11,7 +11,7 @@
 
 use ravel_catalog::{
     ColumnStatsLimits, DEFAULT_MAX_COLUMN_STATS_BYTES, decode_column_stats_header,
-    encode_column_stats,
+    encode_column_stats_v3,
 };
 use ravel_cli::catalog::render_inspect_cstat;
 use ravel_proto::catalog::v1::column_value::Kind;
@@ -30,7 +30,9 @@ fn i64_value(v: i64) -> ColumnValue {
 
 /// Mirrors `crates/ravel-catalog/src/snapshot_format/column_stats.rs`'s own
 /// `segment()` test fixture: a single I64 column, 10-entry dictionary,
-/// `sum = 45` (0+1+...+9).
+/// `sum = 45` (0+1+...+9). `writer_id` is 32 bytes: v3 keys segments by
+/// content hash (ADR-1413 decision 6, #1600), not the 16-byte writer
+/// identity v1 used.
 fn fixture_segment() -> ColumnStatsSegment {
     let dictionary: Vec<DictEntry> = (0..10)
         .map(|v| DictEntry {
@@ -41,7 +43,7 @@ fn fixture_segment() -> ColumnStatsSegment {
     ColumnStatsSegment {
         ingest_hour_bucket: 1,
         shard: 0,
-        writer_id: vec![0xAA; 16],
+        writer_id: vec![0xAA; 32],
         writer_epoch: 1,
         writer_seq: 1,
         columns: vec![ColumnStat {
@@ -61,14 +63,20 @@ fn fixture_segment() -> ColumnStatsSegment {
 #[test]
 fn inspect_cstat_prints_exact_header_values_and_dictionary_presence() {
     let segments = vec![fixture_segment()];
-    let bytes = encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &segments)
-        .expect("encodes a valid v1 object");
+    let bytes = encode_column_stats_v3(
+        [0x11; 16],
+        3,
+        [0x22; 32],
+        &segments,
+        DEFAULT_MAX_COLUMN_STATS_BYTES,
+    )
+    .expect("encodes a valid v3 object");
 
     let mut out = String::new();
     render_inspect_cstat(&bytes, &mut out).expect("a valid object under ceiling decodes cleanly");
 
-    assert!(out.contains("envelope_version: 1\n"), "{out}");
-    assert!(out.contains("format_version: 1\n"), "{out}");
+    assert!(out.contains("envelope_version: 3\n"), "{out}");
+    assert!(out.contains("format_version: 3\n"), "{out}");
     assert!(
         out.contains(&format!("tenant_hash: {}\n", hex::encode([0x11; 16]))),
         "{out}"
@@ -108,7 +116,7 @@ fn encode_forged_envelope(header: &ColumnStatsHeader, body: &[u8]) -> Vec<u8> {
     let header_bytes = header.encode_to_vec();
     let mut prefix = Vec::new();
     prefix.extend_from_slice(b"RCST");
-    prefix.push(1u8);
+    prefix.push(3u8);
     prefix.extend_from_slice(&[0u8; 3]);
     prefix.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
     prefix.extend_from_slice(&header_bytes);
@@ -125,10 +133,10 @@ fn encode_forged_envelope(header: &ColumnStatsHeader, body: &[u8]) -> Vec<u8> {
 #[test]
 fn inspect_cstat_reports_over_ceiling_without_decompressing() {
     let header = ColumnStatsHeader {
-        format_version: 1,
+        format_version: 3,
         tenant_hash: vec![0x33; 16],
         signal: 2,
-        part_blake3: vec![],
+        part_blake3: vec![vec![0x44; 32]],
         segment_count: 1,
         body_uncompressed_len: DEFAULT_MAX_COLUMN_STATS_BYTES + 1,
     };
@@ -170,8 +178,14 @@ fn inspect_cstat_reports_over_ceiling_without_decompressing() {
 #[test]
 fn inspect_cstat_on_a_truncated_object_returns_a_typed_error_not_a_panic() {
     let segments = vec![fixture_segment()];
-    let bytes = encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &segments)
-        .expect("encodes a valid v1 object");
+    let bytes = encode_column_stats_v3(
+        [0x11; 16],
+        3,
+        [0x22; 32],
+        &segments,
+        DEFAULT_MAX_COLUMN_STATS_BYTES,
+    )
+    .expect("encodes a valid v3 object");
     let truncated = &bytes[..bytes.len() - 5];
 
     let mut out = String::new();
@@ -185,8 +199,14 @@ fn inspect_cstat_on_a_truncated_object_returns_a_typed_error_not_a_panic() {
 #[test]
 fn inspect_cstat_on_a_corrupt_object_returns_a_typed_error_not_a_panic() {
     let segments = vec![fixture_segment()];
-    let mut bytes = encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &segments)
-        .expect("encodes a valid v1 object");
+    let mut bytes = encode_column_stats_v3(
+        [0x11; 16],
+        3,
+        [0x22; 32],
+        &segments,
+        DEFAULT_MAX_COLUMN_STATS_BYTES,
+    )
+    .expect("encodes a valid v3 object");
     // Corrupt the magic so this fails the very first envelope check.
     bytes[0] ^= 0xFF;
 
