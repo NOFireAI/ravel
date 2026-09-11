@@ -53,7 +53,7 @@ use crate::budget::IngestByteCharge;
 use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
-    SPAN_SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket,
+    SPAN_SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket, size_trigger_fires,
 };
 use crate::metrics::FlushTrigger;
 use crate::span_error::SpanWriteError;
@@ -103,6 +103,35 @@ pub(crate) fn est_span_bytes(span: &NormalizedSpan) -> usize {
     span.name.len() + span.status_message.as_ref().map(String::len).unwrap_or(0) + attr_bytes + 64
 }
 
+/// Fixed per-span cost in the object a span flush writes: the two i64
+/// timestamps, the 16-byte trace id, the two 8-byte span ids, and the status
+/// code. The same 64 [`est_span_bytes`] charges, which is already the stored
+/// width of those fields rather than their in-memory width.
+const SPAN_OBJECT_FIXED_BYTES: usize = 64;
+
+/// Estimated bytes one span contributes to the object a span flush writes, for
+/// the size trigger only (`target_bytes` and `min_flush_bytes`, issue #1305).
+/// The memory-side figure stays [`est_span_bytes`], which the ADR-0069 ceiling
+/// charges.
+///
+/// Model: the span's stored payload -- name, status message, and every
+/// attribute key and value byte -- plus [`SPAN_OBJECT_FIXED_BYTES`]. No
+/// `(String, String)` pair header appears, because none reaches the object; a
+/// twenty-attribute span charges nearly a kilobyte of struct headers to the
+/// ceiling that RSPAN does not store.
+///
+/// Direction: an upper bound on the bytes the flush writes, for the reason
+/// [`crate::value::IngestPoint::est_object_sample_bytes`] states. RSPAN interns
+/// repeated attribute keys and compresses its blocks, both strictly below the
+/// raw bytes counted here.
+pub(crate) fn est_span_object_bytes(span: &NormalizedSpan) -> usize {
+    let attr_bytes: usize = span.attrs.iter().map(|(k, v)| k.len() + v.len()).sum();
+    span.name.len()
+        + span.status_message.as_ref().map(String::len).unwrap_or(0)
+        + attr_bytes
+        + SPAN_OBJECT_FIXED_BYTES
+}
+
 /// Type-level bridge from the OTLP-independent [`NormalizedSpan`] to the
 /// writer's [`SpanRecord`]. Every field maps one to one; there is no data
 /// transformation, only a struct rename. In particular `attrs` is already the
@@ -128,6 +157,11 @@ fn to_rspan_record(span: NormalizedSpan) -> SpanRecord {
 struct SpanTenantBuf {
     spans: Vec<NormalizedSpan>,
     est_bytes: usize,
+    /// Estimated bytes the object this buffer's flush writes will hold, the
+    /// size trigger's own figure (issue #1305, [`est_span_object_bytes`]).
+    /// `est_bytes` above stays the buffered-memory charge behind the ADR-0069
+    /// ceiling.
+    flush_est_bytes: usize,
     oldest_arrival_ns: Option<i64>,
     min_ingest_ts_ns: Option<i64>,
     max_ingest_ts_ns: Option<i64>,
@@ -157,8 +191,10 @@ impl SpanTenantBuf {
     fn merge(&mut self, spans: Vec<NormalizedSpan>, arrival_ns: i64) -> usize {
         self.note_arrival(arrival_ns);
         let bytes_added: usize = spans.iter().map(est_span_bytes).sum();
+        let object_bytes_added: usize = spans.iter().map(est_span_object_bytes).sum();
         self.spans.extend(spans);
         self.est_bytes += bytes_added;
+        self.flush_est_bytes += object_bytes_added;
         bytes_added
     }
 }
@@ -642,7 +678,6 @@ impl SpanShardActor {
         }
         let arrival_ns = self.clock.now_ns();
         let spans_len = spans.len() as u64;
-        let target_bytes = self.config.target_bytes;
 
         let buf = self.tenants.entry(tenant.clone()).or_default();
         let bytes_added = buf.merge(spans, arrival_ns);
@@ -659,21 +694,25 @@ impl SpanShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| b.est_bytes >= target_bytes)
+            .map(|b| size_trigger_fires(b.flush_est_bytes, b.est_bytes, &self.config))
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
             self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
         }
     }
 
-    /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
+    /// A buffer with a strict-mode waiter, or one whose flush would write at
+    /// least `min_flush_bytes` of object,
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
     /// else is idle and waits for the slower `max_flush_delay_idle` instead
-    /// (ADR-0051 section 7). Strict-mode ack latency is unaffected:
+    /// (ADR-0051 section 7). "Worth a PUT" is a claim about the object, so this
+    /// reads the object-bytes estimate, not the buffered-memory charge (issue
+    /// #1305). Strict-mode ack latency is unaffected:
     /// a strict write always leaves `waiters` non-empty for its whole flush
     /// window.
     fn age_threshold_ns(&self, buf: &SpanTenantBuf) -> i64 {
-        let has_priority = !buf.waiters.is_empty() || buf.est_bytes >= self.config.min_flush_bytes;
+        let has_priority =
+            !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if has_priority {
             self.config.max_flush_delay.as_nanos() as i64
         } else {
