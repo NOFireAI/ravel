@@ -405,11 +405,11 @@ impl ShardSkew {
         }
     }
 
-    /// One flush trigger's injected-`Clock` wait on shard `shard`'s
-    /// `max_inflight_flushes` semaphore. The caller subtracts the same figure
-    /// from the `on_actor_ns` it reports for that message: the wait is a prior
-    /// flush's duration, so charging it as actor work would say "the actor is
-    /// busy" exactly when the truth is "flushes are backed up".
+    /// One flush task's injected-`Clock` wait on shard `shard`'s
+    /// `max_inflight_flushes` semaphore. The acquire runs inside the spawned
+    /// flush task (issue #1292), so this is off-actor time: nothing subtracts it
+    /// from `on_actor_ns`. A rising figure still means "flushes are backed up",
+    /// now with the actor still draining rather than parked behind them.
     pub(crate) fn record_flush_permit_wait_ns(&self, shard: u32, wait_ns: u64) {
         if let Some(s) = self.shards.get(shard as usize) {
             s.flush_permit_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
@@ -685,12 +685,12 @@ impl IngestMetrics {
         self.shard_skew.record_processed(shard, on_actor_ns);
     }
 
-    /// One flush trigger's injected-`Clock` wait on shard `shard`'s
-    /// `max_inflight_flushes` semaphore (issue #865). Recorded by `flush_tenant`
-    /// for every trigger, and excluded by the actor loop from the `on_actor_ns`
-    /// it reports for the same message: the wait is a prior flush's duration,
-    /// so charging it as actor work would say "the actor is busy" exactly when
-    /// the truth is "flushes are backed up".
+    /// One flush task's injected-`Clock` wait on shard `shard`'s
+    /// `max_inflight_flushes` semaphore (issue #865). Recorded inside the spawned
+    /// flush task, where the acquire now happens (issue #1292), so it is no longer
+    /// on-actor time and nothing subtracts it from `on_actor_ns`. It is still the
+    /// backpressure signal "flushes are backed up": a rising figure means tasks
+    /// are queuing for a permit while the actor keeps draining.
     pub(crate) fn record_shard_flush_permit_wait_ns(&self, shard: u32, wait_ns: u64) {
         self.shard_skew.record_flush_permit_wait_ns(shard, wait_ns);
     }
