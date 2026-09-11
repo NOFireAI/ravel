@@ -488,9 +488,9 @@ and the CAS read/write helpers.
   content-addressed key and swaps HEAD, leaving the old object in place (the
   "orphan part" crash case); without this rule each such fold leaks one object. The rule LISTs the two
   prefixes first, then GETs the current `catalog/<signal>/HEAD`, treats every
-  `parts[].key`, the optional `postings.key`, and the optional
-  column-statistics keys `column_stats.key` (field 11) and
-  `column_stats_part.key` (field 13) as referenced, and deletes any
+  `parts[].key`, the optional `postings.key`, and each part's optional
+  per-part column-statistics key `parts[].column_stats.key` (field 7) as
+  referenced, and deletes any
   object under the two prefixes that HEAD does not name once its
   `last_modified` age exceeds `CompactorConfig::protection_horizon_ns`. A fresh
   re-verify GET of HEAD is taken immediately before the delete loop (the same
@@ -522,66 +522,46 @@ and the CAS read/write helpers.
 ### Per-part column statistics (ADR-1413)
 
 `SnapshotPartRef` carries an additive field 7, `column_stats:
-SnapshotColumnStatsPartRef`, alongside the existing whole-object refs at HEAD
-field 11 (v1, ADR-0850) and field 13 (v2, ADR-0942). It points at a `.cstat`
-envelope version 3: same `RCST` header/body/CRC shape as v1 and v2, keyed by
-content hash exactly as v2 is (`ColumnStatsSegment.writer_id` is the entry's
-own content hash), but scoped to exactly the one snapshot part that owns it
--- `ColumnStatsHeader.part_blake3` has length one, the owning part's hash,
-and `ColumnStatsHeader.segment_count` is that part's segment count. Field 7
-is absent (proto3 default) for a part with no per-part statistics; the reader
-falls back to field 13, then field 11, then to scan (ADR-1413 decision 2).
-Absence is never an error.
+SnapshotColumnStatsPartRef`. It points at a `.cstat` envelope version 3: same
+`RCST` header/body/CRC shape the format has always used, keyed by content
+hash (`ColumnStatsSegment.writer_id` is the entry's own content hash), but
+scoped to exactly the one snapshot part that owns it -- `ColumnStatsHeader.
+part_blake3` has length one, the owning part's hash, and `ColumnStatsHeader.
+segment_count` is that part's segment count. Field 7 is absent (proto3
+default) for a part with no per-part statistics; there is no fallback for
+such a part, it is scanned (ADR-1413 decision 6). Absence is never an error.
 
-**Reader (`Catalog::load_column_stats`, ADR-1413 decision 2).** A query
-resolves its window to an hour range and narrows HEAD's parts to the ones
-`parts_intersecting` that window covers -- the same narrowing
-`load_snapshot` uses for segment refs. For each covered part, independently:
-try that part's own field-7 ref first. If it is present and the v3 object
-loads and decodes, that part's segment lands in the loaded statistics keyed
-by its own content hash and the reader is done with that part -- one GET,
-no whole-object read triggered by it. If the ref is absent, or the GET comes
-back not-found, or the object fails to decode
-(`FetchOutcome::DecodeRefused`, the same warn-once-and-count-once decode
-refusal the whole-object reader already applies, extended per part: logged
-once via `tracing::warn!` and counted once in
-`Catalog::column_stats_decode_refusals`), that part's coverage is deferred
-to the fallback below rather than left silently missing.
+The whole-tenant v1 (`SnapshotColumnStatsRef`, formerly HEAD field 11,
+ADR-0850) and v2 (`SnapshotColumnStatsPartRef` at the whole-tenant scope,
+formerly HEAD field 13, ADR-0942) forms are retired by ADR-1413 decision 6
+(#1600): the fold no longer publishes either at any size, fields 11 and 13
+are `reserved` on `SnapshotHead` (never reused), and the decoder's accepted
+set of `.cstat` envelope versions is exactly `{3}` -- a v1 or v2 object, if
+one somehow still existed, is rejected as an unsupported version rather than
+decoded.
 
-Once every covered part has been tried, if any part still needs coverage the
-reader fetches the whole-tenant field-13 (v2) object once, if HEAD has one,
-and merges every decoded segment in with `.or_insert` -- a part that already
-got its own v3 record keeps it; the whole-object entry only fills a gap. A
-decoded v2 object does not by itself prove every still-needed part was
-answered: the fold's per-entry column-stats build has a warn-and-omit path
-(one segment's build failing degrades that segment out of the published
-object rather than failing the whole fold), so v2 can decode successfully
-while silently missing a covered part's segment. No v2 record identifies
-which physical part it belongs to (its key is the entry's own content hash,
-unrelated to any part's blake3), so the reader cannot check per-part
-coverage directly; instead it compares the number of segments v2 actually
-decoded against the sum of `entry_count` declared across every part on
-HEAD -- the total v2's whole-tenant build claims to cover. Only when that
-comparison shows a shortfall (or the v2 object was absent, refused, or HEAD
-carries no field 13) does the reader also fetch and merge the whole-tenant
-field-11 (v1) object once, the same way and with the same precedence: a part
-already covered by v3 or v2 is never displaced by v1. A part that still has
-no coverage after all three sources is left uncovered: the query scans for
-it, exactly as if no statistics existed for that part at all. A HEAD whose
-parts carry no field-7 ref anywhere (a snapshot folded before ADR-1413)
-never attempts a per-part GET: every covered part is immediately deferred to
-the fallback, so the reader still evaluates the v2-then-v1 coverage check
-described above rather than assuming one whole-object GET always suffices.
+**Reader (`Catalog::load_column_stats`, ADR-1413 decision 2, amended by
+decision 6).** A query resolves its window to an hour range and narrows
+HEAD's parts to the ones `parts_intersecting` that window covers -- the same
+narrowing `load_snapshot` uses for segment refs. For each covered part,
+independently: if it carries a field-7 ref and the v3 object it names loads
+and decodes, that part's segment lands in the loaded statistics keyed by its
+own content hash -- one GET per such part, and no other object is ever
+fetched on its account. If the ref is absent, or the GET comes back
+not-found, or the object fails to decode (`FetchOutcome::DecodeRefused`,
+logged once via `tracing::warn!` and counted once in
+`Catalog::column_stats_decode_refusals`), that part is left with no loaded
+statistics at all: the query scans for it, exactly as if no statistics
+existed for that part. There is no whole-tenant fallback and no
+declared-entry-count coverage comparison to decide whether one is needed --
+per-part coverage is decided per part, from that part's own field-7 ref
+alone.
 
 Cost, in accounted GETs: one HEAD GET, plus exactly one GET per covered part
-that carries its own field-7 ref, plus up to one v2 GET and, when v2 leaves
-a covered part uncovered (absent, refused, missing from HEAD, or decoded
-short of the declared entry-count total), one further v1 GET, each fetched
-at most once per call. A query can therefore legitimately issue both the v2
-and the v1 whole-object GET in the same call -- this is intended behavior
-for a v2 object that omitted a segment via the fold's warn-and-omit path,
-not a cost regression. The reader never issues more than one v2 GET and one
-v1 GET per call regardless of how many parts fall back to it.
+that carries its own field-7 ref, and nothing else. A part without a field-7
+ref, or whose v3 object is absent or refused, costs no additional GET beyond
+the one already spent (or not spent) on it; the query simply scans that
+part's segments directly.
 
 The fold writes one v3 object per part it actually re-encodes this fold
 (never for a part carried forward by reference, since that part's `.csnap`
@@ -603,7 +583,7 @@ bytes."
 
 **Per-part ceiling and degrade (ADR-1413 decisions 3-4, amended
 2026-09-08).** The per-part ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES` (256
-MiB), the same constant `ColumnStatsLimits` already enforces on the
+MiB), the same constant `ColumnStatsLimits` enforced on the now-retired
 whole-object v1/v2 guard, not a separate per-part formula (ADR-1413's
 rejected alternatives record the proportional bound and why it lost).
 Before compressing, the fold measures the concatenated uncompressed body
@@ -625,23 +605,27 @@ the error (`SnapshotFormatError::ColumnStatsPartOverBound`/
 `CatalogError::ColumnStatsPartOverBound`) and write no object -- there is no
 truncated object for a reader to silently trust.
 
-**Dual-publish window.** The fold keeps writing the v1 (field 11) and v2
-(field 13) whole-object statistics unchanged alongside the new v3 per-part
-objects: retiring field 13 at the first v3 publish would be the
-writers-before-readers change ADR-0066 decision 1 forbids, since an older
-reader that ignores field 7 must still find field 13. The decoder's accepted
-set of `.cstat` envelope versions is `{1, 2, 3}` for this window; the set
-narrows to
-`{2, 3}` and then `{3}` only as field 13's and field 11's own reviewed
-retirement changes, each citing the recorded format floors (ADR-0066
-decision 3), independently of each other.
+**Retirement of the whole-object forms (ADR-1413 decision 6, #1600).** The
+fold no longer writes the v1 or v2 whole-tenant statistics at any size: v3
+per-part objects at field 7 are the only form published. `SnapshotHead`
+fields 11 and 13 are `reserved`, so there is no struct field left to set or
+read for either one; a HEAD encoded today carries neither. This landed as
+one coordinated change across the fold (write side), the reader (decode
+side), and the GC sweep (reachability side) rather than a dual-publish
+window, since the whole-tenant forms had no independent readers left to
+migrate off them first: `load_column_stats`'s only fallback for a
+field-7-less part was the scan path already required for the absent case.
 
 **GC-sweep coverage.** The sweep rule described above
 (`ravel_maintain::sweep::sweep_unreferenced_catalog_objects`) treats HEAD's
-own `column_stats.key` (field 11), `column_stats_part.key` (field 13), and
-every `parts[].column_stats.key` (field 7) as referenced, so a v3 per-part
-object HEAD's current parts list still names is never swept as unreferenced
-while its owning part is live.
+`postings.key` and every `parts[].column_stats.key` (field 7) as referenced.
+It no longer reads `column_stats.key` (field 11) or `column_stats_part.key`
+(field 13) at all -- there is no struct field to read -- so a `.cstat`
+object named only by one of those retired fields on a HEAD written before
+this change is now unreferenced and swept once it crosses the protection
+horizon, exactly like any other orphaned catalog object. A v3 per-part
+object HEAD's current parts list still names is unaffected and is never
+swept as unreferenced while its owning part is live.
 
 ### Idempotency marker body layout
 
