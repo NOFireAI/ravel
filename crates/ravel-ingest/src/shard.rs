@@ -41,7 +41,7 @@ use tokio::task::JoinSet;
 use tokio::time::Duration;
 use uuid::Uuid;
 
-use crate::budget::IngestByteCharge;
+use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
@@ -923,6 +923,11 @@ pub(crate) struct ShardActor {
     flushes: JoinSet<()>,
     rx: mpsc::Receiver<ShardMsg>,
     tenants: HashMap<TenantId, TenantBuf>,
+    /// The configured ADR-0069 ceiling, shared live with the router so the
+    /// per-buffer memory backstop is a fraction of the limit the operator set.
+    /// Read at trigger time rather than resolved once, because the router
+    /// installs the budget after the actors are spawned.
+    backstop_ceiling: BufferBudgetCeiling,
 }
 
 impl ShardActor {
@@ -939,6 +944,7 @@ impl ShardActor {
         metrics: Arc<IngestMetrics>,
         rx: mpsc::Receiver<ShardMsg>,
         flush_floor_ns: Arc<AtomicI64>,
+        backstop_ceiling: BufferBudgetCeiling,
         #[cfg(feature = "stage-timing")] stage_timings: Arc<MetricStageTimings>,
     ) -> Self {
         let rtt = Arc::new(RttTracker::new());
@@ -971,6 +977,7 @@ impl ShardActor {
             flushes: JoinSet::new(),
             rx,
             tenants: HashMap::new(),
+            backstop_ceiling,
         }
     }
 
@@ -1135,7 +1142,14 @@ impl ShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| size_trigger_fires(b.flush_est_bytes, b.est_bytes, &self.config))
+            .map(|b| {
+                size_trigger_fires(
+                    b.flush_est_bytes,
+                    b.est_bytes,
+                    &self.config,
+                    self.backstop_ceiling.get(),
+                )
+            })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
             return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
@@ -1458,8 +1472,9 @@ impl ShardActor {
                 // so that next trigger flushes them (finding 1): `charges` ride
                 // back with the buffer (the byte budget is not refunded, the bytes
                 // are still held), and the whole buffer -- series, exemplars, and
-                // the trigger bookkeeping (`est_bytes`, `oldest_arrival_ns`) -- is
-                // preserved intact. Only `waiters` are acked here and taken out of
+                // the trigger bookkeeping (`flush_est_bytes`, which drives the
+                // size trigger, `est_bytes`, which drives the memory backstop,
+                // and `oldest_arrival_ns`) -- is preserved intact. Only `waiters` are acked here and taken out of
                 // the re-inserted buffer: a waiter left in it would be re-acked by
                 // the next flush against an already-answered oneshot. A strict-mode
                 // waiter that retries on the 503 re-enqueues rows this buffer still

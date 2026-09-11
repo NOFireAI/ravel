@@ -53,7 +53,7 @@ use tokio::task::JoinSet;
 use tokio::time::Duration;
 use uuid::Uuid;
 
-use crate::budget::IngestByteCharge;
+use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_ALL_PASSES,
@@ -955,6 +955,11 @@ pub(crate) struct LogShardActor {
     flushes: JoinSet<()>,
     rx: mpsc::Receiver<LogShardMsg>,
     tenants: HashMap<TenantId, LogTenantBuf>,
+    /// The configured ADR-0069 ceiling, shared live with the router so the
+    /// per-buffer memory backstop is a fraction of the limit the operator set.
+    /// Read at trigger time rather than resolved once, because the router
+    /// installs the budget after the actors are spawned.
+    backstop_ceiling: BufferBudgetCeiling,
 }
 
 impl LogShardActor {
@@ -970,6 +975,7 @@ impl LogShardActor {
         metrics: Arc<LogIngestMetrics>,
         rx: mpsc::Receiver<LogShardMsg>,
         indexed_fields: Arc<IndexedFieldsOverlay>,
+        backstop_ceiling: BufferBudgetCeiling,
         #[cfg(feature = "stage-timing")] stage_timings: Arc<LogStageTimings>,
     ) -> Self {
         let ctx = Arc::new(LogFlushCtx {
@@ -999,6 +1005,7 @@ impl LogShardActor {
             flushes: JoinSet::new(),
             rx,
             tenants: HashMap::new(),
+            backstop_ceiling,
         }
     }
 
@@ -1151,7 +1158,14 @@ impl LogShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| size_trigger_fires(b.flush_est_bytes, b.est_bytes, &self.config))
+            .map(|b| {
+                size_trigger_fires(
+                    b.flush_est_bytes,
+                    b.est_bytes,
+                    &self.config,
+                    self.backstop_ceiling.get(),
+                )
+            })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
             return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
@@ -1162,9 +1176,10 @@ impl LogShardActor {
     /// The columnar counterpart of [`Self::handle_write`] (ADR-0109 decision 5):
     /// buffers one already-partitioned [`ColumnarLogBatch`] for `tenant`,
     /// refusing fail-loud if the buffer already holds row-major records. The
-    /// flush-trigger accounting (`flush_est_bytes >= target_bytes`), the charge and
-    /// waiter handling, and the size-flush path are identical to the row path,
-    /// as is the flush-permit wait it returns (see [`Self::handle_write`]).
+    /// flush-trigger accounting (`flush_est_bytes >= target_bytes`, or
+    /// `est_bytes` past the memory backstop), the charge and waiter handling,
+    /// and the size-flush path are identical to the row path, as is the
+    /// flush-permit wait it returns (see [`Self::handle_write`]).
     async fn handle_write_columnar(
         &mut self,
         tenant: TenantId,
@@ -1211,7 +1226,14 @@ impl LogShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| size_trigger_fires(b.flush_est_bytes, b.est_bytes, &self.config))
+            .map(|b| {
+                size_trigger_fires(
+                    b.flush_est_bytes,
+                    b.est_bytes,
+                    &self.config,
+                    self.backstop_ceiling.get(),
+                )
+            })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
             return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
@@ -1484,8 +1506,9 @@ impl LogShardActor {
                 // so that next trigger flushes them (finding 1): `charges` ride
                 // back with the buffer (the byte budget is not refunded, the bytes
                 // are still held), and the whole buffer -- content, declared-column
-                // stats, and the trigger bookkeeping (`est_bytes`,
-                // `oldest_arrival_ns`) -- is preserved intact. Only `waiters` are
+                // stats, and the trigger bookkeeping (`flush_est_bytes`, which
+                // drives the size trigger, `est_bytes`, which drives the memory
+                // backstop, and `oldest_arrival_ns`) -- is preserved intact. Only `waiters` are
                 // acked here and taken out of the re-inserted buffer: a waiter left
                 // in it would be re-acked by the next flush against an
                 // already-answered oneshot. A strict-mode waiter that retries on the
@@ -1770,6 +1793,7 @@ mod tests {
                 Arc::new(IndexedFieldsOverlay::new(Arc::new(
                     crate::log_router::NoIndexedFields,
                 ))),
+                BufferBudgetCeiling::unlimited(),
                 #[cfg(feature = "stage-timing")]
                 Arc::new(LogStageTimings::new()),
             );
@@ -2629,6 +2653,7 @@ mod tests {
             Arc::new(IndexedFieldsOverlay::new(Arc::new(
                 crate::log_router::NoIndexedFields,
             ))),
+            BufferBudgetCeiling::unlimited(),
             #[cfg(feature = "stage-timing")]
             Arc::new(LogStageTimings::new()),
         );

@@ -12,7 +12,7 @@ use ravel_otlp::NormalizedPoint;
 use ravel_types::{CommitToken, Signal, TenantId, shard_for};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
+use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::error::WriteError;
@@ -137,6 +137,11 @@ pub struct IngestRouter {
     /// `services/ravel-server` installs the configured budget with
     /// [`IngestRouter::with_budget`].
     budget: Arc<IngestByteBudget>,
+    /// The ceiling from `budget`, shared with every shard actor this router
+    /// spawns so the per-buffer memory backstop is a fraction of the configured
+    /// limit. Written by [`IngestRouter::with_budget`], which runs after the
+    /// actors exist.
+    backstop_ceiling: BufferBudgetCeiling,
     /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
     /// every shard actor and flush task so the seam records into one table the
     /// bench reporter reads via [`IngestRouter::stage_timings`]. Present only
@@ -222,6 +227,7 @@ impl IngestRouter {
         // router's fixed shard set (issue #865), so the per-message enqueue and
         // process paths never contend on a shared lock.
         let metrics = Arc::new(IngestMetrics::new(config.shard_count));
+        let backstop_ceiling = BufferBudgetCeiling::unlimited();
         #[cfg(feature = "stage-timing")]
         let stage_timings = Arc::new(MetricStageTimings::new());
         // Each generation's shard-actor set gets a fresh writer identity, so
@@ -231,6 +237,7 @@ impl IngestRouter {
             let clock = Arc::clone(&clock);
             let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
+            let backstop_ceiling = backstop_ceiling.clone();
             #[cfg(feature = "stage-timing")]
             let stage_timings = Arc::clone(&stage_timings);
             move |shard_count: u32| -> Vec<ShardHandle> {
@@ -255,6 +262,7 @@ impl IngestRouter {
                             Arc::clone(&metrics),
                             rx,
                             Arc::clone(&flush_floor_ns),
+                            backstop_ceiling.clone(),
                             #[cfg(feature = "stage-timing")]
                             Arc::clone(&stage_timings),
                         );
@@ -276,6 +284,7 @@ impl IngestRouter {
             metrics,
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
+            backstop_ceiling,
             #[cfg(feature = "stage-timing")]
             stage_timings,
         }
@@ -294,8 +303,13 @@ impl IngestRouter {
     /// and calls this on each of the metrics, log, and span routers with the
     /// same `Arc`, so a single `--max-ingest-buffer-bytes` ceiling bounds the
     /// buffered-byte sum across every signal.
+    ///
+    /// Also publishes the ceiling to this router's shard actors, so the
+    /// per-buffer memory backstop is a fraction of the configured limit rather
+    /// than of the default one (issue #1305).
     #[must_use]
     pub fn with_budget(mut self, budget: Arc<IngestByteBudget>) -> Self {
+        self.backstop_ceiling.set(budget.limit());
         self.budget = budget;
         self
     }
@@ -704,6 +718,7 @@ impl IngestRouter {
             Arc::clone(&self.metrics),
             rx,
             flush_floor_ns,
+            self.backstop_ceiling.clone(),
             #[cfg(feature = "stage-timing")]
             Arc::clone(&self.stage_timings),
         );

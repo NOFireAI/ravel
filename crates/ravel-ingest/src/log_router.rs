@@ -19,7 +19,7 @@ use ravel_types::logstream::AttrValue;
 use ravel_types::{CommitToken, TenantHash, shard_for_log};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
+use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
@@ -96,6 +96,11 @@ pub struct LogIngestRouter {
     /// `services/ravel-server` installs the configured budget via
     /// [`LogIngestRouter::with_budget`].
     budget: Arc<IngestByteBudget>,
+    /// The ceiling from `budget`, shared with every shard actor this router
+    /// spawns so the per-buffer memory backstop is a fraction of the configured
+    /// limit. Written by [`LogIngestRouter::with_budget`], which runs after the
+    /// actors exist.
+    backstop_ceiling: BufferBudgetCeiling,
     /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
     /// every shard actor and flush task so the seam records into one table the
     /// bench reporter reads via [`LogIngestRouter::stage_timings`]. Present only
@@ -155,6 +160,7 @@ impl LogIngestRouter {
         rng: Arc<dyn RngSource>,
     ) -> Self {
         let metrics = Arc::new(LogIngestMetrics::new(config.shard_count));
+        let backstop_ceiling = BufferBudgetCeiling::unlimited();
         #[cfg(feature = "stage-timing")]
         let stage_timings = Arc::new(LogStageTimings::new());
         let factory = {
@@ -163,6 +169,7 @@ impl LogIngestRouter {
             let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
             let indexed_fields = Arc::clone(&indexed_fields);
+            let backstop_ceiling = backstop_ceiling.clone();
             #[cfg(feature = "stage-timing")]
             let stage_timings = Arc::clone(&stage_timings);
             move |shard_count: u32| -> Vec<LogShardHandle> {
@@ -183,6 +190,7 @@ impl LogIngestRouter {
                             Arc::clone(&metrics),
                             rx,
                             Arc::clone(&indexed_fields),
+                            backstop_ceiling.clone(),
                             #[cfg(feature = "stage-timing")]
                             Arc::clone(&stage_timings),
                         );
@@ -206,6 +214,7 @@ impl LogIngestRouter {
             indexed_fields,
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
+            backstop_ceiling,
             #[cfg(feature = "stage-timing")]
             stage_timings,
         }
@@ -219,9 +228,13 @@ impl LogIngestRouter {
         Arc::clone(&self.stage_timings)
     }
 
-    /// Installs the shared process-wide ingest buffer byte budget (ADR-0069).
+    /// Installs the shared process-wide ingest buffer byte budget (ADR-0069),
+    /// and publishes its ceiling to this router's shard actors so the
+    /// per-buffer memory backstop is a fraction of the configured limit rather
+    /// than of the default one (issue #1305).
     #[must_use]
     pub fn with_budget(mut self, budget: Arc<IngestByteBudget>) -> Self {
+        self.backstop_ceiling.set(budget.limit());
         self.budget = budget;
         self
     }
