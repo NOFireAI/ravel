@@ -81,6 +81,7 @@ mod memory;
 mod metadata_agg;
 mod minmax;
 mod output;
+mod page_plan;
 mod provider;
 mod pushdown;
 pub mod redact;
@@ -161,6 +162,10 @@ pub use logs_udf::{HAS_WORD_UDF, has_word_udf};
 pub use memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
 pub use metadata_agg::{METADATA_ONLY_AGGREGATE_RULE, MetadataOnlyAggregate, MetadataOnlyExec};
 pub use output::QueryOutput;
+pub use page_plan::{
+    NotTotalOrder, OrderTerm, PAGE_ALIAS, PagePlan, PagePlanError, ResumePosition, ResumeValue,
+    plan_page,
+};
 pub use provider::RavelTableProvider;
 pub use pushdown::Pushdown;
 /// Re-exported beside [`SegmentPin`], whose `level` field has this type: a
