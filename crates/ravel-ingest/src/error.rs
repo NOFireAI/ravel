@@ -13,12 +13,19 @@ pub enum WriteError {
     /// send half or a strict-mode ack fail because the actor task is gone.
     /// This means the router is shutting down, or an individual shard actor
     /// task ended without shutdown (e.g. it panicked mid-flush); the latter
-    /// leaves the router serving the surviving shards while every series
-    /// hashing to the dead shard fails here. The router counts each distinct
-    /// shard death (`IngestMetricsSnapshot::shard_deaths`) so the degraded
-    /// state is observable rather than silent. Retryable at the
-    /// client, but points routed to a dead shard keep failing until the
-    /// process is restarted.
+    /// leaves the router serving the surviving shards while the write that
+    /// observed the death, and any concurrent one to the same shard, fails
+    /// here. The router counts each death (`IngestMetricsSnapshot::shard_deaths`)
+    /// so the degraded state is observable rather than silent (issue #1299).
+    /// Retryable at the client, and usually transient: the router respawns the
+    /// dead shard with a fresh writer identity (up to
+    /// [`crate::IngestRouter::MAX_SHARD_RESPAWNS`]), so a retry routed after the
+    /// respawn reaches a live actor. The buffered points the dead actor held
+    /// are not recovered by the respawn, which is why even a buffered-mode
+    /// writer's already-acked points for that flush are lost. Once a shard
+    /// exhausts its respawn budget it is condemned: writes to it keep failing,
+    /// and the router reports not-ready (`IngestRouter::ready`) so the
+    /// orchestrator replaces the replica.
     #[error("shard actor unavailable")]
     ShardUnavailable,
     /// A strict-mode ack did not arrive within the caller's `ack_deadline`.
