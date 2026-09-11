@@ -669,9 +669,13 @@ terms:
    holds one decoded/normalized request body during normalization, before its
    points reach a buffer. This is bounded by
    `--max-inflight-ingest-requests` (default 1024) times the largest
-   per-request decoded size (Remote Write's 64 MiB post-decompression cap, or
-   OTLP's 16 MiB), the same worst case the concurrency limit already
-   documents above. Two slices of this overhead were moved under term 1 by the
+   per-request decoded body, which on the Remote Write RW2 path is the resolved
+   label bytes the decoder owns after it expands symbol references (up to 16
+   times the 64 MiB decompression cap, detailed below), not the 64 MiB cap
+   itself, and on the OTLP paths is the 16 MiB per-request cap. That is a larger
+   worst case than the coarse decode-cap ceiling the concurrency limit documents
+   above, which counts the 64 MiB decompressed input, not the resolved body.
+   Two slices of this overhead were moved under term 1 by the
    two ADR-0069 amendments: the OTLP HTTP gzip
    decompression buffer and the Remote Write snappy decompression buffer,
    each of which used to inflate up to 64 MiB per request entirely outside any
@@ -692,10 +696,21 @@ terms:
    in a batch), none of which the buffer budget charges. So
    the worst-case transient decode memory bounded only by
    `--max-inflight-ingest-requests` is still that ceiling times the largest
-   *uncharged* decoded body (Remote Write's 64 MiB post-decompression cap, or
-   OTLP gRPC / OTAP / identity HTTP's 16 MiB); what changed is that neither
-   inflate buffer is part of that product any more, since both are bounded by
-   `--max-ingest-buffer-bytes` instead.
+   *uncharged* decoded body. On the Remote Write RW2 path that body is not the
+   64 MiB post-decompression cap but the resolved label bytes the decoder owns
+   once it expands `labels_refs` symbol references into per-series `Label` bytes:
+   `ravel-remote-write` bounds cumulative resolved label bytes at
+   `RESOLVED_LABEL_BUDGET_MULTIPLIER` (16) times `max_decompressed_bytes`, so a
+   single request can retain up to 16 times 64 MiB, about 1 GiB, of owned label
+   bytes in its `ResolvedRequest`. That resolve step is a decode expansion, not
+   a decompression surface, and this ceiling does not charge it: term 1 charges
+   only the snappy inflate that produces the 64 MiB decompressed input. The wire
+   body that produces all of it is separately capped at 16 MiB
+   (`MAX_REQUEST_BODY_BYTES`), so the RW2 amplification to size for is 16 MiB on
+   the wire to as much as 1 GiB retained. The other uncharged decoded bodies
+   stay at their 16 MiB caps (OTLP gRPC / OTAP / identity HTTP); what changed is
+   that neither inflate buffer is part of that product any more, since both are
+   bounded by `--max-ingest-buffer-bytes` instead.
 3. **Fixed overhead**: shard-actor and router state, the admission
    controller's per-tenant maps, and the read caches (`--cache-max-bytes`),
    all bounded independently of ingest volume. Independent of ingest volume is
@@ -708,9 +723,12 @@ So an operator sizes ingest RSS as
 `max_ingest_buffer_bytes + (max_inflight_ingest_requests x largest_uncharged_decoded_body)
 + fixed_overhead`, the first two terms knobs and the third measured, where
 `largest_uncharged_decoded_body` is
-now the largest body term 2 still owns (Remote Write's 64 MiB post-decompression
-cap, or OTLP gRPC / OTAP / identity OTLP HTTP's 16 MiB) rather than either
-inflate buffer. Lowering
+now the largest body term 2 still owns: the Remote Write RW2 resolved-label
+bound (up to 16 times the 64 MiB decompression cap, so as much as 1 GiB per
+request, bounded by `RESOLVED_LABEL_BUDGET_MULTIPLIER` times
+`max_decompressed_bytes` and not charged by this ceiling), or OTLP gRPC / OTAP /
+identity OTLP HTTP's 16 MiB, rather than either inflate buffer or the 64 MiB
+decompression cap. Lowering
 `--max-ingest-buffer-bytes` tightens term 1 directly, trading a lower memory
 ceiling for earlier shedding under a many-tenant burst.
 
