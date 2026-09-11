@@ -1466,8 +1466,8 @@ fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u6
 
 /// The process-wide ingest buffer byte budget family (ADR-0069 decision 1,
 /// amended): the current gauge of estimated buffered bytes plus in-flight
-/// OTLP HTTP gzip decode state, the configured ceiling, and the cumulative
-/// shed counter. Mode-only labeled like `render_ingest_concurrency_family`
+/// OTLP HTTP gzip and Remote Write snappy decode state, the configured
+/// ceiling, and the cumulative shed counter. Mode-only labeled like `render_ingest_concurrency_family`
 /// above: the budget is a single gauge shared across metrics/logs/traces
 /// with no per-signal breakdown.
 ///
@@ -1485,7 +1485,7 @@ fn render_ingest_buffer_budget_family(
     write_header(
         out,
         "ravel_ingest_buffer_bytes",
-        "Estimated buffered ingest bytes currently held across all tenants and signals, plus in-flight OTLP HTTP gzip decode state (the process-wide ingest byte budget gauge, ADR-0069).",
+        "Estimated buffered ingest bytes currently held across all tenants and signals, plus in-flight OTLP HTTP gzip and Remote Write snappy decode state (the process-wide ingest byte budget gauge, ADR-0069).",
         "gauge",
     );
     write_sample(

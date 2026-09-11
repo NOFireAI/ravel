@@ -161,8 +161,10 @@ bytes it decompresses, **before it finishes inflating**, incrementally as each
 chunk is produced. A decompression whose running total would cross the ceiling
 is shed mid-inflate (OTLP HTTP 429 with `Retry-After`, the existing shed
 counter) rather than being allocated in full and charged afterward. This
-amendment covers OTLP HTTP gzip only; OTLP gRPC gzip decompression is unchanged
-and tracked separately (#1419), so no gRPC status is described here. The charge
+amendment covers OTLP HTTP gzip only; the Remote Write snappy inflate is
+charged by the 2026-09-10 amendment below, and OTLP gRPC gzip decompression
+stays uncharged (that amendment records why), so no gRPC status is described
+here. The charge
 is held as an RAII guard through protobuf decode and released once decode has
 consumed and freed the inflate chunks -- prost copies them into owned structs --
 before the router takes its own decision-1 buffered charge. A single request's
@@ -180,7 +182,8 @@ because an allocator may return more than was requested).
 
 **What the gauge now means.** Before this amendment `ravel_ingest_buffer_bytes`
 measured buffered ingest state only. It now also counts the transient OTLP HTTP
-gzip decode state currently in flight: a request that is mid-inflate holds a
+gzip decode state currently in flight (and, since the 2026-09-10 amendment
+below, the Remote Write snappy decode state): a request that is mid-inflate holds a
 decode charge on the same gauge, alongside every other request's buffered
 charge, so the gauge reflects the concurrent inflate buffers that used to be
 invisible. For that decode term the gauge counts the bytes the request has
@@ -194,7 +197,8 @@ contribution is the larger of the two, never their sum. This is deliberate: the 
 resident ingest memory, and the concurrent inflate buffers are part of that
 peak. The identity (uncompressed) path allocates no inflate buffer and takes no
 gateway charge; the OTLP gRPC and Remote Write decode paths are out of scope
-here and remain bounded by `--max-inflight-ingest-requests` alone.
+here. Remote Write is charged by the 2026-09-10 amendment below; OTLP gRPC and
+OTAP remain bounded by `--max-inflight-ingest-requests` alone.
 
 **Why the actual inflated length, charged incrementally.** Charging the 64 MiB
 cap up front would over-charge every well-compressing request and shed real
@@ -242,3 +246,127 @@ flush: there is no new transition, no new commit-protocol interleaving, and
 nothing for the TLA+ model to cover. This amendment changes only where in the
 Rust ingest path a byte is charged, not the durability or visibility state
 machine.
+
+## Amendment (2026-09-10): the Remote Write snappy inflate is charged
+
+This amendment appends to decision 1 and extends the 2026-09-07 amendment to a
+second ingest path. Everything above stands unchanged.
+
+### Context
+
+The 2026-09-07 amendment closed the OTLP HTTP gzip gap and left the other
+ingest surfaces where decision 1 put them: outside the ceiling. Two of them
+inflate attacker-controlled bytes before anything is charged.
+
+- **Remote Write** (`services/ravel-server/src/remote_write.rs`) takes the
+  in-flight permit, then snappy-decompresses the body up to
+  `MAX_DECOMPRESSED_PAYLOAD_BYTES` (64 MiB), and only afterward does the
+  router take the decision-1 charge. As with gzip,
+  `--max-inflight-ingest-requests` copies of a 64 MiB inflate could exist at
+  once with nothing charged.
+- **OTLP gRPC** (`services/ravel-server/src/lib.rs`, `accept_compressed(
+  CompressionEncoding::Gzip)`) inflates inside tonic, bounded only by
+  `max_decoding_message_size` (16 MiB here).
+- **OTAP** (`crates/ravel-otap/src/stream.rs`, `decompress_capped`) inflates
+  each `ArrowPayload.record` with zstd, bounded per payload by
+  `StreamConfig::default().max_decompressed_payload_bytes` (16 MiB), with one
+  such buffer per payload in a `BatchArrowRecords`.
+
+The flag docs and docs/ingest.md named the uncharged Remote Write inflate as a
+term of the declared bound, so the same overclaim #1297 identified for gzip
+applied to it (issue #1419).
+
+### Decision
+
+The Remote Write path charges the process-wide `IngestByteBudget` for its
+snappy expansion **before that expansion is allocated**. The snappy block
+format declares its decompressed length in a varint header, so
+`snap::raw::decompress_len` returns the exact inflated size without allocating,
+and `ravel-remote-write` then allocates exactly that many bytes. The handler
+therefore charges the exact quantity it is about to materialize, not the cap
+and not the compressed length, and a body the budget cannot admit is shed with
+HTTP 429 and `Retry-After` (the existing `ravel_ingest_buffer_shed_total`)
+before its output buffer exists.
+
+The order per request is cap, then budget, then allocate: a declared inflate
+larger than the 64 MiB post-decompression cap takes no charge and is rejected
+by the decoder with 400 exactly as before, so a tight budget cannot turn an
+over-cap body into a 429. The charge is an RAII guard held through protobuf
+decode and normalization and released immediately before the router takes its
+own decision-1 buffered charge, so a single request's inflate charge and
+buffered charge never coexist. Holding it past decode over-holds on purpose:
+the inflate buffer is freed when decode returns, and the charge then stands as
+the admission cost of the decoded request until its points reach the router.
+Charging one step rather than chunk by chunk is what the declared length buys:
+the sum charged equals the length allocated exactly, with no partial-chunk
+refund path and no incremental shed point to describe.
+
+**Scope: this amendment covers Remote Write only.** The OTLP gRPC gzip inflate
+and the OTAP zstd payload inflate are **not** charged and remain outside
+`--max-ingest-buffer-bytes`, bounded only by `--max-inflight-ingest-requests`
+times their 16 MiB per-message caps. Together with the 2026-09-07 amendment,
+two of Ravel's four ingest decompression surfaces are inside the ceiling and
+two are outside it. Any claim that the flag bounds all ingest inflate is false.
+
+**Why OTLP gRPC was not fixed here.** Three placements were examined and none
+charges the right quantity at the right time without a change below our code:
+
+1. *A tonic interceptor, custom codec, or `Service` layer that sees the
+   compressed frame.* An interceptor receives `Request<()>` (metadata and
+   extensions), never the frame body. A `tower::Layer` does see the compressed
+   frame, and one already runs on the gRPC listener
+   (`services/ravel-server/src/wire_byte_count.rs`), but the only quantity
+   derivable there before inflation is the *compressed* length: gzip, unlike
+   snappy, does not declare its output size, so no correct pre-inflate charge
+   exists at that seam. A custom codec would be the right seam, and it is not
+   reachable: tonic-build emits `let codec = tonic_prost::ProstCodec::
+   default();` inside the generated server's `call`, so the codec cannot be
+   substituted without hand-writing the generated stubs.
+2. *Charge the post-inflate length in the handler.* Available, and rejected:
+   it charges after the peak has already been allocated, which the 2026-09-07
+   amendment rejects by name ("Charge after inflate"). It would also charge a
+   quantity that is not the allocation. tonic inflates into a reused
+   amortized-growth `BytesMut` (`Streaming::decompress_buf`, tonic 0.14.6
+   `src/codec/decode.rs`), cleared but not freed between messages on a stream,
+   so its length undercounts its capacity.
+3. *Neither, without a tonic-level change.* This is where OTLP gRPC stands.
+
+A correct fix needs one of: an upstream tonic hook that reports decompressed
+bytes as they are produced (so the charge can be taken incrementally and the
+inflate shed mid-stream, as gzip is on HTTP), or moving the inflate out of
+tonic entirely -- accept identity at the tonic layer and inflate in our own
+layer using the charged chunked reader `otlp_http.rs` already has. Both are
+larger than this change and neither is attempted here. OTAP is untouched for
+the same reason at a different layer: its inflate is inside `ravel-otap`, out
+of scope for this change.
+
+**What the gauge now means.** `ravel_ingest_buffer_bytes` counts the Remote
+Write snappy decode state in flight alongside the OTLP HTTP gzip decode state
+and the buffered charges. For the Remote Write term the gauge counts the
+declared decompressed length, which is exactly what `ravel-remote-write`
+allocates for the body (`vec![0u8; len]`, allocated once at its final size),
+not an estimate. Uncharged on this path: the compressed request body (bounded
+by the 16 MiB `MAX_REQUEST_BODY_BYTES` cap and already counted against
+`--max-inflight-ingest-requests`), and the prost-decoded and normalized structs
+the request holds after the inflate buffer is freed, which stay in the
+in-flight-request term exactly as decision 1 left them.
+
+### Rejected alternatives
+
+- **Charge the 64 MiB cap up front**: rejected. It over-charges every
+  well-compressing request and sheds real traffic under a tight budget, and
+  the declared length makes the exact figure available for free.
+- **Charge the compressed body length**: rejected. It is the wrong quantity by
+  the compression ratio, which is precisely what a decompression bomb
+  maximizes, so the bound would fail exactly when it matters.
+- **Charge inside `ravel-remote-write` rather than in the gateway**: rejected
+  for this change. It would put a budget dependency into a decode crate that
+  has none, and the declared length is readable from the gateway without it.
+- **Fix OTLP gRPC by charging post-inflate so all paths "look" covered**:
+  rejected. It would let the flag docs claim a bound the gRPC path does not
+  enforce, which is the failure #1297 was filed for.
+
+### Model (RUST_ONLY)
+
+Unaffected, for the reason the 2026-09-07 amendment gives: shedding happens
+strictly before `PinFlush` and the model has no admission action.

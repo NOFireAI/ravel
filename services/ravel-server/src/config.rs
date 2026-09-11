@@ -1048,16 +1048,18 @@ pub struct Cli {
     /// That same 16 MiB request cap also bounds the compressed OTLP HTTP
     /// gzip request body term 2 now lists.
     /// It does not by itself bound the buffered ingest bytes those
-    /// requests then hold, nor the OTLP HTTP gzip inflate, which
-    /// `--max-ingest-buffer-bytes` charges. `0` disables the limit.
+    /// requests then hold, nor the OTLP HTTP gzip inflate and the Remote
+    /// Write snappy inflate, which `--max-ingest-buffer-bytes` charges.
+    /// `0` disables the limit.
     #[arg(long = "max-inflight-ingest-requests", default_value_t = 1024)]
     pub max_inflight_ingest_requests: u64,
 
     /// The process-wide ingest buffer byte budget (ADR-0069 decision 1,
-    /// amended by issue #1297): a ceiling on the sum of estimated buffered
-    /// ingest bytes held across every tenant and signal (metrics, logs,
-    /// traces) at once, plus the transient bytes an OTLP HTTP gzip request
-    /// inflates during decode -- those are charged against this same gauge as
+    /// amended by issues #1297 and #1419): a ceiling on the sum of estimated
+    /// buffered ingest bytes held across every tenant and signal (metrics,
+    /// logs, traces) at once, plus the transient bytes an OTLP HTTP gzip
+    /// request or a Remote Write snappy request inflates during decode.
+    /// The gzip bytes are charged against this same gauge as
     /// they inflate: each decompressed chunk is charged before it is retained,
     /// and the inflate is retained as those exactly-sized chunks rather than
     /// appended into one growing buffer, so the charge equals the bytes held at
@@ -1074,13 +1076,20 @@ pub struct Cli {
     /// a time, and it and the decoder state are a fixed cost that alone can
     /// exceed the charge itself on a small decompressed body. A decompression
     /// whose running charge would cross the ceiling is shed mid-inflate instead
-    /// of being allocated in full. A request whose charge would push the gauge
+    /// of being allocated in full. Remote Write's snappy body is charged in one
+    /// step instead, and before anything is allocated: the snappy block format
+    /// declares its decompressed length in a varint header, so the exact
+    /// inflated size is charged ahead of the buffer it pays for, and the charge
+    /// is held through protobuf decode and normalization and released before
+    /// the router charges the normalized batch. A body whose declared inflate
+    /// exceeds the 64 MiB post-decompression cap takes no charge and is
+    /// rejected by the decoder as before. A request whose charge would push the gauge
     /// past this ceiling is shed before any buffering -- HTTP 429 with
     /// `Retry-After`, gRPC `RESOURCE_EXHAUSTED` -- so a burst of active
     /// tenants can no longer grow resident memory without bound (the
     /// per-tenant buffer caps bound each tenant, not their sum). It does NOT
-    /// cover the identity-path decoded body or the gRPC and Remote Write
-    /// inflate; those stay bounded by
+    /// cover the identity-path decoded body, the OTLP gRPC gzip inflate, or
+    /// the OTAP zstd payload inflate; those stay bounded by
     /// `--max-inflight-ingest-requests` (docs/ingest.md, "Worst-case resident
     /// memory"). Like `--max-inflight-ingest-requests` this is a per-process
     /// local bound, never fleet-reconciled. Default 512 MiB; `0` disables the
