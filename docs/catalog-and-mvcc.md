@@ -1263,6 +1263,23 @@ existing `ravel_catalog_interlock_violations_total` and
 tally a harmless-overlap anomaly the query still resolves past, every
 increment of the isolation-breach counter corresponds to a failed query.
 
+The fold's own liveness is exported beside those counters, from the same
+`Catalog`: `ravel_catalog_fold_cycles_total`,
+`ravel_catalog_fold_failures_total`, and the
+`ravel_catalog_fold_last_success_timestamp_seconds` gauge, stamped with the
+caller-supplied `now_ns` of the last fold that returned `Ok`. They are
+accumulated inside `Catalog::fold` rather than at its callers, so the
+scheduled fold loop, the on-demand fold route, and the CLI all feed one set
+of figures; a family fed by only one of several fold paths would read as
+healthy while another path was dead. A no-op fold counts as a cycle and
+advances the gauge, because the seal window above means a fold on a quiet
+tenant legitimately publishes nothing most cycles. The gauge's age is the
+signal that the fold has STOPPED, which is the failure the index has no
+other alarm for: nothing seals, the unsealed span grows without bound, and
+the first symptom is a recent-window query refused for exceeding its
+request budget. The alert rule and the threshold arithmetic are in
+docs/guides/observability.md.
+
 Soundness rests entirely on the seal lemma above: for sealed buckets, the
 fold's LIST equals any later LIST, so serving them from the snapshot
 returns exactly what full listing would; open buckets keep the listing path

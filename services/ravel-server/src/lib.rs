@@ -852,16 +852,6 @@ impl DrainRouter for SpanIngestRouter {
     }
 }
 
-/// Attempt to flush a router's buffers, then join its shard actors only as a
-/// best-effort step. The flush ALWAYS runs (it takes `&self`); the join runs
-/// only when this is the sole `Arc` owner, because joining consumes the router.
-/// If another task still holds a clone the flush still runs but the actors are
-/// not joined, which is safe: the join only reaps the actors and adds no
-/// durability that the flush did not already attempt. Factored out of
-/// [`Running::shutdown`] so the "flush is unconditional, join is best-effort"
-/// contract is unit-testable; deleting the flush here makes that test fail
-/// rather than passing on the incidental flush a later owner's own shutdown
-/// would perform.
 /// The ingest health sources the readiness probe consults (issue #1299).
 ///
 /// Deliberately returns the router's METRICS handle, never a clone of the
@@ -878,6 +868,16 @@ fn ingest_health_sources(router: Option<&Arc<IngestRouter>>) -> Vec<Arc<dyn heal
         .unwrap_or_default()
 }
 
+/// Attempt to flush a router's buffers, then join its shard actors only as a
+/// best-effort step. The flush ALWAYS runs (it takes `&self`); the join runs
+/// only when this is the sole `Arc` owner, because joining consumes the router.
+/// If another task still holds a clone the flush still runs but the actors are
+/// not joined, which is safe: the join only reaps the actors and adds no
+/// durability that the flush did not already attempt. Factored out of
+/// [`Running::shutdown`] so the "flush is unconditional, join is best-effort"
+/// contract is unit-testable; deleting the flush here makes that test fail
+/// rather than passing on the incidental flush a later owner's own shutdown
+/// would perform.
 async fn drain_router<R: DrainRouter>(router: Option<Arc<R>>, label: &str) {
     let Some(router) = router else {
         return;

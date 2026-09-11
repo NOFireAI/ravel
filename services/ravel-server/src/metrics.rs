@@ -1417,6 +1417,33 @@ pub struct CatalogCountersSnapshot {
     /// tenant_hash mismatch or an out-of-prefix listing result. Unlike the
     /// two counters above, each of these also failed its query.
     pub isolation_breaches: u64,
+    /// `Catalog::fold` calls that returned `Ok`, no-op cycles included.
+    pub fold_cycles: u64,
+    /// `Catalog::fold` calls that returned `Err`.
+    pub fold_failures: u64,
+    /// `now_ns` of the most recent successful fold, or `0` when none has
+    /// succeeded in this process. Carried in nanoseconds (the catalog's own
+    /// unit, and an exact integer) and divided down to seconds only at the
+    /// render below, so this struct stays `Eq`-comparable in tests.
+    pub fold_last_success_unix_ns: i64,
+}
+
+impl CatalogCountersSnapshot {
+    /// Read every counter off a live [`ravel_catalog::Catalog`]. The scrape
+    /// handler calls this rather than listing the six reads inline, so the
+    /// catalog-to-exposition wiring is a function a test can call: a renderer
+    /// driven only by struct literals proves the formatting and nothing about
+    /// whether the numbers came from the catalog at all.
+    pub fn from_catalog(catalog: &ravel_catalog::Catalog) -> Self {
+        CatalogCountersSnapshot {
+            interlock_violations: catalog.interlock_violations(),
+            compaction_input_set_conflicts: catalog.compaction_input_set_conflicts(),
+            isolation_breaches: catalog.isolation_breaches(),
+            fold_cycles: catalog.fold_cycles(),
+            fold_failures: catalog.fold_failures(),
+            fold_last_success_unix_ns: catalog.fold_last_success_unix_ns(),
+        }
+    }
 }
 
 fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCountersSnapshot) {
@@ -1457,6 +1484,50 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         "ravel_catalog_isolation_breach_total",
         &[Label::Mode(mode)],
         snapshot.isolation_breaches,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_fold_cycles_total",
+        "Catalog folds that completed successfully, including the no-op folds that are the healthy steady state.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_fold_cycles_total",
+        &[Label::Mode(mode)],
+        snapshot.fold_cycles,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_fold_failures_total",
+        "Catalog folds that failed. A fold that fails every cycle leaves the unsealed ingest span growing without bound.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_fold_failures_total",
+        &[Label::Mode(mode)],
+        snapshot.fold_failures,
+    );
+
+    // The liveness gauge, and the only figure here that moves when the fold
+    // STOPS rather than when it runs. `0` means no fold has succeeded since
+    // this process started, which is why the alert rule in
+    // docs/guides/observability.md carries a `for:` long enough to cover a
+    // freshly started process's first fold interval.
+    write_header(
+        out,
+        "ravel_catalog_fold_last_success_timestamp_seconds",
+        "Unix time of the last successful catalog fold in this process, 0 if none has succeeded yet. Its age is the fold-liveness signal.",
+        "gauge",
+    );
+    write_sample_f64(
+        out,
+        "ravel_catalog_fold_last_success_timestamp_seconds",
+        &[Label::Mode(mode)],
+        snapshot.fold_last_success_unix_ns as f64 / 1e9,
     );
 }
 
@@ -4018,11 +4089,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         ));
     }
 
-    let catalog_snapshot = CatalogCountersSnapshot {
-        interlock_violations: state.catalog.interlock_violations(),
-        compaction_input_set_conflicts: state.catalog.compaction_input_set_conflicts(),
-        isolation_breaches: state.catalog.isolation_breaches(),
-    };
+    let catalog_snapshot = CatalogCountersSnapshot::from_catalog(state.catalog.as_ref());
 
     let maintain_snapshot =
         state
@@ -4673,6 +4740,7 @@ mod tests {
             interlock_violations: 1,
             compaction_input_set_conflicts: 2,
             isolation_breaches: 3,
+            ..Default::default()
         };
         let body = render(
             Mode::Gateway,
@@ -5290,6 +5358,7 @@ mod tests {
             interlock_violations: 0,
             compaction_input_set_conflicts: 0,
             isolation_breaches: 5,
+            ..Default::default()
         };
         let body = render(
             Mode::Gateway,
@@ -5324,6 +5393,174 @@ mod tests {
         assert!(
             body.contains("ravel_catalog_isolation_breach_total{mode=\"gateway\"} 5"),
             "isolation-breach counter must render its current value:\n{body}"
+        );
+    }
+
+    /// The fold-liveness family reaches `/metrics` with the values it was
+    /// driven with (issue #1306), following
+    /// [`metadata_sink_counters_render_for_metrics_only`]: a family whose doc
+    /// comments describe it but whose renderer emits nothing is exactly the
+    /// defect that test exists for. The gauge is asserted as the exact
+    /// rendered string, so a unit slip (nanoseconds emitted where seconds are
+    /// declared) fails here rather than reading as a 54-year-old fold.
+    #[test]
+    fn catalog_fold_liveness_family_renders_its_driven_values() {
+        // 1_758_000_123_500_000_000 ns is 1758000123.5 s: a value with a
+        // fractional second, so a renderer that truncated to whole seconds
+        // would not match.
+        let catalog = CatalogCountersSnapshot {
+            fold_cycles: 41,
+            fold_failures: 3,
+            fold_last_success_unix_ns: 1_758_000_123_500_000_000,
+            ..Default::default()
+        };
+        let body = render(
+            Mode::All,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            body.contains("# TYPE ravel_catalog_fold_cycles_total counter"),
+            "the cycle counter must declare its type:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_catalog_fold_cycles_total{mode=\"all\"} 41"),
+            "the cycle counter must render its driven value:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_catalog_fold_failures_total{mode=\"all\"} 3"),
+            "the failure counter must render its driven value:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_catalog_fold_last_success_timestamp_seconds gauge"),
+            "the liveness timestamp is a gauge, not a counter:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_catalog_fold_last_success_timestamp_seconds{mode=\"all\"} 1758000123.5"
+            ),
+            "the liveness gauge must render the driven nanosecond stamp as seconds:\n{body}"
+        );
+    }
+
+    /// The scrape path reads the fold figures off the live `Catalog`, not off
+    /// a zero placeholder. The two render tests above drive a struct literal,
+    /// so on their own they would still pass if the handler never asked the
+    /// catalog anything; this drives a real fold through a real catalog and
+    /// asserts the snapshot carries what that fold left behind.
+    #[tokio::test]
+    async fn catalog_fold_snapshot_reads_the_live_catalog() {
+        use ravel_catalog::{Catalog, CatalogConfig};
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_types::{Signal, TenantId};
+
+        let store = std::sync::Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, CatalogConfig::default()).expect("catalog");
+        let before = CatalogCountersSnapshot::from_catalog(&catalog);
+        assert_eq!(before.fold_cycles, 0);
+        assert_eq!(before.fold_last_success_unix_ns, 0);
+
+        // A fold over an empty store: the watermark advances over hours that
+        // hold nothing, so it publishes a first HEAD naming no entry at all.
+        // That is exactly the shape of a healthy cycle on a quiet tenant, and
+        // the cycle counter has to count it.
+        let tenant = TenantId::new("metrics-fold-snapshot").hash();
+        let now_ns = 1_758_000_123_500_000_000;
+        let report = catalog
+            .fold(
+                &tenant,
+                Signal::Metrics,
+                uuid::Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold over an empty store succeeds");
+        assert_eq!(report.entry_count, 0, "an empty store folds no entry");
+
+        let after = CatalogCountersSnapshot::from_catalog(&catalog);
+        assert_eq!(after.fold_cycles, 1);
+        assert_eq!(after.fold_failures, 0);
+        assert_eq!(
+            after.fold_last_success_unix_ns, now_ns,
+            "the snapshot carries the catalog's own stamp, not a placeholder"
+        );
+    }
+
+    /// A process that has never folded successfully still renders the gauge,
+    /// at `0`, rather than omitting the series. An absent series cannot be
+    /// alerted on with the `time() - gauge` expression the observability
+    /// guide publishes: the alert would simply never fire for the process
+    /// whose fold never worked at all.
+    #[test]
+    fn catalog_fold_liveness_gauge_renders_zero_before_any_successful_fold() {
+        let body = render(
+            Mode::All,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            body.contains("ravel_catalog_fold_last_success_timestamp_seconds{mode=\"all\"} 0"),
+            "the liveness gauge must render its zero sentinel, not be omitted:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_catalog_fold_cycles_total{mode=\"all\"} 0"),
+            "a zero cycle counter must render, not be omitted:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_catalog_fold_failures_total{mode=\"all\"} 0"),
+            "a zero failure counter must render, not be omitted:\n{body}"
         );
     }
 
