@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use ravel_catalog::{CatalogConfig, FoldReport, PartLimits};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
-use ravel_proto::catalog::v1::{SnapshotColumnStatsPartRef, SnapshotColumnStatsRef};
+use ravel_proto::catalog::v1::SnapshotColumnStatsPartRef;
 use ravel_types::{Signal, TenantHash, TenantId};
 use uuid::Uuid;
 
@@ -259,22 +259,6 @@ fn render_fold_report(
     out.push_str(&format!("postings_built: {}\n", report.postings_built));
     out.push_str(&format!("postings_bytes: {}\n", report.postings_bytes));
     out.push_str(&format!(
-        "column_stats_built: {}\n",
-        report.column_stats_built
-    ));
-    out.push_str(&format!(
-        "column_stats_bytes: {}\n",
-        report.column_stats_bytes
-    ));
-    out.push_str(&format!(
-        "column_stats_part_built: {}\n",
-        report.column_stats_part_built
-    ));
-    out.push_str(&format!(
-        "column_stats_part_bytes: {}\n",
-        report.column_stats_part_bytes
-    ));
-    out.push_str(&format!(
         "column_stats_part_objects_built: {}\n",
         report.column_stats_part_objects_built
     ));
@@ -376,14 +360,6 @@ pub async fn render_inspect(
     ));
     out.push_str(&format!("created_unix_ns: {}\n", head.created_unix_ns));
     out.push_str(&format!("parts: {}\n", head.parts.len()));
-    out.push_str(&format!(
-        "column_stats (field 11): {}\n",
-        format_column_stats_ref(head.column_stats.as_ref())
-    ));
-    out.push_str(&format!(
-        "column_stats_part (field 13): {}\n",
-        format_column_stats_part_ref(head.column_stats_part.as_ref())
-    ));
 
     let limits = PartLimits::default();
     for (index, part_ref) in head.parts.iter().enumerate() {
@@ -433,20 +409,10 @@ pub async fn render_inspect(
     Ok(())
 }
 
-/// Formats a HEAD-level `SnapshotColumnStatsRef` (field 11, ADR-0850) as a
+/// Formats a `SnapshotColumnStatsPartRef` (per-part field 7, ADR-1413) as a
 /// `key=... size=...` line, or `ABSENT` when the field is unset. Printing
 /// `ABSENT` rather than omitting the line matters: an omitted line and an
 /// unset field are otherwise indistinguishable to a reader (#1598).
-fn format_column_stats_ref(r: Option<&SnapshotColumnStatsRef>) -> String {
-    match r {
-        Some(r) => format!("key={} size={}", r.key, r.size),
-        None => "ABSENT".to_string(),
-    }
-}
-
-/// Formats a `SnapshotColumnStatsPartRef` (HEAD field 13, ADR-0942, or
-/// per-part field 7, ADR-1413 -- both share this message shape) as a
-/// `key=... size=...` line, or `ABSENT` when the field is unset.
 fn format_column_stats_part_ref(r: Option<&SnapshotColumnStatsPartRef>) -> String {
     match r {
         Some(r) => format!("key={} size={}", r.key, r.size),
@@ -715,8 +681,6 @@ mod tests {
             folder_id: vec![0u8; 16],
             created_unix_ns: 0,
             postings: None,
-            column_stats: None,
-            column_stats_part: None,
             shard_generation_count: 1,
         };
         let head_bytes = ravel_catalog::encode_head(&head).expect("encode head");
