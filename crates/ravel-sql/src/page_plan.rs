@@ -182,10 +182,42 @@
 //! The page statement wraps the caller's own statement as a derived table:
 //!
 //! ```text
-//! SELECT * FROM (<statement, its own ORDER BY removed>) AS ravel_page
+//! SELECT * FROM (<statement, its own ORDER BY removed when it only orders>) AS ravel_page
 //!   [WHERE <keyset predicate>]
 //!   ORDER BY <effective terms>
 //! ```
+//!
+//! The caller's own `ORDER BY` is dropped from the derived table only where it
+//! ORDERS the result. Where it SELECTS the result, it is preserved, because
+//! dropping it changes which rows come back rather than which order they come
+//! back in. [`ordering_selects_rows`] is that distinction, and the module's
+//! other refusals are what make its list short: every construct whose row set
+//! reads the statement's own ordering is refused before the rewrite runs,
+//! except one.
+//!
+//! `DISTINCT ON (...)` is that one. The ordering chooses WHICH row of each
+//! `ON` group survives, so `SELECT DISTINCT ON (series_id) ts, series_id FROM
+//! samples ORDER BY series_id, ts DESC` asks for each series' LAST sample and a
+//! page rendered without the inner ordering returned its first, with no error
+//! and `not_total` reported as usual.
+//!
+//! The rest of that class does not reach here:
+//!
+//! - a row limit in any spelling (`LIMIT`, `OFFSET`, `FETCH`, ClickHouse's
+//!   `LIMIT ... BY`, and `TOP`) is [`PagePlanError::RowLimitInStatement`] at
+//!   every depth, which also takes `FETCH ... WITH TIES` with it;
+//! - a pipe operator is [`PagePlanError::PipeOperator`], so a `|> limit` or a
+//!   `|> order_by` cannot reshape the rows after the body;
+//! - `WITH FILL` is [`PagePlanError::UnsupportedOrderOption`], which is the
+//!   only ClickHouse ordering form that adds rows (an `INTERPOLATE` is defined
+//!   only in terms of one, so it cannot change a row set on its own).
+//!
+//! A window function is NOT in the class: `OVER (ORDER BY ...)` carries its
+//! own ordering and no SQL window inherits the statement's. It is still paged
+//! correctly for a second reason, which is the wrap itself: the window is
+//! computed inside the derived table over all the statement's rows, while the
+//! keyset predicate filters outside it, so `count(*) OVER ()` reports the same
+//! total on every page rather than counting down as the walk advances.
 //!
 //! The wrap is what makes the keyset predicate land on the statement's OUTPUT
 //! rows. Injected into the caller's own `WHERE`, it would filter before any
@@ -1846,17 +1878,50 @@ fn non_identity_shape(query: &Query, target: PageTarget) -> Option<&'static str>
     }
 }
 
+/// Whether the statement's own `ORDER BY` decides WHICH rows it returns rather
+/// than only the order they come back in.
+///
+/// The distinction is what [`render_statement`] strips the inner ordering on.
+/// For a statement where the ordering only orders, the outer one dominates and
+/// the inner one is a second sort of the same rows; for a statement where it
+/// selects, dropping it delivers different rows under the same `not_total`
+/// report, which is a wrong answer rather than a slow one.
+///
+/// `DISTINCT ON (...)` is the only construct that reaches here and reads the
+/// ordering: it keeps the FIRST row of each `ON` group under it. The rest of
+/// the class -- every row limit spelling, a pipe operator, and `WITH FILL` --
+/// is refused before the rewrite runs (see the module docs), and a window
+/// function is not in the class at all, because `OVER (ORDER BY ...)` carries
+/// its own ordering and no window inherits the statement's.
+///
+/// Read off the outermost body alone, which is the only ordering
+/// [`render_statement`] removes. An inner `Query` keeps its own `ORDER BY`
+/// verbatim, and a set operation's arm is a bare `SetExpr::Select` that has no
+/// ordering of its own to read: the ordering written after a set operation
+/// belongs to the operation's result, so no arm's `DISTINCT ON` can consume
+/// it.
+fn ordering_selects_rows(query: &Query) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    matches!(select.distinct, Some(Distinct::On(_)))
+}
+
 /// Render the page statement.
 fn render_statement(
     query: &Query,
     terms: &[OrderTerm],
     resume: Option<&ResumePosition>,
 ) -> Result<String, PagePlanError> {
-    // The caller's own `ORDER BY` is dropped from the derived table: the
-    // effective ordering is applied once, outside, where the keyset predicate
-    // is. Leaving it would order the same rows twice.
+    // The caller's own `ORDER BY` is dropped from the derived table when it
+    // only orders: the effective ordering is applied once, outside, where the
+    // keyset predicate is, and leaving it would order the same rows twice. It
+    // is kept when the row set itself reads it, which is a different statement
+    // rather than the same one sorted twice.
     let mut inner = query.clone();
-    inner.order_by = None;
+    if !ordering_selects_rows(&inner) {
+        inner.order_by = None;
+    }
 
     let ordering = terms
         .iter()
