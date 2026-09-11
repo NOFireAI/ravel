@@ -8662,14 +8662,23 @@ mod tests {
     /// the shape a pre-#1600 fold would have produced. Retiring the fallback
     /// ladder means neither is ever read, covered or not.
     ///
-    /// Prove-the-test: this pins `Catalog::load_column_stats`'s per-part loop
-    /// (`for part in &covered`) actually consulting `parts_intersecting`'s
-    /// narrowed set rather than HEAD's full `parts` list. Flip that loop's
-    /// `for part in &covered` to `for part in &head.parts` and the key-set
-    /// assertion below fails: three `.cstat` GETs fire (including the
-    /// excluded part's), not two. Reintroducing a whole-object fallback read
-    /// makes it fail differently: the poisoned field-11/field-13 keys appear
-    /// in `cstat_gets` and the GET count climbs past 3.
+    /// Prove-the-test: the excluded part 'a' carries no field-7 ref at all
+    /// (`column_stats: None`), so neither flipping this loop's `for part in
+    /// &covered` to `for part in &head.parts` nor reintroducing the genuine
+    /// pre-#1600 `needs_fallback` ladder (verified directly against the
+    /// pre-#1600 tree, commit `5d40a50`'s parent) changes this fixture's
+    /// outcome: both covered parts (b, c) already resolve successfully, so no
+    /// fallback of any kind is ever consulted for either, whole-object
+    /// machinery present or not. This test instead pins the fixed
+    /// covered-part key set and GET count against a poisoned HEAD; the
+    /// mutation that DOES break it is `resolve_part_stats_ref`
+    /// (`column_stats_resolve.rs`) fabricating a ref from a part's own
+    /// blake3 when `column_stats` is absent instead of returning `None` --
+    /// verified directly, this leaves the assertions below unaffected too,
+    /// because the fabricated ref would only apply to excluded part 'a'; see
+    /// [`head_with_only_field_thirteen_yields_no_statistics_and_scans`] for
+    /// the fixture where that same mutation (and reintroducing genuine
+    /// pre-#1600 code) both do fail.
     #[tokio::test]
     async fn query_over_k_of_n_parts_issues_exactly_k_per_part_gets_and_no_whole_object_get() {
         let inner = MemoryStore::new();
@@ -9358,10 +9367,16 @@ mod tests {
     /// (`append_raw_field`), the way a HEAD folded before this change would
     /// actually carry one.
     ///
-    /// Prove-the-test: reintroducing a `head.column_stats_part` fallback
-    /// read in the per-part resolution loop makes this fail: `loaded`
-    /// becomes `Some` with both parts' statistics, and the v2 object is
-    /// fetched once instead of never.
+    /// Prove-the-test: verified two ways. (1) Reintroducing the genuine
+    /// pre-#1600 `needs_fallback` ladder and its real `head.v1`/`head.v2`
+    /// fields (the pre-#1600 tree, commit `5d40a50`'s parent, run with this
+    /// exact test body) makes this fail: `loaded` becomes `Some` with both
+    /// parts' statistics, at 2 accounted GETs (HEAD plus the one whole-object
+    /// fallback), not 1. (2) Against CURRENT code, mutating
+    /// `resolve_part_stats_ref` (`column_stats_resolve.rs`) to fabricate a
+    /// ref from a part's own blake3 when `column_stats` is absent, instead of
+    /// returning `None`, also makes this fail: the accounted GET count climbs
+    /// to 3 (HEAD plus one fabricated-ref attempt per part), not 1.
     #[tokio::test]
     async fn head_with_only_field_thirteen_yields_no_statistics_and_scans() {
         let inner = MemoryStore::new();
