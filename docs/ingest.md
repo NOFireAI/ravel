@@ -230,8 +230,9 @@ Operationally (see docs/guides/operations/troubleshooting.md,
 "Readiness, storage and authentication"): `shard_deaths` counts every death including respawned
 incarnations, so it can exceed `shard_count`; a low steady rate is
 transient recovery, a sustained climb on one shard is a poison-pill
-input. `shards_condemned` counts each condemned shard at most once and
-never exceeds `shard_count`; any nonzero value means the process is
+input. `shards_condemned` counts each condemned shard at most once per live
+generation, so under resharding it is bounded by `live_generations *
+shard_count` rather than `shard_count`; any nonzero value means the process is
 not-ready and is being replaced, so alert on `shards_condemned > 0`.
 
 Flush (still inside the actor; ingest-ordering per shard is the point):
@@ -971,7 +972,9 @@ Counters recorded today:
   death including each respawned incarnation, so it can exceed
   `shard_count`.
 - `shards_condemned`: shards that exhausted their respawn budget and were
-  condemned, counted at most once per shard and never exceeding `shard_count`.
+  condemned, counted at most once per shard per live generation and bounded by
+  `live_generations * shard_count`, not `shard_count`: under resharding each
+  generation's handle for a shard index can condemn independently.
   Nonzero turns `IngestRouter::ready()` false and, through
   `services/ravel-server`, `/readyz` to 503.
 - `in_flight_flushes_total`: gauge, sum across shards of flush tasks spawned
