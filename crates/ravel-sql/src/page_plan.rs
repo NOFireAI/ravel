@@ -24,21 +24,54 @@
 //! Exactly one table has a row identity to build that on. The `samples` scan
 //! emits at most one row per `(series_id, ts)` (`crate::dedup` picks one winner
 //! per group under the full dedup total order), so that pair is a key. The four
-//! RLOG- and RSPAN-backed tables have none: ingest is at-least-once and none of
-//! them carries row identity, so two rows can tie on every orderable column
-//! (`docs/adrs/1374-agent-mcp-server.md` D5 says this of `logs`, and the same
-//! holds for `spans`, `alerts`, and `audit`). For those, a page cannot be made
-//! total by appending anything, so nothing is appended and
-//! [`NotTotalOrder::NoRowIdentity`] says so; D5's own answer for that case is
-//! the equal-group rule the tool applies (fetch `k + 1` rows, drop the whole
-//! trailing group of equal tuples), which is the caller's half and not this
-//! module's.
+//! RLOG- and RSPAN-backed tables have none, because ingest is at-least-once and
+//! nothing above their scans dedups: the same record can arrive twice and two
+//! rows can then tie on every orderable column
+//! (`docs/adrs/1374-agent-mcp-server.md` D5 says this of `logs`, and the
+//! at-least-once argument carries to `spans`, `alerts`, and `audit`).
+//!
+//! `alerts` is the one that looks like an exception and is not. Its public
+//! schema does carry a non-nullable `(writer_id, writer_epoch, writer_seq)`
+//! triple, but that triple is the write identity of the OBJECT a row was read
+//! from, stamped by the scan (ADR-1101 decision 1), not of the row: every row
+//! decoded from one segment carries the same three values. So it cannot break
+//! a tie between two rows of one object, and a retried write puts the second
+//! copy in a different object under a different triple. The conclusion is
+//! [`NotTotalOrder::NoRowIdentity`] for all four either way; D5's own answer
+//! for that case is the equal-group rule the tool applies (fetch `k + 1` rows,
+//! drop the whole trailing group of equal tuples), which is the caller's half
+//! and not this module's.
 //!
 //! The identity claim also depends on the statement's shape, not only on its
 //! target: a `GROUP BY`, a join, a `DISTINCT`, a CTE, or a set operation
 //! projects rows the scan's dedup says nothing about. Those report
 //! [`NotTotalOrder::ShapeNotIdentityPreserving`] rather than a tiebreak that
 //! would be unsound.
+//!
+//! # Two things the text has to be read for, not around
+//!
+//! A pipe operator (`|> ...`) is refused outright
+//! ([`PagePlanError::PipeOperator`]). The parser's default dialect accepts
+//! them, `Display for Query` re-emits them, and every clause this module reads
+//! to classify a statement lives in the `SELECT` body that a pipe runs AFTER:
+//! a pipe can impose a row limit, a join, a set operation, a new projection,
+//! or an ordering, none of which the body carries. So no pipe is admitted, and
+//! the refusal is on the presence of any pipe rather than on a list of pipe
+//! kinds, so a pipe kind added by a later sqlparser is refused too instead of
+//! being silently admitted.
+//!
+//! An `ORDER BY` term that can be NULL is refused as well
+//! ([`PagePlanError::OrderTermNullable`]): a keyset comparison against NULL is
+//! NULL, so the rows whose term is NULL match no disjunct and appear on no
+//! page at all. That is a wrong answer on both the total and the not-total
+//! path, because the keyset predicate is what resumes both. Only a term that
+//! the text proves NON NULL is admitted: it has to be a bare reference to a
+//! column the target table's public schema declares non-nullable, either
+//! directly or through an alias over one. Everything else is refused,
+//! including a projected expression (whose nullability no schema lookup
+//! answers), a declared column (all nullable), a set-operation body (whose
+//! projection is not readable from the text), an output name projected twice
+//! under different sources, and a statement with no base table at all.
 //!
 //! # The rewrite
 //!
@@ -63,7 +96,7 @@
 //! support for comparing tuples, and each conjunct is a plain binary
 //! comparison the providers can push down.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
@@ -71,7 +104,12 @@ use datafusion::sql::sqlparser::ast::{
     SelectItem, SetExpr, Statement, TableFactor,
 };
 
+use crate::alerts_schema::alerts_schema;
+use crate::audit_schema::audit_schema;
+use crate::logs_schema::logs_schema;
+use crate::schema::public_schema;
 use crate::session::{ALERTS_TABLE, AUDIT_TABLE, LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE};
+use crate::spans_schema::spans_schema;
 use crate::validate::{ValidationError, referenced_base_tables, validate};
 
 /// The alias the page statement gives the caller's own statement as a derived
@@ -176,6 +214,20 @@ pub enum PagePlanError {
     )]
     RowLimitInStatement,
 
+    /// The statement uses a pipe operator (`|> ...`).
+    ///
+    /// Every classification this module makes reads the `SELECT` body, and a
+    /// pipe runs after it: it can impose a row limit, a join, a set operation,
+    /// a projection, or an ordering that the body does not carry, while
+    /// `Display for Query` re-emits the pipe into the derived table. The
+    /// refusal is on the presence of a pipe rather than on its kind, so a kind
+    /// a later sqlparser adds is refused rather than admitted unexamined.
+    #[error(
+        "a statement using a pipe operator cannot be paged; a pipe reshapes \
+         the rows after the SELECT body a page is planned from"
+    )]
+    PipeOperator,
+
     /// There is nothing to order by: the statement carries no `ORDER BY` and
     /// the target has no row identity to impose one from.
     #[error(
@@ -216,6 +268,21 @@ pub enum PagePlanError {
         option: &'static str,
     },
 
+    /// An `ORDER BY` term the text does not prove NON NULL.
+    ///
+    /// Refusing the `NULLS FIRST`/`NULLS LAST` spellings is not enough:
+    /// omitting the option does not remove NULLs from the sequence, it leaves
+    /// their position to a session default. A keyset comparison against a NULL
+    /// is NULL, so every row whose term is NULL matches no disjunct and lands
+    /// on no page, which is a dropped row rather than a mis-ordered one. See
+    /// the module docs for what counts as proof of NON NULL here.
+    #[error(
+        "the ORDER BY term `{column}` is not known to be NON NULL, and a \
+         keyset comparison against NULL selects no rows, so the rows whose \
+         `{column}` is NULL would appear on no page"
+    )]
+    OrderTermNullable { column: String },
+
     /// The resume tuple does not have one value per effective term.
     #[error("the resume position has {found} values for {expected} ORDER BY terms")]
     ResumeArity { expected: usize, found: usize },
@@ -236,9 +303,12 @@ pub enum PagePlanError {
 ///
 /// There is no NULL variant, which is deliberate: every comparison against
 /// NULL is NULL, so a keyset predicate resumed at a NULL selects no rows at
-/// all. A column that can be NULL cannot be paged by this form, and
-/// [`PagePlanError::UnsupportedOrderOption`] refuses the `NULLS FIRST`/`NULLS
-/// LAST` spellings that ask for one explicitly.
+/// all. A term that can be NULL cannot be paged by this form at all, which is
+/// why [`PagePlanError::OrderTermNullable`] refuses one before a resume tuple
+/// is ever rendered against it. [`PagePlanError::UnsupportedOrderOption`]
+/// refuses the `NULLS FIRST`/`NULLS LAST` spellings on top of that, but it is
+/// not what closes this hole: an omitted option still leaves NULL rows in the
+/// sequence.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResumeValue {
     /// A signed integer column.
@@ -343,17 +413,21 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
     validate(sql)?;
     let query = parse_query(sql)?;
 
+    // Before anything else reads the `SELECT` body: a pipe operator makes that
+    // body an incomplete description of the statement, so every check below it
+    // would be answering about the wrong rows.
+    if !query.pipe_operators.is_empty() {
+        return Err(PagePlanError::PipeOperator);
+    }
     if query.limit_clause.is_some() || query.fetch.is_some() {
+        return Err(PagePlanError::RowLimitInStatement);
+    }
+    if let Some(SelectShape { top: Some(_), .. }) = shape_of(&query) {
         return Err(PagePlanError::RowLimitInStatement);
     }
 
     let target = page_target(sql)?;
     let projection = projection_of(&query);
-    if let Projection::Columns(_) = &projection
-        && let Some(SelectShape { top: Some(_), .. }) = shape_of(&query)
-    {
-        return Err(PagePlanError::RowLimitInStatement);
-    }
 
     let mut terms = statement_order_terms(&query)?;
     for term in &terms {
@@ -372,6 +446,15 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
         return Err(PagePlanError::NoOrdering {
             target: target.describe(),
         });
+    }
+    // Every effective term, the appended tiebreak included: a NULL anywhere in
+    // the ordering drops the rows it covers from every page.
+    for term in &terms {
+        if !term_is_non_nullable(target, &projection, &term.column) {
+            return Err(PagePlanError::OrderTermNullable {
+                column: term.column.clone(),
+            });
+        }
     }
 
     let statement = render_statement(&query, &terms, resume)?;
@@ -456,15 +539,29 @@ fn page_target(sql: &str) -> Result<PageTarget, PagePlanError> {
     }
 }
 
+/// What one output column of a `SELECT` list is built from, as far as the
+/// text says. The distinction exists for nullability: a schema lookup answers
+/// for a bare column reference and for nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutputSource {
+    /// A bare reference to this column of the `FROM` relation, under its own
+    /// name or an alias.
+    Column(String),
+    /// Anything else: a computed expression, or an output name the projection
+    /// gives twice from different sources. Neither has a column in the
+    /// target's schema to look up.
+    Opaque,
+}
+
 /// What the statement projects, as far as its text says.
 enum Projection {
     /// A wildcard projects every column of the target, so any column of it is
     /// available to order by.
     Wildcard,
     /// The named output columns (an alias where the item has one, the column
-    /// itself otherwise). An item that is neither -- a bare expression with no
-    /// alias -- contributes no name.
-    Columns(BTreeSet<String>),
+    /// itself otherwise), each with what it is built from. An item that is
+    /// neither -- a bare expression with no alias -- contributes no name.
+    Columns(BTreeMap<String, OutputSource>),
     /// The projection is not readable from the text (a set-operation body).
     Unknown,
 }
@@ -479,7 +576,26 @@ impl Projection {
     fn projects(&self, column: &str) -> bool {
         match self {
             Projection::Wildcard | Projection::Unknown => true,
-            Projection::Columns(names) => names.contains(column),
+            Projection::Columns(names) => names.contains_key(column),
+        }
+    }
+
+    /// The target-table column the output column `column` is a bare reference
+    /// to, or `None` when the text does not name one.
+    ///
+    /// A wildcard answers with the name itself: every output column of a
+    /// `SELECT *` is a column of the `FROM` relation under its own name.
+    /// `Unknown` answers `None` rather than guessing, which is what makes a
+    /// set-operation body fail the nullability check instead of passing it
+    /// unexamined.
+    fn source_column<'a>(&'a self, column: &'a str) -> Option<&'a str> {
+        match self {
+            Projection::Wildcard => Some(column),
+            Projection::Unknown => None,
+            Projection::Columns(items) => match items.get(column) {
+                Some(OutputSource::Column(name)) => Some(name.as_str()),
+                Some(OutputSource::Opaque) | None => None,
+            },
         }
     }
 }
@@ -488,18 +604,28 @@ fn projection_of(query: &Query) -> Projection {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Projection::Unknown;
     };
-    let mut names = BTreeSet::new();
+    let mut names: BTreeMap<String, OutputSource> = BTreeMap::new();
+    let mut record = |name: String, source: OutputSource| {
+        // A name the projection gives twice is ambiguous here even when both
+        // sources are columns, so it degrades to opaque rather than to
+        // whichever item came last.
+        let entry = names.entry(name).or_insert_with(|| source.clone());
+        if *entry != source {
+            *entry = OutputSource::Opaque;
+        }
+    };
     for item in &select.projection {
         match item {
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
                 return Projection::Wildcard;
             }
-            SelectItem::ExprWithAlias { alias, .. } => {
-                names.insert(ident_name(alias));
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let source = column_of(expr).map_or(OutputSource::Opaque, OutputSource::Column);
+                record(ident_name(alias), source);
             }
             SelectItem::UnnamedExpr(expr) => {
                 if let Some(column) = column_of(expr) {
-                    names.insert(column);
+                    record(column.clone(), OutputSource::Column(column));
                 }
             }
             // A multi-alias item names columns this planner does not model, so
@@ -509,6 +635,34 @@ fn projection_of(query: &Query) -> Projection {
         }
     }
     Projection::Columns(names)
+}
+
+/// Whether the text proves the effective term `column` is NON NULL.
+///
+/// The proof has to hold end to end: the output column has to be a bare
+/// reference to a column of the target table (so a schema lookup is about the
+/// right value at all), and that column has to be declared non-nullable in the
+/// table's public schema. A statement with no base table has no schema to ask,
+/// and a declared column is absent from the static schema and nullable
+/// anyway, so both answer false.
+fn term_is_non_nullable(target: PageTarget, projection: &Projection, column: &str) -> bool {
+    let Some(table) = target.table_name() else {
+        return false;
+    };
+    let Some(source) = projection.source_column(column) else {
+        return false;
+    };
+    let schema = match table {
+        SAMPLES_TABLE => public_schema(),
+        LOGS_TABLE => logs_schema(),
+        SPANS_TABLE => spans_schema(),
+        ALERTS_TABLE => alerts_schema(),
+        AUDIT_TABLE => audit_schema(),
+        _ => return false,
+    };
+    schema
+        .field_with_name(source)
+        .is_ok_and(|field| !field.is_nullable())
 }
 
 /// The parts of a single `SELECT` body that decide whether it projects the
@@ -663,16 +817,23 @@ fn tiebreak(
 /// grouping, and no dialect clause that reshapes rows. A statement this
 /// passes is one whose result rows are the scan's rows, so the scan's row
 /// identity is the result's.
+///
+/// A pipe operator and a `TOP` clause are refused outright by [`plan_page`]
+/// before this runs, so neither reason can reach a returned plan. They are
+/// named here anyway: this classification has to be complete on its own
+/// reading, not only in combination with what its one caller happens to check
+/// first.
 fn non_identity_shape(query: &Query, target: PageTarget) -> Option<&'static str> {
     if query.with.is_some() {
         return Some("a WITH clause");
+    }
+    if !query.pipe_operators.is_empty() {
+        return Some("a pipe operator");
     }
     let Some(shape) = shape_of(query) else {
         return Some("a set operation");
     };
     if shape.top.is_some() {
-        // Refused as a row limit before this is reached; named here so the
-        // shape check stays exhaustive on its own.
         return Some("a TOP clause");
     }
     if shape.joined {
@@ -789,27 +950,28 @@ fn bare_name(name: &ObjectName) -> Option<String> {
     }
 }
 
-/// `column` as it is written into the page statement: bare when it is a plain
-/// lowercase identifier, double-quoted (with `"` doubled) otherwise.
+/// `column` as it is written into the page statement: always double-quoted,
+/// with `"` doubled.
+///
+/// Unconditionally, with no bare spelling for a plain-looking name. A name
+/// that is all lowercase, digits and underscores can still be a reserved word
+/// (`select`, `order`, `from`), reachable here through a quoted alias, and
+/// emitting one of those bare re-parses it as syntax rather than as the
+/// column: the ordering and the keyset predicate would then be about
+/// something other than the row. Quoting every name is what makes the rewrite
+/// independent of the keyword list of whatever dialect parses it back.
 fn quote_ident(column: &str) -> String {
-    let plain = !column.is_empty()
-        && column
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && column
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if plain {
-        column.to_string()
-    } else {
-        format!("\"{}\"", column.replace('"', "\"\""))
-    }
+    format!("\"{}\"", column.replace('"', "\"\""))
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::sync::Arc;
+
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+
     use super::*;
 
     /// The `series_id` value used in every keyset assertion: sixteen `0xab`
@@ -843,7 +1005,7 @@ mod tests {
         assert_eq!(
             plan.statement,
             "SELECT * FROM (SELECT * FROM samples) AS ravel_page \
-             ORDER BY ts ASC, series_id ASC",
+             ORDER BY \"ts\" ASC, \"series_id\" ASC",
         );
 
         // A statement already ordered by the whole identity needs no tiebreak,
@@ -862,7 +1024,7 @@ mod tests {
         assert_eq!(
             complete.statement,
             "SELECT * FROM (SELECT * FROM samples) AS ravel_page \
-             ORDER BY series_id DESC, ts ASC",
+             ORDER BY \"series_id\" DESC, \"ts\" ASC",
         );
     }
 
@@ -884,7 +1046,7 @@ mod tests {
         assert_eq!(logs.order_by, vec![OrderTerm::ascending("ts")]);
         assert_eq!(
             logs.statement,
-            "SELECT * FROM (SELECT * FROM logs) AS ravel_page ORDER BY ts ASC",
+            "SELECT * FROM (SELECT * FROM logs) AS ravel_page ORDER BY \"ts\" ASC",
         );
 
         let grouped = plan_page(
@@ -929,11 +1091,11 @@ mod tests {
             plan.statement,
             format!(
                 "SELECT * FROM (SELECT * FROM samples) AS ravel_page \
-                 WHERE ((ts > arrow_cast(500, 'Timestamp(Nanosecond, None)')) \
-                 OR (ts = arrow_cast(500, 'Timestamp(Nanosecond, None)') \
-                 AND series_id > arrow_cast(decode('{SERIES_ID_HEX}', 'hex'), \
+                 WHERE ((\"ts\" > arrow_cast(500, 'Timestamp(Nanosecond, None)')) \
+                 OR (\"ts\" = arrow_cast(500, 'Timestamp(Nanosecond, None)') \
+                 AND \"series_id\" > arrow_cast(decode('{SERIES_ID_HEX}', 'hex'), \
                  'FixedSizeBinary(16)'))) \
-                 ORDER BY ts ASC, series_id ASC"
+                 ORDER BY \"ts\" ASC, \"series_id\" ASC"
             ),
         );
 
@@ -946,11 +1108,11 @@ mod tests {
             descending.statement,
             format!(
                 "SELECT * FROM (SELECT * FROM samples) AS ravel_page \
-                 WHERE ((ts < arrow_cast(500, 'Timestamp(Nanosecond, None)')) \
-                 OR (ts = arrow_cast(500, 'Timestamp(Nanosecond, None)') \
-                 AND series_id > arrow_cast(decode('{SERIES_ID_HEX}', 'hex'), \
+                 WHERE ((\"ts\" < arrow_cast(500, 'Timestamp(Nanosecond, None)')) \
+                 OR (\"ts\" = arrow_cast(500, 'Timestamp(Nanosecond, None)') \
+                 AND \"series_id\" > arrow_cast(decode('{SERIES_ID_HEX}', 'hex'), \
                  'FixedSizeBinary(16)'))) \
-                 ORDER BY ts DESC, series_id ASC"
+                 ORDER BY \"ts\" DESC, \"series_id\" ASC"
             ),
         );
 
@@ -965,11 +1127,11 @@ mod tests {
             filtered.statement,
             format!(
                 "SELECT * FROM (SELECT * FROM samples WHERE value > 1) AS ravel_page \
-                 WHERE ((ts > arrow_cast(500, 'Timestamp(Nanosecond, None)')) \
-                 OR (ts = arrow_cast(500, 'Timestamp(Nanosecond, None)') \
-                 AND series_id > arrow_cast(decode('{SERIES_ID_HEX}', 'hex'), \
+                 WHERE ((\"ts\" > arrow_cast(500, 'Timestamp(Nanosecond, None)')) \
+                 OR (\"ts\" = arrow_cast(500, 'Timestamp(Nanosecond, None)') \
+                 AND \"series_id\" > arrow_cast(decode('{SERIES_ID_HEX}', 'hex'), \
                  'FixedSizeBinary(16)'))) \
-                 ORDER BY ts ASC, series_id ASC"
+                 ORDER BY \"ts\" ASC, \"series_id\" ASC"
             ),
         );
     }
@@ -1009,9 +1171,25 @@ mod tests {
         assert_eq!(
             plan.statement,
             "SELECT * FROM (SELECT * FROM logs) AS ravel_page \
-             WHERE ((severity_text > 'it''s here') \
-             OR (severity_text = 'it''s here' AND ts > -7)) \
-             ORDER BY severity_text ASC, ts ASC",
+             WHERE ((\"severity_text\" > 'it''s here') \
+             OR (\"severity_text\" = 'it''s here' AND \"ts\" > -7)) \
+             ORDER BY \"severity_text\" ASC, \"ts\" ASC",
+        );
+
+        // The unsigned variant, on the one non-nullable UInt column any public
+        // schema declares: `alerts.writer_seq`.
+        let unsigned = plan_page(
+            "SELECT * FROM alerts ORDER BY writer_seq",
+            Some(&ResumePosition::new(vec![ResumeValue::UInt(
+                18_446_744_073_709_551_615,
+            )])),
+        )
+        .expect("planned");
+        assert_eq!(
+            unsigned.statement,
+            "SELECT * FROM (SELECT * FROM alerts) AS ravel_page \
+             WHERE ((\"writer_seq\" > 18446744073709551615)) \
+             ORDER BY \"writer_seq\" ASC",
         );
 
         let floats = plan_page(
@@ -1024,7 +1202,7 @@ mod tests {
         )
         .expect("planned");
         assert!(
-            floats.statement.contains("value > -0.5"),
+            floats.statement.contains("\"value\" > -0.5"),
             "unexpected float literal in {}",
             floats.statement
         );
@@ -1041,6 +1219,64 @@ mod tests {
         assert_eq!(err, PagePlanError::NonFiniteResumeValue);
     }
 
+    /// Every [`ResumeValue`] variant's exact rendered literal, including the
+    /// three no statement-level assertion can reach.
+    ///
+    /// `Bool` and `Binary` describe declared attribute columns, and `UInt`
+    /// beyond `alerts.writer_seq` likewise: a declared column is nullable, so
+    /// [`PagePlanError::OrderTermNullable`] refuses an ordering on one and no
+    /// page statement can carry the literal. The literal is still this
+    /// module's contract with whatever mints a cursor, so it is pinned here
+    /// rather than left unasserted until a NULL-aware ordering makes those
+    /// columns pageable.
+    #[test]
+    fn every_resume_variant_renders_its_exact_sql_literal() {
+        let cases: Vec<(ResumeValue, String)> = vec![
+            (ResumeValue::Int(-7), "-7".to_string()),
+            (ResumeValue::Int(0), "0".to_string()),
+            (ResumeValue::UInt(0), "0".to_string()),
+            (
+                ResumeValue::UInt(18_446_744_073_709_551_615),
+                "18446744073709551615".to_string(),
+            ),
+            (ResumeValue::Bool(true), "TRUE".to_string()),
+            (ResumeValue::Bool(false), "FALSE".to_string()),
+            (ResumeValue::Float(-0.5), "-0.5".to_string()),
+            (ResumeValue::Float(-0.0), "-0.0".to_string()),
+            (
+                ResumeValue::Str("it's here".to_string()),
+                "'it''s here'".to_string(),
+            ),
+            (
+                ResumeValue::TimestampNanos(500),
+                "arrow_cast(500, 'Timestamp(Nanosecond, None)')".to_string(),
+            ),
+            (
+                ResumeValue::Binary(Vec::new()),
+                "decode('', 'hex')".to_string(),
+            ),
+            (
+                ResumeValue::Binary(vec![0x00, 0xde, 0xad, 0xff]),
+                "decode('00deadff', 'hex')".to_string(),
+            ),
+            (
+                ResumeValue::FixedSizeBinary(vec![0x01, 0x02]),
+                "arrow_cast(decode('0102', 'hex'), 'FixedSizeBinary(2)')".to_string(),
+            ),
+            (
+                ResumeValue::FixedSizeBinary(SERIES_ID.to_vec()),
+                format!("arrow_cast(decode('{SERIES_ID_HEX}', 'hex'), 'FixedSizeBinary(16)')"),
+            ),
+        ];
+        for (value, expected) in &cases {
+            assert_eq!(
+                &value.render().expect("rendered"),
+                expected,
+                "unexpected literal for {value:?}"
+            );
+        }
+    }
+
     /// Everything the planner refuses outright, with the reason each carries.
     /// A refusal is the deliverable for these: a page planned from any of them
     /// would either return rows past a bound the caller set or resume at a
@@ -1055,6 +1291,51 @@ mod tests {
             (
                 "SELECT * FROM samples ORDER BY ts OFFSET 10 ROWS",
                 PagePlanError::RowLimitInStatement,
+            ),
+            // A `TOP` clause is a row limit whatever the projection is. The
+            // wildcard spelling used to slip the check and be planned as a
+            // not-total page that re-applied the caller's own cap per page.
+            (
+                "SELECT TOP 5 * FROM samples ORDER BY ts",
+                PagePlanError::RowLimitInStatement,
+            ),
+            (
+                "SELECT TOP 5 ts, series_id FROM samples ORDER BY ts",
+                PagePlanError::RowLimitInStatement,
+            ),
+            // Pipe operators. The parser's dialect accepts them and `Display`
+            // re-emits them, so a pipe not read here survives into the derived
+            // table with every guard above it satisfied by the SELECT body.
+            (
+                "SELECT * FROM samples |> LIMIT 10",
+                PagePlanError::PipeOperator,
+            ),
+            (
+                "SELECT * FROM samples ORDER BY ts |> LIMIT 10",
+                PagePlanError::PipeOperator,
+            ),
+            (
+                "SELECT * FROM samples ORDER BY ts |> UNION ALL (SELECT * FROM samples)",
+                PagePlanError::PipeOperator,
+            ),
+            (
+                "SELECT * FROM samples ORDER BY ts |> JOIN samples AS s2 ON true",
+                PagePlanError::PipeOperator,
+            ),
+            // Nullable ordering terms: a projected expression whose
+            // nullability no schema lookup answers, and a column the schema
+            // declares nullable outright.
+            (
+                "SELECT nullif(value, 0) AS v, ts, series_id FROM samples ORDER BY v",
+                PagePlanError::OrderTermNullable {
+                    column: "v".to_string(),
+                },
+            ),
+            (
+                "SELECT * FROM logs ORDER BY trace_id, ts",
+                PagePlanError::OrderTermNullable {
+                    column: "trace_id".to_string(),
+                },
             ),
             (
                 "SELECT * FROM samples ORDER BY ts + 1",
@@ -1104,6 +1385,191 @@ mod tests {
         assert!(
             matches!(err, PagePlanError::Invalid(_)),
             "expected a validation refusal, got {err:?}"
+        );
+    }
+
+    /// Every pipe operator is refused, whatever the pipe carries.
+    ///
+    /// The first three are the demonstrated defects of the first cut of this
+    /// module: a pipe row limit was planned with `total_order() == true` and
+    /// the caller's own cap re-applied per page, and a pipe union or join
+    /// reported a total order while the tiebreak columns were no longer a key.
+    /// Every guard above them was satisfied because they all read the `SELECT`
+    /// body, which a pipe runs after. The rest are here because the refusal
+    /// has to rest on the presence of a pipe rather than on a list of kinds:
+    /// one that only reprojects or renames still makes the body an incomplete
+    /// description of the rows, and a kind a later sqlparser adds has to be
+    /// refused without this test being edited.
+    #[test]
+    fn refuses_every_pipe_operator_whatever_it_carries() {
+        let cases = [
+            "SELECT * FROM samples ORDER BY ts |> LIMIT 10",
+            "SELECT * FROM samples ORDER BY ts |> UNION ALL (SELECT * FROM samples)",
+            "SELECT * FROM samples ORDER BY ts |> JOIN samples AS s2 ON true",
+            "SELECT * FROM samples ORDER BY ts |> INTERSECT DISTINCT (SELECT * FROM samples)",
+            "SELECT * FROM samples ORDER BY ts |> EXCEPT DISTINCT (SELECT * FROM samples)",
+            "SELECT * FROM samples ORDER BY ts |> AGGREGATE count(*)",
+            "SELECT * FROM samples ORDER BY ts |> WHERE value > 1",
+            "SELECT * FROM samples ORDER BY ts |> ORDER BY value",
+            "SELECT * FROM samples ORDER BY ts |> SELECT ts",
+            "SELECT * FROM samples ORDER BY ts |> DROP value",
+            "SELECT * FROM samples ORDER BY ts |> AS renamed",
+            "SELECT * FROM samples |> LIMIT 10",
+        ];
+        for sql in cases {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(err, PagePlanError::PipeOperator, "unexpected for {sql:?}");
+            assert_eq!(
+                err.to_string(),
+                "a statement using a pipe operator cannot be paged; a pipe \
+                 reshapes the rows after the SELECT body a page is planned from",
+            );
+        }
+    }
+
+    /// An ordering term that can be NULL is refused rather than served as if
+    /// it were sound.
+    ///
+    /// Refusing the `NULLS FIRST`/`NULLS LAST` spellings does not cover this:
+    /// omitting the option leaves the NULL rows in the sequence at a session
+    /// default's position, and every keyset disjunct is NULL for those rows,
+    /// so they land on no page at all. That is a dropped row on both the total
+    /// and the not-total path, because the keyset predicate is what resumes
+    /// both. Proof of NON NULL has to come from the statement's own text, and
+    /// it does for a bare reference to a column the target's public schema
+    /// declares non-nullable and for nothing else.
+    #[test]
+    fn refuses_an_ordering_term_that_can_be_null() {
+        let cases: Vec<(&str, &str)> = vec![
+            // A projected expression: the case reachable on the TOTAL path.
+            // This used to report `total_order() == true` while every keyset
+            // disjunct was NULL for the rows `nullif` nulled out.
+            (
+                "SELECT nullif(value, 0) AS v, ts, series_id FROM samples ORDER BY v",
+                "v",
+            ),
+            // Columns the schemas declare nullable, one per table that has
+            // one.
+            ("SELECT * FROM logs ORDER BY span_id, ts", "span_id"),
+            ("SELECT * FROM spans ORDER BY service_name", "service_name"),
+            ("SELECT * FROM alerts ORDER BY alert_id", "alert_id"),
+            // An output name the projection gives twice from different
+            // columns: both are columns, but which one the term means is not
+            // readable from the text, so the nullable one cannot be ruled out.
+            ("SELECT ts AS a, trace_id AS a FROM logs ORDER BY a", "a"),
+            // A set-operation body carries no readable projection at all.
+            (
+                "SELECT ts FROM logs UNION ALL SELECT ts FROM logs ORDER BY ts",
+                "ts",
+            ),
+            // No base table, so there is no schema to prove anything against.
+            ("SELECT 1 AS a ORDER BY a", "a"),
+        ];
+        for (sql, column) in cases {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermNullable {
+                    column: column.to_string(),
+                },
+                "unexpected refusal for {sql:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "the ORDER BY term `{column}` is not known to be NON NULL, \
+                     and a keyset comparison against NULL selects no rows, so \
+                     the rows whose `{column}` is NULL would appear on no page"
+                ),
+            );
+        }
+
+        // The non-nullable columns of those same tables still page, including
+        // through an alias over one, so the refusal is about nullability and
+        // not about the table or about aliasing.
+        for sql in [
+            "SELECT * FROM logs ORDER BY ts, observed_ts, severity_num, body, flags",
+            "SELECT * FROM spans ORDER BY trace_id, span_id, name, start_ts, duration_ns",
+            "SELECT * FROM alerts ORDER BY ts_ns, writer_id, writer_epoch, writer_seq",
+            "SELECT * FROM audit ORDER BY ts_ns, severity_text, body",
+            "SELECT body AS message, ts FROM logs ORDER BY message, ts",
+        ] {
+            let plan = plan_page(sql, None);
+            assert!(plan.is_ok(), "{sql:?} should plan, got {plan:?}");
+        }
+    }
+
+    /// Every order term is quoted, so a column aliased with a quoted keyword
+    /// stays a column reference in the page statement.
+    ///
+    /// The term text is the one place caller-supplied text reaches the
+    /// rewritten statement. Rendered bare, `select` re-parses as syntax rather
+    /// than as the column: the ordering becomes a constant and the keyset
+    /// predicate evaluates to NULL, so the page comes back empty with nothing
+    /// to say why.
+    #[test]
+    fn quotes_every_order_term_so_a_keyword_alias_stays_a_column() {
+        let plan = plan_page(
+            "SELECT ts, body AS \"select\" FROM logs ORDER BY \"select\", ts",
+            Some(&ResumePosition::new(vec![
+                ResumeValue::Str("x".to_string()),
+                ResumeValue::TimestampNanos(9),
+            ])),
+        )
+        .expect("planned");
+        assert_eq!(
+            plan.order_by,
+            vec![OrderTerm::ascending("select"), OrderTerm::ascending("ts")],
+        );
+        assert_eq!(
+            plan.statement,
+            "SELECT * FROM (SELECT ts, body AS \"select\" FROM logs) AS ravel_page \
+             WHERE ((\"select\" > 'x') OR (\"select\" = 'x' \
+             AND \"ts\" > arrow_cast(9, 'Timestamp(Nanosecond, None)'))) \
+             ORDER BY \"select\" ASC, \"ts\" ASC",
+        );
+    }
+
+    /// The one property of the wrap that text alone cannot settle: whether the
+    /// derived-table alias changes how an inner statement with two output
+    /// columns of the same name is planned. Answered against the real planner
+    /// rather than by reasoning about it, on the `samples` schema registered
+    /// as a plain in-memory table, because the question is DataFusion's own
+    /// name resolution and the Ravel session does not touch it.
+    ///
+    /// It does not: the duplicate is rejected inside the inner projection,
+    /// before an alias or an outer `ORDER BY` is reached, so both spellings
+    /// fail with the identical message. That is what lets the planner emit
+    /// such a statement without a check of its own -- the caller gets the same
+    /// plan error for the page as for the statement it handed in, which is the
+    /// property [`Projection::projects`] already relies on.
+    #[tokio::test]
+    async fn duplicate_output_names_fail_the_same_wrapped_as_at_top_level() {
+        let ctx = SessionContext::new();
+        let table = MemTable::try_new(public_schema(), vec![vec![]]).expect("mem table");
+        ctx.register_table(SAMPLES_TABLE, Arc::new(table))
+            .expect("registered");
+
+        let inner = "SELECT ts AS a, series_id AS a FROM samples";
+        let top_level = ctx
+            .state()
+            .create_logical_plan(&format!("{inner} ORDER BY a"))
+            .await
+            .expect_err("duplicate output names are a plan error")
+            .to_string();
+        let wrapped = ctx
+            .state()
+            .create_logical_plan(&format!(
+                "SELECT * FROM ({inner}) AS {PAGE_ALIAS} ORDER BY \"a\" ASC"
+            ))
+            .await
+            .expect_err("duplicate output names are a plan error")
+            .to_string();
+
+        assert_eq!(top_level, wrapped);
+        assert!(
+            top_level.contains("Projections require unique expression names"),
+            "unexpected plan error: {top_level}"
         );
     }
 
