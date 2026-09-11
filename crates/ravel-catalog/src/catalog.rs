@@ -354,6 +354,25 @@ impl ColumnStatsCache {
     }
 }
 
+/// One fold-accounting slot per [`Signal`] variant, so the per-signal fold
+/// counters are a fixed-size array indexed by [`fold_slot`] rather than a map
+/// behind a lock on the fold path.
+const SIGNAL_SLOTS: usize = 6;
+
+/// The fold-accounting slot for a signal. Exhaustive: adding a [`Signal`]
+/// variant breaks this compile until it is given a slot and [`SIGNAL_SLOTS`]
+/// is raised, rather than silently aliasing onto another signal's counters.
+const fn fold_slot(signal: Signal) -> usize {
+    match signal {
+        Signal::Metrics => 0,
+        Signal::Logs => 1,
+        Signal::Spans => 2,
+        Signal::Profiles => 3,
+        Signal::Alerts => 4,
+        Signal::Audit => 5,
+    }
+}
+
 /// Listing-based catalog over an object store backend (Phase 1, ADR-0003).
 /// A future compaction phase folds commit records into immutable snapshot
 /// objects behind a CAS'd HEAD pointer; this type's public API does not
@@ -421,38 +440,52 @@ pub struct Catalog {
     /// these also fails the query: the count is a record of hard failures,
     /// not a harmless-overlap anomaly tally.
     isolation_breaches: AtomicU64,
-    /// Count of [`Catalog::fold`] calls that returned `Ok`, including the
-    /// no-op folds that are the healthy steady state. This counts fold
-    /// *cycles*, not published snapshots: a fold seals an ingest hour only
-    /// once `max_flush_lifetime + clock_skew_allowance + fold_safety_margin`
-    /// has elapsed past that hour, so most cycles legitimately publish
-    /// nothing, and a counter that moved only on publish would read as a
-    /// stopped fold on any quiet tenant.
-    fold_cycles: AtomicU64,
-    /// Count of [`Catalog::fold`] calls that returned `Err`. Before this
-    /// counter the fold's failure path was `tracing` only, so a fold failing
-    /// every cycle was indistinguishable at `/metrics` from a fold that was
-    /// succeeding: the unsealed span grows either way and the first visible
-    /// symptom was a recent-window query exceeding its request budget.
-    fold_failures: AtomicU64,
-    /// Caller-supplied `now_ns` of the most recent [`Catalog::fold`] call
-    /// that returned `Ok`, or `0` when no fold has succeeded in this process.
-    /// This crate reads no clock: the value is whatever `now_ns` the caller
-    /// passed into `fold`, which is that caller's injected clock.
+    /// Count of [`Catalog::fold`] calls that returned `Ok`, per signal,
+    /// including the no-op folds that are the healthy steady state. This
+    /// counts fold *cycles*, not published snapshots: a fold seals an ingest
+    /// hour only once `max_flush_lifetime + clock_skew_allowance +
+    /// fold_safety_margin` has elapsed past that hour, so most cycles
+    /// legitimately publish nothing, and a counter that moved only on publish
+    /// would read as a stopped fold on any quiet tenant.
     ///
-    /// Updated with a plain `store`, not `fetch_max`. Within one process every
-    /// fold caller reads the same host wall clock (the server's scheduled loop
-    /// and its on-demand route both pass `SystemClock`), so nothing here races
-    /// two callers with different clocks: the only thing that can move this
-    /// value backwards is an NTP step on that one host. The direction of that
-    /// trade is what picks `store` over `fetch_max`. `fetch_max` would latch a
-    /// forward NTP step permanently, leaving the gauge stuck at a future
-    /// reading it can never come down from, so `time() - gauge` stays small and
-    /// a later genuine stall is masked with no bound on how long. A plain
-    /// `store` lets a backward NTP step produce only a transient false stall
-    /// that the next successful fold clears. On a liveness signal a bounded
-    /// false positive is the safe side; an unbounded false negative is not.
-    fold_last_success_unix_ns: AtomicI64,
+    /// Keyed by signal because folding is per (tenant, signal) throughout and
+    /// the server drives it as one independent task per signal: a
+    /// process-global counter reads as healthy while one signal's fold has
+    /// stopped and the others keep running. Indexed by [`fold_slot`].
+    fold_cycles: [AtomicU64; SIGNAL_SLOTS],
+    /// Count of [`Catalog::fold`] calls that returned `Err`, per signal.
+    /// Before this counter the fold's failure path was `tracing` only, so a
+    /// fold failing every cycle was indistinguishable at `/metrics` from a
+    /// fold that was succeeding: the unsealed span grows either way and the
+    /// first visible symptom was a recent-window query exceeding its request
+    /// budget. Indexed by [`fold_slot`].
+    fold_failures: [AtomicU64; SIGNAL_SLOTS],
+    /// Caller-supplied `now_ns` of the most recent [`Catalog::fold`] call for
+    /// this signal that returned `Ok`, or `0` when no fold of that signal has
+    /// succeeded in this process. This crate reads no clock: the value is
+    /// whatever `now_ns` the caller passed into `fold`, which is that caller's
+    /// injected clock. Indexed by [`fold_slot`].
+    ///
+    /// Updated with a plain `store`, not `fetch_max`: the latest reading to
+    /// FINISH wins, and that can be an older reading than the slot already
+    /// holds. Two things produce that. Folds of one signal overlap (the
+    /// server's scheduled loop for that signal folds its tenants one at a
+    /// time, re-reading the clock per tenant, while an on-demand fold of the
+    /// same signal for a different tenant runs against the same `Catalog`),
+    /// and each stamp is the reading taken *before* its fold began, so a fold
+    /// that starts later and finishes sooner is overwritten by the slower one
+    /// completing behind it. The resulting step back is bounded by the slower
+    /// fold's own duration. An NTP step back on the host does the same thing
+    /// without any overlap.
+    ///
+    /// Both are transient and bounded, and the next successful fold clears
+    /// them; that is what picks `store` over `fetch_max`. `fetch_max` would
+    /// latch a forward NTP step permanently, leaving the gauge stuck at a
+    /// future reading it can never come down from, so `time() - gauge` stays
+    /// small and a later genuine stall is masked with no bound on how long. On
+    /// a liveness signal a bounded false positive is the safe side; an
+    /// unbounded false negative is not.
+    fold_last_success_unix_ns: [AtomicI64; SIGNAL_SLOTS],
     /// Bounds the object-store requests one resolve keeps in flight. Ephemeral, process-local, correctness-free: it changes only
     /// how many round trips overlap, never which segments a resolve returns.
     request_semaphore: Arc<tokio::sync::Semaphore>,
@@ -605,9 +638,9 @@ impl Catalog {
             compaction_input_set_conflicts: AtomicU64::new(0),
             rewrite_sibling_conflicts: AtomicU64::new(0),
             isolation_breaches: AtomicU64::new(0),
-            fold_cycles: AtomicU64::new(0),
-            fold_failures: AtomicU64::new(0),
-            fold_last_success_unix_ns: AtomicI64::new(0),
+            fold_cycles: std::array::from_fn(|_| AtomicU64::new(0)),
+            fold_failures: std::array::from_fn(|_| AtomicU64::new(0)),
+            fold_last_success_unix_ns: std::array::from_fn(|_| AtomicI64::new(0)),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.resolve_get_concurrency,
             )),
@@ -1050,40 +1083,44 @@ impl Catalog {
         self.isolation_breaches.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// [`Catalog::fold`] calls that returned `Ok` across this catalog's
-    /// lifetime, no-op cycles included. See the field docs for why a no-op
-    /// counts.
-    pub fn fold_cycles(&self) -> u64 {
-        self.fold_cycles.load(Ordering::Relaxed)
+    /// [`Catalog::fold`] calls for `signal` that returned `Ok` across this
+    /// catalog's lifetime, no-op cycles included. See the field docs for why a
+    /// no-op counts, and why this is per signal rather than process-global.
+    pub fn fold_cycles(&self, signal: Signal) -> u64 {
+        self.fold_cycles[fold_slot(signal)].load(Ordering::Relaxed)
     }
 
-    /// [`Catalog::fold`] calls that returned `Err` across this catalog's
-    /// lifetime.
-    pub fn fold_failures(&self) -> u64 {
-        self.fold_failures.load(Ordering::Relaxed)
+    /// [`Catalog::fold`] calls for `signal` that returned `Err` across this
+    /// catalog's lifetime.
+    pub fn fold_failures(&self, signal: Signal) -> u64 {
+        self.fold_failures[fold_slot(signal)].load(Ordering::Relaxed)
     }
 
-    /// The `now_ns` of the most recent successful [`Catalog::fold`] call, or
-    /// `0` if none has succeeded in this process. The age of this value is
-    /// the one figure that moves when the fold STOPS rather than when it
-    /// runs, which is what an operator alerts on.
-    pub fn fold_last_success_unix_ns(&self) -> i64 {
-        self.fold_last_success_unix_ns.load(Ordering::Relaxed)
+    /// The `now_ns` of the most recent successful [`Catalog::fold`] call for
+    /// `signal`, or `0` if none has succeeded in this process. The age of this
+    /// value is the one figure that moves when that signal's fold STOPS rather
+    /// than when it runs, which is what an operator alerts on.
+    pub fn fold_last_success_unix_ns(&self, signal: Signal) -> i64 {
+        self.fold_last_success_unix_ns[fold_slot(signal)].load(Ordering::Relaxed)
     }
 
     /// `pub(crate)`: the single accounting point every [`Catalog::fold`]
     /// outcome passes through, called from the wrapper in `fold.rs` rather
     /// than from each of the fold body's many exits. Keeping it in one place
-    /// is what makes the counters cover every fold call path (the server's
-    /// scheduled loop, its on-demand admin route, the CLI, the bench) with no
-    /// per-call-site wiring to forget.
-    pub(crate) fn record_fold_outcome(&self, now_ns: i64, succeeded: bool) {
+    /// is what makes the counters cover every fold call path with no
+    /// per-call-site wiring to forget. In the server that matters because the
+    /// scheduled fold loops and the on-demand admin route are `Arc` clones of
+    /// one `Catalog` in one process, so a family fed by only one of them would
+    /// read as healthy while the other was dead. A `ravel-cli` fold and the
+    /// catalog bench run in their own processes, each with its own `Catalog`
+    /// and no `/metrics` route, so they account into counters nothing scrapes.
+    pub(crate) fn record_fold_outcome(&self, signal: Signal, now_ns: i64, succeeded: bool) {
+        let slot = fold_slot(signal);
         if succeeded {
-            self.fold_cycles.fetch_add(1, Ordering::Relaxed);
-            self.fold_last_success_unix_ns
-                .store(now_ns, Ordering::Relaxed);
+            self.fold_cycles[slot].fetch_add(1, Ordering::Relaxed);
+            self.fold_last_success_unix_ns[slot].store(now_ns, Ordering::Relaxed);
         } else {
-            self.fold_failures.fetch_add(1, Ordering::Relaxed);
+            self.fold_failures[slot].fetch_add(1, Ordering::Relaxed);
         }
     }
 

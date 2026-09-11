@@ -899,7 +899,7 @@ impl Catalog {
                 default_retention_ns,
             )
             .await;
-        self.record_fold_outcome(now_ns, result.is_ok());
+        self.record_fold_outcome(signal, now_ns, result.is_ok());
         result
     }
 
@@ -6795,10 +6795,10 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
 
-        assert_eq!(catalog.fold_cycles(), 0);
-        assert_eq!(catalog.fold_failures(), 0);
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 0);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 0);
         assert_eq!(
-            catalog.fold_last_success_unix_ns(),
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
             0,
             "no fold has succeeded yet, so the gauge is the zero sentinel"
         );
@@ -6818,10 +6818,10 @@ mod tests {
             .expect("fold succeeds");
         assert!(!report.no_op, "the fold folded the sealed hour");
 
-        assert_eq!(catalog.fold_cycles(), 1);
-        assert_eq!(catalog.fold_failures(), 0);
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 1);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 0);
         assert_eq!(
-            catalog.fold_last_success_unix_ns(),
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
             now_ns,
             "the gauge is exactly the now_ns the caller folded at"
         );
@@ -6843,9 +6843,9 @@ mod tests {
             .await
             .expect("second fold succeeds");
         assert!(second.no_op, "nothing newly sealed between the two folds");
-        assert_eq!(catalog.fold_cycles(), 2);
-        assert_eq!(catalog.fold_failures(), 0);
-        assert_eq!(catalog.fold_last_success_unix_ns(), later_ns);
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 2);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 0);
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Metrics), later_ns);
     }
 
     /// The other half of the same claim (issue #1306): a fold that returns
@@ -6887,8 +6887,8 @@ mod tests {
             )
             .await
             .expect("first fold succeeds");
-        assert_eq!(catalog.fold_cycles(), 1);
-        assert_eq!(catalog.fold_last_success_unix_ns(), first_ns);
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 1);
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Metrics), first_ns);
 
         let failing_ns = now_at_seal(13);
         publish_segment(
@@ -6915,28 +6915,39 @@ mod tests {
 
         // The fault fired exactly once, so exactly one fold failed.
         assert_eq!(store.fault_count(Op::Put, FaultKind::Permanent), 1);
-        assert_eq!(catalog.fold_failures(), 1);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 1);
         assert_eq!(
-            catalog.fold_cycles(),
+            catalog.fold_cycles(Signal::Metrics),
             1,
             "the failing fold is not a cycle: the cycle count is still the one successful fold"
         );
         assert_eq!(
-            catalog.fold_last_success_unix_ns(),
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
             first_ns,
             "a failing fold must not advance the liveness gauge, even though its now_ns is later"
         );
     }
 
-    /// A plain `store`, not `fetch_max`: the liveness gauge tracks the most
-    /// recent successful fold's `now_ns`, so a backward clock step lowers it.
-    /// This pins the semantics deliberately. Within one process every fold
-    /// caller reads the same host clock, so the only way `now_ns` regresses is
-    /// an NTP step back on that host, and the safe response to it is a
-    /// transient false stall the next fold clears, not the permanently latched
-    /// future reading `fetch_max` would leave after a step forward.
+    /// A plain `store`, not `fetch_max`: the liveness gauge holds the stamp of
+    /// the last fold to FINISH, even when that stamp is older than the one the
+    /// slot already carried. This pins the semantics deliberately.
+    ///
+    /// The two calls below model out-of-order completion, which is the way one
+    /// signal's slot goes backwards with no clock anomaly at all. Each stamp
+    /// is the `now_ns` read before its fold began, and folds of one signal
+    /// overlap in the server (the scheduled loop for that signal re-reads the
+    /// clock per tenant while an on-demand fold for another tenant of the same
+    /// signal runs against the same `Catalog`), so a fold that started later
+    /// and finished sooner is overwritten by the slower one completing behind
+    /// it. Calling `fold(ahead)` then `fold(behind)` is that completion order.
+    /// An NTP step back produces the same store.
+    ///
+    /// Under `fetch_max` the second store would be dropped and the gauge would
+    /// stay at `ahead_ns`, which is the assertion that fails below. That is
+    /// the failure mode being rejected: `fetch_max` latches a forward step and
+    /// masks a later genuine stall with no bound on how long.
     #[tokio::test]
-    async fn a_backwards_clock_lowers_the_last_success_gauge() {
+    async fn an_out_of_order_fold_completion_lowers_the_last_success_gauge() {
         let store = Arc::new(MemoryStore::new());
         let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
 
@@ -6952,8 +6963,8 @@ mod tests {
                 None,
             )
             .await
-            .expect("fold from the ahead clock");
-        assert_eq!(catalog.fold_last_success_unix_ns(), ahead_ns);
+            .expect("fold stamped at the later reading");
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Metrics), ahead_ns);
 
         let behind_ns = ahead_ns - 60_000_000_000;
         catalog
@@ -6966,12 +6977,97 @@ mod tests {
                 None,
             )
             .await
-            .expect("fold from the behind clock");
+            .expect("fold stamped at the earlier reading finishes second");
         assert_eq!(
-            catalog.fold_last_success_unix_ns(),
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
             behind_ns,
-            "the gauge holds the latest successful now_ns, even a backward one"
+            "the gauge holds the stamp of the last fold to finish, even an older one"
         );
-        assert_eq!(catalog.fold_cycles(), 2, "both folds are still cycles");
+        assert_eq!(
+            catalog.fold_cycles(Signal::Metrics),
+            2,
+            "both folds are still cycles"
+        );
+    }
+
+    /// Per-signal keying (issue #1306): folding one signal moves that signal's
+    /// counters and gauge and leaves every other signal's exactly where they
+    /// were. Without this, the three families are process-global and one dead
+    /// fold loop out of three stays invisible behind the two that still run.
+    ///
+    /// `Signal::Profiles` is asserted alongside the two other folded signals
+    /// because the slot table covers every `Signal` variant, not just the
+    /// three the server folds, and an off-by-one there would alias two of them
+    /// onto one slot.
+    #[tokio::test]
+    async fn folding_one_signal_leaves_the_other_signals_untouched() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now_ns = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_ns - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Logs, Uuid::new_v4(), now_ns, &[], None)
+            .await
+            .expect("the logs fold succeeds");
+
+        assert_eq!(catalog.fold_cycles(Signal::Logs), 1);
+        assert_eq!(catalog.fold_failures(Signal::Logs), 0);
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Logs), now_ns);
+
+        for untouched in [Signal::Metrics, Signal::Spans, Signal::Profiles] {
+            assert_eq!(
+                catalog.fold_cycles(untouched),
+                0,
+                "{untouched:?} was never folded, so its cycle count is still 0"
+            );
+            assert_eq!(
+                catalog.fold_failures(untouched),
+                0,
+                "{untouched:?} was never folded, so its failure count is still 0"
+            );
+            assert_eq!(
+                catalog.fold_last_success_unix_ns(untouched),
+                0,
+                "{untouched:?} was never folded, so its gauge is still the zero sentinel"
+            );
+        }
+    }
+
+    /// The failure half of the per-signal claim: a fold that fails for one
+    /// signal leaves every other signal's failure counter at zero, so the
+    /// `RavelCatalogFoldFailing` rule attributes the failure to the signal
+    /// that produced it rather than to the process.
+    #[tokio::test]
+    async fn a_failing_fold_charges_only_its_own_signal() {
+        // Fail the first HEAD PUT. No other PUT key contains "HEAD".
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("head cas failure".into()))
+                .with_key_contains("HEAD")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        // No segment is published: a fold over an empty prefix still advances
+        // its watermark over the hours that held nothing and writes a first
+        // HEAD, which is the PUT the fault below intercepts.
+        let now_ns = now_at_seal(11);
+        let err = catalog
+            .fold(&tenant(), Signal::Spans, Uuid::new_v4(), now_ns, &[], None)
+            .await
+            .expect_err("the HEAD CAS fault must surface as an error");
+        assert!(matches!(err, CatalogError::Store(_)), "got {err:?}");
+
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Permanent), 1);
+        assert_eq!(catalog.fold_failures(Signal::Spans), 1);
+        for untouched in [Signal::Metrics, Signal::Logs] {
+            assert_eq!(
+                catalog.fold_failures(untouched),
+                0,
+                "{untouched:?} did not fail: only the folded signal is charged"
+            );
+            assert_eq!(catalog.fold_cycles(untouched), 0);
+        }
     }
 }

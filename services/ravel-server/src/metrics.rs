@@ -1406,10 +1406,48 @@ fn render_logs_postings_family(out: &mut String, mode: Mode, pipelines: &[Ingest
     }
 }
 
+/// One signal's fold-liveness figures. The fold runs as one independent task
+/// per [`crate::fold::FOLD_SIGNALS`] entry, so these are per signal rather
+/// than per process: a process-global set reads as healthy whenever any one
+/// of those tasks is still running, which is the blind spot a dead signal
+/// loop would otherwise sit in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogFoldCounters {
+    /// The signal these figures belong to, carried in the entry rather than
+    /// implied by its position, so the renderer cannot mislabel a series by
+    /// iterating out of step with `FOLD_SIGNALS`.
+    pub signal: Signal,
+    /// `Catalog::fold` calls for this signal that returned `Ok`, no-op cycles
+    /// included.
+    pub cycles: u64,
+    /// `Catalog::fold` calls for this signal that returned `Err`.
+    pub failures: u64,
+    /// `now_ns` of the most recent successful fold of this signal, or `0` when
+    /// none has succeeded in this process. Carried in nanoseconds (the
+    /// catalog's own unit, and an exact integer) and divided down to seconds
+    /// only at the render below, so this struct stays `Eq`-comparable in
+    /// tests.
+    pub last_success_unix_ns: i64,
+}
+
+impl CatalogFoldCounters {
+    /// One zeroed entry per folded signal: the `Default` shape of the
+    /// per-signal array, spelled here because [`Signal`] has no `Default` of
+    /// its own and the entries must still name their signals.
+    fn zeroed_per_signal() -> [CatalogFoldCounters; crate::fold::FOLD_SIGNALS.len()] {
+        crate::fold::FOLD_SIGNALS.map(|signal| CatalogFoldCounters {
+            signal,
+            cycles: 0,
+            failures: 0,
+            last_success_unix_ns: 0,
+        })
+    }
+}
+
 /// The catalog anomaly and hard-failure counters
 /// (`crates/ravel-catalog/src/catalog.rs`), decoupled from `Catalog` itself
 /// so the renderer is testable with a plain struct literal.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogCountersSnapshot {
     pub interlock_violations: u64,
     pub compaction_input_set_conflicts: u64,
@@ -1417,20 +1455,24 @@ pub struct CatalogCountersSnapshot {
     /// tenant_hash mismatch or an out-of-prefix listing result. Unlike the
     /// two counters above, each of these also failed its query.
     pub isolation_breaches: u64,
-    /// `Catalog::fold` calls that returned `Ok`, no-op cycles included.
-    pub fold_cycles: u64,
-    /// `Catalog::fold` calls that returned `Err`.
-    pub fold_failures: u64,
-    /// `now_ns` of the most recent successful fold, or `0` when none has
-    /// succeeded in this process. Carried in nanoseconds (the catalog's own
-    /// unit, and an exact integer) and divided down to seconds only at the
-    /// render below, so this struct stays `Eq`-comparable in tests.
-    pub fold_last_success_unix_ns: i64,
+    /// Fold liveness, one entry per signal the fold covers.
+    pub fold: [CatalogFoldCounters; crate::fold::FOLD_SIGNALS.len()],
+}
+
+impl Default for CatalogCountersSnapshot {
+    fn default() -> Self {
+        CatalogCountersSnapshot {
+            interlock_violations: 0,
+            compaction_input_set_conflicts: 0,
+            isolation_breaches: 0,
+            fold: CatalogFoldCounters::zeroed_per_signal(),
+        }
+    }
 }
 
 impl CatalogCountersSnapshot {
     /// Read every counter off a live [`ravel_catalog::Catalog`]. The scrape
-    /// handler calls this rather than listing the six reads inline, so the
+    /// handler calls this rather than listing the reads inline, so the
     /// catalog-to-exposition wiring is a function a test can call: a renderer
     /// driven only by struct literals proves the formatting and nothing about
     /// whether the numbers came from the catalog at all.
@@ -1439,9 +1481,12 @@ impl CatalogCountersSnapshot {
             interlock_violations: catalog.interlock_violations(),
             compaction_input_set_conflicts: catalog.compaction_input_set_conflicts(),
             isolation_breaches: catalog.isolation_breaches(),
-            fold_cycles: catalog.fold_cycles(),
-            fold_failures: catalog.fold_failures(),
-            fold_last_success_unix_ns: catalog.fold_last_success_unix_ns(),
+            fold: crate::fold::FOLD_SIGNALS.map(|signal| CatalogFoldCounters {
+                signal,
+                cycles: catalog.fold_cycles(signal),
+                failures: catalog.fold_failures(signal),
+                last_success_unix_ns: catalog.fold_last_success_unix_ns(signal),
+            }),
         }
     }
 }
@@ -1486,49 +1531,64 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         snapshot.isolation_breaches,
     );
 
+    // The three fold families carry a `signal` label because the fold is one
+    // independent task per signal (`crate::fold::FOLD_SIGNALS`). Every folded
+    // signal renders every cycle, whether or not its loop is still alive, so a
+    // loop that has died leaves its own series standing and going stale
+    // instead of vanishing into an aggregate its siblings keep fresh.
+    fn labels(mode: Mode, signal: Signal) -> [Label; 2] {
+        [Label::Mode(mode), Label::Signal(signal)]
+    }
+
     write_header(
         out,
         "ravel_catalog_fold_cycles_total",
-        "Catalog folds that completed successfully, including the no-op folds that are the healthy steady state.",
+        "Catalog folds that completed successfully, by signal, including the no-op folds that are the healthy steady state.",
         "counter",
     );
-    write_sample(
-        out,
-        "ravel_catalog_fold_cycles_total",
-        &[Label::Mode(mode)],
-        snapshot.fold_cycles,
-    );
+    for fold in &snapshot.fold {
+        write_sample(
+            out,
+            "ravel_catalog_fold_cycles_total",
+            &labels(mode, fold.signal),
+            fold.cycles,
+        );
+    }
 
     write_header(
         out,
         "ravel_catalog_fold_failures_total",
-        "Catalog folds that failed. A fold that fails every cycle leaves the unsealed ingest span growing without bound.",
+        "Catalog folds that failed, by signal. A fold that fails every cycle leaves the unsealed ingest span growing without bound.",
         "counter",
     );
-    write_sample(
-        out,
-        "ravel_catalog_fold_failures_total",
-        &[Label::Mode(mode)],
-        snapshot.fold_failures,
-    );
+    for fold in &snapshot.fold {
+        write_sample(
+            out,
+            "ravel_catalog_fold_failures_total",
+            &labels(mode, fold.signal),
+            fold.failures,
+        );
+    }
 
     // The liveness gauge, and the only figure here that moves when the fold
-    // STOPS rather than when it runs. `0` means no fold has succeeded since
-    // this process started, which is why the alert rule in
+    // STOPS rather than when it runs. `0` means no fold of that signal has
+    // succeeded since this process started, which is why the alert rule in
     // docs/guides/observability.md carries a `for:` long enough to cover a
     // freshly started process's first fold interval.
     write_header(
         out,
         "ravel_catalog_fold_last_success_timestamp_seconds",
-        "Unix time of the last successful catalog fold in this process, 0 if none has succeeded yet. Its age is the fold-liveness signal.",
+        "Unix time of the last successful catalog fold of this signal in this process, 0 if none has succeeded yet. Its age is the fold-liveness signal.",
         "gauge",
     );
-    write_sample_f64(
-        out,
-        "ravel_catalog_fold_last_success_timestamp_seconds",
-        &[Label::Mode(mode)],
-        snapshot.fold_last_success_unix_ns as f64 / 1e9,
-    );
+    for fold in &snapshot.fold {
+        write_sample_f64(
+            out,
+            "ravel_catalog_fold_last_success_timestamp_seconds",
+            &labels(mode, fold.signal),
+            fold.last_success_unix_ns as f64 / 1e9,
+        );
+    }
 }
 
 /// Tenancy adoption counter (ADR-0050 section 3). Counts buckets this process
@@ -5396,22 +5456,47 @@ mod tests {
         );
     }
 
-    /// The fold-liveness family reaches `/metrics` with the values it was
-    /// driven with (issue #1306), following
-    /// [`metadata_sink_counters_render_for_metrics_only`]: a family whose doc
-    /// comments describe it but whose renderer emits nothing is exactly the
-    /// defect that test exists for. The gauge is asserted as the exact
-    /// rendered string, so a unit slip (nanoseconds emitted where seconds are
-    /// declared) fails here rather than reading as a 54-year-old fold.
+    /// The fold-liveness family reaches `/metrics` as one series per folded
+    /// signal, each carrying the values it was driven with (issue #1306),
+    /// following [`metadata_sink_counters_render_for_metrics_only`]: a family
+    /// whose doc comments describe it but whose renderer emits nothing is
+    /// exactly the defect that test exists for. The gauge is asserted as the
+    /// exact rendered string, so a unit slip (nanoseconds emitted where
+    /// seconds are declared) fails here rather than reading as a 54-year-old
+    /// fold.
+    ///
+    /// The three signals are driven with three DIFFERENT values, and each is
+    /// asserted against its own label set. A renderer that emitted one signal
+    /// three times, or that paired the values with the wrong signals, passes
+    /// an assertion that only checks that three series exist; it fails here.
+    /// The series count is pinned exactly too, so a fourth signal cannot
+    /// appear unnoticed.
     #[test]
-    fn catalog_fold_liveness_family_renders_its_driven_values() {
+    fn catalog_fold_liveness_family_renders_one_series_per_signal() {
         // 1_758_000_123_500_000_000 ns is 1758000123.5 s: a value with a
         // fractional second, so a renderer that truncated to whole seconds
         // would not match.
         let catalog = CatalogCountersSnapshot {
-            fold_cycles: 41,
-            fold_failures: 3,
-            fold_last_success_unix_ns: 1_758_000_123_500_000_000,
+            fold: [
+                CatalogFoldCounters {
+                    signal: Signal::Metrics,
+                    cycles: 41,
+                    failures: 3,
+                    last_success_unix_ns: 1_758_000_123_500_000_000,
+                },
+                CatalogFoldCounters {
+                    signal: Signal::Logs,
+                    cycles: 17,
+                    failures: 0,
+                    last_success_unix_ns: 1_700_000_000_500_000_000,
+                },
+                CatalogFoldCounters {
+                    signal: Signal::Spans,
+                    cycles: 0,
+                    failures: 9,
+                    last_success_unix_ns: 0,
+                },
+            ],
             ..Default::default()
         };
         let body = render(
@@ -5449,23 +5534,53 @@ mod tests {
             "the cycle counter must declare its type:\n{body}"
         );
         assert!(
-            body.contains("ravel_catalog_fold_cycles_total{mode=\"all\"} 41"),
-            "the cycle counter must render its driven value:\n{body}"
-        );
-        assert!(
-            body.contains("ravel_catalog_fold_failures_total{mode=\"all\"} 3"),
-            "the failure counter must render its driven value:\n{body}"
-        );
-        assert!(
             body.contains("# TYPE ravel_catalog_fold_last_success_timestamp_seconds gauge"),
             "the liveness timestamp is a gauge, not a counter:\n{body}"
         );
-        assert!(
-            body.contains(
-                "ravel_catalog_fold_last_success_timestamp_seconds{mode=\"all\"} 1758000123.5"
-            ),
-            "the liveness gauge must render the driven nanosecond stamp as seconds:\n{body}"
-        );
+
+        // Exact label sets and exact values, per signal. Every sample line the
+        // renderer must emit is named here in full.
+        for expected in [
+            "ravel_catalog_fold_cycles_total{mode=\"all\",signal=\"metrics\"} 41",
+            "ravel_catalog_fold_cycles_total{mode=\"all\",signal=\"logs\"} 17",
+            "ravel_catalog_fold_cycles_total{mode=\"all\",signal=\"spans\"} 0",
+            "ravel_catalog_fold_failures_total{mode=\"all\",signal=\"metrics\"} 3",
+            "ravel_catalog_fold_failures_total{mode=\"all\",signal=\"logs\"} 0",
+            "ravel_catalog_fold_failures_total{mode=\"all\",signal=\"spans\"} 9",
+            "ravel_catalog_fold_last_success_timestamp_seconds{mode=\"all\",signal=\"metrics\"} 1758000123.5",
+            "ravel_catalog_fold_last_success_timestamp_seconds{mode=\"all\",signal=\"logs\"} 1700000000.5",
+            "ravel_catalog_fold_last_success_timestamp_seconds{mode=\"all\",signal=\"spans\"} 0",
+        ] {
+            assert_eq!(
+                body.lines().filter(|line| *line == expected).count(),
+                1,
+                "expected exactly one `{expected}` sample line:\n{body}"
+            );
+        }
+
+        // Exactly three series per family: an unlabelled process-global series
+        // rendered alongside the per-signal ones, or a fourth signal, fails
+        // here rather than at the alert.
+        for family in [
+            "ravel_catalog_fold_cycles_total",
+            "ravel_catalog_fold_failures_total",
+            "ravel_catalog_fold_last_success_timestamp_seconds",
+        ] {
+            let samples = body
+                .lines()
+                .filter(|line| {
+                    // `{` catches a labelled series, ` ` an unlabelled one, so
+                    // a process-global sample counts here instead of slipping
+                    // past a labelled-only match. `#` lines are HELP and TYPE.
+                    line.strip_prefix(family)
+                        .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+                })
+                .count();
+            assert_eq!(
+                samples, 3,
+                "{family} must render one series per folded signal and no other:\n{body}"
+            );
+        }
     }
 
     /// The scrape path reads the fold figures off the live `Catalog`, not off
@@ -5479,11 +5594,24 @@ mod tests {
         use ravel_object_store::memory::MemoryStore;
         use ravel_types::{Signal, TenantId};
 
+        /// The snapshot entry for one signal, by the signal it names rather
+        /// than by its position in the array.
+        fn entry(
+            snapshot: &CatalogCountersSnapshot,
+            signal: Signal,
+        ) -> &super::CatalogFoldCounters {
+            snapshot
+                .fold
+                .iter()
+                .find(|fold| fold.signal == signal)
+                .expect("every folded signal has a snapshot entry")
+        }
+
         let store = std::sync::Arc::new(MemoryStore::new());
         let catalog = Catalog::new(store, CatalogConfig::default()).expect("catalog");
         let before = CatalogCountersSnapshot::from_catalog(&catalog);
-        assert_eq!(before.fold_cycles, 0);
-        assert_eq!(before.fold_last_success_unix_ns, 0);
+        assert_eq!(entry(&before, Signal::Metrics).cycles, 0);
+        assert_eq!(entry(&before, Signal::Metrics).last_success_unix_ns, 0);
 
         // A fold over an empty store: the watermark advances over hours that
         // hold nothing, so it publishes a first HEAD naming no entry at all.
@@ -5505,12 +5633,29 @@ mod tests {
         assert_eq!(report.entry_count, 0, "an empty store folds no entry");
 
         let after = CatalogCountersSnapshot::from_catalog(&catalog);
-        assert_eq!(after.fold_cycles, 1);
-        assert_eq!(after.fold_failures, 0);
+        assert_eq!(entry(&after, Signal::Metrics).cycles, 1);
+        assert_eq!(entry(&after, Signal::Metrics).failures, 0);
         assert_eq!(
-            after.fold_last_success_unix_ns, now_ns,
+            entry(&after, Signal::Metrics).last_success_unix_ns,
+            now_ns,
             "the snapshot carries the catalog's own stamp, not a placeholder"
         );
+
+        // The snapshot reads each signal's own slot: the two signals that were
+        // not folded are still at zero, so a `from_catalog` that read one
+        // signal's counters into every entry fails here.
+        for untouched in [Signal::Logs, Signal::Spans] {
+            assert_eq!(
+                entry(&after, untouched).cycles,
+                0,
+                "{untouched:?} was not folded"
+            );
+            assert_eq!(
+                entry(&after, untouched).last_success_unix_ns,
+                0,
+                "{untouched:?} was not folded"
+            );
+        }
     }
 
     /// A process that has never folded successfully still renders the gauge,
@@ -5550,18 +5695,26 @@ mod tests {
             None,
         );
 
-        assert!(
-            body.contains("ravel_catalog_fold_last_success_timestamp_seconds{mode=\"all\"} 0"),
-            "the liveness gauge must render its zero sentinel, not be omitted:\n{body}"
-        );
-        assert!(
-            body.contains("ravel_catalog_fold_cycles_total{mode=\"all\"} 0"),
-            "a zero cycle counter must render, not be omitted:\n{body}"
-        );
-        assert!(
-            body.contains("ravel_catalog_fold_failures_total{mode=\"all\"} 0"),
-            "a zero failure counter must render, not be omitted:\n{body}"
-        );
+        for signal in ["metrics", "logs", "spans"] {
+            assert!(
+                body.contains(&format!(
+                    "ravel_catalog_fold_last_success_timestamp_seconds{{mode=\"all\",signal=\"{signal}\"}} 0"
+                )),
+                "the {signal} liveness gauge must render its zero sentinel, not be omitted:\n{body}"
+            );
+            assert!(
+                body.contains(&format!(
+                    "ravel_catalog_fold_cycles_total{{mode=\"all\",signal=\"{signal}\"}} 0"
+                )),
+                "a zero {signal} cycle counter must render, not be omitted:\n{body}"
+            );
+            assert!(
+                body.contains(&format!(
+                    "ravel_catalog_fold_failures_total{{mode=\"all\",signal=\"{signal}\"}} 0"
+                )),
+                "a zero {signal} failure counter must render, not be omitted:\n{body}"
+            );
+        }
     }
 
     #[test]
