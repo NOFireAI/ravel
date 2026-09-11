@@ -17,10 +17,10 @@ use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy}
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Affinity, Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
-    KeyToPath, PodAffinityTerm, PodAntiAffinity, PodSecurityContext, PodSpec, PodTemplateSpec,
-    Probe, ResourceRequirements, SeccompProfile, SecretKeySelector, SecretVolumeSource,
-    SecurityContext, Service, ServiceAccount, ServicePort, ServiceSpec, Volume, VolumeMount,
-    WeightedPodAffinityTerm,
+    KeyToPath, Lifecycle, LifecycleHandler, PodAffinityTerm, PodAntiAffinity, PodSecurityContext,
+    PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecretKeySelector,
+    SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServicePort, ServiceSpec,
+    SleepAction, Volume, VolumeMount, WeightedPodAffinityTerm,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
@@ -98,6 +98,37 @@ pub const HTTP_PORT: i32 = 4318;
 
 /// gRPC listener port (OTLP/gRPC), exposed by the gateway tier only.
 pub const GRPC_PORT: i32 = 4317;
+
+/// `preStop` sleep, in seconds, on every ravel-server pod.
+///
+/// Endpoint deregistration and SIGTERM are concurrent, not ordered: when a pod
+/// is deleted the kubelet sends SIGTERM at the same time the EndpointSlice
+/// removal begins propagating to every node's kube-proxy (and to any external
+/// load balancer). Without a delay the server can start draining while new
+/// requests are still being routed to it. This `preStop` sleep holds the
+/// container up before SIGTERM so endpoint removal has time to propagate; 10s
+/// covers kube-proxy iptables/IPVS reprogramming across nodes and typical cloud
+/// load-balancer drain under load.
+pub const PRE_STOP_DRAIN_DELAY_SECONDS: i64 = 10;
+
+/// `terminationGracePeriodSeconds` on every ravel-server pod.
+///
+/// Kubernetes runs `preStop` inside the grace period and only sends SIGTERM
+/// after it returns, so the grace period must cover the `preStop` sleep plus the
+/// server's own SIGTERM-to-exit budget plus headroom. The server budget is fixed
+/// by ravel-server's compiled defaults, not chosen here: the operator renders no
+/// `--shutdown-timeout`, so the server uses `DEFAULT_SHUTDOWN_TIMEOUT` (25s), and
+/// `services/ravel-server/src/lib.rs` pins the SIGTERM-to-exit worst case at
+/// 32.5s (25s drain + max(2.5s heartbeat stop, 0.5s readiness settle) + 5s OTLP
+/// trace-exporter flush cap) in
+/// `default_shutdown_timeout_is_below_the_kubernetes_grace_period`.
+///
+/// 10s `preStop` + 32.5s server budget = 42.5s, plus 2.5s headroom for kubelet
+/// exec/SIGTERM-delivery latency, rounded to 45s. The error is deliberately on
+/// the long side: a grace period shorter than `preStop` + the server budget lets
+/// SIGKILL land mid-drain and lose buffered-mode ingest data, an irreversible
+/// loss, while a longer one only slows a rolling update's pod turnover.
+pub const POD_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 45;
 
 /// Secret key holding the S3 access key id.
 pub(crate) const S3_ACCESS_KEY_ID_KEY: &str = "accessKeyId";
@@ -610,6 +641,28 @@ fn container_security_context() -> SecurityContext {
     }
 }
 
+/// The `preStop` hook stamped on every ravel-server container, holding it up for
+/// [`PRE_STOP_DRAIN_DELAY_SECONDS`] before SIGTERM so Service endpoint removal
+/// has time to propagate (see that constant).
+///
+/// Uses the native `sleep` lifecycle action (`SleepAction`, GA since Kubernetes
+/// 1.32; the operator pins `k8s-openapi` at `v1_34`) rather than an
+/// `exec: ["/bin/sleep", ...]`: the rendered container runs with a read-only
+/// root filesystem, non-root, and every Linux capability dropped
+/// ([`container_security_context`]), so an image without a `sleep` binary must
+/// not be assumed.
+fn pre_stop_lifecycle() -> Lifecycle {
+    Lifecycle {
+        pre_stop: Some(LifecycleHandler {
+            sleep: Some(SleepAction {
+                seconds: PRE_STOP_DRAIN_DELAY_SECONDS,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// The hardened pod-level SecurityContext stamped on every PodSpec the operator
 /// renders (issue #126): run as non-root and confine every container to the
 /// `RuntimeDefault` seccomp profile.
@@ -682,6 +735,7 @@ fn deployment(
         ports: if ports.is_empty() { None } else { Some(ports) },
         liveness_probe: Some(liveness),
         readiness_probe: Some(readiness),
+        lifecycle: Some(pre_stop_lifecycle()),
         resources: resources(resources_spec),
         volume_mounts: volume_mount.map(|m| vec![m]),
         security_context: Some(container_security_context()),
@@ -717,6 +771,7 @@ fn deployment(
                 spec: Some(PodSpec {
                     containers: vec![container],
                     volumes: volume.map(|v| vec![v]),
+                    termination_grace_period_seconds: Some(POD_TERMINATION_GRACE_PERIOD_SECONDS),
                     security_context: Some(pod_security_context()),
                     affinity: Some(pod_anti_affinity(instance, component)),
                     ..Default::default()
@@ -3607,6 +3662,62 @@ mod tests {
                 .expect("httpGet");
             assert_eq!(ready.path.as_deref(), Some("/readyz"));
             assert_eq!(ready.port, IntOrString::Int(HTTP_PORT));
+        }
+    }
+
+    #[test]
+    fn every_server_tier_sets_grace_period_and_prestop_drain_delay() {
+        // Issue #1291: every ravel-server pod must give the graceful-shutdown
+        // drain room to finish. The three server tiers are rendered by the
+        // shared `deployment` builder, so this asserts on the builder's output
+        // through all three call paths (gateway/query/maintain): a field set on
+        // only some tiers regresses the ones it misses silently.
+        //
+        // Exact values, not "is set": `terminationGracePeriodSeconds` is sized
+        // against ravel-server's 32.5s SIGTERM-to-exit worst case (see
+        // POD_TERMINATION_GRACE_PERIOD_SECONDS) and the `preStop` sleep against
+        // endpoint propagation (PRE_STOP_DRAIN_DELAY_SECONDS). Either drifting
+        // silently is the failure this pins.
+        let spec = base_spec();
+        let ctx = ctx();
+        for dep in [
+            desired_gateway_deployment(&spec, "prod", &ctx),
+            desired_query_deployment(&spec, "prod", &ctx),
+            desired_maintain_deployment(&spec, "prod", &ctx)
+                .expect("no gc render error")
+                .expect("enabled"),
+        ] {
+            assert_eq!(
+                pod_spec_of(&dep).termination_grace_period_seconds,
+                Some(45),
+                "every server tier must set terminationGracePeriodSeconds to the \
+                 value derived from ravel-server's shutdown budget"
+            );
+            let lifecycle = container_of(&dep)
+                .lifecycle
+                .as_ref()
+                .expect("every server tier must set a lifecycle hook");
+            let pre_stop = lifecycle
+                .pre_stop
+                .as_ref()
+                .expect("every server tier must set a preStop hook");
+            let sleep = pre_stop
+                .sleep
+                .as_ref()
+                .expect("the preStop hook must use the native sleep action");
+            assert_eq!(
+                sleep.seconds, 10,
+                "the preStop sleep must cover endpoint propagation exactly"
+            );
+            // The native sleep action carries the whole hook: no exec/httpGet/
+            // tcpSocket variant, which would need a binary the hardened
+            // read-only-root container is not guaranteed to have.
+            assert!(
+                pre_stop.exec.is_none()
+                    && pre_stop.http_get.is_none()
+                    && pre_stop.tcp_socket.is_none(),
+                "the preStop hook must be sleep-only"
+            );
         }
     }
 

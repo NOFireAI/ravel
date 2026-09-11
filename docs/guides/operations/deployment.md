@@ -200,6 +200,44 @@ nothing consumes `/readyz`:
 - `ravel_store_probe_failures_total`, a counter labeled by mode, incremented on
   every failed probe cycle even below the readiness threshold.
 
+## Graceful shutdown and the pod grace period
+
+On SIGTERM the server flips readiness to draining first, then flushes and joins
+every ingest shard actor before it exits. That drain is what protects
+buffered-mode ingest data on a rolling update: if the process is killed before
+the drain finishes, the unflushed buffers are lost. The drain is bounded by
+`--shutdown-timeout` (default `25s`). The full SIGTERM-to-exit worst case at the
+shipped defaults is `32.5s`: the `25s` drain, plus up to `2.5s` for the
+pre-drain heartbeat stop and readiness settle, plus a `5s` hard cap on the final
+OTLP trace-exporter flush.
+
+The operator sizes the pod's shutdown lifecycle against that budget, so the two
+numbers cannot drift apart:
+
+- `terminationGracePeriodSeconds` is set to **45s** on every ravel-server pod
+  (gateway, query, and maintain). Kubernetes runs the `preStop` hook inside the
+  grace period and only sends SIGTERM once it returns, so the grace period has
+  to cover the `preStop` sleep plus the `32.5s` server budget plus headroom:
+  `10s + 32.5s + 2.5s`, rounded up. The error is deliberately on the long side.
+  A grace period shorter than the server's budget lets SIGKILL land mid-drain
+  and lose buffered data, which is irreversible; a longer one only slows a
+  rolling update's pod turnover by a few seconds.
+- A `preStop` hook sleeps **10s** before SIGTERM. Endpoint removal and SIGTERM
+  are concurrent, not ordered: when a pod is deleted, the kubelet sends SIGTERM
+  at the same time the EndpointSlice removal begins propagating to every node's
+  kube-proxy and to any external load balancer. Without the sleep the server can
+  start draining while new requests are still routed to it. The `10s` covers
+  kube-proxy reprogramming across nodes and typical cloud load-balancer drain
+  under load. The hook uses the native `sleep` lifecycle action, not an
+  `exec` of a `sleep` binary, because the container runs with a read-only root
+  filesystem and every Linux capability dropped.
+
+The operator renders no `--shutdown-timeout` flag, so the server runs at its
+compiled default and `45s` is the correct grace period today. `--shutdown-timeout`
+is configurable on the server itself; if a future CRD field exposes it, the grace
+period must track it, staying above the new server budget plus the `preStop`
+sleep.
+
 ## Durable auth refresh
 
 On a keyed bucket, a request-serving process (`all`, `gateway`, `query`)
