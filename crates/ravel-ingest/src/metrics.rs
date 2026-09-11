@@ -206,10 +206,14 @@ pub struct IngestMetrics {
     shard_deaths: AtomicU64,
     /// Shards condemned after exhausting their respawn budget (issue #1299):
     /// the router stopped respawning the shard and reports itself not-ready
-    /// (`IngestRouter::ready`) so the orchestrator replaces this replica. One
-    /// increment per shard, at most once per shard, so it never exceeds
-    /// `shard_count`. Nonzero means at least one shard is permanently down in
-    /// this process and its series keep failing until the replica is replaced.
+    /// (`IngestRouter::ready`) so the orchestrator replaces this replica.
+    /// Condemnation is deduped by the per-generation `ShardHandle`'s
+    /// `condemned` bool, so it counts each shard at most once per live
+    /// generation and is bounded by `live_generations * shard_count`, not
+    /// `shard_count`: under resharding each live generation's handle for the
+    /// same shard index can condemn independently. Nonzero means at least one
+    /// shard is permanently down in this process and its series keep failing
+    /// until the replica is replaced.
     shards_condemned: AtomicU64,
     /// Flushes failed closed because the router's cached provisioning view for
     /// the tenant was older than the refresh interval `C` (ADR-0052 section 3).
@@ -809,8 +813,10 @@ impl IngestMetrics {
     }
 
     /// One shard condemned after exhausting its respawn budget (issue #1299).
-    /// Recorded at most once per shard, on the death that spends the last
-    /// respawn; drives `IngestRouter::ready` false.
+    /// Recorded at most once per shard per live generation (deduped by that
+    /// generation's `ShardHandle`, so a reshard's second live handle for the
+    /// same shard index condemns independently), on the death that spends the
+    /// last respawn; drives `IngestRouter::ready` false.
     pub(crate) fn record_shard_condemned(&self) {
         self.shards_condemned.fetch_add(1, Ordering::Relaxed);
     }

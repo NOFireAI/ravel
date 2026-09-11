@@ -1074,8 +1074,9 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             out,
             "ravel_ingest_shards_condemned_total",
             "Shards condemned after exhausting their respawn budget (issue #1299), counted at \
-             most once per shard; any nonzero value makes the process report /readyz 503, by \
-             signal.",
+             most once per shard per live generation (bounded by live_generations * shard_count \
+             under resharding, not shard_count); any nonzero value makes the process report \
+             /readyz 503, by signal.",
             "counter",
         );
         for pipeline in with_condemned {
