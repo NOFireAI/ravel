@@ -76,6 +76,13 @@ before anything else goes wrong.
 300) controls only how often it wakes up to check for newly sealed hours; it has
 no bearing on when an hour becomes eligible to seal.
 
+Disabling the fold has one monitoring consequence to know: the fold-liveness
+gauge (`ravel_catalog_fold_last_success_timestamp_seconds`) never advances past
+its `0` sentinel with no fold to stamp it, so the `RavelCatalogFoldStalled`
+alert in the observability guide pages about ten minutes after start. That is
+consistent with the unsealed span growing, but if you run a fleet with the fold
+intentionally off, drop that alert for it rather than leave it paging.
+
 ### The seal margin, and why it matters
 
 A fold seals an hour only once:
