@@ -165,21 +165,37 @@ Single task per shard. No locks on the hot path; all state actor-local:
 - `buf: HashMap<SeriesId, SeriesBuf { labels: LabelSet, samples: Vec<Sample> }>`
 - `exemplars: Vec<IngestExemplar>` in arrival order, one per exemplar the wire
   admitted for a series routed to this shard (ADR-0047)
-- `est_bytes`: running estimate (samples * 16 + label bytes on first sight,
-  plus the `IngestExemplar` struct width and its attribute bytes per buffered
-  exemplar). "Label bytes" means what the buffer holds, not what the object
-  will hold: each label costs `size_of::<Label>()` (two `String` headers, 48
-  bytes) plus its name and value bytes. Leaving the header term out
+- `est_bytes`: running buffered-memory estimate (samples * 16 + label bytes on
+  first sight, plus the `IngestExemplar` struct width and its attribute bytes
+  per buffered exemplar). "Label bytes" means what the buffer holds, not what
+  the object will hold: each label costs `size_of::<Label>()` (two `String`
+  headers, 48 bytes) plus its name and value bytes. Leaving the header term out
   understates a ten-label series by roughly 480 bytes against the 200 it
-  counts, so both flush triggers and the process-wide budget below fire late
-  on exactly the label-heavy workloads they exist to bound.
+  counts, so the process-wide memory budget below fires late on exactly the
+  label-heavy workloads it exists to bound. This estimate feeds the
+  buffered-bytes gauge and mirrors the process-wide ceiling charge; it does
+  **not** drive the flush size triggers.
+- `flush_est_bytes`: a separate running estimate of the encoded RSEG bytes a
+  flush of this buffer would write, and the figure both size triggers read.
+  It charges a per-series framing term (one run per series per flush) plus a
+  per-sample codec term, and deliberately omits the in-memory `Label` headers:
+  a series' labels intern into LABEL_DICT once and cost about 0.01 B/sample
+  stored, so charging their 48-byte memory headers against a written-bytes
+  trigger fired `target_bytes` at a small fraction of real data and left mean
+  object size in the tens of KB. The per-sample term is calibrated to the
+  representative encoded cost (ADR-0092's 2026-08-21 amendment: 2.5-3.0
+  B/sample merged for realistic value shapes, not the 8.88 incompressible
+  worst-case control), rounded to the upper edge so representative workloads
+  flush at or just under `target_bytes`. Sizing `target_bytes` therefore sizes
+  the object; it no longer trades against the memory ceiling, which `est_bytes`
+  and the process-wide budget charge separately.
 - `oldest_ns`: ingest-arrival time of the oldest buffered point
 - `waiters: Vec<oneshot::Sender<...>>` for strict-mode acks in this flush window
 - writer identity: (writer_id uuid, epoch, next_seq) owned by the process
 
 Loop over `select!`:
 - message received: merge points, push `ack` to waiters (strict) or reply
-  immediately (buffered), flush if `est_bytes >= target_bytes` (default
+  immediately (buffered), flush if `flush_est_bytes >= target_bytes` (default
   8 MiB). Before merging, each point's series_id is checked against the
   canonical label set that id already claims in the buffer; a mismatch
   (hash collision) rejects the point with a typed error and increments
@@ -188,7 +204,7 @@ Loop over `select!`:
 - flush tick (interval default 200 ms): flush if `oldest_ns` older than an
   age threshold, and buffer non-empty. The threshold is `max_flush_delay`
   (default 2 s) when the buffer has a strict-mode waiter or already holds
-  at least `min_flush_bytes` (default 256 KiB); otherwise the buffer is idle
+  at least `min_flush_bytes` (default 256 KiB) of `flush_est_bytes`; otherwise the buffer is idle
   and the threshold is `max_flush_delay_idle` (default 40 s) instead
   (ADR-0051 section 7). Strict-mode ack latency is unaffected, since a
   strict write always leaves a waiter in the buffer for its whole flush

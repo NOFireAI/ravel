@@ -30,8 +30,8 @@ use ravel_commit::rng::RngSource;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_segment::{
-    ExemplarInput, HistogramSample, IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3,
-    SeriesValues,
+    ExemplarInput, HistogramCounts, HistogramSample, HistogramValue, IngestBounds, SegmentIdentity,
+    SegmentWriter, SeriesInputV3, SeriesValues,
 };
 use ravel_types::{
     CommitToken, ExemplarCap, Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId,
@@ -140,6 +140,73 @@ impl SeriesAccumValues {
     }
 }
 
+/// Estimated encoded RSEG bytes one flush will write per series, charged once
+/// per series present in the buffer. One L0 flush emits exactly one run per
+/// series, so this is the per-run framing (SERIES_META plus the TS/VAL page
+/// headers) amortized over that run's samples. ADR-0092's measured table
+/// (docs/adrs/0092-run-merged-l1-and-rseg-v7.md) puts a one-sample run at about
+/// 26.5 B total after compaction, of which roughly 24 is framing and the rest
+/// is the sample; this is that framing term.
+const FLUSH_BYTES_PER_SERIES: usize = 24;
+
+/// Estimated encoded RSEG bytes one flush will write per scalar sample. Set to
+/// the upper edge of ADR-0092's representative range (its 2026-08-21 amendment
+/// records 2.50 to 3.00 B/sample merged for realistic value shapes; 8.88 is the
+/// incompressible-value worst-case control, not the representative cost). Using
+/// the upper edge makes the estimate a slight over-estimate of representative
+/// encoded bytes, so representative workloads flush at or just under
+/// `target_bytes` rather than over it.
+///
+/// This is deliberately NOT the buffered memory footprint: a series' labels
+/// intern into LABEL_DICT once and cost about 0.01 B/sample stored (ADR-0092
+/// measured table), so the `size_of::<Label>()` header term that
+/// [`crate::value::IngestPoint::est_charge_bytes`] must charge for the memory
+/// ceiling has no place in a written-bytes estimate. Charging it here is the
+/// defect this estimator exists to remove: it fired `target_bytes` at a small
+/// fraction of real data and left mean object size in the tens of KB.
+const FLUSH_BYTES_PER_SCALAR_SAMPLE: usize = 3;
+
+/// Fixed per-histogram-sample framing (event timestamp contribution, span
+/// lists, and the optional `sum`), on top of the per-bucket term below. A
+/// native-histogram sample is far larger than a scalar, so charging it the
+/// scalar rate would let a histogram-heavy buffer flush well over
+/// `target_bytes`; this keeps the size trigger honest for histograms.
+const FLUSH_HISTOGRAM_SAMPLE_OVERHEAD: usize = 16;
+
+/// Estimated encoded bytes per histogram bucket count (one varint per bucket in
+/// the common integer-count case). A coarse model, chosen high enough that a
+/// wide histogram does not under-charge the size trigger into oversized
+/// objects.
+const FLUSH_BYTES_PER_HISTOGRAM_BUCKET: usize = 2;
+
+/// Bucket count of one histogram sample: the entries on both sides, whichever
+/// count representation it carries.
+fn histogram_bucket_count(value: &HistogramValue) -> usize {
+    match &value.counts {
+        HistogramCounts::Int {
+            positive, negative, ..
+        } => positive.len() + negative.len(),
+        HistogramCounts::Float {
+            positive, negative, ..
+        } => positive.len() + negative.len(),
+    }
+}
+
+/// Estimated encoded RSEG bytes one flush will write for a single sample of the
+/// given value, the per-sample half of the size-trigger estimator. The
+/// per-series framing ([`FLUSH_BYTES_PER_SERIES`]) is charged separately, once
+/// per series, in [`TenantBuf::merge`].
+fn flush_sample_bytes(value: &IngestValue) -> usize {
+    match value {
+        IngestValue::Scalar(_) => FLUSH_BYTES_PER_SCALAR_SAMPLE,
+        IngestValue::Histogram(h) => {
+            FLUSH_BYTES_PER_SCALAR_SAMPLE
+                + FLUSH_HISTOGRAM_SAMPLE_OVERHEAD
+                + histogram_bucket_count(&h.value) * FLUSH_BYTES_PER_HISTOGRAM_BUCKET
+        }
+    }
+}
+
 struct SeriesAccum {
     /// The series' shared label set (ADR-0098). Moved in from the first
     /// point of the run that opened this accumulator; the points that
@@ -159,7 +226,19 @@ struct TenantBuf {
     /// to the flush-scoped cap, and the sample-side `HashMap` would lose the
     /// arrival order that breaks ties.
     exemplars: Vec<IngestExemplar>,
+    /// Buffered-memory estimate, charged with the same per-label `Label`-header
+    /// rule as [`crate::value::IngestPoint::est_charge_bytes`] (ADR-0069). This
+    /// bounds the process-wide 512 MiB memory ceiling, not the flush size, and
+    /// so keeps the conservative header term the ceiling depends on. It feeds
+    /// the buffered-bytes gauge (`record_buffered`); the flush triggers read
+    /// `flush_est_bytes` instead.
     est_bytes: usize,
+    /// Size-trigger estimate: the encoded RSEG bytes this buffer would write if
+    /// flushed now (per-series framing plus per-sample codec bytes, no in-memory
+    /// label headers). The `target_bytes` and `min_flush_bytes` triggers read
+    /// this so mean object size tracks `target_bytes` instead of the memory
+    /// footprint. See [`FLUSH_BYTES_PER_SERIES`] / [`FLUSH_BYTES_PER_SCALAR_SAMPLE`].
+    flush_est_bytes: usize,
     oldest_arrival_ns: Option<i64>,
     min_ingest_ts_ns: Option<i64>,
     max_ingest_ts_ns: Option<i64>,
@@ -269,6 +348,10 @@ impl TenantBuf {
         self.note_arrival(arrival_ns);
         let mut bytes_added = 0usize;
         for point in points {
+            // Size-trigger accounting is charged for every sample, plus a
+            // per-series framing term the first time a series is seen. Read the
+            // value's kind before it is moved into the accumulator below.
+            self.flush_est_bytes += flush_sample_bytes(&point.value);
             match self.series.entry(point.series_id) {
                 Entry::Occupied(mut occ) => {
                     occ.get_mut().values.try_push(point.value);
@@ -280,6 +363,7 @@ impl TenantBuf {
                         .map(|l| size_of::<Label>() + l.name.len() + l.value.len())
                         .sum();
                     bytes_added += label_bytes;
+                    self.flush_est_bytes += FLUSH_BYTES_PER_SERIES;
                     vac.insert(SeriesAccum {
                         labels: point.labels,
                         values: SeriesAccumValues::new_with(point.value),
@@ -1118,7 +1202,7 @@ impl ShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| b.est_bytes >= target_bytes)
+            .map(|b| b.flush_est_bytes >= target_bytes)
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
             return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
@@ -1142,7 +1226,8 @@ impl ShardActor {
     /// from one that used the fixed value (`IngestMetrics`'s
     /// `flushes_by_age` vs `flushes_by_age_adaptive`).
     fn age_threshold_ns(&self, buf: &TenantBuf) -> (i64, FlushTrigger) {
-        let has_priority = !buf.waiters.is_empty() || buf.est_bytes >= self.config.min_flush_bytes;
+        let has_priority =
+            !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if !has_priority {
             return (
                 self.config.max_flush_delay_idle.as_nanos() as i64,
@@ -1739,11 +1824,14 @@ mod buffer_accounting_tests {
         }
     }
 
-    /// The flush triggers read `TenantBuf::est_bytes`; the process-wide ceiling
-    /// reads `IngestPoint::est_charge_bytes`. On a batch of first-sighting
-    /// series the two must produce the same number, or one of them is lying
-    /// about the same bytes -- which is exactly how the label-header term went
-    /// missing from the budget side while the exemplar side kept it.
+    /// `TenantBuf::est_bytes` (the buffered-memory estimate) and
+    /// `IngestPoint::est_charge_bytes` (the process-wide ceiling charge) must
+    /// produce the same number on a batch of first-sighting series, or one of
+    /// them is lying about the same bytes -- which is exactly how the
+    /// label-header term went missing from the budget side while the exemplar
+    /// side kept it. The size trigger reads `flush_est_bytes`, a separate
+    /// estimate, so it is deliberately not compared here (see
+    /// `size_trigger_tracks_object_size_and_keeps_memory_charge`).
     #[test]
     fn merge_accounting_matches_the_budget_charge() {
         for width in [1usize, 10, 64] {
@@ -1872,5 +1960,175 @@ mod buffer_accounting_tests {
             .expect("same series again");
         assert_eq!(repeat, 16, "a repeat sighting charges the sample only");
         assert_eq!(first, 16 + 10 * (size_of::<Label>() + 3));
+    }
+
+    /// A repeat sighting of a series still advances the size trigger by the
+    /// per-sample codec term, but never re-charges the per-series framing: one
+    /// flush emits one run per series regardless of how many of its samples
+    /// arrived across separate merges.
+    #[test]
+    fn flush_est_charges_framing_once_and_a_sample_each_time() {
+        let labels = labels_of(10);
+        let mut buf = TenantBuf::default();
+        buf.merge(vec![point(1, labels.clone())], 1_000)
+            .expect("first sighting");
+        assert_eq!(
+            buf.flush_est_bytes,
+            FLUSH_BYTES_PER_SERIES + FLUSH_BYTES_PER_SCALAR_SAMPLE,
+            "first sample charges framing plus one sample"
+        );
+        buf.merge(vec![point(1, labels)], 2_000)
+            .expect("same series again");
+        assert_eq!(
+            buf.flush_est_bytes,
+            FLUSH_BYTES_PER_SERIES + 2 * FLUSH_BYTES_PER_SCALAR_SAMPLE,
+            "a repeat sighting adds only the per-sample term, no second framing"
+        );
+    }
+
+    /// Builds `k` samples of one ten-label series with pseudo-random
+    /// integer-valued payloads (a realistic value shape the integer-model codec
+    /// fires on, per ADR-0092's 2026-08-21 amendment) on a regular 15 s scrape
+    /// cadence. Deterministic: no wall clock, no RNG crate.
+    fn representative_series(series: u16, k: usize) -> (SeriesId, LabelSet, Vec<Sample>) {
+        let mut id = [0u8; 16];
+        id[0..2].copy_from_slice(&series.to_le_bytes());
+        let base_ts = 1_700_000_000_000_000_000i64;
+        // A small LCG per series so successive values are not a constant delta
+        // (which would compress to near zero and stop modelling realistic data).
+        let mut state = 0x2545_f491u32.wrapping_add(series as u32);
+        let samples = (0..k)
+            .map(|i| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let value = (state >> 8) % 1_000;
+                Sample {
+                    ts_ns: base_ts + (i as i64) * 15_000_000_000,
+                    value: value as f64,
+                }
+            })
+            .collect();
+        (SeriesId(id), labels_of(10), samples)
+    }
+
+    /// Acceptance test for the size-trigger estimator (issue #1305).
+    ///
+    /// Buffers ten-label scalar series (K samples each) exactly as ingest would
+    /// until the SIZE trigger's estimate first reaches `target_bytes`, then
+    /// builds the object that flush would write and measures it. The object is
+    /// built from precisely the samples the trigger accumulated, so the flushed
+    /// size is a function of the estimator: the defect (a header-charged
+    /// trigger) fires with far fewer samples buffered and produces an object
+    /// far under `target_bytes`.
+    ///
+    /// Pre-registered before running (see the task report):
+    /// - Corpus: ten-label scalar series, 350 samples each, representative
+    ///   integer-valued payloads on a 15 s cadence, buffered until the trigger
+    ///   fires (about 500 series at the default constants).
+    /// - `target_bytes` = 512 KiB.
+    /// - Object-size band: [0.35, 1.30] x `target_bytes`. Lower edge 0.35
+    ///   guards the original defect (a header-charged trigger fired at roughly
+    ///   3% of `target_bytes`); a correctly-calibrated object sits well above it.
+    ///   Upper edge 1.30 allows the fixed object framing (footer, section
+    ///   headers, LABEL_DICT over the buffered series) the per-series/per-sample
+    ///   model omits, while still catching an estimator that under-charges into
+    ///   oversized objects. A result outside the band is a miss to diagnose, not
+    ///   a band to widen.
+    /// - Memory charge: `est_bytes` must still equal the conservative
+    ///   header-inclusive figure exactly, proving the flush estimator was not
+    ///   silently repointed at the memory ceiling.
+    #[test]
+    fn size_trigger_tracks_object_size_and_keeps_memory_charge() {
+        const TARGET_BYTES: usize = 512 * 1024;
+        const K: usize = 350;
+
+        // Buffer one series at a time until the size trigger's estimate first
+        // reaches the target, keeping the exact samples that were accumulated.
+        let mut buf = TenantBuf::default();
+        let mut buffered: Vec<(SeriesId, LabelSet, Vec<Sample>)> = Vec::new();
+        let mut series_idx = 0u16;
+        while buf.flush_est_bytes < TARGET_BYTES {
+            let (id, labels, samples) = representative_series(series_idx, K);
+            series_idx += 1;
+            let labels_arc = Arc::new(labels.clone());
+            let points: Vec<IngestPoint> = samples
+                .iter()
+                .map(|s| IngestPoint {
+                    series_id: id,
+                    labels: Arc::clone(&labels_arc),
+                    value: IngestValue::Scalar(*s),
+                })
+                .collect();
+            buf.merge(points, 1_000)
+                .expect("one series, one value kind");
+            buffered.push((id, labels, samples));
+        }
+        let n_series = buffered.len();
+
+        // The size trigger models per-series framing plus per-sample codec bytes.
+        let expected_flush =
+            n_series * FLUSH_BYTES_PER_SERIES + n_series * K * FLUSH_BYTES_PER_SCALAR_SAMPLE;
+        assert_eq!(
+            buf.flush_est_bytes, expected_flush,
+            "flush estimate must be framing-per-series + per-sample"
+        );
+
+        // The memory charge is unchanged: still the conservative header-inclusive
+        // figure, charged once per series plus 16 per sample. This is the half of
+        // the test that fails if the flush estimator was repointed at the ceiling.
+        let per_series_label_bytes: usize = labels_of(10)
+            .iter()
+            .map(|l| size_of::<Label>() + l.name.len() + l.value.len())
+            .sum();
+        let expected_memory = n_series * per_series_label_bytes + 16 * n_series * K;
+        assert_eq!(
+            buf.est_bytes, expected_memory,
+            "memory charge must still carry the 48-byte Label headers"
+        );
+        assert!(
+            buf.est_bytes > buf.flush_est_bytes,
+            "the two estimates must be distinct: memory {} vs flush {}",
+            buf.est_bytes,
+            buf.flush_est_bytes
+        );
+
+        // Build the object this buffer would flush and measure its real encoded
+        // size against the target.
+        let series_inputs: Vec<SeriesInputV3> = buffered
+            .into_iter()
+            .map(|(series_id, labels, samples)| SeriesInputV3 {
+                series_id,
+                labels,
+                values: SeriesValues::Scalar(samples),
+            })
+            .collect();
+        let identity = SegmentIdentity {
+            tenant_hash: [0u8; 16],
+            shard: 0,
+            writer_id: "writer".to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 1_000,
+            max_ingest_ts_ns: 1_000,
+        };
+        let written = SegmentWriter::write_histograms_with_exemplars(
+            series_inputs,
+            identity,
+            bounds,
+            Vec::new(),
+        )
+        .expect("segment builds");
+        let object_bytes = written.bytes.len();
+
+        let lower = (TARGET_BYTES as f64 * 0.35) as usize;
+        let upper = (TARGET_BYTES as f64 * 1.30) as usize;
+        assert!(
+            (lower..=upper).contains(&object_bytes),
+            "flushed object {object_bytes} B ({:.3}x target) outside pre-registered \
+             band [{lower}, {upper}] of target {TARGET_BYTES} B; \
+             {n_series} series buffered before the trigger fired",
+            object_bytes as f64 / TARGET_BYTES as f64
+        );
     }
 }
