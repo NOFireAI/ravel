@@ -36,15 +36,10 @@ struct KeyHash {
     g2: u64,
 }
 
-/// Test-only instrument: counts `key_hash` (BLAKE3) invocations on the current
-/// thread. A `debug_assert!` cannot answer "how many": the tests below assert
-/// an exact invocation count (zero while duplicates are only staged, one for
-/// a single distinct key, `m` for `m` distinct keys), which needs a queryable
-/// value, not an inline boolean check. Compiled only under `cfg(test)`, so a
-/// production build never pays for it on the path this change optimizes;
-/// verified to still increment correctly under an optimized test build
-/// (`cargo test --release -p ravel-codec bloom::`). Thread-local, so parallel
-/// tests do not race a shared counter.
+/// Test-only instrument: counts `key_hash` (BLAKE3) invocations on the
+/// current thread. A `debug_assert!` cannot answer "how many", and the tests
+/// below assert exact counts, so this needs a queryable value. Thread-local,
+/// so parallel tests do not race a shared counter.
 #[cfg(test)]
 mod hash_calls {
     use std::cell::Cell;
@@ -112,32 +107,27 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 /// blocked bloom filter for them.
 ///
 /// The staged key is the raw `column_id_le || token` bytes, deduplicated
-/// before any BLAKE3 is computed. Ingest calls `insert` 20x-349x more often
-/// than there are distinct keys (issue #1518), so hashing on insert spent most
-/// of its work on tokens the staging set was about to discard. Staging the raw
-/// key first defers `key_hash` to `finish`, which runs it exactly once per
-/// distinct key: the `n` BLAKE3 invocations that used to be spread across
-/// `insert` calls at ingest time now all land inside one `finish` call, so
-/// ingest gets cheaper and `finish` gets correspondingly slower -- a
-/// stage-timing split now attributes that cost to `finish`, not to `insert`.
+/// before any BLAKE3 is computed. A CPU profile of ingest attributed 57% of
+/// per-row time to `key_hash` before this change (issue #1518) -- a
+/// basis-independent figure. Per block (a `BloomBuilder` is one per row
+/// block, not per object), `insert` runs `inserts_per_block /
+/// distinct_per_block` times more often than there are distinct keys; the
+/// object-level ratio (20x-349x, issue #1518) is an upper bound on that
+/// per-builder ratio, not the ratio itself, since a token spanning multiple
+/// blocks counts once in the per-object distinct total but once per builder.
+/// Staging the raw key first defers `key_hash` to `finish`, which runs it
+/// exactly once per distinct key: the same `n` BLAKE3 invocations now all run
+/// inside one `finish` call instead of being spread across `insert` calls.
 /// The emitted bytes are unchanged: `finish` reconstructs the same
 /// `(block, g1, g2)` triple set the old insert-time hashing produced (it even
 /// re-deduplicates by triple, so a BLAKE3 collision between two distinct raw
 /// keys still collapses to one, matching the old distinct-triple count that
 /// sizes the filter).
 ///
-/// `finish` takes `self` by value and drains `staged`, freeing each raw
-/// entry's `Box<[u8]>` as it is hashed. That drain does not halve peak
-/// memory: `triples` below is built with
-/// `HashSet::with_capacity(self.staged.len())` before the drain loop runs,
-/// and `with_capacity` reserves the full bucket array up front to satisfy
-/// its no-reallocation guarantee, so the whole `triples` table exists
-/// before a single `staged` entry is freed -- `staged` and `triples` are
-/// both fully live at that point, and draining only lets `staged` shrink
-/// back down while `triples` fills in alongside it. Measured on this host
-/// (process RSS around one `BloomBuilder` loaded with a large distinct-key
-/// corpus): 38460 KB immediately before the drain loop starts, 37380 KB
-/// immediately after `finish` returns -- about 3%, not "roughly halved".
+/// `finish` takes `self` by value and drains `staged`. `triples` is built
+/// with `HashSet::with_capacity(self.staged.len())` before the drain loop,
+/// which reserves the full bucket array up front, so `staged` and `triples`
+/// are both fully live at once: draining does not roughly halve peak memory.
 ///
 /// Per-key cost at that peak, on the same basis for both tables (hashbrown
 /// adds one control byte per slot and keeps the load factor between about
@@ -158,7 +148,11 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 ///   distinct key.
 ///
 /// Both tables are live at peak (above), so the combined peak cost is their
-/// sum: roughly 132 to 180 bytes per distinct key.
+/// sum: roughly 132 to 180 bytes per distinct key. That is an increase over
+/// the old builder's single `staged: HashSet<(u64, u64, u64)>` (~29 to 57
+/// bytes per distinct key on the same basis), roughly 3x -- negligible in
+/// absolute terms at a per-block builder's typical scale (a few MB at
+/// ~16k distinct keys).
 pub struct BloomBuilder {
     seed: u64,
     /// Distinct `column_id_le || token` byte strings. Queried by `&[u8]` via
@@ -193,7 +187,11 @@ impl BloomBuilder {
     /// tokens with a private 64-byte const scoped to its own function body
     /// (`TOKEN_MAX_BYTES` inside `tokenizer::tokens`,
     /// crates/ravel-codec/src/tokenizer.rs) -- neither const is importable
-    /// from here. A caller outside those two paths can pass an
+    /// from here. The governing contract is docs/log-segment-format.md,
+    /// which states the 64-byte cap normatively (lines 747, 998) and that it
+    /// is not a pinned invariant (line 1002), so it can move without a
+    /// format version bump: check that doc, not these consts, for whether
+    /// the bound has changed. A caller outside those two paths can pass an
     /// arbitrary-length slice, and this function will stage it as-is.
     pub fn insert(&mut self, column_id: u32, token: &[u8]) {
         self.scratch.clear();
@@ -477,17 +475,10 @@ mod proptests {
         // orders, and high duplicate densities (a small key pool picked many
         // times). Insert order must not change the bytes.
         //
-        // The pool is drawn from two size ranges, not one, so both filter
-        // geometries stay covered every run: 1..=53 distinct keys keeps the
-        // 512-bit floor reachable (`ceil(n * 9.585) <= 512` iff `n <= 53`, so
-        // `block_count == 1`; a pool this small is also fully saturated by up
-        // to 1600 picks, so `n` is exactly the pool size, never above it), and
-        // 54..=599 routinely lands above the floor (`block_count > 1`). A
-        // single 1..600 range measured 0 of 258 cases at `block_count == 1`:
-        // once `picks` (0..1600) exceeds the pool size, the birthday effect
-        // saturates the pool almost every run, so raising the top of one
-        // range to reach `block_count > 1` silently pushed distinct counts
-        // past the floor on every case instead of adding coverage next to it.
+        // The pool is drawn from two size ranges so both filter geometries
+        // stay covered every run: 1..=53 distinct keys keeps `block_count ==
+        // 1` reachable (`ceil(n * 9.585) <= 512` iff `n <= 53`), and 54..=599
+        // routinely lands above the floor (`block_count > 1`).
         #[test]
         fn byte_identical_to_reference(
             pool in prop_oneof![
