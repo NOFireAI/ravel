@@ -523,7 +523,9 @@ in the output's own SERIES_IDS. Records of one series keep canonical input
 order, and the writer's stable sort by `(series_index, ts_ns)` leaves the
 section ascending with equal keys intact. Every input exemplar must reach
 exactly one output part, or the run is abandoned before anything is
-published.
+published -- except an erasure rewrite (ADR-0064 §4, :359), which drops an
+exemplar matching the erasure predicate instead of carrying it forward, by
+design rather than by fault.
 
 ## Page format (TS, VAL, HIST)
 

@@ -58,28 +58,16 @@
 //!
 //! ## Exemplars are filtered by the erasure predicate
 //!
-//! An erasure rewrite deliberately drops matching records; ADR-0064 §4
-//! requires that every live segment and derived dataset be free of them, and
-//! an exemplar section rides inside the segment and is rewritten with it
-//! (ADR-0064:359). This is NOT the ADR-0047 decision-3 carry-forward, whose
-//! premise is compaction/format-migration dropping nothing. [`build_rewrite`]
-//! therefore tests each input exemplar
-//! [`crate::read::load_catalog_from_object`] loaded against the SAME
-//! per-record matcher the sample loop uses ([`first_dropping_request`], keyed
-//! on the exemplar's own `ts_ns` and its own series labels), and hands only
-//! the survivors to `SegmentWriter::write_v5_with_exemplars`. An exemplar is
-//! dropped when a request matches it -- including one on a series that only
-//! partially survives (a windowed request keeps out-of-window samples, so the
-//! series stays in the output while its in-window exemplars are erased) -- and
-//! also when its series has zero surviving samples at all, since the writer
-//! rejects an exemplar naming a series absent from the output
-//! (`WriteError::ExemplarUnknownSeries`). The `series_index` remap is the
-//! writer's own: it resolves each `ExemplarInput::series_id` against the
-//! output's SERIES_IDS ordering, the same resolution `build_parts` relies on,
-//! so this module carries no second resolution path and adopts none of
-//! `build_parts`'s per-batch exemplar-assignment batching (this metrics path
-//! writes a single part, so a flat filter suffices). An exemplar belonging to
-//! a series no request matches survives with that series.
+//! An erasure rewrite must drop matching exemplars along with matching
+//! samples (ADR-0064 §4, :359), not carry them forward whole -- see
+//! [`build_rewrite`]'s exemplar carry-forward comment for the full per-record
+//! filtering rule and why a series-level survival test would leak. The
+//! `series_index` remap on write is the writer's own: it resolves each
+//! `ExemplarInput::series_id` against the output's SERIES_IDS ordering, the
+//! same resolution `build_parts` relies on, so this module carries no second
+//! resolution path and adopts none of `build_parts`'s per-batch
+//! exemplar-assignment batching (this metrics path writes a single part, so a
+//! flat filter suffices).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -956,11 +944,16 @@ pub async fn build_rewrite(
     // sample loop uses ([`first_dropping_request`]) against an exemplar's own
     // series labels. `ExemplarInput` carries only `series_id`, not labels, so
     // this is the resolution the exemplar filter reuses rather than deriving a
-    // second matching path. Built only when some input actually carries an
-    // exemplar; per read.rs an empty EXEMPLARS section is the common case, so
-    // the common no-exemplar rewrite never clones a per-series `LabelSet`/
-    // applicable set into a map it would only consult for exemplars.
-    let any_exemplars = catalogs.iter().any(|c| !c.exemplars.is_empty());
+    // second matching path. Gated on the exemplars' own series ids (not a
+    // whole-bucket "any exemplars" flag): a bucket can carry thousands of
+    // series with one exemplar naming just one of them, and this map is
+    // otherwise a `LabelSet`/applicable-set clone per series the exemplar
+    // filter never consults.
+    let exemplar_series: HashSet<[u8; 16]> = catalogs
+        .iter()
+        .flat_map(|c| c.exemplars.iter())
+        .map(|e| e.series_id.0)
+        .collect();
     let mut series_meta: HashMap<[u8; 16], (LabelSet, Vec<usize>)> = HashMap::new();
 
     for (_id, contributions) in by_series {
@@ -975,7 +968,7 @@ pub async fn build_rewrite(
             .map(|(i, _)| i)
             .collect();
 
-        if any_exemplars {
+        if exemplar_series.contains(&series_id.0) {
             series_meta.insert(series_id.0, (labels.clone(), applicable.clone()));
         }
 
@@ -1139,9 +1132,8 @@ pub async fn build_rewrite(
     // is borrowed; read.rs bounds each input's exemplar set to the
     // catalog-metadata memory term, so one copy stays inside that bound.
     let surviving_series: HashSet<[u8; 16]> = series_out.iter().map(|s| s.series_id.0).collect();
-    // Tally kept vs dropped exemplars as an additive report (see `RewriteBuild`).
-    // This is NOT folded into the sample conservation gate: exemplars are not
-    // samples and that gate's arithmetic must not change.
+    // Tally kept vs dropped exemplars; see `RewriteBuild`'s doc for why this is
+    // additive and separate from the sample conservation gate.
     let mut exemplars_kept: u64 = 0;
     let mut exemplars_dropped: u64 = 0;
     let exemplars: Vec<ExemplarInput> = catalogs
@@ -1174,6 +1166,7 @@ pub async fn build_rewrite(
             input_set_hash,
             series_out,
             exemplars,
+            exemplars_kept,
         )?]
     };
 
@@ -1211,13 +1204,29 @@ pub async fn build_rewrite(
 /// [`build_rewrite`] against the erasure predicate (ADR-0064 §4) and to series
 /// that survive into `batch`; `write_v5_with_exemplars` resolves each record's
 /// `series_index` against this part's own SERIES_IDS ordering.
+///
+/// `exemplars_kept` is [`build_rewrite`]'s own tally of `exemplars.len()`,
+/// threaded through separately so a caller that starts passing the wrong
+/// vector here (a hardcoded `Vec::new()`, a stale clone) is caught before the
+/// write rather than reported as a correct disposition it never produced --
+/// the same shape as the sample-count encode reconciliation in
+/// `publish_rewrite_record`.
 fn build_rewrite_part(
     bucket: &Bucket,
     config: &CompactorConfig,
     input_set_hash: &[u8; 32],
     batch: Vec<SeriesInputV4>,
     exemplars: Vec<ExemplarInput>,
+    exemplars_kept: u64,
 ) -> Result<BuiltPart> {
+    if exemplars.len() as u64 != exemplars_kept {
+        return Err(MaintainError::Invariant(format!(
+            "erasure rewrite exemplar reconciliation failed: exemplars_kept {} does not \
+             match exemplars.len() {} about to be written",
+            exemplars_kept,
+            exemplars.len()
+        )));
+    }
     let run_count: u64 = batch.iter().map(|s| s.runs.len() as u64).sum();
     let first_series_id = batch.iter().map(|s| s.series_id).min();
     let last_series_id = batch.iter().map(|s| s.series_id).max();
@@ -1676,9 +1685,7 @@ pub async fn publish_rewrite_record(
         )));
     }
 
-    // Exemplar disposition surfaces here as an additive observation, separate
-    // from the sample conservation gate above (ADR-0064 decision 3 point 4
-    // counts samples only). Zero on logs/spans, which have no exemplar section.
+    // Exemplar disposition report; see `RewriteBuild`'s doc.
     tracing::debug!(
         tenant_hash = %hex::encode(bucket.tenant_hash.0),
         signal = bucket.signal.key_prefix(),
@@ -7199,6 +7206,71 @@ mod tests {
             3,
             "dropped + kept must equal the fixture's 3 exemplars exactly, so a \
              miscount cannot hide in an unaccounted remainder"
+        );
+    }
+
+    /// Every exemplar test above seeds exactly one L0 commit, so the
+    /// cross-catalog `flat_map` in `build_rewrite`'s exemplar filter
+    /// (`catalogs.iter().flat_map(|catalog| catalog.exemplars.iter())`) is
+    /// only ever exercised with a single catalog. A sealed bucket's live
+    /// RawL0 input set is normally >=2 commits sharing a `series_id` (see the
+    /// comment on `by_series` above), so pin the shape with two: `alpha`'s
+    /// first commit carries an in-window exemplar (ts 20, dropped), its
+    /// second commit -- a separate L0, same series, non-overlapping
+    /// timestamps -- carries an out-of-window one (ts 100, kept).
+    #[tokio::test]
+    async fn rewrite_exemplar_filter_spans_two_catalogs_for_the_same_series() {
+        let store = MemoryStore::new();
+        seed_with_exemplars(
+            &store,
+            1,
+            vec![series("alpha", &[(10, 1.0), (20, 2.0)])],
+            vec![exemplar("alpha", 20, 2.0)],
+        )
+        .await;
+        seed_with_exemplars(
+            &store,
+            2,
+            vec![series("alpha", &[(100, 5.0), (110, 6.0)])],
+            vec![exemplar("alpha", 100, 5.0)],
+        )
+        .await;
+
+        let mut request = erasure_request(1, "alpha");
+        request.window_start_ns = 15;
+        request.window_end_ns = 35;
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(
+            matches!(outcome, ErasureRewriteOutcome::Rewritten { parts: 1, .. }),
+            "expected a one-part rewrite, got {outcome:?}"
+        );
+
+        let part_key = output_part_key(&store).await;
+        let got = read_output_exemplars(&store, &config, &part_key).await;
+        assert_eq!(
+            got,
+            vec![exemplar_key(&exemplar("alpha", 100, 5.0))],
+            "the first catalog's in-window exemplar (ts 20) must be dropped and \
+             the second catalog's out-of-window exemplar (ts 100) must survive, \
+             even though both name the same series_id across two catalogs"
         );
     }
 }

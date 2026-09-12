@@ -86,6 +86,14 @@ and both carry only the `signal="metrics"` series, because exemplars ride on
 metric points. A rising drop count means the cap is engaging, and an operator
 reads that from outside the process rather than from the flush logs.
 
+## Erasure removes matching exemplars
+
+A subject-erasure request removes an exemplar the same way it removes a
+sample: any exemplar matching the request's predicate is dropped from the
+rewrite output, including one whose own timestamp falls inside the erasure
+window but whose enclosing object survives because other series or samples
+in it did not match.
+
 ## How to query exemplars
 
 Query exemplars over `GET`/`POST /api/v1/query_exemplars`. The endpoint takes
