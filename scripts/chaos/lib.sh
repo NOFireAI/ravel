@@ -171,7 +171,7 @@ chaos_minio_client_available() {
     return 0
   fi
   if chaos_have_command docker; then
-    # demo.sh drives mc via `docker run minio/mc`; docker presence is the
+    # demo.sh drives mc via `docker run quay.io/minio/mc`; docker presence is the
     # gate for that path. We do not pull the image here (that would touch the
     # network); we only report the capability exists.
     return 0
@@ -317,9 +317,12 @@ minio_up() {
   fi
 
   log "ensuring bucket ${RAVEL_S3_BUCKET} exists"
+  # quay.io, not Docker Hub: Docker Hub's anonymous pull allowance is per-IP
+  # and shared across every project on a runner, so an unauthenticated pull
+  # from there fails unpredictably.
   docker run --rm --network host \
     -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
-    minio/mc:latest mb -p "local/${RAVEL_S3_BUCKET}" >/dev/null 2>&1 || true
+    quay.io/minio/mc:latest mb -p "local/${RAVEL_S3_BUCKET}" >/dev/null 2>&1 || true
 
   # ADR-0050 EC7: a non-Memory store refuses to serve until `sys/qualification`
   # exists, and there is no bootstrap-and-continue path. Qualify before any
