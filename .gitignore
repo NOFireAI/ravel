@@ -24,3 +24,9 @@ graft/
 # The disk watchdog drops this in the scope directory when it fires; the
 # harness commit-on-death sweeps an unignored file into a wip commit.
 .disk-watchdog-fired
+# Fleet executors write gate logs and any cargo-install tree inside the
+# checkout, because $HOME on the amd64 executor class is a 1 GB tmpfs and
+# /tmp is the harness capture filesystem. Ignored for the same reason as
+# the watchdog marker above: commit-on-death must not sweep them in.
+.gate-logs/
+.dd-tools/

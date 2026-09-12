@@ -97,10 +97,15 @@ Gates: format and lint IN PLACE before the commit you will gate -- run
 `cargo fmt --all` (not just --check) and, where it applies, scoped
 `cargo clippy --fix -p <crate>` -- then verify with `cargo fmt --all
 --check`; cargo clippy --workspace --all-targets -- -D warnings;
-scripts/affected-tests.sh -p <crate> [-p <crate2>]. Pass `--jobs 4` on
-the amd64 executor class and `--jobs 2` on the arm64 (Pi) class when you
-invoke cargo directly; `scripts/gates.sh` caps build jobs on an 8 GB host
-automatically, so this only matters for hand-run cargo commands. Do NOT run
+scripts/affected-tests.sh -p <crate> [-p <crate2>]. Cap cargo's build
+parallelism through the environment, not a flag, because
+`scripts/affected-tests.sh` accepts no `--jobs` and runs cargo at the
+default otherwise: find your executor class with `uname -m` and `nproc`
+(x86_64 with 16 cores is the amd64 class, aarch64 with 4 cores is the
+arm64 Pi class), then prefix every cargo command and every script that
+runs cargo with `CARGO_BUILD_JOBS=4` on amd64 or `CARGO_BUILD_JOBS=2` on
+arm64. `scripts/gates.sh` caps jobs on an 8 GB host by itself; nothing
+else does. Do NOT run
 `cargo test --workspace`: full-workspace tests are verified at merge
 time (verify-dispatch cold gate and PR CI); your job is the blast
 radius of your own change, and affected-tests.sh computes it (the
@@ -118,12 +123,14 @@ Where that file goes is itself a rule, because both wrong answers have
 already cost a task. Run this first, as ONE command, substituting
 nothing:
 
-    mkdir -p .gate-logs && grep -qxF '.gate-logs/' .git/info/exclude || echo '.gate-logs/' >> .git/info/exclude; scripts/guards/check-disk-headroom.sh .gate-logs 5 && df -h /tmp . "$HOME"
+    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 5 && df -h /tmp . "$HOME"
 
-One command because each tool call is its own shell: a variable set in
-one call is empty in the next, which is why this rule fixes the log
-path as literal text instead of building it from `$HOME` or the
-checkout's basename.
+Every step is joined with `&&` so a failure anywhere fails the command:
+`git check-ignore -q .gate-logs` proves the tracked `.gitignore` covers
+the directory before a single log is written there. The path is literal
+text rather than built from `$HOME` or the checkout's basename because
+each tool call is its own shell and a variable set in one call is empty
+in the next.
 
 If the guard exits non-zero, say so in your report and stop rather than
 picking another directory: a host without 5 GB for a log has no room for
@@ -136,13 +143,13 @@ before any gate runs, and three tasks died exactly that way on
 2026-09-12. `/tmp` is the harness's own capture filesystem (issue
 #1526): a run that fills it fails every later Bash call, including
 `true` and `df`, while the host's own disk figures still look healthy.
-Inside the checkout is the only volume with room on that class.
-`.git/info/exclude` is never tracked, so listing `.gate-logs/` there
-keeps the harness's commit-on-death `git add -A` from sweeping the logs
-into a wip commit that the merge script would then fold forward into
-the PR; do not use `.gitignore` for this, since that file is a tracked
-change this task does not own. Quote all three `df` lines (`/tmp`, `.`,
-and `"$HOME"`) in your report.
+Inside the checkout is the only volume with room on that class. The
+repository's tracked `.gitignore` lists `.gate-logs/` and `.dd-tools/`
+(the latter for any `cargo install --root "$PWD/.dd-tools"` tree), next
+to the disk-watchdog marker it already ignores for the same reason: the
+harness's commit-on-death `git add -A` must not sweep them into a wip
+commit that the merge script would then fold forward into the PR. Quote
+all three `df` lines (`/tmp`, `.`, and `"$HOME"`) in your report.
 `CLAUDE_CODE_TMPDIR` is NOT the executor's lever: the harness reads it
 when it creates the per-call capture directory, before the task's first
 Bash call, so exporting it from inside a task changes nothing. Setting it
@@ -178,8 +185,8 @@ commit:
   flipped line in your report. A test that cannot fail proves nothing.
 - **Stray files**: nothing staged that the deliverables do not name
   (scratch scripts, logs, `__pycache__/`, editor droppings). `.gate-logs/`
-  is excluded via `.git/info/exclude`, not `.gitignore`; it must never be
-  force-added (`git add -f`) into a commit.
+  and `.dd-tools/` are covered by the tracked `.gitignore`; never
+  force-add them (`git add -f`) into a commit.
 
 ## Commit before the slow gates, not after
 
@@ -230,7 +237,9 @@ the second survives a kill mid-build.
 
 The Gates template scopes executor tests with affected-tests.sh on
 purpose. A fleet task used to end with `cargo test --workspace` on an
-8 GB 4-core host: 1-2 hours of cold compile and test time per task,
+8 GB 4-core host (the arm64 Pi class; the 16 vCPU amd64 class is roughly
+four times faster, so size by the slower class): 1-2 hours of cold
+compile and test time per task,
 almost all of it re-verifying crates the change cannot affect, and all
 of it re-verified anyway at merge (the orchestrator's cold
 verify-dispatch run and the PR's required CI checks are the trust
