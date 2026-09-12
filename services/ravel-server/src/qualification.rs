@@ -1,8 +1,9 @@
 //! Store-backend qualification startup gate (ADR-0050 section 6 enforcement,
 //! EC7).
 //!
-//! A production store backend is qualified empirically, once per bucket, by
-//! `ravel-cli store qualify`, which records the outcome at `sys/qualification`
+//! A production store backend is qualified empirically, once per bucket at a
+//! given suite version, by `ravel-cli store qualify`, which records the outcome
+//! at `sys/qualification`
 //! (the durable [`QualificationRecord`], relocated into
 //! [`ravel_object_store::conformance`] so this reader and that writer share one
 //! definition). This module is the fail-closed reader every server process runs

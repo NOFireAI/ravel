@@ -25,7 +25,7 @@ t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapsho
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.cstat         column statistics (immutable; ADR-0850, ADR-0942, ADR-1413)
-sys/qualification                                                       store qualification record (write-once, additive)
+sys/qualification                                                       store qualification record (once per suite version, re-recorded on a version bump; ADR-1302)
 sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
 sys/tenancy                                                             tenant-hash scheme marker (write-once, additive; ADR-0050 §3)
 sys/auth                                                                deployment-wide keyed-token-hash -> tenant map (CAS whole-record replace, additive; ADR-0066 §6)
@@ -186,13 +186,16 @@ is folded in. The `Signal::Alerts` records, the RLOG format, and every other key
 are untouched; this is a new derived-object prefix, no version bump, following
 the `sys/maintain/memo/` precedent above (ADR-0065 §3).
 
-`sys/qualification` and the `sys/qualify/` prefix (ADR-0050 §6) are
-additive root-level keys, outside any tenant's `t/<tenant_hash>/` space.
-`sys/qualification` is written once per bucket by `ravel-cli store
-qualify` (services/ravel-cli/src/qualify.rs) via `CreateIfAbsent` after a
-passing conformance run; it is never overwritten, and server startup on a
-production store kind reads it to refuse starting when the record is
-absent or its suite version is stale. `sys/qualify/<run-id>/...` holds the
+`sys/qualification` and the `sys/qualify/` prefix (ADR-0050 §6, ADR-1302)
+are additive root-level keys, outside any tenant's `t/<tenant_hash>/` space.
+`sys/qualification` is written by `ravel-cli store qualify`
+(services/ravel-cli/src/qualify.rs) via `CreateIfAbsent` after a passing
+conformance run, once per bucket at a given suite version. A record left
+by an older suite version is the one exception: a re-run overwrites it,
+guarded by `CasVersion` on the version it read so a concurrent newer
+record is never downgraded (ADR-1302). Server startup on a production
+store kind reads it to refuse starting when the record is absent or its
+suite version is stale. `sys/qualify/<run-id>/...` holds the
 scratch objects the conformance suite (crates/ravel-object-store/src/
 conformance.rs) writes and reads while probing conditional-write and
 listing consistency under a fresh `run-id` each run; these objects are

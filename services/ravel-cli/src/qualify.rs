@@ -3,7 +3,9 @@
 //! backend and, on a pass, records the outcome at `sys/qualification` via
 //! `CreateIfAbsent` -- once per bucket at a given suite version. A record left
 //! by an older suite version is the one exception: a re-run overwrites it, which
-//! is the only way to clear `ravel-server`'s stale-record refusal.
+//! is the only way to clear `ravel-server`'s stale-record refusal. That
+//! overwrite is guarded by `CasVersion` on the read version, so a concurrent
+//! `qualify` from a newer binary can never be silently downgraded (ADR-1302).
 
 use std::sync::Arc;
 
@@ -12,7 +14,7 @@ use ravel_object_store::conformance::{
     BucketConfigProbe, CONFORMANCE_SUITE_VERSION, bucket_config_alarms, probe_bucket_config,
     probe_object_lock, run_conformance_suite,
 };
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError};
 
 // The record and its key now live in `ravel-object-store` so `ravel-server`
 // startup (ADR-0050 section 6) and this writer share one definition.
@@ -113,39 +115,75 @@ pub async fn qualify(
             Ok(())
         }
         Err(StoreError::AlreadyExists) => {
-            let existing = store
-                .get(QUALIFICATION_KEY, GetRange::Full)
-                .await
-                .map_err(|err| {
-                    anyhow::anyhow!("failed to read existing {QUALIFICATION_KEY}: {err}")
-                })?;
-            let existing: QualificationRecord = serde_json::from_slice(&existing.data)
-                .map_err(|err| anyhow::anyhow!("{QUALIFICATION_KEY} is corrupt: {err}"))?;
-            // A record recorded under an older suite version was never checked
-            // against the probes this build added, so `ravel-server` refuses to
-            // start on it (a stale record that reads as a current pass is worse
-            // than none). Re-recording is the only way to clear that refusal:
-            // `CreateIfAbsent` cannot, so the once-per-bucket rule is relaxed to
-            // once-per-suite-version and this run overwrites the stale record
-            // with the current pass. An equal-or-newer record is still left
-            // untouched, so a repeated run at the same version is a no-op
-            // (ADR-0050 section 6).
-            if existing.suite_version < CONFORMANCE_SUITE_VERSION {
-                let refreshed = serde_json::to_vec_pretty(&record).map_err(|err| {
-                    anyhow::anyhow!("failed to encode qualification record: {err}")
-                })?;
-                store
-                    .put(
-                        QUALIFICATION_KEY,
-                        Bytes::from(refreshed),
-                        PutOptions::default(),
-                    )
-                    .await
-                    .map_err(|err| {
-                        anyhow::anyhow!(
-                            "qualification passed but re-recording {QUALIFICATION_KEY} failed: {err}"
-                        )
-                    })?;
+            re_record_if_stale(store.as_ref(), &record, &backend_identity).await
+        }
+        Err(err) => Err(anyhow::anyhow!(
+            "qualification passed but writing {QUALIFICATION_KEY} failed: {err}"
+        )),
+    }
+}
+
+/// Bound on re-record retries when a concurrent `qualify` keeps changing the
+/// record between our read and our CAS write. Reached only when a peer wins the
+/// race repeatedly with an equal-or-older suite version, which no single
+/// production binary does (a peer at an equal-or-newer version ends the loop as
+/// a no-op on the next read); the bound turns a pathological mixed-binary race
+/// into a clear error instead of an operator-visible hang.
+const MAX_RERECORD_ATTEMPTS: usize = 5;
+
+/// Called when `CreateIfAbsent` reported the record already exists. Leaves an
+/// equal-or-newer record untouched (the once-per-bucket-at-a-suite-version
+/// no-op); when the stored record predates [`CONFORMANCE_SUITE_VERSION`] it was
+/// never checked against the probes this build added, so `ravel-server` refuses
+/// it as stale and this run must overwrite it (ADR-1302, superseding ADR-0050
+/// section 6's write-once rule).
+///
+/// The overwrite is guarded by [`PutMode::CasVersion`] on the version read in
+/// the same iteration, not an unconditional `Overwrite`: between the read and
+/// the write a concurrent `qualify` from a newer binary could install a
+/// higher-version record, and an unconditional overwrite would silently
+/// downgrade it back to this run's older version, installing exactly the stale
+/// record the startup gate accepts that this whole change exists to prevent.
+/// On a `PreconditionFailed` the loop re-reads and re-decides: an
+/// equal-or-newer record now present is left untouched, and only a genuinely
+/// older one is overwritten again, bounded by [`MAX_RERECORD_ATTEMPTS`].
+async fn re_record_if_stale(
+    store: &dyn ObjectStoreBackend,
+    record: &QualificationRecord,
+    backend_identity: &str,
+) -> anyhow::Result<()> {
+    for _ in 0..MAX_RERECORD_ATTEMPTS {
+        let existing_obj = store
+            .get(QUALIFICATION_KEY, GetRange::Full)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to read existing {QUALIFICATION_KEY}: {err}"))?;
+        let existing: QualificationRecord = serde_json::from_slice(&existing_obj.data)
+            .map_err(|err| anyhow::anyhow!("{QUALIFICATION_KEY} is corrupt: {err}"))?;
+
+        if existing.suite_version >= CONFORMANCE_SUITE_VERSION {
+            println!(
+                "{QUALIFICATION_KEY} already recorded for {} (suite v{}, qualified at unix_ns={}); \
+                 not overwritten -- qualification is once per bucket at this suite version, per \
+                 ADR-1302",
+                existing.backend_identity, existing.suite_version, existing.qualified_unix_ns
+            );
+            return Ok(());
+        }
+
+        let refreshed = serde_json::to_vec_pretty(record)
+            .map_err(|err| anyhow::anyhow!("failed to encode qualification record: {err}"))?;
+        match store
+            .put(
+                QUALIFICATION_KEY,
+                Bytes::from(refreshed),
+                PutOptions {
+                    mode: PutMode::CasVersion(existing_obj.version),
+                    checksum: None,
+                },
+            )
+            .await
+        {
+            Ok(_) => {
                 println!(
                     "re-recorded {QUALIFICATION_KEY}: {backend_identity} re-qualified, upgrading \
                      the stored record from suite v{} to v{}",
@@ -153,18 +191,22 @@ pub async fn qualify(
                 );
                 return Ok(());
             }
-            println!(
-                "{QUALIFICATION_KEY} already recorded for {} (suite v{}, qualified at unix_ns={}); \
-                 not overwritten -- qualification is once per bucket at this suite version, per \
-                 ADR-0050 section 6",
-                existing.backend_identity, existing.suite_version, existing.qualified_unix_ns
-            );
-            Ok(())
+            // A concurrent writer changed the record between our read and this
+            // write; re-read and re-decide rather than downgrade blindly.
+            Err(StoreError::PreconditionFailed) => continue,
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "qualification passed but re-recording {QUALIFICATION_KEY} failed: {err}"
+                ));
+            }
         }
-        Err(err) => Err(anyhow::anyhow!(
-            "qualification passed but writing {QUALIFICATION_KEY} failed: {err}"
-        )),
     }
+
+    Err(anyhow::anyhow!(
+        "qualification passed but {QUALIFICATION_KEY} is being rewritten concurrently by another \
+         qualify run; retried {MAX_RERECORD_ATTEMPTS} times without a stable version. Re-run \
+         `ravel-cli store qualify` once concurrent runs have stopped"
+    ))
 }
 
 /// Render the informational required-bucket-configuration report for a
