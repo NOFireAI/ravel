@@ -31,7 +31,7 @@ use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, Scri
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
-use ravel_query::{EngineConfig, SegmentFetcher};
+use ravel_query::{EngineConfig, PhaseAccounting, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::RavelTableProvider;
 use ravel_types::accounting::QueryAccounting;
@@ -227,7 +227,7 @@ async fn run_pipeline(
 ) -> Reduced {
     let fetcher = SegmentFetcher::new(store);
     let provider =
-        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, PhaseAccounting::new());
     let plan = provider.plan(target_partitions).expect("build plan");
     let batches = collect(plan, Arc::new(TaskContext::default()))
         .await
@@ -495,7 +495,7 @@ async fn pending_erasure_excludes_matching_series_when_bytes_are_served_from_a_w
         TENANT,
         fetcher.clone(),
         EngineConfig::default(),
-        warm_accounting.clone(),
+        PhaseAccounting::pooled_over(&warm_accounting),
     );
     let plan = provider.plan(1).expect("build plan");
     collect(plan, Arc::new(TaskContext::default()))
@@ -523,7 +523,7 @@ async fn pending_erasure_excludes_matching_series_when_bytes_are_served_from_a_w
         TENANT,
         fetcher,
         EngineConfig::default(),
-        hot_accounting.clone(),
+        PhaseAccounting::pooled_over(&hot_accounting),
     );
     let plan = provider.plan(1).expect("build plan");
     let batches = collect(plan, Arc::new(TaskContext::default()))
@@ -603,7 +603,7 @@ async fn optimizer_path_preserves_sort_preserving_merge_and_full_rows() {
         TENANT,
         fetcher,
         EngineConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     ctx.register_table("samples", Arc::new(provider))
         .expect("register table");
@@ -738,7 +738,7 @@ async fn max_samples_budget_trips_on_yielded_rows() {
     };
     let fetcher = SegmentFetcher::new(backend);
     let provider =
-        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, PhaseAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, Arc::new(TaskContext::default()))
         .await
@@ -793,7 +793,7 @@ async fn mid_scan_get_failure_is_typed_error_and_fault_fires() {
         TENANT,
         fetcher,
         EngineConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, Arc::new(TaskContext::default()))

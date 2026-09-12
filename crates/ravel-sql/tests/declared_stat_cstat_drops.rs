@@ -30,10 +30,9 @@ use ravel_commit::declared_stats::{StatCarrier, declared_stat_drops_observed};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
-use ravel_query::LogSegmentFetcher;
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{DeclaredColumn, DeclaredType, LogsTableProvider};
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -156,7 +155,7 @@ fn resolve(
         },
         TENANT,
         LogSegmentFetcher::new(backend),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_declared_columns(vec![DeclaredColumn::new(COL, DeclaredType::I64)])
     .with_column_stats(Some(stats));

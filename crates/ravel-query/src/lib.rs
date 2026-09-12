@@ -14,7 +14,7 @@ pub mod io_shape;
 mod limiter;
 mod log_fetcher;
 pub mod log_series;
-mod phase_accounting;
+pub mod phase_accounting;
 mod query_admission;
 mod request_budgets;
 mod segment_admission;

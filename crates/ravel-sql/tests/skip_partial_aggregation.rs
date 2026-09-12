@@ -71,7 +71,7 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::LogSegmentFetcher;
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
     LogsTableProvider, SKIP_PARTIAL_AGGREGATION_PROBE_ROWS, SessionTable, SpillDecision, SqlConfig,
     TenantMemoryAccountant, build_session,
@@ -404,7 +404,7 @@ async fn run(
         snapshot,
         TENANT,
         LogSegmentFetcher::new(Arc::clone(store)),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     ));
     let ctx = build_session(
         &config,

@@ -72,7 +72,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{CacheFetchError, LogSegmentFetcher};
+use ravel_query::{CacheFetchError, LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
     CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision,
     SqlConfig, TenantDelegatingPool, TenantMemoryAccountant, build_session,
@@ -441,9 +441,13 @@ async fn run(sql: &str, setup: Setup) -> Run {
     } else {
         fetcher
     };
-    let provider =
-        LogsTableProvider::new(snapshot, TenantHash(TENANT), fetcher, accounting.clone())
-            .with_declared_columns(declared_columns());
+    let provider = LogsTableProvider::new(
+        snapshot,
+        TenantHash(TENANT),
+        fetcher,
+        PhaseAccounting::pooled_over(&accounting),
+    )
+    .with_declared_columns(declared_columns());
     let config = config(setup);
     let ctx = session(provider, &config);
 

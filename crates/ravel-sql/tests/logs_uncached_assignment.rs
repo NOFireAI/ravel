@@ -41,10 +41,9 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{CacheFetchError, LogSegmentFetcher};
+use ravel_query::{CacheFetchError, LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::LogsTableProvider;
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
 
 use util::CountingStore;
@@ -229,7 +228,7 @@ fn provider(snapshot: Snapshot, fetcher: LogSegmentFetcher) -> LogsTableProvider
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
 }
 

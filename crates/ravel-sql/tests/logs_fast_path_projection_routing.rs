@@ -69,12 +69,13 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{BlockRangeFetcher, CacheFetchError, LogFetchError, LogSegmentFetcher};
+use ravel_query::{
+    BlockRangeFetcher, CacheFetchError, LogFetchError, LogSegmentFetcher, PhaseAccounting,
+};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_TS, LogsTableProvider,
 };
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
 
 const TENANT: [u8; 16] = [7u8; 16];
@@ -381,7 +382,7 @@ fn provider(snapshot: Snapshot, fetcher: LogSegmentFetcher) -> LogsTableProvider
         snapshot,
         TenantHash(TENANT),
         fetcher,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_declared_columns(declared_columns())
 }

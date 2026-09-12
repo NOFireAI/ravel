@@ -832,6 +832,7 @@ mod tests {
     use ravel_catalog::Snapshot;
     use ravel_object_store::memory::MemoryStore;
 
+    use ravel_query::phase_accounting::PhaseAccounting;
     use ravel_types::accounting::QueryAccounting;
 
     use super::*;
@@ -1170,7 +1171,7 @@ mod tests {
             ravel_types::TenantHash([0u8; 16]),
             ravel_query::SegmentFetcher::new(store.clone()),
             SqlConfig::default(),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )))
     }
 
@@ -1179,7 +1180,7 @@ mod tests {
             empty_snapshot(),
             ravel_types::TenantHash([0u8; 16]),
             ravel_query::LogSegmentFetcher::new(store.clone()),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )))
     }
 

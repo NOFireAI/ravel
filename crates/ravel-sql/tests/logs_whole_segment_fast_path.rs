@@ -44,7 +44,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{CacheFetchError, LogSegmentFetcher};
+use ravel_query::{CacheFetchError, LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::LogsTableProvider;
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -211,7 +211,12 @@ fn provider_with_accounting(
     fetcher: LogSegmentFetcher,
     accounting: QueryAccounting,
 ) -> LogsTableProvider {
-    LogsTableProvider::new(snapshot, TenantHash([7u8; 16]), fetcher, accounting)
+    LogsTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        fetcher,
+        PhaseAccounting::pooled_over(&accounting),
+    )
 }
 
 fn provider(snapshot: Snapshot, fetcher: LogSegmentFetcher) -> LogsTableProvider {

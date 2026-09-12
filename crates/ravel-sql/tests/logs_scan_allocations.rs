@@ -28,10 +28,9 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::LogSegmentFetcher;
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{LogsScanExec, logs_schema_with_declared};
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::log_stream_id;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 use uuid::Uuid;
@@ -159,7 +158,7 @@ async fn drain(
         // ts, observed_ts, severity_num, flags: numeric fixed columns, so the
         // query is columnar-eligible and no per-cell string decode is charged.
         Some(&vec![0usize, 1, 2, 7]),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
         logs_schema_with_declared(&[]),
         Arc::new(Vec::new()),
     )

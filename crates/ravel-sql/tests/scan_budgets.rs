@@ -27,7 +27,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{ByteLimit, EngineConfig, RequestLimit, SegmentFetcher};
+use ravel_query::{ByteLimit, EngineConfig, PhaseAccounting, RequestLimit, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{RavelTableProvider, SqlConfig, TenantMemoryAccountant};
 use ravel_types::accounting::QueryAccounting;
@@ -245,7 +245,7 @@ async fn max_series_rejects_before_every_segment_is_fetched() {
         TENANT,
         baseline_fetcher,
         baseline_config,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let baseline_plan = baseline_provider.plan(1).expect("plan");
     collect(baseline_plan, Arc::new(TaskContext::default()))
@@ -273,7 +273,7 @@ async fn max_series_rejects_before_every_segment_is_fetched() {
         TENANT,
         capped_fetcher,
         capped_config,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let capped_plan = capped_provider.plan(1).expect("plan");
     let err = collect(capped_plan, Arc::new(TaskContext::default()))
@@ -325,7 +325,7 @@ async fn max_bytes_scanned_rejects_before_every_segment_is_fetched() {
         TENANT,
         baseline_fetcher,
         baseline_config,
-        baseline_acc.clone(),
+        PhaseAccounting::pooled_over(&baseline_acc),
     );
     let baseline_plan = baseline_provider.plan(1).expect("plan");
     collect(baseline_plan, Arc::new(TaskContext::default()))
@@ -354,7 +354,7 @@ async fn max_bytes_scanned_rejects_before_every_segment_is_fetched() {
         TENANT,
         capped_fetcher,
         capped_config,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let capped_plan = capped_provider.plan(1).expect("plan");
     let err = collect(capped_plan, Arc::new(TaskContext::default()))
@@ -391,7 +391,7 @@ async fn unlimited_bytes_scanned_matches_prior_behavior() {
         ..EngineConfig::default()
     };
     let provider =
-        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, PhaseAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let batches = collect(plan, Arc::new(TaskContext::default()))
         .await
@@ -437,7 +437,7 @@ async fn max_s3_requests_rejects_before_every_segment_is_fetched() {
         TENANT,
         baseline_fetcher,
         baseline_config,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let baseline_plan = baseline_provider.plan(1).expect("plan");
     collect(baseline_plan, Arc::new(TaskContext::default()))
@@ -461,7 +461,7 @@ async fn max_s3_requests_rejects_before_every_segment_is_fetched() {
         TENANT,
         capped_fetcher,
         capped_config,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let capped_plan = capped_provider.plan(1).expect("plan");
     let err = collect(capped_plan, Arc::new(TaskContext::default()))
@@ -540,7 +540,7 @@ async fn byte_budget_rejects_during_fetch_decode_not_only_after_batches() {
         TENANT,
         fetcher,
         EngineConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let plan = provider.plan(1).expect("plan");
     let mut stream = plan.execute(0, task_ctx).expect("execute");
