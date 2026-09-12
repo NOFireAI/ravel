@@ -376,29 +376,30 @@ it durably records `sys/qualification` in the bucket, so a qualified bucket
 handed to a new `RavelCluster` with the same inputs still gets its own Job
 run (the gate reads this `RavelCluster`'s own status, not the bucket record).
 That run re-runs the full conformance suite rather than short-circuiting on
-the existing record: the suite is 28 sequential object operations, up to
-roughly 560 s against a slow-but-healthy backend, so the Job can sit for
-minutes even on a bucket you know is qualified. It passes if the backend
-still satisfies the contract, and the final `sys/qualification` write is then
-a no-op, unless the stored record predates this binary's suite version, in
-which case the run overwrites it in place and reports that it upgraded the
-record. Because qualification now runs on every input change rather than only
-when you run it by hand, the transient scratch each run leaves under
-`sys/qualify/<run-id>/` accumulates without you choosing to; the [deployment
-guide](operations/deployment.md#qualify-the-store) describes that scratch and
-why nothing deletes it.
+the existing record: the suite issues dozens of object operations against
+the bucket, several of them concurrent rather than sequential, so the Job
+can sit for minutes even on a bucket you know is qualified. It passes if the
+backend still satisfies the contract, and the final `sys/qualification`
+write is then a no-op, unless the stored record predates this binary's
+suite version, in which case the run overwrites it in place and reports
+that it upgraded the record. Because qualification now runs on every input
+change rather than only when you run it by hand, the transient scratch each
+run leaves under `sys/qualify/<run-id>/` accumulates without you choosing
+to; the [deployment guide](operations/deployment.md#qualify-the-store)
+describes that scratch and why nothing deletes it.
 
 Progress and failure surface on the `StoreQualified` condition below, not as
 a Job failure you have to go find: `Pending` while the Job is being created
-or is still running, `Succeeded` once it passes, `Failed` once it exhausts
-its retry budget (the message names the attempt count and the next retry
-time). A failing Job is recreated on a capped exponential backoff (30 s
-doubling to 480 s) for the first five consecutive failures; after six it
-holds for an hour before trying again, and only a qualified-input change
-clears that hold early. Fixing the backend outside the `RavelCluster` spec (a
-bucket policy or endpoint setting) does not shorten the hold, because no
-hashed input changed. `kubectl describe job <cluster>-qualify` and its pod
-logs give the underlying `store qualify` failure, but only for about an hour:
+or is still running, `Succeeded` once it passes, `Failed` once a qualify Job
+reports failure (the message names the consecutive-attempt count and the
+next retry time, so `Failed` on its own is not terminal). A failing Job is
+recreated on a capped exponential backoff (30 s doubling to 480 s) for the
+first five consecutive failures; after six it holds for an hour before
+trying again, and only a qualified-input change clears that hold early.
+Fixing the backend outside the `RavelCluster` spec (a bucket policy, an IAM
+grant, a network route) does not shorten the hold, because no hashed input
+changed. `kubectl describe job <cluster>-qualify` and its pod logs give the
+underlying `store qualify` failure, but only for about an hour:
 the Job and its pod are garbage-collected an hour after they finish, on the
 success and failure paths alike, so the `StoreQualified` condition message is
 the durable record and the Job is best-effort within that window.
