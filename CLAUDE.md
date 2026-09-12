@@ -577,8 +577,19 @@ into a false green. When you write or edit any such script:
 Facts about the dispatched clone that executors have re-derived by trial
 and error, one wasted turn (or one lost result) at a time:
 
-- The host has 8 GB RAM and 4 cores. See "Long commands and the Bash
-  tool" above for the `timeout` and `--jobs` consequences.
+- Two executor classes exist. The amd64 class (label `arch=amd64`) has 16
+  vCPU, 30 GB RAM, and about 350 GB free on the root volume, but HOME is
+  a 1 GB tmpfs: never write logs or `cargo install` output under HOME on
+  this class, and use `--root "$PWD/.dd-tools"` style paths inside the
+  checkout for any tool install. The arm64 Pi class has 4 cores and 8 GB
+  RAM; keep `--jobs 2` there. See "Long commands and the Bash tool" above
+  for the `timeout` and `--jobs` consequences on the Pi class.
+- Gate logs go to `.gate-logs/` inside the checkout, excluded through
+  `.git/info/exclude` (never `.gitignore`, which would be a tracked
+  change), for the reasons stated in the fleet-task-spec skill.
+- fleet-cp rejects any dispatch spec whose text contains a dollar-paren
+  command substitution or a backtick substitution with `400 bad request`.
+  Write every path in a spec as fixed text.
 - Fresh clones may carry no git identity, and the first `git commit -s`
   fails with "unable to auto-detect email address". Before your first
   commit, run: `git config user.email "fleet-executor@nofire.ai" &&
