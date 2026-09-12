@@ -44,8 +44,12 @@ spec:
         app.kubernetes.io/component: fake-s3
     spec:
       containers:
+        # MinIO images are pulled from quay.io, not Docker Hub: Docker Hub's
+        # anonymous pull allowance is per-IP and shared across every project
+        # on a runner, so an unauthenticated pull from there fails
+        # unpredictably.
         - name: minio
-          image: minio/minio:latest
+          image: quay.io/minio/minio:latest
           imagePullPolicy: IfNotPresent
           # The image has no default command that serves anything; `server
           # /data` is required, which is also why the CI job runs MinIO with
@@ -136,7 +140,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: create-bucket
-          image: minio/mc:latest
+          image: quay.io/minio/mc:latest
           imagePullPolicy: IfNotPresent
           env:
             # Must match spec.storage.s3.bucket of the RavelCluster that uses
