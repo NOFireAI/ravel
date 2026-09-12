@@ -129,24 +129,36 @@ directly. Five stages need instrumentation: `admit`, `route`, `merge`,
 surface small.
 
 **These stages are not a partition, and summing them double-counts.** The
-first four are disjoint and consecutive, so `admit + route + merge + encode`
-is a meaningful total. `bloom` is not a fifth slice alongside them: it is
+first four are measured over disjoint, consecutive code boundaries, so no
+nanosecond is counted under two of `admit`, `route`, `merge`, and `encode`.
+That does not make their sum wall-clock time: `route` and `admit` are
+recorded per `LogIngestRouter::write` call, of which many can be in flight
+concurrently across shards, and `encode` is recorded inside a flush task
+spawned off the shard actor (`log_shard.rs:1660`, `self.flushes.spawn(...)`)
+rather than on the actor itself, with up to `max_inflight_flushes` such tasks
+running at once per shard (`log_shard.rs:6-14`). The four figures are
+per-stage busy time summed across overlapping tasks, not samples of a single
+timeline, so their sum can already exceed wall time before `bloom` enters
+the picture. `bloom` is not a fifth slice alongside them either: it is
 measured *inside* `encode`, with the enclosing `encode` timer still running
 (issue #1516). The `RlogWriter` block-write loop times each block's
-`BloomBuilder` insert-plus-`finish` window and reports the sum through
-`WriteStats::bloom_block_ns`, which `log_shard` folds into the `bloom`
-accumulator; every one of those nanoseconds is also counted in `encode`. So
-`admit + route + merge + encode + bloom` exceeds the wall time the pipeline
-actually spent, by exactly the bloom figure. Read `bloom` as a breakdown of
-`encode`, never as a term in a total. The table lists it after `encode`
-because it is contained by it, not because it runs after it.
+`BloomBuilder` insert-plus-`finish` window and reports one entry per block
+through `WriteStats::bloom_block_ns`, which `log_shard` folds into the
+`bloom` accumulator; every one of those nanoseconds is also counted in
+`encode`. So
+`bloom` adds double-counting on top of the four stages' own lack of a
+wall-clock relationship. Read `bloom` as a breakdown of `encode`, never as a
+term in a total, and do not read the four disjoint-boundary stages as
+summing to wall time either. The table lists `bloom` after `encode` because
+it is contained by it, not because it runs after it.
 
-The nesting is deliberate rather than an artefact. Carving bloom out of
-`encode` as a disjoint slice would mean starting and stopping the `encode`
-timer around every block's bloom window, which puts two `Instant::now()`
-reads per block into the path whose cost is under measurement. Measuring the
-inner window separately costs the same two reads but leaves `encode`
-comparable to the figure it reported before this stage existed.
+The nesting is deliberate rather than an artefact. A disjoint `bloom` slice
+would make `encode` mean something different from what it meant before this
+stage existed: readers who compare an `encode` figure across a build with
+`bloom` split out and one without would be comparing "encode minus bloom" to
+"encode including bloom" without any signal that the basis changed. Nesting
+keeps `encode` reporting the same thing it always has, with `bloom` as a
+breakdown of part of it.
 
 **Caveat on `admit` — CORRECTED after T1 (#504) measured it.** The original
 text here said the bulk-load path bypasses the per-tenant
@@ -289,9 +301,11 @@ flowchart LR
 ```
 
 The left-to-right arrows are pipeline order and the boxes they connect are
-disjoint, so those figures sum. `bloom` is drawn inside the `encode` box
-rather than on the chain because it is contained by `encode`, not sequenced
-with it; see decision 2 on why summing all five double-counts.
+disjoint code boundaries, so no nanosecond is counted under two of them; that
+is not the same as summing to wall time under concurrency (see decision 2).
+`bloom` is drawn inside the `encode` box rather than on the chain because it
+is contained by `encode`, not sequenced with it; see decision 2 on why
+summing all five double-counts.
 
 ## Rejected alternatives
 
