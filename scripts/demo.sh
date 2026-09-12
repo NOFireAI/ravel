@@ -74,9 +74,12 @@ else
 fi
 
 log "ensuring bucket ${RAVEL_S3_BUCKET} exists"
+# quay.io, not Docker Hub: Docker Hub's anonymous pull allowance is per-IP and
+# shared across every project on a runner, so an unauthenticated pull from
+# there fails unpredictably.
 docker run --rm --network host \
   -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
-  minio/mc:latest mb -p "local/${RAVEL_S3_BUCKET}" >/dev/null 2>&1 || true
+  quay.io/minio/mc:latest mb -p "local/${RAVEL_S3_BUCKET}" >/dev/null 2>&1 || true
 
 log "building ravel-server and ravel-cli"
 cargo build --quiet -p ravel-server -p ravel-cli

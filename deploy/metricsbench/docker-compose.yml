@@ -123,8 +123,13 @@ services:
   # against this MinIO is a correctness/functional result, NOT a publishable
   # cost or performance result. A real-S3 substrate is required for that, exactly
   # as Ravel's own publishable lane requires real S3.
+  # MinIO images are pulled from quay.io, not Docker Hub: Docker Hub's
+  # anonymous pull allowance is per-IP and shared across every project on a
+  # runner, so an unauthenticated pull from there fails unpredictably. The
+  # digest is content-addressed and identical on quay.io, so the pin below is
+  # preserved, not weakened.
   minio:
-    image: minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b
+    image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b
     command: server /data --console-address ":9001"
     ports:
       - "127.0.0.1:9101:9001"
@@ -140,7 +145,7 @@ services:
           memory: 2g
 
   createbuckets:
-    image: minio/mc:RELEASE.2025-04-08T15-39-49Z@sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952
+    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z@sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952
     depends_on: [minio]
     # Mimir's `all` target opens blocks, ruler and alertmanager storage; create
     # all three buckets so a fresh MinIO does not stall Mimir startup. The
