@@ -2839,6 +2839,22 @@ fn parse_bool_field(spec: &str, key: &str, value: &str) -> anyhow::Result<bool> 
 }
 
 impl Cli {
+    /// The `backend_identity` this process compares against a
+    /// `sys/qualification` record at startup (ADR-0050 section 6, D2), or
+    /// `None` for the exempt memory store. Built from
+    /// [`ravel_object_store::conformance::s3_backend_identity`], the same
+    /// function `ravel-cli store qualify` writes the record with, so the reader
+    /// and writer never disagree on format.
+    pub fn backend_identity(&self) -> Option<String> {
+        match self.store {
+            StoreKind::Memory => None,
+            StoreKind::S3 => Some(ravel_object_store::conformance::s3_backend_identity(
+                self.s3_bucket.as_deref(),
+                self.s3_endpoint.as_deref(),
+            )),
+        }
+    }
+
     /// The OTLP trace-export config `main.rs` passes to
     /// `ravel_tracing_export::init` (ADR-0060), or `None` when
     /// `--otlp-trace-endpoint` is absent. A single function so the binary's
@@ -7840,6 +7856,54 @@ mod tests {
         let mut argv = vec!["ravel-server"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv).expect("flags parse")
+    }
+
+    /// The identity the qualification gate compares against is the exact string
+    /// `ravel-cli store qualify` records, in both the endpoint and no-endpoint
+    /// forms, and the exempt memory store supplies none. Pinned here because
+    /// the check is warn-only: a reader that built the string differently (the
+    /// two arguments are both `Option<&str>`, so swapping them compiles) would
+    /// warn on every start against a correctly qualified bucket, and nothing
+    /// would fail.
+    #[test]
+    fn backend_identity_matches_the_recorded_format() {
+        assert_eq!(
+            cli(&[]).backend_identity(),
+            None,
+            "the memory store is exempt, so there is nothing to compare"
+        );
+
+        let with_endpoint = cli(&[
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ]);
+        assert_eq!(
+            with_endpoint.backend_identity().as_deref(),
+            Some("s3://ravel-test@http://127.0.0.1:9000")
+        );
+
+        let without_endpoint = cli(&[
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ]);
+        assert_eq!(
+            without_endpoint.backend_identity().as_deref(),
+            Some("s3://ravel-test")
+        );
     }
 
     /// Reachability (ADR-0074): the shipped
