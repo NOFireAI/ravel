@@ -110,8 +110,7 @@ pub struct RlogWriter {
 /// allowlist forbids: `postings_distinct_total` over `postings_indexed_fields`
 /// yields a mean distinct-per-field, and `postings_distinct_max` the tail,
 /// with no field name ever leaving this struct.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(not(feature = "stage-timing"), derive(Copy))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WriteStats {
     /// Indexed fields dropped from POSTINGS in this object for exceeding
     /// `RlogConfig::postings_max_distinct`
@@ -143,19 +142,27 @@ pub struct WriteStats {
     /// budget, which is otherwise silent (ADR-0100 decision 1). Same
     /// aggregate-only, no-per-field-label shaping as the fields above.
     pub dynamic_columns_overflowed: u32,
-    /// Nanoseconds spent building each block's bloom filter: the
-    /// `BloomBuilder::new` through `finish` window in the block-write loop,
-    /// one entry per block in block order. Excludes `write_block` /
+    /// Total nanoseconds spent building this object's bloom filters: the sum,
+    /// across every block, of that block's `BloomBuilder::new` through
+    /// `finish` window in the block-write loop. Excludes `write_block` /
     /// `write_block_columnar` (block assembly), POSTINGS term accumulation
     /// (which both paths run in a pass of its own ahead of that window, so a
     /// tenant with indexed fields is not charged for it here), and everything
-    /// else `build_object` / `build_object_columnar` does. Only present with the
-    /// `stage-timing` feature; the caller (`ravel_ingest::log_shard`) folds
-    /// each entry in as its own `LogStage::Bloom` sample, nested inside (not
+    /// else `build_object` / `build_object_columnar` does. Paired with
+    /// [`Self::bloom_blocks`], the block count the sum was taken over; no
+    /// per-block distribution is kept because nothing today consumes more
+    /// than the count and the sum (a future p50/max would be a reason to add
+    /// one back). Only present with the `stage-timing` feature; the caller
+    /// (`ravel_ingest::log_shard`) folds the pair directly into
+    /// `LogStage::Bloom`'s sample count and total, nested inside (not
     /// subtracted from) the `LogStage::Encode` window that already times the
     /// whole `finish_with_stats` call (issue #1516).
     #[cfg(feature = "stage-timing")]
-    pub bloom_block_ns: Vec<u64>,
+    pub bloom_total_ns: u64,
+    /// Number of blocks [`Self::bloom_total_ns`] was summed over, one per
+    /// block written (issue #1516).
+    #[cfg(feature = "stage-timing")]
+    pub bloom_blocks: u32,
 }
 
 /// The maximum byte length of a string value inserted into the bloom by exact
@@ -535,7 +542,9 @@ impl RlogWriter {
         let mut blocks = BlocksBuilder::new(layout);
         let mut bloom_entries: Vec<Vec<u8>> = Vec::new();
         #[cfg(feature = "stage-timing")]
-        let mut bloom_block_ns: Vec<u64> = Vec::new();
+        let mut bloom_total_ns: u64 = 0;
+        #[cfg(feature = "stage-timing")]
+        let mut bloom_blocks: u32 = 0;
 
         // POSTINGS accumulation: per indexed column, term -> sorted block
         // indices. `BTreeMap`/`BTreeSet` throughout, never `HashMap`, so
@@ -607,9 +616,16 @@ impl RlogWriter {
             // distinct-value cap (decision 4) now counts merged values.
             //
             // This runs in its own pass ahead of the timed bloom region
-            // below, never inside it: `bloom_block_ns` reports bloom
+            // below, never inside it: `bloom_total_ns` reports bloom
             // construction alone, and a tenant with indexed fields would
             // otherwise see term accounting charged to bloom (issue #1516).
+            // The split is unconditional (no `stage-timing` gate), so every
+            // build traverses `block_rows` twice per block where it traversed
+            // it once before this pass existed, including a tenant with no
+            // indexed fields, whose added pass iterates an empty
+            // `row.indexed_terms` per row and does nothing. Not yet measured
+            // against the #1511 profile to know whether that second
+            // traversal is within noise; flagged rather than guessed.
             for row in block_rows {
                 for (cid, v) in &row.indexed_terms {
                     if postings_capped.contains(cid) {
@@ -646,8 +662,11 @@ impl RlogWriter {
             }
             bloom_entries.push(builder.finish());
             #[cfg(feature = "stage-timing")]
-            bloom_block_ns
-                .push(u64::try_from(bloom_start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            {
+                bloom_total_ns +=
+                    u64::try_from(bloom_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                bloom_blocks += 1;
+            }
 
             // Accounting.
             for row in block_rows {
@@ -831,7 +850,9 @@ impl RlogWriter {
                 dynamic_columns_used,
                 dynamic_columns_overflowed,
                 #[cfg(feature = "stage-timing")]
-                bloom_block_ns,
+                bloom_total_ns,
+                #[cfg(feature = "stage-timing")]
+                bloom_blocks,
             },
         ))
     }
@@ -1209,7 +1230,9 @@ impl RlogWriter {
         let mut blocks = BlocksBuilder::new(layout);
         let mut bloom_entries: Vec<Vec<u8>> = Vec::new();
         #[cfg(feature = "stage-timing")]
-        let mut bloom_block_ns: Vec<u64> = Vec::new();
+        let mut bloom_total_ns: u64 = 0;
+        #[cfg(feature = "stage-timing")]
+        let mut bloom_blocks: u32 = 0;
         let mut postings_terms: BTreeMap<u32, BTreeMap<Vec<u8>, BTreeSet<u32>>> = BTreeMap::new();
         let mut postings_capped: BTreeSet<u32> = BTreeSet::new();
         let mut min_ts = i64::MAX;
@@ -1428,8 +1451,10 @@ impl RlogWriter {
 
             // POSTINGS over each row's merged-view indexed terms, in its own
             // pass ahead of the timed bloom region below and never inside it,
-            // for the same reason as the row path: `bloom_block_ns` reports
-            // bloom construction alone (issue #1516).
+            // for the same reason as the row path: `bloom_total_ns` reports
+            // bloom construction alone (issue #1516). Same unconditional
+            // second traversal, same "not yet measured against #1511" caveat
+            // as `build_object`'s POSTINGS pass.
             let mut terms_start = 0usize;
             for li in 0..block_rows.len() {
                 let terms_end = blk_indexed_ends
@@ -1498,8 +1523,11 @@ impl RlogWriter {
             }
             bloom_entries.push(builder.finish());
             #[cfg(feature = "stage-timing")]
-            bloom_block_ns
-                .push(u64::try_from(bloom_start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            {
+                bloom_total_ns +=
+                    u64::try_from(bloom_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                bloom_blocks += 1;
+            }
 
             for &g in block_rows {
                 min_ts = min_ts.min(g_ts[g]);
@@ -1662,7 +1690,9 @@ impl RlogWriter {
                 dynamic_columns_used,
                 dynamic_columns_overflowed,
                 #[cfg(feature = "stage-timing")]
-                bloom_block_ns,
+                bloom_total_ns,
+                #[cfg(feature = "stage-timing")]
+                bloom_blocks,
             },
         ))
     }
@@ -3552,8 +3582,8 @@ mod tests {
         let (_obj, stats) = w.finish_with_stats().expect("finish");
         // Field-by-field, not a full-struct `assert_eq!` against
         // `WriteStats::default()`: with `stage-timing` on, this single-record
-        // write still builds one block's bloom, so `bloom_block_ns` is
-        // genuinely non-empty here and a full-struct comparison against the
+        // write still builds one block's bloom, so `bloom_blocks` is
+        // genuinely nonzero here and a full-struct comparison against the
         // all-default value would fail for a reason this test isn't about.
         assert_eq!(stats.postings_capped_fields, 0);
         assert_eq!(stats.postings_bytes, 0);
@@ -3564,17 +3594,16 @@ mod tests {
         assert_eq!(stats.dynamic_columns_overflowed, 0);
     }
 
-    /// One `bloom_block_ns` sample per block, no more, no fewer (issue #1516).
-    /// `block_target_records: 3` chunks 30 pushed records into exactly 10
-    /// blocks (`chunk_blocks` splits by record count alone here;
+    /// `bloom_blocks` counts one block per bloom sample, no more, no fewer
+    /// (issue #1516). `block_target_records: 3` chunks 30 pushed records into
+    /// exactly 10 blocks (`chunk_blocks` splits by record count alone here;
     /// `block_max_bytes`'s default 8MB is nowhere near reached at this
-    /// scale), so the sample count is pinned to 10, not merely asserted
-    /// non-empty: a build that recorded one sample for the whole write
-    /// instead of one per block would still pass a `> 0` check but fails
-    /// this one.
+    /// scale), so the count is pinned to 10, not merely asserted nonzero: a
+    /// build that recorded one sample for the whole write instead of one per
+    /// block would still pass a `> 0` check but fails this one.
     #[cfg(feature = "stage-timing")]
     #[test]
-    fn bloom_block_ns_reports_exactly_one_sample_per_block() {
+    fn bloom_blocks_reports_exactly_one_sample_per_block() {
         let cfg = RlogConfig {
             block_target_records: 3,
             ..RlogConfig::default()
@@ -3585,12 +3614,11 @@ mod tests {
         }
         let (_obj, stats) = w.finish_with_stats().expect("finish");
         assert_eq!(
-            stats.bloom_block_ns.len(),
-            10,
+            stats.bloom_blocks, 10,
             "30 records at block_target_records=3 must chunk into exactly 10 blocks, one bloom sample each"
         );
-        // bloom_block_ns entries are wall-clock durations; deliberately not
-        // asserted on beyond their count above.
+        // bloom_total_ns is a wall-clock duration; deliberately not asserted
+        // on beyond the block count above.
     }
 
     /// The timed bloom region covers bloom construction and nothing else: in
@@ -3661,14 +3689,18 @@ mod tests {
         }
     }
 
-    /// The runtime half of [`timed_bloom_region_excludes_postings_work`]: the
-    /// same records written with and without indexed fields produce the same
-    /// number of bloom samples, and the indexed write really did do POSTINGS
-    /// work (its counters are exact and nonzero), so the exclusion above is
-    /// about a workload that has something to exclude.
+    /// A fixture check, not a runtime counterpart to
+    /// [`timed_bloom_region_excludes_postings_work`]: bloom sampling is one
+    /// entry per block, and where the POSTINGS pass sits relative to the
+    /// timed bloom region has no effect on block chunking, so
+    /// `indexed_stats.bloom_blocks == bare_stats.bloom_blocks` would hold
+    /// whether or not the exclusion in that test were real. What this test
+    /// proves is that the indexed write performs real, nonzero POSTINGS work
+    /// (its counters are exact), so the source-scan exclusion above is about
+    /// a workload that actually has something to exclude, not an empty one.
     #[cfg(feature = "stage-timing")]
     #[test]
-    fn bloom_sample_count_is_unchanged_by_indexed_fields() {
+    fn indexed_write_performs_real_postings_work() {
         let cfg = RlogConfig {
             block_target_records: 3,
             ..RlogConfig::default()
@@ -3694,11 +3726,10 @@ mod tests {
         assert_eq!(bare_stats.postings_indexed_fields, 0);
         assert_eq!(indexed_stats.postings_indexed_fields, 1, "svc");
         assert_eq!(indexed_stats.postings_distinct_total, 5, "s0..s4");
-        assert_eq!(bare_stats.bloom_block_ns.len(), 10);
+        assert_eq!(bare_stats.bloom_blocks, 10);
         assert_eq!(
-            indexed_stats.bloom_block_ns.len(),
-            bare_stats.bloom_block_ns.len(),
-            "POSTINGS work adds no bloom sample"
+            indexed_stats.bloom_blocks, bare_stats.bloom_blocks,
+            "block chunking is unaffected by indexed fields, not evidence of timing exclusion"
         );
     }
 
@@ -4228,17 +4259,16 @@ mod tests {
         }
 
         /// Assert the row and columnar builds agree on every deterministic
-        /// [`WriteStats`] field, and on the SAMPLE COUNT (not the durations)
-        /// of `bloom_block_ns`.
+        /// [`WriteStats`] field, and on the BLOCK COUNT (not the durations)
+        /// of the bloom fields.
         ///
-        /// `bloom_block_ns` holds wall-clock measurements, so a full-struct
+        /// `bloom_total_ns` holds a wall-clock measurement, so a full-struct
         /// `prop_assert_eq!(rs, cs)` under `stage-timing` compares two
-        /// independently measured timing vectors and fails whenever the
-        /// machine is loaded, even though both encoders emitted
-        /// byte-identical output. Its length is deterministic (one sample per
-        /// block, and both paths cut the same blocks, which
-        /// `columnar_cuts_identical_blocks` pins), so length is what parity
-        /// means here.
+        /// independently measured durations and fails whenever the machine
+        /// is loaded, even though both encoders emitted byte-identical
+        /// output. `bloom_blocks` is deterministic (one per block, and both
+        /// paths cut the same blocks, which `columnar_cuts_identical_blocks`
+        /// pins), so it is what parity means here.
         ///
         /// The destructuring binds are the add-a-field guard: neither uses
         /// `..`, so a new `WriteStats` field stops this function compiling
@@ -4253,7 +4283,9 @@ mod tests {
                 dynamic_columns_used: r_dyn_used,
                 dynamic_columns_overflowed: r_dyn_overflowed,
                 #[cfg(feature = "stage-timing")]
-                    bloom_block_ns: r_bloom_ns,
+                    bloom_total_ns: _r_bloom_total_ns,
+                #[cfg(feature = "stage-timing")]
+                    bloom_blocks: r_bloom_blocks,
             } = rs;
             let WriteStats {
                 postings_capped_fields: c_capped,
@@ -4264,7 +4296,9 @@ mod tests {
                 dynamic_columns_used: c_dyn_used,
                 dynamic_columns_overflowed: c_dyn_overflowed,
                 #[cfg(feature = "stage-timing")]
-                    bloom_block_ns: c_bloom_ns,
+                    bloom_total_ns: _c_bloom_total_ns,
+                #[cfg(feature = "stage-timing")]
+                    bloom_blocks: c_bloom_blocks,
             } = cs;
             prop_assert_eq!(r_capped, c_capped, "postings_capped_fields");
             prop_assert_eq!(r_bytes, c_bytes, "postings_bytes");
@@ -4283,9 +4317,9 @@ mod tests {
             );
             #[cfg(feature = "stage-timing")]
             prop_assert_eq!(
-                r_bloom_ns.len(),
-                c_bloom_ns.len(),
-                "bloom_block_ns sample count (one per block); durations are wall clock and are not compared"
+                r_bloom_blocks,
+                c_bloom_blocks,
+                "bloom_blocks (one per block); bloom_total_ns is wall clock and is not compared"
             );
             Ok(())
         }
