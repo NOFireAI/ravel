@@ -278,13 +278,10 @@ impl StoreArgs {
     pub fn backend_identity(&self) -> String {
         match self.store_kind() {
             StoreKind::Memory => "memory".to_string(),
-            StoreKind::S3 => {
-                let bucket = self.s3_bucket.as_deref().unwrap_or("<unset>");
-                match self.s3_endpoint.as_deref() {
-                    Some(endpoint) => format!("s3://{bucket}@{endpoint}"),
-                    None => format!("s3://{bucket}"),
-                }
-            }
+            StoreKind::S3 => ravel_object_store::conformance::s3_backend_identity(
+                self.s3_bucket.as_deref(),
+                self.s3_endpoint.as_deref(),
+            ),
         }
     }
 }

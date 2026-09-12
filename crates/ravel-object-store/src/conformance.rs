@@ -33,7 +33,16 @@ use crate::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError};
 /// `sys/qualification` (ADR-0050 section 6). Bump this whenever a probe is
 /// added, tightened, or its pass criteria changes, so an old qualification
 /// record can be told apart from one taken under the current suite.
-pub const CONFORMANCE_SUITE_VERSION: u32 = 1;
+///
+/// Version 1 checked four properties (the two conditional-write modes,
+/// read-after-write, and list-after-write). Version 2 is the eight-probe suite
+/// [`run_conformance_suite`] runs today: the four above plus concurrent
+/// single-winner create, lexicographic listing order, cross-page listing, and
+/// delete visibility. A record written under version 1 was never checked
+/// against the last four, so `ravel-server` startup refuses it as stale
+/// (`services/ravel-server/src/qualification.rs`) and `ravel-cli store qualify`
+/// re-records over it when re-run against the same bucket.
+pub const CONFORMANCE_SUITE_VERSION: u32 = 2;
 
 /// Root-prefix key for the durable qualification record (ADR-0050 section 6,
 /// "New durable objects and key-layout entries": root prefix `sys/`).
@@ -61,6 +70,26 @@ pub struct QualificationRecord {
     pub backend_identity: String,
     pub qualified_unix_ns: i64,
     pub passed_properties: Vec<String>,
+}
+
+/// Canonical `backend_identity` string for an S3-backed
+/// [`QualificationRecord`], shared by the writer (`ravel-cli store qualify`)
+/// and the reader (`ravel-server` startup) so the two never disagree on the
+/// format they compare. Built from the bucket and optional endpoint only: it
+/// names which bucket at which endpoint a qualification belongs to, and
+/// deliberately omits credentials, region, and addressing style.
+///
+/// The endpoint is the volatile part. An endpoint rename, a region alias, or a
+/// path-style/virtual-host switch changes this string without any change of
+/// backend, so a startup check that refused on a difference would fire on a
+/// benign rename; that is why the reader warns rather than refuses on a
+/// mismatch (see `ravel-server`'s qualification module).
+pub fn s3_backend_identity(bucket: Option<&str>, endpoint: Option<&str>) -> String {
+    let bucket = bucket.unwrap_or("<unset>");
+    match endpoint {
+        Some(endpoint) => format!("s3://{bucket}@{endpoint}"),
+        None => format!("s3://{bucket}"),
+    }
 }
 
 /// One property the object store contract requires, named so a failure

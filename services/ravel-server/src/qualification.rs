@@ -65,16 +65,57 @@ pub enum QualificationError {
     Decode(String),
 }
 
+/// Outcome of comparing the recorded `backend_identity` against the identity
+/// this process is configured for (ADR-0050 section 6). Separated from the
+/// logging in [`enforce`] so the comparison rule can be asserted directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityCheck {
+    /// No configured identity to compare against (the exempt memory store, or a
+    /// caller that did not supply one). Nothing is checked.
+    Skipped,
+    /// The recorded identity matches the configured one.
+    Matches,
+    /// The recorded identity differs from the configured one. A warning, never
+    /// a refusal: see [`enforce`].
+    Mismatch,
+}
+
+/// Compare a record's `backend_identity` against the configured one. A missing
+/// configured identity is [`IdentityCheck::Skipped`], not a mismatch: the
+/// caller had nothing to compare, so silence is correct.
+fn check_identity(recorded: &str, configured: Option<&str>) -> IdentityCheck {
+    match configured {
+        None => IdentityCheck::Skipped,
+        Some(configured) if configured == recorded => IdentityCheck::Matches,
+        Some(_) => IdentityCheck::Mismatch,
+    }
+}
+
 /// Enforce the qualification gate for `store_kind` against the durable
 /// `sys/qualification` record (ADR-0050 section 6). Returns `Ok(())` when the
 /// store is exempt ([`StoreKind::Memory`]) or a current-version record is
 /// present; refuses with a specific [`QualificationError`] otherwise.
+///
+/// `configured_identity` is the [`ravel_object_store::conformance::s3_backend_identity`]
+/// string this process is configured for, or `None` for the exempt memory
+/// store. When it is present and differs from the record's `backend_identity`,
+/// [`enforce`] logs a warning and starts anyway. The record lives in the
+/// bucket, so a replicated, restored, or migrated bucket carries a
+/// qualification a different backend earned; a mismatch is the signal for that.
+/// It is deliberately not a refusal: the identity is endpoint-derived (see
+/// [`ravel_object_store::conformance::s3_backend_identity`]), so an endpoint
+/// rename or an addressing-style switch changes it with no backend change, and
+/// a hard refusal on that benign case would be an outage an operator then
+/// disables, leaving the check protecting nothing. This reader never writes, so
+/// it cannot re-qualify either; warning is the honest report, mirroring the
+/// bucket-protection gate's `Unknown` handling.
 ///
 /// Read-only: a single GET of the fixed record key, no write on any path, so it
 /// is safe to run before any listener binds in every mode.
 pub async fn enforce(
     store: &dyn ObjectStoreBackend,
     store_kind: StoreKind,
+    configured_identity: Option<&str>,
 ) -> Result<(), QualificationError> {
     // The semantics oracle is exempt: MemoryStore *is* the reference behavior
     // the suite falsifies other backends against, so qualifying it against
@@ -100,6 +141,18 @@ pub async fn enforce(
             record_version: record.suite_version,
             required_version: CONFORMANCE_SUITE_VERSION,
         });
+    }
+
+    if check_identity(&record.backend_identity, configured_identity) == IdentityCheck::Mismatch {
+        tracing::warn!(
+            recorded_identity = %record.backend_identity,
+            configured_identity = configured_identity.unwrap_or_default(),
+            "sys/qualification was recorded against a different backend identity than this \
+             process is configured for. After a benign endpoint rename or addressing-style \
+             change this is expected, but on a replicated, restored, or migrated bucket it means \
+             this backend was never qualified. Verify the backend and re-run `ravel-cli store \
+             qualify` if it is genuinely a different store."
+        );
     }
 
     Ok(())
@@ -140,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn absent_record_on_production_store_refuses() {
         let store = store();
-        let err = enforce(store.as_ref(), StoreKind::S3)
+        let err = enforce(store.as_ref(), StoreKind::S3, None)
             .await
             .expect_err("an absent record on a production store must refuse startup");
         assert!(
@@ -155,7 +208,7 @@ mod tests {
     async fn stale_version_record_refuses_distinctly() {
         let store = store();
         write_record(store.as_ref(), CONFORMANCE_SUITE_VERSION - 1).await;
-        let err = enforce(store.as_ref(), StoreKind::S3)
+        let err = enforce(store.as_ref(), StoreKind::S3, None)
             .await
             .expect_err("a below-floor suite_version must refuse startup");
         match err {
@@ -175,7 +228,7 @@ mod tests {
     async fn current_record_on_production_store_starts() {
         let store = store();
         write_record(store.as_ref(), CONFORMANCE_SUITE_VERSION).await;
-        enforce(store.as_ref(), StoreKind::S3)
+        enforce(store.as_ref(), StoreKind::S3, None)
             .await
             .expect("a current-version record must start cleanly");
     }
@@ -186,11 +239,11 @@ mod tests {
     #[tokio::test]
     async fn memory_store_is_exempt_with_or_without_a_record() {
         let store = store();
-        enforce(store.as_ref(), StoreKind::Memory)
+        enforce(store.as_ref(), StoreKind::Memory, None)
             .await
             .expect("memory is exempt even with no record");
         write_record(store.as_ref(), CONFORMANCE_SUITE_VERSION).await;
-        enforce(store.as_ref(), StoreKind::Memory)
+        enforce(store.as_ref(), StoreKind::Memory, None)
             .await
             .expect("memory is exempt with a record too");
     }
@@ -208,9 +261,54 @@ mod tests {
             )
             .await
             .expect("seed garbage");
-        let err = enforce(store.as_ref(), StoreKind::S3)
+        let err = enforce(store.as_ref(), StoreKind::S3, None)
             .await
             .expect_err("a corrupt record must refuse, not panic");
         assert!(matches!(err, QualificationError::Decode(_)), "got: {err}");
+    }
+
+    /// The identity comparison rule: a match, a mismatch, and the no-configured
+    /// case are the three distinct outcomes.
+    #[test]
+    fn check_identity_distinguishes_match_mismatch_and_skip() {
+        assert_eq!(
+            check_identity("s3://ravel-test", Some("s3://ravel-test")),
+            IdentityCheck::Matches
+        );
+        assert_eq!(
+            check_identity("s3://ravel-test", Some("s3://other@host")),
+            IdentityCheck::Mismatch
+        );
+        assert_eq!(
+            check_identity("s3://ravel-test", None),
+            IdentityCheck::Skipped
+        );
+    }
+
+    /// A record whose `backend_identity` differs from the configured one is a
+    /// warning, never a refusal: the server still starts. The identity is
+    /// endpoint-derived, so a benign rename must not be an outage (D2).
+    #[tokio::test]
+    async fn mismatched_identity_warns_but_starts() {
+        let store = store();
+        write_record(store.as_ref(), CONFORMANCE_SUITE_VERSION).await;
+        enforce(
+            store.as_ref(),
+            StoreKind::S3,
+            Some("s3://a-different-bucket@elsewhere"),
+        )
+        .await
+        .expect("an identity mismatch warns, it does not refuse startup");
+    }
+
+    /// A matching configured identity starts cleanly, same as the no-identity
+    /// path, so supplying an identity never tightens the gate into a refusal.
+    #[tokio::test]
+    async fn matching_identity_starts() {
+        let store = store();
+        write_record(store.as_ref(), CONFORMANCE_SUITE_VERSION).await;
+        enforce(store.as_ref(), StoreKind::S3, Some("s3://ravel-test"))
+            .await
+            .expect("a matching identity must start cleanly");
     }
 }

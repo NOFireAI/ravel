@@ -54,3 +54,54 @@ async fn a_second_qualify_run_does_not_overwrite_the_existing_record() {
 
     assert_eq!(first.data, second.data, "qualification is once per bucket");
 }
+
+/// A record recorded under an older suite version is re-recorded (not left
+/// stale) when `qualify` re-runs against the same bucket. Without this,
+/// bumping `CONFORMANCE_SUITE_VERSION` would deadlock every already-qualified
+/// bucket: `ravel-server` refuses a below-floor record, and `CreateIfAbsent`
+/// cannot clear it. The re-recorded object carries the current suite version
+/// and the full probed-property set.
+#[tokio::test]
+async fn qualify_re_records_over_a_stale_suite_version() {
+    use bytes::Bytes;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::conformance::CONFORMANCE_SUITE_VERSION;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+    // A bucket qualified before the probe set grew carries a below-floor record.
+    let stale = qualify::QualificationRecord {
+        suite_version: CONFORMANCE_SUITE_VERSION - 1,
+        backend_identity: "memory".to_string(),
+        qualified_unix_ns: 1,
+        passed_properties: vec!["conditional_write_create_if_absent".to_string()],
+    };
+    store
+        .put(
+            QUALIFICATION_KEY,
+            Bytes::from(serde_json::to_vec(&stale).expect("encode stale record")),
+            PutOptions::default(),
+        )
+        .await
+        .expect("seed a stale-version record");
+
+    qualify::qualify(store.clone(), "memory".to_string(), "run-1")
+        .await
+        .expect("re-qualification upgrades a stale record instead of erroring");
+
+    let outcome = store
+        .get(QUALIFICATION_KEY, GetRange::Full)
+        .await
+        .expect("record present after re-qualification");
+    let record: qualify::QualificationRecord =
+        serde_json::from_slice(&outcome.data).expect("record must be valid JSON");
+    assert_eq!(
+        record.suite_version, CONFORMANCE_SUITE_VERSION,
+        "a below-floor record is re-recorded at the current suite version"
+    );
+    assert_eq!(
+        record.passed_properties.len(),
+        8,
+        "the upgraded record lists all eight probed properties"
+    );
+}

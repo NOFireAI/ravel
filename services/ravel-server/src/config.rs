@@ -2839,6 +2839,22 @@ fn parse_bool_field(spec: &str, key: &str, value: &str) -> anyhow::Result<bool> 
 }
 
 impl Cli {
+    /// The `backend_identity` this process compares against a
+    /// `sys/qualification` record at startup (ADR-0050 section 6, D2), or
+    /// `None` for the exempt memory store. Built from
+    /// [`ravel_object_store::conformance::s3_backend_identity`], the same
+    /// function `ravel-cli store qualify` writes the record with, so the reader
+    /// and writer never disagree on format.
+    pub fn backend_identity(&self) -> Option<String> {
+        match self.store {
+            StoreKind::Memory => None,
+            StoreKind::S3 => Some(ravel_object_store::conformance::s3_backend_identity(
+                self.s3_bucket.as_deref(),
+                self.s3_endpoint.as_deref(),
+            )),
+        }
+    }
+
     /// The OTLP trace-export config `main.rs` passes to
     /// `ravel_tracing_export::init` (ADR-0060), or `None` when
     /// `--otlp-trace-endpoint` is absent. A single function so the binary's
