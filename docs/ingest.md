@@ -357,7 +357,12 @@ actor: the co-resident tenants' writes are still accepted, their age triggers
 still fire, and each trigger hands its buffer off and spawns another waiting
 flush. So the queue grows with the stall, and every flush in it holds a whole
 flush window and its ADR-0069 byte charge from the moment it left the actor,
-which is what the budget sheds against. Strict-mode writers behind those
+which is what the budget sheds against. That shed is the only thing that bounds
+the queue's memory, so it bounds it only when the byte budget is configured:
+under the default `Bounded(512 MiB)` a sustained stall stops admitting new
+bytes before the queue grows without limit, but under `--max-ingest-buffer-bytes
+0` (`Unlimited`) `try_charge` never sheds and nothing but host memory bounds the
+queue (ADR-1642). Strict-mode writers behind those
 queued flushes stay unacked for the duration; buffered-mode writers were acked
 at enqueue and their data stays invisible to queries until the flush commits.
 Raising the bound gives healthy tenants a permit to flush on while one prefix
@@ -381,22 +386,31 @@ flush, since a shard could never acquire a permit to run one.
 Backpressure at the bound now propagates through the ADR-0069 global byte
 budget rather than by parking the actor and filling the bounded channel: each
 in-flight flush holds its byte charge until it completes, so a shard wedged on
-a throttled prefix drains the budget and admission sheds at the ceiling.
+a throttled prefix drains the budget and admission sheds at the ceiling. That
+path exists only when the budget is configured; with `--max-ingest-buffer-bytes
+0` the ceiling is off, admission never sheds, and a stall is bounded only by
+host memory (ADR-1642).
 Whether the permit is the constraint is observable rather than inferred:
 `flush_permit_wait_ns` in the per-shard skew stats below accrues, in the flush
 task, whenever a task waits for a permit, so a rising value while the actor
 keeps draining means flushes are backed up on the bound.
 
-Pipelining does not change what the catalog already tolerates: a
+Out-of-seq publication does not change what the catalog already tolerates: a
 flush's seq is allocated at pin time, not at commit time, so two
-overlapped flushes for the same shard can publish their commit records
-out of seq order when the store resolves their PUTs out of order. This
-is the same seq-gap tolerance the per-(writer,shard) commit protocol
-already provides (docs/catalog-and-mvcc.md) for a writer restart or a
-retried, abandoned flush; pipelining just makes it a routine occurrence
-under concurrency greater than 1 instead of an edge case. Nothing about
-resolution or read-your-write changes: a commit token still names its
-exact object directly.
+flushes for the same shard can publish their commit records out of seq order.
+Two causes now exist. Under `max_inflight_flushes > 1` overlapped flushes
+publish out of order when the store resolves their PUTs out of order. Since
+ADR-1642 it also happens at `max_inflight_flushes = 1`: the permit is acquired
+inside the spawned tasks, which race to reach the acquire, so the task that
+acquires first publishes first even though its seq may be the later one. The
+on-actor acquire published strictly in seq order at one permit; that ordering
+is gone. Either way this is the same seq-gap tolerance the
+per-(writer,shard) commit protocol already provides (docs/catalog-and-mvcc.md)
+for a writer restart or a retried, abandoned flush: seq is monotonic with gaps
+permitted and completeness is never inferred from it, so a reordered
+publication is a reordering of independently visible commits, not a gap.
+Nothing about resolution or read-your-write changes: a commit token still
+names its exact object directly.
 
 This applies to all three ingest pipelines. The log and span shard
 actors (below) pipeline their flushes on the same terms (ADR-0076
