@@ -117,9 +117,42 @@ pub async fn qualify(
                 })?;
             let existing: QualificationRecord = serde_json::from_slice(&existing.data)
                 .map_err(|err| anyhow::anyhow!("{QUALIFICATION_KEY} is corrupt: {err}"))?;
+            // A record recorded under an older suite version was never checked
+            // against the probes this build added, so `ravel-server` refuses to
+            // start on it (a stale record that reads as a current pass is worse
+            // than none). Re-recording is the only way to clear that refusal:
+            // `CreateIfAbsent` cannot, so the once-per-bucket rule is relaxed to
+            // once-per-suite-version and this run overwrites the stale record
+            // with the current pass. An equal-or-newer record is still left
+            // untouched, so a repeated run at the same version is a no-op
+            // (ADR-0050 section 6).
+            if existing.suite_version < CONFORMANCE_SUITE_VERSION {
+                let refreshed = serde_json::to_vec_pretty(&record).map_err(|err| {
+                    anyhow::anyhow!("failed to encode qualification record: {err}")
+                })?;
+                store
+                    .put(
+                        QUALIFICATION_KEY,
+                        Bytes::from(refreshed),
+                        PutOptions::default(),
+                    )
+                    .await
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "qualification passed but re-recording {QUALIFICATION_KEY} failed: {err}"
+                        )
+                    })?;
+                println!(
+                    "re-recorded {QUALIFICATION_KEY}: {backend_identity} re-qualified, upgrading \
+                     the stored record from suite v{} to v{}",
+                    existing.suite_version, CONFORMANCE_SUITE_VERSION
+                );
+                return Ok(());
+            }
             println!(
                 "{QUALIFICATION_KEY} already recorded for {} (suite v{}, qualified at unix_ns={}); \
-                 not overwritten -- qualification is once per bucket, per ADR-0050 section 6",
+                 not overwritten -- qualification is once per bucket at this suite version, per \
+                 ADR-0050 section 6",
                 existing.backend_identity, existing.suite_version, existing.qualified_unix_ns
             );
             Ok(())
