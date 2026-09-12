@@ -203,12 +203,35 @@ struct DedupStream {
 }
 
 impl DedupStream {
-    /// Emit `pending` as a winner: project to the public schema, count it,
-    /// and enforce the sample budget.
+    /// Emit `pending` as a winner: project to the public schema, compact its
+    /// one-row labels dictionary down to the single entry it references
+    /// (`crate::labels::compact_labels`), count it, and enforce the sample
+    /// budget.
+    ///
+    /// Compacting each slice here, not only once per flush in [`Self::flush`],
+    /// bounds `flush`'s `concat_batches` peak: every slice already carries an
+    /// at-most-one-entry dictionary going in, so one flush's peak dictionary
+    /// memory is O(`FLUSH_ROWS`) one-entry dictionaries, not O(rows x
+    /// distinct-series-per-upstream-batch). Measured on a many-series corpus
+    /// with one row per upstream batch (the case this bounds): peak
+    /// pre-flush-compaction labels memory of 350,192,304 bytes without this,
+    /// 853,232 bytes with it.
+    ///
+    /// This does cost a per-row `MapBuilder` rebuild. Measured on 4095 winner
+    /// rows of a single series, where every slice's dictionary is already
+    /// pointer-equal so `concat_batches` alone stays cheap: pre-flush-
+    /// compaction labels memory of 27,336 bytes without this, 443,056 bytes
+    /// with it -- 16x, but still four orders of magnitude under the
+    /// many-series bound above and still O(`FLUSH_ROWS`), so the trade is
+    /// kept.
     fn finalize(&mut self, pending: Pending) -> DFResult<()> {
         let public = pending
             .row
             .project(&(0..PUBLIC_COLUMNS).collect::<Vec<_>>())
+            .map_err(DataFusionError::from)?;
+        let mut columns = public.columns().to_vec();
+        columns[COL_LABELS] = crate::labels::compact_labels(&columns[COL_LABELS])?;
+        let public = RecordBatch::try_new(Arc::clone(&self.schema), columns)
             .map_err(DataFusionError::from)?;
         self.out.push(public);
         self.out_rows += 1;
@@ -227,29 +250,16 @@ impl DedupStream {
         let batch = concat_batches(&self.schema, self.out.iter()).map_err(DataFusionError::from)?;
         self.out.clear();
         self.out_rows = 0;
-        // Concatenating the accumulated one-row slices appends each slice's
-        // whole retained labels dictionary whenever an adjacent pair's
-        // dictionary child is not pointer-equal (arrow-data's
-        // `MutableArrayData` shares one dictionary only when every input's
-        // dictionary child is pointer-equal to its neighbor), so the
-        // concatenated dictionary generally grows with the row count.
-        // Compact it back to one entry per distinct series the flushed rows
-        // reference; the schema and every decoded label set are unchanged.
+        // `finalize` already compacted each slice's labels dictionary to one
+        // entry, but `concat_batches` can still append them back up to one
+        // entry per row (see `crate::labels::compact_labels` for when
+        // dictionaries share vs. append). Compact once more so the flushed
+        // batch holds exactly one entry per distinct series it references;
+        // the schema and every decoded label set are unchanged.
         //
-        // This runs per dedup flush, and the exact `entries == distinct`
-        // invariant it restores holds only for this one flushed batch. Each
-        // flush is compacted independently, so two flush batches' dictionary
-        // arrays are never pointer-equal to each other even when their
-        // decoded content overlaps. A caller that concatenates several
-        // flushed batches back together -- a Flight client materializing the
-        // whole streamed result into one Arrow table is the common case --
-        // re-triggers the same pointer-inequality growth this fix addresses,
-        // regrowing the dictionary to roughly (flush count) x (distinct
-        // series) across the concatenated result, not exactly distinct
-        // series. This crate's own Flight server does not itself perform that
-        // concatenation: `FlightDataEncoder` only splits an oversized batch,
-        // it never merges batches together, so each flush is still forwarded
-        // to the wire as its own, correctly-bounded message.
+        // This holds per flush only: each flush is compacted independently of
+        // every other, so two flush batches' dictionaries are never merged
+        // together by anything in this crate.
         let mut columns = batch.columns().to_vec();
         columns[COL_LABELS] = crate::labels::compact_labels(&columns[COL_LABELS])?;
         let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns)
