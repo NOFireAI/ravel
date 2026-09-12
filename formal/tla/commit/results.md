@@ -3,8 +3,12 @@
 Entry module `MCCommitProtocol.tla` over `CommitProtocol.tla`, which
 instantiates the shared store module. Per-run figures land in
 `.cache/tla/last-run.tsv`; the enforced bands live in `bands.tsv` and the
-harness fails a PASS run whose distinct-state count or depth falls outside
-them.
+harness fails a PASS run whose distinct-state count falls outside its band.
+Depth is enforced the same way wherever a row carries integer bounds, but a
+row may set both depth bounds to the sentinel `-`, meaning depth is not
+enforced for that cfg. `smoke.cfg` does: TLC's reported search depth can
+overshoot by a level when workers race, while the distinct-state count is
+worker-independent.
 
 Toolchain: TLC 2.19 (tla2tools 1.7.4), Eclipse Temurin 21.0.12.1 JRE, Linux
 x86_64, `-workers auto` (8 workers, 8 cores). Wall times are host-dependent
