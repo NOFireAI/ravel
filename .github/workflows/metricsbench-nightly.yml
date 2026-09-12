@@ -57,6 +57,8 @@ jobs:
             --bin metricsbench_ingest --bin metricsbench_report
       - name: Start MinIO
         run: |
+          # quay.io rather than Docker Hub: rationale on ci.yml's
+          # object-store-contract "Start MinIO" step.
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
