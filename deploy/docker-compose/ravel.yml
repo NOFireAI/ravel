@@ -16,8 +16,11 @@ services:
   # MinIO and the bucket-creation one-shot mirror deploy/docker-compose/minio.yml
   # exactly: same credentials, same `ravel-dev` bucket, same `minio-data/` host
   # dir (gitignored, shared with that stack, and safe to reuse across runs).
+  # MinIO images are pulled from quay.io, not Docker Hub: Docker Hub's
+  # anonymous pull allowance is per-IP and shared across every project on a
+  # runner, so an unauthenticated pull from there fails unpredictably.
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     command: server /data --console-address ":9001"
     ports:
       - "127.0.0.1:9000:9000"
@@ -29,7 +32,7 @@ services:
       - ../../minio-data:/data
 
   createbucket:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     depends_on: [minio]
     # `mc alias set` fails until MinIO is reachable, so the until-loop is the
     # readiness wait: this service completes successfully only once the bucket
