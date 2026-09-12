@@ -113,7 +113,10 @@ mod tests {
             .iter()
             .map(|e| e["s3GetRequests"].as_u64().expect("u64"))
             .sum();
-        assert_eq!(total_bytes, 1111, "100 + 10 + 1 + 1000 resolve/plan/probe/scan");
+        assert_eq!(
+            total_bytes, 1111,
+            "100 + 10 + 1 + 1000 resolve/plan/probe/scan"
+        );
         assert_eq!(total_requests, 4, "one GET recorded per phase");
         assert_eq!(total_bytes, snapshot.pooled().total_s3_bytes());
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());

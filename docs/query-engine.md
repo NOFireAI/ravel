@@ -1694,10 +1694,15 @@ change outside this crate:
   writes, so these three keep taking a plain `&QueryAccounting` and are
   `scan` phase by construction instead, documented at each call site.
 
-`ravel-sql`'s `SqlExecutor` builds its own `QueryAccounting` per attempt
-(`SqlOutcome.accounting`) entirely inside that crate, so the phase split
-does not reach `ravel-bench`'s `sql_latency_bench` report: doing so needs
-a `ravel-sql` change outside this crate.
+`ravel-sql`'s `SqlExecutor` builds its own `PhaseAccounting` per attempt
+too: `SqlOutcome.phase_accounting` is the same split,
+`SqlOutcome.accounting` its `.pooled()` counterpart, and `SqlOutcome.io_shape`
+the SQL-side `QueryIoShape` (`sql_io_shape`, `executor.rs`). It is rendered
+on `/api/v1/sql`'s JSON response the same way (see "JSON response shape"
+below), but the split still does not reach `ravel-bench`'s
+`sql_latency_bench` report, which reads only the pooled totals; wiring the
+bench report to the split would need a `ravel-bench` change outside the
+scope that added the rendering.
 
 ### Pre-execution cost estimate
 
@@ -1944,6 +1949,19 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   read as a measurement rather than an absence (ADR-0927 decision 7):
   `s3HeadRequests`/`s3HeadBytes`, `s3ListBytes`, and
   `peakIntermediateBytes` (SQL executor only).
+
+**`/api/v1/sql`'s JSON response** carries `stats.phases` and
+`stats.io` alongside its own pre-existing `stats.accounting`/`stats.estimate`,
+with the identical field names, `QueryPhase::ALL` ordering, and
+per-phase/per-figure semantics described above, populated from
+`SqlOutcome::phase_accounting`/`SqlOutcome::io_shape`. The rendering itself
+(`crates/ravel-sql/src/stats_json.rs`) is independently built from the same
+public `phase_accounting`/`io_shape` types rather than reusing this crate's
+`http::json` module, which is private to it. The Arrow-IPC encoding of
+`/api/v1/sql` carries no `stats` object at all (unchanged: it never carried
+`stats.accounting`/`stats.estimate` either), and Flight SQL constructs no
+`SqlOutcome` and has no stats envelope to extend, so neither surface renders
+`stats.phases`/`stats.io`.
 
 ### I/O dependency shape
 

@@ -1549,12 +1549,16 @@ impl SqlExecutor {
             .query_pool(self.tenant_budget(tenant_hash), accounting.clone());
         let segments = snapshot.segments.clone();
         let target_partitions = segments.len().max(1);
+        // Worker fragments keep the pre-#1367 pooled `&QueryAccounting` API
+        // (no `SqlOutcome` and thus no phase/I/O-shape breakdown crosses the
+        // Flight wire for a worker slice): `pooled_over` bridges it to the
+        // phase-split constructor the same way `explain_inner` does above.
         let provider = Arc::new(RavelTableProvider::new(
             snapshot,
             tenant_hash,
             self.fetcher.clone(),
             self.config.clone(),
-            accounting.clone(),
+            PhaseAccounting::pooled_over(accounting),
         ));
         let plan = provider
             .worker_fragment(target_partitions, &segments)
