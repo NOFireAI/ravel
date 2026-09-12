@@ -577,16 +577,19 @@ into a false green. When you write or edit any such script:
 Facts about the dispatched clone that executors have re-derived by trial
 and error, one wasted turn (or one lost result) at a time:
 
-- Two executor classes exist. The amd64 class (label `arch=amd64`) has 16
-  vCPU, 30 GB RAM, and about 350 GB free on the root volume, but HOME is
-  a 1 GB tmpfs: never write logs or `cargo install` output under HOME on
-  this class, and use `--root "$PWD/.dd-tools"` style paths inside the
-  checkout for any tool install. The arm64 Pi class has 4 cores and 8 GB
-  RAM; keep `--jobs 2` there. See "Long commands and the Bash tool" above
-  for the `timeout` and `--jobs` consequences on the Pi class.
-- Gate logs go to `.gate-logs/` inside the checkout, excluded through
-  `.git/info/exclude` (never `.gitignore`, which would be a tracked
-  change), for the reasons stated in the fleet-task-spec skill.
+- Two executor classes exist; tell them apart with `uname -m` and
+  `nproc`. The amd64 class (label `arch=amd64`, x86_64, 16 vCPU, 30 GB
+  RAM, about 350 GB free on the root volume) has a 1 GB tmpfs as HOME:
+  never write logs or `cargo install` output under HOME there; install
+  tools with `--root "$PWD/.dd-tools"`. The arm64 Pi class (aarch64, 4
+  cores, 8 GB RAM) needs `CARGO_BUILD_JOBS=2` on every cargo command and
+  on every script that runs cargo (`scripts/affected-tests.sh` takes no
+  jobs flag); use `CARGO_BUILD_JOBS=4` on amd64. See "Long commands and
+  the Bash tool" above for the `timeout` consequences.
+- Gate logs go to `.gate-logs/` inside the checkout. The tracked
+  `.gitignore` covers `.gate-logs/` and `.dd-tools/` so the harness's
+  commit-on-death cannot sweep them into a wip commit; the fleet-task-spec
+  skill's setup command checks that with `git check-ignore` first.
 - fleet-cp rejects any dispatch spec whose text contains a dollar-paren
   command substitution or a backtick substitution with `400 bad request`.
   Write every path in a spec as fixed text.
