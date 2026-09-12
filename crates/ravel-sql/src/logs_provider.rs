@@ -40,7 +40,9 @@ use ravel_catalog::{LoadedColumnStats, SegmentRef, Snapshot};
 use ravel_query::ByteLimit;
 use ravel_query::LogSegmentFetcher;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
+use ravel_query::phase_accounting::PhaseAccounting;
 use ravel_types::TenantHash;
+#[cfg(test)]
 use ravel_types::accounting::QueryAccounting;
 
 use crate::declared::DeclaredColumn;
@@ -61,10 +63,11 @@ pub struct LogsTableProvider {
     tenant_hash: TenantHash,
     fetcher: LogSegmentFetcher,
     schema: SchemaRef,
-    /// This query's accounting handle (ADR-0044), cloned into every
-    /// `LogsScanExec` the provider builds so every store fetch the scan
-    /// issues on this query's behalf is recorded against it.
-    accounting: QueryAccounting,
+    /// This query's phase-split accounting handle (ADR-0044, issue #796),
+    /// cloned into every `LogsScanExec` the provider builds so every store
+    /// fetch the scan issues on this query's behalf is recorded against the
+    /// right phase.
+    phase_accounting: PhaseAccounting,
     /// Pending selective-erasure predicates derived once from
     /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `LogsScanExec` the provider builds.
@@ -98,7 +101,7 @@ impl LogsTableProvider {
         snapshot: Snapshot,
         tenant_hash: TenantHash,
         fetcher: LogSegmentFetcher,
-        accounting: QueryAccounting,
+        phase_accounting: PhaseAccounting,
     ) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
         LogsTableProvider {
@@ -106,7 +109,7 @@ impl LogsTableProvider {
             tenant_hash,
             fetcher,
             schema: logs_schema(),
-            accounting,
+            phase_accounting,
             erasure,
             declared: Arc::new(Vec::new()),
             column_stats: None,
@@ -243,7 +246,7 @@ impl LogsTableProvider {
             Arc::new(pushdown.prune.clone()),
             Arc::clone(&self.erasure),
             projection,
-            self.accounting.clone(),
+            self.phase_accounting.clone(),
             Arc::clone(&self.schema),
             Arc::clone(&self.declared),
         )?
@@ -362,7 +365,7 @@ impl TableProvider for LogsTableProvider {
                 Arc::clone(&dist.client),
                 Arc::clone(&self.schema),
                 _limit,
-                self.accounting.clone(),
+                self.phase_accounting.scan().clone(),
                 ByteLimit::Unlimited,
             )?;
             return self.apply_projection(plan, projection);
@@ -665,7 +668,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
 
@@ -743,7 +746,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
 
@@ -813,7 +816,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
 
@@ -891,7 +894,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
 
@@ -971,7 +974,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
 
@@ -1045,7 +1048,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
 
@@ -1087,7 +1090,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
 
@@ -1143,7 +1146,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
 
@@ -1205,7 +1208,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
         let df = ctx.sql("SELECT ts, body FROM logs").await.expect("plan");
@@ -1261,7 +1264,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
         let df = ctx.sql("SELECT ts, body FROM logs").await.expect("plan");
@@ -1313,7 +1316,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
         let df = ctx.sql("SELECT ts, body FROM logs").await.expect("plan");
@@ -1377,7 +1380,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )
         .with_declared_columns(i64_status_code());
         let ctx = logs_session(provider).expect("build session");
@@ -1440,7 +1443,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )
         .with_declared_columns(vec![DeclaredColumn::new("region", DeclaredType::Str)]);
         let ctx = logs_session(provider).expect("build session");
@@ -1488,7 +1491,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )
         .with_declared_columns(i64_status_code());
         let ctx = logs_session(provider).expect("build session");
@@ -1553,7 +1556,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )
         .with_declared_columns(i64_status_code());
         let ctx = logs_session(provider).expect("build session");
@@ -1631,7 +1634,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )
         .with_declared_columns(i64_status_code());
         let ctx = logs_session(provider).expect("build session");
@@ -1723,7 +1726,7 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )
         .with_declared_columns(i64_status_code());
         let ctx = logs_session(provider).expect("build session");
@@ -1786,7 +1789,7 @@ mod tests {
             },
             TenantHash([7u8; 16]),
             LogSegmentFetcher::new(store),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )
         .with_declared_columns(declared)
     }

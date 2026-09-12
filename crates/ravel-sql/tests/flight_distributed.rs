@@ -86,8 +86,8 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::distrib::partition::{DistribThresholds, partition_snapshot};
 use ravel_query::{
-    ByteLimit, EngineConfig, LogSegmentFetcher, QueryAdmissionController, QueryConcurrencyLimit,
-    SegmentFetcher,
+    ByteLimit, EngineConfig, LogSegmentFetcher, PhaseAccounting, QueryAdmissionController,
+    QueryConcurrencyLimit, SegmentFetcher,
 };
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{
@@ -348,7 +348,7 @@ impl WorkerSliceClient for InProcessWorker {
             TENANT,
             self.fetcher.clone(),
             self.config.clone(),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let plan = provider.worker_fragment(segments.len().max(1), &segments)?;
         execute_stream(plan, Arc::new(TaskContext::default()))
@@ -565,7 +565,7 @@ async fn distributed_scan_equals_local_scan() {
         TENANT,
         fetcher.clone(),
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let local_plan = local.plan(4).expect("local plan");
     let local_batches = collect(local_plan, Arc::new(TaskContext::default()))
@@ -580,7 +580,7 @@ async fn distributed_scan_equals_local_scan() {
         TENANT,
         fetcher,
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client));
     let ctx = SessionContext::new();
@@ -676,7 +676,7 @@ async fn limit_hint_returns_exactly_limit_rows_over_multiple_slices() {
         TENANT,
         fetcher.clone(),
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let local_batches = collect(
         local.plan(4).expect("local plan"),
@@ -699,7 +699,7 @@ async fn limit_hint_returns_exactly_limit_rows_over_multiple_slices() {
         TENANT,
         fetcher,
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client));
 
@@ -1097,7 +1097,7 @@ async fn distributed_scan_over_wire_equals_local() {
         TENANT,
         fetcher.clone(),
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let local_batches = collect(
         local.plan(4).expect("local plan"),
@@ -1121,7 +1121,7 @@ async fn distributed_scan_over_wire_equals_local() {
         TENANT,
         fetcher,
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client));
     let ctx = SessionContext::new();
@@ -1238,7 +1238,7 @@ async fn distributed_aggregate_equals_local() {
                 TENANT,
                 fetcher.clone(),
                 SqlConfig::default(),
-                QueryAccounting::new(),
+                PhaseAccounting::new(),
             )),
         )
         .expect("register local");
@@ -1255,7 +1255,7 @@ async fn distributed_aggregate_equals_local() {
                     TENANT,
                     fetcher,
                     SqlConfig::default(),
-                    QueryAccounting::new(),
+                    PhaseAccounting::new(),
                 )
                 .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client)),
             ),
@@ -1299,7 +1299,7 @@ async fn distributed_scan_folds_bytes_into_coordinator_accounting() {
         TENANT,
         fetcher.clone(),
         SqlConfig::default(),
-        accounting.clone(),
+        PhaseAccounting::pooled_over(&accounting),
     )
     .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client));
     let ctx = SessionContext::new();
@@ -1326,7 +1326,7 @@ async fn distributed_scan_folds_bytes_into_coordinator_accounting() {
         TENANT,
         fetcher,
         tight,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client));
     let ctx2 = SessionContext::new();
@@ -1549,7 +1549,7 @@ fn logs_fragment(
     fetcher: LogSegmentFetcher,
     target_partitions: usize,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
-    LogsTableProvider::new(snapshot, TENANT, fetcher, QueryAccounting::new())
+    LogsTableProvider::new(snapshot, TENANT, fetcher, PhaseAccounting::new())
         .worker_fragment(target_partitions)
 }
 
@@ -1666,7 +1666,7 @@ async fn distributed_logs_reshard_straddle_equals_sorted_local() {
             snapshot.clone(),
             TENANT,
             fetcher.clone(),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )
         .plan(4)
         .expect("local plan"),
@@ -1680,7 +1680,7 @@ async fn distributed_logs_reshard_straddle_equals_sorted_local() {
         build: logs_fragment,
     });
     let dist: Arc<dyn TableProvider> = Arc::new(
-        LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+        LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, PhaseAccounting::new())
             .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
     );
     let got = ts_and(&collect_distributed(dist).await, "ts", "body");
@@ -1728,7 +1728,7 @@ async fn distributed_logs_preserves_duplicate_rows() {
             snapshot.clone(),
             TENANT,
             fetcher.clone(),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )
         .plan(4)
         .expect("local plan"),
@@ -1742,7 +1742,7 @@ async fn distributed_logs_preserves_duplicate_rows() {
         build: logs_fragment,
     });
     let dist: Arc<dyn TableProvider> = Arc::new(
-        LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+        LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, PhaseAccounting::new())
             .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
     );
     let mut got = ts_and(&collect_distributed(dist).await, "ts", "body");
@@ -1786,7 +1786,7 @@ async fn distributed_logs_plan_merges_without_dedup() {
         fetcher: fetcher.clone(),
         build: logs_fragment,
     });
-    let dist = LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+    let dist = LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, PhaseAccounting::new())
         .with_distributed_scan(rlog_endpoints_for(&snapshot), client);
     let ctx = SessionContext::new();
     let plan = dist

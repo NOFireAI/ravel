@@ -15,6 +15,7 @@ use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
 use ravel_object_store::memory::MemoryStore;
+use ravel_query::PhaseAccounting;
 use ravel_sql::{
     CeilingBreach, RavelTableProvider, SessionTable, SpillDecision, SqlConfig, SqlError,
     TenantDelegatingPool, TenantMemoryAccountant, build_session,
@@ -410,7 +411,7 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         tenant.hash(),
         fixture.fetcher.clone(),
         config.clone(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let ctx = build_session(
         &config,

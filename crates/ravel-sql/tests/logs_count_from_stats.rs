@@ -26,7 +26,7 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{LogSegmentFetcher, PhaseAccounting, SegmentFetcher};
 use ravel_sql::{
     LogsTableProvider, SessionTable, SpanSegmentFetcher, SpillDecision, SqlConfig, SqlExecutor,
     TenantMemoryAccountant, build_session,
@@ -190,7 +190,7 @@ fn provider_over(store: Arc<CountingStore>, snapshot: Snapshot) -> LogsTableProv
         snapshot,
         TENANT,
         LogSegmentFetcher::new(backend),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
 }
 
