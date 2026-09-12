@@ -1015,6 +1015,46 @@ output size: every matched series in every matched segment is still fully
 fetched and SoA-decoded before the merge runs, so peak fetch/decode memory
 scales with the query's matched input, not with `max_samples`.
 
+### Process memory budget (ADR-1170)
+
+Every SQL query draws from one process-wide memory budget, not just its own
+per-query pool. `resolve_performance_defaults` derives
+`memory_budget_bytes` at startup from the cgroup-capped effective memory
+minus a fixed overhead reserve, and logs the result (`setting =
+"memory_budget_bytes"`) alongside its source (derived from the host,
+an explicit flag, or the unknown-memory fallback).
+
+That budget is then carved: the fetcher cache and the catalog byte cache
+each keep a hard eviction ceiling sized as a share of the budget (they
+cannot shed under pressure, so they cannot share a pool with anything
+else), and the remainder is a shared accountant that the SQL executor's
+per-tenant memory pools draw against through `try_grow`/`shrink`. Startup
+refuses to start, rather than silently clamping, if the two hard cache
+ceilings alone would sum to more than the budget. A DataFusion-internal
+grow that cannot be checked ahead of time (the infallible `grow` path) is
+still allowed to overshoot the accountant rather than deadlock the query;
+the overshoot is recorded and surfaces as a typed resource-exhausted error
+on the stream's next poll rather than being caught before it happens. This
+residual is bounded by admission concurrency, not eliminated by it.
+
+Three gauges expose the budget and the shared remainder's live state on
+the metrics endpoint: `ravel_memory_budget_bytes` (the derived total),
+`ravel_memory_reserved_bytes{component="sql"}` (the SQL executor's live
+draw against the shared remainder), and `ravel_memory_handoff_overlap_bytes`
+(bytes transiently charged against two ledgers at once during a handoff
+between reservation holders). A fetch-layer reservation
+(`component="fetch"`) is part of the design but has no live accountant to
+read from yet, so rather than render a gauge that would always read zero
+and look like a real measurement, it is omitted entirely until that
+accountant exists.
+
+The fixed overhead reserve subtracted from effective memory is a
+documented placeholder, not yet a calibrated figure: the calibration
+methodology needs the shared accountant and the fetch-layer reservation
+both live to measure the real gap between resident memory and what the
+accountant tracks, and only the accountant side is built so far. Operators
+should not read the current reserve as a tuned number.
+
 ## Per-request budgets (ADR-1374)
 
 Every budget above is a server ceiling, configured once at startup and the

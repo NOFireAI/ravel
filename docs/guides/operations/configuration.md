@@ -526,6 +526,59 @@ alongside the existing cache label, so RAM and disk hit rates are reported
 separately. With no `--cache-dir` no tier label appears at all. See
 [the caching guide](../caching.md) for the full metric list and sizing advice.
 
+## Process memory budget
+
+Startup derives one process-wide `memory_budget_bytes` from the host's
+effective memory (`MemTotal`, capped by the cgroup memory limit in a
+container) minus a fixed overhead reserve, and logs it like every other
+resolved setting:
+
+```
+INFO performance default resolved setting="memory_budget_bytes" value=... source="derived"
+```
+
+That budget is then carved rather than shared unconditionally: the fetcher
+cache and the catalog byte cache each take a fixed share of it as a hard
+eviction ceiling (they evict rather than grow, so they cannot draw from a
+shared pool), and what remains is a shared accountant the SQL executor's
+per-tenant memory pools draw against. Startup refuses to start, rather than
+silently shrinking a ceiling, if the two hard cache shares alone would sum
+to more than the budget.
+
+Three gauges on the metrics endpoint expose this at runtime:
+
+- `ravel_memory_budget_bytes` -- the derived total.
+- `ravel_memory_reserved_bytes{component="sql"}` -- bytes the SQL executor
+  currently holds against the shared remainder.
+- `ravel_memory_handoff_overlap_bytes` -- bytes transiently charged against
+  two ledgers at once while a reservation is handed off between holders (a
+  buffer moving from a fetch reservation into an SQL scan's pool, for
+  example), so subtracting it from the sum of the other ledgers gives the
+  true unique total.
+
+There is no `component="fetch"` sample: a fetch-layer reservation is part
+of the design but has no live accountant on this build to read a real
+number from, and a gauge that read zero for that reason would look
+indistinguishable from an actual all-clear measurement. It is left out
+entirely instead, and will appear once that accountant lands.
+
+The overhead reserve subtracted from effective memory is a fixed,
+documented placeholder today, not a value obtained by measuring this
+process under load -- treat it as provisional rather than as a tuned
+operational parameter, and expect it to change once the fetch-layer
+reservation above lands and a proper calibration run can be done against
+both pieces together.
+
+One path is deliberately not hard-refused: a DataFusion-internal memory
+grow that cannot be checked against the budget ahead of time is still
+allowed to overshoot it rather than deadlock the query outright, and the
+overshoot is recorded and turned into a typed resource-exhausted error the
+next time the query's result stream is polled, rather than being caught
+before it happens. This residual exposure is bounded by how many queries
+the server admits concurrently, not eliminated by the accounting above --
+an operator relying on the memory budget as a hard ceiling should also
+bound query admission.
+
 ## Retention and garbage-collection configuration
 
 Four values govern when a deleted object's bytes actually go away, and they must
