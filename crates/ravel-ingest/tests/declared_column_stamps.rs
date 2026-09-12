@@ -33,7 +33,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_proto::commit::v1::CommitRecord;
-use ravel_query::LogSegmentFetcher;
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision, SqlConfig,
     TenantMemoryAccountant, build_session,
@@ -299,7 +299,7 @@ async fn min_max_count_answered_from_ingest_stamps_with_zero_gets() {
         .expect("resolve logs snapshot");
 
     let declared = vec![DeclaredColumn::new(COL, DeclaredType::I64)];
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let provider = LogsTableProvider::new(
         snapshot,
         tenant_hash(),
@@ -568,7 +568,7 @@ async fn stamped_min_max_count(
         snapshot,
         tenant_hash(),
         LogSegmentFetcher::new(Arc::clone(&backend)),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_declared_columns(vec![DeclaredColumn::new(COL, DeclaredType::I64)]);
     let ctx = logs_session(provider);
