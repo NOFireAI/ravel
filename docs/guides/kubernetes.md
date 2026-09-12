@@ -357,7 +357,14 @@ fails the [object-store contract](../object-store-contract.md). On a fresh
 cluster no serving pod is created until the Job passes, so there is no
 crash-loop to observe: the Deployments do not exist yet. On a cluster
 that is already serving and re-qualifying after a config edit, the existing
-Deployments are left running while the new Job proves the new inputs.
+Deployments are left running the previous spec while the new Job proves the
+new inputs. During that hold `observedGeneration` advances to the edited
+generation and `Available` stays `True` on the previous spec's ready
+replicas, so after a spec edit that changed a qualified input (the server
+image, for one) do not treat `Available` alone as "the new spec has rolled
+out": wait for `StoreQualified=True` at
+`observedGeneration == .metadata.generation` as well, because `Available`
+can report ready before any pod has moved to the new spec.
 
 The Job is recreated only when its inputs change: the bucket, region,
 endpoint, server image, or the shared credentials Secret's name or
@@ -367,17 +374,34 @@ too, within one resync interval; an unrelated spec edit (a replica count, a
 fold interval) does not. Qualification itself stays once-per-bucket: passing
 it durably records `sys/qualification` in the bucket, so a qualified bucket
 handed to a new `RavelCluster` with the same inputs still gets its own Job
-run (the gate reads this `RavelCluster`'s own status, not the bucket record),
-but that run passes immediately because the suite's final write is a no-op
-against an already-qualified bucket.
+run (the gate reads this `RavelCluster`'s own status, not the bucket record).
+That run re-runs the full conformance suite rather than short-circuiting on
+the existing record: the suite is 28 sequential object operations, up to
+roughly 560 s against a slow-but-healthy backend, so the Job can sit for
+minutes even on a bucket you know is qualified. It passes if the backend
+still satisfies the contract, and the final `sys/qualification` write is then
+a no-op, unless the stored record predates this binary's suite version, in
+which case the run overwrites it in place and reports that it upgraded the
+record. Because qualification now runs on every input change rather than only
+when you run it by hand, the transient scratch each run leaves under
+`sys/qualify/<run-id>/` accumulates without you choosing to; the [deployment
+guide](operations/deployment.md#qualify-the-store) describes that scratch and
+why nothing deletes it.
 
 Progress and failure surface on the `StoreQualified` condition below, not as
 a Job failure you have to go find: `Pending` while the Job is being created
 or is still running, `Succeeded` once it passes, `Failed` once it exhausts
 its retry budget (the message names the attempt count and the next retry
-time, and the Job is recreated on a capped backoff after that). `kubectl
-describe job <cluster>-qualify` or its pod logs give the underlying `store
-qualify` failure.
+time). A failing Job is recreated on a capped exponential backoff (30 s
+doubling to 480 s) for the first five consecutive failures; after six it
+holds for an hour before trying again, and only a qualified-input change
+clears that hold early. Fixing the backend outside the `RavelCluster` spec (a
+bucket policy or endpoint setting) does not shorten the hold, because no
+hashed input changed. `kubectl describe job <cluster>-qualify` and its pod
+logs give the underlying `store qualify` failure, but only for about an hour:
+the Job and its pod are garbage-collected an hour after they finish, on the
+success and failure paths alike, so the `StoreQualified` condition message is
+the durable record and the Job is best-effort within that window.
 
 None of this applies if you run `ravel-server` against a bucket outside a
 `RavelCluster`: nothing qualifies it for you, and you are on the hand-run
@@ -390,14 +414,26 @@ kubectl get -n ravel-system ravelcluster dev -o jsonpath='{.status}'
 ```
 
 `status` carries `observedGeneration`, `gatewayReadyReplicas`,
-`queryReadyReplicas`, `maintainReadyReplicas`, and conditions. Besides
-`Available` and `Degraded`, the operator writes a `StoreQualified` condition
-while the qualification gate above is active. It emits no `Progressing`
+`queryReadyReplicas`, `maintainReadyReplicas`, `storeQualifiedHash`,
+`qualifyFailureCount`, `qualifyNextRetryTime`, `qualifyRetryHash`,
+`gcBootstrapWaitingSince`, and conditions. `qualifyFailureCount` and
+`qualifyNextRetryTime` are the machine-readable form of the retry-budget
+state the `StoreQualified` message describes in prose. Besides `Available`
+and `Degraded`, the operator writes a `StoreQualified` condition on every
+pass: `True` with reason `Succeeded` once the store is qualified for the
+current inputs, `False` with `Pending` or `Failed` while it is not. A steady,
+healthy cluster therefore always shows `StoreQualified=True`; it is not a
+transient the gate sets only during a hold. It emits no `Progressing`
 condition, so do not wait on one.
 
 `Available=True` means the gateway and query Deployments both report ready
 replicas. `kubectl wait --for=condition=Available` is therefore a usable
-readiness gate for scripts and CI. If a reconcile fails (a missing Secret,
+readiness gate for scripts and CI, with one caveat after a spec edit: during
+a re-qualification `Available` stays `True` on the previous spec's replicas
+while `observedGeneration` advances, so a `wait` on `Available` alone can
+return before the new spec has rolled out. Gate on `StoreQualified=True` at
+`observedGeneration == .metadata.generation` as well, as described under
+Store qualification above. If a reconcile fails (a missing Secret,
 an apply error), the operator writes a `Degraded=True` condition with the
 reason and flips `Available` to `False`. A `kubectl wait` then fails with an
 explanation instead of timing out silently.
