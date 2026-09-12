@@ -36,12 +36,44 @@ struct KeyHash {
     g2: u64,
 }
 
+/// Test-only instrument: counts `key_hash` (BLAKE3) invocations on the current
+/// thread. A `debug_assert!` cannot answer "how many": the tests below assert
+/// an exact invocation count (zero while duplicates are only staged, one for
+/// a single distinct key, `m` for `m` distinct keys), which needs a queryable
+/// value, not an inline boolean check. Compiled only under `cfg(test)`, so a
+/// production build never pays for it on the path this change optimizes;
+/// verified to still increment correctly under an optimized test build
+/// (`cargo test --release -p ravel-codec bloom::`). Thread-local, so parallel
+/// tests do not race a shared counter.
+#[cfg(test)]
+mod hash_calls {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        CALLS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn reset() {
+        CALLS.with(|c| c.set(0));
+    }
+
+    pub(super) fn count() -> u64 {
+        CALLS.with(Cell::get)
+    }
+}
+
 /// `h = blake3(seed_le || column_id_le || token)`. `block` is bytes 0..8 LE,
 /// `g1` is bytes 8..16 LE, `g2` is bytes 16..24 LE with the low bit forced
 /// set. Using disjoint digest bytes for the block and the offsets keeps the
 /// first probe from being congruent to the block index (which would collapse
 /// most set bits onto two offsets and wreck the false-positive rate).
 fn key_hash(seed: u64, column_id: u32, token: &[u8]) -> KeyHash {
+    #[cfg(test)]
+    hash_calls::bump();
     let mut hasher = blake3::Hasher::new();
     hasher.update(&seed.to_le_bytes());
     hasher.update(&column_id.to_le_bytes());
@@ -78,9 +110,64 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 
 /// Accumulates distinct `(column_id, token)` keys, then sizes and serializes a
 /// blocked bloom filter for them.
+///
+/// The staged key is the raw `column_id_le || token` bytes, deduplicated
+/// before any BLAKE3 is computed. Ingest calls `insert` 20x-349x more often
+/// than there are distinct keys (issue #1518), so hashing on insert spent most
+/// of its work on tokens the staging set was about to discard. Staging the raw
+/// key first defers `key_hash` to `finish`, which runs it exactly once per
+/// distinct key: the `n` BLAKE3 invocations that used to be spread across
+/// `insert` calls at ingest time now all land inside one `finish` call, so
+/// ingest gets cheaper and `finish` gets correspondingly slower -- a
+/// stage-timing split now attributes that cost to `finish`, not to `insert`.
+/// The emitted bytes are unchanged: `finish` reconstructs the same
+/// `(block, g1, g2)` triple set the old insert-time hashing produced (it even
+/// re-deduplicates by triple, so a BLAKE3 collision between two distinct raw
+/// keys still collapses to one, matching the old distinct-triple count that
+/// sizes the filter).
+///
+/// `finish` takes `self` by value and drains `staged`, freeing each raw
+/// entry's `Box<[u8]>` as it is hashed. That drain does not halve peak
+/// memory: `triples` below is built with
+/// `HashSet::with_capacity(self.staged.len())` before the drain loop runs,
+/// and `with_capacity` reserves the full bucket array up front to satisfy
+/// its no-reallocation guarantee, so the whole `triples` table exists
+/// before a single `staged` entry is freed -- `staged` and `triples` are
+/// both fully live at that point, and draining only lets `staged` shrink
+/// back down while `triples` fills in alongside it. Measured on this host
+/// (process RSS around one `BloomBuilder` loaded with a large distinct-key
+/// corpus): 38460 KB immediately before the drain loop starts, 37380 KB
+/// immediately after `finish` returns -- about 3%, not "roughly halved".
+///
+/// Per-key cost at that peak, on the same basis for both tables (hashbrown
+/// adds one control byte per slot and keeps the load factor between about
+/// 0.4375 just after a resize and 0.875 just before the next one, so a
+/// slot's real cost is `(value_width + 1) / load_factor`, not the bare
+/// value width):
+/// - `staged: HashSet<Box<[u8]>>` -- each slot holds a `Box<[u8]>` fat
+///   pointer (16 bytes: data pointer + length), so the slot itself costs
+///   `(16 + 1) / 0.875` to `(16 + 1) / 0.4375`, roughly 19 to 39 bytes. That
+///   pointer addresses a separate heap allocation for the raw
+///   `column_id_le || token` bytes: up to 4 + 64 = 68 bytes of data (the
+///   64-byte token bound `insert` documents below) plus a typical ~16-byte
+///   allocator header, roughly 84 bytes. Staged cost: roughly 103 to 123
+///   bytes per distinct key.
+/// - `triples: HashSet<(u64, u64, u64)>` -- the 24-byte tuple lives inline
+///   in the slot, no separate heap allocation, so the slot costs
+///   `(24 + 1) / 0.875` to `(24 + 1) / 0.4375`, roughly 29 to 57 bytes per
+///   distinct key.
+///
+/// Both tables are live at peak (above), so the combined peak cost is their
+/// sum: roughly 132 to 180 bytes per distinct key.
 pub struct BloomBuilder {
     seed: u64,
-    staged: HashSet<(u64, u64, u64)>,
+    /// Distinct `column_id_le || token` byte strings. Queried by `&[u8]` via
+    /// `Box<[u8]>: Borrow<[u8]>`, so a duplicate insert probes without
+    /// allocating.
+    staged: HashSet<Box<[u8]>>,
+    /// Reused `column_id_le || token` buffer for the membership probe, so a
+    /// duplicate insert copies bytes but allocates nothing.
+    scratch: Vec<u8>,
 }
 
 impl BloomBuilder {
@@ -88,27 +175,61 @@ impl BloomBuilder {
         BloomBuilder {
             seed,
             staged: HashSet::new(),
+            scratch: Vec::new(),
         }
     }
 
-    /// Stages one field-scoped token. Duplicates collapse; the staged
-    /// distinct count sizes the filter.
+    /// Stages one field-scoped token. Duplicates collapse; the filter is
+    /// sized by the distinct-*triple* count `finish` computes after hashing
+    /// and re-deduping the staged keys, not by the staged distinct-key
+    /// count itself. No BLAKE3 here: only distinct keys reach `key_hash`,
+    /// in `finish`.
+    ///
+    /// `token` is not length-checked or truncated here. The crate's
+    /// per-key memory bound holds only because every current caller keeps
+    /// `token` at or under 64 bytes: `ravel-logseg`'s writer module bounds
+    /// whole-value inserts with a private 64-byte const (`EXACT_BLOOM_MAX`,
+    /// crates/ravel-logseg/src/writer.rs), and the tokenizer bounds word
+    /// tokens with a private 64-byte const scoped to its own function body
+    /// (`TOKEN_MAX_BYTES` inside `tokenizer::tokens`,
+    /// crates/ravel-codec/src/tokenizer.rs) -- neither const is importable
+    /// from here. A caller outside those two paths can pass an
+    /// arbitrary-length slice, and this function will stage it as-is.
     pub fn insert(&mut self, column_id: u32, token: &[u8]) {
-        let h = key_hash(self.seed, column_id, token);
-        self.staged.insert((h.block, h.g1, h.g2));
+        self.scratch.clear();
+        self.scratch.extend_from_slice(&column_id.to_le_bytes());
+        self.scratch.extend_from_slice(token);
+        if !self.staged.contains(self.scratch.as_slice()) {
+            self.staged.insert(self.scratch.as_slice().into());
+        }
     }
 
     /// Sizes the filter for a ~1% false-positive rate at the staged distinct
     /// count (`m_bits` rounded up to a power of two, at least 512 bits) and
     /// returns the serialized entry bytes: `m_bits` uvarint, `k` u8, `seed`
     /// u64 LE, then the bit array (`m_bits / 8` bytes).
-    pub fn finish(self) -> Vec<u8> {
-        let n = self.staged.len() as f64;
+    pub fn finish(mut self) -> Vec<u8> {
+        // Hash each distinct raw key once, then dedup by triple exactly as the
+        // old insert-time path did (idempotent for bit-setting, but the
+        // distinct-triple count is what sizes the filter). Draining (instead
+        // of borrowing) frees each key's `Box<[u8]>` as it is hashed, but
+        // `with_capacity` below reserves the full table up front, so `staged`
+        // and `triples` are both fully live once the loop starts -- see the
+        // struct doc for the measured peak and per-key arithmetic.
+        let mut triples: HashSet<(u64, u64, u64)> = HashSet::with_capacity(self.staged.len());
+        for key in self.staged.drain() {
+            let mut col = [0u8; 4];
+            col.copy_from_slice(&key[..4]);
+            let column_id = u32::from_le_bytes(col);
+            let h = key_hash(self.seed, column_id, &key[4..]);
+            triples.insert((h.block, h.g1, h.g2));
+        }
+        let n = triples.len() as f64;
         let target = (n * BITS_PER_ELEM).ceil() as u64;
         let m_bits = target.max(BLOCK_BITS).next_power_of_two();
         let block_count = m_bits / BLOCK_BITS;
         let mut bits = vec![0u8; (m_bits / 8) as usize];
-        for (block, g1, g2) in &self.staged {
+        for (block, g1, g2) in &triples {
             let h = KeyHash {
                 block: *block,
                 g1: *g1,
@@ -232,6 +353,38 @@ mod tests {
     }
 
     #[test]
+    fn blake3_scales_with_distinct_keys_not_inserts() {
+        // Many duplicates of one key: BLAKE3 runs exactly once, in finish.
+        let mut b = BloomBuilder::new(9);
+        hash_calls::reset();
+        for _ in 0..10_000 {
+            b.insert(5, b"same-token");
+        }
+        assert_eq!(hash_calls::count(), 0, "insert must not hash");
+        let _ = b.finish();
+        assert_eq!(
+            hash_calls::count(),
+            1,
+            "one distinct key must hash exactly once"
+        );
+
+        // M distinct keys: exactly M invocations, still none on insert.
+        let m: u32 = 500;
+        let mut b = BloomBuilder::new(9);
+        hash_calls::reset();
+        for i in 0..m {
+            b.insert(5, format!("token-{i}").as_bytes());
+        }
+        assert_eq!(hash_calls::count(), 0, "insert must not hash");
+        let _ = b.finish();
+        assert_eq!(
+            u32::try_from(hash_calls::count()).expect("count fits u32"),
+            m,
+            "distinct-key count must equal BLAKE3 invocations"
+        );
+    }
+
+    #[test]
     fn parse_rejects_corrupt_entries() {
         // Truncated: empty buffer.
         assert!(matches!(
@@ -277,6 +430,90 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
+
+    /// The pre-#1518 algorithm: hash on every insert, stage the triple, size
+    /// and serialize from the distinct-triple set. The new builder must emit
+    /// bytes identical to this for every input and every insert order.
+    fn reference_filter(seed: u64, inserts: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut staged: HashSet<(u64, u64, u64)> = HashSet::new();
+        for (col, tok) in inserts {
+            let h = key_hash(seed, *col, tok);
+            staged.insert((h.block, h.g1, h.g2));
+        }
+        let n = staged.len() as f64;
+        let target = (n * BITS_PER_ELEM).ceil() as u64;
+        let m_bits = target.max(BLOCK_BITS).next_power_of_two();
+        let block_count = m_bits / BLOCK_BITS;
+        let mut bits = vec![0u8; (m_bits / 8) as usize];
+        for (block, g1, g2) in &staged {
+            let h = KeyHash {
+                block: *block,
+                g1: *g1,
+                g2: *g2,
+            };
+            for bit in probe_bits(&h, K, block_count) {
+                set_bit(&mut bits, bit);
+            }
+        }
+        let mut out = Vec::new();
+        put_uvarint(&mut out, m_bits);
+        out.push(K);
+        out.extend_from_slice(&seed.to_le_bytes());
+        out.extend_from_slice(&bits);
+        out
+    }
+
+    fn build(seed: u64, inserts: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut b = BloomBuilder::new(seed);
+        for (col, tok) in inserts {
+            b.insert(*col, tok);
+        }
+        b.finish()
+    }
+
+    proptest! {
+        // Byte-for-byte identical to the pre-#1518 output, over random column
+        // ids, token lengths (including empty and >64 bytes), seeds, insert
+        // orders, and high duplicate densities (a small key pool picked many
+        // times). Insert order must not change the bytes.
+        //
+        // The pool is drawn from two size ranges, not one, so both filter
+        // geometries stay covered every run: 1..=53 distinct keys keeps the
+        // 512-bit floor reachable (`ceil(n * 9.585) <= 512` iff `n <= 53`, so
+        // `block_count == 1`; a pool this small is also fully saturated by up
+        // to 1600 picks, so `n` is exactly the pool size, never above it), and
+        // 54..=599 routinely lands above the floor (`block_count > 1`). A
+        // single 1..600 range measured 0 of 258 cases at `block_count == 1`:
+        // once `picks` (0..1600) exceeds the pool size, the birthday effect
+        // saturates the pool almost every run, so raising the top of one
+        // range to reach `block_count > 1` silently pushed distinct counts
+        // past the floor on every case instead of adding coverage next to it.
+        #[test]
+        fn byte_identical_to_reference(
+            pool in prop_oneof![
+                proptest::collection::vec(
+                    (0u32..8u32, proptest::collection::vec(any::<u8>(), 0..80usize)),
+                    1..54usize),
+                proptest::collection::vec(
+                    (0u32..8u32, proptest::collection::vec(any::<u8>(), 0..80usize)),
+                    54..600usize),
+            ],
+            picks in proptest::collection::vec(any::<usize>(), 0..1600usize),
+            seed in any::<u64>(),
+        ) {
+            let inserts: Vec<(u32, Vec<u8>)> = picks
+                .iter()
+                .map(|&i| pool[i % pool.len()].clone())
+                .collect();
+            let reference = reference_filter(seed, &inserts);
+            let mine = build(seed, &inserts);
+            prop_assert_eq!(&mine, &reference);
+
+            // Insert order independence: reversed inserts, same bytes.
+            let reversed: Vec<(u32, Vec<u8>)> = inserts.iter().rev().cloned().collect();
+            prop_assert_eq!(build(seed, &reversed), mine);
+        }
+    }
 
     proptest! {
         #[test]
