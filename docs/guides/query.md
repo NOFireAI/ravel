@@ -474,7 +474,7 @@ INFO performance default resolved setting="fetch_concurrency" value=32 source="d
 INFO performance default resolved setting="store_get_concurrency" value=32 source="derived"
 INFO performance default resolved setting="sql_partition_count" value=32 source="derived"
 INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
-INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=8053063680 source="derived"
 ```
 
 `--logs-fetch-policy latency-first` resolves these three concurrency knobs the

@@ -302,8 +302,10 @@ single-tenant](#one-credential-per-process-federation-is-single-tenant).
 A federated request carries **matchers, a time window, and budgets**, never
 segment references and never object-store credentials. The remote resolves its
 own snapshot over that window and runs it through its ordinary query path, so
-it enforces its own admission limits, its own tenancy hashing, its own
-selective-erasure predicates, and its own budgets.
+it enforces its own admission limits, its own tenancy hashing, and its own
+selective-erasure predicates. The budgets travel with the request and are the
+caller's carried limits, applied by the remote; the coordinator re-enforces
+them over the folded remote spend regardless.
 
 The credential is an **operator** secret, and the tenant the remote serves is
 derived from that credential by the remote's own resolver chain. A coordinator

@@ -24,15 +24,13 @@ covers it. Wave R6 (crates/ravel-object-store, ravel-failure-tests,
 ravel-catalog, ravel-maintain, ravel-ingest, ravel-fleet, services/ravel-cli
 regression tests) closed every other row that previously appeared here.
 
-### lifecycle (2 rows, production gaps)
+### lifecycle (1 row, test gap)
 
-- `RequestErasure` — `crates/ravel-commit/src/keys.rs::erasure_request_key::DREQ_SUFFIX`
-  — no production symbol PUTs the request marker; only the key builder and
-  tests exist
 - `CompleteErasure / CompletionImpliesNoPreRewriteExposure` —
-  `crates/ravel-maintain/src/erasure_rewrite.rs::bucket_erasure_completion::bucket_serves_subject`
-  — the gate is computed but no production symbol writes the completion
-  object
+  `services/ravel-server/src/maintain.rs::write_erasure_completion` — the
+  production symbol writes the completion object, but no test drives it
+  through the served-set branch end-to-end; only the gate
+  (`bucket_erasure_completion`) is unit-tested
 
 ### maintenance (3 rows, proposal with no shipped caller)
 
@@ -47,4 +45,4 @@ regression tests) closed every other row that previously appeared here.
 - `LostClaimNeverPublishesThroughGuardedPath` —
   `crates/ravel-fleet/src/claim.rs::renew` — same reason as `GuardedPublish`
 
-Total test-debt rows: 5 (lifecycle 2, maintenance 3).
+Total test-debt rows: 4 (lifecycle 1, maintenance 3).
