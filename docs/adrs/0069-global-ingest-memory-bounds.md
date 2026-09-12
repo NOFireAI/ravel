@@ -370,3 +370,110 @@ in-flight-request term exactly as decision 1 left them.
 
 Unaffected, for the reason the 2026-09-07 amendment gives: shedding happens
 strictly before `PinFlush` and the model has no admission action.
+
+## Amendment (2026-09-12): OTLP gRPC is bounded and documented, not charged
+
+This amendment resolves the OTLP gRPC gzip inflate that the 2026-09-10
+amendment left as an open item ("Why OTLP gRPC was not fixed here"). It changes
+no ingest behavior; it records a decision and adds a test that pins the ceiling
+that decision relies on. Everything above stands unchanged. It matches the
+Remote Write amendment's scope in reverse: that one added a charge, this one
+records that no charge is the correct outcome for this path and says why
+completely, rather than leaving the path as a deferred gap. OTAP is out of
+scope (issue #1419 names gRPC only) and is treated below.
+
+### Context
+
+The 2026-09-10 amendment charged the Remote Write snappy inflate and examined
+three placements for a matching OTLP gRPC charge, concluding none charges the
+right quantity at the right time without a change below Ravel's code. It left
+the path uncharged and the fix unattempted. docs/ingest.md described the state
+as "not charged by this amendment", which reads as a deferral rather than a
+decision. Issue #1419's gRPC half is that decision.
+
+The determining fact is where the inflate happens. tonic decompresses inside
+its own `Streaming` codec (`decompress` into `StreamingInner::decompress_buf`,
+tonic 0.14.6 `src/codec/decode.rs`), before the generated server calls any
+Ravel handler. The earliest Ravel code on the request path is
+`WireByteCountLayer` (`services/ravel-server/src/wire_byte_count.rs`, installed
+on the gRPC server builder in `src/lib.rs`), a `tower::Layer` whose body wrapper
+parses gRPC frame headers off the wire. Before inflation it can read only the
+compressed frame length and the compression flag; gzip does not declare its
+output size, so the true inflated size is not knowable at that seam.
+
+### Decision
+
+The OTLP gRPC gzip inflate stays uncharged and is bounded per request by
+tonic's `max_decoding_message_size` (16 MiB here, set on every OTLP gRPC service
+in `src/lib.rs`), which tonic 0.14.6 enforces at two points, both verified
+against the version in the lock file:
+
+- the compressed frame length is checked against the cap before anything is
+  inflated (`decode.rs`, `len > limit` yields `OUT_OF_RANGE`), and
+- the decompression output buffer is capped at the same value
+  (`(&mut self.decompress_buf).limit(limit)`), so an inflate that would exceed
+  it fails with `RESOURCE_EXHAUSTED` mid-decompression rather than allocating
+  past the cap.
+
+So one gRPC ingest request's decompressed message cannot exceed 16 MiB, and the
+process-wide exposure is `--max-inflight-ingest-requests` times 16 MiB, a term
+the worst-case arithmetic in docs/ingest.md already states. This is the same
+bound `--max-inflight-ingest-requests` documents for every uncharged OTLP
+decoded body; no new headroom is claimed.
+
+`services/ravel-server/tests/inflate_budget_e2e.rs` pins the ceiling: a gzip
+gRPC request whose body inflates past 16 MiB is refused with
+`RESOURCE_EXHAUSTED` and a status message that names the exact 16777216-byte
+limit, and a request inflating to just under 16 MiB is accepted. The number the
+documentation states is therefore the number the code enforces, checked in CI.
+
+### Rejected alternatives
+
+- **Charge the compressed frame length in `WireByteCountLayer`.** It runs before
+  inflation and could hold a charge across the allocation, but the compressed
+  length is the wrong quantity by the compression ratio, which a decompression
+  bomb maximizes, so the bound would fail exactly when it matters. Same reason
+  the Remote Write amendment rejects "charge the compressed body length".
+- **A custom tonic `Codec` that charges as it decompresses.** The right seam and
+  unreachable: tonic-build emits `tonic_prost::ProstCodec::default()` inside the
+  generated server's `call`, and the `Decoder` trait sees only the already
+  decompressed `DecodeBuf`, so even a hand-substituted decoder would charge
+  after the peak.
+- **Charge the post-inflate length in the handler.** After the peak has already
+  been allocated, which does not bound the peak (the 2026-09-07 amendment
+  rejects "charge after inflate" by name), and it charges tonic's reused
+  amortized-growth `decompress_buf`, whose length undercounts its retained
+  capacity.
+- **Charge a flat 16 MiB per request on admission.** This does bound the peak
+  and can be held across the allocation, but it over-charges every
+  well-compressing request and sheds real traffic under a tight budget, and the
+  result (`max_inflight` times 16 MiB) is exactly what the concurrency bound
+  already states without any charge. It buys nothing over documenting the
+  existing bound.
+- **Fix it post-inflate anyway so all paths "look" covered.** Rejected for the
+  reason the 2026-09-10 amendment gives: it would let the flag docs claim a
+  bound the path does not enforce, the failure #1297 was filed for.
+
+### OTAP (out of scope, recorded for a follow-up)
+
+OTAP is not part of issue #1419 and is not decided here. It is a larger
+exposure than the gRPC path and is worth its own issue. A `BatchArrowRecords`
+carries `arrow_payloads`, an unbounded repeated field; `ravel-otap`
+(`crates/ravel-otap/src/stream.rs`) imposes no payload-count cap and decompresses
+each payload's `record` capped at `max_decompressed_payload_bytes` (16 MiB),
+one payload at a time. The whole compressed message is bounded by the same
+16 MiB `max_decoding_message_size`, so the payload count is bounded only by that
+size divided by the minimum per-payload wire bytes (on the order of 10^4 for
+maximally-compressing bomb payloads). The transient decompress buffer is 16 MiB
+(freed between payloads), but the decoded `RecordBatch`es accumulate across all
+payloads of the message, so one request's retained decode bytes are the payload
+count times the per-payload decoded size, far above a single 16 MiB message.
+`max_rows_per_batch` (default 1,000,000) caps rows per IPC message but neither
+the payload count nor the sum. docs/ingest.md and this ADR state the per-payload
+16 MiB cap but not this per-request total; quantifying and bounding it is the
+follow-up.
+
+### Model (RUST_ONLY)
+
+Unaffected. This amendment records a decision and adds a test; it changes no
+ingest path and no durability or visibility state.

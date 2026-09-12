@@ -930,6 +930,136 @@ async fn remote_write_shed_releases_its_charge_so_the_same_body_later_succeeds()
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// Issue #1419 (gRPC half): the OTLP gRPC gzip decode path is deliberately not
+/// charged against the byte budget. Unlike the OTLP HTTP and Remote Write
+/// paths, tonic inflates inside its own codec before any Ravel handler runs, so
+/// no charge of the true inflated size can be held across the allocation (a
+/// tower layer sees only the compressed frame length, and gzip does not declare
+/// its output size). Instead the path is bounded per request to 16 MiB by
+/// tonic's `max_decoding_message_size` and documented as such, and this test
+/// pins that ceiling so the number the documentation states is the number the
+/// code enforces.
+///
+/// A single request whose gzip body inflates past 16 MiB is refused by tonic's
+/// decompression-output cap with `RESOURCE_EXHAUSTED`, and the status message
+/// names the exact ceiling (16777216 bytes). The body is a run of identical
+/// points, so it gzips to far under the 16 MiB frame cap: the frame-length
+/// check (`decode.rs` `len > limit`) clears, and it is the decompressed-output
+/// limit (`(&mut decompress_buf).limit(16 MiB)`, tonic 0.14.6
+/// `src/codec/decode.rs`) that refuses it, not the frame cap.
+///
+/// Non-vacuity: change `MAX_DECODED_MESSAGE_BYTES` in `src/lib.rs` (the
+/// `.max_decoding_message_size(...)` argument on every OTLP gRPC service). Any
+/// other value makes the status message name a different ceiling, so the
+/// exact-number assertion fails.
+#[tokio::test]
+async fn grpc_gzip_inflate_over_the_decoding_ceiling_is_refused_at_16_mib() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+    use tonic::codec::CompressionEncoding;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    // Byte budget unlimited: this path is deliberately uncharged, so the only
+    // thing that can refuse the request is tonic's per-message decode cap. That
+    // is precisely what makes this a ceiling test and not a budget test.
+    let running = start_test_server(store, IngestByteBudgetLimit::Unlimited).await;
+    let grpc_addr = running.grpc_addr.expect("gateway mode binds gRPC");
+    let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("gRPC client connects")
+        .send_compressed(CompressionEncoding::Gzip);
+
+    // Derive the per-point encoded cost from the codec itself so the fixture
+    // tracks the wire format rather than a guessed constant.
+    let per_point = (compressible_request(2000).encoded_len()
+        - compressible_request(1000).encoded_len())
+        / 1000;
+    let mib = 1024 * 1024;
+    let over_points = (20 * mib) / per_point;
+    let request = compressible_request(over_points);
+    let inflated = request.encoded_len();
+    assert!(
+        inflated > 16 * mib,
+        "fixture must inflate past the 16 MiB ceiling to exercise it: inflated={inflated}"
+    );
+
+    let mut tonic_request = tonic::Request::new(request);
+    tonic_request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
+    );
+
+    let status = client
+        .export(tonic_request)
+        .await
+        .expect_err("an inflate past the 16 MiB decode cap must be refused");
+    assert_eq!(
+        status.code(),
+        tonic::Code::ResourceExhausted,
+        "tonic maps the decompressed-output cap to RESOURCE_EXHAUSTED, got {status:?}"
+    );
+    // The refusal names the exact ceiling the code enforces. This is the pin:
+    // the documented 16 MiB is the enforced 16 MiB.
+    let ceiling = 16 * mib;
+    assert!(
+        status.message().contains(&ceiling.to_string()) && status.message().contains("decompress"),
+        "the refusal must name the {ceiling}-byte decompression ceiling, got: {:?}",
+        status.message()
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Issue #1419 (gRPC half), the accept side of
+/// `grpc_gzip_inflate_over_the_decoding_ceiling_is_refused_at_16_mib`: a gzip
+/// request whose body inflates to just under 16 MiB is not refused, so the
+/// enforced ceiling is not lower than the documented one. Together the two
+/// tests bracket the enforced ceiling at exactly 16 MiB: a body inflating to
+/// ~14 MiB is accepted, a body inflating past 16 MiB is refused with the
+/// 16777216-byte message.
+///
+/// Non-vacuity: lower `MAX_DECODED_MESSAGE_BYTES` in `src/lib.rs` below this
+/// body's inflated size and the request is refused with RESOURCE_EXHAUSTED, so
+/// the `is_ok()` assertion fails.
+#[tokio::test]
+async fn grpc_gzip_body_under_the_decoding_ceiling_is_accepted() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+    use tonic::codec::CompressionEncoding;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_test_server(store, IngestByteBudgetLimit::Unlimited).await;
+    let grpc_addr = running.grpc_addr.expect("gateway mode binds gRPC");
+    let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("gRPC client connects")
+        .send_compressed(CompressionEncoding::Gzip);
+
+    let per_point = (compressible_request(2000).encoded_len()
+        - compressible_request(1000).encoded_len())
+        / 1000;
+    let mib = 1024 * 1024;
+    let under_points = (14 * mib) / per_point;
+    let request = compressible_request(under_points);
+    let inflated = request.encoded_len();
+    assert!(
+        inflated > 12 * mib && inflated < 16 * mib,
+        "fixture must inflate to just under the 16 MiB ceiling: inflated={inflated}"
+    );
+
+    let mut tonic_request = tonic::Request::new(request);
+    tonic_request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
+    );
+
+    let response = client.export(tonic_request).await;
+    assert!(
+        response.is_ok(),
+        "a gzip request inflating to under 16 MiB must be accepted, got {response:?}"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// Issue #1419, the Remote Write complement of
 /// `a_request_whose_inflate_and_batch_each_fit_is_not_shed_for_their_sum`: the
 /// handler releases the inflate charge before the router takes its buffered
