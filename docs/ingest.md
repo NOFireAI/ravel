@@ -771,8 +771,16 @@ it past decode over-holds deliberately: the inflate buffer itself is freed when
 decode returns, and the charge stays as the admission cost of the decoded
 request until its points reach the router.
 
-The OTLP gRPC and OTAP decode paths are not charged by this amendment and
-remain term 2 (see the sweep in ADR-0069's amendment for why).
+The OTLP gRPC decode path is deliberately not charged and remains term 2, by
+the decision recorded in ADR-0069's 2026-09-12 amendment: tonic inflates inside
+its own codec before any Ravel handler runs, so no charge of the true inflated
+size can be held across the allocation, and the path is instead bounded per
+request to 16 MiB by tonic's `max_decoding_message_size` (verified against tonic
+0.14.6 and pinned by an end-to-end test). The OTAP decode path is likewise
+uncharged and remains term 2, but its per-request bound is larger than one
+16 MiB message and is not yet quantified (a `BatchArrowRecords` carries an
+uncapped vector of payloads, each capped at 16 MiB); that is a separate
+follow-up, not this decision.
 
 ### Worst-case resident memory
 
@@ -880,10 +888,19 @@ its declared length before it is allocated), so the sum of all concurrent OTLP
 HTTP gzip and Remote Write snappy inflate buffers is bounded by that one
 ceiling, the same gauge that bounds buffered state. Two ingest paths are still
 outside it: the OTLP gRPC gzip inflate, which tonic performs inside its codec
-where no charge can be taken before the bytes are materialized, and the OTAP
-zstd payload inflate. Both remain term 2, bounded only by
-`--max-inflight-ingest-requests` times their 16 MiB per-message caps. That
-bound is about these transients only,
+where no charge of the true inflated size can be held across the allocation
+(the only quantity a layer in front of tonic can read pre-inflate is the
+compressed frame length, which gzip does not tie to the output size), and the
+OTAP zstd payload inflate. The gRPC path is bounded per request to 16 MiB by
+tonic 0.14.6's `max_decoding_message_size`, which caps both the compressed frame
+length and the decompression output at that value (ADR-0084; the 2026-09-12
+amendment to ADR-0069 records why bounding-and-documenting this path is the
+complete fix rather than a charge, and an end-to-end test pins the 16 MiB
+ceiling). OTAP's per-request bound is larger, because a `BatchArrowRecords`
+carries an uncapped vector of payloads each capped at 16 MiB; that figure is
+not yet quantified and is a separate follow-up. Both remain term 2, the gRPC
+path bounded by `--max-inflight-ingest-requests` times its 16 MiB per-message
+cap. That bound is about these transients only,
 not about total process RSS: the admission controller's per-tenant maps are
 deliberately excluded from idle-tenant eviction and still grow with tenant count
 (see below), so the inflate buffers' contribution to peak RSS is a
