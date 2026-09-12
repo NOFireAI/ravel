@@ -8,9 +8,14 @@
 //! waiters and its ADR-0069 byte charges) into a task spawned onto
 //! [`SpanFlushCtx::run_flush`], then keeps draining its channel.
 //! `max_inflight_flushes` (ADR-0067 decision 2) bounds concurrent flush tasks
-//! per shard via a semaphore acquired before spawning; at the bound the acquire
-//! blocks the flush trigger (and the actor's next message pull), which is where
-//! backpressure propagates. This ports ADR-0067 decisions 1 and 2 from the
+//! per shard via a semaphore acquired INSIDE the spawned task (issue #1641):
+//! the actor spawns and returns, so a stalled flush -- a tenant whose S3 key
+//! prefix is being throttled -- parks only its own task on the permit, never the
+//! actor, so every co-resident tenant's age tick and channel drain keep running.
+//! Backpressure at the bound propagates through the ADR-0069 byte budget
+//! (charges held until a flush completes), not through parking the actor;
+//! ADR-1642 supersedes ADR-0067 decision 2 with that. This ports ADR-0067
+//! decisions 1 and 2 from the
 //! metrics [`crate::shard`]; the adaptive flush delay (decision 3) is
 //! metrics-only and deliberately absent here (the age trigger stays the fixed
 //! `max_flush_delay`/`max_flush_delay_idle` in [`SpanShardActor::age_threshold_ns`]).
@@ -515,13 +520,34 @@ fn handle_flush_join_result(shard: u32, result: Result<(), tokio::task::JoinErro
     }
 }
 
-/// RAII in-flight-flush accounting: incremented when a flush task is spawned,
-/// decremented on `Drop` when it ends, including on panic. Moved into the
-/// spawned task itself (not held by the actor) so the decrement fires exactly
-/// once, whenever that task's future is finally dropped.
+/// RAII in-flight-flush accounting, the span-pipeline counterpart of
+/// [`crate::shard`]'s guard. [`InFlightFlushGuard::new`] is the only way to
+/// construct one and it performs the `+1`; `Drop` performs the `-1`. Pairing
+/// them in one value is what keeps the gauge unbiased: an increment written as
+/// a separate statement inside the spawned task never runs for a task dropped
+/// before its first poll (a `JoinSet` dropped with tasks still queued, when the
+/// actor unwinds out of `handle_flush_join_result` or the router drops the
+/// actor), while dropping that task's future still fires the `Drop`. The gauge
+/// clamps at 0 on read so nothing underflows, but the negative bias persists in
+/// the map, and the router hands the same [`SpanIngestMetrics`] to the respawned
+/// actor for that shard index, so a shard biased to -2 would report 0 in flight
+/// while two real flushes ran.
+///
+/// The guard is constructed on the actor, in the same non-awaiting region that
+/// moves the buffer into the flush task, so the gauge counts a flush from the
+/// moment its memory leaves the actor: a task still waiting for a permit holds
+/// its buffer and its ADR-0069 byte charge exactly as an executing one does, and
+/// that memory is what ADR-0067's in-flight consequence is about.
 struct InFlightFlushGuard {
     metrics: Arc<SpanIngestMetrics>,
     shard: u32,
+}
+
+impl InFlightFlushGuard {
+    fn new(metrics: Arc<SpanIngestMetrics>, shard: u32) -> Self {
+        metrics.record_inflight_flush_delta(shard, 1);
+        InFlightFlushGuard { metrics, shard }
+    }
 }
 
 impl Drop for InFlightFlushGuard {
@@ -903,13 +929,13 @@ impl SpanShardActor {
     /// Pins `buf`'s flush identity, then moves `buf`'s payload, waiters, and
     /// ADR-0069 charges into a task spawned onto [`SpanFlushCtx::run_flush`]
     /// (ADR-0067 decision 1), mirroring [`crate::log_shard`]'s `flush_tenant`.
-    /// Everything up to and including the semaphore acquire runs here, on the
-    /// actor; nothing after it does, so a slow encode or a slow PUT never blocks
-    /// the actor from processing its next message once a permit is free.
+    /// Everything up to the spawn runs here, on the actor; nothing after it
+    /// does. The `max_inflight_flushes` acquire is inside the spawned task
+    /// (ADR-1642), so neither a slow encode, a slow PUT, nor a wait for a permit
+    /// blocks the actor from processing its next message.
     ///
-    /// An empty buffer never reaches the semaphore or a spawned task: there is
-    /// nothing to encode, and a flush identity pinned for nothing would burn a
-    /// `seq` for no object.
+    /// An empty buffer never reaches a spawned task: there is nothing to encode,
+    /// and a flush identity pinned for nothing would burn a `seq` for no object.
     async fn flush_tenant(
         &mut self,
         tenant: TenantId,
@@ -1031,28 +1057,46 @@ impl SpanShardActor {
             charges,
         };
 
-        // ADR-0067 decision 2: the only place a flush trigger blocks. At
-        // `max_inflight_flushes` already-spawned tasks, this await parks until
-        // one ends and releases its permit; because `flush_tenant` is itself
-        // awaited from `handle_write`/`flush_aged`/`flush_all`, that park keeps
-        // the actor from pulling its next channel message, exactly the
-        // backpressure path the bounded mpsc already relies on.
-        let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => panic!(
-                "ravel-ingest: span flush semaphore closed unexpectedly on shard {}",
-                self.shard
-            ),
-        };
-        self.metrics.record_inflight_flush_delta(self.shard, 1);
-        let guard = InFlightFlushGuard {
-            metrics: Arc::clone(&self.metrics),
-            shard: self.shard,
-        };
+        // ADR-0067 decision 2, amended for tenant isolation (issue #1641): the
+        // `max_inflight_flushes` acquire runs INSIDE the spawned flush task, not
+        // on the actor. Acquiring on the actor parked the whole `select!` loop at
+        // the bound -- it stopped pulling channel messages, stopped the age-flush
+        // tick, and stopped reaping finished flushes -- so one tenant whose
+        // key prefix was throttled (S3 `503 SlowDown` is per-prefix) stalled
+        // every co-resident tenant on the shard, including their age triggers.
+        // Handing the acquire to the task keeps the actor draining and ticking no
+        // matter how long a flush is stalled. Backpressure now propagates through
+        // the ADR-0069 global byte budget: each flush's `charges` are held until
+        // it completes, so a shard wedged on a throttled prefix drains the budget
+        // and `try_charge` sheds at the ceiling, rather than parking the actor and
+        // filling the bounded channel. ADR-1642 supersedes ADR-0067 decision 2
+        // with exactly this, for all three ingest pipelines.
+        //
+        // The in-flight gauge is incremented here, by the guard's constructor,
+        // and decremented by its `Drop` inside the task: see
+        // [`InFlightFlushGuard`] for why the two must be one value. A flush
+        // still waiting for a permit counts as in flight, because it is holding
+        // a flush window of memory.
+        //
+        // Unlike the metrics and log pipelines this one carries no per-shard
+        // skew instrumentation (issue #865 never reached it), so there is no
+        // `flush_permit_wait_ns` span to move with the acquire and no on-actor
+        // subtraction to unwind.
+        let guard = InFlightFlushGuard::new(Arc::clone(&self.metrics), self.shard);
+        let semaphore = Arc::clone(&self.semaphore);
+        let shard = self.shard;
         let ctx = Arc::clone(&self.ctx);
         self.flushes.spawn(async move {
-            let _permit = permit;
             let _guard = guard;
+            // Wait for a flush permit here, off the actor. At the bound this task
+            // parks; the actor does not.
+            let permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => panic!(
+                    "ravel-ingest: span flush semaphore closed unexpectedly on shard {shard}"
+                ),
+            };
+            let _permit = permit;
             ctx.run_flush(pinned).await;
         });
     }
@@ -1863,5 +1907,40 @@ mod tests {
             "seq1's span resolves to its own object"
         );
         h.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod inflight_guard_tests {
+    use super::*;
+
+    /// The span-pipeline counterpart of
+    /// `crate::shard::inflight_guard_tests::a_flush_task_dropped_before_its_first_poll_leaves_the_gauge_balanced`.
+    /// A flush task spawned and then dropped before its first poll has to leave
+    /// the gauge exactly where it found it; pairing the `+1` and the `-1` in one
+    /// value is what makes that hold, and the public reader's clamp at 0 is why
+    /// this asserts on the raw signed count.
+    #[test]
+    fn a_flush_task_dropped_before_its_first_poll_leaves_the_gauge_balanced() {
+        let metrics = Arc::new(SpanIngestMetrics::default());
+        assert_eq!(metrics.in_flight_flushes_signed(0), 0);
+
+        let guard = InFlightFlushGuard::new(Arc::clone(&metrics), 0);
+        assert_eq!(
+            metrics.in_flight_flushes_signed(0),
+            1,
+            "the buffer has left the actor, so the flush counts as in flight"
+        );
+
+        let flush_task = async move {
+            let _guard = guard;
+        };
+        drop(flush_task);
+
+        assert_eq!(
+            metrics.in_flight_flushes_signed(0),
+            0,
+            "the guard's own Drop ran, so the pair balanced"
+        );
     }
 }
