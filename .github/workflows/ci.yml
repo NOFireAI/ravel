@@ -793,11 +793,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Start MinIO
         run: |
+          # Docker Hub's anonymous pull allowance is per-IP and shared across
+          # every project on a runner, so an unauthenticated pull there fails
+          # unpredictably; quay.io does not share that allowance.
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+            quay.io/minio/minio:latest server /data
       - name: Wait for MinIO to be live
         run: |
           for _ in $(seq 1 30); do
@@ -812,7 +815,10 @@ jobs:
           exit 1
       - name: Create the contract-suite bucket
         run: |
-          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+          # Docker Hub's anonymous pull allowance is per-IP and shared across
+          # every project on a runner, so an unauthenticated pull there fails
+          # unpredictably; quay.io does not share that allowance.
+          docker run --rm --network host --entrypoint sh quay.io/minio/mc:latest -c "
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/ravel-object-store-test"
       # The contract suite's S3/MinIO case is gated on RAVEL_MINIO_URL; set it
@@ -966,11 +972,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Start MinIO
         run: |
+          # Docker Hub's anonymous pull allowance is per-IP and shared across
+          # every project on a runner, so an unauthenticated pull there fails
+          # unpredictably; quay.io does not share that allowance.
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+            quay.io/minio/minio:latest server /data
       - name: Wait for MinIO to be live
         run: |
           for _ in $(seq 1 30); do
@@ -985,7 +994,10 @@ jobs:
           exit 1
       - name: Create the bench-smoke bucket
         run: |
-          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+          # Docker Hub's anonymous pull allowance is per-IP and shared across
+          # every project on a runner, so an unauthenticated pull there fails
+          # unpredictably; quay.io does not share that allowance.
+          docker run --rm --network host --entrypoint sh quay.io/minio/mc:latest -c "
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/ravel-object-store-test"
       # minio_ingest_read_smoke is gated on RAVEL_MINIO_URL, same convention
