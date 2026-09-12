@@ -200,7 +200,19 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
         outcome.stats.blocks_pruned_by_postings,
     );
 
-    let stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
+    let mut stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
+    if let serde_json::Value::Object(ref mut map) = stats {
+        map.insert(
+            "phases".to_string(),
+            serde_json::Value::Array(ravel_sql::stats_json::phase_costs_json(
+                &outcome.phase_accounting,
+            )),
+        );
+        map.insert(
+            "io".to_string(),
+            ravel_sql::stats_json::io_shape_json(&outcome.io_shape),
+        );
+    }
     encode(&headers, &outcome, tenant_hash, stats)
 }
 
