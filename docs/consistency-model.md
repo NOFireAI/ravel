@@ -48,6 +48,16 @@ Buffered mode (opt-in per request, named "buffered"):
   `max_inflight_flushes` permit on its shard (ADR-1642) and runs its PUTs, so
   a shard whose permits are held by a stalled flush widens the window until
   the stall clears or `max_flush_lifetime` abandons the flush.
+- Loss is not only a crash consequence. When a flush is abandoned because it
+  outran `max_flush_lifetime`, its buffered rows are dropped with no crash, and
+  in buffered mode those rows were already acked. A flush's deadline is pinned
+  at flush-open, so a flush that waits behind a stalled prefix burns its
+  lifetime while queued; a stall longer than `max_flush_lifetime` therefore
+  abandons every flush opened during it, not one. This needs a long stall:
+  `max_flush_lifetime` defaults to 3600 s and is not operator-tunable from the
+  server. Strict mode does not have this exposure, because a strict write is
+  acked only after its flush commits and an abandoned flush returns a
+  retryable error instead.
 - Never described as durable. No commit token is returned.
 
 Rejection: admission failures (limits, auth, quota) reject before buffering

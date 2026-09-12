@@ -36,17 +36,35 @@ shape and all three had the same wait in the same place.
    ADR-0067 decision 1 says it does: it pins the flush identity, moves the
    tenant buffer and its waiters into a flush task, and spawns it. It does not
    wait for a permit. The spawned task's first action is to acquire, so at the
-   bound the task parks and the actor returns to its loop. Ordering is
-   unaffected: identity and `seq` are still pinned on the actor, in
-   submission order, before the spawn. This applies to all three pipelines.
+   bound the task parks and the actor returns to its loop. `seq` allocation
+   order is unaffected: identity and `seq` are pinned on the actor, in
+   submission order, before the spawn, so the `seq` a flush carries still
+   reflects arrival order. Publication order is not preserved. The permit is
+   now acquired inside the spawned tasks, which race to reach the acquire, so
+   even at `max_inflight_flushes = 1` two flushes of one shard can publish
+   their commit records in an order other than `seq` order, where the on-actor
+   acquire published them strictly in `seq` order (at one permit it granted the
+   permit to the next flush only after the previous one had committed). This is
+   an accuracy correction, not a durability or read defect: `seq` is monotonic
+   per `(writer_id, epoch, shard)` with gaps permitted, and completeness is
+   never inferred from `seq` continuity (docs/catalog-and-mvcc.md), so an
+   out-of-`seq` publication is a reordering of independently visible commits,
+   not a gap. This applies to all three pipelines.
 
 2. **Backpressure at the bound propagates through the ADR-0069 ingest byte
    budget, not through the bounded channel.** A flush holds its byte charge
    from the moment its buffer leaves the actor until the flush completes,
    waiting for a permit included. A shard wedged on a throttled prefix
    therefore accumulates charges, and `try_charge` sheds new writes with
-   `BufferBudgetExceeded` once they reach the ceiling. That is the memory
-   bound at the bound. The bounded channel remains backpressure for its own
+   `BufferBudgetExceeded` once they reach the ceiling. When the budget is
+   configured (`--max-ingest-buffer-bytes`, default `Bounded(512 MiB)`) that
+   shed is the memory bound at the bound. It is not unconditional: the flag's
+   `0` value maps to `Unlimited`, under which `try_charge` never sheds
+   (`crates/ravel-ingest/src/budget.rs`), so an operator who disables the
+   budget also disables this bound and nothing but host memory limits the
+   spawned-but-waiting flush queue under a sustained stall. The consequence
+   below states what holds in each configuration. The bounded channel remains
+   backpressure for its own
    case, an actor busy in on-actor work, which after this change is merge,
    pin, and the drains that await in-flight flushes.
 
@@ -85,11 +103,28 @@ flowchart LR
   by: memory per shard rises by one flush window per spawned flush, and the
   number of spawned flushes is not bounded by `max_inflight_flushes`, because
   a flush is spawned whenever a trigger fires rather than whenever a permit is
-  free. The real bound is the ADR-0069 process-wide byte budget, which holds
-  every in-flight flush's charge and sheds at the ceiling. `max_inflight_flushes`
-  keeps its other meaning unchanged: it is the concurrency of flushes actually
-  executing against the object store, and so the bound on concurrent PUTs and
-  on encode memory in flight.
+  free. What bounds that count depends on the byte-budget configuration, and
+  the change removed the one bound that held regardless of it:
+  - Under the default `Bounded(512 MiB)` budget the bound is the ADR-0069
+    process-wide byte budget, which holds every in-flight flush's charge and
+    sheds new writes at the ceiling, so a sustained stall stops admitting new
+    bytes before the queue can grow without limit.
+  - Under `Unlimited` (`--max-ingest-buffer-bytes 0`) `try_charge` never sheds,
+    so nothing bounds the spawned-but-waiting flush queue except host memory. A
+    sustained stall on a throttled prefix can queue flush tasks until the
+    process runs out of memory. Before this change the on-actor acquire plus
+    the 256-deep bounded channel bounded that memory whatever the budget was
+    set to, at the cost of the cross-tenant coupling this ADR removes; the two
+    cannot both hold, because a bound that fired without parking the actor or
+    shedding would have to be one of those two, and shedding under `Unlimited`
+    contradicts what `0` means everywhere else in this crate. Disabling the
+    budget is therefore an explicit opt-out of this memory bound, consistent
+    with every other `0`-means-no-limit ceiling in ingest; operators who set it
+    accept unbounded buffered flush memory under a long stall.
+
+  `max_inflight_flushes` keeps its other meaning unchanged: it is the
+  concurrency of flushes actually executing against the object store, and so
+  the bound on concurrent PUTs and on encode memory in flight.
 - The in-flight gauge can read above `max_inflight_flushes` for a shard. An
   alert or dashboard that treated the bound as the gauge's ceiling reads the
   queue depth of waiting flushes as if it were oversubscription. The gauge
@@ -131,4 +166,9 @@ flowchart LR
   either the on-actor wait this ADR removes or a shed. Shedding is already
   what the ADR-0069 byte budget does, against the quantity that actually
   matters (bytes held), rather than against a count of flushes whose sizes
-  differ.
+  differ. This is why the `Unlimited` exposure in the consequences is
+  documented rather than fixed with a count bound: a count bound that also
+  sheds under `Unlimited` would make `0` shed, which contradicts its meaning,
+  and one disabled under `Unlimited` alongside the byte budget would leave the
+  same exposure. The only bound that fires without the on-actor wait is a shed,
+  and shedding is what an operator turns off by setting `0`.
