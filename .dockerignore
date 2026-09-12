@@ -12,13 +12,19 @@ target/
 # left behind (e.g. under .claude/worktrees/); each is a full duplicate source
 # tree that is never needed by the build and has been observed to inflate the
 # build context by an order of magnitude on a dev machine with a few stale
-# ones lying around.
+# ones lying around. Fleet executors keep gate logs and cargo-install trees in
+# .gate-logs/ and .dd-tools/ inside the checkout (see .gitignore), and graft
+# keeps its regenerable graph cache in graft/; none of the three is read by
+# the build.
 minio-data/
 .cache/
 .superpowers/
 .claude/
 node_modules/
 .DS_Store
+.gate-logs/
+.dd-tools/
+graft/
 
 # Version control and CI metadata.
 .git/
