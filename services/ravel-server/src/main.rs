@@ -106,9 +106,13 @@ async fn main() -> anyhow::Result<()> {
     // the tenancy marker and GC config, an absent record is NOT a
     // bootstrap-and-continue case: a fresh production deployment must run `store
     // qualify` first, by design (see `qualification` and the operations guide).
-    ravel_server::qualification::enforce(store.as_ref(), cli.store)
-        .await
-        .context("store backend is not qualified (sys/qualification); refusing to start")?;
+    ravel_server::qualification::enforce(
+        store.as_ref(),
+        cli.store,
+        cli.backend_identity().as_deref(),
+    )
+    .await
+    .context("store backend is not qualified (sys/qualification); refusing to start")?;
 
     // Bucket-protection contract gate (ADR-0072 decision 3), off by default:
     // see docs/object-store-contract.md's "Required bucket configuration"

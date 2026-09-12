@@ -613,17 +613,19 @@ multipart-complete visibility as probes for this suite. Cross-page listing
 is the `CrossPageListing` probe above; multipart-complete visibility is
 still not implemented.
 
-`CONFORMANCE_SUITE_VERSION` is deliberately still `1` even though the probe
-set grew from four properties to eight. Raising it would make every
-already-qualified bucket refuse to start, because `ravel-cli store qualify`
-treats an existing `sys/qualification` record as success (it prints "not
-overwritten" and exits zero) and so cannot re-record one under the new
-version, while ravel-server refuses startup on a record below the binary's
-floor. Fixing that writer is a prerequisite of the bump, not part of it. The
-practical consequence until then: a bucket qualified before these probes
-existed keeps a passing record that only four properties were checked
-against, and only a fresh bucket (or a manually removed record) is
-qualified against all eight.
+`CONFORMANCE_SUITE_VERSION` is `2`. Version 1 checked four properties (the two
+conditional-write modes, read-after-write, and list-after-write); version 2 is
+the eight-probe suite above, adding concurrent single-winner create,
+lexicographic listing order, cross-page listing, and delete visibility. A
+record written under version 1 was never checked against those four, so
+ravel-server refuses startup on it (a stale record that reads as a current pass
+is worse than none: a missing record fails closed, a stale one passes). A
+bucket qualified under the old suite must be re-qualified. `ravel-cli store
+qualify` does that in place: a re-run overwrites a below-floor
+`sys/qualification` record with the current pass, and leaves an
+equal-or-newer record untouched. Re-recording is the only way to clear the
+refusal, because the record is written with `CreateIfAbsent` and cannot
+otherwise be replaced.
 
 This is a runtime, once-per-bucket check, not a replacement for the
 compile-time contract suite below: `crates/ravel-object-store/tests/contract.rs`
@@ -641,18 +643,31 @@ JSON record to `sys/qualification` via `CreateIfAbsent`:
 
 ```json
 {
-  "suite_version": 1,
+  "suite_version": 2,
   "backend_identity": "s3://<bucket>@<endpoint>",
   "qualified_unix_ns": 1234567890000000000,
   "passed_properties": ["conditional_write_create_if_absent", "..."]
 }
 ```
 
-`CreateIfAbsent` makes qualification once-per-bucket: a second `store
-qualify` run against an already-qualified bucket leaves the existing record
-untouched and reports it instead of overwriting it, per ADR-0050 section 6.
-A failing run writes nothing new to `sys/qualification`; its process exit
-names every failing property. The command only ever writes under
+`CreateIfAbsent` makes qualification once-per-bucket at a given suite version:
+a second `store qualify` run against a bucket already qualified under the
+current version leaves the existing record untouched and reports it instead of
+overwriting it, per ADR-0050 section 6. The one exception is a record written
+under an older suite version, which a re-run overwrites with the current pass so
+the version above does not strand an already-qualified bucket. A failing run
+writes nothing new to `sys/qualification`; its process exit names every failing
+property.
+
+At startup ravel-server compares the record's `backend_identity` against the
+identity it is configured for and logs a warning on a mismatch, without
+refusing. The identity is endpoint-derived (bucket plus optional endpoint, no
+credentials), so an endpoint rename or a path-style/virtual-host switch alters
+it with no change of backend, and refusing on that benign case would be an
+outage an operator disables. A mismatch is instead the signal that a
+replicated, restored, or migrated bucket carries a qualification a different
+backend earned: verify the backend and re-run `store qualify` if it is
+genuinely a different store. The command only ever writes under
 `sys/qualify/<run-id>/` (a handful of small scratch objects the suite does
 not delete afterward: each run's key is unique, so this is unbounded
 untracked storage a runbook should sweep periodically, not a correctness
