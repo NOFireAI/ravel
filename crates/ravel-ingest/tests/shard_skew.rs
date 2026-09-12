@@ -6,15 +6,17 @@
 //! The three spans and where each starts and stops:
 //!
 //! 1. `on_actor_ns`: actor pulls a `Write` off its channel -> `handle_write`
-//!    returns, minus any permit wait nested inside.
-//! 2. `flush_permit_wait_ns`: `flush_tenant` reaches the `max_inflight_flushes`
-//!    acquire -> that acquire grants.
-//! 3. `off_actor_ns`: the spawned flush task enters `run_flush` (permit held)
-//!    -> `run_flush` returns.
+//!    returns. Spawning the flush task is inside this span; waiting for its
+//!    permit is not, because the actor does not wait (ADR-1642).
+//! 2. `flush_permit_wait_ns`: the spawned flush task's first poll -> the
+//!    `max_inflight_flushes` acquire grants.
+//! 3. `off_actor_ns`: that acquire returns (permit held) -> `run_flush`
+//!    returns.
 //!
-//! 1 and 2 both accrue on the actor task, so they are disjoint in wall time
-//! too. 3 accrues in tasks that run concurrently with the actor, which is what
-//! ADR-0067's pipelining is for.
+//! Only 1 accrues on the actor task. 2 and 3 accrue in flush tasks that run
+//! concurrently with the actor, which is what ADR-0067's pipelining is for, so
+//! each is a sum over concurrent tasks and each can exceed wall time. Within one
+//! flush task 2 and 3 are consecutive and disjoint.
 #![allow(clippy::expect_used)]
 
 mod common;
@@ -256,7 +258,7 @@ fn contended_flush_config() -> IngestConfig {
     IngestConfig {
         // Any single point clears this, so every write is a size trigger.
         target_bytes: 1,
-        // One permit: the second concurrent flush trigger must park.
+        // One permit: the second concurrent flush task must park.
         max_inflight_flushes: 1,
         // Comfortably longer than the whole scripted timeline, so no flush is
         // abandoned: these tests are about slow-but-successful flushes.
@@ -274,11 +276,13 @@ fn contended_flush_config() -> IngestConfig {
 const SPIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Spins until the shard actor has merged `n` points in total. `buffered_*` is
-/// incremented in `handle_write` before the flush trigger, and the only
-/// suspension point between that increment and the flush-permit acquire is the
-/// acquire itself, so on the current-thread runtime `#[tokio::test]` provides,
-/// observing this count from the test task means the actor has already reached
-/// (and parked on) that acquire.
+/// incremented in `handle_write` before the flush trigger, and everything
+/// between that increment and the spawn of the flush task runs without a
+/// suspension point, so on the current-thread runtime `#[tokio::test]` provides,
+/// observing this count from the test task means the flush task for that write
+/// exists. The task itself is what waits for the permit (ADR-1642), and the
+/// caller sequences against that wait with `await_slow_puts` or by advancing the
+/// clock.
 async fn await_points_merged(router: &IngestRouter, n: u64) {
     tokio::time::timeout(SPIN_TIMEOUT, async {
         while router.metrics().snapshot().buffered_points_total < n {
@@ -313,19 +317,21 @@ async fn await_slow_puts(store: &SlowStore, n: u64) {
 }
 
 /// The defect this test exists for: at `max_inflight_flushes`, a size-triggered
-/// write's `handle_write` parks on the flush semaphore, and what elapses there
-/// is a PRIOR flush's remaining duration -- time `flush_tenant` already charges
-/// to `off_actor_ns`. Charging it to `on_actor_ns` as well both double-counts
-/// the interval and makes the actor read as busy at exactly the moment flushing
-/// is the bottleneck, which would manufacture evidence for the shard-actor
-/// throughput claim #865 was filed to test.
+/// write's flush task parks on the flush semaphore, and what elapses there is a
+/// PRIOR flush's remaining duration -- time `run_flush` already charges to
+/// `off_actor_ns`. Charging it to `on_actor_ns` as well both double-counts the
+/// interval and makes the actor read as busy at exactly the moment flushing is
+/// the bottleneck, which would manufacture evidence for the shard-actor
+/// throughput claim #865 was filed to test. Since ADR-1642 the wait is taken by
+/// the spawned task rather than the actor, which makes the separation
+/// structural, but the counter still has to record it in its own span.
 ///
 /// Fixed input, exact figures. The first flush's data PUT costs SLOW; the clock
 /// is advanced by PRE_WAIT while it is in flight and before the second write, so
-/// the actor parks for exactly the remaining SLOW - PRE_WAIT. That remainder
-/// must land in `flush_permit_wait_ns` and nowhere else -- in particular it must
-/// be strictly less than the flush it waited on, so the counter cannot be a copy
-/// of `off_actor_ns`.
+/// the second flush task parks for exactly the remaining SLOW - PRE_WAIT. That
+/// remainder must land in `flush_permit_wait_ns` and nowhere else -- in
+/// particular it must be strictly less than the flush it waited on, so the
+/// counter cannot be a copy of `off_actor_ns`.
 #[tokio::test]
 async fn permit_wait_lands_in_its_own_counter_not_in_on_actor() {
     const SLOW: Duration = Duration::from_secs(5);
@@ -353,17 +359,17 @@ async fn permit_wait_lands_in_its_own_counter_not_in_on_actor() {
     write_one(&router, &tenant, "cpu").await;
     await_slow_puts(&slow_store, 1).await;
 
-    // Burn PRE_WAIT of flush A's SLOW before the second write, so the wait the
-    // actor is about to take is a strict subset of flush A's own span.
+    // Burn PRE_WAIT of flush A's SLOW before the second write, so the wait
+    // flush B is about to take is a strict subset of flush A's own span.
     clock.advance_ns(PRE_WAIT.as_nanos() as i64);
 
-    // Write 2: the actor merges it (no clock-advancing work), opens a size
-    // flush, and parks on the semaphore at the bound.
+    // Write 2: the actor merges it (no clock-advancing work), pins the flush
+    // identity, and spawns flush B, which parks on the semaphore at the bound.
     write_one(&router, &tenant, "cpu").await;
     await_points_merged(&router, 2).await;
 
     // Retire flush A's remaining SLOW - PRE_WAIT. Its permit is released, and
-    // the actor's park ends at that same instant.
+    // flush B's park ends at that same instant.
     clock.advance_ns(REMAINING_NS as i64);
 
     // Flush B now holds the permit and stalls the same way; retire it too so
@@ -380,7 +386,7 @@ async fn permit_wait_lands_in_its_own_counter_not_in_on_actor() {
     assert_eq!(shard0.messages_processed, 2);
     assert_eq!(
         shard0.flush_permit_wait_ns, REMAINING_NS,
-        "the second write parked for flush A's remaining {REMAINING_NS}ns; that is \
+        "flush B parked for flush A's remaining {REMAINING_NS}ns; that is \
          backpressure and belongs in the permit-wait span"
     );
     assert_eq!(
@@ -396,7 +402,7 @@ async fn permit_wait_lands_in_its_own_counter_not_in_on_actor() {
     );
     assert!(
         shard0.flush_permit_wait_ns < SLOW.as_nanos() as u64,
-        "the wait is the part of flush A the actor was still parked through \
+        "the wait is the part of flush A that flush B was parked through \
          ({REMAINING_NS}ns of {}ns), not a second copy of that flush's whole span",
         SLOW.as_nanos()
     );
@@ -406,8 +412,10 @@ async fn permit_wait_lands_in_its_own_counter_not_in_on_actor() {
     assert_eq!(elapsed_ns, 2 * SLOW.as_nanos() as u64);
     assert!(
         shard0.on_actor_ns + shard0.flush_permit_wait_ns <= elapsed_ns,
-        "spans 1 and 2 both accrue on the actor task, so together they can never \
-         exceed the window"
+        "the one permit wait here is a subset of flush A's span and the actor did \
+         no clock-advancing work, so the two spans still fit the window. Since \
+         ADR-1642 span 2 runs in the flush task, so this bound is a property of \
+         this scenario's single waiter, not of the two spans sharing a task"
     );
 }
 
@@ -484,14 +492,16 @@ async fn the_three_spans_do_not_double_count_a_known_window() {
     );
     assert!(
         shard0.on_actor_ns + shard0.flush_permit_wait_ns <= elapsed_ns,
-        "the two actor-task spans are disjoint and bounded by the window"
+        "this scenario's permit waits never overlap -- each write lands after the \
+         preceding flush has started, so at most one task waits at a time -- and \
+         the actor adds nothing, so the two spans are bounded by the window"
     );
 
     assert_eq!(shard0.on_actor_ns, 0);
     assert_eq!(
         shard0.flush_permit_wait_ns,
         2 * SLOW.as_nanos() as u64,
-        "writes 2 and 3 each parked for one whole preceding flush"
+        "the flush tasks writes 2 and 3 opened each parked for one whole preceding flush"
     );
     assert_eq!(
         shard0.off_actor_ns, elapsed_ns,

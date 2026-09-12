@@ -233,10 +233,15 @@ pub struct IngestMetrics {
     /// the store is slow/throttled and this router is degraded-but-available
     /// rather than fleet-wide-outed.
     grace_extended_stale_flushes: AtomicU64,
-    /// Per-shard count of flushes whose flush task has been spawned but has
-    /// not yet acked its waiters (ADR-0067 decision 2 consequence: pipelining
-    /// raises per-shard memory by up to `(max_inflight_flushes - 1)` flush
-    /// windows, and this gauge is how that stays observable). Keyed by shard
+    /// Per-shard count of flushes the actor has handed to a spawned flush task
+    /// and that have not yet finished, counted from the moment the buffer
+    /// leaves the actor: a task still waiting for its `max_inflight_flushes`
+    /// permit is included, because it is holding a flush window of memory and
+    /// its ADR-0069 byte charge exactly as an executing one is (ADR-1642). This
+    /// gauge is how ADR-0067's memory consequence stays observable, so it can
+    /// exceed `max_inflight_flushes` per shard: the bound caps concurrent
+    /// execution, not how many flushes are spawned and waiting.
+    /// Keyed by shard
     /// index; a shard with no flush in flight has no entry, equivalent to 0.
     /// Not part of [`IngestMetricsSnapshot`]'s flat counters because it is a
     /// gauge with a per-shard dimension, unlike everything else in this
@@ -483,26 +488,32 @@ impl ShardSkew {
 /// consecutive:
 ///
 /// 1. `on_actor_ns` runs from the actor pulling a `Write` message off its
-///    channel to `handle_write` returning, **minus** any permit wait nested
-///    inside that call.
-/// 2. `flush_permit_wait_ns` runs from `flush_tenant` reaching the
-///    `max_inflight_flushes` semaphore acquire to that acquire granting a
+///    channel to `handle_write` returning. Spawning a flush task is part of
+///    that window; waiting for the flush permit is not, because the actor no
+///    longer does it (ADR-1642).
+/// 2. `flush_permit_wait_ns` runs inside the spawned flush task, from its
+///    first poll to the `max_inflight_flushes` semaphore acquire granting a
 ///    permit.
-/// 3. `off_actor_ns` runs from the spawned flush task entering `run_flush`
-///    (permit already held) to `run_flush` returning.
+/// 3. `off_actor_ns` runs from that acquire returning to `run_flush`
+///    returning, in the same spawned task.
 ///
-/// Spans 1 and 2 both accrue on the actor task and are therefore disjoint in
-/// wall time as well: together they account for the actor's whole
-/// `Write`-handling window, and `on_actor_ns + flush_permit_wait_ns` can never
-/// exceed the wall time the actor spent handling messages. Span 3 accrues in
-/// spawned tasks that run *concurrently* with the actor, which is the entire
-/// point of ADR-0067's pipelining, so it is a sum over concurrent tasks: at
-/// `max_inflight_flushes > 1` it can legitimately exceed wall time, and it
-/// overlaps spans 1 and 2 in wall time. Overlapping in wall time is not
-/// double-counting: no single sampled interval is added to two counters. In
-/// particular, the interval an actor spends parked in span 2 is wall-time
-/// concurrent with a *prior* flush's span 3, and is charged to the actor side
-/// exactly once, as permit wait, never as actor work.
+/// Span 1 is the only one that accrues on the actor task. Spans 2 and 3 accrue
+/// in spawned flush tasks that run *concurrently* with the actor, which is the
+/// entire point of ADR-0067's pipelining, so each is a sum over concurrent
+/// tasks and each can legitimately exceed wall time: span 3 whenever
+/// `max_inflight_flushes > 1`, and span 2 whenever more than one flush task is
+/// queued behind the permit, which the bound does not cap (ADR-1642 moved the
+/// acquire into the task, so flushes are spawned freely and queue there).
+/// Overlapping in wall time is not double-counting: no single sampled interval
+/// is added to two counters. Within one flush task spans 2 and 3 are
+/// consecutive and disjoint by construction, and neither is ever charged to
+/// the actor.
+///
+/// This is a change of meaning for span 2, not only of code: before ADR-1642
+/// it measured a window during which the shard's actor was parked and no other
+/// tenant on the shard could make progress. It now measures a window during
+/// which the flush's buffer is held but the actor is free, so a rising figure
+/// here is a flush-throughput signal rather than a head-of-line-blocking one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShardSkewStats {
     /// `Write` messages the router sent into this shard's channel.
@@ -521,20 +532,22 @@ pub struct ShardSkewStats {
     /// Injected-`Clock` nanoseconds the actor task spent processing this
     /// shard's `Write` messages: the serial merge-and-pin work the actor
     /// genuinely serialises, and nothing else. It excludes the flush, which
-    /// ADR-0067 moved into a spawned task (`off_actor_ns`), and it excludes the
-    /// wait for a flush permit (`flush_permit_wait_ns`), which is a prior
-    /// flush's duration rather than work this actor performs.
+    /// ADR-0067 moved into a spawned task (`off_actor_ns`), and the wait for a
+    /// flush permit (`flush_permit_wait_ns`), which ADR-1642 moved into that
+    /// same task.
     pub on_actor_ns: u64,
-    /// Injected-`Clock` nanoseconds this shard spent parked on the
-    /// `max_inflight_flushes` semaphore before a flush task could be spawned
-    /// (ADR-0067 decision 2). This runs on the actor task, but it is not actor
-    /// work: the actor is stalled waiting for an earlier flush of this same
-    /// shard to release its permit, so this is the shard's flush backpressure
-    /// signal. A rising figure here says flushing is the bottleneck; a rising
-    /// `on_actor_ns` says the single-threaded actor is.
+    /// Injected-`Clock` nanoseconds this shard's spawned flush tasks spent
+    /// parked on the `max_inflight_flushes` semaphore before they could run
+    /// (ADR-0067 decision 2 as superseded by ADR-1642). This runs off the
+    /// actor: the task is waiting for an earlier flush of this same shard to
+    /// release its permit, while the actor keeps pulling messages for every
+    /// tenant on the shard. A rising figure here says flushing is the
+    /// bottleneck; a rising `on_actor_ns` says the single-threaded actor is.
+    ///
+    /// A sum over concurrently waiting tasks, so it can exceed wall time.
     ///
     /// Counted for every flush trigger, not only the size trigger inside
-    /// `handle_write`: an age or manual flush parks on the same semaphore.
+    /// `handle_write`: an age or manual flush waits on the same semaphore.
     pub flush_permit_wait_ns: u64,
     /// Injected-`Clock` nanoseconds spent in this shard's flush tasks, which
     /// run OFF the actor (ADR-0067): exemplar admission, encode, and both PUTs.
@@ -633,9 +646,10 @@ impl IngestMetrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Adjusts shard `shard`'s in-flight-flush gauge by `delta` (+1 when a
-    /// flush task is spawned, -1 when it ends, including on panic via
-    /// `shard.rs`'s `InFlightFlushGuard`). Poison recovery rather than a
+    /// Adjusts shard `shard`'s in-flight-flush gauge by `delta`. Both deltas
+    /// belong to `shard.rs`'s `InFlightFlushGuard`: +1 in its constructor, -1
+    /// in its `Drop`, including on panic. Nothing else may call this, or the
+    /// two can disagree. Poison recovery rather than a
     /// panic on a poisoned lock: a gauge is best-effort self-observability,
     /// not a durability path, so a prior panicked holder must not take this
     /// one down with it.
@@ -661,6 +675,20 @@ impl IngestMetrics {
             .collect();
         counts.sort_unstable_by_key(|&(shard, _)| shard);
         counts
+    }
+
+    /// Shard `shard`'s raw signed in-flight-flush count, before the clamp
+    /// [`IngestMetrics::in_flight_flushes_by_shard`] applies on read. Tests
+    /// only: the clamp is what hides an unbalanced increment/decrement pair
+    /// from the public reader, so a test that the pair cannot come apart has
+    /// to see the sign.
+    #[cfg(test)]
+    pub(crate) fn in_flight_flushes_signed(&self, shard: u32) -> i64 {
+        let map = self
+            .in_flight_flushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&shard).copied().unwrap_or(0)
     }
 
     /// One `Write` message sent by the router into shard `shard`'s channel
