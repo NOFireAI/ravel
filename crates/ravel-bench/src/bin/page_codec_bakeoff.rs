@@ -4,8 +4,15 @@
 //! payloads production writers actually produce, so #1507 can reject a weak
 //! candidate before any integration work is dispatched. This binary changes
 //! no production path: it is report-only tooling reachable only via
-//! `cargo run -p ravel-bench --bin page_codec_bakeoff --profile ci`, and its
+//! `cargo run -p ravel-bench --bin page_codec_bakeoff --release`, and its
 //! consumer is #1507's design gate, not any shipping code path.
+//!
+//! Throughput figures require an optimized build. Root `Cargo.toml`'s
+//! `[profile.ci]` inherits `dev` (`debug = false` only, no optimization
+//! flags), so a `--profile ci` run's `enc_MB/s`/`dec_MB/s` columns are
+//! unoptimized-build numbers, not production-representative ones. Use
+//! `--release` (or `--profile bench`) for throughput; `--profile ci` is only
+//! useful for checking the integrity gates and compression ratios.
 //!
 //! ## What is measured
 //!
@@ -64,6 +71,22 @@
 //! arm on every page; `lz4` (`lz4_flex::compress_prepend_size`, same floor
 //! policy).
 //!
+//! `zstd-3-reused` reuses the compressor/decompressor context but still
+//! allocates a fresh output `Vec` per call (`Compressor::compress`, not
+//! `compress_to_buffer` into a retained scratch buffer), so the measured gap
+//! against `zstd-3` is the context-construction saving alone -- a lower bound
+//! on what a full reuse implementation (retained output buffer too) would
+//! buy, not the whole answer.
+//!
+//! The two low-cardinality datasets spend most of their swept points under
+//! [`ravel_logseg::page::COMPRESSION_FLOOR`] (`low_cardinality_level` is 40
+//! bytes at 64 rows, 280 at 1024; `low_cardinality_service` is 93 and 453),
+//! so those cells report `ratio: 1.000` by construction -- pass-through, not
+//! a codec result -- with MB/s figures dominated by per-call overhead. Only
+//! the 8192-row point for each clears the floor. A low-cardinality column is
+//! exactly the shape most likely to sit under the floor in production; this
+//! sweep does not locate the crossover, only straddles it.
+//!
 //! ## Integrity, enforced by exit code
 //!
 //! Every arm round-trips every page bit-exactly; every (dataset, page-size,
@@ -85,7 +108,7 @@
 
 use std::time::Instant;
 
-use ravel_bench::bench_env::{env_header, git_commit};
+use ravel_bench::bench_env::env_header;
 use ravel_bench::generator::{CardinalityProfile, WorkloadConfig, generate_raw};
 use ravel_bench::segment_support::{LABEL_DICT, SERIES_META, build_segment_v5, section_bytes};
 use ravel_logseg::block::{BlockWriteOut, ColumnPlan, write_block};
@@ -152,14 +175,17 @@ fn base_row(ts_ns: i64) -> ResolvedRow {
 /// The stored page bytes for `column_id`, decoded back through the real
 /// [`read_page`] to recover the exact `encoded` bytes [`write_block`] fed
 /// [`write_page`] -- the reconstruction trick this bake-off relies on
-/// throughout (see the module doc).
+/// throughout (see the module doc). Skips a presence-bitmap page staged
+/// under the same `column_id` (`block::stage_column` emits one immediately
+/// before the value page whenever the column is only partially present): the
+/// value page is always the one this bake-off means to measure.
 fn column_encoded_bytes(out: &BlockWriteOut, column_id: u32) -> Vec<u8> {
     let mut offset = 0usize;
     for desc in &out.descs {
         let len = desc.len as usize;
         let slice = &out.payload[offset..offset + len];
         offset += len;
-        if desc.column_id == column_id {
+        if desc.column_id == column_id && desc.enc != Enc::Bitmap {
             return read_page(slice, desc, DEFAULT_MAX_UNCOMP).expect("read back production page");
         }
     }
@@ -487,14 +513,24 @@ struct CellReport {
 
 /// (median, min, max) seconds-per-call, as returned by [`timed`].
 type TimingStats = (f64, f64, f64);
-/// One arm's outcome for a cell: stored bytes, whether it compressed, then
-/// its encode and decode timing stats.
-type ArmOutcome = (Vec<u8>, bool, TimingStats, TimingStats);
+/// One arm's outcome for a cell: stored bytes, whether the store policy kept
+/// the compressed form, encode timing, decode timing, and the decoded bytes
+/// (the last decode call's output, reused as the round-trip check input so
+/// the same operation is both timed and verified).
+type ArmOutcome = (Vec<u8>, bool, TimingStats, TimingStats, Vec<u8>);
 
-/// Measures one (dataset, size, arm) cell. Pushes a human-readable string
-/// into `failures` for every integrity violation found (round-trip mismatch,
-/// production-baseline policy mismatch, `zstd-3-reused` byte mismatch); never
-/// panics on a mismatch itself, so one bad cell does not hide the rest.
+/// Measures one (dataset, size, arm) cell. `decode_mb_s` always times a real
+/// decode of the arm's compressed output, independent of whether the store
+/// policy (`stored_compressed`) would have kept the compressed form or
+/// fallen back to raw: a `dec_MB/s` cell must always mean "decompress",
+/// never sometimes mean "memcpy" depending on the row (see the SHOULD_FIX in
+/// PR #1548 review). `stored_compressed` reports the store-policy decision
+/// on its own.
+///
+/// Pushes a human-readable string into `failures` for every integrity
+/// violation found (round-trip mismatch, production-baseline policy
+/// mismatch, `zstd-3-reused` byte mismatch); never panics on a mismatch
+/// itself, so one bad cell does not hide the rest.
 fn measure_cell(
     dataset: &str,
     size_label: &str,
@@ -508,11 +544,17 @@ fn measure_cell(
     let reps = inner_reps_for(n);
     let cell_id = format!("{dataset}/{size_label}/{}", arm.name());
 
-    let (stored, stored_compressed, enc_stats, dec_stats): ArmOutcome = match arm {
+    let (stored, stored_compressed, enc_stats, dec_stats, decoded): ArmOutcome = match arm {
         Arm::Raw => {
             let (_, em, emin, emax) = timed(|| encoded.to_vec(), reps);
-            let (_, dm, dmin, dmax) = timed(|| encoded.to_vec(), reps);
-            (encoded.to_vec(), false, (em, emin, emax), (dm, dmin, dmax))
+            let (decoded, dm, dmin, dmax) = timed(|| encoded.to_vec(), reps);
+            (
+                encoded.to_vec(),
+                false,
+                (em, emin, emax),
+                (dm, dmin, dmax),
+                decoded,
+            )
         }
         Arm::Zstd1 | Arm::Zstd3 | Arm::Zstd6 => {
             let level = match arm {
@@ -541,18 +583,17 @@ fn measure_cell(
                     ));
                 }
             }
-            let stored_for_decode = stored.clone();
-            let (_, dm, dmin, dmax) = timed(
-                || {
-                    if use_compressed {
-                        zstd::bulk::decompress(&stored_for_decode, n).expect("zstd decompress")
-                    } else {
-                        stored_for_decode.clone()
-                    }
-                },
+            let (decoded, dm, dmin, dmax) = timed(
+                || zstd::bulk::decompress(&compressed, n).expect("zstd decompress"),
                 reps,
             );
-            (stored, use_compressed, (em, emin, emax), (dm, dmin, dmax))
+            (
+                stored,
+                use_compressed,
+                (em, emin, emax),
+                (dm, dmin, dmax),
+                decoded,
+            )
         }
         Arm::Zstd3Reused => {
             let (compressed, em, emin, emax) = timed(
@@ -576,20 +617,21 @@ fn measure_cell(
             } else {
                 encoded.to_vec()
             };
-            let stored_for_decode = stored.clone();
-            let (_, dm, dmin, dmax) = timed(
+            let (decoded, dm, dmin, dmax) = timed(
                 || {
-                    if use_compressed {
-                        reused_decompressor
-                            .decompress(&stored_for_decode, n)
-                            .expect("reused zstd decompress")
-                    } else {
-                        stored_for_decode.clone()
-                    }
+                    reused_decompressor
+                        .decompress(&compressed, n)
+                        .expect("reused zstd decompress")
                 },
                 reps,
             );
-            (stored, use_compressed, (em, emin, emax), (dm, dmin, dmax))
+            (
+                stored,
+                use_compressed,
+                (em, emin, emax),
+                (dm, dmin, dmax),
+                decoded,
+            )
         }
         Arm::Lz4 => {
             let (compressed, em, emin, emax) =
@@ -600,41 +642,34 @@ fn measure_cell(
             } else {
                 encoded.to_vec()
             };
-            let stored_for_decode = stored.clone();
-            let (_, dm, dmin, dmax) = timed(
+            let (decoded, dm, dmin, dmax) = timed(
                 || {
-                    if use_compressed {
-                        lz4_flex::decompress_size_prepended(&stored_for_decode)
-                            .expect("lz4 decompress")
-                    } else {
-                        stored_for_decode.clone()
-                    }
+                    lz4_flex::decompress_size_prepended(&compressed).expect("lz4 decompress")
                 },
                 reps,
             );
-            (stored, use_compressed, (em, emin, emax), (dm, dmin, dmax))
+            (
+                stored,
+                use_compressed,
+                (em, emin, emax),
+                (dm, dmin, dmax),
+                decoded,
+            )
         }
     };
 
-    let decoded = if stored_compressed {
-        match arm {
-            Arm::Zstd1 | Arm::Zstd3 | Arm::Zstd6 => {
-                zstd::bulk::decompress(&stored, n).expect("verify: zstd decompress")
-            }
-            Arm::Zstd3Reused => reused_decompressor
-                .decompress(&stored, n)
-                .expect("verify: reused zstd decompress"),
-            Arm::Lz4 => {
-                lz4_flex::decompress_size_prepended(&stored).expect("verify: lz4 decompress")
-            }
-            Arm::Raw => unreachable!("raw arm never sets stored_compressed"),
-        }
-    } else {
-        stored.clone()
-    };
     let roundtrip_ok = decoded == encoded;
     if !roundtrip_ok {
         failures.push(format!("round-trip FAILED for {cell_id}"));
+    }
+    let ratio = stored.len() as f64 / n.max(1) as f64;
+    if n == 0 {
+        failures.push(format!("input_bytes is zero for {cell_id}"));
+    }
+    if arm == Arm::Raw && (ratio - 1.0).abs() > f64::EPSILON {
+        failures.push(format!(
+            "raw arm's ratio must be exactly 1.0, got {ratio} for {cell_id}"
+        ));
     }
 
     CellReport {
@@ -643,7 +678,7 @@ fn measure_cell(
         arm: arm.name().to_string(),
         input_bytes: n,
         stored_bytes: stored.len(),
-        ratio: stored.len() as f64 / n.max(1) as f64,
+        ratio,
         stored_compressed,
         encode_median_us: enc_stats.0 * 1e6,
         encode_min_us: enc_stats.1 * 1e6,
@@ -715,11 +750,15 @@ fn target_triple() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// `cfg!(debug_assertions)` only distinguishes {dev, ci} from {release,
+/// bench}; it cannot tell `--profile bench` apart from plain `--release`
+/// (bench inherits release and does not flip debug-assertions back on). Name
+/// the bucket honestly rather than guessing a single profile within it.
 fn build_profile() -> &'static str {
     if cfg!(debug_assertions) {
-        "debug"
+        "unoptimized (dev/ci)"
     } else {
-        "release"
+        "optimized (release/bench)"
     }
 }
 
@@ -740,13 +779,6 @@ fn load_average() -> String {
 /// range. Best-effort: `"unknown"` on any failure, matching
 /// `ravel_bench::bench_env`'s philosophy of never failing the stamp.
 fn resolved_dependency_version(crate_name: &str) -> String {
-    let Ok(output) = std::process::Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps", "-q"])
-        .output()
-    else {
-        return dependency_version_from_full_graph(crate_name);
-    };
-    let _ = output;
     dependency_version_from_full_graph(crate_name)
 }
 
@@ -820,7 +852,6 @@ fn main() {
 
     let datasets = all_datasets();
     let mut failures: Vec<String> = Vec::new();
-    let mut emitted: Vec<CellKey> = Vec::new();
     let mut reports: Vec<CellReport> = Vec::new();
 
     for dataset in &datasets {
@@ -835,16 +866,19 @@ fn main() {
                     &mut reused_decompressor,
                     &mut failures,
                 );
-                emitted.push((
-                    dataset.name.clone(),
-                    size_label.clone(),
-                    arm.name().to_string(),
-                ));
                 reports.push(report);
             }
         }
     }
 
+    // Derived from `reports` -- the vector that actually becomes the table
+    // and the JSON -- not re-derived from the same loop bounds that produced
+    // it, so a `CellReport` silently dropped (or built with the wrong
+    // dataset/size/arm fields) is caught rather than compared against itself.
+    let emitted: Vec<CellKey> = reports
+        .iter()
+        .map(|r| (r.dataset.clone(), r.size_label.clone(), r.arm.clone()))
+        .collect();
     let expected = expected_cells(&datasets);
     if let Err(e) = check_cell_completeness(&expected, &emitted) {
         failures.push(e);
@@ -853,7 +887,6 @@ fn main() {
     let load_end = load_average();
 
     print!("{}", env_header("page_codec_bakeoff"));
-    println!("commit:        {}", git_commit());
     println!("profile:       {}", build_profile());
     println!("target:        {}", target_triple());
     println!("zstd crate:    {}", resolved_dependency_version("zstd"));
