@@ -320,6 +320,7 @@ use ravel_logseg::{
 use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
 use ravel_query::erasure::ErasurePredicate;
+use ravel_query::phase_accounting::PhaseAccounting;
 use ravel_query::{
     CarriedWholeObject, ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher,
     LogSegmentScan,
@@ -1105,10 +1106,10 @@ pub struct LogsScanExec {
     /// [`owned_work`]; the same predicate gates `declared_partitions` above.
     stripe_blocks: bool,
     properties: Arc<PlanProperties>,
-    /// This query's accounting handle (ADR-0044), threaded into every
-    /// per-partition fetch so log fetches are recorded like every other
-    /// funnel.
-    accounting: QueryAccounting,
+    /// This query's phase-split accounting handle (ADR-0044, issue #796),
+    /// threaded into every per-partition fetch so log fetches are recorded
+    /// like every other funnel, split by phase.
+    phase_accounting: PhaseAccounting,
     /// Block-level pruning counters, reported through `EXPLAIN ANALYZE`.
     metrics: ExecutionPlanMetricsSet,
 }
@@ -1327,7 +1328,7 @@ impl LogsScanExec {
         prune: Arc<Vec<Predicate>>,
         erasure: Arc<Vec<ErasurePredicate>>,
         projection: Option<&Vec<usize>>,
-        accounting: QueryAccounting,
+        phase_accounting: PhaseAccounting,
         full_schema: SchemaRef,
         declared: Arc<Vec<DeclaredColumn>>,
     ) -> DFResult<Self> {
@@ -1343,7 +1344,7 @@ impl LogsScanExec {
             prune,
             erasure,
             projection,
-            accounting,
+            phase_accounting,
             full_schema,
             declared,
             false,
@@ -1375,7 +1376,7 @@ impl LogsScanExec {
             Arc::clone(&self.prune),
             Arc::clone(&self.erasure),
             Some(projection),
-            self.accounting.clone(),
+            self.phase_accounting.clone(),
             Arc::clone(&self.full_schema),
             Arc::clone(&self.declared),
             row_refs,
@@ -1409,7 +1410,7 @@ impl LogsScanExec {
         prune: Arc<Vec<Predicate>>,
         erasure: Arc<Vec<ErasurePredicate>>,
         projection: Option<Vec<usize>>,
-        accounting: QueryAccounting,
+        phase_accounting: PhaseAccounting,
         full_schema: SchemaRef,
         declared: Arc<Vec<DeclaredColumn>>,
         row_refs: bool,
@@ -1500,7 +1501,7 @@ impl LogsScanExec {
             columnar_eligible,
             stripe_blocks,
             properties,
-            accounting,
+            phase_accounting,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -2016,7 +2017,7 @@ impl LogsScanExec {
             projection: Arc::clone(&self.projection),
             declared: Arc::clone(&self.declared),
             schema: Arc::clone(&self.schema),
-            accounting: self.accounting.clone(),
+            accounting: self.phase_accounting.scan().clone(),
             concurrency: self.target_partitions,
         }
     }
@@ -2378,7 +2379,7 @@ impl ExecutionPlan for LogsScanExec {
             query,
             columns: self.columns.clone(),
             projected_fraction: self.projected_fraction,
-            accounting: self.accounting.clone(),
+            phase_accounting: self.phase_accounting.clone(),
         });
 
         // #693 part 3 deliverable 1, amended by #739: a predicate-free query
@@ -2576,9 +2577,12 @@ async fn compute_plan_counts(
         // before the open phase can reject the version -- so without this the
         // ordering guarantee holds on the scan path and quietly fails here.
         refuse_unreadable_version(seg)?;
-        let prune = ctx
-            .fetcher
-            .plan_segment(seg, ctx.tenant_hash, &ctx.query, &ctx.accounting);
+        let prune = ctx.fetcher.plan_segment(
+            seg,
+            ctx.tenant_hash,
+            &ctx.query,
+            ctx.phase_accounting.plan(),
+        );
         prunes.push(async move { (idx, prune.await) });
     }
     let budget = plan_concurrency.max(1);
@@ -2638,7 +2642,9 @@ async fn compute_plan_counts(
     // returns (an eviction, an early release), this call must move inside
     // the loop so `observe_intermediate_bytes` sees every local maximum, not
     // just the end state.
-    ctx.accounting.observe_intermediate_bytes(carried_bytes);
+    ctx.phase_accounting
+        .plan()
+        .observe_intermediate_bytes(carried_bytes);
     Ok(Arc::new(PlanCounts {
         segs,
         total_blocks,
@@ -2781,7 +2787,7 @@ struct PartitionCtx {
     /// [`LogsScanExec::projected_fraction`], carried so the whole-segment fast
     /// path can route each segment as it opens it (issue #862).
     projected_fraction: f64,
-    accounting: QueryAccounting,
+    phase_accounting: PhaseAccounting,
 }
 
 impl PartitionCtx {
@@ -2829,9 +2835,9 @@ impl PartitionCtx {
     /// re-count, so the two counters sum to the fast-path segment count.
     fn record_open_shape(&self, by_column_chunk: bool) {
         if by_column_chunk {
-            self.accounting.add_logs_ranged_opens(1);
+            self.phase_accounting.scan().add_logs_ranged_opens(1);
         } else {
-            self.accounting.add_logs_whole_object_opens(1);
+            self.phase_accounting.scan().add_logs_whole_object_opens(1);
         }
     }
 
@@ -2878,7 +2884,7 @@ impl PartitionCtx {
     /// statement takes the same route and exactly one of the two recorders can
     /// fire for a given object.
     fn record_data_object_touched(&self) {
-        self.accounting.add_data_objects_touched(1);
+        self.phase_accounting.scan().add_data_objects_touched(1);
     }
 }
 
@@ -2936,7 +2942,7 @@ fn open_segment_subset(
                 &indices,
                 footer.as_ref(),
                 whole_object,
-                &ctx.accounting,
+                ctx.phase_accounting.scan(),
             )
             .await
             .map_err(SqlError::from)?;
@@ -2961,7 +2967,7 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
                 ctx.tenant_hash,
                 &ctx.query,
                 &ctx.columns,
-                &ctx.accounting,
+                ctx.phase_accounting.scan(),
             )
             .await
             .map_err(SqlError::from)?;
@@ -2991,7 +2997,7 @@ fn open_segment_ranged(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
                 ctx.tenant_hash,
                 &ctx.query,
                 &ctx.columns,
-                &ctx.accounting,
+                ctx.phase_accounting.scan(),
             )
             .await
             .map_err(SqlError::from)?;
@@ -4813,7 +4819,7 @@ mod cstat_reconcile_tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             None,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
             schema,
             Arc::new(declared),
         )

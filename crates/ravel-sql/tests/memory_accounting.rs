@@ -32,7 +32,7 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{LogSegmentFetcher, PhaseAccounting, SegmentFetcher};
 use ravel_sql::{
     LogsTableProvider, RavelTableProvider, SessionTable, SpillDecision, SqlConfig,
     TenantMemoryAccountant, build_session,
@@ -73,7 +73,7 @@ async fn drain(
         tenant.hash(),
         SegmentFetcher::new(Arc::clone(&fixture.store)),
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     ));
     let ctx = build_session(
         &SqlConfig::default(),
@@ -286,7 +286,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         tenant.hash(),
         SegmentFetcher::new(Arc::clone(&fixture.store)),
         config.clone(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     ));
     let ctx = build_session(
         &config,
@@ -488,7 +488,7 @@ async fn drain_logs(
         snapshot,
         tenant.hash(),
         LogSegmentFetcher::new(store),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     ));
     let ctx = build_session(
         &SqlConfig::default(),
