@@ -207,6 +207,8 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         cache: None,
         cache_max_bytes: 0,
         catalog_cache_max_bytes: 0,
+        memory_budget_bytes: 0,
+        sql_memory_budget: None,
         audit_pipeline: None,
     });
 

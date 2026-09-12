@@ -12,6 +12,7 @@ ravel-cache = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-maintain = { workspace = true }
+ravel-memory = { workspace = true }
 # Query-worker registration/liveness and rendezvous slice ownership for the
 # ADR-0071 distributed read fan-out: sys/query/workers heartbeats
 # (ravel_fleet::query_workers) and highest-random-weight slice ownership

@@ -11,17 +11,20 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly eleven label keys: `tenant_hash`, `signal`, `mode`, `op`,
-//! `error_kind`, `workload_class`, `level`, `reason`, `cache`, `tier`, and
-//! `kind` (ADR-0044
+//! renders exactly fourteen label keys: `tenant_hash`, `signal`, `mode`, `op`,
+//! `error_kind`, `workload_class`, `level`, `reason`, `cache`, `tier`,
+//! `kind`, `allocator`, `stat`, and `component` (ADR-0044
 //! section 4; `reason` added by ADR-0051 section 6 for the admission-rejection
 //! family and reused by ADR-0059 section 2 for the scrub seal-divergence family,
 //! `cache` to split the read-cache family into the
 //! fetcher and catalog byte caches, `tier` added by #97 to split each of those
-//! into its RAM and local-disk tiers when a disk tier is configured, and `kind`
+//! into its RAM and local-disk tiers when a disk tier is configured, `kind`
 //! added by ADR-0065 decision 4 to split the maintenance merge-memory gauge into
-//! its transient and total high-water marks). The eleven keys come from twelve
-//! `Label` variants: `RejectReason` and `ScrubReason` both render `reason`.
+//! its transient and total high-water marks, `allocator`/`stat` added by #1170
+//! for the process allocator family, and `component` added by ADR-1170 to split
+//! the process memory-budget reservation gauge by subsystem). The fourteen keys
+//! come from fifteen `Label` variants: `RejectReason` and `ScrubReason` both
+//! render `reason`.
 //! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
 //! anywhere on this path an unlisted label could travel through, and adding a
@@ -254,6 +257,7 @@ pub enum Label {
     /// tenant input), so there is no cardinality this label could blow up.
     Allocator(&'static str),
     AllocatorStat(AllocatorStat),
+    MemoryComponent(MemoryComponent),
 }
 
 /// Which high-water mark a `ravel_maintain_rlog_merge_peak_bytes` sample is
@@ -361,6 +365,7 @@ impl Label {
             Label::MergeMemoryKind(_) => "kind",
             Label::Allocator(_) => "allocator",
             Label::AllocatorStat(_) => "stat",
+            Label::MemoryComponent(_) => "component",
         }
     }
 
@@ -380,6 +385,30 @@ impl Label {
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
             Label::Allocator(name) => name.to_string(),
             Label::AllocatorStat(stat) => stat.name().to_string(),
+            Label::MemoryComponent(component) => component.name().to_string(),
+        }
+    }
+}
+
+/// Which process subsystem a `ravel_memory_reserved_bytes` sample charges
+/// against (ADR-1170), the same one-name-split-by-a-closed-dimension
+/// discipline [`CacheFamily`] uses. Only `Sql` is ever rendered today: the
+/// fetch-layer reservation (ADR-1170 M3) has no live accountant yet, so
+/// there is deliberately no `Fetch` sample rather than one that reads zero
+/// and is mistaken for a measurement. `Fetch` still exists as a variant so
+/// the label's rendered value stays exhaustively matched here the moment
+/// M3 wires a real accountant in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryComponent {
+    Sql,
+    Fetch,
+}
+
+impl MemoryComponent {
+    fn name(self) -> &'static str {
+        match self {
+            MemoryComponent::Sql => "sql",
+            MemoryComponent::Fetch => "fetch",
         }
     }
 }
@@ -2794,6 +2823,67 @@ fn render_allocator_family(
     }
 }
 
+/// The process memory budget and its live SQL reservation (ADR-1170),
+/// always rendering `ravel_memory_budget_bytes` and, when a SQL executor is
+/// wired in (`sql_memory_budget: Some`), `ravel_memory_reserved_bytes` and
+/// `ravel_memory_handoff_overlap_bytes`. There is deliberately no
+/// `component="fetch"` sample on `ravel_memory_reserved_bytes`: the
+/// fetch-layer reservation (ADR-1170 M3) has no live accountant on `main`
+/// yet, and a gauge that reads zero because its producer does not exist
+/// would read as a measurement rather than as the absence it is.
+fn render_memory_family(
+    out: &mut String,
+    mode: Mode,
+    memory_budget_bytes: u64,
+    sql_memory_budget: Option<&Arc<ravel_memory::MemoryBudget>>,
+) {
+    write_header(
+        out,
+        "ravel_memory_budget_bytes",
+        "The resolved process memory budget (ADR-1170): effective memory minus the fixed overhead reserve.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_memory_budget_bytes",
+        &[Label::Mode(mode)],
+        memory_budget_bytes,
+    );
+
+    if let Some(budget) = sql_memory_budget {
+        write_header(
+            out,
+            "ravel_memory_reserved_bytes",
+            "Live bytes reserved against the process memory budget, split by component= (ADR-1170). \
+             No fetch-layer sample: that reservation has no live accountant yet.",
+            "gauge",
+        );
+        write_sample(
+            out,
+            "ravel_memory_reserved_bytes",
+            &[
+                Label::Mode(mode),
+                Label::MemoryComponent(MemoryComponent::Sql),
+            ],
+            budget.reserved(),
+        );
+
+        write_header(
+            out,
+            "ravel_memory_handoff_overlap_bytes",
+            "Bytes double-counted during an in-flight handoff between reservation holders (ADR-1170), \
+             charged against the same process memory budget as ravel_memory_reserved_bytes.",
+            "gauge",
+        );
+        write_sample(
+            out,
+            "ravel_memory_handoff_overlap_bytes",
+            &[Label::Mode(mode)],
+            budget.handoff_overlap(),
+        );
+    }
+}
+
 /// The per-(tenant, signal) admission counters (ADR-0051 section 6), read
 /// from [`AdmissionController::usage_snapshot`] at scrape time and paired with
 /// the `--metrics-tenant-labels` decision, matching every other family's
@@ -3883,9 +3973,12 @@ pub fn render(
     cache_max_bytes: Option<u64>,
     catalog_cache_max_bytes: Option<u64>,
     audit_write_failures: Option<u64>,
+    memory_budget_bytes: u64,
+    sql_memory_budget: Option<&Arc<ravel_memory::MemoryBudget>>,
 ) -> String {
     let mut out = String::new();
     render_allocator_family(&mut out, mode, allocator);
+    render_memory_family(&mut out, mode, memory_budget_bytes, sql_memory_budget);
     render_store_family(&mut out, mode, store);
     if !ingest.is_empty() {
         render_ingest_family(&mut out, mode, ingest);
@@ -4062,6 +4155,23 @@ pub struct MetricsState {
     /// `Some`. The catalog cache's live residency is not rendered (see
     /// [`render_cache_residency_family`]'s doc comment for the scope gap).
     pub catalog_cache_max_bytes: u64,
+    /// The resolved process memory budget (`ServerConfig::memory_budget_bytes`,
+    /// ADR-1170 decision 3): effective memory minus the fixed overhead
+    /// reserve, the number `cache_max_bytes` and `catalog_cache_max_bytes`
+    /// above are carved from. Always present; rendered unconditionally as
+    /// `ravel_memory_budget_bytes`.
+    pub memory_budget_bytes: u64,
+    /// The SQL executor's process-wide memory accountant (ADR-1170 decisions
+    /// 1-2, `ravel_sql::SqlExecutor::process_memory_budget`), read at scrape
+    /// time for `ravel_memory_reserved_bytes{component="sql"}` and
+    /// `ravel_memory_handoff_overlap_bytes`. `Some` only once the
+    /// query-serving block has built a SQL executor (`sql` feature enabled
+    /// and a mode that serves SQL); `None` otherwise leaves both families off
+    /// the exposition. There is deliberately no `component="fetch"` sample:
+    /// the fetch-layer reservation (ADR-1170 M3) is not built yet, and a
+    /// gauge that reads zero because its producer does not exist would be
+    /// mistaken for a measurement.
+    pub sql_memory_budget: Option<Arc<ravel_memory::MemoryBudget>>,
     /// The one process-wide admission controller (ADR-0051), shared with every
     /// ingest path. Always present (built in every mode); in a mode that
     /// serves no ingest its `usage_snapshot` is simply empty, so the admission
@@ -4357,6 +4467,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         cache_max_bytes,
         catalog_cache_max_bytes,
         audit_write_failures,
+        state.memory_budget_bytes,
+        state.sql_memory_budget.as_ref(),
     );
     (
         StatusCode::OK,
@@ -4440,6 +4552,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
 
         assert!(
@@ -4486,7 +4600,9 @@ mod tests {
         // ADR-0065 decision 4 for the RLOG merge-memory gauge; `tier` is the
         // eleventh, added by #97 to split each read cache into its RAM and
         // local-disk tiers; `allocator` and `stat` are the twelfth and
-        // thirteenth, added by #1170 for the process allocator gauges.
+        // thirteenth, added by #1170 for the process allocator gauges;
+        // `component` is the fourteenth, added by ADR-1170 to split the
+        // process memory-budget reservation gauge by subsystem.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -4502,6 +4618,7 @@ mod tests {
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
             Label::Allocator("jemalloc"),
             Label::AllocatorStat(AllocatorStat::Allocated),
+            Label::MemoryComponent(MemoryComponent::Sql),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -4520,6 +4637,7 @@ mod tests {
                 Label::MergeMemoryKind(_) => "kind",
                 Label::Allocator(_) => "allocator",
                 Label::AllocatorStat(_) => "stat",
+                Label::MemoryComponent(_) => "component",
             })
             .collect();
         assert_eq!(
@@ -4542,16 +4660,17 @@ mod tests {
                 "kind",
                 "allocator",
                 "stat",
+                "component",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), the `cache` label, #97's `tier` \
-             label, ADR-0065 decision 4's `kind`, and #1170's `allocator`/`stat`; `shard` must \
-             never appear here"
+             label, ADR-0065 decision 4's `kind`, #1170's `allocator`/`stat`, and ADR-1170's \
+             `component`; `shard` must never appear here"
         );
         assert_eq!(
             one_of_each.len(),
-            14,
-            "exactly 14 label variants, 13 distinct keys"
+            15,
+            "exactly 15 label variants, 14 distinct keys"
         );
     }
 
@@ -4603,6 +4722,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -4688,6 +4809,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -4829,6 +4952,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -5010,6 +5135,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
 
         assert!(body.contains(
@@ -5085,6 +5212,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
 
         assert!(
@@ -5147,6 +5276,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -5222,6 +5353,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
 
         assert!(
@@ -5285,6 +5418,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -5392,6 +5527,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
 
         assert!(
@@ -5447,6 +5584,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -5526,6 +5665,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -5693,6 +5834,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
 
         for signal in ["metrics", "logs", "spans"] {
@@ -5746,6 +5889,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -5817,6 +5962,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
 
         assert!(
@@ -5873,6 +6020,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
 
         assert!(
@@ -5920,6 +6069,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
         // Default reachability is healthy (1); the process runs no probe here.
@@ -6027,6 +6178,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
 
         // All three counters appear, mode-labeled, carrying the driven value.
@@ -6081,6 +6234,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
         assert!(
@@ -6140,6 +6295,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -6235,6 +6392,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
 
         for expected in [
@@ -6312,6 +6471,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
         assert!(
             !off.contains("ravel_distrib_"),
@@ -6368,6 +6529,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -6458,6 +6621,8 @@ mod tests {
             None,
             None,
             None,
+            0,
+            None,
         );
         assert!(
             !body.contains("ravel_scrub_"),
@@ -6514,6 +6679,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -6598,6 +6765,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -6829,6 +6998,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            0,
+            None,
         );
         assert!(
             body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
@@ -6871,6 +7042,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
 
@@ -6982,6 +7155,179 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         assert!(out.contains("ravel_cache_max_bytes{mode=\"query\",cache=\"catalog\"} 2000"));
     }
 
+    /// With no SQL executor wired in (`sql_memory_budget: None`, e.g. a
+    /// `maintain`-mode process or a `sql`-feature-off build), only
+    /// `ravel_memory_budget_bytes` renders: `ravel_memory_reserved_bytes` and
+    /// `ravel_memory_handoff_overlap_bytes` both depend on a live
+    /// `MemoryBudget` accessor that does not exist in that shape, so the
+    /// family must not fabricate zeros for either.
+    #[test]
+    fn memory_family_renders_only_the_budget_gauge_when_no_sql_budget_is_wired() {
+        let mut out = String::new();
+        render_memory_family(&mut out, Mode::Query, 123_456_789, None);
+        assert_eq!(
+            out.matches("ravel_memory_budget_bytes{mode=\"query\"} 123456789")
+                .count(),
+            1,
+            "the budget gauge must render exactly once with the exact derived value:\n{out}"
+        );
+        assert!(
+            !out.contains("ravel_memory_reserved_bytes"),
+            "no live SQL accountant means no reserved-bytes sample can be produced:\n{out}"
+        );
+        assert!(
+            !out.contains("ravel_memory_handoff_overlap_bytes"),
+            "no live SQL accountant means no handoff-overlap sample can be produced:\n{out}"
+        );
+    }
+
+    /// Once a SQL executor's `MemoryBudget` is wired in, all three gauges
+    /// render, and `ravel_memory_reserved_bytes`/
+    /// `ravel_memory_handoff_overlap_bytes` carry the exact figures the same
+    /// `MemoryBudget` accessors return -- not a snapshot taken at some other
+    /// point, and not a hardcoded literal that happens to match today.
+    #[test]
+    fn memory_family_renders_reserved_and_handoff_exact_figures_when_a_sql_budget_is_wired() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1_000_000));
+        budget.try_reserve(42_000).expect("fits the budget");
+        budget.note_handoff(7_000);
+
+        let mut out = String::new();
+        render_memory_family(&mut out, Mode::Query, 1_000_000, Some(&budget));
+
+        let expected_reserved = format!(
+            "ravel_memory_reserved_bytes{{mode=\"query\",component=\"sql\"}} {}",
+            budget.reserved()
+        );
+        let expected_handoff = format!(
+            "ravel_memory_handoff_overlap_bytes{{mode=\"query\"}} {}",
+            budget.handoff_overlap()
+        );
+        assert_eq!(
+            out.matches(&expected_reserved).count(),
+            1,
+            "expected exactly one {expected_reserved:?} sample:\n{out}"
+        );
+        assert_eq!(
+            out.matches(&expected_handoff).count(),
+            1,
+            "expected exactly one {expected_handoff:?} sample:\n{out}"
+        );
+    }
+
+    /// The fetch-layer reservation (ADR-1170 M3) has no live accountant on
+    /// `main` yet. A `component="fetch"` sample that read zero would be
+    /// mistaken for a measurement, so the decision was to omit it entirely
+    /// rather than render a placeholder zero -- this must hold whether or not
+    /// a SQL budget is wired in.
+    #[test]
+    fn memory_family_never_renders_a_fetch_component_sample() {
+        // Scoped to non-comment (sample) lines only: the `# HELP` line for
+        // `ravel_memory_reserved_bytes` explains the omission in prose and
+        // would otherwise false-positive a naive whole-text substring check.
+        fn any_sample_line_has_fetch_label(out: &str) -> bool {
+            out.lines()
+                .filter(|line| !line.starts_with('#'))
+                .any(|line| line.contains("component=\"fetch\""))
+        }
+
+        let mut out = String::new();
+        render_memory_family(&mut out, Mode::Query, 1_000_000, None);
+        assert!(!any_sample_line_has_fetch_label(&out), "{out}");
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1_000_000));
+        budget.try_reserve(1_000).expect("fits the budget");
+        let mut out = String::new();
+        render_memory_family(&mut out, Mode::Query, 1_000_000, Some(&budget));
+        assert!(
+            !any_sample_line_has_fetch_label(&out),
+            "a live SQL budget must not cause a fetch sample to appear either:\n{out}"
+        );
+    }
+
+    /// `ravel_memory_budget_bytes` must agree with the exact figure
+    /// [`crate::config::ResolvedPerformanceDefaults::emit`] logs under
+    /// `setting="memory_budget_bytes"` for the same resolved configuration:
+    /// both are read from the one field
+    /// (`ResolvedPerformanceDefaults::memory_budget_bytes`) that flows into
+    /// `ServerConfig::memory_budget_bytes` and then `MetricsState`, so this
+    /// asserts the emitted log value and the rendered gauge value against
+    /// each other rather than against a separate hardcoded literal.
+    ///
+    /// Prove-the-test: change the gauge's source value passed to
+    /// `render_memory_family` to something other than
+    /// `resolved.memory_budget_bytes` (e.g. hardcode `999`) and this
+    /// assertion fails comparing the rendered `999` against the emitted
+    /// figure derived from the reference host.
+    #[test]
+    fn memory_budget_gauge_agrees_with_the_figure_emit_logs_for_the_same_configuration() {
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        let host = crate::config::HostProfile::new(4, Some(64 * 1024 * 1024 * 1024));
+        let resolved = crate::config::resolve_performance_defaults(
+            host,
+            crate::config::PerformanceFlags::default(),
+        )
+        .expect("test host fits its own derived memory budget");
+
+        #[derive(Default)]
+        struct MemoryBudgetVisitor {
+            setting: Option<String>,
+            value: Option<u64>,
+        }
+        impl Visit for MemoryBudgetVisitor {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "setting" {
+                    self.setting = Some(value.to_string());
+                }
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                if field.name() == "value" {
+                    self.value = Some(value);
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "setting" {
+                    self.setting = Some(format!("{value:?}").trim_matches('"').to_string());
+                }
+            }
+        }
+
+        struct MemoryBudgetCapture(Arc<parking_lot::Mutex<Option<u64>>>);
+        impl<S: tracing::Subscriber> Layer<S> for MemoryBudgetCapture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = MemoryBudgetVisitor::default();
+                event.record(&mut visitor);
+                if visitor.setting.as_deref() == Some("memory_budget_bytes")
+                    && let Some(value) = visitor.value
+                {
+                    *self.0.lock() = Some(value);
+                }
+            }
+        }
+
+        let captured = Arc::new(parking_lot::Mutex::new(None));
+        let subscriber =
+            tracing_subscriber::registry().with(MemoryBudgetCapture(Arc::clone(&captured)));
+        tracing::subscriber::with_default(subscriber, || {
+            resolved.emit(host);
+        });
+        let emitted_value = captured
+            .lock()
+            .expect("emit() must log a memory_budget_bytes setting");
+
+        let mut out = String::new();
+        render_memory_family(&mut out, Mode::Query, resolved.memory_budget_bytes, None);
+        let expected = format!("ravel_memory_budget_bytes{{mode=\"query\"}} {emitted_value}");
+        assert!(
+            out.contains(&expected),
+            "the rendered gauge {out:?} must agree with the value emit() logged \
+             ({emitted_value}), not a separately hardcoded figure"
+        );
+    }
+
     fn tenant_usage(tenant: &str, signal: Signal) -> TenantUsage {
         TenantUsage {
             tenant_hash: ravel_types::TenantId::new(tenant).hash(),
@@ -7069,6 +7415,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            0,
+            None,
         );
 
         assert_eq!(
@@ -7153,6 +7501,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            0,
+            None,
         );
 
         let rendered = admission_tenant_hashes(&body);
@@ -7236,6 +7586,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            0,
+            None,
         );
         assert!(
             body.contains(&format!(
@@ -7293,6 +7645,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            None,
+            0,
             None,
         );
         let hash = hash.to_hex();
@@ -7366,6 +7720,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            None,
+            0,
             None,
         )
     }
@@ -7588,6 +7944,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            None,
+            0,
             None,
         )
     }

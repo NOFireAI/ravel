@@ -138,6 +138,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         catalog_cache_max_bytes: 256 * 1024 * 1024,
+        memory_budget_bytes: 1024 * 1024 * 1024,
         cache_dir: None,
         catalog_resolve_concurrency: None,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,

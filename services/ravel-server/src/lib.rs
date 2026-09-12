@@ -472,6 +472,13 @@ pub struct ServerConfig {
     /// fetcher cache; an explicit `--cache-max-bytes` sets both equal. Ignored
     /// when `disable_cache` is set.
     pub catalog_cache_max_bytes: u64,
+    /// The resolved process memory budget
+    /// (`ResolvedPerformanceDefaults::memory_budget_bytes`): effective memory
+    /// minus the fixed overhead reserve, the number `cache_max_bytes` and
+    /// `catalog_cache_max_bytes` are carved from. `main` fills it from the
+    /// resolved struct; [`start`] records it on [`metrics::MetricsState`] as
+    /// `ravel_memory_budget_bytes`, unaffected by `disable_cache`.
+    pub memory_budget_bytes: u64,
     /// `--cache-dir`: the ADR-0046 local-disk cache tier's directory (#97),
     /// `None` when the flag is unset. `main` sets it from `Cli::cache_dir`.
     /// When `Some` and `disable_cache` is off, [`query::build_catalog`] attaches
@@ -1931,6 +1938,7 @@ pub async fn start(
         cache: cache.clone(),
         cache_max_bytes: config.cache_max_bytes,
         catalog_cache_max_bytes: config.catalog_cache_max_bytes,
+        memory_budget_bytes: config.memory_budget_bytes,
         admission: admission.clone(),
         metrics_tenant_labels: config.metrics_tenant_labels,
         query_accounting: query_accounting.clone(),
@@ -1946,6 +1954,10 @@ pub async fn start(
         // pipeline; the metrics router is merged after that block for the
         // same reason.
         audit_pipeline: None,
+        // Filled in below, once the query-serving block has built the SQL
+        // executor (mirrors `audit_pipeline` above); stays `None` in a mode
+        // or feature build with no SQL executor at all.
+        sql_memory_budget: None,
     };
 
     // Held past the HTTP wiring so the Flight SQL service can register
@@ -2178,6 +2190,10 @@ pub async fn start(
             // from (ADR-0069 decision 2): built once here, shared, never a
             // second instance with its own per-tenant accounting.
             sweep_sql_executor = Some(state.executor.clone());
+            // The same executor's process-wide memory accountant (ADR-1170),
+            // for the `ravel_memory_reserved_bytes`/
+            // `ravel_memory_handoff_overlap_bytes` gauges.
+            metrics_state.sql_memory_budget = Some(state.executor.process_memory_budget().clone());
             http_router = http_router.merge(sql::router(state.clone()));
             // The mTLS listener's SQL route shares the same executor (built
             // once above) rather than calling `build_sql_state` a second

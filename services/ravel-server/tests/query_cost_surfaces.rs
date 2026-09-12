@@ -218,6 +218,8 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         cache: None,
         cache_max_bytes: 0,
         catalog_cache_max_bytes: 0,
+        memory_budget_bytes: 0,
+        sql_memory_budget: None,
         audit_pipeline: None,
     });
 
@@ -629,6 +631,8 @@ mod flight {
             cache: None,
             cache_max_bytes: 0,
             catalog_cache_max_bytes: 0,
+            memory_budget_bytes: 0,
+            sql_memory_budget: None,
             audit_pipeline: None,
         });
         let scrape = scrape(&metrics).await;

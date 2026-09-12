@@ -5143,6 +5143,7 @@ dependencies = [
  "ravel-logseg",
  "ravel-maintain",
  "ravel-mcp",
+ "ravel-memory",
  "ravel-object-store",
  "ravel-otap",
  "ravel-otlp",
