@@ -41,7 +41,7 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::LogSegmentFetcher;
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{DeclaredColumn, DeclaredType, LogsTableProvider, has_word_udf};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -249,7 +249,7 @@ async fn scan_prunes_by_ts_and_word_returns_exact_rows() {
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
 
     // WHERE ts >= 100 AND ts <= 250 AND has_word(body, 'timeout')
@@ -350,7 +350,7 @@ async fn stream_attr_equality_is_resolved_by_the_residual() {
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
 
     // A full SessionContext query so DataFusion's residual FilterExec actually
@@ -536,7 +536,7 @@ async fn residual_recheck_keeps_resource_only_stream_attr_match() {
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
 
     let ctx = SessionContext::new();
@@ -671,7 +671,7 @@ async fn order_by_ts_is_sorted_by_an_inserted_sort_not_by_a_leaf_claim() {
         snapshot,
         TenantHash([7u8; 16]),
         LogSegmentFetcher::new(backend),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
 
     // The leaf itself declares nothing. Read it off the unsorted plan so this
@@ -823,7 +823,7 @@ async fn column_projection_decodes_only_the_referenced_attribute_pages() {
         snapshot,
         TenantHash([7u8; 16]),
         LogSegmentFetcher::new(backend),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let ctx = logs_session(provider).expect("session");
 
@@ -897,7 +897,7 @@ async fn referencing_attrs_decodes_every_dynamic_column() {
         snapshot,
         TenantHash([7u8; 16]),
         LogSegmentFetcher::new(backend),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let ctx = logs_session(provider).expect("session");
 
@@ -990,7 +990,7 @@ async fn has_word_over_declared_str_column_has_no_cast_and_returns_exact_rows() 
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_declared_columns(vec![DeclaredColumn::new("name", DeclaredType::Str)]);
 
@@ -1087,7 +1087,7 @@ async fn has_word_first_argument_coercion_matrix() {
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_declared_columns(vec![DeclaredColumn::new("name", DeclaredType::Str)]);
 
@@ -1221,7 +1221,7 @@ async fn like_matrix_plans_without_cast_and_matches_rows() {
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_declared_columns(vec![DeclaredColumn::new("name", DeclaredType::Str)]);
 
@@ -1398,7 +1398,7 @@ async fn logs_scan_over_block_range_fetcher_returns_exact_rows() {
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
 
     let (lo, hi) = (100i64, 250i64);

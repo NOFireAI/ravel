@@ -69,6 +69,7 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_query::PhaseAccounting;
 use ravel_query::{
     BlockRangeFetcher, CacheFetchError, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogSegmentFetcher,
 };
@@ -296,7 +297,7 @@ async fn run(request_cost_bytes: u64) -> Routed {
             snapshot,
             TenantHash(TENANT),
             fetcher(store, request_cost_bytes),
-            accounting.clone(),
+            PhaseAccounting::pooled_over(&accounting),
         )
         .with_declared_columns(declared_columns()),
     );
