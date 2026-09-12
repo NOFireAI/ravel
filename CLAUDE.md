@@ -235,6 +235,9 @@ connection, a pushed-but-broken main).
 - `scripts/ci-sweep-cancelled.sh [-y]`: finds cancelled ci runs on open PR
   head SHAs and reruns them (dry run by default). A cancelled required
   check blocks auto-merge the same as a red one, and nothing retries it.
+  It refuses to rerun a run whose job ran within a minute of that job's own
+  `timeout-minutes`, since rerunning a timeout only times out again and
+  hides a budget problem; it prints the job and both numbers and exits 3.
 - `scripts/fleet-result-inspect.sh <task-id>`: fetches a dispatched
   task's result branch and prints its commits and diff scope vs `main`,
   for review before merging. Never trust an executor's own "gates green"
