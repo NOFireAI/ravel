@@ -740,9 +740,7 @@ jobs:
           exit 1
       - name: Create the contract-suite bucket
         run: |
-          # Docker Hub's anonymous pull allowance is per-IP and shared across
-          # every project on a runner, so an unauthenticated pull there fails
-          # unpredictably; quay.io does not share that allowance.
+          # quay.io rationale: see this job's "Start MinIO" step above.
           docker run --rm --network host --entrypoint sh quay.io/minio/mc:latest -c "
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/ravel-object-store-test"
@@ -887,9 +885,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Start MinIO
         run: |
-          # Docker Hub's anonymous pull allowance is per-IP and shared across
-          # every project on a runner, so an unauthenticated pull there fails
-          # unpredictably; quay.io does not share that allowance.
+          # quay.io rationale: see object-store-contract's "Start MinIO" step.
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
@@ -909,9 +905,7 @@ jobs:
           exit 1
       - name: Create the bench-smoke bucket
         run: |
-          # Docker Hub's anonymous pull allowance is per-IP and shared across
-          # every project on a runner, so an unauthenticated pull there fails
-          # unpredictably; quay.io does not share that allowance.
+          # quay.io rationale: see object-store-contract's "Start MinIO" step.
           docker run --rm --network host --entrypoint sh quay.io/minio/mc:latest -c "
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/ravel-object-store-test"
