@@ -12,11 +12,11 @@ read as a write-once record: created once by a deliberate `ravel-cli store
 qualify` run and never changed.
 
 The conformance suite has since grown. `CONFORMANCE_SUITE_VERSION` moved from 1
-to 2 when the suite added the `CasVersion` stale-precondition probe, the
-cross-page listing probe, the delete-visibility probe, and the concurrent
-single-winner `CreateIfAbsent` probe. A record written under version 1 was
-never checked against any of those, so `ravel-server` startup refuses it as
-below the running binary's floor (`services/ravel-server/src/qualification.rs`).
+to 2 when the suite added the concurrent single-winner `CreateIfAbsent` probe,
+the lexicographic listing order probe, the cross-page listing probe, and the
+delete-visibility probe. A record written under version 1 was never checked
+against any of those, so `ravel-server` startup refuses it as below the
+running binary's floor (`services/ravel-server/src/qualification.rs`).
 
 A write-once record makes that floor unreachable on an already-qualified
 bucket. `CreateIfAbsent` fails against the existing record, so a re-run cannot
