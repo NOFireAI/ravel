@@ -35,11 +35,13 @@ Affinity narrows which *replicas* a tenant reaches, not which *shards*. Within
 a replica a tenant's series still hash across all of that replica's shards, so
 affinity does not isolate a tenant from a per-shard object-store stall: if one
 tenant's key prefix is being throttled (`503 SlowDown`, which the store applies
-per prefix) and its flush wedges a shard, co-resident tenants on that shard are
-affected on every replica in the subset, and a smaller or different subset does
-not change that. The control for cross-tenant flush isolation on a shard is
-`max_inflight_flushes` (docs/ingest.md "Shard actor"), not the subset size and
-not the shard count.
+per prefix), its stalled flush holds a permit on that shard and co-resident
+tenants' flushes queue behind it on every replica in the subset, and a smaller
+or different subset does not change that. The shard actor itself keeps running,
+so those tenants' writes are still accepted and their age triggers still fire;
+what they wait for is a permit to flush on. The control for
+cross-tenant flush isolation on a shard is `max_inflight_flushes`
+(docs/ingest.md "Shard actor"), not the subset size and not the shard count.
 
 There is a read-side benefit too. Fewer, larger L0 objects mean fewer open-hour
 segments for a query to open, which lowers the per-query request budget.

@@ -43,7 +43,11 @@ Strict mode (default):
 
 Buffered mode (opt-in per request, named "buffered"):
 - Acknowledged after admission and enqueue to a shard actor. A crash between
-  ack and flush loses the buffered window (bounded by max flush delay).
+  ack and flush loses the buffered window. Max flush delay bounds when the
+  flush is triggered, not when it completes: the flush task then waits for a
+  `max_inflight_flushes` permit on its shard (ADR-1642) and runs its PUTs, so
+  a shard whose permits are held by a stalled flush widens the window until
+  the stall clears or `max_flush_lifetime` abandons the flush.
 - Never described as durable. No commit token is returned.
 
 Rejection: admission failures (limits, auth, quota) reject before buffering
@@ -55,10 +59,13 @@ rejected point counts and reasons.
 - A batch becomes visible to queries when its commit record exists; commit
   record creation is atomic (create-if-absent), so visibility is atomic per
   L0 object.
-- Visibility latency = flush delay + data PUT + commit PUT. The flush delay
-  is a configurable operator budget (`--max-flush-delay`), default 2 s in
-  strict mode (ADR-0076 decision 4); the p99 visibility target under target
-  load tracks that budget, not a fixed sub-second constant.
+- Visibility latency = flush delay + flush-permit wait + data PUT + commit
+  PUT. The flush delay is a configurable operator budget
+  (`--max-flush-delay`), default 2 s in strict mode (ADR-0076 decision 4);
+  the p99 visibility target under target load tracks that budget, not a fixed
+  sub-second constant. The permit wait is zero unless the shard already has
+  `max_inflight_flushes` flushes running (ADR-1642), which is where a stalled
+  tenant's throttled prefix shows up in a co-resident tenant's visibility.
 - There is no cross-shard ordering guarantee. A query snapshot may include
   commit N+1 of shard A and not commit M of shard B, regardless of wall-clock
   order. Per (writer, shard), commits are sequenced by `seq`.

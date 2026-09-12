@@ -109,7 +109,13 @@ pub struct SpanIngestMetrics {
     grace_extended_stale_flushes: AtomicU64,
     /// Per-shard count of flushes whose flush task has been spawned but has
     /// not yet acked its waiters (ADR-0067 decisions 1-2, the span-pipeline
-    /// counterpart of [`crate::IngestMetrics`]'s own gauge). Keyed by shard
+    /// counterpart of [`crate::IngestMetrics`]'s own gauge), counted from the
+    /// moment the buffer leaves the actor: a task still waiting for its
+    /// `max_inflight_flushes` permit is included, because it holds a flush
+    /// window of memory and its ADR-0069 byte charge exactly as an executing
+    /// one does (ADR-1642). So this can exceed `max_inflight_flushes` per
+    /// shard: the bound caps concurrent execution, not how many flushes are
+    /// spawned and waiting. Keyed by shard
     /// index; a shard with no flush in flight has no entry, equivalent to 0.
     /// Not part of [`SpanIngestMetricsSnapshot`]'s flat counters because it is
     /// a gauge with a per-shard dimension, unlike everything else here; read it
@@ -254,9 +260,10 @@ impl SpanIngestMetrics {
         self.partial_writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Adjusts shard `shard`'s in-flight-flush gauge by `delta` (+1 when a
-    /// flush task is spawned, -1 when it ends, including on panic via
-    /// `span_shard`'s `InFlightFlushGuard`). Poison recovery rather than a
+    /// Adjusts shard `shard`'s in-flight-flush gauge by `delta`. Both deltas
+    /// belong to `span_shard`'s `InFlightFlushGuard`: +1 in its constructor, -1
+    /// in its `Drop`, including on panic. Nothing else may call this, or the
+    /// two can disagree. Poison recovery rather than a
     /// panic on a poisoned lock: a gauge is best-effort self-observability, not
     /// a durability path, so a prior panicked holder must not take this one
     /// down with it.
@@ -282,6 +289,20 @@ impl SpanIngestMetrics {
             .collect();
         counts.sort_unstable_by_key(|&(shard, _)| shard);
         counts
+    }
+
+    /// Shard `shard`'s raw signed in-flight-flush count, before the clamp
+    /// [`SpanIngestMetrics::in_flight_flushes_by_shard`] applies on read. Tests
+    /// only: the clamp is what hides an unbalanced increment/decrement pair
+    /// from the public reader, so a test that the pair cannot come apart has
+    /// to see the sign.
+    #[cfg(test)]
+    pub(crate) fn in_flight_flushes_signed(&self, shard: u32) -> i64 {
+        let map = self
+            .in_flight_flushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&shard).copied().unwrap_or(0)
     }
 
     pub(crate) fn record_stale_provisioning_flush(&self) {

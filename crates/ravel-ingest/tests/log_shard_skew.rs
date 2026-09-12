@@ -7,11 +7,15 @@
 //! pipeline's:
 //!
 //! 1. `on_actor_ns`: the actor pulls a write off its channel -> `handle_write`
-//!    (or `handle_write_columnar`) returns, minus any permit wait nested inside.
-//! 2. `flush_permit_wait_ns`: `flush_tenant` reaches the `max_inflight_flushes`
-//!    acquire -> that acquire grants.
-//! 3. `off_actor_ns`: the spawned flush task enters `run_flush` (permit held) ->
-//!    `run_flush` returns. On this pipeline that span is the RLOG encode plus
+//!    (or `handle_write_columnar`) returns. Spawning the flush task is inside
+//!    this span; waiting for its permit is not, because the actor does not wait
+//!    (ADR-1642).
+//! 2. `flush_permit_wait_ns`: the spawned flush task's first poll -> the
+//!    `max_inflight_flushes` acquire grants. A sum over concurrently waiting
+//!    tasks, so at one permit it grows with how many flushes are queued, not
+//!    just with how many were refused once.
+//! 3. `off_actor_ns`: that acquire returns (permit held) -> `run_flush`
+//!    returns. On this pipeline that span is the RLOG encode plus
 //!    the data-object PUT plus the commit-record publish.
 //!
 //! Every figure below is exact rather than banded: `SlowStore` sleeps on the
@@ -210,7 +214,7 @@ async fn log_flush_cost_is_recorded_off_actor_and_nothing_parks_on_a_free_permit
 /// | arm | submission | permits | wall | `flush_permit_wait_ns` |
 /// |---|---|---|---|---|
 /// | A | serial | 1 | `3 * SLOW` | 0 |
-/// | B | concurrent | 1 | `3 * SLOW` | `2 * SLOW` |
+/// | B | concurrent | 1 | `3 * SLOW` | `3 * SLOW` |
 /// | C | concurrent | 3 | `SLOW` | 0 |
 ///
 /// Arm A is the shipped-before loader shape (`--pipeline-depth 1`): each write
@@ -222,11 +226,14 @@ async fn log_flush_cost_is_recorded_off_actor_and_nothing_parks_on_a_free_permit
 ///
 /// Arm B is the same three flushes submitted concurrently against ONE permit.
 /// The wall is identical to arm A's, so the outer window alone buys nothing
-/// either -- but the counter now reads `2 * SLOW`, each of writes 2 and 3
-/// parking out exactly one prior flush. A and B are the two ways to be slow, and
-/// the counter is what tells them apart: 0 means "nobody asked this window for
-/// anything", nonzero means "this window refused". Only the second is a reason
-/// to raise it.
+/// either -- but the counter now reads `3 * SLOW`. All three flush tasks are
+/// spawned at once, because the actor no longer waits for a permit itself
+/// (ADR-1642), so their waits overlap: flush 1 waits nothing, flush 2 waits one
+/// flush, flush 3 waits two. The span is a sum over concurrently waiting tasks,
+/// so like `off_actor_ns` it can exceed the wall. A and B are the two ways to be
+/// slow, and the counter is what tells them apart: 0 means "nobody asked this
+/// window for anything", nonzero means "this window refused". Only the second is
+/// a reason to raise it.
 ///
 /// Arm C raises both. The three flushes overlap, the wall drops to one flush,
 /// and the permit wait is 0 again -- with `off_actor_ns` still `3 * SLOW`,
@@ -236,10 +243,13 @@ async fn log_flush_cost_is_recorded_off_actor_and_nothing_parks_on_a_free_permit
 /// moves the same counter on the same fixture. A permit-wait counter stuck at 0
 /// fails arm B; one that reported any wait unconditionally fails arms A and C; a
 /// wall that ignored the windows fails arm C. Confirmed by replacing the
-/// `record_shard_flush_permit_wait_ns` call in `log_shard.rs::flush_tenant` with
-/// a discard, which is the pre-change state of that pipeline: arm B then fails
-/// with `left: 0, right: 10000000000` while arms A and C still pass, since their
-/// expectation for that counter is 0 either way.
+/// `record_shard_flush_permit_wait_ns` call in `log_shard.rs::flush_tenant`'s
+/// spawned task with a discard, which is the pre-instrumentation state of that
+/// pipeline: arm B then fails with `left: 0, right: 15000000000` while arms A
+/// and C still pass, since their expectation for that counter is 0 either way.
+/// Arm B's figure also pins where the acquire runs: moving it back onto the
+/// actor serialises the waits instead of overlapping them and the arm fails with
+/// `left: 10000000000, right: 15000000000`.
 #[tokio::test]
 async fn neither_write_window_alone_moves_the_wall_and_the_counters_say_which() {
     const SLOW: Duration = Duration::from_secs(5);
@@ -358,10 +368,11 @@ async fn neither_write_window_alone_moves_the_wall_and_the_counters_say_which() 
     assert_eq!(shard0.messages_processed, WRITES as u64);
     assert_eq!(
         shard0.flush_permit_wait_ns,
-        2 * SLOW.as_nanos() as u64,
-        "writes 2 and 3 each park out exactly one prior flush: at one permit the \
-         inner window IS refusing work, and it says so on its own counter rather \
-         than leaving the wall unexplained"
+        3 * SLOW.as_nanos() as u64,
+        "all three flush tasks are spawned at once and queue on the one permit, \
+         so their waits overlap: 0 + SLOW + 2 * SLOW. At one permit the inner \
+         window IS refusing work, and it says so on its own counter rather than \
+         leaving the wall unexplained"
     );
     assert_eq!(
         shard0.off_actor_ns,

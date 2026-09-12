@@ -1097,15 +1097,25 @@ pub struct Cli {
     #[arg(long = "max-ingest-buffer-bytes", default_value_t = 512 * 1024 * 1024)]
     pub max_ingest_buffer_bytes: u64,
 
-    /// Per-shard bound on concurrently in-flight flushes, for all three
-    /// ingest pipelines (metrics, logs, spans -- ADR-0067 decision 2,
-    /// extended to logs and spans by ADR-0076 decision 3). Each shard's
-    /// flush runs in a spawned task the shard actor no longer waits on; this
-    /// caps how many such tasks a single shard may have outstanding at once,
-    /// so pipelining trades bounded extra memory (buffers held by in-flight
-    /// flushes) for overlapped PUT latency instead of unbounded fan-out.
-    /// Matches [`ravel_ingest::IngestConfig::max_inflight_flushes`]'s own
-    /// default of 1 (today's non-pipelined behavior). `0` is rejected by
+    /// Per-shard bound on flushes executing at once, for all three ingest
+    /// pipelines (metrics, logs, spans -- ADR-0067 decision 2, extended to
+    /// logs and spans by ADR-0076 decision 3, and amended by ADR-1642). Each
+    /// flush runs in a spawned task that acquires the shard's permit itself,
+    /// so the shard actor never waits for one: it keeps draining its channel
+    /// and firing age triggers for every tenant on the shard while a flush is
+    /// stalled. This makes the knob the per-shard cross-tenant flush
+    /// isolation control as much as a throughput one. At the default of 1, a
+    /// tenant whose S3 key prefix is being throttled (`503 SlowDown`, applied
+    /// per prefix) holds the shard's only permit, and co-resident tenants'
+    /// flushes queue behind it until the stall clears or `max_flush_lifetime`
+    /// abandons it; their writes are still accepted, but their data stays
+    /// invisible to queries meanwhile. Raising it gives those tenants a
+    /// permit to flush on, at the cost of more concurrent PUTs and more
+    /// encode memory in flight. Queued flushes hold their buffers and their
+    /// ADR-0069 byte charges, so the byte budget, not this bound, is what
+    /// sheds when a shard backs up. Matches
+    /// [`ravel_ingest::IngestConfig::max_inflight_flushes`]'s own default of
+    /// 1 (today's non-pipelined behavior). `0` is rejected by
     /// [`Cli::validate`]: it would deadlock every flush, since a shard could
     /// never acquire a permit to run one.
     #[arg(long = "max-inflight-flushes", default_value_t = 1)]
