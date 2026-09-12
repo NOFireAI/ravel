@@ -7858,6 +7858,54 @@ mod tests {
         Cli::try_parse_from(argv).expect("flags parse")
     }
 
+    /// The identity the qualification gate compares against is the exact string
+    /// `ravel-cli store qualify` records, in both the endpoint and no-endpoint
+    /// forms, and the exempt memory store supplies none. Pinned here because
+    /// the check is warn-only: a reader that built the string differently (the
+    /// two arguments are both `Option<&str>`, so swapping them compiles) would
+    /// warn on every start against a correctly qualified bucket, and nothing
+    /// would fail.
+    #[test]
+    fn backend_identity_matches_the_recorded_format() {
+        assert_eq!(
+            cli(&[]).backend_identity(),
+            None,
+            "the memory store is exempt, so there is nothing to compare"
+        );
+
+        let with_endpoint = cli(&[
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ]);
+        assert_eq!(
+            with_endpoint.backend_identity().as_deref(),
+            Some("s3://ravel-test@http://127.0.0.1:9000")
+        );
+
+        let without_endpoint = cli(&[
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ]);
+        assert_eq!(
+            without_endpoint.backend_identity().as_deref(),
+            Some("s3://ravel-test")
+        );
+    }
+
     /// Reachability (ADR-0074): the shipped
     /// `--distribute-*-threshold` flag defaults flow through
     /// `parse_distrib_settings` into the `DistribThresholds` the live query

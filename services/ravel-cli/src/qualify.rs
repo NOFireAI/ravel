@@ -1,7 +1,9 @@
 //! `ravel-cli store qualify` (ADR-0050 section 6): runs
 //! `ravel_object_store::conformance`'s empirical suite against a configured
 //! backend and, on a pass, records the outcome at `sys/qualification` via
-//! `CreateIfAbsent` -- once per bucket, never overwritten.
+//! `CreateIfAbsent` -- once per bucket at a given suite version. A record left
+//! by an older suite version is the one exception: a re-run overwrites it, which
+//! is the only way to clear `ravel-server`'s stale-record refusal.
 
 use std::sync::Arc;
 
@@ -21,9 +23,11 @@ pub use ravel_object_store::conformance::{QUALIFICATION_KEY, QualificationRecord
 
 /// Run the conformance suite against `store` under a fresh scratch prefix and
 /// print each property's outcome. On a pass, writes [`QualificationRecord`]
-/// to `sys/qualification`; if one is already there (a prior qualifying run),
-/// leaves it untouched and reports it instead. Returns an error -- without
-/// writing anything -- if any property fails, naming which one(s).
+/// to `sys/qualification`; if an equal-or-newer record is already there (a
+/// prior qualifying run at this suite version), leaves it untouched and reports
+/// it instead, and overwrites one written under an older suite version with the
+/// current pass. Returns an error -- without writing anything -- if any
+/// property fails, naming which one(s).
 pub async fn qualify(
     store: Arc<dyn ObjectStoreBackend>,
     backend_identity: String,
