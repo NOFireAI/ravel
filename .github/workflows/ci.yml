@@ -601,6 +601,24 @@ jobs:
         # the crate that declares the feature.
       - name: Test ravel-bench --features stage-timing
         run: cargo test --locked -p ravel-bench --features stage-timing
+      - name: Clippy ravel-logseg + ravel-ingest --features stage-timing
+        run: cargo clippy --locked -p ravel-logseg -p ravel-ingest --features stage-timing --all-targets -- -D warnings
+        # The step above enables ravel-logseg/stage-timing and
+        # ravel-ingest/stage-timing transitively, so it does type-check their
+        # production code. It cannot reach their TESTS: `-p ravel-bench` builds
+        # both crates as library dependencies, and cargo never compiles a
+        # dependency's `#[cfg(test)]` module. Every
+        # `#[cfg(feature = "stage-timing")]` test in those two crates was
+        # unreachable from any lane -- including the ones that pin the logs
+        # stage set and the per-block bloom sample count (issue #1516). This
+        # pair of steps is the lane that compiles and runs them.
+        #
+        # services/ravel-cli also declares stage-timing and is deliberately NOT
+        # in this selection: its stage-timing test is broken on main under
+        # issue #1522, so including it would make this lane red for a reason
+        # unrelated to the seam.
+      - name: Test ravel-logseg + ravel-ingest --features stage-timing
+        run: cargo test --locked -p ravel-logseg -p ravel-ingest --features stage-timing
 
   # Supply-chain gate. deny.toml encodes an advisory,
   # license, ban, and source policy that `make audit` runs locally but no
