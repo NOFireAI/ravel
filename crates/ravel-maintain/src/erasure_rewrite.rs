@@ -7194,5 +7194,11 @@ mod tests {
             build.exemplars_kept, 2,
             "the two out-of-window exemplars (ts 10, 40) are kept"
         );
+        assert_eq!(
+            build.exemplars_dropped + build.exemplars_kept,
+            3,
+            "dropped + kept must equal the fixture's 3 exemplars exactly, so a \
+             miscount cannot hide in an unaccounted remainder"
+        );
     }
 }
