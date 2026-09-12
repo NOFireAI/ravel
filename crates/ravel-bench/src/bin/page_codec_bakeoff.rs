@@ -643,9 +643,7 @@ fn measure_cell(
                 encoded.to_vec()
             };
             let (decoded, dm, dmin, dmax) = timed(
-                || {
-                    lz4_flex::decompress_size_prepended(&compressed).expect("lz4 decompress")
-                },
+                || lz4_flex::decompress_size_prepended(&compressed).expect("lz4 decompress"),
                 reps,
             );
             (
