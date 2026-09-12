@@ -192,11 +192,11 @@ and symbol, an existing test, and any test still needed. The
 traceability lane checks that every named path and symbol resolves in
 the real source tree, and it needs no Java runtime.
 
-Five rows across the suite still have no test. Two are in lifecycle.
-`RequestErasure` has no production code that writes the erasure request
-marker. Only a key builder and tests exist. The pair `CompleteErasure`
-and `CompletionImpliesNoPreRewriteExposure` names a gate the code
-computes, but no production symbol writes the completion object.
+Four rows across the suite still have no test. One is in lifecycle: the
+pair `CompleteErasure` and `CompletionImpliesNoPreRewriteExposure` names
+a gate the code computes and a production symbol writes the completion
+object for, but no test drives that write through the served-set branch
+end-to-end.
 
 Three rows are in maintenance, inside the proposed compaction-claims
 design. `GuardedPublish`, `AbandonPublish`, and

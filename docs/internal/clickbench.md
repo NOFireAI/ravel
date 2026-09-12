@@ -723,10 +723,10 @@ concurrency is CPU-derived and also matches on this box: 32, two per core on
 `MemTotal` (capped by the cgroup limit when the server runs in a container,
 which the reference box does not), which Linux reports as
 32,909,025,280 bytes here, so they land within 2.2% of the published figures
-rather than on them: an 80% read cache of 26,327,220,224 bytes against the
-published 25,769,803,776, a 25% per-query SQL pool of 8,227,256,320 against
-8,053,063,680, and a 50% per-tenant pool of 16,454,512,640 against
-16,106,127,360. The catalog byte cache derives to a separate 5% ceiling,
+rather than on them: a 25% read cache and a 25% per-query SQL pool, each
+8,227,256,320 bytes here against the published 8,053,063,680, and a 50%
+per-tenant pool of 16,454,512,640 against 16,106,127,360. The catalog byte
+cache derives to a separate 5% ceiling,
 1,645,451,264 bytes (#1141). Do not assume the resolved values: record the
 server's own startup log lines (below) with the entry. Both of the two settings
 that used to be mandatory here are among the derived six: a folded ClickBench
@@ -742,7 +742,7 @@ them, and record them with the entry (the values below are the reference-host
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
-INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=8053063680 source="derived"
 INFO performance default resolved setting="catalog_cache_max_bytes" value=1610612736 source="derived"
 ```
 
