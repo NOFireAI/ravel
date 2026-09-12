@@ -653,11 +653,14 @@ JSON record to `sys/qualification` via `CreateIfAbsent`:
 `CreateIfAbsent` makes qualification once-per-bucket at a given suite version:
 a second `store qualify` run against a bucket already qualified under the
 current version leaves the existing record untouched and reports it instead of
-overwriting it, per ADR-0050 section 6. The one exception is a record written
-under an older suite version, which a re-run overwrites with the current pass so
-the version above does not strand an already-qualified bucket. A failing run
-writes nothing new to `sys/qualification`; its process exit names every failing
-property.
+overwriting it, per ADR-1302 (superseding ADR-0050 section 6). The one exception
+is a record written under an older suite version, which a re-run overwrites with
+the current pass so the version above does not strand an already-qualified
+bucket. That overwrite is guarded by `CasVersion` on the version the run just
+read, not an unconditional write, so a concurrent `qualify` from a newer binary
+that installed a higher-version record between the read and the write is left in
+place rather than downgraded. A failing run writes nothing new to
+`sys/qualification`; its process exit names every failing property.
 
 At startup ravel-server compares the record's `backend_identity` against the
 identity it is configured for and logs a warning on a mismatch, without
