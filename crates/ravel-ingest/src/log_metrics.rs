@@ -757,7 +757,9 @@ mod tests {
                     dynamic_columns_used: 7,
                     dynamic_columns_overflowed: 2,
                     #[cfg(feature = "stage-timing")]
-                    bloom_block_ns: Vec::new(),
+                    bloom_total_ns: 0,
+                    #[cfg(feature = "stage-timing")]
+                    bloom_blocks: 0,
                 })
             },
             LogIngestMetricsSnapshot {

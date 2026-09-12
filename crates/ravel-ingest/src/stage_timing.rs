@@ -71,9 +71,18 @@ mod imp {
         /// window in `ravel_logseg::RlogWriter`'s `build_object` /
         /// `build_object_columnar`, one sample per block. It covers the bloom
         /// build only, excluding `write_block` / `write_block_columnar`
-        /// (block assembly), POSTINGS term accumulation for indexed fields,
-        /// and everything else those functions do. A tenant with indexed
-        /// fields therefore reports the same bloom figure as one without.
+        /// (block assembly), POSTINGS term accumulation, and everything else
+        /// those functions do: the figure excludes POSTINGS term
+        /// accumulation, so an indexed tenant is not charged for it here.
+        ///
+        /// `build_object` (row path, driven by `LogIngestRouter::write` and
+        /// so by OTLP ingest) inserts every row's string column once per
+        /// row. `build_object_columnar` (driven by `write_columnar`, and so
+        /// by `ravel-cli load --parquet`) tokenizes a dict-encoded string
+        /// column once per distinct value in the block instead. Both set the
+        /// same bloom bits, but at different insert cost, so a `bloom`
+        /// figure from one path is not comparable to one from the other
+        /// whenever a string column dict-encodes.
         ///
         /// This window is INSIDE [`LogStage::Encode`], not subtracted from
         /// it: `Encode` still times the whole `RlogWriter::push` +
@@ -149,6 +158,20 @@ mod imp {
             let cell = self.cell(stage);
             cell.samples.fetch_add(1, Ordering::Relaxed);
             let ns = u64::try_from(dur.as_nanos()).unwrap_or(u64::MAX);
+            cell.total_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+
+        /// Adds `samples` samples summing to `total` to `stage` in one fold, for
+        /// a caller that already accumulated a count and a sum (for example,
+        /// `WriteStats::bloom_blocks` and `bloom_total_ns`) rather than one
+        /// [`std::time::Instant`] pair per sample. A no-op when `samples` is 0.
+        pub fn record_n(&self, stage: LogStage, samples: u64, total: Duration) {
+            if samples == 0 {
+                return;
+            }
+            let cell = self.cell(stage);
+            cell.samples.fetch_add(samples, Ordering::Relaxed);
+            let ns = u64::try_from(total.as_nanos()).unwrap_or(u64::MAX);
             cell.total_ns.fetch_add(ns, Ordering::Relaxed);
         }
 
