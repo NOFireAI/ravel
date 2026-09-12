@@ -46,13 +46,16 @@ pub fn build_labels_dict(distinct: &[LabelSet], keys: &[i32]) -> Result<ArrayRef
 /// are dropped.
 ///
 /// Slicing a `DictionaryArray` (as the dedup operator does, one winner row at
-/// a time) rewrites the key run but retains the whole source values buffer, so
-/// concatenating many such slices appends every slice's entire dictionary. The
-/// concatenated dictionary therefore grows with the row count rather than with
-/// the distinct-series count. This collapses it back: entries are deduplicated
-/// by content, so the result carries exactly one entry per distinct label set
-/// referenced by a non-null row, bounded by the distinct series in the batch
-/// regardless of how many rows reference them.
+/// a time) rewrites the key run but retains the whole source values buffer.
+/// Concatenating such slices (`concat_batches`, or an optimizer-inserted
+/// batch coalescer) shares one dictionary only when every input's dictionary
+/// child is pointer-equal to its neighbor (arrow-data's `MutableArrayData`);
+/// otherwise it appends each slice's whole dictionary, so the concatenated
+/// dictionary grows with row count rather than distinct-series count. This
+/// collapses it back: entries are deduplicated by content, so the result
+/// carries exactly one entry per distinct label set referenced by a non-null
+/// row, bounded by the distinct series in the batch regardless of how many
+/// rows reference them.
 pub fn compact_labels(labels: &ArrayRef) -> Result<ArrayRef, SqlError> {
     let dict = labels
         .as_any()
@@ -119,7 +122,6 @@ pub fn compact_labels(labels: &ArrayRef) -> Result<ArrayRef, SqlError> {
 /// compacted key. Entries with identical canonical content share one key, so
 /// the same series appearing under many retained sub-dictionaries collapses to
 /// a single entry.
-#[allow(clippy::too_many_arguments)]
 fn intern_entry(
     builder: &mut MapBuilder<StringBuilder, StringBuilder>,
     seen: &mut HashMap<Vec<u8>, i32>,
@@ -129,9 +131,14 @@ fn intern_entry(
     offsets: &[i32],
     old: usize,
 ) -> Result<i32, SqlError> {
-    // A null map entry (no label set) is distinct from any real one; the
-    // scan never builds one, but canonicalize it explicitly so the fallback
-    // stays correct rather than aliasing an empty label set.
+    // A null map entry (no label set) is distinct from any real one.
+    // `build_labels_dict`, the only builder that feeds `compact_labels`'s
+    // production callers in `dedup.rs` (`finalize` and `flush`), never
+    // produces one, so this branch is unreachable from any real query and
+    // exercised only by the hand-built arrays in the tests below. It stays as
+    // a handled case rather than `unreachable!()` because `compact_labels` is
+    // a general utility over any `Dictionary(Int32, Map)` array, not only the
+    // one production shape.
     if maps.is_null(old) {
         let canon = vec![0u8];
         if let Some(&k) = seen.get(&canon) {
@@ -458,6 +465,75 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn compact_labels_merges_byte_identical_entries_at_different_old_indices() {
+        // Two source dictionary entries (old indices 0 and 1) whose decoded
+        // content is byte-identical -- the shape produced when several
+        // concatenated sub-dictionaries each retain their own copy of the
+        // same series' label set. `seen` must key on canonical content, not
+        // on `old`, so both collapse into the same compacted entry and both
+        // rows re-key to it; an `old_to_new`/`seen` bug that keyed on `old`
+        // instead would keep them as two entries and still satisfy
+        // `entries == distinct` by accident if the two rows differed.
+        let raw = raw_map_dict(
+            &[
+                Some(&[("host", Some("a")), ("region", Some("us"))]),
+                Some(&[("host", Some("a")), ("region", Some("us"))]),
+            ],
+            &[0, 1],
+        );
+
+        let compacted = compact_labels(&raw).unwrap();
+        let dict = compacted
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let maps = dict.values().as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(
+            maps.len(),
+            1,
+            "two source entries with identical content must collapse to one"
+        );
+        assert_eq!(
+            dict.keys().value(0),
+            dict.keys().value(1),
+            "both rows must re-key to the same compacted entry"
+        );
+    }
+
+    #[test]
+    fn compact_labels_of_one_row_slice_of_large_dictionary_has_one_entry() {
+        // A one-row slice referencing one entry of a 20-entry dictionary --
+        // exactly the shape `RsegDedupExec::finalize` compacts per winner
+        // row -- must retain only that one referenced entry, not all 20.
+        let distinct: Vec<LabelSet> = (0..20)
+            .map(|i| {
+                let host = format!("host-{i}");
+                set(&[("host", host.as_str())])
+            })
+            .collect();
+        let keys: Vec<i32> = (0..20).collect();
+        let labels = build_labels_dict(&distinct, &keys).unwrap();
+        let sliced = labels.slice(7, 1);
+
+        let compacted = compact_labels(&sliced).unwrap();
+        let dict = compacted
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let maps = dict.values().as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(
+            maps.len(),
+            1,
+            "a one-row slice must compact to exactly one dictionary entry"
+        );
+        assert_eq!(
+            decode_compacted(&compacted, 0),
+            vec![("host".to_string(), Some("host-7".to_string()))],
+            "the surviving entry must be the sliced row's own label set"
+        );
     }
 
     #[test]

@@ -1,15 +1,9 @@
 //! Regression tests for issue #1519: the post-dedup `labels` dictionary must
-//! carry one entry per distinct series it references, not one per row.
-//!
-//! The dedup operator keeps each winner row as a one-row `DictionaryArray`
-//! slice, which retains the whole source dictionary, and concatenates every
-//! slice folded since the last flush. `FLUSH_ROWS = 1024` is only checked
-//! after an entire upstream (scan/merge) batch has been folded, so a flush
-//! batch is actually bounded by the upstream batch size (8192 rows), not by
-//! 1024. Before the compaction fix, the flushed dictionary held
-//! `rows x distinct-series-per-source-batch` entries, so a `SELECT labels`
-//! result ballooned ~430x and a stock 4 MiB Flight client could not read it
-//! past a dozen series.
+//! carry one entry per distinct series it references, not one per row. See
+//! `compact_labels`'s doc in `src/labels.rs` for why concatenating dedup's
+//! one-row slices can otherwise blow the dictionary up to `rows x
+//! distinct-series-per-source-batch` entries, and `src/dedup.rs`'s `flush`/
+//! `finalize` for where the two compaction passes run.
 //!
 //! These tests drive the real scan -> merge -> dedup pipeline (the same
 //! `RavelTableProvider::plan` the SQL endpoint runs), following the harness
@@ -27,13 +21,14 @@ use datafusion::arrow::datatypes::Int32Type;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::collect;
+use datafusion::physical_plan::{collect, displayable};
+use datafusion::prelude::SessionContext;
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{EngineConfig, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
-use ravel_sql::RavelTableProvider;
+use ravel_sql::{RavelTableProvider, label_udf};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
 use uuid::Uuid;
@@ -304,9 +299,19 @@ async fn flushed_dictionary_is_bounded_by_distinct_series_not_rows() {
 /// its series was written with, including name order within the map, a label
 /// unique to one series, and a label absent from half the series. Compaction
 /// must not corrupt or reorder any entry.
+///
+/// The corpus must span more than one upstream scan/merge batch (8192 rows):
+/// a single-batch corpus never concatenates more than one sub-dictionary, so
+/// every row's dictionary child stays pointer-equal and `compact_labels` only
+/// ever re-keys within one already-distinct dictionary, never re-keying a row
+/// from one old sub-dictionary's index into a content-interned entry shared
+/// with another sub-dictionary. `varied_corpus(500, 20)` (10,000 rows) forces
+/// that re-keying; a `seen`/`old_to_new` bug that swapped one series' label
+/// set onto another's rows would still satisfy the entry-count-only
+/// assertions in the other tests in this file but fail here.
 #[tokio::test]
 async fn compaction_preserves_every_rows_label_set() {
-    let series = varied_corpus(24, 60);
+    let series = varied_corpus(500, 20);
     let batches = run(&series).await;
 
     // Ground truth: series id -> its canonical label pairs. Independent of the
@@ -336,44 +341,32 @@ async fn compaction_preserves_every_rows_label_set() {
             checked += 1;
         }
     }
-    // 24 series x 60 samples, all distinct (series, ts), none deduped away.
-    assert_eq!(checked, 24 * 60, "every written sample must appear once");
+    // 500 series x 20 samples, all distinct (series, ts), none deduped away.
+    assert_eq!(checked, 500 * 20, "every written sample must appear once");
 }
 
-/// Client-boundary size, measured on the largest single raw per-flush
-/// `RsegDedupExec` output batch obtained from `run` (`provider.plan()` +
-/// `collect()`, bypassing `SessionContext` and the DataFusion physical
-/// optimizer). That per-flush batch is not a proxy for the wire unit a Flight
-/// client receives, it *is* that unit: `crates/ravel-sql/src/flight/stream.rs`
-/// feeds the execution stream's batches straight into
-/// `FlightDataEncoderBuilder` with no intervening batch-coalescing stage, and
-/// DataFusion's own `CoalesceBatches` physical-optimizer rule is only ever
-/// inserted by the `TopKRepartition` rule (`datafusion-physical-optimizer`'s
-/// `optimizer.rs` rule list has no other site that adds it), which does not
-/// apply to this scan -> merge -> dedup plan -- confirmed by dumping this
-/// plan's `displayable` output through a real `SessionContext` and finding no
-/// `CoalesceBatchesExec` in it. So there is no separate "client-facing
-/// coalesced batch" to go measure via the optimizer path; the largest
-/// per-flush batch already is it.
+/// Client-boundary size, measured on the raw per-flush `RsegDedupExec` output
+/// batch obtained from `run` (`provider.plan()` + `collect()`, bypassing
+/// `SessionContext`). That per-flush batch is not a proxy for the wire unit a
+/// Flight client receives, it *is* that unit: `src/flight/stream.rs` feeds
+/// the execution stream's batches straight into `FlightDataEncoderBuilder`
+/// with no intervening batch-coalescing stage of its own.
+/// `optimizer_path_batches_stay_client_sized` (below) covers the same bound
+/// on the `SessionContext`/optimizer path, whose own batch coalescing
+/// produces a different, larger batch shape.
 ///
 /// The corpus must have many distinct series with few samples each, not few
-/// series with many samples (the previous `varied_corpus(25, 2400)` shape):
-/// `RsegScanExec`/`SortPreservingMergeExec` output is globally sorted by
-/// `(series_id, ts)` regardless of segment or partition layout, so an
-/// 8192-row scan/merge window's distinct-series span is `window_rows /
-/// samples_per_series`, independent of how many segments or partitions wrote
-/// it. With 25 series x 2400 samples that span is ~3.4 series and even the
-/// unfixed path's per-window dictionary stays tiny (verified: reverting the
-/// `compact_labels` call in `dedup.rs::flush` left that shape green). This
-/// corpus's 1000 series x 20 samples gives a ~410-series span per window, and
-/// at that span an unfixed flush batch's labels dictionary is bloated exactly
-/// `rows_in_batch x distinct_in_window`-shaped (this holds whenever a
-/// flush's accumulated one-row slices originate from more than one upstream
-/// scan/merge batch, which happens whenever a flush's row budget crosses a
-/// scan-window boundary): 8192 rows x 411 distinct measured at 3,366,911
-/// dictionary entries pre-fix, exactly 411 post-fix. Do not shrink the series
-/// count or grow the per-series sample count back down: either narrows the
-/// per-window span and silently defuses the test again.
+/// series with many samples: `RsegScanExec`/`SortPreservingMergeExec` output
+/// is globally sorted by `(series_id, ts)` regardless of segment or partition
+/// layout, so an 8192-row scan/merge window's distinct-series span is
+/// `window_rows / samples_per_series`, independent of how many segments or
+/// partitions wrote it. This corpus's 1000 series x 20 samples gives a
+/// ~410-series span per window, and at that span an unfixed flush batch's
+/// labels dictionary is bloated exactly `rows_in_batch x distinct_in_window`-
+/// shaped: 8192 rows x 411 distinct measured at 3,366,911 dictionary entries
+/// pre-fix, exactly 411 post-fix. Do not shrink the series count or grow the
+/// per-series sample count back down: either narrows the per-window span and
+/// silently defuses the test again.
 #[tokio::test]
 async fn largest_ipc_body_fits_a_stock_flight_client() {
     const FOUR_MIB: usize = 4 * 1024 * 1024;
@@ -423,4 +416,67 @@ async fn largest_ipc_body_fits_a_stock_flight_client() {
         "largest single-batch IPC body {largest} bytes must fit the 4 MiB \
          Flight default"
     );
+}
+
+/// Every other test in this file drives `provider.plan()` straight into
+/// `collect()`, which never runs the DataFusion optimizer, so none of them
+/// exercise a batch shape wider than the dedup operator's own `FLUSH_ROWS`
+/// (1024) or the upstream scan window. A `SessionContext` query with a
+/// residual filter (`RavelTableProvider::supports_filters_pushdown` reports
+/// `Inexact` for every filter, so DataFusion always keeps one) makes
+/// DataFusion plan a real `FilterExec` above the dedup, which internally
+/// coalesces the filtered-through rows up to its own 8192-row batch size
+/// before emitting -- a wider, client-boundary-shaped batch the collect()
+/// path never produces. This must still satisfy the same
+/// `entries == distinct` bound.
+#[tokio::test]
+async fn optimizer_path_batches_stay_client_sized() {
+    let series = varied_corpus(1000, 20);
+    let provider = build_provider(&series).await;
+
+    let ctx = SessionContext::new();
+    ctx.register_udf(label_udf());
+    ctx.register_table("samples", Arc::new(provider))
+        .expect("register table");
+
+    // `host` is never empty, so this residual filter keeps every row while
+    // still forcing DataFusion to plan a real `FilterExec` above the dedup.
+    let df = ctx
+        .sql("SELECT * FROM samples WHERE label(labels, 'host') != ''")
+        .await
+        .expect("plan sql");
+    let physical = df.create_physical_plan().await.expect("physical plan");
+    let plan_str = displayable(physical.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str.contains("FilterExec"),
+        "expected a residual FilterExec above the dedup; got:\n{plan_str}"
+    );
+
+    let batches = collect(physical, Arc::new(TaskContext::default()))
+        .await
+        .expect("collect via optimizer path");
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        20_000,
+        "the residual filter must keep every row"
+    );
+    assert!(
+        batches.iter().any(|b| b.num_rows() > 1024),
+        "expected FilterExec's own batch coalescing to produce a batch \
+         larger than the dedup operator's FLUSH_ROWS, got max {}",
+        batches.iter().map(RecordBatch::num_rows).max().unwrap_or(0)
+    );
+
+    for batch in &batches {
+        let entries = dict_entry_count(batch);
+        let distinct = distinct_label_sets(batch);
+        assert_eq!(
+            entries,
+            distinct,
+            "dictionary must hold exactly the distinct series it references \
+             on the batch shape the optimizer path actually produces \
+             (rows={})",
+            batch.num_rows()
+        );
+    }
 }
