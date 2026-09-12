@@ -501,8 +501,8 @@ There is no separate capacity flag for the disk tier. Each tier is bounded by
 The fetcher cache and the catalog byte cache are two independent LRU caches.
 When `--cache-max-bytes` is **set**, both are bounded at that one value. When it
 is **unset**, the two derive separately from `MemTotal`: the fetcher cache at
-80% and the catalog byte cache at a smaller 5% (`25769803776` and `1610612736`
-on the 30 GB reference host), so deriving both at 80% cannot commit 160% of RAM.
+25% and the catalog byte cache at a smaller 5% (`8053063680` and `1610612736`
+on the 30 GB reference host), so the catalog cache does not double the fetcher's claim.
 Both ceilings are LRU caps, not reservations: neither pre-allocates, each holds
 only the bytes it has admitted, and the sum of the two cache ceilings and the
 SQL memory pools may exceed physical RAM by design (the caches fill only under a
@@ -1035,7 +1035,7 @@ A value of `0` in any of `--fetch-concurrency`, `--store-get-concurrency`,
 that flag, raised before any fetcher, engine, or SQL session exists.
 
 Two more settings are derived the same way: `--cache-max-bytes` (fetcher cache
-80% of MemTotal, catalog byte cache a separate 5% ceiling, 256 MiB each if
+25% of MemTotal, catalog byte cache a separate 5% ceiling, 256 MiB each if
 memory is unknown; an explicit flag bounds both at that one value) and
 `--gc-max-query-duration` (11 minutes). Memory is read from `/proc/meminfo`'s
 `MemTotal` on Linux and is "unknown" everywhere else; cores come from the
@@ -1061,7 +1061,7 @@ INFO performance default resolved setting="store_get_concurrency" value=32 sourc
 INFO performance default resolved setting="sql_partition_count" value=32 source="derived"
 INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
 INFO performance default resolved setting="max_segments" value=1000000 source="derived"
-INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=8053063680 source="derived"
 INFO performance default resolved setting="catalog_cache_max_bytes" value=1610612736 source="derived"
 INFO performance default resolved setting="sql_max_query_bytes" value=8053063680 source="derived"
 INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived"

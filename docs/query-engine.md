@@ -856,9 +856,11 @@ token-resolved via an explicit `min_commit_token`) and `max_segments` applies
 to the sealed count only; recent and token-resolved segments are exempt, so a
 hot tenant's open hour and a read-your-write query no longer 422 on count.
 Their cost is bounded instead by a per-query S3 request budget
-(`EngineConfig::max_s3_requests`, default 25,000), checked incrementally at
-the same points `max_bytes_scanned` already is, and reported as
-`RequestBudgetExceeded` (HTTP 422) when tripped.
+(`EngineConfig::max_s3_requests`, derived from the deployment's shard count
+and ingest flush cadence by `derive_max_s3_requests` rather than a flat
+constant -- ADR-0075 decisions 1-2; 48,200 at the default 4 shards and 500ms
+flush delay), checked incrementally at the same points `max_bytes_scanned`
+already is, and reported as `RequestBudgetExceeded` (HTTP 422) when tripped.
 
 `crates/ravel-query/src/segment_admission.rs` is the one seam both checks go
 through: `admit(&snapshot, &origins, &config)` for the sealed-count check,

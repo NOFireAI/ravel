@@ -413,3 +413,15 @@ and it is checked by tests over the real code (a version-2 and a version-0 recor
 of each kind refused with the typed error, version 1 accepted, and, at each
 enforcement layer, a version-2 compaction record neither swept nor resolved as
 version 1).
+
+## Amendment (2026-09-12): the Context's "does not exist today" primitive has since shipped
+
+Context (under "Prior format changes, in practice") says a page-grammar
+migration "needs a true decode-and-re-encode primitive that does not exist
+today." That was true when this ADR was written; supplying it is decision 5's
+own subject. The primitive has since landed as the shared rewrite primitive in
+`crates/ravel-maintain/src/rewrite.rs`, and RSEG's `build_parts` now decodes
+and re-encodes an input recorded below the current output version instead of
+only copying pages verbatim (see that module's doc comment). The Context
+sentence is left as written, a record of the gap this ADR closes; this note
+points forward to where it closed.
