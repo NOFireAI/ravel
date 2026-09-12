@@ -802,6 +802,66 @@ else
     bad "u: $workflow not found"
 fi
 
+# --- (v)-(x) issues #1353/#1439/#1638: check_bands' depth sentinel "-" ------
+# TLC's reported BFS depth overshoots by a level when workers race, while
+# distinct is worker-independent (measured on commit/smoke.cfg: distinct
+# stable at 426976 across -workers 2 and -workers auto, depth 25 at
+# -workers 2 but 25 or 26 at -workers auto). A bands.tsv row may set both
+# min_depth and max_depth to "-" to stop enforcing depth while distinct
+# stays exactly enforced; a row with only one side sentineled is malformed
+# and must fail closed, same as any other malformed row.
+echo "--- (v) check_bands: depth sentinel '-' '-' passes regardless of depth, distinct still enforced"
+vdir="$(mktemp -d)"
+varea_dir="$vdir/farea"
+mkdir -p "$varea_dir"
+printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\nsmoke.cfg\t100\t100\t-\t-\n' \
+    > "$varea_dir/bands.tsv"
+orig_formal_dir5="$FORMAL_DIR"
+FORMAL_DIR="$vdir"
+vout="$(check_bands farea smoke.cfg 100 25 2>&1)"; vcode=$?
+if [ "$vcode" -eq 0 ]; then ok; else bad "v1: expected exit 0 with depth=25 under a sentinel band, got $vcode; out: $vout"; fi
+vout2="$(check_bands farea smoke.cfg 100 26 2>&1)"; vcode2=$?
+if [ "$vcode2" -eq 0 ]; then ok; else bad "v2: expected exit 0 with depth=26 (the exact varying figure that broke commit/smoke.cfg) under a sentinel band, got $vcode2; out: $vout2"; fi
+if printf '%s' "$vout2" | grep -qF "depth=26 (not enforced, band is '-')"; then
+    ok
+else
+    bad "v2: expected a 'not enforced' note naming depth=26; out: $vout2"
+fi
+# distinct must still be enforced even though depth is sentineled.
+vout3="$(check_bands farea smoke.cfg 999 25 2>&1)"; vcode3=$?
+if [ "$vcode3" -ne 0 ]; then ok; else bad "v3: expected nonzero exit on distinct=999 outside [100,100], got 0; out: $vout3"; fi
+FORMAL_DIR="$orig_formal_dir5"
+rm -rf "$vdir"
+
+echo "--- (w) check_bands: mismatched depth sentinel (one side '-', other numeric) fails closed"
+wdir="$(mktemp -d)"
+warea_dir="$wdir/farea"
+mkdir -p "$warea_dir"
+printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\nsmoke.cfg\t100\t100\t-\t25\n' \
+    > "$warea_dir/bands.tsv"
+FORMAL_DIR="$wdir"
+wout="$(check_bands farea smoke.cfg 100 25 2>&1)"; wcode=$?
+if [ "$wcode" -ne 0 ]; then ok; else bad "w: expected nonzero exit on a mismatched sentinel row, got 0; out: $wout"; fi
+if printf '%s' "$wout" | grep -qF "min_depth and max_depth must both be '-' or both be integers"; then
+    ok
+else
+    bad "w: expected the mismatched-sentinel malformed-row message; out: $wout"
+fi
+FORMAL_DIR="$orig_formal_dir5"
+rm -rf "$wdir"
+
+echo "--- (x) check_bands: a non-numeric, non-sentinel depth bound still fails closed"
+xdir="$(mktemp -d)"
+xarea_dir="$xdir/farea"
+mkdir -p "$xarea_dir"
+printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\nsmoke.cfg\t100\t100\tabc\t25\n' \
+    > "$xarea_dir/bands.tsv"
+FORMAL_DIR="$xdir"
+xout="$(check_bands farea smoke.cfg 100 25 2>&1)"; xcode=$?
+if [ "$xcode" -ne 0 ]; then ok; else bad "x: expected nonzero exit on a non-numeric, non-sentinel depth bound, got 0; out: $xout"; fi
+FORMAL_DIR="$orig_formal_dir5"
+rm -rf "$xdir"
+
 rm -f "$LIB_SRC"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

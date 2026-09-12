@@ -301,6 +301,17 @@ log_field() {
 # A missing bands.tsv, or a bands.tsv with no row for this cfg, is not an error
 # (bands are opt-in). A row that exists is enforced: the figure must be present
 # (not "-") and inside [min,max]. Returns non-zero on any violation.
+#
+# min_depth/max_depth may instead both be the literal sentinel "-", meaning
+# depth is not enforced for this row: TLC's reported BFS search depth can
+# overshoot the true diameter by a level when multiple workers race (issues
+# #1353, #1439, #1638), so a row measured and enforced under a parallel
+# `-workers auto` configuration cannot pin an exact depth the way it can pin
+# distinct, which is worker-independent. One sentinel, not two: min_depth and
+# max_depth must agree (both "-" or both integers) so a half-specified range
+# fails closed as malformed rather than silently comparing against an empty
+# bound. min_distinct/max_distinct take no sentinel; distinct stays exactly
+# enforced.
 check_bands() {
     local area="$1" cfg_name="$2" distinct="$3" depth="$4"
     local bands="$FORMAL_DIR/$area/bands.tsv"
@@ -320,13 +331,28 @@ check_bands() {
     mindepth="$(echo "$row" | cut -f4)"
     maxdepth="$(echo "$row" | cut -f5)"
     local f
-    for f in "$mind" "$maxd" "$mindepth" "$maxdepth"; do
+    for f in "$mind" "$maxd"; do
         case "$f" in
             ''|*[!0-9]*)
-                note "$area bands: malformed row for $cfg_name (need cfg, min_distinct, max_distinct, min_depth, max_depth as integers): '$row'"
+                note "$area bands: malformed row for $cfg_name (need min_distinct, max_distinct as integers): '$row'"
                 return 1 ;;
         esac
     done
+    local depth_enforced=1
+    if [ "$mindepth" = '-' ] && [ "$maxdepth" = '-' ]; then
+        depth_enforced=0
+    elif [ "$mindepth" = '-' ] || [ "$maxdepth" = '-' ]; then
+        note "$area bands: malformed row for $cfg_name (min_depth and max_depth must both be '-' or both be integers): '$row'"
+        return 1
+    else
+        for f in "$mindepth" "$maxdepth"; do
+            case "$f" in
+                ''|*[!0-9]*)
+                    note "$area bands: malformed row for $cfg_name (need min_depth, max_depth as integers or '-'): '$row'"
+                    return 1 ;;
+            esac
+        done
+    fi
     local rc=0
     case "$distinct" in
         ''|*[!0-9]*)
@@ -336,14 +362,18 @@ check_bands() {
                 note "$area bands: $cfg_name distinct=$distinct outside [$mind,$maxd]"; rc=1
             fi ;;
     esac
-    case "$depth" in
-        ''|*[!0-9]*)
-            note "$area bands: $cfg_name depth figure missing or non-numeric ('$depth')"; rc=1 ;;
-        *)
-            if [ "$depth" -lt "$mindepth" ] || [ "$depth" -gt "$maxdepth" ]; then
-                note "$area bands: $cfg_name depth=$depth outside [$mindepth,$maxdepth]"; rc=1
-            fi ;;
-    esac
+    if [ "$depth_enforced" -eq 0 ]; then
+        note "$area bands: $cfg_name depth=$depth (not enforced, band is '-')"
+    else
+        case "$depth" in
+            ''|*[!0-9]*)
+                note "$area bands: $cfg_name depth figure missing or non-numeric ('$depth')"; rc=1 ;;
+            *)
+                if [ "$depth" -lt "$mindepth" ] || [ "$depth" -gt "$maxdepth" ]; then
+                    note "$area bands: $cfg_name depth=$depth outside [$mindepth,$maxdepth]"; rc=1
+                fi ;;
+        esac
+    fi
     return $rc
 }
 
