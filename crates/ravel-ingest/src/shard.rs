@@ -13,7 +13,8 @@
 //! only its own task on the permit, never the actor, so every co-resident
 //! tenant's age tick and channel drain keep running. Backpressure at the bound
 //! propagates through the ADR-0069 byte budget (charges held until a flush
-//! completes), not through parking the actor. The permit wait is measured as
+//! completes), not through parking the actor; ADR-1642 supersedes ADR-0067
+//! decision 2 with that. The permit wait is measured as
 //! its own span (`flush_permit_wait_ns`, issue #865) inside the task. The
 //! adaptive age trigger (ADR-0067
 //! decision 3) is `age_threshold_ns`/`adaptive_age_threshold_ns` below.
@@ -866,16 +867,33 @@ fn handle_flush_join_result(shard: u32, result: Result<(), tokio::task::JoinErro
     }
 }
 
-/// RAII in-flight-flush accounting: the flush task increments the gauge as its
-/// first act (issue #1292: before it waits for a permit, so a spawned task
-/// parked on the bound still counts as in flight), and this guard's `Drop`
-/// decrements it when the task ends, including on panic. Moved into the spawned
-/// task itself (not held by the actor) so the decrement fires exactly once,
-/// whenever that task's future is finally dropped, with no separate bookkeeping
-/// the actor could get out of sync with.
+/// RAII in-flight-flush accounting. [`InFlightFlushGuard::new`] is the only way
+/// to construct one and it performs the `+1`; `Drop` performs the `-1`. Pairing
+/// them in one value is what keeps the gauge unbiased: an increment written as a
+/// separate statement inside the spawned task never runs for a task dropped
+/// before its first poll (a `JoinSet` dropped with tasks still queued, when the
+/// actor unwinds out of `handle_flush_join_result` or the router drops the
+/// actor), while dropping that task's future still fires the `Drop`. The gauge
+/// clamps at 0 on read so nothing underflows, but the negative bias persists in
+/// the map, and the router hands the same [`IngestMetrics`] to the respawned
+/// actor for that shard index, so a shard biased to -2 would report 0 in flight
+/// while two real flushes ran.
+///
+/// The guard is constructed on the actor, in the same non-awaiting region that
+/// moves the buffer into the flush task, so the gauge counts a flush from the
+/// moment its memory leaves the actor: a task still waiting for a permit holds
+/// its buffer and its ADR-0069 byte charge exactly as an executing one does, and
+/// that memory is what ADR-0067's in-flight consequence is about.
 struct InFlightFlushGuard {
     metrics: Arc<IngestMetrics>,
     shard: u32,
+}
+
+impl InFlightFlushGuard {
+    fn new(metrics: Arc<IngestMetrics>, shard: u32) -> Self {
+        metrics.record_inflight_flush_delta(shard, 1);
+        InFlightFlushGuard { metrics, shard }
+    }
 }
 
 impl Drop for InFlightFlushGuard {
@@ -1551,12 +1569,15 @@ impl ShardActor {
         // the ADR-0069 global byte budget: each flush's `charges` are held until
         // it completes, so a shard wedged on a throttled prefix drains the budget
         // and `try_charge` sheds at the ceiling, rather than parking the actor and
-        // filling the bounded channel. See the amendment note for ADR-0067
-        // decision 2 in the issue.
-        let guard = InFlightFlushGuard {
-            metrics: Arc::clone(&self.metrics),
-            shard: self.shard,
-        };
+        // filling the bounded channel. ADR-1642 supersedes ADR-0067 decision 2
+        // with exactly this.
+        //
+        // The in-flight gauge is incremented here, by the guard's constructor,
+        // and decremented by its `Drop` inside the task: see
+        // [`InFlightFlushGuard`] for why the two must be one value. A flush
+        // still waiting for a permit counts as in flight, because it is holding
+        // a flush window of memory.
+        let guard = InFlightFlushGuard::new(Arc::clone(&self.metrics), self.shard);
         let semaphore = Arc::clone(&self.semaphore);
         let ctx = Arc::clone(&self.ctx);
         // Per-shard skew (issue #865): time the whole flush, which runs here off
@@ -1569,11 +1590,6 @@ impl ShardActor {
         let metrics = Arc::clone(&self.metrics);
         let shard = self.shard;
         self.flushes.spawn(async move {
-            // Count this flush as in flight the moment its task starts, before it
-            // waits for a permit: `in_flight_flushes_by_shard` is "spawned but not
-            // finished", and at the bound a task parked on the permit is exactly
-            // that. `guard`'s Drop decrements it when the task ends.
-            metrics.record_inflight_flush_delta(shard, 1);
             let _guard = guard;
             // Wait for a flush permit here, off the actor. At the bound this task
             // parks; the actor does not. The wait is this shard's
@@ -1897,5 +1913,46 @@ mod buffer_accounting_tests {
             .expect("same series again");
         assert_eq!(repeat, 16, "a repeat sighting charges the sample only");
         assert_eq!(first, 16 + 10 * (size_of::<Label>() + 3));
+    }
+}
+
+#[cfg(test)]
+mod inflight_guard_tests {
+    use super::*;
+
+    /// A flush task spawned and then dropped before its first poll has to leave
+    /// the gauge exactly where it found it. `JoinSet`'s `Drop` does that to
+    /// every queued-but-unpolled task, which happens whenever the actor unwinds
+    /// out of `handle_flush_join_result` or the router drops the actor.
+    ///
+    /// This is what forces the `+1` and the `-1` to live in one value: an
+    /// increment written as the spawned task's first statement never runs for
+    /// such a task, while dropping the task's future still fires the guard's
+    /// `Drop`. The public reader clamps at 0, so the resulting negative bias is
+    /// invisible there and persists across an actor respawn, which shares the
+    /// same [`IngestMetrics`] for the shard index. The assertion reads the raw
+    /// signed count for that reason.
+    #[test]
+    fn a_flush_task_dropped_before_its_first_poll_leaves_the_gauge_balanced() {
+        let metrics = Arc::new(IngestMetrics::new(1));
+        assert_eq!(metrics.in_flight_flushes_signed(0), 0);
+
+        let guard = InFlightFlushGuard::new(Arc::clone(&metrics), 0);
+        assert_eq!(
+            metrics.in_flight_flushes_signed(0),
+            1,
+            "the buffer has left the actor, so the flush counts as in flight"
+        );
+
+        let flush_task = async move {
+            let _guard = guard;
+        };
+        drop(flush_task);
+
+        assert_eq!(
+            metrics.in_flight_flushes_signed(0),
+            0,
+            "the guard's own Drop ran, so the pair balanced"
+        );
     }
 }

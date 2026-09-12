@@ -9,10 +9,15 @@
 //! waiters and its ADR-0069 byte charges) into a task spawned onto
 //! [`LogFlushCtx::run_flush`], then keeps draining its channel.
 //! `max_inflight_flushes` (ADR-0067 decision 2) bounds how many such tasks may
-//! run at once per shard via a semaphore acquired before spawning; at the
-//! bound, the acquire blocks the flush trigger (and therefore the actor's
-//! ability to pull its next message), which is exactly where backpressure is
-//! meant to propagate. This ports ADR-0067 decisions 1 and 2 from the metrics
+//! run at once per shard via a semaphore acquired INSIDE the spawned task
+//! (issue #1641): the actor spawns and returns, so a stalled flush -- a tenant
+//! whose S3 key prefix is being throttled -- parks only its own task on the
+//! permit, never the actor, so every co-resident tenant's age tick and channel
+//! drain keep running. Backpressure at the bound propagates through the
+//! ADR-0069 byte budget (charges held until a flush completes), not through
+//! parking the actor; ADR-1642 supersedes ADR-0067 decision 2 with that. The
+//! permit wait is measured as its own span (`flush_permit_wait_ns`, issue #865)
+//! inside the task. This ports ADR-0067 decisions 1 and 2 from the metrics
 //! [`crate::shard`]; the adaptive flush delay (decision 3) is metrics-only and
 //! deliberately absent here (the age trigger stays the fixed
 //! `max_flush_delay`/`max_flush_delay_idle` in [`LogShardActor::age_threshold_ns`]).
@@ -910,14 +915,34 @@ fn handle_flush_join_result(shard: u32, result: Result<(), tokio::task::JoinErro
     }
 }
 
-/// RAII in-flight-flush accounting: incremented when a flush task is spawned,
-/// decremented on `Drop` when it ends, including on panic. Moved into the
-/// spawned task itself (not held by the actor) so the decrement fires exactly
-/// once, whenever that task's future is finally dropped, with no separate
-/// bookkeeping the actor could get out of sync with.
+/// RAII in-flight-flush accounting, the log-pipeline counterpart of
+/// [`crate::shard`]'s guard. [`InFlightFlushGuard::new`] is the only way to
+/// construct one and it performs the `+1`; `Drop` performs the `-1`. Pairing
+/// them in one value is what keeps the gauge unbiased: an increment written as
+/// a separate statement inside the spawned task never runs for a task dropped
+/// before its first poll (a `JoinSet` dropped with tasks still queued, when the
+/// actor unwinds out of `handle_flush_join_result` or the router drops the
+/// actor), while dropping that task's future still fires the `Drop`. The gauge
+/// clamps at 0 on read so nothing underflows, but the negative bias persists in
+/// the map, and the router hands the same [`LogIngestMetrics`] to the respawned
+/// actor for that shard index, so a shard biased to -2 would report 0 in flight
+/// while two real flushes ran.
+///
+/// The guard is constructed on the actor, in the same non-awaiting region that
+/// moves the buffer into the flush task, so the gauge counts a flush from the
+/// moment its memory leaves the actor: a task still waiting for a permit holds
+/// its buffer and its ADR-0069 byte charge exactly as an executing one does, and
+/// that memory is what ADR-0067's in-flight consequence is about.
 struct InFlightFlushGuard {
     metrics: Arc<LogIngestMetrics>,
     shard: u32,
+}
+
+impl InFlightFlushGuard {
+    fn new(metrics: Arc<LogIngestMetrics>, shard: u32) -> Self {
+        metrics.record_inflight_flush_delta(shard, 1);
+        InFlightFlushGuard { metrics, shard }
+    }
 }
 
 impl Drop for InFlightFlushGuard {
@@ -1027,32 +1052,24 @@ impl LogShardActor {
                         Some(LogShardMsg::Write { tenant, records, ack, charge }) => {
                             // Per-shard skew (issue #865), identical bracketing
                             // to `crate::shard::ShardActor::run`: time the
-                            // serial on-actor section only. `handle_write`
-                            // returns once the flush task is spawned, so this
-                            // delta excludes the flush -- but NOT the
-                            // `max_inflight_flushes` acquire that precedes the
-                            // spawn, which at the bound parks here for a prior
-                            // flush's remaining duration. That wait is
-                            // backpressure, not actor work, and is already
-                            // counted (once) as `flush_permit_wait_ns`, so
-                            // subtract it rather than let it read as "the actor
-                            // is busy" whenever flushing is the real bottleneck.
+                            // serial on-actor section only. The flush this may
+                            // open runs in a spawned task, timed off-actor, and
+                            // the `max_inflight_flushes` acquire now parks that
+                            // task rather than the actor (issue #1641), so there
+                            // is no on-actor permit wait left to exclude: this
+                            // delta is pure merge-and-pin work.
                             let started_ns = self.clock.now_ns();
-                            let permit_wait_ns =
-                                self.handle_write(tenant, records, ack, charge).await;
-                            let elapsed_ns =
+                            self.handle_write(tenant, records, ack, charge).await;
+                            let on_actor_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
-                            let on_actor_ns = elapsed_ns.saturating_sub(permit_wait_ns);
                             self.metrics.record_shard_processed(self.shard, on_actor_ns);
                         }
                         Some(LogShardMsg::WriteColumnar { tenant, batch, ack, charge }) => {
                             let started_ns = self.clock.now_ns();
-                            let permit_wait_ns = self
-                                .handle_write_columnar(tenant, *batch, ack, charge)
+                            self.handle_write_columnar(tenant, *batch, ack, charge)
                                 .await;
-                            let elapsed_ns =
+                            let on_actor_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
-                            let on_actor_ns = elapsed_ns.saturating_sub(permit_wait_ns);
                             self.metrics.record_shard_processed(self.shard, on_actor_ns);
                         }
                         Some(LogShardMsg::FlushNow { done }) => {
@@ -1103,20 +1120,20 @@ impl LogShardActor {
         }
     }
 
-    /// Returns the injected-`Clock` nanoseconds this call spent parked on the
-    /// `max_inflight_flushes` semaphore (0 when it opened no flush), so the
-    /// actor loop can subtract that wait from the `on_actor_ns` it reports
-    /// (issue #865).
+    /// Buffers `records` for `tenant` and opens a size-triggered flush if the
+    /// buffer crossed its threshold. Everything here runs on the actor and
+    /// returns once the flush task is spawned; the `max_inflight_flushes`
+    /// acquire happens inside that task (ADR-1642).
     async fn handle_write(
         &mut self,
         tenant: TenantId,
         records: Vec<NormalizedLogRecord>,
         ack: Option<LogAck>,
         charge: Option<Arc<IngestByteCharge>>,
-    ) -> u64 {
+    ) {
         if records.is_empty() && ack.is_none() {
             // Nothing buffered: dropping `charge` here refunds its bytes.
-            return 0;
+            return;
         }
         let arrival_ns = self.clock.now_ns();
         let records_len = records.len() as u64;
@@ -1139,7 +1156,7 @@ impl LogShardActor {
                 if let Some(ack) = ack {
                     let _ = ack.send(Err(err));
                 }
-                return 0;
+                return;
             }
         };
         #[cfg(feature = "stage-timing")]
@@ -1168,9 +1185,8 @@ impl LogShardActor {
             })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
         }
-        0
     }
 
     /// The columnar counterpart of [`Self::handle_write`] (ADR-0109 decision 5):
@@ -1178,18 +1194,17 @@ impl LogShardActor {
     /// refusing fail-loud if the buffer already holds row-major records. The
     /// flush-trigger accounting (`flush_est_bytes >= target_bytes`, or
     /// `est_bytes` past the memory backstop), the charge and waiter handling,
-    /// and the size-flush path are identical to the row path, as is the
-    /// flush-permit wait it returns (see [`Self::handle_write`]).
+    /// and the size-flush path are identical to the row path.
     async fn handle_write_columnar(
         &mut self,
         tenant: TenantId,
         batch: ColumnarLogBatch,
         ack: Option<LogAck>,
         charge: Option<Arc<IngestByteCharge>>,
-    ) -> u64 {
+    ) {
         if batch.is_empty() && ack.is_none() {
             // Nothing buffered: dropping `charge` here refunds its bytes.
-            return 0;
+            return;
         }
         let arrival_ns = self.clock.now_ns();
         let records_len = batch.num_rows as u64;
@@ -1209,7 +1224,7 @@ impl LogShardActor {
                 if let Some(ack) = ack {
                     let _ = ack.send(Err(err));
                 }
-                return 0;
+                return;
             }
         };
         #[cfg(feature = "stage-timing")]
@@ -1236,9 +1251,8 @@ impl LogShardActor {
             })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
         }
-        0
     }
 
     /// A buffer with a strict-mode waiter, or one whose flush would write at
@@ -1274,10 +1288,7 @@ impl LogShardActor {
             .collect();
         for tenant in due {
             if let Some(buf) = self.tenants.remove(&tenant) {
-                // The permit wait is reported by `flush_tenant` itself; there is
-                // no `on_actor_ns` span to subtract it from here, because an age
-                // tick is not a `Write` message.
-                let _permit_wait_ns = self.flush_tenant(tenant, buf, FlushTrigger::Age).await;
+                self.flush_tenant(tenant, buf, FlushTrigger::Age).await;
             }
         }
     }
@@ -1314,7 +1325,7 @@ impl LogShardActor {
             let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
             for tenant in tenants {
                 if let Some(buf) = self.tenants.remove(&tenant) {
-                    let _permit_wait_ns = self.flush_tenant(tenant, buf, trigger).await;
+                    self.flush_tenant(tenant, buf, trigger).await;
                 }
             }
             passes += 1;
@@ -1428,26 +1439,22 @@ impl LogShardActor {
     /// Pins `buf`'s flush identity, then moves `buf`'s payload, waiters, and
     /// ADR-0069 charges into a task spawned onto [`LogFlushCtx::run_flush`]
     /// (ADR-0067 decision 1), mirroring [`crate::shard::ShardActor::flush_tenant`].
-    /// Everything up to and including the semaphore acquire runs here, on the
-    /// actor; nothing after it does, so a slow encode or a slow PUT never blocks
-    /// the actor from processing its next message once a permit is free (true
-    /// even at `max_inflight_flushes == 1`: the actor still returns from this
-    /// call, and therefore drains its channel, the moment the task is spawned).
+    /// Everything up to the spawn runs here, on the actor; nothing after it
+    /// does. The `max_inflight_flushes` acquire is inside the spawned task
+    /// (ADR-1642), so neither a slow encode, a slow PUT, nor a wait for a permit
+    /// blocks the actor from processing its next message. True even at
+    /// `max_inflight_flushes == 1`: the actor returns from this call, and
+    /// therefore drains its channel and keeps ticking its age trigger, the
+    /// moment the task is spawned.
     ///
-    /// An empty buffer never reaches the semaphore or a spawned task: there is
-    /// nothing to encode, and a flush identity pinned for nothing would burn a
-    /// `seq` for no object.
-    ///
-    /// Returns the injected-`Clock` nanoseconds spent parked on the
-    /// `max_inflight_flushes` semaphore (0 on every path that returns before
-    /// reaching it), which the caller subtracts from its own `on_actor_ns`
-    /// (issue #865).
+    /// An empty buffer never reaches a spawned task: there is nothing to encode,
+    /// and a flush identity pinned for nothing would burn a `seq` for no object.
     async fn flush_tenant(
         &mut self,
         tenant: TenantId,
         mut buf: LogTenantBuf,
         trigger: FlushTrigger,
-    ) -> u64 {
+    ) {
         // `waiters` is empty on the record-less path below by construction: the
         // log router mints a strict-mode ack only for a shard that actually
         // received records (`by_shard`/the columnar partition only holds shards
@@ -1469,7 +1476,7 @@ impl LogShardActor {
         if is_empty {
             drop(buf.charges);
             debug_assert!(buf.waiters.is_empty());
-            return 0;
+            return;
         }
         let raw_ns = self.clock.now_ns();
         // The flush-open stamp is decided before the buffer is consumed and before
@@ -1485,7 +1492,7 @@ impl LogShardActor {
                 self.metrics.record_abandoned_input_rejected();
                 self.ctx
                     .ack_waiters(buf.waiters, Err(LogWriteError::SegmentBuild(msg)));
-                return 0;
+                return;
             }
             Err(FlushClockError::RegressionRefused(msg)) => {
                 // Already counted as `clock_regressions_refused` inside the
@@ -1519,7 +1526,7 @@ impl LogShardActor {
                 self.ctx
                     .ack_waiters(waiters, Err(LogWriteError::Abandoned(msg)));
                 self.tenants.insert(tenant, buf);
-                return 0;
+                return;
             }
         };
         let tenant_hash = tenant.hash();
@@ -1553,7 +1560,7 @@ impl LogShardActor {
                         "empty log buffer reached the flush payload stage".to_string(),
                     )),
                 );
-                return 0;
+                return;
             }
         };
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
@@ -1564,7 +1571,7 @@ impl LogShardActor {
                 self.metrics.record_abandoned_input_rejected();
                 self.ctx
                     .ack_waiters(waiters, Err(LogWriteError::SegmentBuild(msg)));
-                return 0;
+                return;
             }
         };
         // Last, after every arm that can refuse this flush: a `seq` is a flush
@@ -1603,61 +1610,63 @@ impl LogShardActor {
             declared_stats,
         };
 
-        // ADR-0067 decision 2: the only place a flush trigger blocks. At
-        // `max_inflight_flushes` already-spawned tasks, this await parks until
-        // one ends and releases its permit; because `flush_tenant` is itself
-        // awaited from `handle_write`/`flush_aged`/`flush_all`, that park keeps
-        // the actor from pulling its next channel message, exactly the
-        // backpressure path the bounded mpsc already relies on.
+        // ADR-0067 decision 2, amended for tenant isolation (issue #1641): the
+        // `max_inflight_flushes` acquire runs INSIDE the spawned flush task, not
+        // on the actor. Acquiring on the actor parked the whole `select!` loop at
+        // the bound -- it stopped pulling channel messages, stopped the age-flush
+        // tick, and stopped reaping finished flushes -- so one tenant whose
+        // key prefix was throttled (S3 `503 SlowDown` is per-prefix) stalled
+        // every co-resident tenant on the shard, including their age triggers.
+        // Handing the acquire to the task keeps the actor draining and ticking no
+        // matter how long a flush is stalled. Backpressure now propagates through
+        // the ADR-0069 global byte budget: each flush's `charges` are held until
+        // it completes, so a shard wedged on a throttled prefix drains the budget
+        // and `try_charge` sheds at the ceiling, rather than parking the actor and
+        // filling the bounded channel. ADR-1642 supersedes ADR-0067 decision 2
+        // with exactly this, for all three ingest pipelines.
         //
-        // Per-shard skew (issue #865), same bracketing as
-        // `crate::shard::ShardActor::flush_tenant`: that park is its own span,
-        // and it belongs to neither the actor's merge-and-pin work nor the
-        // spawned flush's own span. What elapses here is a PRIOR flush's
-        // remaining duration, so folding it into `on_actor_ns` would report an
-        // actor bottleneck at exactly the moment flushing is the bottleneck.
-        // This is the figure that says whether `max_inflight_flushes` is the
-        // binding window on a bulk load (issue #800): it stays at zero unless a
-        // shard is actually asked for a second concurrent flush.
-        let permit_wait_start_ns = self.clock.now_ns();
-        let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => panic!(
-                "ravel-ingest: log flush semaphore closed unexpectedly on shard {}",
-                self.shard
-            ),
-        };
-        let permit_wait_ns = self
-            .clock
-            .now_ns()
-            .saturating_sub(permit_wait_start_ns)
-            .max(0) as u64;
-        self.metrics
-            .record_shard_flush_permit_wait_ns(self.shard, permit_wait_ns);
-        self.metrics.record_inflight_flush_delta(self.shard, 1);
-        let guard = InFlightFlushGuard {
-            metrics: Arc::clone(&self.metrics),
-            shard: self.shard,
-        };
+        // The in-flight gauge is incremented here, by the guard's constructor,
+        // and decremented by its `Drop` inside the task: see
+        // [`InFlightFlushGuard`] for why the two must be one value. A flush
+        // still waiting for a permit counts as in flight, because it is holding
+        // a flush window of memory.
+        let guard = InFlightFlushGuard::new(Arc::clone(&self.metrics), self.shard);
+        let semaphore = Arc::clone(&self.semaphore);
         let ctx = Arc::clone(&self.ctx);
         // Per-shard skew (issue #865): time the whole flush, which runs here off
         // the actor (ADR-0067). Bracketing `run_flush` from outside, rather than
         // inside it, keeps the measurement out of the pinned-identity path and
         // captures every exit `run_flush` takes, abandonment included. The
-        // bracket opens inside the spawned task, with the permit already held,
-        // so the wait for that permit is not counted twice.
+        // permit wait is bracketed separately, before the flush's own span, so
+        // the two never overlap.
         let clock = Arc::clone(&self.clock);
         let metrics = Arc::clone(&self.metrics);
         let shard = self.shard;
         self.flushes.spawn(async move {
-            let _permit = permit;
             let _guard = guard;
+            // Wait for a flush permit here, off the actor. At the bound this task
+            // parks; the actor does not. The wait is this shard's
+            // `flush_permit_wait_ns` (issue #865), measured on the injected clock
+            // and no longer subtracted from any on-actor figure because it is no
+            // longer on-actor time. It is the figure that says whether
+            // `max_inflight_flushes` is the binding window on a bulk load (issue
+            // #800): it stays at zero unless a shard is actually asked for a
+            // second concurrent flush.
+            let permit_wait_start_ns = clock.now_ns();
+            let permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    panic!("ravel-ingest: log flush semaphore closed unexpectedly on shard {shard}")
+                }
+            };
+            let permit_wait_ns = clock.now_ns().saturating_sub(permit_wait_start_ns).max(0) as u64;
+            metrics.record_shard_flush_permit_wait_ns(shard, permit_wait_ns);
+            let _permit = permit;
             let started_ns = clock.now_ns();
             ctx.run_flush(pinned).await;
             let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
             metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });
-        permit_wait_ns
     }
 }
 
@@ -3229,5 +3238,40 @@ mod tests {
         assert_eq!(snap.acks_ok, 1);
         assert_eq!(snap.stream_id_collisions, 0);
         h.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod inflight_guard_tests {
+    use super::*;
+
+    /// The log-pipeline counterpart of
+    /// `crate::shard::inflight_guard_tests::a_flush_task_dropped_before_its_first_poll_leaves_the_gauge_balanced`.
+    /// A flush task spawned and then dropped before its first poll has to leave
+    /// the gauge exactly where it found it; pairing the `+1` and the `-1` in one
+    /// value is what makes that hold, and the public reader's clamp at 0 is why
+    /// this asserts on the raw signed count.
+    #[test]
+    fn a_flush_task_dropped_before_its_first_poll_leaves_the_gauge_balanced() {
+        let metrics = Arc::new(LogIngestMetrics::new(1));
+        assert_eq!(metrics.in_flight_flushes_signed(0), 0);
+
+        let guard = InFlightFlushGuard::new(Arc::clone(&metrics), 0);
+        assert_eq!(
+            metrics.in_flight_flushes_signed(0),
+            1,
+            "the buffer has left the actor, so the flush counts as in flight"
+        );
+
+        let flush_task = async move {
+            let _guard = guard;
+        };
+        drop(flush_task);
+
+        assert_eq!(
+            metrics.in_flight_flushes_signed(0),
+            0,
+            "the guard's own Drop ran, so the pair balanced"
+        );
     }
 }

@@ -45,10 +45,13 @@ ShardMsg::Write { tenant, points: Vec<NormalizedPoint>, ack: Option<oneshot::Sen
 Channel: `tokio::sync::mpsc` bounded (default 256 messages per shard).
 `send` awaiting on a full channel IS a backpressure mechanism; the gateway
 holds the request open while it awaits. A stalled flush no longer fills this
-channel, though: the actor never parks on the flush permit (see "Shard actor"),
-so the channel fills only when the actor genuinely cannot keep up with merge
-work. Backpressure from a shard wedged on a throttled key prefix instead
-propagates through the ADR-0069 byte budget, which sheds at its ceiling.
+channel, though: in all three pipelines the actor never parks on the flush
+permit (ADR-1642, see "Shard actor"), so the channel fills only when the actor
+is busy in work it does itself. That is merge and pin, plus the drains that
+have to await in-flight flushes before they can answer: an explicit flush-all,
+shutdown, and channel close. Backpressure from a shard wedged on a throttled
+key prefix instead propagates through the ADR-0069 byte budget, which sheds at
+its ceiling.
 
 What actually bounds gateway memory is a process-wide in-flight
 ingest-request ceiling, `--max-inflight-ingest-requests`
@@ -349,20 +352,24 @@ That makes `max_inflight_flushes` the per-shard flush **isolation** control,
 not only a memory/latency knob. At the default **1** on `ravel-server`, one
 tenant's stalled flush holds the shard's only permit, so every co-resident
 tenant's flush queues behind it until the stall clears or its
-`max_flush_lifetime` abandons it (their writes are still accepted and their
-age triggers still fire -- the actor is alive -- but no second flush can run
-in the meantime). Raising it gives healthy tenants a permit to flush on while
-one prefix is throttled, at the cost of bounded extra per-shard memory
-(buffers held open by the extra in-flight flushes, up to
-`max_inflight_flushes - 1` flush windows' worth), all held under the ADR-0069
-byte budget. This is the lever for cross-tenant flush isolation on a shard;
+`max_flush_lifetime` abandons it. What queues is a spawned task, not the
+actor: the co-resident tenants' writes are still accepted, their age triggers
+still fire, and each trigger hands its buffer off and spawns another waiting
+flush. So the queue grows with the stall, and every flush in it holds a whole
+flush window and its ADR-0069 byte charge from the moment it left the actor,
+which is what the budget sheds against. Strict-mode writers behind those
+queued flushes stay unacked for the duration; buffered-mode writers were acked
+at enqueue and their data stays invisible to queries until the flush commits.
+Raising the bound gives healthy tenants a permit to flush on while one prefix
+is throttled, at the cost of more concurrent PUTs and more encode memory in
+flight. This is the lever for cross-tenant flush isolation on a shard;
 raising `--shards` is not (a strict write fans out to every shard its series
 hash to, so a wider shard set only raises the chance a write touches the
 throttled shard), and per-replica ingest affinity is not
 (docs/guides/ingest-affinity.md: within a replica every tenant still hashes
 across all that replica's shards). The two defaults differ because the two
 callers have different memory owners: **1** on `ravel-server`
-(`--max-inflight-flushes`, ADR-0067 decision 2 as amended for isolation),
+(`--max-inflight-flushes`, ADR-0067 decision 2 as superseded by ADR-1642),
 where nothing upstream caps the work a shard is offered; and **4** on
 `ravel-cli load` (`--max-inflight-flushes`, ADR-0807 as amended), where
 `--pipeline-depth` already caps the outstanding batches, so the flush window
@@ -458,7 +465,9 @@ same `IngestConfig` knobs, the same flush triggers, the same pinned
 writer identity, the same commit sequence, and the same pipelined flush:
 ADR-0067 decisions 1 and 2 apply here too, so a flush runs in a spawned
 task bounded by `max_inflight_flushes` and shutdown joins every in-flight
-flush before the actor completes) and diverge in exactly four places:
+flush before the actor completes; the permit is acquired inside that task
+under ADR-1642, so this actor does not park on it either) and diverge in
+exactly four places:
 
 - Objects are RLOG, built with `ravel_logseg::RlogWriter`, not RSEG built
   with `SegmentWriter`. They land under the `l` keyspace
@@ -516,8 +525,8 @@ POST /v1/traces (axum) | trace.v1.TraceService/Export (tonic)
 `LogShardActor` structurally (one bounded mpsc channel and one actor task
 per shard, the same `IngestConfig` knobs, the same flush triggers, the same
 pinned writer identity, the same commit sequence, and the same pipelined
-flush under `max_inflight_flushes` with a shutdown join) and diverge in
-these places:
+flush under `max_inflight_flushes` with a shutdown join, with the permit
+acquired inside the flush task under ADR-1642) and diverge in these places:
 
 - Objects are RSPAN, built with `ravel_rspan::RspanWriter`. They land under
   the `s` keyspace (`t/<tenant>/s/l0/...`); commit records under
@@ -1124,12 +1133,15 @@ Counters recorded today:
   `services/ravel-server`, `/readyz` to 503, and nothing recovers it in
   process.
 - `in_flight_flushes_total`: gauge, sum across shards of flush tasks spawned
-  but not yet acked (ADR-0067 decision 2 consequence of pipelining). Unlike
-  every other counter here it is per-shard underneath
+  but not yet acked (ADR-0067 decision 2 consequence of pipelining). It counts
+  a flush from the moment its buffer leaves the actor, so a task still waiting
+  for its `max_inflight_flushes` permit is included: it holds a flush window
+  and an ADR-0069 byte charge exactly as an executing flush does. A shard's
+  reading can therefore exceed `max_inflight_flushes` (ADR-1642), and the
+  excess over it, floored at zero, is the shard's queue of flushes waiting on
+  the bound. Unlike every other counter here it is per-shard underneath
   (`IngestMetrics::in_flight_flushes_by_shard`) before being summed into this
-  flat total; a shard with no flush in flight contributes 0. With
-  `max_inflight_flushes` at its default of 1, this never exceeds
-  `shard_count`.
+  flat total; a shard with no flush in flight contributes 0.
 
 ### Per-shard skew
 
@@ -1205,44 +1217,38 @@ increment is visible before its enqueue.
 The split is the point of the whole measurement: without it, a figure cannot
 tell an actor-thread bottleneck from a flush bottleneck, and a two-way split
 cannot tell either of those from flush backpressure. Each span is bracketed on
-the injected `Clock` at a distinct boundary in `crates/ravel-ingest/src/shard.rs`,
-and the three boundaries are consecutive, so no nanosecond of any sampled
-interval is charged to more than one counter.
+the injected `Clock` at a distinct boundary in the metrics shard actor, and
+within one flush's life the three boundaries are consecutive, so no nanosecond
+of any sampled interval is charged to more than one counter.
 
 | Counter | Starts | Stops | What it means |
 |---|---|---|---|
-| `on_actor_ns` | the actor pulls a `Write` off its channel | `handle_write` returns, minus any permit wait nested inside | merge-and-pin work the single-threaded actor genuinely serialises |
-| `flush_permit_wait_ns` | `flush_tenant` reaches the `max_inflight_flushes` acquire | that acquire grants a permit | this shard's flush backpressure: the actor is stalled on an earlier flush of the same shard |
+| `on_actor_ns` | the actor pulls a `Write` off its channel | `handle_write` returns | merge-and-pin work the single-threaded actor genuinely serialises |
+| `flush_permit_wait_ns` | the spawned flush task reaches the `max_inflight_flushes` acquire | that acquire grants a permit | this shard's flush backpressure: flushes are queued behind earlier flushes of the same shard |
 | `off_actor_ns` | the spawned flush task enters `run_flush`, permit already held | `run_flush` returns (success or abandonment) | exemplar admission, encode, and both PUTs |
 
 Read them as: a rising `on_actor_ns` means the actor is the bottleneck; a rising
-`flush_permit_wait_ns` means flushing is, and the actor is merely waiting on it;
-a rising `off_actor_ns` with a flat permit wait means flushes are slow but not
-yet backed up.
+`flush_permit_wait_ns` means flushing is, and flushes are queueing behind the
+bound; a rising `off_actor_ns` with a flat permit wait means flushes are slow
+but not yet backed up.
 
-`on_actor_ns` and `flush_permit_wait_ns` both accrue on the actor task, so they
-are disjoint in wall time as well as in code: no wall-clock interval is charged
-to both. They do not, however, jointly equal the actor's `Write`-handling
-window. `on_actor_ns` is scoped to `Write` handling, but `flush_permit_wait_ns`
-is recorded in `flush_tenant`, which the actor also reaches from `flush_aged`
-and `flush_all`: an age-triggered or manual flush parks on the same semaphore
-outside any `Write`-handling window, and that wait still lands in
-`flush_permit_wait_ns`. So permit wait can accrue when no `Write` is being
-handled, and the two counters' sum can exceed the `Write`-handling window by
-exactly those out-of-band flush waits.
-`off_actor_ns` accrues in spawned tasks that run *concurrently* with the actor,
-which is exactly what ADR-0067's pipelining is for, so it is a sum over
-concurrent tasks: at `max_inflight_flushes > 1` it can legitimately exceed wall
-time, and it overlaps the other two in wall time. That overlap is not
-double-counting -- no sampled interval lands in two counters.
+Only `on_actor_ns` accrues on the actor task. Since ADR-1642 the permit is
+acquired inside the spawned flush task, so `flush_permit_wait_ns` no longer
+measures time the actor spent and is no longer subtracted from `on_actor_ns`:
+`on_actor_ns` is merge-and-pin work, whole. That also makes permit wait a sum
+over concurrently waiting tasks rather than a series of intervals on one task.
+At one permit with three flushes queued it accrues all three waits, so like
+`off_actor_ns` it can exceed wall time and it overlaps the other two spans in
+wall time. That overlap is not double-counting: no sampled interval lands in two
+counters, because the three brackets are still consecutive within one flush's
+life (the actor's handling of the write, then that flush task's wait, then that
+flush task's execution).
 
-The interval an actor spends parked in `flush_permit_wait_ns` is wall-time
-concurrent with a *prior* flush's `off_actor_ns`, and it is charged to the actor
-side once and once only, as permit wait, never as actor work. Folding it into
-`on_actor_ns` instead (as the first cut of this metric did) both double-counts
-that interval and inverts the reading: the actor reports busy precisely when the
-truth is that flushes are backed up. `crates/ravel-ingest/tests/shard_skew.rs`
-pins both properties on fixed input.
+Folding the permit wait into `on_actor_ns` instead (as the first cut of this
+metric did) inverts the reading: the actor reports busy precisely when the truth
+is that flushes are backed up and the actor is free. It would now also be false
+outright, since the wait is not on the actor at all. The skew tests in
+`ravel-ingest` pin both the split and the overlap on fixed input.
 
 Still tracked future work (not yet implemented): a per-tenant dimensioned
 model and per-shard latency histograms -- per-shard buffered bytes/points,
