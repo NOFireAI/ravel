@@ -95,6 +95,7 @@ mod spans_pushdown;
 mod spans_scan;
 mod spans_schema;
 pub mod spill;
+pub mod stats_json;
 mod udf;
 mod validate;
 
