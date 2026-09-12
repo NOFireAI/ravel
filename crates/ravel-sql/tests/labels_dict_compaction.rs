@@ -2,8 +2,11 @@
 //! carry one entry per distinct series it references, not one per row.
 //!
 //! The dedup operator keeps each winner row as a one-row `DictionaryArray`
-//! slice, which retains the whole source dictionary, and concatenates ~1024 of
-//! them per flush. Before the compaction fix, the flushed dictionary held
+//! slice, which retains the whole source dictionary, and concatenates every
+//! slice folded since the last flush. `FLUSH_ROWS = 1024` is only checked
+//! after an entire upstream (scan/merge) batch has been folded, so a flush
+//! batch is actually bounded by the upstream batch size (8192 rows), not by
+//! 1024. Before the compaction fix, the flushed dictionary held
 //! `rows x distinct-series-per-source-batch` entries, so a `SELECT labels`
 //! result ballooned ~430x and a stock 4 MiB Flight client could not read it
 //! past a dozen series.
@@ -121,9 +124,9 @@ async fn write_segment(
     }
 }
 
-/// Build the snapshot and run the provider's scan -> merge -> dedup pipeline,
-/// returning the flushed public-schema batches.
-async fn run(series: &[Series]) -> Vec<RecordBatch> {
+/// Write `series` into one segment and build the `RavelTableProvider` over
+/// it.
+async fn build_provider(series: &[Series]) -> RavelTableProvider {
     let store = Arc::new(MemoryStore::new());
     let per_series: Vec<Vec<(i64, f64)>> = series.iter().map(|s| s.samples.clone()).collect();
     let segment = write_segment(
@@ -140,13 +143,21 @@ async fn run(series: &[Series]) -> Vec<RecordBatch> {
         pending_erasure: Vec::new(),
     };
     let fetcher = SegmentFetcher::new(store as Arc<dyn ObjectStoreBackend>);
-    let provider = RavelTableProvider::new(
+    RavelTableProvider::new(
         snapshot,
         TENANT,
         fetcher,
         EngineConfig::default(),
         QueryAccounting::new(),
-    );
+    )
+}
+
+/// Build the snapshot and run the provider's scan -> merge -> dedup pipeline
+/// straight from the hand-built plan, bypassing the DataFusion physical
+/// optimizer entirely. Returns the flushed public-schema batches exactly as
+/// `RsegDedupExec` emits them, one per dedup flush.
+async fn run(series: &[Series]) -> Vec<RecordBatch> {
+    let provider = build_provider(series).await;
     let plan = provider.plan(1).expect("build plan");
     collect(plan, Arc::new(TaskContext::default()))
         .await
@@ -243,8 +254,14 @@ fn varied_corpus(count: usize, samples_each: usize) -> Vec<Series> {
 /// distinct label set present in the batch.
 #[tokio::test]
 async fn flushed_dictionary_is_bounded_by_distinct_series_not_rows() {
-    // 20 series x 100 samples = 2000 winner rows, which crosses the 1024-row
-    // flush threshold, so the result is emitted as more than one batch.
+    // 20 series x 100 samples = 2000 winner rows, all in one scan/merge
+    // batch. `process_batch` folds that whole batch before `poll_next` checks
+    // `FLUSH_ROWS`, leaving only the final row's group as `pending`; the fold
+    // finalizes the other 1999 rows, which alone crosses `FLUSH_ROWS` (1024)
+    // and flushes immediately. The trailing pending row is finalized and
+    // flushed separately once the input is exhausted, so this corpus emits
+    // two batches (1999 rows, then 1), not because 2000 rows spans two
+    // 1024-row flush chunks.
     let series = varied_corpus(20, 100);
     let batches = run(&series).await;
 
@@ -323,31 +340,78 @@ async fn compaction_preserves_every_rows_label_set() {
     assert_eq!(checked, 24 * 60, "every written sample must appear once");
 }
 
-/// Client-boundary size: at the 25-series / 60,000-row shape the diagnosis
-/// measured a ~5.87 MB single Arrow IPC body, the post-fix largest single
-/// batch body must fit inside the 4 MiB a stock Flight client allows.
+/// Client-boundary size, measured on the largest single raw per-flush
+/// `RsegDedupExec` output batch obtained from `run` (`provider.plan()` +
+/// `collect()`, bypassing `SessionContext` and the DataFusion physical
+/// optimizer). That per-flush batch is not a proxy for the wire unit a Flight
+/// client receives, it *is* that unit: `crates/ravel-sql/src/flight/stream.rs`
+/// feeds the execution stream's batches straight into
+/// `FlightDataEncoderBuilder` with no intervening batch-coalescing stage, and
+/// DataFusion's own `CoalesceBatches` physical-optimizer rule is only ever
+/// inserted by the `TopKRepartition` rule (`datafusion-physical-optimizer`'s
+/// `optimizer.rs` rule list has no other site that adds it), which does not
+/// apply to this scan -> merge -> dedup plan -- confirmed by dumping this
+/// plan's `displayable` output through a real `SessionContext` and finding no
+/// `CoalesceBatchesExec` in it. So there is no separate "client-facing
+/// coalesced batch" to go measure via the optimizer path; the largest
+/// per-flush batch already is it.
+///
+/// The corpus must have many distinct series with few samples each, not few
+/// series with many samples (the previous `varied_corpus(25, 2400)` shape):
+/// `RsegScanExec`/`SortPreservingMergeExec` output is globally sorted by
+/// `(series_id, ts)` regardless of segment or partition layout, so an
+/// 8192-row scan/merge window's distinct-series span is `window_rows /
+/// samples_per_series`, independent of how many segments or partitions wrote
+/// it. With 25 series x 2400 samples that span is ~3.4 series and even the
+/// unfixed path's per-window dictionary stays tiny (verified: reverting the
+/// `compact_labels` call in `dedup.rs::flush` left that shape green). This
+/// corpus's 1000 series x 20 samples gives a ~410-series span per window, and
+/// at that span an unfixed flush batch's labels dictionary is bloated exactly
+/// `rows_in_batch x distinct_in_window`-shaped (this holds whenever a
+/// flush's accumulated one-row slices originate from more than one upstream
+/// scan/merge batch, which happens whenever a flush's row budget crosses a
+/// scan-window boundary): 8192 rows x 411 distinct measured at 3,366,911
+/// dictionary entries pre-fix, exactly 411 post-fix. Do not shrink the series
+/// count or grow the per-series sample count back down: either narrows the
+/// per-window span and silently defuses the test again.
 #[tokio::test]
 async fn largest_ipc_body_fits_a_stock_flight_client() {
     const FOUR_MIB: usize = 4 * 1024 * 1024;
 
-    // 25 series x 2400 samples = 60,000 rows, the shape the diagnosis measured
-    // a ~5.87 MB single Arrow IPC body at before the fix.
-    let series = varied_corpus(25, 2400);
+    // 1000 series x 20 samples = 20,000 winner rows.
+    let series = varied_corpus(1000, 20);
     let batches = run(&series).await;
     assert_eq!(
         batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        60_000,
-        "corpus must produce exactly 60,000 winner rows"
+        20_000,
+        "corpus must produce exactly 20,000 winner rows"
+    );
+    assert!(
+        batches.len() >= 2,
+        "expected the result to span multiple flushed batches, got {}",
+        batches.len()
     );
 
-    let schema = batches[0].schema();
     let mut largest = 0usize;
     for batch in &batches {
+        let entries = dict_entry_count(batch);
+        let distinct = distinct_label_sets(batch);
+        // Exact bound, same invariant as the decisive test: the compacted
+        // dictionary holds precisely the distinct label sets its rows
+        // reference, never more.
+        assert_eq!(
+            entries,
+            distinct,
+            "dictionary must hold exactly the distinct series it references \
+             (rows={})",
+            batch.num_rows()
+        );
         // One IPC body per record batch, the unit a Flight client reads as a
         // single message.
         let mut buf: Vec<u8> = Vec::new();
         {
-            let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref()).expect("ipc writer");
+            let mut writer =
+                StreamWriter::try_new(&mut buf, batch.schema().as_ref()).expect("ipc writer");
             writer.write(batch).expect("ipc write");
             writer.finish().expect("ipc finish");
         }
