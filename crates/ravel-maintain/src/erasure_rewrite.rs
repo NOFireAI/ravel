@@ -2615,14 +2615,21 @@ mod tests {
     /// read-back -- which [`read_output_exemplars`] and [`exemplar_key`] assert,
     /// rather than collapsing every record to `(series_id, ts_ns)`.
     fn exemplar(metric: &str, ts_ns: i64, value: f64) -> ExemplarInput {
+        exemplar_with_id(metric, ts_ns, value, ts_ns)
+    }
+
+    /// [`exemplar`], but the `trace_id`/`span_id` bytes are derived from
+    /// `id_seed` instead of `ts_ns`, so two records on the same series and
+    /// timestamp can still get distinct ids.
+    fn exemplar_with_id(metric: &str, ts_ns: i64, value: f64, id_seed: i64) -> ExemplarInput {
         let mut trace_id = [0x11u8; 16];
-        trace_id[..8].copy_from_slice(&ts_ns.to_be_bytes());
+        trace_id[..8].copy_from_slice(&id_seed.to_be_bytes());
         ExemplarInput {
             series_id: series_id(metric),
             ts_ns,
             value,
             trace_id,
-            span_id: ts_ns.to_be_bytes(),
+            span_id: id_seed.to_be_bytes(),
             attrs: vec![("k".to_string(), metric.to_string())],
         }
     }
@@ -6660,11 +6667,16 @@ mod tests {
         );
     }
 
-    /// The read-back identity of one exemplar: `series_id`, `ts_ns`, and the
-    /// `trace_id`/`span_id` that the [`exemplar`] helper's own docstring says
-    /// exist to keep records distinguishable. Asserting the full tuple (not
-    /// just `(series_id, ts_ns)`) is what makes two exemplars on the same
-    /// series and timestamp distinguishable to these tests.
+    /// The read-back identity of one exemplar: `series_id`, `ts_ns`,
+    /// `trace_id`, and `span_id`. Asserting the full tuple (not just
+    /// `(series_id, ts_ns)`) only distinguishes two same-series
+    /// same-timestamp exemplars when their ids were seeded independently of
+    /// `ts_ns`, via [`exemplar_with_id`]. The plain [`exemplar`] helper
+    /// derives both ids from `ts_ns` alone, so two of its records sharing a
+    /// series and timestamp still collapse to the same key; there, the
+    /// trace/span fields guard a different mutation class instead (an
+    /// implementation that rebuilds `ExemplarInput` instead of cloning it
+    /// would zero the ids).
     fn exemplar_key(e: &ExemplarInput) -> (SeriesId, i64, [u8; 16], [u8; 8]) {
         (e.series_id, e.ts_ns, e.trace_id, e.span_id)
     }
@@ -6771,6 +6783,77 @@ mod tests {
             got, expected,
             "exactly the three exemplars whose series survive must carry forward: \
              both beta records and gamma's, and no alpha record"
+        );
+    }
+
+    /// Two exemplars on the SAME series and the SAME `ts_ns`, seeded with
+    /// independent ids via [`exemplar_with_id`], both survive an
+    /// untouched-series rewrite with their own ids intact -- `exemplar_key`'s
+    /// full tuple actually discriminates them.
+    ///
+    /// Flip-line proof: this fails against the old ids-derived-from-`ts_ns`
+    /// helper. Changing the second `exemplar_with_id` call's `id_seed`
+    /// argument below from `200` to `15` (the shared `ts_ns`, i.e. what
+    /// `exemplar` alone would produce) collapses both records' trace/span
+    /// ids to the same bytes, and the `assert_ne!` on the trace ids fails.
+    #[tokio::test]
+    async fn rewrite_keeps_same_series_same_timestamp_exemplars_distinct_by_id() {
+        let store = MemoryStore::new();
+        seed_with_exemplars(
+            &store,
+            1,
+            vec![series("alpha", &[(10, 1.0)]), series("beta", &[(15, 9.5)])],
+            vec![
+                exemplar_with_id("beta", 15, 9.5, 100),
+                exemplar_with_id("beta", 15, 9.5, 200),
+            ],
+        )
+        .await;
+
+        // Erases `alpha` outright; `beta` and both its same-timestamp
+        // exemplars pass straight through.
+        let request = erasure_request(1, "alpha");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(
+            matches!(outcome, ErasureRewriteOutcome::Rewritten { parts: 1, .. }),
+            "expected a one-part rewrite, got {outcome:?}"
+        );
+
+        let part_key = output_part_key(&store).await;
+        let mut got = read_output_exemplars(&store, &config, &part_key).await;
+        got.sort();
+
+        let mut expected = vec![
+            exemplar_key(&exemplar_with_id("beta", 15, 9.5, 100)),
+            exemplar_key(&exemplar_with_id("beta", 15, 9.5, 200)),
+        ];
+        expected.sort();
+        assert_eq!(
+            got, expected,
+            "both same-series same-timestamp exemplars must survive with their own ids intact"
+        );
+        assert_ne!(
+            got[0].2, got[1].2,
+            "the two records' trace ids must differ: they were seeded with independent ids, \
+             not ids derived from the shared ts_ns"
         );
     }
 
