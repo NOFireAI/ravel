@@ -370,6 +370,26 @@ one permit aborted with `timed out waiting for shard ack`, and it bounds the
 memory at a stated multiple rather than at `--shards`, which an operator may
 provision far above 4.
 
+## Note (ADR-1642): the `flush_permit_wait_ns` figure above is pre-1642
+
+The measurement above, "submitting concurrently against one permit gives a
+`flush_permit_wait_ns` of `2 * SLOW` on a three-flush fixture", was recorded
+under the accounting in force before ADR-1642. That figure is left as the
+record of what was observed then and is not edited to track the current code.
+
+ADR-1642 moved the `max_inflight_flushes` acquire off the shard actor and into
+the spawned flush task. The permit wait is now measured per task and is a sum
+over concurrently waiting tasks rather than the on-actor series it was. On the
+same three-flush, one-permit fixture the three tasks are spawned at once and
+their waits overlap as `0 + SLOW + 2 * SLOW`, so the counter now reads
+`3 * SLOW`. `crates/ravel-ingest/tests/log_shard_skew.rs` pins the current
+value.
+
+The second half of the sentence still holds: the wall is the same as the
+serial arm. One permit still serialises the flushes, so submitting them
+concurrently changes only where the time is attributed on the counter, not how
+long the work takes.
+
 The memory cost is the outer window's alone. The loader holds at most
 `--pipeline-depth` built batches for their in-flight writes plus
 `--decode-queue-batches` queued ahead, so the resident batch working set goes
