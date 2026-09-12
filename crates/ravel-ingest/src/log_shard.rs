@@ -654,16 +654,25 @@ impl LogFlushCtx {
             self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
             return;
         }
-        let bytes = match writer.finish_with_stats() {
+        let finish_result = writer.finish_with_stats();
+        // `Encode` closes here, immediately after `finish_with_stats` returns:
+        // the bloom-sample fold and `record_postings` below are bookkeeping on
+        // an already-finished object, not part of RLOG serialization, and must
+        // not grow the figure this stage exists to attribute precisely.
+        #[cfg(feature = "stage-timing")]
+        let encode_elapsed = encode_start.elapsed();
+        let bytes = match finish_result {
             Ok((bytes, stats)) => {
                 // Per-block bloom-construction time (issue #1516), nested inside
-                // the `Encode` window this whole match arm sits in: one sample
-                // per block, read before `record_postings` moves `stats`.
+                // the `Encode` window this whole match arm sits in: folded in as
+                // one `bloom_blocks`-sample batch, read before `record_postings`
+                // moves `stats`.
                 #[cfg(feature = "stage-timing")]
-                for bloom_ns in &stats.bloom_block_ns {
-                    self.stage_timings
-                        .record(LogStage::Bloom, Duration::from_nanos(*bloom_ns));
-                }
+                self.stage_timings.record_n(
+                    LogStage::Bloom,
+                    u64::from(stats.bloom_blocks),
+                    Duration::from_nanos(stats.bloom_total_ns),
+                );
                 // Write-side POSTINGS metrics: section bytes, per-field distinct
                 // counts, and the cap-exceeded counter.
                 self.metrics.record_postings(stats);
@@ -681,8 +690,7 @@ impl LogFlushCtx {
             }
         };
         #[cfg(feature = "stage-timing")]
-        self.stage_timings
-            .record(LogStage::Encode, encode_start.elapsed());
+        self.stage_timings.record(LogStage::Encode, encode_elapsed);
 
         let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
         let data = Bytes::from(bytes);
