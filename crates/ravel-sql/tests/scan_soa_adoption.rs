@@ -42,10 +42,9 @@ use futures::StreamExt;
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{EngineConfig, SegmentFetcher};
+use ravel_query::{EngineConfig, PhaseAccounting, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::RavelTableProvider;
-use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
 use uuid::Uuid;
 
@@ -355,7 +354,7 @@ async fn scan_batches(
         TENANT,
         SegmentFetcher::new(store),
         EngineConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     // One partition, so this stream is the whole globally ordered stream.
     let fragment = provider.worker_fragment(1, &segments).expect("fragment");

@@ -65,10 +65,9 @@ use ravel_logseg::{
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
-use ravel_query::LogSegmentFetcher;
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{LogsTableProvider, has_word_udf};
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::log_stream_id;
 use uuid::Uuid;
 
@@ -920,7 +919,7 @@ async fn scan_rows(
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
 
     let ctx = SessionContext::new();
@@ -1007,7 +1006,7 @@ async fn scan_projected(
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
 
     let ctx = SessionContext::new();

@@ -650,8 +650,13 @@ fn provider(
     fetcher: LogSegmentFetcher,
     acc: QueryAccounting,
 ) -> LogsTableProvider {
-    LogsTableProvider::new(snapshot, TenantHash(TENANT), fetcher, acc)
-        .with_declared_columns(vec![DeclaredColumn::new(CODE_COL, DeclaredType::I64)])
+    LogsTableProvider::new(
+        snapshot,
+        TenantHash(TENANT),
+        fetcher,
+        PhaseAccounting::pooled_over(&acc),
+    )
+    .with_declared_columns(vec![DeclaredColumn::new(CODE_COL, DeclaredType::I64)])
 }
 
 fn find_scan(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {

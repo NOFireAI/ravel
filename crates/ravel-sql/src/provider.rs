@@ -40,8 +40,8 @@ use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_promql::LabelMatcher;
 use ravel_query::SegmentFetcher;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
+use ravel_query::phase_accounting::PhaseAccounting;
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
 
 use crate::config::SqlConfig;
 use crate::dedup::RsegDedupExec;
@@ -67,10 +67,11 @@ pub struct RavelTableProvider {
     fetcher: SegmentFetcher,
     config: SqlConfig,
     schema: SchemaRef,
-    /// This query's accounting handle (ADR-0044), cloned into every
-    /// `RsegScanExec` the provider builds so every store fetch the scan
-    /// issues on this query's behalf is recorded against it.
-    accounting: QueryAccounting,
+    /// This query's phase-split accounting handle (ADR-0044, issue #796),
+    /// cloned into every `RsegScanExec` the provider builds so every store
+    /// fetch the scan issues on this query's behalf is recorded against the
+    /// right phase.
+    phase_accounting: PhaseAccounting,
     /// Pending selective-erasure predicates derived once from
     /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `RsegScanExec` the provider builds. On the distributed
@@ -100,7 +101,7 @@ impl RavelTableProvider {
         tenant_hash: TenantHash,
         fetcher: SegmentFetcher,
         config: impl Into<SqlConfig>,
-        accounting: QueryAccounting,
+        phase_accounting: PhaseAccounting,
     ) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
         RavelTableProvider {
@@ -109,7 +110,7 @@ impl RavelTableProvider {
             fetcher,
             config: config.into(),
             schema: public_schema(),
-            accounting,
+            phase_accounting,
             erasure,
             #[cfg(feature = "flight-sql")]
             distributed: None,
@@ -192,7 +193,7 @@ impl RavelTableProvider {
             self.config.engine.max_bytes_scanned,
             self.config.engine.max_s3_requests,
             Arc::clone(&self.erasure),
-            self.accounting.clone(),
+            self.phase_accounting.clone(),
         )?);
         let scan_schema = scan.schema();
 
@@ -317,7 +318,7 @@ impl TableProvider for RavelTableProvider {
                 Arc::clone(&dist.client),
                 self.config.engine.max_samples,
                 _limit,
-                self.accounting.clone(),
+                self.phase_accounting.scan().clone(),
                 self.config.engine.max_bytes_scanned,
             )?;
             return self.apply_projection(plan, projection);

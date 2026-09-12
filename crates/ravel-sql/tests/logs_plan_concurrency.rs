@@ -30,10 +30,9 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::LogSegmentFetcher;
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::LogsTableProvider;
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -146,7 +145,7 @@ async fn plan_phase_prunes_target_partitions_segments_at_a_time() {
         },
         TENANT,
         LogSegmentFetcher::new(store),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let plan = provider.plan(TARGET_PARTITIONS).expect("build plan");
     let query = tokio::spawn(collect(plan, Arc::new(TaskContext::default())));

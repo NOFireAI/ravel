@@ -2283,6 +2283,27 @@ impl SegmentFetcher {
         Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))
     }
 
+    /// Phase-split counterpart of [`fetch_soa_accounted`](Self::fetch_soa_accounted)
+    /// (issue #1367): the scalar-only sibling of
+    /// [`fetch_soa_and_histograms_phase_accounted`](Self::fetch_soa_and_histograms_phase_accounted),
+    /// for a caller (`ravel-sql`'s metrics table scan) with no use for
+    /// histogram series that would otherwise pay their decode for nothing.
+    /// `pub`, unlike its histogram-carrying sibling, because `ravel-sql` calls
+    /// it directly with a real, persistent `PhaseAccounting` for per-phase
+    /// visibility, the same way `engine.rs` calls the sibling.
+    pub async fn fetch_soa_phase_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &PhaseAccounting,
+    ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
+        let (runs, stats) = self
+            .fetch_runs(tenant_hash, seg_ref, matchers, true, accounting)
+            .await?;
+        Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))
+    }
+
     /// Histogram counterpart to [`fetch_soa`](Self::fetch_soa): fetches
     /// and decodes the native-histogram samples of every histogram-kind series
     /// in this segment matching `matchers`, as SoA
