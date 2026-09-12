@@ -312,6 +312,7 @@ For a `RavelCluster` named `dev`:
 
 | Object | Kind | Notes |
 |---|---|---|
+| `dev-qualify` | Job | One-shot `ravel-cli store qualify` run, before any serving Deployment exists. Recreated when its inputs change; see [store qualification](#store-qualification). |
 | `dev-gateway` | Deployment | `--mode gateway`, RollingUpdate. |
 | `dev-gateway` | Service | Ports 4318 (HTTP/OTLP/query API) and 4317 (OTLP/gRPC). |
 | `dev-query` | Deployment | `--mode query`, RollingUpdate. |
@@ -343,6 +344,45 @@ an old and a new pod briefly claiming overlapping units at once. That only
 duplicates work. It does not corrupt committed state, so scaling
 `spec.maintain.replicas` above one is safe.
 
+### Store qualification
+
+Before it creates any serving Deployment, the operator renders a one-shot
+`<cluster>-qualify` Job that runs `ravel-cli store qualify` against the
+cluster's bucket, and holds the gateway, query, and maintain Deployments until
+it succeeds. This is the same check the [deployment
+guide](operations/deployment.md#qualify-the-store) has you run by hand
+against a bucket you manage yourself; the operator runs it for you so a fresh
+`RavelCluster` never comes up as three tiers crash-looping on a backend that
+fails the [object-store contract](../object-store-contract.md). On a fresh
+cluster no serving pod is created until the Job passes, so there is no
+crash-loop to observe: the Deployments do not exist yet. On a cluster
+that is already serving and re-qualifying after a config edit, the existing
+Deployments are left running while the new Job proves the new inputs.
+
+The Job is recreated only when its inputs change: the bucket, region,
+endpoint, server image, or the shared credentials Secret's name or
+`resourceVersion`. Rotating that Secret in place bumps its `resourceVersion`,
+so a rotation to credentials that no longer pass qualification re-qualifies
+too, within one resync interval; an unrelated spec edit (a replica count, a
+fold interval) does not. Qualification itself stays once-per-bucket: passing
+it durably records `sys/qualification` in the bucket, so a qualified bucket
+handed to a new `RavelCluster` with the same inputs still gets its own Job
+run (the gate reads this `RavelCluster`'s own status, not the bucket record),
+but that run passes immediately because the suite's final write is a no-op
+against an already-qualified bucket.
+
+Progress and failure surface on the `StoreQualified` condition below, not as
+a Job failure you have to go find: `Pending` while the Job is being created
+or is still running, `Succeeded` once it passes, `Failed` once it exhausts
+its retry budget (the message names the attempt count and the next retry
+time, and the Job is recreated on a capped backoff after that). `kubectl
+describe job <cluster>-qualify` or its pod logs give the underlying `store
+qualify` failure.
+
+None of this applies if you run `ravel-server` against a bucket outside a
+`RavelCluster`: nothing qualifies it for you, and you are on the hand-run
+path in the deployment guide.
+
 ### Status
 
 ```sh
@@ -350,9 +390,10 @@ kubectl get -n ravel-system ravelcluster dev -o jsonpath='{.status}'
 ```
 
 `status` carries `observedGeneration`, `gatewayReadyReplicas`,
-`queryReadyReplicas`, `maintainReadyReplicas`, and conditions. The operator
-writes two condition types: `Available` and `Degraded`. It emits no
-`Progressing` condition, so do not wait on one.
+`queryReadyReplicas`, `maintainReadyReplicas`, and conditions. Besides
+`Available` and `Degraded`, the operator writes a `StoreQualified` condition
+while the qualification gate above is active. It emits no `Progressing`
+condition, so do not wait on one.
 
 `Available=True` means the gateway and query Deployments both report ready
 replicas. `kubectl wait --for=condition=Available` is therefore a usable
@@ -402,7 +443,10 @@ cluster.
 - Point `spec.storage.s3.endpoint` at real S3 (or omit it) and supply real
   credentials in the Secret.
 - Bucket lifecycle is the platform owner's job. The operator provisions no
-  buckets; the create-bucket Jobs exist only in the dev manifests.
+  buckets; the create-bucket Jobs exist only in the dev manifests. Store
+  qualification is not: the operator runs `ravel-cli store qualify` itself
+  for every `RavelCluster` (see [store qualification](#store-qualification)),
+  so a real bucket needs no hand-run qualify step before you apply one.
 - The operator does not expose the query Service outside the cluster. It renders
   ingest exposure only when you ask for it: `gateway.ingestAffinity` on
   `backend: ingressNginx` renders an ingest Ingress, `backend: ravelNative`
