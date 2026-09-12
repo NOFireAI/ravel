@@ -127,11 +127,11 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_promql::LabelMatcher;
 use ravel_query::erasure::{ErasurePredicate, retain_series_soa};
+use ravel_query::phase_accounting::PhaseAccounting;
 use ravel_query::{
     ByteLimit, FetchedSeriesSoa, RequestLimit, SamplePriority, SegmentFetcher,
     request_budget_exceeded,
 };
-use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, TenantHash};
 
 use crate::error::SqlError;
@@ -287,15 +287,16 @@ pub struct RsegScanExec {
     /// doc for why this is per-partition, not a cross-partition total.
     max_series: usize,
     /// Per-tenant bytes-scanned budget (ADR-0061 decision 1),
-    /// checked once per completed segment fetch against the running
-    /// `QueryAccounting` total. `Unlimited` never trips, so a caller that does
-    /// not opt in behaves exactly as before this budget existed.
+    /// checked once per completed segment fetch against the running pooled
+    /// (`PhaseAccountingSnapshot::pooled`) total. `Unlimited` never trips, so
+    /// a caller that does not opt in behaves exactly as before this budget
+    /// existed.
     max_bytes_scanned: ByteLimit,
     /// Per-tenant S3 request budget (ADR-0073 decision 4),
-    /// checked once per completed segment fetch against the running
-    /// `QueryAccounting` total, the same checkpoint as `max_bytes_scanned`.
-    /// Mirrors `ravel_query::engine`'s PromQL enforcement so both query
-    /// languages trip the same budget the same way.
+    /// checked once per completed segment fetch against the running pooled
+    /// total, the same checkpoint as `max_bytes_scanned`. Mirrors
+    /// `ravel_query::engine`'s PromQL enforcement so both query languages
+    /// trip the same budget the same way.
     max_s3_requests: RequestLimit,
     /// Pending selective-erasure predicates from the resolved snapshot
     /// (ADR-0064 decision 2). Applied to each segment's decoded
@@ -305,9 +306,9 @@ pub struct RsegScanExec {
     erasure: Arc<Vec<ErasurePredicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
-    /// This query's accounting handle (ADR-0044), cloned into every
-    /// partition's `fetch_soa_accounted` call.
-    accounting: QueryAccounting,
+    /// This query's phase-split accounting handle (ADR-0044, issue #796),
+    /// cloned into every partition's `fetch_soa_phase_accounted` call.
+    phase_accounting: PhaseAccounting,
     /// Per-partition batch-path counters (ADR-0099 decision 6), published so
     /// `EXPLAIN ANALYZE` and tests can see which batch-building path ran.
     metrics: ExecutionPlanMetricsSet,
@@ -349,7 +350,7 @@ impl RsegScanExec {
         max_bytes_scanned: ByteLimit,
         max_s3_requests: RequestLimit,
         erasure: Arc<Vec<ErasurePredicate>>,
-        accounting: QueryAccounting,
+        phase_accounting: PhaseAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
         let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
@@ -370,7 +371,7 @@ impl RsegScanExec {
             erasure,
             schema,
             properties,
-            accounting,
+            phase_accounting,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -480,7 +481,7 @@ impl ExecutionPlan for RsegScanExec {
             self.max_s3_requests,
             erasure,
             reservation,
-            self.accounting.clone(),
+            self.phase_accounting.clone(),
         ));
         Ok(Box::pin(ScanStream {
             schema,
@@ -502,9 +503,9 @@ struct Prepared {
 /// labels. Applies the `series_id` allow-set as a post-fetch row filter.
 ///
 /// Enforces four budgets before the next segment is ever fetched: the
-/// per-tenant bytes-scanned budget against the running `QueryAccounting`
+/// per-tenant bytes-scanned budget against the running pooled
 /// total (ADR-0061 decision 1), the per-tenant S3 request budget
-/// against the same running total (ADR-0073 decision 4),
+/// against the same running pooled total (ADR-0073 decision 4),
 /// the distinct-series count against `max_series`, and the
 /// reservation's byte budget against this segment's decoded size.
 /// `reservation` is threaded through and returned so the caller's
@@ -521,28 +522,30 @@ async fn prepare_partition(
     max_s3_requests: RequestLimit,
     erasure: Arc<Vec<ErasurePredicate>>,
     reservation: MemoryReservation,
-    accounting: QueryAccounting,
+    phase_accounting: PhaseAccounting,
 ) -> DFResult<(Prepared, MemoryReservation)> {
     let mut runs: Vec<Run> = Vec::with_capacity(segs.len());
     let mut labels: HashMap<[u8; 16], LabelSet> = HashMap::new();
 
     for seg in &segs {
         let (mut series, stats) = fetcher
-            .fetch_soa_accounted(tenant, seg, &matchers, &accounting)
+            .fetch_soa_phase_accounted(tenant, seg, &matchers, &phase_accounting)
             .await
             .map_err(SqlError::from)?;
         // Selective-erasure exclusion (ADR-0064 decision 2):
         // applied to the decoded series immediately after fetch, after the
-        // ADR-0046 read cache `fetch_soa_accounted` routes through, before any
-        // row below reaches DataFusion. A no-op when `erasure` is empty.
+        // ADR-0046 read cache `fetch_soa_phase_accounted` routes through,
+        // before any row below reaches DataFusion. A no-op when `erasure` is
+        // empty.
         retain_series_soa(&mut series, &erasure);
         // Per-tenant bytes-scanned budget (ADR-0061 decision 1): this fetch
-        // has just charged its S3 bytes into the shared `accounting` handle,
-        // so check the running total against the tenant's cap here, once per
-        // completed segment fetch, before decoding this segment or fetching
-        // the next one. This loop is genuinely sequential, so a trip here
-        // straightforwardly means the remaining segments' GETs never happen.
-        let scanned = accounting.snapshot().total_s3_bytes();
+        // has just charged its S3 bytes into the shared `phase_accounting`
+        // handle, so check the running pooled total against the tenant's cap
+        // here, once per completed segment fetch, before decoding this
+        // segment or fetching the next one. This loop is genuinely
+        // sequential, so a trip here straightforwardly means the remaining
+        // segments' GETs never happen.
+        let scanned = phase_accounting.snapshot().pooled().total_s3_bytes();
         if max_bytes_scanned.is_exceeded_by(scanned) {
             let max = match max_bytes_scanned {
                 ByteLimit::Bounded(max) => max,
@@ -555,7 +558,10 @@ async fn prepare_partition(
         // here also means the remaining segments' GETs never happen. Mirrors
         // `ravel_query::engine`'s PromQL enforcement exactly.
         if let Some(ravel_query::QueryError::RequestBudgetExceeded { requests, max }) =
-            request_budget_exceeded(accounting.snapshot().total_s3_requests(), max_s3_requests)
+            request_budget_exceeded(
+                phase_accounting.snapshot().pooled().total_s3_requests(),
+                max_s3_requests,
+            )
         {
             return Err(SqlError::RequestBudgetExceeded { requests, max }.into());
         }

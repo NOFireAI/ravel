@@ -30,7 +30,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{EngineConfig, SegmentFetcher};
+use ravel_query::{EngineConfig, PhaseAccounting, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{
     RavelTableProvider, SqlConfig, TenantMemoryAccountant, label_match_udf, label_udf,
@@ -333,7 +333,7 @@ fn register(ctx: &SessionContext, snapshot: Snapshot, store: Arc<dyn ObjectStore
         TENANT,
         fetcher,
         EngineConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     ctx.register_udf(label_udf());
     ctx.register_udf(label_match_udf());
@@ -457,7 +457,7 @@ async fn label_equality_prunes_series_pages() {
         TENANT,
         fetcher,
         EngineConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     ctx.register_udf(label_udf());
     ctx.register_table("samples", Arc::new(provider)).unwrap();
@@ -501,7 +501,7 @@ async fn label_equality_prunes_series_pages() {
         TENANT,
         fetcher2,
         EngineConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let plan = provider2.plan(1).expect("plan");
     let _ = collect(plan, Arc::new(TaskContext::default()))
@@ -832,7 +832,7 @@ async fn byte_budget_exceeded_returns_typed_error() {
 
     let fetcher = SegmentFetcher::new(Arc::clone(&store));
     let provider =
-        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, PhaseAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, task_ctx).await.expect_err("budget must trip");
     let msg = format!("{err}");
@@ -866,7 +866,7 @@ async fn dropped_mid_scan_stream_releases_tenant_bytes() {
 
     let fetcher = SegmentFetcher::new(Arc::clone(&store));
     let provider =
-        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, PhaseAccounting::new());
     let plan = provider.plan(1).expect("plan");
 
     let mut stream = plan.execute(0, task_ctx).expect("execute");
@@ -927,7 +927,7 @@ async fn high_cardinality_trips_query_pool_before_tenant() {
 
     let fetcher = SegmentFetcher::new(Arc::clone(&store));
     let provider =
-        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, PhaseAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, task_ctx)
         .await
@@ -996,7 +996,7 @@ async fn tenant_budget_trips_and_rolls_back_the_query_reservation() {
 
     let fetcher = SegmentFetcher::new(Arc::clone(&store));
     let provider =
-        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, PhaseAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, task_ctx)
         .await
@@ -1055,7 +1055,7 @@ async fn query_budget_reported_first_when_both_ceilings_are_equally_reachable() 
 
     let fetcher = SegmentFetcher::new(Arc::clone(&store));
     let provider =
-        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, PhaseAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, task_ctx).await.expect_err("budget must trip");
     let msg = format!("{err}");

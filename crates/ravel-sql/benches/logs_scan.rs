@@ -42,11 +42,10 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::LogSegmentFetcher;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{LOG_COL_ATTRS, LogsScanExec, logs_schema_with_declared};
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::log_stream_id;
 use uuid::Uuid;
 
@@ -172,7 +171,7 @@ async fn drain(
         Arc::new(Vec::new()),
         Arc::new(erasure),
         Some(&projection),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
         logs_schema_with_declared(&[]),
         Arc::new(Vec::new()),
     )

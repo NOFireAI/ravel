@@ -55,7 +55,7 @@ use ravel_proto::commit::v1::{
     CommitRecord, CompactionPart, DeclaredColumnMinMax, DeclaredColumnStatValue,
     declared_column_stat_value::Kind as StampKind,
 };
-use ravel_query::LogSegmentFetcher;
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision, SqlConfig,
     TenantMemoryAccountant, build_session,
@@ -387,7 +387,7 @@ fn provider_with(
         snapshot,
         TENANT,
         LogSegmentFetcher::new(backend),
-        accounting.clone(),
+        PhaseAccounting::pooled_over(accounting),
     )
     .with_declared_columns(declared)
     .with_column_stats(stats)

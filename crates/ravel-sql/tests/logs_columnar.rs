@@ -52,13 +52,12 @@ use ravel_logseg::{
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::erasure::snapshot_pending_erasure_predicates;
-use ravel_query::{CacheFetchError, LogSegmentFetcher};
+use ravel_query::{CacheFetchError, LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, FIRST_DECLARED_COL, LOG_COL_ATTRS, LogsScanExec,
     logs_schema_with_declared,
 };
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::log_stream_id;
 use uuid::Uuid;
 
@@ -380,7 +379,7 @@ async fn run_scan(
         Arc::new(Vec::new()),
         Arc::new(erasure),
         projection.as_ref(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
         full_schema,
         Arc::new(declared),
     )
@@ -468,7 +467,7 @@ async fn run_scan_tp(
         Arc::new(Vec::new()),
         Arc::new(erasure),
         projection.as_ref(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
         full_schema,
         Arc::new(declared),
     )
@@ -1451,7 +1450,7 @@ async fn an_uncached_fetcher_caps_partitions_at_the_segment_count() {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Some(&projection),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
             Arc::clone(&full_schema),
             Arc::new(declared.clone()),
         )
@@ -1517,7 +1516,7 @@ async fn logs_scan_declares_no_output_ordering() {
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         None,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
         logs_schema_with_declared(&[]),
         Arc::new(Vec::new()),
     )
