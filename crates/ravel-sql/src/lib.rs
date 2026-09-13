@@ -46,6 +46,7 @@ mod alerts_provider;
 mod alerts_pushdown;
 mod alerts_scan;
 mod alerts_schema;
+mod attrs_per_key;
 mod audit_provider;
 mod audit_pushdown;
 mod audit_scan;
