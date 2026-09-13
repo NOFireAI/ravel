@@ -2,19 +2,28 @@
 //! (docs/consistency-model.md "Deletion
 //! and GC"). This is the first implementation of any deletion in Ravel.
 //!
-//! 1. **Orphan GC** (ADR-0010 §11): an `l0/` data object with no commit
-//!    record, older than `grace + max_flush_lifetime`. The writer interlock
-//!    (a writer abandons any flush older than `max_flush_lifetime` and never
-//!    publishes it afterward) is what makes this safe: a record-less object
-//!    that old can never gain a commit record later, so deleting it cannot
-//!    orphan a future reader. Commit-record absence is re-verified with one
-//!    fresh strongly consistent LIST shared by every candidate in the pass
-//!    (ADR-0048 decision 5), then gated by a mass-orphan circuit breaker
-//!    (ADR-0048 decision 4): a pass that would delete at least
-//!    `orphan_breaker_min_count` candidates AND more than
-//!    `orphan_breaker_max_ratio` of the shard's listed L0 objects deletes
-//!    nothing and halts, because that shape is the signature of an
-//!    out-of-band commit-record loss, not routine cleanup.
+//! 1. **Orphan GC** (ADR-0010 §11, quarantine ADR-0058 amendment): an `l0/`
+//!    data object with no commit record, older than `grace +
+//!    max_flush_lifetime`. The writer interlock (a writer abandons any flush
+//!    older than `max_flush_lifetime` and never publishes it afterward) is what
+//!    makes this safe: a record-less object that old can never gain a commit
+//!    record later, so removing it cannot orphan a future reader. Commit-record
+//!    absence is re-verified with one fresh strongly consistent LIST shared by
+//!    every candidate in the pass (ADR-0048 decision 5), then gated by a
+//!    mass-orphan circuit breaker (ADR-0048 decision 4): a pass that would
+//!    collect at least `orphan_breaker_min_count` candidates AND more than
+//!    `orphan_breaker_max_ratio` of the shard's listed L0 objects collects
+//!    nothing and halts, because that shape is the signature of an out-of-band
+//!    commit-record loss, not routine cleanup. Below those thresholds the
+//!    breaker does not trip, and the same small or thinly-spread loss used to
+//!    be deleted permanently. So orphan GC no longer deletes a candidate
+//!    directly: it copies the object to `quarantine/<original key>/q<ns>`
+//!    (copy first, then delete the live key, never the reverse) and
+//!    [`sweep_quarantine`] physically deletes the copy only after a second
+//!    horizon (`quarantine_horizon_ns`, default 7 days) measured from the
+//!    quarantine timestamp embedded in the key. A small record loss under the
+//!    breaker is then recoverable for a week and reported by
+//!    [`SweepReport::orphans_quarantined`], instead of vanishing silently.
 //! 2. **Superseded-input sweep** (ADR-0018): the L0 commit records and data
 //!    objects a compaction record names in its input list, once
 //!    `now >= record.created_unix_ns + protection_horizon` AND the live catalog
@@ -107,7 +116,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use ravel_catalog::select_authoritative_compaction_records;
 use ravel_commit::keys::{self, BucketEntry, KeyError, parse_ingest_hour_string};
 use ravel_commit::record;
-use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError, list_all};
+use ravel_object_store::{
+    GetRange, ObjectMeta, ObjectStoreBackend, PutOptions, StoreError, list_all,
+};
 use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionRecord, ErasureCompletion, RewriteRecord,
 };
@@ -150,8 +161,32 @@ impl LeaseCheck for NoLeases {
 /// What one sweep pass over a `(tenant, signal, shard)` deleted, per rule.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepReport {
-    /// Rule 1: record-less `l0/` data objects deleted (orphan GC).
+    /// Rule 1: record-less `l0/` data objects removed from the live keyspace
+    /// (orphan GC). Since the ADR-0058 quarantine amendment these are moved to
+    /// the `quarantine/` prefix rather than deleted outright, so this counts
+    /// objects quarantined this pass, equal to [`Self::orphans_quarantined`];
+    /// the name is retained because the operator-facing meaning ("orphan
+    /// candidates GC removed from the live L0 set") is unchanged, and
+    /// `orphans_deleted + orphans_withheld` is still the pass's total
+    /// orphan-candidate count with exactly one term nonzero.
     pub orphans_deleted: usize,
+    /// Rule 1: record-less `l0/` data objects moved to `quarantine/` this pass
+    /// (ADR-0058 amendment). Equal to [`Self::orphans_deleted`]; a distinctly
+    /// named counter an operator can alert on to see quarantine activity
+    /// (small out-of-band commit-record loss below the mass-orphan breaker).
+    pub orphans_quarantined: usize,
+    /// Rule 1: orphan candidates NOT quarantined this pass because the copy to
+    /// `quarantine/` failed, so the live object was left in place (fail-closed:
+    /// the dangerous delete never runs when its safe copy did not). A persistent
+    /// nonzero value is an operator signal that quarantine cannot make progress
+    /// (a store fault, a permissions or capacity problem on the prefix), not the
+    /// ordinary steady state, which is `0`.
+    pub orphans_quarantine_refused: usize,
+    /// The quarantine reaper ([`sweep_quarantine`]): objects physically deleted
+    /// from `quarantine/` this pass because their embedded quarantine timestamp
+    /// is more than `quarantine_horizon_ns` behind the clock. This is the only
+    /// place orphan-GC'd data is ever physically removed.
+    pub quarantine_reaped: usize,
     /// Rule 2: superseded L0 commit records deleted.
     pub superseded_records_deleted: usize,
     /// Rule 2: superseded L0 data objects deleted.
@@ -225,17 +260,35 @@ pub async fn sweep_shard_with_holds(
     superseded_holds.absorb(&superseded);
     let unreferenced_parts_deleted =
         sweep_unreferenced_parts(store, clock, config, lease, tenant, signal, shard).await?;
-    let (orphans_deleted, orphan_breaker_tripped, orphans_withheld, orphan_breaker_overridden) =
-        match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
-            Ok(outcome) => (outcome.deleted, false, 0, outcome.breaker_overridden),
-            Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
-                (0, true, candidates, false)
-            }
-            Err(e) => return Err(e),
-        };
+    let (
+        orphans_deleted,
+        orphans_refused,
+        orphan_breaker_tripped,
+        orphans_withheld,
+        orphan_breaker_overridden,
+    ) = match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
+        Ok(outcome) => (
+            outcome.deleted,
+            outcome.refused,
+            false,
+            0,
+            outcome.breaker_overridden,
+        ),
+        Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
+            (0, 0, true, candidates, false)
+        }
+        Err(e) => return Err(e),
+    };
+    // The quarantine reaper is the second horizon on rule 1's output. It runs
+    // every pass so it is reachable from the same maintain tick as the sweep,
+    // and whole-shard because quarantine keys are not hour-bucketed.
+    let quarantine = sweep_quarantine(store, clock, config, lease, tenant, signal, shard).await?;
     Ok((
         SweepReport {
             orphans_deleted,
+            orphans_quarantined: orphans_deleted,
+            orphans_quarantine_refused: orphans_refused,
+            quarantine_reaped: quarantine.reaped,
             superseded_records_deleted: superseded.records_deleted,
             superseded_data_deleted: superseded.data_deleted,
             unreferenced_parts_deleted,
@@ -324,17 +377,35 @@ pub async fn sweep_shard_zoned_with_holds(
         Some(hours),
     )
     .await?;
-    let (orphans_deleted, orphan_breaker_tripped, orphans_withheld, orphan_breaker_overridden) =
-        match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
-            Ok(outcome) => (outcome.deleted, false, 0, outcome.breaker_overridden),
-            Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
-                (0, true, candidates, false)
-            }
-            Err(e) => return Err(e),
-        };
+    let (
+        orphans_deleted,
+        orphans_refused,
+        orphan_breaker_tripped,
+        orphans_withheld,
+        orphan_breaker_overridden,
+    ) = match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
+        Ok(outcome) => (
+            outcome.deleted,
+            outcome.refused,
+            false,
+            0,
+            outcome.breaker_overridden,
+        ),
+        Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
+            (0, 0, true, candidates, false)
+        }
+        Err(e) => return Err(e),
+    };
+    // The quarantine reaper runs on every pass, including the zone-scoped one,
+    // so a per-tick sweep reaps expired quarantine too; it is whole-shard
+    // because quarantine keys are not hour-bucketed (like rule 1 itself).
+    let quarantine = sweep_quarantine(store, clock, config, lease, tenant, signal, shard).await?;
     Ok((
         SweepReport {
             orphans_deleted,
+            orphans_quarantined: orphans_deleted,
+            orphans_quarantine_refused: orphans_refused,
+            quarantine_reaped: quarantine.reaped,
             superseded_records_deleted: superseded.records_deleted,
             superseded_data_deleted: superseded.data_deleted,
             unreferenced_parts_deleted,
@@ -386,25 +457,45 @@ fn log_superseded_holds(
 /// fields for callers that run the whole shard.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OrphanSweepOutcome {
-    /// Record-less `l0/` data objects deleted this pass.
+    /// Record-less `l0/` data objects removed from the live keyspace this pass.
+    /// Since the ADR-0058 quarantine amendment "removed" means moved to
+    /// `quarantine/` (copy then delete of the live key), not physically
+    /// deleted; the field keeps its name because it is the count of orphan
+    /// candidates GC took out of the live L0 set.
     pub deleted: usize,
+    /// Orphan candidates left in place this pass because the copy to
+    /// `quarantine/` failed. The live object is untouched (fail-closed), and
+    /// the candidate is retried next pass.
+    pub refused: usize,
     /// This pass exceeded the breaker's threshold but proceeded anyway
     /// because [`CompactorConfig::force_orphan_gc`] was set (ADR-0048
     /// decision 4's one-shot operator override).
     pub breaker_overridden: bool,
 }
 
-/// Delete every record-less `l0/` data object older than the orphan age
-/// gate. Three phases (ADR-0048 decisions 4 and 5): (a) candidate selection
-/// over one listing of the shard's L0 data objects, filtered by the
-/// commit-record identities already present, the age gate, and lease
-/// protection; (b) one fresh strongly consistent LIST of the commit prefix,
-/// shared by every candidate, dropping any whose identity now appears
-/// (replacing the old per-candidate full-shard LIST, the dominant request
-/// cost of a sweep); (c) the mass-orphan circuit breaker gate; (d) delete.
-/// A tripped, non-overridden breaker returns
-/// [`MaintainError::OrphanBreakerTripped`] before phase (d), so the pass is
-/// all-or-nothing: either every surviving candidate is deleted, or none are.
+/// Quarantine every record-less `l0/` data object older than the orphan age
+/// gate (ADR-0058 amendment). Four phases (ADR-0048 decisions 4 and 5): (a)
+/// candidate selection over one listing of the shard's L0 data objects,
+/// filtered by the commit-record identities already present, the age gate, and
+/// lease protection; (b) one fresh strongly consistent LIST of the commit
+/// prefix, shared by every candidate, dropping any whose identity now appears
+/// (replacing the old per-candidate full-shard LIST, the dominant request cost
+/// of a sweep); (c) the mass-orphan circuit breaker gate; (d) move each
+/// surviving candidate to the `quarantine/` prefix (copy then delete the live
+/// key). A tripped, non-overridden breaker returns
+/// [`MaintainError::OrphanBreakerTripped`] before phase (d), so the breaker is
+/// all-or-nothing: either every surviving candidate is quarantined, or none
+/// are. Physical deletion of a quarantined object happens only later, in
+/// [`sweep_quarantine`], after a second horizon.
+///
+/// The move is copy-first, delete-second, per object: the bytes are copied to
+/// `quarantine/<original key>/q<quarantined_at_ns>` and only then is the live
+/// key deleted, so a crash or store fault between the two leaves the object in
+/// at least one location, never none. A candidate whose copy fails is left
+/// live and reported in [`OrphanSweepOutcome::refused`] (fail-closed: the
+/// delete never runs when its copy did not), and retried on the next pass.
+/// [`OrphanSweepOutcome::deleted`] counts candidates successfully moved out of
+/// the live keyspace this pass.
 pub async fn sweep_orphans(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -470,18 +561,94 @@ pub async fn sweep_orphans(
         });
     }
 
-    // Phase (d): delete. All-or-nothing: phase (c) already returned if the
-    // pass should delete zero.
+    // Phase (d): quarantine. The breaker (phase (c)) already returned if the
+    // pass should collect zero; here every surviving candidate is moved to the
+    // `quarantine/` prefix, copy first and delete of the live key second, so a
+    // crash or fault between the two never destroys the only copy. A copy
+    // failure leaves the object live and is counted, not fatal: nothing is
+    // deleted that was not first safely copied.
+    let quarantined_at_ns = now;
+    let mut quarantined = 0usize;
+    let mut refused = 0usize;
     for (meta, _) in &candidates {
-        if !config.dry_run {
-            store.delete(&meta.key).await?;
+        if config.dry_run {
+            quarantined += 1;
+            continue;
+        }
+        let dest = quarantine_key(&meta.key, quarantined_at_ns);
+        match quarantine_object(store, &meta.key, &dest).await {
+            Ok(QuarantineMove::Copied) => {
+                store.delete(&meta.key).await?;
+                quarantined += 1;
+            }
+            // The live object vanished between the listing and the copy (a
+            // concurrent pass, or a prior crashed pass that had already
+            // deleted it): nothing to move, and idempotent.
+            Ok(QuarantineMove::SourceGone) => {}
+            Err(e) => {
+                tracing::warn!(
+                    tenant_hash = %tenant.to_hex(),
+                    signal = signal.key_prefix(),
+                    shard,
+                    key = %meta.key,
+                    error = %e,
+                    "orphan GC: copy to quarantine failed; leaving the object live and \
+                     retrying next pass (fail-closed: never delete what was not copied)"
+                );
+                refused += 1;
+            }
         }
     }
 
+    if quarantined > 0 || refused > 0 {
+        tracing::warn!(
+            tenant_hash = %tenant.to_hex(),
+            signal = signal.key_prefix(),
+            shard,
+            quarantined,
+            refused,
+            l0_objects_listed,
+            breaker_overridden = would_trip && config.force_orphan_gc,
+            "orphan GC: moved record-less L0 data objects to quarantine (recoverable for \
+             quarantine_horizon_ns before physical deletion); a nonzero count below the \
+             mass-orphan breaker's thresholds can be small out-of-band commit-record loss"
+        );
+    }
+
     Ok(OrphanSweepOutcome {
-        deleted: candidate_count,
+        deleted: quarantined,
+        refused,
         breaker_overridden: would_trip && config.force_orphan_gc,
     })
+}
+
+/// Whether [`quarantine_object`] copied the source or found it already gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuarantineMove {
+    /// The source bytes were copied to the quarantine key.
+    Copied,
+    /// The source object was already absent (NotFound): nothing to copy, and
+    /// the live-key delete is skipped. Idempotent with a prior crashed pass.
+    SourceGone,
+}
+
+/// Copy one object's bytes to its quarantine key (`quarantine/<original
+/// key>/q<ns>`). The overwrite [`PutOptions`] make a re-quarantine of the same
+/// object idempotent. NotFound on the source is reported as
+/// [`QuarantineMove::SourceGone`] rather than an error: the object vanished
+/// between the listing and the copy, which is not a fault.
+async fn quarantine_object(
+    store: &dyn ObjectStoreBackend,
+    src: &str,
+    dest: &str,
+) -> Result<QuarantineMove> {
+    let got = match store.get(src, GetRange::Full).await {
+        Ok(got) => got,
+        Err(StoreError::NotFound) => return Ok(QuarantineMove::SourceGone),
+        Err(e) => return Err(MaintainError::Store(e)),
+    };
+    store.put(dest, got.data, PutOptions::default()).await?;
+    Ok(QuarantineMove::Copied)
 }
 
 /// The set of L0 commit-record identities `(writer_id, epoch, seq)` present in
@@ -518,6 +685,122 @@ async fn referenced_l0_identities(
         }
     }
     Ok(out)
+}
+
+// --- Rule 1b: quarantine reaper (ADR-0058 amendment) -----------------------
+
+/// Top-level prefix every quarantined orphan lives under. A new additive
+/// key space alongside `t/` and `sys/`, listed only by [`sweep_quarantine`]
+/// and never by any other sweep rule, so no `t/`-scoped listing ever sees it.
+const QUARANTINE_PREFIX: &str = "quarantine/";
+
+/// The quarantine key for one live object: `quarantine/<original key>/q<ns>`.
+/// The whole original key is preserved verbatim (strip the `quarantine/`
+/// prefix and the trailing `/q<ns>` segment to recover it for a restore), and
+/// the trailing segment records when the object was quarantined so
+/// [`sweep_quarantine`] can gate the second horizon on the injected clock
+/// rather than on the copy's store `last_modified` (which, like every other
+/// GC age signal that can, this path reads from the key, not the object; see
+/// rule 4's ingest-hour marker). Zero-padded to a fixed width so the segment
+/// is unambiguous and lexicographically ordered.
+fn quarantine_key(original: &str, quarantined_at_ns: i64) -> String {
+    format!("{QUARANTINE_PREFIX}{original}/q{quarantined_at_ns:020}")
+}
+
+/// `quarantine/t/<tenant_hash>/<signal>/l0/<shard>/` -- the prefix covering
+/// every quarantined orphan for one `(tenant, signal, shard)`, the quarantine
+/// mirror of [`l0_data_prefix`].
+fn quarantine_l0_data_prefix(tenant: &TenantHash, signal: Signal, shard: u32) -> Result<String> {
+    Ok(format!(
+        "{QUARANTINE_PREFIX}{}",
+        l0_data_prefix(tenant, signal, shard)?
+    ))
+}
+
+/// The quarantine timestamp encoded in a quarantine key's trailing `/q<ns>`
+/// segment, or `None` if it is absent or unparseable. `None` is treated as
+/// not-yet-expired by [`sweep_quarantine`] (fail-closed: a malformed key is
+/// never reaped early).
+fn parse_quarantine_timestamp(quarantine_key: &str) -> Option<i64> {
+    quarantine_key
+        .rsplit('/')
+        .next()
+        .and_then(|seg| seg.strip_prefix('q'))
+        .and_then(|digits| digits.parse::<i64>().ok())
+}
+
+/// What one quarantine-reaper pass did (ADR-0058 amendment).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuarantineSweepOutcome {
+    /// Objects physically deleted from `quarantine/` this pass, past the second
+    /// horizon.
+    pub reaped: usize,
+    /// Objects left in quarantine this pass, still inside the second horizon
+    /// (or with an unparseable timestamp, or lease-protected).
+    pub retained: usize,
+}
+
+/// Physically delete quarantined orphan objects for one `(tenant, signal,
+/// shard)` whose embedded quarantine timestamp is more than
+/// `quarantine_horizon_ns` behind the clock (ADR-0058 amendment).
+///
+/// This is the second and final horizon on orphan-GC'd data and the only place
+/// it is ever physically removed: [`sweep_orphans`] moved these objects out of
+/// the live keyspace into `quarantine/`, giving an operator a recovery window
+/// for a small out-of-band commit-record loss the mass-orphan breaker does not
+/// catch. It runs whole-shard like rule 1 (quarantine keys are not
+/// hour-bucketed), is stateless and idempotent (deleting a missing key is a
+/// success), and fails closed on a malformed key (an unparseable age is never
+/// reaped). The age is read from the key, not the copy's store
+/// `last_modified`, so the horizon is deterministic under the injected clock.
+pub async fn sweep_quarantine(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<QuarantineSweepOutcome> {
+    let now = clock.now_ns();
+    let horizon = config.quarantine_horizon_ns;
+    let prefix = quarantine_l0_data_prefix(tenant, signal, shard)?;
+    let objects = list_all(store, &prefix).await?;
+
+    let mut reaped = 0usize;
+    let mut retained = 0usize;
+    for meta in objects {
+        let Some(quarantined_at_ns) = parse_quarantine_timestamp(&meta.key) else {
+            retained += 1;
+            continue;
+        };
+        if now.saturating_sub(quarantined_at_ns) <= horizon {
+            retained += 1;
+            continue;
+        }
+        if lease.is_protected(&meta.key) {
+            retained += 1;
+            continue;
+        }
+        if !config.dry_run {
+            store.delete(&meta.key).await?;
+        }
+        reaped += 1;
+    }
+
+    if reaped > 0 {
+        tracing::warn!(
+            tenant_hash = %tenant.to_hex(),
+            signal = signal.key_prefix(),
+            shard,
+            reaped,
+            retained,
+            "quarantine reaper: physically deleted orphan-GC'd objects past the second \
+             horizon; this is the point at which quarantined data becomes unrecoverable"
+        );
+    }
+
+    Ok(QuarantineSweepOutcome { reaped, retained })
 }
 
 // --- Rule 2: superseded-input sweep (ADR-0018) -----------------------------
@@ -2904,6 +3187,304 @@ mod tests {
                 "batched: only two commit-prefix LISTs per pass, regardless of candidate count"
             );
         }
+    }
+
+    // --- Quarantine (ADR-0058 amendment, issue #528) -----------------------
+
+    /// The L0 data key `put_orphan` writes for `seq`, so a test can assert the
+    /// exact key set that ended up quarantined.
+    fn orphan_data_key(tenant: &TenantHash, signal: Signal, shard: u32, seq: u64) -> String {
+        let writer_id = Uuid::from_u128(u128::from(seq) + 1);
+        keys::data_key(tenant, signal, shard, writer_id, 1, seq, &[7u8; 32])
+            .expect("valid data key")
+    }
+
+    /// A referenced (non-orphan) L0 data object: its data object plus a commit
+    /// record at the matching identity, so it counts toward `l0_objects_listed`
+    /// (the breaker ratio's denominator) but is never an orphan candidate.
+    /// `referenced_l0_identities` reads commit-record KEYS only, so an empty
+    /// object at a valid commit key is enough to mark the data object
+    /// referenced.
+    async fn put_referenced(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        seq: u64,
+    ) {
+        let writer_id = Uuid::from_u128(u128::from(seq) + 1_000_000);
+        let data = keys::data_key(tenant, signal, shard, writer_id, 1, seq, &[9u8; 32])
+            .expect("valid data key");
+        let commit = keys::commit_key(tenant, signal, shard, 0, writer_id, 1, seq)
+            .expect("valid commit key");
+        store
+            .put(&data, Bytes::new(), PutOptions::default())
+            .await
+            .expect("seed referenced data");
+        store
+            .put(&commit, Bytes::new(), PutOptions::default())
+            .await
+            .expect("seed commit record");
+    }
+
+    /// Recover the original object key from a quarantine key
+    /// (`quarantine/<original>/q<ns>`): strip the prefix and the trailing
+    /// `/q<ns>` segment. This is the operator's recovery path, exercised as an
+    /// assertion.
+    fn recover_original(quarantine_key: &str) -> String {
+        let without_prefix = quarantine_key
+            .strip_prefix(QUARANTINE_PREFIX)
+            .expect("quarantine prefix present");
+        let (original, last) = without_prefix
+            .rsplit_once('/')
+            .expect("trailing timestamp segment present");
+        assert!(last.starts_with('q'), "trailing segment is the q<ns> stamp");
+        original.to_string()
+    }
+
+    async fn keys_under(store: &dyn ObjectStoreBackend, prefix: &str) -> BTreeSet<String> {
+        list_all(store, prefix)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|m| m.key)
+            .collect()
+    }
+
+    /// The ticket's own case: fewer than `orphan_breaker_min_count` orphan
+    /// candidates, so the breaker does NOT trip. Pre-fix this deleted the
+    /// objects permanently; now they are recoverable from `quarantine/`, pinned
+    /// by exact key set.
+    #[tokio::test]
+    async fn small_loss_below_breaker_is_quarantined_not_deleted() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 7;
+        let store = MemoryStore::new();
+        for seq in 0..3u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+        let now = clock.now_ns();
+
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("3 candidates is below orphan_breaker_min_count: no trip");
+        assert_eq!(outcome.deleted, 3, "all three moved out of the live set");
+        assert_eq!(outcome.refused, 0);
+
+        // Nothing is left in the live L0 keyspace.
+        assert!(
+            keys_under(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+                .await
+                .is_empty(),
+            "orphans removed from the live keyspace"
+        );
+
+        // All three are recoverable from quarantine, by exact key set.
+        let expected_originals: BTreeSet<String> = (0..3u64)
+            .map(|seq| orphan_data_key(&tenant, signal, shard, seq))
+            .collect();
+        let quarantined = keys_under(
+            &store,
+            &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+        )
+        .await;
+        assert_eq!(quarantined.len(), 3, "exactly three quarantined");
+        let recovered: BTreeSet<String> = quarantined.iter().map(|k| recover_original(k)).collect();
+        assert_eq!(
+            recovered, expected_originals,
+            "the exact orphan keys are recoverable from quarantine"
+        );
+        // The embedded timestamp is the quarantine instant.
+        for k in &quarantined {
+            assert_eq!(parse_quarantine_timestamp(k), Some(now));
+        }
+    }
+
+    /// The thin-spread case: orphan candidates under the ratio on a large
+    /// shard, so neither the count nor the ratio condition trips. Same
+    /// assertion: recoverable, not deleted.
+    #[tokio::test]
+    async fn thin_spread_loss_under_ratio_is_quarantined() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 8;
+        let store = MemoryStore::new();
+        // 5 orphans among 100 listed L0 objects = 5% < 10%, and 5 < 50, so the
+        // breaker's ratio condition is what would otherwise matter and it does
+        // not trip.
+        for seq in 0..95u64 {
+            put_referenced(&store, &tenant, signal, shard, seq).await;
+        }
+        for seq in 1000..1005u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("5/100 is under the ratio and under the count: no trip");
+        assert_eq!(outcome.deleted, 5);
+        assert_eq!(outcome.refused, 0);
+
+        let expected_originals: BTreeSet<String> = (1000..1005u64)
+            .map(|seq| orphan_data_key(&tenant, signal, shard, seq))
+            .collect();
+        let quarantined = keys_under(
+            &store,
+            &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+        )
+        .await;
+        let recovered: BTreeSet<String> = quarantined.iter().map(|k| recover_original(k)).collect();
+        assert_eq!(
+            recovered, expected_originals,
+            "only the five orphans are quarantined; the 95 referenced objects are untouched"
+        );
+        // The referenced data objects stay live.
+        assert_eq!(
+            keys_under(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+                .await
+                .len(),
+            95,
+            "referenced L0 data objects remain live"
+        );
+    }
+
+    /// The dangerous half: fail the copy to quarantine and assert nothing was
+    /// deleted and the refusal is counted. Copy-first/delete-second means a
+    /// failed copy leaves the live object in place.
+    #[tokio::test]
+    async fn copy_failure_leaves_object_and_counts_refusal() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 9;
+        let mem = MemoryStore::new();
+        for seq in 0..3u64 {
+            put_orphan(&mem, &tenant, signal, shard, seq).await;
+        }
+        // Every PUT under the quarantine prefix fails: the copy half never
+        // completes, so the delete half must never run.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Timeout)
+                .with_key_contains(QUARANTINE_PREFIX)
+                .with_occurrence(Occurrence::Always),
+        );
+        let store = FaultStore::new(mem, plan);
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("a copy failure is per-object, not fatal to the pass");
+        assert_eq!(outcome.deleted, 0, "nothing was moved out of the live set");
+        assert_eq!(outcome.refused, 3, "all three refusals counted");
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Timeout),
+            3,
+            "the copy PUT faulted for each candidate",
+        );
+
+        // Every live object is still present; nothing reached quarantine.
+        assert_eq!(
+            keys_under(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+                .await
+                .len(),
+            3,
+            "fail-closed: the live objects are untouched",
+        );
+        assert!(
+            keys_under(
+                &store,
+                &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+            )
+            .await
+            .is_empty(),
+            "no partial quarantine copy survived the failed put",
+        );
+    }
+
+    /// The reaper: an object past the second horizon is physically deleted; one
+    /// inside it is not. Run under `with_page_size(2)` so listing pagination is
+    /// exercised. Exact key sets.
+    #[tokio::test]
+    async fn reaper_deletes_past_horizon_keeps_within() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 5;
+        let store = MemoryStore::with_page_size(2);
+        let config = CompactorConfig::default();
+
+        // Quarantine A at t1.
+        put_orphan(&store, &tenant, signal, shard, 0).await;
+        let t1 = config.orphan_age_gate_ns() + 1;
+        let clock = FixedClock::new(t1);
+        let out = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("quarantine A");
+        assert_eq!(out.deleted, 1);
+
+        // Quarantine B one whole horizon later, at t2 = t1 + horizon.
+        put_orphan(&store, &tenant, signal, shard, 1).await;
+        let t2 = t1 + config.quarantine_horizon_ns;
+        clock.set(t2);
+        let out = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("quarantine B");
+        assert_eq!(out.deleted, 1);
+
+        // Reap at t2 + 1: A (age horizon + 1) is past the horizon; B (age 1) is
+        // not.
+        clock.set(t2 + 1);
+        let reaped = sweep_quarantine(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("reap");
+        assert_eq!(reaped.reaped, 1, "only A, past the horizon");
+        assert_eq!(reaped.retained, 1, "B is still inside the horizon");
+
+        let key_b = orphan_data_key(&tenant, signal, shard, 1);
+        let remaining = keys_under(
+            &store,
+            &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+        )
+        .await;
+        let recovered: BTreeSet<String> = remaining.iter().map(|k| recover_original(k)).collect();
+        assert_eq!(
+            recovered,
+            BTreeSet::from([key_b]),
+            "exactly B remains quarantined; A is physically gone"
+        );
+    }
+
+    /// A quarantine key whose timestamp segment is unparseable is never reaped
+    /// (fail-closed): an unreadable age is treated as not-yet-expired.
+    #[tokio::test]
+    async fn reaper_never_deletes_malformed_key() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 6;
+        let store = MemoryStore::new();
+        // A quarantine-prefixed key with no `/q<ns>` stamp.
+        let malformed = format!(
+            "{}bogus-object",
+            quarantine_l0_data_prefix(&tenant, signal, shard).unwrap()
+        );
+        store
+            .put(&malformed, Bytes::new(), PutOptions::default())
+            .await
+            .expect("seed malformed");
+        assert_eq!(parse_quarantine_timestamp(&malformed), None);
+
+        let config = CompactorConfig::default();
+        // Clock far past any horizon.
+        let clock = FixedClock::new(config.quarantine_horizon_ns * 100);
+        let reaped = sweep_quarantine(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("reap");
+        assert_eq!(reaped.reaped, 0, "a malformed key is never reaped");
+        assert_eq!(reaped.retained, 1);
     }
 
     fn idem_receipt(written_count: u64) -> IdempotencyReceipt {

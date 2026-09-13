@@ -673,6 +673,19 @@ pub const DEFAULT_ORPHAN_BREAKER_MIN_COUNT: usize = 50;
 /// in a large shard is never mistaken for mass record loss.
 pub const DEFAULT_ORPHAN_BREAKER_MAX_RATIO: f64 = 0.10;
 
+/// Default `quarantine_horizon_ns` (ADR-0058 amendment): 7 days. The second
+/// horizon orphan GC gives an operator between moving a record-less L0 data
+/// object out of the live keyspace (into `quarantine/`, past the orphan age
+/// gate) and physically deleting it. The first horizon (`grace +
+/// max_flush_lifetime`, ~25 h) is when the object is quarantined; this one is
+/// how long the recoverable copy then survives before the reaper deletes it.
+/// Sized far above the ~25 h loss-to-quarantine window so an operator who
+/// misses the quarantine signal still has most of a week to restore the lost
+/// commit records or copy the bytes back before the loss becomes permanent.
+/// The cost is storage: a quarantined object occupies the bucket for this long
+/// past its quarantine before it is reclaimed.
+pub const DEFAULT_QUARANTINE_HORIZON_NS: i64 = 7 * 24 * NS_PER_HOUR;
+
 /// Default `audit_retention_window_ns`: 90 days. The
 /// dedicated retention window for query-audit records on
 /// [`crate::query_audit::QUERY_AUDIT_SHARD`], independent of the ADR-0019
@@ -963,6 +976,19 @@ pub struct CompactorConfig {
     /// [`Self::orphan_breaker_min_count`]. Default
     /// [`DEFAULT_ORPHAN_BREAKER_MAX_RATIO`] (0.10).
     pub orphan_breaker_max_ratio: f64,
+    /// Second horizon for orphan GC (ADR-0058 amendment): how long a
+    /// record-less L0 data object, once it clears the orphan age gate, survives
+    /// in the `quarantine/` prefix before the reaper physically deletes it.
+    /// Orphan GC never deletes a candidate directly; it copies the object under
+    /// `quarantine/<original key>/q<quarantined_at_ns>` and deletes the live
+    /// key, and [`crate::sweep::sweep_quarantine`] deletes the copy only once
+    /// its embedded quarantine timestamp is more than this behind the clock. A
+    /// small out-of-band commit-record loss that stays under the mass-orphan
+    /// breaker's thresholds is therefore recoverable for this long instead of
+    /// being deleted permanently at the first horizon. Default
+    /// [`DEFAULT_QUARANTINE_HORIZON_NS`] (7 days); an existing deployment gets
+    /// the recoverable behaviour without setting anything.
+    pub quarantine_horizon_ns: i64,
     /// One-shot deliberate operator override for a tripped mass-orphan
     /// breaker (ADR-0048 decision 4). The server never sets this; it exists
     /// so a future `ravel-cli maintain sweep --override-orphan-breaker`
@@ -1054,6 +1080,7 @@ impl Default for CompactorConfig {
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
             orphan_breaker_min_count: DEFAULT_ORPHAN_BREAKER_MIN_COUNT,
             orphan_breaker_max_ratio: DEFAULT_ORPHAN_BREAKER_MAX_RATIO,
+            quarantine_horizon_ns: DEFAULT_QUARANTINE_HORIZON_NS,
             force_orphan_gc: false,
             idem_dedup_window_hours: DEFAULT_IDEM_DEDUP_WINDOW_HOURS,
             audit_retention_window_ns: DEFAULT_AUDIT_RETENTION_NS,
