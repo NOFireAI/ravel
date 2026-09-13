@@ -16,8 +16,9 @@ services:
   # MinIO and the bucket-creation one-shot mirror deploy/docker-compose/minio.yml
   # exactly: same credentials, same `ravel-dev` bucket, same `minio-data/` host
   # dir (gitignored, shared with that stack, and safe to reuse across runs).
+  # quay.io rather than Docker Hub: rationale in deploy/README.md.
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     command: server /data --console-address ":9001"
     ports:
       - "127.0.0.1:9000:9000"
@@ -29,7 +30,7 @@ services:
       - ../../minio-data:/data
 
   createbucket:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     depends_on: [minio]
     # `mc alias set` fails until MinIO is reachable, so the until-loop is the
     # readiness wait: this service completes successfully only once the bucket
@@ -123,7 +124,11 @@ services:
   # log source for the README's PromQL-over-logs query (`ravel_log_lines`) when
   # no telemetrygen is involved (#1334).
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
+    # ghcr.io, not Docker Hub (otel/opentelemetry-collector-contrib): same
+    # anonymous-pull-allowance problem as the MinIO images above, and the
+    # upstream project publishes this image to ghcr.io under a different
+    # repo path (collector-releases, not collector-contrib).
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:latest
     depends_on: [ravel-server]
     command: ["--config=/etc/otel/collector-config.yaml"]
     # The collector's own metrics, for answering "is it delivering?" without
@@ -144,6 +149,12 @@ services:
   # ravel-server's /api/v1 surface, carrying the demo bearer token (ADR-0081
   # decision 1). The token lives in a checked-in provisioning file; it is a fixed
   # development credential in the same class as the MinIO secret above.
+  #
+  # Left on Docker Hub deliberately: no anonymous mirror was found elsewhere.
+  # Checked (anonymous manifest HEAD for grafana/grafana:latest):
+  #   quay.io/grafana/grafana            -> 401 (no such repository)
+  #   ghcr.io/grafana/grafana             -> 403 (forbidden)
+  #   public.ecr.aws/grafana/grafana      -> 404 (no such repository)
   grafana:
     image: grafana/grafana:latest
     depends_on: [ravel-server]
