@@ -1,3 +1,7 @@
+# Both rows below still pin an exact depth and run under RAVEL_TLA_WORKERS=auto
+# (smoke.cfg in ci.yml's required lane, exhaustive.cfg in tla-nightly.yml), so
+# both can overshoot the way commit/bands.tsv's smoke.cfg did. #1671 tracks
+# measuring and loosening them.
 cfg	min_distinct	max_distinct	min_depth	max_depth
 smoke.cfg	1950000	2070000	15	15
 exhaustive.cfg	3730000	3960000	15	15
