@@ -277,6 +277,20 @@ mod tests {
                 SqlError::Plan("No field named samples.nope".to_string()),
                 tonic::Code::FailedPrecondition,
             ),
+            (
+                // The structural-complexity rejection (issue #1680) reaches
+                // this surface through the same `validate` call the HTTP
+                // handler makes, and carries the same class: HTTP 400 here is
+                // `InvalidArgument`.
+                SqlError::Validation(
+                    crate::StatementTooComplex {
+                        count: crate::MAX_STATEMENT_COMPLEXITY + 1,
+                        max: crate::MAX_STATEMENT_COMPLEXITY,
+                    }
+                    .into(),
+                ),
+                tonic::Code::InvalidArgument,
+            ),
         ];
         for (err, code) in cases {
             let status = status_from_sql(&err, tenant);
@@ -286,5 +300,35 @@ mod tests {
                 "plan detail must not reach the client"
             );
         }
+    }
+
+    /// The complexity rejection's client message carries the two counts and
+    /// nothing else of the caller's input, so the client can see exactly how
+    /// far over the bound it was.
+    #[test]
+    fn the_complexity_rejection_message_carries_both_counts() {
+        let tenant = TenantHash([0u8; 16]);
+        let err = SqlError::Validation(
+            crate::StatementTooComplex {
+                count: crate::MAX_STATEMENT_COMPLEXITY + 1,
+                max: crate::MAX_STATEMENT_COMPLEXITY,
+            }
+            .into(),
+        );
+        let status = status_from_sql(&err, tenant);
+        assert!(
+            status
+                .message()
+                .contains(&(crate::MAX_STATEMENT_COMPLEXITY + 1).to_string()),
+            "{}",
+            status.message()
+        );
+        assert!(
+            status
+                .message()
+                .contains(&crate::MAX_STATEMENT_COMPLEXITY.to_string()),
+            "{}",
+            status.message()
+        );
     }
 }

@@ -154,62 +154,61 @@ enum Mode {
 /// the abort this guards against happens while the parsed tree is walked, and
 /// on a deep enough tree during the parse itself.
 pub fn check(sql: &str) -> Result<(), StatementTooComplex> {
-    let chars: Vec<char> = sql.chars().collect();
     let mut mode = Mode::Normal;
     let mut count: usize = 0;
-    let mut i = 0;
+    // Characters already consumed by a lookahead below, skipped when the
+    // iterator reaches them.
+    let mut skip: usize = 0;
 
-    while i < chars.len() {
-        let c = chars[i];
+    for (at, c) in sql.char_indices() {
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        let rest = &sql[at..];
+
         match mode {
             Mode::LineComment => {
                 if c == '\n' {
                     mode = Mode::Normal;
                 }
-                i += 1;
             }
             Mode::BlockComment(depth) => {
-                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                if rest.starts_with("/*") {
                     mode = Mode::BlockComment(depth + 1);
-                    i += 2;
-                } else if c == '*' && chars.get(i + 1) == Some(&'/') {
+                    skip = 1;
+                } else if rest.starts_with("*/") {
                     mode = if depth == 1 {
                         Mode::Normal
                     } else {
                         Mode::BlockComment(depth - 1)
                     };
-                    i += 2;
-                } else {
-                    i += 1;
+                    skip = 1;
                 }
             }
             Mode::Quoted(delimiter) => {
                 if c == delimiter {
                     mode = Mode::Normal;
                 }
-                i += 1;
             }
             Mode::Dollar(ref end) => {
-                if chars[i..].starts_with(&end.chars().collect::<Vec<_>>()[..]) {
-                    i += end.chars().count();
+                if rest.starts_with(end.as_str()) {
+                    skip = end.chars().count() - 1;
                     mode = Mode::Normal;
-                } else {
-                    i += 1;
                 }
             }
             Mode::Normal => {
-                if c == '-' && chars.get(i + 1) == Some(&'-') {
+                if rest.starts_with("--") {
                     mode = Mode::LineComment;
-                    i += 2;
+                    skip = 1;
                     continue;
                 }
-                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                if rest.starts_with("/*") {
                     mode = Mode::BlockComment(1);
-                    i += 2;
+                    skip = 1;
                     continue;
                 }
                 if c.is_whitespace() {
-                    i += 1;
                     continue;
                 }
 
@@ -225,17 +224,14 @@ pub fn check(sql: &str) -> Result<(), StatementTooComplex> {
 
                 if c == '\'' || c == '"' || c == '`' {
                     mode = Mode::Quoted(c);
-                    i += 1;
                     continue;
                 }
                 if c == '$'
-                    && let Some(end) = dollar_delimiter(&chars, i)
+                    && let Some(end) = dollar_delimiter(rest)
                 {
-                    i += end.chars().count();
+                    skip = end.chars().count() - 1;
                     mode = Mode::Dollar(end);
-                    continue;
                 }
-                i += 1;
             }
         }
     }
@@ -243,19 +239,19 @@ pub fn check(sql: &str) -> Result<(), StatementTooComplex> {
     Ok(())
 }
 
-/// The closing delimiter of the dollar-quoted string opening at `chars[at]`
-/// (which must be `$`), or `None` when the `$` opens no such string.
+/// The closing delimiter of the dollar-quoted string opening at the start of
+/// `rest` (whose first character must be `$`), or `None` when that `$` opens
+/// no such string.
 ///
 /// Mirrors the tokenizer: the tag runs while alphanumeric or `_`, and a `$`
 /// must close it. `$1` and a bare `$` are placeholders, not literals, and
 /// return `None` so their characters keep being counted.
-fn dollar_delimiter(chars: &[char], at: usize) -> Option<String> {
-    let mut end = at + 1;
-    while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
-        end += 1;
-    }
-    if chars.get(end) == Some(&'$') {
-        Some(chars[at..=end].iter().collect())
+fn dollar_delimiter(rest: &str) -> Option<String> {
+    let tag_len = rest[1..]
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len() - 1);
+    if rest[1 + tag_len..].starts_with('$') {
+        Some(rest[..=1 + tag_len].to_string())
     } else {
         None
     }

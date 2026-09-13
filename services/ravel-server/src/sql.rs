@@ -458,11 +458,42 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "execution",
             ),
+            (
+                // The structural-complexity rejection (issue #1680) is a bad
+                // request like every other validation refusal, not a 413 and
+                // not a 422: the statement is malformed for this endpoint, and
+                // the caller can fix it by simplifying the expression.
+                SqlError::Validation(
+                    ravel_sql::StatementTooComplex {
+                        count: ravel_sql::MAX_STATEMENT_COMPLEXITY + 1,
+                        max: ravel_sql::MAX_STATEMENT_COMPLEXITY,
+                    }
+                    .into(),
+                ),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+            ),
         ];
         for (err, status, error_type) in cases {
             let api = ServiceError::from_sql(err, tenant);
             assert_eq!(api.status, status);
             assert_eq!(api.error_type, error_type);
         }
+    }
+
+    /// The body cap and the statement gate are one decision, so the two
+    /// numbers are pinned together: a body large enough to hold a statement at
+    /// the complexity bound is accepted, and the cap stays far below the 1 MiB
+    /// that let a 500,000-operator payload through (issue #1680).
+    #[test]
+    fn the_body_cap_admits_a_statement_at_the_complexity_bound() {
+        assert_eq!(MAX_BODY_BYTES, 64 << 10);
+        let statement = "a".repeat(ravel_sql::MAX_STATEMENT_COMPLEXITY);
+        let body = format!(r#"{{"query":"{statement}"}}"#);
+        assert!(
+            body.len() < MAX_BODY_BYTES,
+            "a statement at the complexity bound must fit the body cap: {} vs {MAX_BODY_BYTES}",
+            body.len()
+        );
     }
 }
