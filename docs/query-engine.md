@@ -2083,6 +2083,15 @@ leftover request, so the model is one round too many. The same sliding
   `fetch_concurrency`). Lower `--store-get-concurrency` below
   `--promql-fetch-fanout` and the limiter binds instead, for a single-plan
   query too; this figure follows whichever bound is smaller.
+
+  `ravel-sql`'s `SqlExecutor::sql_io_shape` computes the identical
+  single-plan reduction, `ceil(segment_count / min(sql_partition_count,
+  sharedGetPermits))`, reading `sharedGetPermits` off the same process-wide
+  `GetLimiter` its three fetchers share with the PromQL path (`services/
+  ravel-server/src/query.rs` wires one `Arc<GetLimiter>` into all of them).
+  A SQL query resolves exactly one target signal per statement, so there is
+  no `distinct_plans`/wave concept to sum over here, only the single-plan
+  case above with `sql_partition_count` in place of `promql_fetch_fanout`.
 - `unfoldedSegmentsResolved`: the EXACT (never estimated) count of segments
   this query's resolve took from the recent (unfolded) listing path rather
   than a folded snapshot part (`SegmentOrigin::Recent`, ADR-0073 decision 1).
@@ -2129,6 +2138,21 @@ leftover request, so the model is one round too many. The same sliding
   would be a fabricated severity this crate cannot back up. Decided before
   any segment is opened, from the query's shape and the resolve's own
   pruning outcome, not from the fetch's actual cost.
+
+  `ravel-sql`'s `sql_io_shape` reports the same `unclassified` value for the
+  same reason on its `Logs`/`Spans`/`Alerts`/`Audit` targets: `resolve_admitted`
+  hardcodes `name_filter: None` for those targets too, so `segments_pruned`
+  is structurally 0 there regardless of window width. Only a `Metrics`
+  target's resolve carries a real name-postings filter, so only `Metrics`
+  distinguishes `selective_indexed` from `exhaustive_scan` on the SQL side.
+  This does not yet cover SQL's metadata-only fast paths (a predicate-free
+  `SELECT COUNT(*)` answered from partition statistics, or a declared-column
+  min/max/count answered from ingest stamps, both with no scan node in the
+  plan): `sql_io_shape` has no signal for "the optimizer removed the scan
+  node entirely," so those queries still report `selective_indexed`,
+  `exhaustive_scan`, or `unclassified` rather than `metadata_only`; adding
+  that signal is out of scope for the change that added SQL's `unclassified`
+  handling.
 
 What is knowable from `ravel-query`, and what is not: the per-segment fetch
 pipeline this crate owns is visible here, so `dependencyDepth` reflects it

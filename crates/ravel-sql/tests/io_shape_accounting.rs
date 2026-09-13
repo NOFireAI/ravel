@@ -23,6 +23,7 @@ use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
+use ravel_query::io_shape::PlanClass;
 use ravel_query::phase_accounting::QueryPhase;
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7};
@@ -279,4 +280,41 @@ async fn wire_rendering_names_each_phase_exactly_once_on_a_real_query() {
         .map(|e| e["phase"].as_str().expect("phase is a string"))
         .collect();
     assert_eq!(names, vec!["resolve", "plan", "probe", "scan"]);
+}
+
+/// `SqlOutcome::io_shape` on this fixture's two queries, pinned by exact
+/// value rather than `> 0`. Both segments are tiny (well under
+/// `DEFAULT_WHOLE_OBJECT_THRESHOLD`), so `dependency_depth` is 1 for either
+/// query. `service_batches` is `ceil(segments / min(sql_partition_count,
+/// shared_get_permits))`; `SqlConfig::default()` resolves
+/// `sql_partition_count()` to `DEFAULT_FETCH_CONCURRENCY` (8) and
+/// `SegmentFetcher::new`'s `GetLimiter` defaults to `DEFAULT_MAX_CONCURRENT_GETS`
+/// (16), so the bound is `min(8, 16) = 8` for both queries here, and
+/// `ceil(1 / 8) = ceil(2 / 8) = 1` either way. `plan_class` is the pair this
+/// test exists to pin post-fix: the `Metrics` target still tells a pruned
+/// fetch from a full scan via `Snapshot::segments_pruned`, so the pruned
+/// single-segment query classifies as `SelectiveIndexed` (one of the two
+/// window segments was excluded) and the unpruned two-segment query as
+/// `ExhaustiveScan` (no segment was excluded) -- neither is `Unclassified`,
+/// because that fix only changed the `Logs`/`Spans`/`Alerts`/`Audit` targets,
+/// not `Metrics`.
+#[tokio::test]
+async fn io_shape_pins_dependency_depth_service_batches_and_plan_class() {
+    let (executor, th, _len_a, _len_b, window, now) = fixture().await;
+
+    let pruned = executor
+        .execute(th, &sql_request(PRUNED_SQL, window, now))
+        .await
+        .expect("pruned query");
+    assert_eq!(pruned.io_shape.dependency_depth, 1);
+    assert_eq!(pruned.io_shape.service_batches, 1);
+    assert_eq!(pruned.io_shape.plan_class, PlanClass::SelectiveIndexed);
+
+    let unpruned = executor
+        .execute(th, &sql_request(UNPRUNED_SQL, window, now))
+        .await
+        .expect("unpruned query");
+    assert_eq!(unpruned.io_shape.dependency_depth, 1);
+    assert_eq!(unpruned.io_shape.service_batches, 1);
+    assert_eq!(unpruned.io_shape.plan_class, PlanClass::ExhaustiveScan);
 }
