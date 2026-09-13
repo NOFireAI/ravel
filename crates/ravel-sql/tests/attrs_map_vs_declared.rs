@@ -15,8 +15,9 @@
 //!   declaration is NULL under both (the cast fails to NULL, the declared
 //!   column reads NULL on a variant mismatch);
 //! - a wrong-variant value under a `str` declaration is the one defined
-//!   divergence: the map form renders the value as text, the declared column
-//!   reads NULL (ADR-0090 decision 6);
+//!   divergence: the map form renders the value as text (ADR-0090 decision 6,
+//!   declared keys stay in `attrs` too), the declared column reads NULL
+//!   (decision 7, no cast, ever);
 //! - a key that spilled into `attrs_raw` (the writer's dynamic-column budget
 //!   exhausted by an unrelated key) reads identically through both forms, on
 //!   the row path the overflow forces;
