@@ -46,6 +46,10 @@ services:
   # sample is in the in-memory head block and the write-ahead log on local disk.
   # This is NOT an object-storage durability guarantee and must never be placed
   # in the same column as Ravel's durable-on-ack S3 result (ADR-0927 decision 3).
+  # Left on Docker Hub deliberately: this is the only registry that
+  # publishes prom/prometheus, and this compose file is not run by any CI
+  # job, so it carries none of the anonymous-pull-allowance pressure the
+  # quickstart job hits (rationale in deploy/README.md).
   prometheus:
     image: prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893
     command:
@@ -85,6 +89,8 @@ services:
   # DURABILITY: local-disk storage at /victoria-metrics-data. An ack means the
   # sample is written to VictoriaMetrics' local storage; like Prometheus this is
   # a local-disk guarantee, not an object-storage one.
+  # Left on Docker Hub deliberately: same reasoning as the prometheus
+  # comparator above.
   victoriametrics:
     image: victoriametrics/victoria-metrics:v1.115.0@sha256:d8ac3a1776c8a9beead8bbd42a489c82249b1bfe9071dfd4813f34ebe36354bb
     command:
@@ -123,9 +129,7 @@ services:
   # against this MinIO is a correctness/functional result, NOT a publishable
   # cost or performance result. A real-S3 substrate is required for that, exactly
   # as Ravel's own publishable lane requires real S3.
-  # MinIO images are pulled from quay.io, not Docker Hub: Docker Hub's
-  # anonymous pull allowance is per-IP and shared across every project on a
-  # runner, so an unauthenticated pull from there fails unpredictably. The
+  # quay.io rather than Docker Hub: rationale in deploy/README.md. The
   # digest is content-addressed and identical on quay.io, so the pin below is
   # preserved, not weakened.
   minio:
@@ -173,6 +177,8 @@ services:
   # the data object and commit record are already durable in object storage
   # (ADR-0927 decision 3). Do not compare Mimir's ack latency against Ravel's on
   # the same row without this distinction.
+  # Left on Docker Hub deliberately: same reasoning as the prometheus
+  # comparator above.
   mimir:
     image: grafana/mimir:2.14.2@sha256:2d3912435771d356ec03ae4729fb584b4d76a5f035d9dda40b563a55bb6760e3
     depends_on:

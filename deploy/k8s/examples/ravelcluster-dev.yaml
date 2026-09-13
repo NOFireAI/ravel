@@ -9,6 +9,9 @@ metadata:
   name: dev
   namespace: ravel-system
 spec:
+  # A locally built/loaded tag, not a pull: this example is never applied by
+  # kind-up.sh (which renders its own RavelCluster with the built image) or
+  # by CI, so it carries no Docker Hub pull risk.
   image: ravel-server:latest
   imagePullPolicy: IfNotPresent
   shards: 4
