@@ -1732,7 +1732,13 @@ impl SqlExecutor {
     /// selector fan-out does. There is therefore no `distinct_plans`/
     /// `service_fetch_multiplier` concept to sum waves over here: this is the
     /// single-plan reduction `service_batches_over_plan_waves`'s own doc
-    /// comment names, `service_batches(segments, concurrency)` directly.
+    /// comment names, `service_batches(segments, min(sql_partition_count,
+    /// shared_get_permits))` -- the same reduction `ravel_query::engine`
+    /// computes for a single-plan PromQL query, both reading the same
+    /// process-wide `GetLimiter` (ADR-1195; `services/ravel-server/src/
+    /// query.rs` wires the identical `Arc<GetLimiter>` into this crate's
+    /// metrics, logs, and spans fetchers alike), so the two surfaces' figures
+    /// are directly comparable.
     fn sql_io_shape(
         &self,
         target: TargetSignal,
@@ -1752,8 +1758,12 @@ impl SqlExecutor {
             }
             // `SpanSegmentFetcher` has no block-range/whole-object split: it
             // always issues one whole-object GET per segment, so every span
-            // segment's dependency depth is 1 regardless of size (a threshold
-            // no `object_size` can exceed).
+            // segment with a nonzero `object_size` reports dependency depth 1
+            // regardless of size (a threshold no nonzero `object_size` can
+            // exceed). `depth_for_object` special-cases `object_size == 0` to
+            // depth 4 (see its own doc comment); a published commit record
+            // should never carry a zero object size, so that case does not
+            // arise here in practice.
             TargetSignal::Spans => u64::MAX,
         };
         let mut counts = IoShapeCounts::default();
@@ -1766,22 +1776,54 @@ impl SqlExecutor {
             .max()
             .unwrap_or(0);
         counts.record_dependency_chain(depth);
+        // The two bounds `service_batches` divides by, mirroring
+        // `ravel_query::engine::io_shape_for_resolve`: the fan-out this
+        // crate's own scan partitions the segments into
+        // (`sql_partition_count`) and the permit count of the process-wide
+        // `GetLimiter` every fetcher this executor holds shares (ADR-1195).
+        // Reading the permits off the fetcher rather than caching them here
+        // keeps one source of truth, exactly like the PromQL engine reads
+        // its own `get_limiter` rather than a copy.
         let concurrency = self.config.engine.sql_partition_count().max(1) as u64;
+        let shared_get_permits = self.fetcher.get_limiter_permits() as u64;
         counts.record_service_batches(ravel_query::io_shape::service_batches(
             snapshot.segments.len() as u64,
-            concurrency,
+            concurrency.min(shared_get_permits),
         ));
         let resolve_snapshot = phase_accounting.resolve().snapshot();
         let resolve_list_requests = resolve_snapshot.s3_requests(AccountedOp::List);
         counts.record_list_pages(resolve_list_requests.min(u64::from(u32::MAX)) as u32);
-        // SQL has no discovery-only resolve path (the PromQL engine's series-
-        // resolution callers, which never reach a fetch stage): every SQL
-        // resolve is for real evaluation, so the classification always falls
-        // through to the pruned/exhaustive split below.
-        let plan_class = if snapshot.segments_pruned > 0 {
-            PlanClass::SelectiveIndexed
-        } else {
-            PlanClass::ExhaustiveScan
+        // A metrics query's resolve carries a real pruning signal
+        // (`pushed_down_name_filter` above), so its `Snapshot::segments_pruned`
+        // genuinely distinguishes a pruned fetch from a full scan. The
+        // RLOG/RSPAN/alerts/audit lanes' resolve always passes `name_filter:
+        // None` (see `resolve_admitted` above), so `segments_pruned` is
+        // structurally always 0 for them regardless of whether the resolved
+        // window is actually narrow: reporting `ExhaustiveScan` there would be
+        // fabricated, matching the PromQL log lane's own
+        // `PlanClass::Unclassified` (`ravel_query::engine`'s
+        // `log_plan_class`).
+        //
+        // This does not yet distinguish SQL's metadata-only fast paths (a
+        // predicate-free `SELECT COUNT(*)` answered from partition statistics
+        // with no scan node in the plan, or a declared-column min/max/count
+        // answered from ingest stamps) from a real scan: both still report
+        // `SelectiveIndexed`/`ExhaustiveScan`/`Unclassified` here rather than
+        // `MetadataOnly`, since this function has no signal for "the
+        // optimizer removed the scan node entirely" and adding one is out of
+        // scope for this change.
+        let plan_class = match target {
+            TargetSignal::Metrics => {
+                if snapshot.segments_pruned > 0 {
+                    PlanClass::SelectiveIndexed
+                } else {
+                    PlanClass::ExhaustiveScan
+                }
+            }
+            TargetSignal::Logs
+            | TargetSignal::Spans
+            | TargetSignal::Alerts
+            | TargetSignal::Audit => PlanClass::Unclassified,
         };
         counts.into_shape(
             unfolded_segments_resolved,
