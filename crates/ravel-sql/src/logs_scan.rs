@@ -284,6 +284,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use datafusion::arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, DictionaryArray, FixedSizeBinaryBuilder, Int32Array,
@@ -299,7 +300,7 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
-    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
@@ -1111,6 +1112,11 @@ pub struct LogsScanExec {
     phase_accounting: PhaseAccounting,
     /// Block-level pruning counters, reported through `EXPLAIN ANALYZE`.
     metrics: ExecutionPlanMetricsSet,
+    /// The one monotonic origin every partition's timeline offsets
+    /// (`seg_*_offset`, `first_batch_elapsed`, `stream_elapsed`) are measured
+    /// from, so events from different partitions can be ordered against each
+    /// other. Taken when the plan node is built, before any partition exists.
+    created_at: Instant,
 }
 
 /// Which conjunct kept a statement off the predicate-free full-window
@@ -1201,11 +1207,70 @@ struct BlockMetrics {
     /// and that nothing fell through it.
     fast_path_whole_object_segments: Count,
     fast_path_ranged_segments: Count,
+    /// Wall time this partition spent with a segment open in flight: from the
+    /// `NextSegment` arm constructing the open future to the `Opening` arm
+    /// seeing it ready. It is the exposed open stall, not network time: an
+    /// open can mix cache hits, carried bytes, and real GETs, and the
+    /// partition does no decode while it waits.
+    open_elapsed: Time,
+    /// `Opening` polls that returned `Pending`, the count of times this
+    /// partition yielded to the runtime with an open in flight.
+    open_pending_polls: Count,
+    /// Segments this partition opened (first opens only; the `attrs_raw`
+    /// reopen counts under [`Self::reopens`]).
+    segments_opened: Count,
+    /// Wall time in `ReopenRows` opens (the `attrs_raw` fallback), kept apart
+    /// from [`Self::open_elapsed`] so a fallback's second open is visible.
+    reopen_elapsed: Time,
+    reopens: Count,
+    /// Wall time in the synchronous decode and Arrow build sites inside
+    /// `poll_next`: `next_block_columnar` plus `build_columnar_batches` on the
+    /// columnar path, `next_block` on the row path. Nothing nested is timed
+    /// twice, and the buffered-output drain is under [`Self::emit_elapsed`].
+    decode_build_elapsed: Time,
+    /// Wall time handing buffered output downstream: `emit_next_row_batch`
+    /// (which builds the row-path batch) and `emit_next_columnar_batch`.
+    emit_elapsed: Time,
+    /// This partition's wait on the shared plan barrier, from the stream's
+    /// creation to the `Planning` arm seeing the counts. Every partition waits
+    /// on the one cell, so the SUM over partitions overstates the query-level
+    /// delay; the barrier's own cost is [`Self::plan_init_elapsed`].
+    planning_wait_elapsed: Time,
+    /// Wall time of the one `compute_plan_counts` run, recorded by whichever
+    /// partition's poll initialized the shared cell. Non-zero on exactly one
+    /// partition per query, so its sum over partitions is the query's planning
+    /// cost counted once.
+    plan_init_elapsed: Time,
+    /// Offset from the exec's creation to this partition's first emitted
+    /// batch, and to the stream reporting `Done`. Both on the exec's clock.
+    first_batch_elapsed: Time,
+    stream_elapsed: Time,
+    /// `poll_next` calls, and how many of them returned `Pending`.
+    polls: Count,
+    polls_pending: Count,
 }
 
 impl BlockMetrics {
     fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         BlockMetrics {
+            open_elapsed: MetricBuilder::new(metrics).subset_time("open_elapsed", partition),
+            open_pending_polls: MetricBuilder::new(metrics)
+                .counter("open_pending_polls", partition),
+            segments_opened: MetricBuilder::new(metrics).counter("segments_opened", partition),
+            reopen_elapsed: MetricBuilder::new(metrics).subset_time("reopen_elapsed", partition),
+            reopens: MetricBuilder::new(metrics).counter("reopens", partition),
+            decode_build_elapsed: MetricBuilder::new(metrics)
+                .subset_time("decode_build_elapsed", partition),
+            emit_elapsed: MetricBuilder::new(metrics).subset_time("emit_elapsed", partition),
+            planning_wait_elapsed: MetricBuilder::new(metrics)
+                .subset_time("planning_wait_elapsed", partition),
+            plan_init_elapsed: MetricBuilder::new(metrics)
+                .subset_time("plan_init_elapsed", partition),
+            first_batch_elapsed: MetricBuilder::new(metrics)
+                .subset_time("first_batch_elapsed", partition),
+            stream_elapsed: MetricBuilder::new(metrics).subset_time("stream_elapsed", partition),
+            polls: MetricBuilder::new(metrics).counter("polls", partition),
+            polls_pending: MetricBuilder::new(metrics).counter("polls_pending", partition),
             total: MetricBuilder::new(metrics).counter("blocks_total", partition),
             scanned: MetricBuilder::new(metrics).counter("blocks_scanned", partition),
             pruned_by_postings: MetricBuilder::new(metrics)
@@ -1502,6 +1567,7 @@ impl LogsScanExec {
             properties,
             phase_accounting,
             metrics: ExecutionPlanMetricsSet::new(),
+            created_at: Instant::now(),
         })
     }
 
@@ -2389,6 +2455,7 @@ impl ExecutionPlan for LogsScanExec {
         // whole-object GET (no plan probe, no scan-side probe). Any other shape
         // falls to the plan-then-stripe path below, byte for byte, and records
         // which conjunct sent it there.
+        let blocks = BlockMetrics::new(&self.metrics, partition);
         let (work, fast_whole_segment, state) = match self.whole_segment_fast_path(&ctx.query) {
             Ok(relevant) => {
                 let n = self.target_partitions.max(1).min(relevant.max(1));
@@ -2410,6 +2477,7 @@ impl ExecutionPlan for LogsScanExec {
                     Arc::clone(&ctx),
                     Arc::clone(&self.segments),
                     self.target_partitions,
+                    blocks.plan_init_elapsed.clone(),
                 );
                 (VecDeque::new(), false, LogScanState::Planning(counts_fut))
             }
@@ -2422,7 +2490,12 @@ impl ExecutionPlan for LogsScanExec {
             ctx,
             erasure: Arc::clone(&self.erasure),
             columnar_eligible: self.columnar_eligible,
-            blocks: BlockMetrics::new(&self.metrics, partition),
+            blocks,
+            metrics: self.metrics.clone(),
+            origin: self.created_at,
+            stream_started: Instant::now(),
+            open_started: None,
+            first_batch_seen: false,
             partition,
             target_partitions: self.target_partitions,
             stripe_blocks: self.stripe_blocks,
@@ -2501,10 +2574,18 @@ fn plan_counts_future(
     ctx: Arc<PartitionCtx>,
     segments: Arc<Vec<SegmentRef>>,
     plan_concurrency: usize,
+    plan_init_elapsed: Time,
 ) -> CountsFuture {
     Box::pin(async move {
         let counts = cell
-            .get_or_try_init(|| compute_plan_counts(&ctx, &segments, plan_concurrency))
+            .get_or_try_init(|| async {
+                // Only the initializing partition runs this closure, so the
+                // metric it records is the barrier's cost counted once.
+                let started = Instant::now();
+                let counts = compute_plan_counts(&ctx, &segments, plan_concurrency).await;
+                plan_init_elapsed.add_elapsed(started);
+                counts
+            })
             .await?;
         Ok(Arc::clone(counts))
     })
@@ -3235,9 +3316,32 @@ struct LogScanStream {
     /// emitted twice. Reset when a new segment starts draining.
     seg_columnar_blocks: usize,
     state: LogScanState,
+    /// The exec's metric set, kept so per-segment timeline points can be
+    /// published as labelled metrics (`segment=<ordinal>`) alongside the
+    /// per-partition totals in [`Self::blocks`].
+    metrics: ExecutionPlanMetricsSet,
+    /// The exec's creation instant; every `*_offset` metric is measured from it.
+    origin: Instant,
+    /// When this partition's stream was built; `planning_wait_elapsed` and
+    /// `stream_elapsed` start here.
+    stream_started: Instant,
+    /// When the open (or reopen) currently in flight was constructed.
+    open_started: Option<Instant>,
+    /// Whether `first_batch_elapsed` has been recorded.
+    first_batch_seen: bool,
 }
 
 impl LogScanStream {
+    /// Publish one timeline point for the segment being drained: `name` at the
+    /// current offset from the exec's origin, labelled with the segment's
+    /// snapshot ordinal so a reader can line the partitions up on one clock.
+    fn mark_segment(&self, name: &'static str) {
+        MetricBuilder::new(&self.metrics)
+            .with_new_label("segment", self.current_seg_ordinal.to_string())
+            .subset_time(name, self.partition)
+            .add_elapsed(self.origin);
+    }
+
     /// The surviving-block index of the block the cursor is about to yield, or
     /// `None` when this scan emits no row refs.
     ///
@@ -3397,14 +3501,34 @@ impl Stream for LogScanStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        this.blocks.polls.add(1);
+        let polled = this.poll_inner(cx);
+        match &polled {
+            Poll::Pending => this.blocks.polls_pending.add(1),
+            Poll::Ready(Some(Ok(_))) if !this.first_batch_seen => {
+                this.first_batch_seen = true;
+                this.blocks.first_batch_elapsed.add_elapsed(this.origin);
+            }
+            Poll::Ready(None) => this.blocks.stream_elapsed.add_elapsed(this.origin),
+            Poll::Ready(_) => {}
+        }
+        polled
+    }
+}
+
+impl LogScanStream {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<DFResult<RecordBatch>>> {
+        let this = self;
         loop {
             // Anything buffered from the current block goes out first.
             if this.has_pending() {
+                let emit_started = Instant::now();
                 let emitted = match &this.pending {
                     Pending::Rows { .. } => this.emit_next_row_batch(),
                     Pending::Batches(_) => this.emit_next_columnar_batch(),
                     Pending::None => unreachable!("has_pending() ruled this out"),
                 };
+                this.blocks.emit_elapsed.add_elapsed(emit_started);
                 return match emitted {
                     Ok(batch) => Poll::Ready(Some(Ok(batch))),
                     Err(e) => this.fail(e),
@@ -3419,6 +3543,9 @@ impl Stream for LogScanStream {
             match &mut this.state {
                 LogScanState::Planning(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(counts)) => {
+                        this.blocks
+                            .planning_wait_elapsed
+                            .add_elapsed(this.stream_started);
                         // Cap the stride by the real block count (ADR-0102): with
                         // fewer blocks than partitions this collapses the extra
                         // partitions to empty work, exactly what the declared
@@ -3470,6 +3597,9 @@ impl Stream for LogScanStream {
                         this.current_whole_object = whole_object;
                         this.seg_columnar_blocks = 0;
                         this.block_cursor = 0;
+                        this.blocks.segments_opened.add(1);
+                        this.open_started = Some(Instant::now());
+                        this.mark_segment("seg_open_start_offset");
                         // Whole-segment fast path reads the object in one GET
                         // (#693 part 3), or by column chunk when the projection
                         // is narrow enough to pay for the extra round trips
@@ -3512,6 +3642,10 @@ impl Stream for LogScanStream {
                 },
                 LogScanState::Opening(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(Some(scan))) => {
+                        if let Some(started) = this.open_started.take() {
+                            this.blocks.open_elapsed.add_elapsed(started);
+                        }
+                        this.mark_segment("seg_open_ready_offset");
                         this.state = if this.columnar_eligible {
                             LogScanState::Columnar(Box::new(scan))
                         } else {
@@ -3523,12 +3657,23 @@ impl Stream for LogScanStream {
                     }
                     // The segment's ts span could not satisfy the query: no GET
                     // was issued and there is nothing to drain.
-                    Poll::Ready(Ok(None)) => this.state = LogScanState::NextSegment,
+                    Poll::Ready(Ok(None)) => {
+                        if let Some(started) = this.open_started.take() {
+                            this.blocks.open_elapsed.add_elapsed(started);
+                        }
+                        this.state = LogScanState::NextSegment;
+                    }
                     Poll::Ready(Err(e)) => return this.fail(e),
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        this.blocks.open_pending_polls.add(1);
+                        return Poll::Pending;
+                    }
                 },
                 LogScanState::ReopenRows { fut, skip } => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(Some(scan))) => {
+                        if let Some(started) = this.open_started.take() {
+                            this.blocks.reopen_elapsed.add_elapsed(started);
+                        }
                         let skip = *skip;
                         this.state = LogScanState::Rows {
                             scan: Box::new(scan),
@@ -3568,6 +3713,7 @@ impl Stream for LogScanStream {
                     // The view borrows `scan`, so every outcome is folded into an
                     // owned `Step` here; `this.fail`/`this.state` are only touched
                     // after the match, once that borrow has ended.
+                    let decode_started = Instant::now();
                     let step = match scan.next_block_columnar() {
                         Ok(ColumnarBlockOutcome::Exhausted) => Step::Exhausted(scan.stats()),
                         // The fast path is only entered with no erasure, so this
@@ -3615,6 +3761,7 @@ impl Stream for LogScanStream {
                         }
                         Err(e) => Step::Failed(SqlError::from(e).into()),
                     };
+                    this.blocks.decode_build_elapsed.add_elapsed(decode_started);
                     match step {
                         Step::Failed(e) => return this.fail(e),
                         Step::Exhausted(stats) => {
@@ -3626,6 +3773,7 @@ impl Stream for LogScanStream {
                             if this.fast_whole_segment {
                                 this.blocks.record_segment_totals(&stats);
                             }
+                            this.mark_segment("seg_done_offset");
                             this.state = LogScanState::NextSegment;
                         }
                         Step::Fallback => {
@@ -3681,6 +3829,8 @@ impl Stream for LogScanStream {
                                     this.current_whole_object.take(),
                                 )
                             };
+                            this.blocks.reopens.add(1);
+                            this.open_started = Some(Instant::now());
                             this.state = LogScanState::ReopenRows {
                                 fut,
                                 skip: this.seg_columnar_blocks,
@@ -3714,7 +3864,10 @@ impl Stream for LogScanStream {
                     // Drain and discard the blocks a columnar fallback already
                     // emitted, then hold the next block's records.
                     if *skip > 0 {
-                        match scan.next_block() {
+                        let decode_started = Instant::now();
+                        let next = scan.next_block();
+                        this.blocks.decode_build_elapsed.add_elapsed(decode_started);
+                        match next {
                             Ok(Some(_)) => *skip -= 1,
                             Ok(None) => {
                                 let stats = scan.stats();
@@ -3722,13 +3875,17 @@ impl Stream for LogScanStream {
                                 if this.fast_whole_segment {
                                     this.blocks.record_segment_totals(&stats);
                                 }
+                                this.mark_segment("seg_done_offset");
                                 this.state = LogScanState::NextSegment;
                             }
                             Err(e) => return this.fail(SqlError::from(e).into()),
                         }
                         continue;
                     }
-                    match scan.next_block() {
+                    let decode_started = Instant::now();
+                    let next = scan.next_block();
+                    this.blocks.decode_build_elapsed.add_elapsed(decode_started);
+                    match next {
                         Ok(Some(records)) => {
                             // Stamp the block's row-ref address before the
                             // records are held: the batch builder reads it out
@@ -3749,6 +3906,7 @@ impl Stream for LogScanStream {
                             if this.fast_whole_segment {
                                 this.blocks.record_segment_totals(&stats);
                             }
+                            this.mark_segment("seg_done_offset");
                             this.state = LogScanState::NextSegment;
                         }
                         Err(e) => return this.fail(SqlError::from(e).into()),
