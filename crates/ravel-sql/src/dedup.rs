@@ -208,22 +208,33 @@ impl DedupStream {
     /// (`crate::labels::compact_labels`), count it, and enforce the sample
     /// budget.
     ///
-    /// Compacting each slice here, not only once per flush in [`Self::flush`],
-    /// bounds `flush`'s `concat_batches` peak: every slice already carries an
-    /// at-most-one-entry dictionary going in, so one flush's peak dictionary
-    /// memory is O(`FLUSH_ROWS`) one-entry dictionaries, not O(rows x
-    /// distinct-series-per-upstream-batch). Measured on a many-series corpus
-    /// with one row per upstream batch (the case this bounds): peak
-    /// pre-flush-compaction labels memory of 350,192,304 bytes without this,
-    /// 853,232 bytes with it.
+    /// This still leaves one dictionary-bearing slice per row in `self.out`;
+    /// [`Self::flush`] collapses those slices into one shared dictionary
+    /// later, via `concat_batches`. So this call does not shrink the emitted
+    /// batch shape (`flush`'s own compaction already owns that) -- it bounds
+    /// *peak* allocation at `concat_batches` time. `concat_batches` shares an
+    /// input's dictionary only on pointer equality; without this call, every
+    /// accumulated slice still points at its whole upstream dictionary, so
+    /// concatenating rows drawn from several non-pointer-equal upstream
+    /// dictionaries appends one full dictionary per accumulated row instead
+    /// of a single already-bounded one. Compacting here first means every
+    /// slice already carries an at-most-one-entry dictionary going in, so one
+    /// flush's peak dictionary memory is O(rows accumulated since the last
+    /// flush, i.e. up to one upstream batch plus `FLUSH_ROWS`) one-entry
+    /// dictionaries, not O(rows x distinct-source-dictionaries). Measured on
+    /// a 10,000-series corpus split across 500 small segments, each with its
+    /// own dictionary (`tests/dedup_finalize_allocation.rs`): scan -> merge ->
+    /// dedup peak allocation of 387,118,145 bytes without this, 201,280,657
+    /// bytes with it.
     ///
     /// This does cost a per-row `MapBuilder` rebuild. Measured on 4095 winner
     /// rows of a single series, where every slice's dictionary is already
     /// pointer-equal so `concat_batches` alone stays cheap: pre-flush-
     /// compaction labels memory of 27,336 bytes without this, 443,056 bytes
-    /// with it -- 16x, but still four orders of magnitude under the
-    /// many-series bound above and still O(`FLUSH_ROWS`), so the trade is
-    /// kept.
+    /// with it -- 16x, but still roughly 450x under the many-series bound
+    /// above, and the true peak there is bounded by rows accumulated since
+    /// the last flush rather than by `FLUSH_ROWS` alone (see above), so the
+    /// trade is kept.
     fn finalize(&mut self, pending: Pending) -> DFResult<()> {
         let public = pending
             .row
