@@ -64,6 +64,88 @@ pub const VERSION_V6: u16 = 6;
 /// uses the whole SERIES_META. Written by every writer.
 pub const VERSION_V7: u16 = 7;
 
+/// One RSEG trailer version this build admits: a token that exists only for a
+/// version inside the reader window ([`SegmentVersion::WINDOW`]), and the type
+/// the structural validator dispatches on.
+///
+/// This is what makes the trailer gate and the structural validator unable to
+/// disagree. A raw `u16` read out of a trailer becomes a `SegmentVersion` at
+/// exactly one place ([`SegmentVersion::from_number`]); a number outside the
+/// window has no token at all, so it cannot reach a rule set, and a token can
+/// only have come from the window. The per-version rule set is then selected by
+/// an exhaustive `match` over this enum with no wildcard arm, so adding a
+/// variant without giving it a validator is a compile error rather than a
+/// silent acceptance of a version nothing knows how to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SegmentVersion {
+    /// RSEG v7 ([`VERSION_V7`]), the current version and the only one any
+    /// writer emits.
+    V7,
+}
+
+impl SegmentVersion {
+    /// The reader window (ADR-0066 decision 1: "N/N-1 window, readers first"),
+    /// newest first. THIS IS THE ONE PLACE the set of admitted versions is
+    /// written down: the trailer gate, the structural validator's dispatch,
+    /// [`SUPPORTED_VERSIONS`] (and through it `audit-versions` and `migrate`)
+    /// are all functions of this slice, none of them carrying a version literal
+    /// of its own.
+    ///
+    /// Adding N-1 at a bump is one line here. The const assertions below hold
+    /// the window to ADR-0066's shape: non-empty, at most two wide, and
+    /// contiguous, so it can never reach past N-1 or skip a version.
+    pub const WINDOW: &'static [SegmentVersion] = &[SegmentVersion::V7];
+
+    /// This version's trailer number. An exhaustive match, so a new variant
+    /// must state its number here before anything else compiles.
+    pub const fn number(self) -> u16 {
+        match self {
+            SegmentVersion::V7 => VERSION_V7,
+        }
+    }
+
+    /// Resolve a raw trailer version into a token, or `None` when it is outside
+    /// this build's window. The single resolution point: both the reader's
+    /// trailer gate and [`crate::validate_sections`] go through it, so neither
+    /// can admit a version the other rejects.
+    pub const fn from_number(version: u16) -> Option<SegmentVersion> {
+        let window = SegmentVersion::WINDOW;
+        let mut i = 0;
+        while i < window.len() {
+            let candidate = window[i];
+            if candidate.number() == version {
+                return Some(candidate);
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+/// Shape guards on the window itself (ADR-0066 decision 1). A window that is
+/// empty, wider than N/N-1, or non-contiguous fails the build rather than
+/// quietly widening what the reader admits. Non-emptiness is also what lets
+/// [`SupportedVersions::newest`] and [`SupportedVersions::oldest`] index
+/// element 0 without a fallback.
+const _: () = {
+    assert!(
+        !SegmentVersion::WINDOW.is_empty(),
+        "the RSEG reader window must admit at least the current version"
+    );
+    assert!(
+        SegmentVersion::WINDOW.len() <= 2,
+        "ADR-0066 decision 1 caps the reader window at N and N-1"
+    );
+    let mut i = 1;
+    while i < SegmentVersion::WINDOW.len() {
+        assert!(
+            SegmentVersion::WINDOW[i - 1].number() == SegmentVersion::WINDOW[i].number() + 1,
+            "the RSEG reader window must be contiguous and newest-first"
+        );
+        i += 1;
+    }
+};
+
 /// The set of RSEG trailer versions this build's reader accepts (ADR-0066
 /// decision 1: "N/N-1 window, readers first"). Writers always emit the current
 /// version [`VERSION_V7`]; readers accept the current version and, once a
@@ -72,52 +154,83 @@ pub const VERSION_V7: u16 = 7;
 /// immediately preceding version, so a retired version (RSEG v1-v6) stays
 /// rejected.
 ///
-/// This is the single source the reader gate, `audit-versions`, and `migrate`
-/// all read, so a future bump edits one constant instead of the sixteen
-/// hand-mirrored version sites ADR-0049 measured for the RSEG bump alone.
+/// This is a projection of [`SegmentVersion::WINDOW`], not a second declaration
+/// of it: membership is membership in that slice, so this and the structural
+/// validator cannot drift apart. It is the single source the reader gate,
+/// `audit-versions`, and `migrate` all read, so a future bump edits one slice
+/// instead of the sixteen hand-mirrored version sites ADR-0049 measured for the
+/// RSEG bump alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupportedVersions {
-    newest: u16,
-    oldest: u16,
+    window: &'static [SegmentVersion],
 }
 
 impl SupportedVersions {
-    /// A window accepting exactly one version. This is the shape today: only
-    /// one RSEG version has existed since ADR-0027 deleted the older readers,
-    /// so there is no N-1 to accept and the reader behaves identically to the
-    /// old single-version gate.
-    pub const fn single(version: u16) -> Self {
-        Self {
-            newest: version,
-            oldest: version,
-        }
-    }
-
-    /// The N/N-1 window: accept `newest` and the immediately preceding version.
-    /// Used at the first format bump that ships a dual reader; no RSEG version
-    /// uses it today.
-    pub const fn n_and_prev(newest: u16) -> Self {
-        // `newest` is always a real format version (>= 1), so the predecessor
-        // never underflows.
-        Self {
-            newest,
-            oldest: newest - 1,
-        }
+    /// The window over a version slice. Private: the only window that exists is
+    /// [`SUPPORTED_VERSIONS`], over [`SegmentVersion::WINDOW`], because a second
+    /// window built somewhere else is exactly the drift this type removes.
+    const fn over(window: &'static [SegmentVersion]) -> Self {
+        Self { window }
     }
 
     /// The current (newest, always-written) version.
     pub const fn newest(&self) -> u16 {
-        self.newest
+        let mut newest = self.window[0].number();
+        let mut i = 1;
+        while i < self.window.len() {
+            let v = self.window[i].number();
+            if v > newest {
+                newest = v;
+            }
+            i += 1;
+        }
+        newest
     }
 
     /// The oldest accepted version (the window floor).
     pub const fn oldest(&self) -> u16 {
-        self.oldest
+        let mut oldest = self.window[0].number();
+        let mut i = 1;
+        while i < self.window.len() {
+            let v = self.window[i].number();
+            if v < oldest {
+                oldest = v;
+            }
+            i += 1;
+        }
+        oldest
     }
 
-    /// Whether `version` is inside the accepted window.
+    /// Whether `version` is inside the accepted window. Membership in the
+    /// version slice, not `oldest..=newest`: a range would admit a number with
+    /// no [`SegmentVersion`] token if the window were ever non-contiguous, and
+    /// that number would then pass the trailer gate and be rejected by the
+    /// validator.
     pub const fn contains(&self, version: u16) -> bool {
-        version >= self.oldest && version <= self.newest
+        let mut i = 0;
+        while i < self.window.len() {
+            if self.window[i].number() == version {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// How many versions the window admits (1 today, 2 across a bump).
+    pub const fn len(&self) -> usize {
+        self.window.len()
+    }
+
+    /// Always false: the window is asserted non-empty at compile time. Present
+    /// because clippy requires it alongside [`Self::len`].
+    pub const fn is_empty(&self) -> bool {
+        self.window.is_empty()
+    }
+
+    /// The admitted versions, newest first.
+    pub fn versions(&self) -> impl Iterator<Item = SegmentVersion> + '_ {
+        self.window.iter().copied()
     }
 }
 
@@ -126,7 +239,7 @@ impl SupportedVersions {
 /// v7 bump, which deleted the v6 read and write paths in the same change,
 /// ADR-0092 decision 7); the machinery carries ADR-0066's two-wide shape ready
 /// for the first post-release bump.
-pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION_V7);
+pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::over(SegmentVersion::WINDOW);
 
 /// Series-count threshold at or above which `SegmentWriter::write_v5` emits
 /// the sparse SERIES_IDX + chunked SERIES_META sections (ADR-0026 decision
@@ -304,34 +417,50 @@ mod tests {
         assert!(!SUPPORTED_VERSIONS.contains(0));
     }
 
-    /// The N/N-1 window shape, proven on a synthetic version number rather than
-    /// a real N-1 byte fixture (no RSEG version below v6 has ever existed
-    /// post-ADR-0027). The window is exactly two versions wide: it accepts N
-    /// and N-1 and has a hard floor at N-1, rejecting N-2 and older. This is
-    /// the machinery a real bump will switch [`SUPPORTED_VERSIONS`] to; it must
-    /// never silently widen past N-1.
+    /// The window keeps ADR-0066 decision 1's shape: non-empty, at most two
+    /// versions wide, contiguous, newest first, and newest equal to the version
+    /// every writer emits. The const assertions beside [`SegmentVersion::WINDOW`]
+    /// already fail the build on the first three; this states them where a
+    /// reader of the test list can see the policy, and adds the two the const
+    /// block cannot check (newest-first ordering is checkable there, the tie to
+    /// [`VERSION_V7`] is the one that changes at a bump).
     #[test]
-    fn n_and_prev_window_is_exactly_two_wide_with_a_floor() {
-        const N: u16 = 100;
-        let window = SupportedVersions::n_and_prev(N);
-        assert_eq!(window.newest(), N);
-        assert_eq!(window.oldest(), N - 1);
-        assert!(window.contains(N), "N is accepted");
-        assert!(window.contains(N - 1), "N-1 is accepted");
-        assert!(!window.contains(N - 2), "N-2 is below the floor, rejected");
-        assert!(!window.contains(N + 1), "a newer version is rejected");
+    fn the_window_keeps_the_n_and_prev_shape() {
+        let window = SUPPORTED_VERSIONS;
+        assert!(window.len() >= 1 && window.len() <= 2, "N/N-1 at most");
+        assert!(!window.is_empty());
+        assert_eq!(window.newest(), VERSION_V7, "writers emit the newest");
+
+        let versions: Vec<u16> = window.versions().map(SegmentVersion::number).collect();
+        assert_eq!(versions[0], window.newest(), "newest first");
+        assert_eq!(
+            *versions.last().expect("non-empty window"),
+            window.oldest(),
+            "oldest last"
+        );
+        for pair in versions.windows(2) {
+            assert_eq!(pair[0], pair[1] + 1, "contiguous, descending");
+        }
     }
 
-    /// A single-version window has no predecessor: it is a one-wide window with
-    /// its floor equal to its newest, so N-1 is rejected exactly like N-2.
+    /// Every version the window admits has a token, and every version it does
+    /// not admit has none. This is the property the structural validator relies
+    /// on to be unable to disagree with the trailer gate: the two ask the same
+    /// question through [`SegmentVersion::from_number`], and a number with no
+    /// token cannot reach any rule set. Swept over the whole `u16` domain, so a
+    /// window that ever admits a number without a variant fails here.
     #[test]
-    fn single_window_has_no_predecessor() {
-        const N: u16 = 42;
-        let window = SupportedVersions::single(N);
-        assert_eq!(window.newest(), N);
-        assert_eq!(window.oldest(), N);
-        assert!(window.contains(N));
-        assert!(!window.contains(N - 1));
-        assert!(!window.contains(N + 1));
+    fn token_resolution_agrees_with_the_window_over_every_u16() {
+        for version in 0..=u16::MAX {
+            let token = SegmentVersion::from_number(version);
+            assert_eq!(
+                token.is_some(),
+                SUPPORTED_VERSIONS.contains(version),
+                "version {version}: token presence must match window membership"
+            );
+            if let Some(token) = token {
+                assert_eq!(token.number(), version, "a token round-trips its number");
+            }
+        }
     }
 }
