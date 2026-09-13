@@ -347,7 +347,9 @@ pub struct ScanTiming {
 
 /// One segment's timeline on one partition: offsets in nanoseconds from the
 /// exec's creation. A point that never happened (a segment pruned at open, a
-/// stream that failed) reads zero.
+/// stream that failed) reads zero. Rows are comparable with each other only
+/// within one exec; see [`accumulate_scan_timing`] for what a multi-scan plan
+/// does to them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SegmentTiming {
     pub partition: u64,
@@ -358,6 +360,14 @@ pub struct SegmentTiming {
 }
 
 /// Fold every `LogsScanExec` timing metric under `plan` into `timing`.
+///
+/// Elapsed sums and counts hold for any plan. Everything derived from an
+/// offset holds only while the plan has ONE `LogsScanExec`: each exec times
+/// from its own `created_at`, so under a multi-scan plan (a `UNION`, say) the
+/// `segments` offsets, `first_batch_elapsed_min_ns` and
+/// `stream_elapsed_max_ns` mix origins, and two execs can contribute rows for
+/// the same `(partition, segment)` pair. Making those comparable means giving
+/// the execs one query-level origin rather than merging harder here.
 fn accumulate_scan_timing(plan: &Arc<dyn ExecutionPlan>, timing: &mut ScanTiming) {
     if let Some(metrics) = plan.metrics() {
         let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
