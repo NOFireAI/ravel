@@ -11,8 +11,9 @@
 //! worker thread gets, because that is the budget the production failure is
 //! measured against. A test-harness thread's stack is larger, so running these
 //! on it would prove nothing about the endpoint.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use ravel_sql::{MAX_STATEMENT_COMPLEXITY, ValidationError, validate};
+use ravel_sql::{MAX_STATEMENT_COMPLEXITY, ValidationError, structural_count, validate};
 
 /// A tokio worker's stack budget.
 const WORKER_STACK_BYTES: usize = 2 << 20;
@@ -110,6 +111,59 @@ fn a_realistic_analytic_statement_is_accepted() {
     // The statement is substantial, not a token gesture at one: pin its size
     // so a later edit cannot shrink it into a trivially-passing case.
     assert!(sql.len() > 1_500, "statement length {}", sql.len());
+}
+
+/// The bound is not set below what real analytic SQL needs. The ClickBench
+/// corpus is the largest body of real statements this repository holds, read
+/// from where the benchmarks keep it rather than copied, and every one of its
+/// statements must pass the gate. Its largest statement (90 `SUM(col + n)`
+/// terms) is the one that decides the bound, so its exact structural count is
+/// pinned here: a later tightening of `MAX_STATEMENT_COMPLEXITY` fails this
+/// test rather than a user's query.
+#[test]
+fn every_clickbench_corpus_statement_is_accepted() {
+    const CLICKBENCH_CORPUS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/clickbench/hits.corpus.json"
+    ));
+    let corpus: serde_json::Value = serde_json::from_str(CLICKBENCH_CORPUS).expect("corpus parses");
+    let entries = corpus["entries"].as_array().expect("corpus has entries");
+    assert_eq!(entries.len(), 43, "corpus statement count");
+
+    let mut widest = (0usize, String::new());
+    for entry in entries {
+        let sql = entry["sql"].as_str().expect("entry has sql");
+        let id = entry["id"].as_str().unwrap_or("<unnamed>").to_string();
+        validate(sql).unwrap_or_else(|err| panic!("{id} must pass the gate: {err}"));
+        let count = structural_count(sql);
+        if count > widest.0 {
+            widest = (count, id);
+        }
+    }
+
+    assert_eq!(
+        widest,
+        (901, "q30_resolution_running_sums".to_string()),
+        "the widest corpus statement, and its exact structural count"
+    );
+    assert!(
+        widest.0 < MAX_STATEMENT_COMPLEXITY,
+        "the bound must admit the corpus: {} vs {MAX_STATEMENT_COMPLEXITY}",
+        widest.0
+    );
+}
+
+/// `structural_count` is the figure the gate decides on, so it is pinned
+/// exactly, not just in relation to the bound: whitespace is free, a literal
+/// costs one character however long it is, and a comment costs none.
+#[test]
+fn the_structural_count_is_exact() {
+    assert_eq!(structural_count("SELECT 1"), 7);
+    assert_eq!(structural_count("SELECT   \n  1"), 7);
+    assert_eq!(structural_count("SELECT 'aaaaaaaaaaaaaaaaaaaa'"), 7);
+    assert_eq!(structural_count("SELECT 1 -- aaaaaaaaaaaaaaaaaaaa\n"), 7);
+    assert_eq!(structural_count("SELECT 1 /* aaaa */"), 7);
+    assert_eq!(structural_count("SELECT 1+1"), 9);
 }
 
 /// The guard counts structure, not characters: a statement whose string
