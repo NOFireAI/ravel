@@ -1452,6 +1452,47 @@ that flag the service runs every statement whole-set on the coordinator.
 The whole seam sits behind the `flight-sql` cargo feature. The published image
 builds that feature; a source build reaches this code only by asking for it.
 
+#### The metrics SQL lane's failure sequence
+
+This part is the metrics SQL scan (`DistributedScanExec`,
+`crates/ravel-sql/src/distributed.rs`), not the `DistributedSliceScanExec` the
+rest of this section describes: the log/trace scan still propagates a worker
+error straight out of its partition stream.
+
+A heartbeat live-set keeps a dead worker registered for `3 * H`, so a slice can
+be assigned to a location whose process is gone. Each metrics slice therefore
+runs the same three steps the queryfrag lane runs
+(`DistributedScanExec::execute`): the
+assigned worker, EXACTLY ONE re-dispatch to another location in the endpoint
+list, a coordinator-local read of the same slice ticket, then a typed
+`SqlError::Execution` naming the last cause. Never a partial merge.
+
+The local step runs `RavelTableProvider::worker_fragment` over the ticket's
+pinned segments -- the same plan `SqlExecutor::worker_fragment_stream` serves a
+remote fetch from, against the same object store -- so a successful local read
+is byte-identical to the remote result it replaces. Its store spend is folded
+into the query's own phase accounting by the scan, not counted a second time as
+wire bytes.
+
+A step is taken when the previous one fails either at construction
+(`WorkerSliceClient::fetch_slice` returns `Err`) or on the FIRST POLL of its
+stream, which is where a lazily-dialed channel surfaces a refused or reset
+connection and therefore where a dead worker usually appears. Every attempt is
+probed for its first batch before the partition emits anything, so both shapes
+are caught; a failure *after* the first batch is not re-dispatchable and
+surfaces typed, because restarting the slice would feed the coordinator's
+`SortPreservingMergeExec` a second, out-of-order run of the same rows.
+`SliceFallbackCounters` counts the steps per query, split so a re-dispatch to
+another worker and a coordinator-local read are never pooled into one figure.
+
+Two things this lane does not have, and the queryfrag lane does: rendezvous
+placement (slice `k` goes to roster entry `k % len`) and a quarantine map (a
+dead location is retried by the next statement rather than skipped). Both need
+state shared with the PromQL router. The roster itself already excludes the
+coordinator's own endpoint, which the fleet live-set otherwise always contains:
+the coordinator serves its own slices through the local path, so dispatching one
+to itself over Flight would be a wasted hop.
+
 ### Budgets and the fault matrix
 
 The coordinator re-enforces the query's budgets over the folded per-slice
