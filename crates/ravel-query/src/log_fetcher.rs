@@ -3851,6 +3851,15 @@ impl BlockRangeFetcher {
                 .await?;
             if live {
                 self.observe_fetch_run(total_size);
+                if self.cache.is_some() {
+                    // Cache miss that just admitted these bytes: `cached_extent`'s
+                    // leader-miss insert put them under the cache's own ledger too,
+                    // the same overlap the whole-object funnel's `Source::Upstream`
+                    // arm marks. `live` alone cannot distinguish this from an
+                    // uncached direct GET (`cached_extent` reports `live = true`
+                    // for both), so the cache-configured check decides it here.
+                    reservation.mark_handed_off();
+                }
             } else {
                 // Cache hit: `bytes` clones the cache entry's allocation, so
                 // the cache cap and this guard both cover it for as long as
@@ -7741,6 +7750,81 @@ mod whole_object_get_limiter_tests {
              and this guard"
         );
         drop(hit);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the buffer drops"
+        );
+        assert_eq!(budget.reserved(), 0, "the reservation releases with it");
+    }
+
+    /// `covering_read`'s single-GET branch on a cache MISS: `cached_extent`
+    /// reports `live = true` for both an uncached direct GET and a cache miss
+    /// that its own leader just inserted, so `live` alone cannot tell them
+    /// apart -- the fix branches on `self.cache.is_some()` instead. This is
+    /// the cache-configured case, the very first scan against a fresh cache
+    /// (no warm-up), which is a genuine miss for both the suffix probe and
+    /// the covering read.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call added to
+    /// the `if live` arm of `covering_read`'s single-GET branch leaves
+    /// `handoff_overlap()` at 0 while this scan's buffer is held, so the
+    /// assertion below fails with: assertion `left == right` failed: a
+    /// covering-read cache miss holds the same freshly admitted bytes under
+    /// the cache cap and this guard -- left: 0, right: 477 (the fixture
+    /// object's size; confirmed by making exactly that edit, observing the
+    /// failure, and reverting it by hand).
+    #[tokio::test]
+    async fn covering_read_cache_miss_marks_the_reservation_handed_off() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+            16 * 1024 * 1024,
+            100,
+            16 * 1024 * 1024,
+        )));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(16 * 1024 * 1024));
+        // A small, explicit suffix (unlike the sibling hit test, which relies
+        // on the default `derive_suffix_len` covering the whole object): the
+        // suffix probe then caches a distinct, smaller key than the covering
+        // read's full `(0, total_size)` key, so the covering read cannot ride
+        // the probe's own insert to a hit. With the default suffix both key
+        // the same sub-range, and the probe's insert makes the "covering GET"
+        // that follows in the same scan a hit, not a miss -- there is then no
+        // way to reach the `if live` arm on a first, fresh-cache scan at all.
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_block_range_threshold(0)
+            .with_suffix_len(16)
+            .with_cache(cache)
+            .with_memory_budget(budget.clone());
+
+        let accounting = QueryAccounting::new();
+        let scan = fetcher
+            .scan_accounted_with_tenant(
+                &seg_ref(size),
+                TENANT,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                &ColumnSelection::all(),
+                &accounting,
+            )
+            .await
+            .expect("scan")
+            .expect("the segment is relevant to a full-window query");
+        assert_eq!(
+            accounting.snapshot().cache_hits,
+            0,
+            "the very first scan against a fresh cache, with a suffix probe key \
+             distinct from the covering read's, is a genuine miss on both"
+        );
+        assert_eq!(
+            budget.handoff_overlap(),
+            size,
+            "a covering-read cache miss holds the same freshly admitted bytes \
+             under the cache cap and this guard"
+        );
+        drop(scan);
         assert_eq!(
             budget.handoff_overlap(),
             0,

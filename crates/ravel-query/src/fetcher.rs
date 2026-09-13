@@ -1150,7 +1150,18 @@ impl SegmentFetcher {
             .iter()
             .map(|(start, end)| end.saturating_sub(*start))
             .fold(0u64, u64::saturating_add);
-        regions.hold_reservation(self.reserve_fetch(reserved)?);
+        let mut reservation = self.reserve_fetch(reserved)?;
+        if self.cache.is_some() {
+            // Every run below is a `GetRange::Range`, so `guarded_get` routes
+            // all of them through `cached_get` when a cache is configured: the
+            // bytes this reservation covers land in the cache's own ledger too,
+            // on a hit or a miss alike (`cached_get`'s `Source::Cache` and
+            // `Source::Upstream` arms), the same overlap `whole_object_bytes`'s
+            // two arms mark, decided once here for the whole coalesced batch
+            // rather than per source.
+            reservation.mark_handed_off();
+        }
+        regions.hold_reservation(reservation);
         let gets = join_all(runs.into_iter().map(|(start, end)| async move {
             let (got, got_cost) = self
                 .guarded_get(
@@ -4136,6 +4147,70 @@ mod tests {
             budget.reserved(),
             0,
             "the reservation releases when the FetchedRegions buffer drops"
+        );
+    }
+
+    /// `ensure_ranges`'s reservation covers a coalesced-run batch, not one
+    /// GET, so it cannot branch on a per-range `Source` the way
+    /// `LogSegmentFetcher::whole_object_bytes`'s two arms do: every run it
+    /// fetched routes through `cached_get` when a cache is configured
+    /// (`guarded_get`'s cache-eligible branch), so the whole reservation is
+    /// handed off once, decided from `self.cache.is_some()` rather than from
+    /// any one run's hit/miss outcome.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call added
+    /// in `ensure_ranges` leaves `handoff_overlap()` at 0 while the regions
+    /// are held, so the first assertion below fails with: assertion
+    /// `left == right` failed: ensure_ranges's reservation is marked handed
+    /// off while a cache is configured, since every coalesced run it fetched
+    /// is now cache-resident too -- left: 0, right: 64 (confirmed by making
+    /// exactly that edit, observing the failure, and reverting it by hand).
+    #[tokio::test]
+    async fn rseg_ensure_ranges_cache_marks_the_reservation_handed_off() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let fetcher = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(0)
+            .with_suffix_len(16)
+            .with_cache(ram_cache())
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let (_footer, _total, suffix_etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+
+        const RUN: u64 = 64;
+        assert_eq!(budget.reserved(), 0, "open_segment reserves nothing");
+        fetcher
+            .ensure_ranges(
+                &seg_ref,
+                tenant_hash,
+                &suffix_etag,
+                &[(0, RUN)],
+                &mut regions,
+                &accounting,
+            )
+            .await
+            .expect("ensure_ranges");
+        assert_eq!(
+            budget.handoff_overlap(),
+            RUN,
+            "ensure_ranges's reservation is marked handed off while a cache is \
+             configured, since every coalesced run it fetched is now \
+             cache-resident too"
+        );
+        drop(regions);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the regions drop"
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the reservation releases with the regions"
         );
     }
 

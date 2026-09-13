@@ -273,10 +273,12 @@ that are not yet reserved or tracked.
    - a cache **hit** (`Source::Cache`), where the returned buffer is the resident
      cache entry and the fetch guard reserves the same bytes the cache cap
      already holds. This one is now marked in both fetchers, so the residual `d`
-     below was believed to be the SQL boundary alone -- the 2026-09-13 amendment
-     below found a third untracked site, so that is no longer the case; the
-     reasoning is kept because it is the same shape and because a hit was as
-     real an overlap as an insert all along.
+     below was believed to be the SQL boundary alone -- the first 2026-09-13
+     amendment below found a third untracked site (`covering_read`'s insert
+     branch), and the second found a fourth class (RSEG's `ensure_ranges` plus
+     every `ObjectAssembler`-based multi-GET path), so that is no longer the
+     case; the reasoning is kept because it is the same shape and because a hit
+     was as real an overlap as an insert all along.
 
    The direction is an overcount of `unique` by the untracked overlap `d`, and
    that overcount does not stop at the decision-4 acceptance assertion: decision
@@ -316,9 +318,12 @@ marked):
   `MemoryBudget::unlimited()`: `QueryEngine::with_memory_budget` reaches only its
   `fetcher` and `log_fetcher`, and no server task installs a finite budget yet.
 - The SQL cross-boundary overlap is untracked by `handoff_overlap`. The
-  cache-hit overlap was too, and is now marked at every cache-hit call site.
-  The residual is the SQL boundary plus `covering_read`'s own cache-insert
-  branch (2026-09-13 amendment below), not the SQL boundary alone.
+  cache-hit overlap was too, and is now marked at every cache-hit call site,
+  and `covering_read`'s own cache-insert branch and RSEG's `ensure_ranges`
+  reservation are now marked too (2026-09-13 second amendment below). The
+  residual is the SQL boundary plus a materially larger, previously
+  unenumerated class: every `ObjectAssembler`-based multi-GET reservation in
+  `log_fetcher.rs` (see the second amendment), not the SQL boundary alone.
 - **Idle assembly buffers.** The invariant above is stated over LIVE bytes for
   a reason: `AssemblyBuffer::drop` returns its allocation to
   `AssemblyBufferPool`'s free list, not to the allocator, so those bytes stay
@@ -366,6 +371,62 @@ account for both terms of `d`, or mark both sites, before decision 3's
 `1.25 x d` sizing can be measured against a value smaller than what the
 calibration run linked from decision 2 already computes.
 
+#### Amendment (2026-09-13, second pass, Refs: #1170)
+
+Both sites the amendment above left open are now marked:
+`covering_read`'s single-GET cache-insert branch (`log_fetcher.rs`), and a
+site this ADR never enumerated at all -- RSEG's
+`SegmentFetcher::ensure_ranges` (`fetcher.rs`), whose reservation covers a
+`join_all`-coalesced batch of ranges that `guarded_get` routes through
+`cached_get` whenever a cache is configured, on a hit or a miss alike. This
+ADR's residual discussion has only ever tracked the RLOG (`log_fetcher.rs`)
+and RSPAN (`span_fetcher.rs`) paths; RSEG had the identical shape of gap and
+was simply never audited for it. Both fixes decide handoff from
+`self.cache.is_some()` at the batch level rather than from any individual
+sub-fetch's `Source`/`live` result, since `mark_handed_off` is idempotent and
+whole-reservation-granularity, and every cache-eligible sub-range in such a
+batch becomes cache-resident (hit or insert) whenever a cache exists at all.
+
+Closing those two was the prompt for a full sweep of every `reserve_fetch`
+call site in `ravel-query` (fetcher.rs, log_fetcher.rs, span_fetcher.rs),
+grepping `reserve_fetch`, `mark_handed_off`, and the cache-`Source`/`live`
+discriminant together. The result is that the residual does **not** shrink
+to the SQL boundary alone: it shrinks by two sites and grows by a fourth,
+previously undocumented class, which is materially larger than either fixed
+site. Every `ObjectAssembler`-based multi-GET reservation in `log_fetcher.rs`
+leaves `mark_handed_off` uncalled on every branch, hit or miss:
+
+- `covering_read`'s own segmented branch (`log_fetcher.rs`, the
+  `ObjectAssembler` loop past the single-GET early return): the reservation
+  moves into the assembler and neither the hit nor the miss arm of its
+  per-range `cached_extent` call marks it.
+- `fetch_object_with_footer`'s asm-owned reservation.
+- `fetch_object_v4` and the helpers it feeds (`fetch_blocks`,
+  `fetch_chunk_ranges`): `fetch_chunk_ranges` and `fetch_blocks` each also
+  hold their own *transient* pre-`join_all` reservation, the same shape
+  `ensure_ranges` had, also unmarked.
+- Inside `fetch_blocks`, a raw `cache.get`/`cache.insert` pair (the
+  already-resident-from-probe branch) that never goes through
+  `reserve_fetch` or a reservation at all: verified bytes are inserted into
+  the cache with no ledger overlap recorded on either side, because there is
+  no reservation live at that point to mark.
+
+`ObjectAssembler` exposes no method to mark handoff on the `Reservation` it
+owns, so none of these close with a one-line mirror of this round's fix; each
+needs either a handoff-marking method added to `ObjectAssembler` or a
+restructure of the call site. None of this is fixed in this pass -- it is
+scope beyond the two sites this round closed -- and it is reported rather
+than silently patched, per this repo's contradiction/bug-outside-scope rule.
+
+So after this second amendment the untracked residual `d` in decision 2's
+`unique` expression is the SQL cross-boundary overlap (still unmarked, and
+outside `ravel-query`) **plus** the `ObjectAssembler`-based multi-GET class
+above (also still unmarked, and larger in call-site count than either of the
+two sites this round closed), not the SQL boundary alone. The reserve
+derivation must account for both terms, or close the `ObjectAssembler` class,
+before decision 3's `1.25 x d` sizing can be measured against a value smaller
+than what the calibration run linked from decision 2 already computes.
+
 ### 3. A static carve under one number
 
 `resolve_performance_defaults` derives one `memory_budget_bytes` from the
@@ -399,13 +460,16 @@ subtracts.
 This paragraph originally said that expression was exact by construction. It is
 exact only if every overlap is marked, which the first implementation did not
 achieve: see the amendments under decision 2. Cache hits are now marked at
-every call site, but two overlaps remain unmarked: the SQL cross-boundary one,
-where the fetch guard and the scan's `try_grow` both cover the buffer, and
-`covering_read`'s own cache-insert overlap (2026-09-13 amendment). Until both
-are marked, `unique` is an upper bound, the reserve derived from it is
-undersized by roughly 1.25 times their combined residual, and the
-calibration run must either mark them first or measure the residual and widen
-the multiplier. The margin covers allocator slack and sampling, not accounting
+every call site, and so are `covering_read`'s cache-insert branch and RSEG's
+`ensure_ranges` reservation (2026-09-13, second amendment), but two classes of
+overlap remain unmarked: the SQL cross-boundary one, where the fetch guard and
+the scan's `try_grow` both cover the buffer, and every `ObjectAssembler`-based
+multi-GET reservation in `log_fetcher.rs` (also the second amendment), a
+larger class than either site just closed. Until both are marked, `unique` is
+an upper bound, the reserve derived from it is undersized by roughly 1.25
+times their combined residual, and the calibration run must either mark them
+first or measure the residual and widen the multiplier. The margin covers
+allocator slack and sampling, not accounting
 overlap, so it cannot be leaned on to absorb this. That value lands as a
 constant in the derivation with the calibration figures in its doc comment, the
 way `CACHE_MEMORY_PERCENT` carries the sweep, in a commit that precedes the
