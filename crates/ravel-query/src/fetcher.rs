@@ -736,6 +736,19 @@ impl SegmentFetcher {
         &self.get_limiter
     }
 
+    /// This fetcher's `GetLimiter` permit count (ADR-1195): the process-wide
+    /// GET concurrency bound, shared with every other fetcher and engine that
+    /// took the same `Arc` via [`Self::with_get_limiter`]. `io_shape`'s
+    /// `service_batches` needs this the same way
+    /// `ravel_query::engine::io_shape_for_resolve` reads its own
+    /// `QueryEngine::get_limiter`: a caller who set `--store-get-concurrency`
+    /// below its own fan-out makes the limiter, not the fan-out, the real
+    /// binding bound.
+    #[must_use]
+    pub fn get_limiter_permits(&self) -> usize {
+        self.get_limiter.permits()
+    }
+
     /// One store GET, bounded by the shared in-flight limiter. The permit
     /// is released the moment the GET resolves; callers must
     /// never hold the returned future's permit across another
