@@ -421,16 +421,21 @@ async fn largest_ipc_body_fits_a_stock_flight_client() {
 }
 
 /// Every other test in this file drives `provider.plan()` straight into
-/// `collect()`, which never runs the DataFusion optimizer, so none of them
-/// exercise a batch shape wider than the dedup operator's own `FLUSH_ROWS`
-/// (1024) or the upstream scan window. A `SessionContext` query with a
-/// residual filter (`RavelTableProvider::supports_filters_pushdown` reports
-/// `Inexact` for every filter, so DataFusion always keeps one) makes
-/// DataFusion plan a real `FilterExec` above the dedup, which internally
-/// coalesces the filtered-through rows up to its own 8192-row batch size
-/// before emitting -- a wider, client-boundary-shaped batch the collect()
-/// path never produces. This must still satisfy the same
-/// `entries == distinct` bound.
+/// `collect()`, which never runs the DataFusion optimizer. This test instead
+/// runs the same corpus through a `SessionContext` query with a residual
+/// filter (`RavelTableProvider::supports_filters_pushdown` reports `Inexact`
+/// for every filter, so DataFusion always keeps one), which makes DataFusion
+/// plan a real `FilterExec` above the dedup, to prove the optimizer inserts
+/// no stage that breaks the dedup operator's own `entries == distinct` bound.
+///
+/// It does not exercise a wider batch shape than the `collect()` path:
+/// measured on `varied_corpus(1000, 20)`, both paths produce the identical
+/// four batch sizes (`[8191, 8192, 3616, 1]`, up to ordering) -- `FilterExec`
+/// does not coalesce across the dedup operator's flush boundaries here.
+/// Nothing in this file exercises a client-facing batch assembled from more
+/// than one dedup flush, the case `DedupStream::flush`'s own doc comment
+/// calls out: each flush is compacted independently of every other, so two
+/// flush batches' dictionaries are never merged by anything in this crate.
 #[tokio::test]
 async fn optimizer_path_batches_stay_client_sized() {
     let series = varied_corpus(1000, 20);
@@ -464,8 +469,10 @@ async fn optimizer_path_batches_stay_client_sized() {
     );
     assert!(
         batches.iter().any(|b| b.num_rows() > 1024),
-        "expected FilterExec's own batch coalescing to produce a batch \
-         larger than the dedup operator's FLUSH_ROWS, got max {}",
+        "expected at least one flushed batch larger than the dedup \
+         operator's FLUSH_ROWS (the dedup operator's own flush windows can \
+         already exceed it; see `dedup_finalize_allocation_single_series.rs`), \
+         got max {}",
         batches.iter().map(RecordBatch::num_rows).max().unwrap_or(0)
     );
 
