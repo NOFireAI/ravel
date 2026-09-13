@@ -798,8 +798,14 @@ groups:
             No rule is being evaluated and no transition is being written or
             notified on this process, while the pod still reads Running and
             Ready. The first operator-visible symptom would otherwise be an
-            alert that never arrived. Check the process logs for a panic in the
-            evaluator task.
+            alert that never arrived. Check the process logs for a panic in an
+            evaluator task. This gauge is process-wide liveness and not
+            per-tenant: the evaluator runs one task per tenant and every task
+            stamps the same gauge, so one tenant's dead evaluator stays hidden
+            while any other tenant on the process keeps ticking. Per-tenant
+            liveness cannot be a label on this route under ADR-0044, so a
+            deployment that needs it runs one tenant per process or watches
+            the alert output itself.
       - alert: RavelAlertNotificationsAllFailing
         # Delivery failure is retried every tick, so a genuinely broken sink
         # advances the failure counter continuously while the delivered counter
