@@ -347,10 +347,12 @@ async fn compaction_preserves_every_rows_label_set() {
 
 /// Client-boundary size, measured on the raw per-flush `RsegDedupExec` output
 /// batch obtained from `run` (`provider.plan()` + `collect()`, bypassing
-/// `SessionContext`). That per-flush batch is not a proxy for the wire unit a
-/// Flight client receives, it *is* that unit: `src/flight/stream.rs` feeds
-/// the execution stream's batches straight into `FlightDataEncoderBuilder`
-/// with no intervening batch-coalescing stage of its own.
+/// `SessionContext`). That per-flush batch is the unit `src/flight/stream.rs`
+/// hands to `FlightDataEncoderBuilder`, with no intervening batch-coalescing
+/// stage of its own: `FlightDataEncoder` may still split the batch's data
+/// half at `max_flight_data_size`, but under `DictionaryHandling::Resend` the
+/// dictionary message itself is always emitted whole, so this body bounds
+/// every message a client sees.
 /// `optimizer_path_batches_stay_client_sized` (below) covers the same bound
 /// on the `SessionContext`/optimizer path, whose own batch coalescing
 /// produces a different, larger batch shape.
