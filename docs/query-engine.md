@@ -2619,6 +2619,51 @@ Surface: 133 constructs over 242 corpus entries in 10 corpus files.
 | subquery per-node point cap | accepted divergence | accepted divergence | ADR-0030, 2 corpus entries; Ravel's per-subquery-node 11,000-point budget has no Prometheus counterpart, so Ravel rejects by design where Prometheus accepts; the comparator asserts exactly that shape |
 <!-- END GENERATED PROMQL CONFORMANCE TABLE -->
 
+## SQL statement complexity gate (issue #1680)
+
+`ravel_sql::validate` is the single gate every SQL surface reaches: the
+`POST /api/v1/sql` handler, Flight SQL's `get_flight_info_statement` and
+`do_get_statement`, and the page plan. Its first step, before the text is
+parsed at all, is a structural-complexity check over the raw statement
+(`ravel_sql::complexity_guard`). A statement over the bound is rejected with
+HTTP 400 (`InvalidArgument` on the Flight surface), and the message carries
+the measured count and the maximum and nothing else of the caller's input.
+
+The check exists because a flat operator chain (`SELECT 1+1+1+...`) parses at
+a nesting depth of one while building a tree one level deep per operator: the
+parser consumes same-precedence infix operators in a loop, so its own
+recursion limit never sees them. Every later walk over that tree -- the
+read-only and excluded-function visitors here, the page-plan rewrites,
+DataFusion's SQL-to-`LogicalPlan` conversion, and the tree's `Drop` -- then
+recurses once per level, and a stack overflow on a tokio worker's 2 MiB stack
+aborts the process rather than raising a catchable panic, taking every other
+tenant on the node with it.
+
+What is bounded is not nesting depth but a sound invariant: a
+recursive-descent parser cannot produce more tree levels than it has
+structural characters to consume. The count is of non-whitespace characters
+outside literals and comments, so a long `LIKE` pattern, an embedded JSON
+document, or a long comment costs nothing beyond one character for the
+literal token itself, while every construct that can deepen a tree is
+bounded, including ones nobody has tested.
+
+Three numbers, one decision:
+
+- `ravel_sql::MAX_STATEMENT_COMPLEXITY` is 600 structural characters. It is
+  set at a third of the tightest measured survival figure: on a 2 MiB stack
+  in a release build, DataFusion's SQL-to-`LogicalPlan` conversion survives
+  1,807 characters of a binary-operator chain and aborts at 1,907. (The
+  validation walk itself survives 50,007 and aborts at 60,007, so the
+  planner, not the gate's own caller, is the binding consumer.)
+- The parser recursion limit is pinned at 50 rather than inherited from
+  `datafusion-sql`'s default. It is a second, independent bound: it catches
+  nested constructs (parentheses, subqueries) that the complexity count would
+  otherwise let through, and the complexity count catches the flat chains it
+  cannot see.
+- `POST /api/v1/sql` caps the request body at 64 KiB, down from 1 MiB. A
+  statement at the complexity bound fits in it many times over, with room for
+  whitespace, string literals, and `min_commit_token` values.
+
 ## SQL over logs (the `logs` table, ADR-0033)
 
 `POST /api/v1/sql` serves five tables from one endpoint, of which this section

@@ -105,6 +105,17 @@ coverage without `allow_partial: true` is 503. `/api/v1/analytics` and
 ceiling as the other query routes, and a request refused by it gets the same
 503 body those routes return.
 
+`/api/v1/sql` caps its request body at 64 KiB; a larger body is 400. The
+statement itself is gated before it is parsed: a statement carrying more than
+600 structural characters (non-whitespace characters outside string literals
+and comments) is 400, with a message naming the measured count and the
+maximum. The gate bounds the depth of the expression tree a statement can
+build, which no body-size cap does on its own, and it applies to Flight SQL
+too, where it surfaces as `InvalidArgument`. A long string literal or comment
+costs one character against the count, so the bound constrains structure
+rather than text length. See docs/query-engine.md, "SQL statement complexity
+gate".
+
 `/api/v1/sql` is behind the `sql` cargo feature. The published server image
 builds that feature, so the route is available there. Its response envelope is
 
