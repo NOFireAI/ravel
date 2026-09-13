@@ -1,6 +1,9 @@
-//! Peak allocation for `RsegDedupExec`'s labels-dictionary handling
-//! (`src/dedup.rs`, `DedupStream::flush`) on the worst case for it: one
-//! series with many samples. Issue #1582 measurement round, deferral round.
+//! Allocation-churn figures (cumulative bytes allocated over the run, via
+//! `stats_alloc`; not peak resident bytes -- see
+//! `tests/peak_alloc_instrument.rs`) for `RsegDedupExec`'s labels-dictionary
+//! handling (`src/dedup.rs`, `DedupStream::flush`) on the worst case for it:
+//! one series with many samples. Issue #1582 measurement round, deferral
+//! round.
 //!
 //! Unlike `tests/dedup_finalize_allocation.rs`'s many-small-segments corpus,
 //! every row here shares the *same* series and so the *same* one-entry
@@ -43,15 +46,16 @@ static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 const TENANT: TenantHash = TenantHash([12u8; 16]);
 const SAMPLES: usize = 20_000;
 
-/// Bytes the whole scan -> merge -> dedup pipeline may allocate to answer
+/// Allocation churn (cumulative bytes allocated, not peak resident bytes)
+/// the whole scan -> merge -> dedup pipeline may accumulate answering
 /// `SELECT * FROM samples` over one series with 20,000 samples in one
 /// segment. Measured on this fixture (debug build, cargo test default
 /// profile, the same profile as `tests/dedup_finalize_allocation.rs`):
 ///
-///   - compaction skipped/deleted outright:                65,194,710 bytes
-///   - as committed pre-memo (issue #1582 round 1):       345,644,574 bytes
-///   - as committed, memo but unconditional (round 2):     65,236,104 bytes
-///   - as committed today, deferred to `flush` (this round): 64,875,832 bytes
+///   - compaction skipped/deleted outright:                65,194,710 bytes allocated
+///   - as committed pre-memo (issue #1582 round 1):       345,644,574 bytes allocated
+///   - as committed, memo but unconditional (round 2):     65,236,104 bytes allocated
+///   - as committed today, deferred to `flush` (this round): 64,875,832 bytes allocated
 ///
 /// The current figure is within noise of the no-compaction floor: on this
 /// corpus almost every flush window already draws from a single dictionary
@@ -62,7 +66,7 @@ const SAMPLES: usize = 20_000;
 /// figure, so it stays decisive against a regression in either the skip or
 /// the memo (silently no longer firing, or being removed) without being so
 /// tight that unrelated allocator jitter trips it.
-const MAX_BYTES: usize = 90_000_000;
+const MAX_CHURN_BYTES: usize = 90_000_000;
 
 fn one_series_corpus(samples_each: usize) -> Vec<(LabelSet, Vec<(i64, f64)>)> {
     let labels = LabelSet::new(vec![
@@ -202,11 +206,12 @@ fn finalize_labels_compaction_on_single_series_many_samples() {
         stats.allocations, stats.bytes_allocated,
     );
     assert!(
-        stats.bytes_allocated <= MAX_BYTES,
+        stats.bytes_allocated <= MAX_CHURN_BYTES,
         "scan -> merge -> dedup over one series x {SAMPLES} samples allocated \
-         {} bytes, exceeding the {MAX_BYTES} bound (measured as committed, \
-         with the finalize labels memo in place); this guards the memo \
-         against silently no longer firing on the shape it targets",
+         {} bytes (churn), exceeding the {MAX_CHURN_BYTES} churn bound \
+         (measured as committed, with the finalize labels memo in place); \
+         this guards the memo against silently no longer firing on the \
+         shape it targets",
         stats.bytes_allocated,
     );
 }

@@ -1,7 +1,9 @@
-//! Peak allocation bound for `RsegDedupExec`'s labels-dictionary handling
-//! across a flush window (`src/dedup.rs`'s `DedupStream::flush`, deferred
-//! from an earlier per-row `finalize` call to `crate::labels::compact_labels`;
-//! issue #1582 fix-round finding at `src/dedup.rs:233`, deferral round).
+//! Allocation-churn bound (cumulative bytes allocated over the run, via
+//! `stats_alloc`; not peak resident bytes -- see `tests/peak_alloc_instrument.rs`
+//! for that) for `RsegDedupExec`'s labels-dictionary handling across a flush
+//! window (`src/dedup.rs`'s `DedupStream::flush`, deferred from an earlier
+//! per-row `finalize` call to `crate::labels::compact_labels`; issue #1582
+//! fix-round finding at `src/dedup.rs:233`, deferral round).
 //!
 //! This file contains EXACTLY ONE test on purpose, following
 //! `tests/scan_batch_allocations.rs`: the measurement is a `stats_alloc::Region`
@@ -24,8 +26,9 @@
 //! `series_id` order upstream of this operator, not by segment), but the
 //! upstream `SortPreservingMergeExec` already materializes one shared
 //! dictionary per *its own* output batch when it interleaves several small
-//! segments' rows into it -- the same pointer-equality-or-copy rule
-//! `concat_batches` follows applies to arrow's merge machinery too. So most
+//! segments' rows into it (arrow's merge shares a dictionary across an
+//! output batch under the same pointer-equality-or-copy rule
+//! `crate::labels::compact_labels` describes for `concat_batches`). So most
 //! flush windows here draw from one already-unified merge-batch dictionary,
 //! and `flush` skips the per-row `compact_labels` rebuild for them; only a
 //! flush window that straddles a merge-batch boundary needs it for real.
@@ -53,20 +56,22 @@ static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 const TENANT: TenantHash = TenantHash([11u8; 16]);
 
-/// Bytes the whole scan -> merge -> dedup pipeline may allocate to answer
-/// `SELECT * FROM samples` over the 10,000-series/500-segment corpus
-/// described above. Measured on this fixture, as committed today
+/// Allocation churn (cumulative bytes allocated over the run, not peak
+/// resident bytes) the whole scan -> merge -> dedup pipeline may accumulate
+/// answering `SELECT * FROM samples` over the 10,000-series/500-segment
+/// corpus described above. Measured on this fixture, as committed today
 /// (`flush` skips per-row compaction for a flush window whose rows all share
 /// one dictionary pointer, compacting only when they don't -- see
-/// `DedupStream::flush`): 84,838,905 bytes. Two superseded variants, kept for
-/// scale: the per-row call made unconditionally in `finalize` (an earlier
-/// round of this fix), 201,280,697 bytes; that call deleted outright,
-/// 387,118,145 bytes. This bound sits about a third of the way from the
-/// current measurement towards the unconditional-compaction figure, so it
-/// stays decisive against either superseded variant (a skip that silently
-/// stops firing, or a compaction step deleted outright) without being a bare
-/// `> 0` or a restatement of the measured number.
-const MAX_BYTES: usize = 150_000_000;
+/// `DedupStream::flush`): 84,838,905 bytes allocated. Two superseded
+/// variants, kept for scale: the per-row call made unconditionally in
+/// `finalize` (an earlier round of this fix), 201,280,697 bytes allocated;
+/// that call deleted outright, 387,118,145 bytes allocated. This bound sits
+/// about a third of the way from the current measurement towards the
+/// unconditional-compaction figure, so it stays decisive against either
+/// superseded variant (a skip that silently stops firing, or a compaction
+/// step deleted outright) without being a bare `> 0` or a restatement of the
+/// measured number.
+const MAX_CHURN_BYTES: usize = 150_000_000;
 
 /// A corpus of `count` series, each with a distinct multi-label set and one
 /// label unique to it, plus a shared and a per-series-absent label so the
@@ -226,11 +231,12 @@ fn finalize_labels_compaction_bounds_peak_allocation() {
         stats.allocations, stats.bytes_allocated,
     );
     assert!(
-        stats.bytes_allocated <= MAX_BYTES,
+        stats.bytes_allocated <= MAX_CHURN_BYTES,
         "scan -> merge -> dedup over the 10,000-series/500-segment corpus \
-         allocated {} bytes, exceeding the {MAX_BYTES} bound; this guards \
-         RsegDedupExec::flush's labels-dictionary compaction (src/dedup.rs) \
-         against being deleted or made unconditional again",
+         allocated {} bytes (churn), exceeding the {MAX_CHURN_BYTES} churn \
+         bound; this guards RsegDedupExec::flush's labels-dictionary \
+         compaction (src/dedup.rs) against being deleted or made \
+         unconditional again",
         stats.bytes_allocated,
     );
 }
