@@ -142,10 +142,11 @@ timeline, so their sum can already exceed wall time before `bloom` enters
 the picture. `bloom` is not a fifth slice alongside them either: it is
 measured *inside* `encode`, with the enclosing `encode` timer still running
 (issue #1516). The `RlogWriter` block-write loop times each block's
-`BloomBuilder` insert-plus-`finish` window and reports one entry per block
-through `WriteStats::bloom_block_ns`, which `log_shard` folds into the
-`bloom` accumulator; every one of those nanoseconds is also counted in
-`encode`. So
+`BloomBuilder` insert-plus-`finish` window and reports the per-object sum
+and block count through `WriteStats::bloom_total_ns` and
+`WriteStats::bloom_blocks`, which `log_shard` folds into the `bloom`
+accumulator as one batch of `bloom_blocks` samples; every one of those
+nanoseconds is also counted in `encode`. So
 `bloom` adds double-counting on top of the four stages' own lack of a
 wall-clock relationship. Read `bloom` as a breakdown of `encode`, never as a
 term in a total, and do not read the four disjoint-boundary stages as
@@ -281,18 +282,18 @@ flowchart LR
     end
     RTE --> MRG
     subgraph actor["shard actor (stage-timing seam)"]
-        MRG[merge] --> ENC
-        subgraph ENC["encode (one timer spans this whole box)"]
+        MRG[merge] --> ENCBOX
+        subgraph ENCBOX["encode (one timer spans this whole box)"]
             BLM["bloom (logs only)<br/>inner timer, not a slice of encode"]
         end
     end
-    ENC --> PUT[PUT]
+    ENCBOX --> PUT[PUT]
     PUT --> STORE[(object store)]
     PUT -.->|"latency, counts, bytes"| INST[InstrumentedStore]
     ADM -.-> ACC["per-stage ns accumulator<br/>(read only by the reporter)"]
     RTE -.-> ACC
     MRG -.-> ACC
-    ENC -.-> ACC
+    ENCBOX -.-> ACC
     BLM -.->|"also counted in encode"| ACC
     ACC --> REP[bench report JSON]
     INST --> REP
