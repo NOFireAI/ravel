@@ -70,7 +70,17 @@ pub fn spawn(
                 _ = &mut rx => return,
             }
             let now_ns = SystemClock.now_ns();
-            reconcile_once(controller.as_ref(), store.as_ref(), interval, now_ns).await;
+            let stats = reconcile_once(controller.as_ref(), store.as_ref(), interval, now_ns).await;
+            // A cycle that approaches the `2 * R` staleness window makes every
+            // sibling read as stale, so each process starts enforcing the whole
+            // fleet cap alone (issue #1679). The figures move before that does.
+            tracing::debug!(
+                cycle_duration_ns = stats.cycle_duration_ns,
+                siblings_observed = stats.siblings_observed,
+                stale_keys_skipped = stats.stale_keys_skipped,
+                keys_reaped = stats.keys_reaped,
+                "admission reconciliation cycle"
+            );
         }
     });
     AdmissionReconcileTask {
