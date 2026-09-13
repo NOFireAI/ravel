@@ -173,6 +173,8 @@ impl ExecutionPlan for RsegDedupExec {
             out_rows: 0,
             yielded: 0,
             input_done: false,
+            out_dict_values: None,
+            out_multi_dict: false,
             labels_memo: None,
         }))
     }
@@ -201,13 +203,21 @@ struct DedupStream {
     out_rows: usize,
     yielded: usize,
     input_done: bool,
-    /// Last one-row labels compaction `finalize` performed, for reuse when
-    /// the next row's source dictionary and key are unchanged. See
+    /// The labels dictionary `values` pointer of the first row accumulated
+    /// into `out` since the last flush, or `None` before any row has been
+    /// pushed. Compared against each new row's pointer to maintain
+    /// `out_multi_dict` without re-walking `out` at flush time.
+    out_dict_values: Option<ArrayRef>,
+    /// Whether the rows accumulated in `out` since the last flush span more
+    /// than one distinct labels-dictionary pointer. See [`Self::flush`].
+    out_multi_dict: bool,
+    /// Last one-row labels compaction `flush` performed, for reuse when the
+    /// next row's source dictionary and key are unchanged. See
     /// [`LabelsMemo`].
     labels_memo: Option<LabelsMemo>,
 }
 
-/// The last (source dictionary, key) pair `finalize`'s per-row labels
+/// The last (source dictionary, key) pair `flush`'s per-row labels
 /// compaction was run on, plus the one-entry array it produced.
 ///
 /// Two consecutive winner rows folded from the same upstream batch
@@ -228,47 +238,20 @@ struct LabelsMemo {
 }
 
 impl DedupStream {
-    /// Emit `pending` as a winner: project to the public schema, compact its
-    /// one-row labels dictionary down to the single entry it references
-    /// (`crate::labels::compact_labels`), count it, and enforce the sample
-    /// budget.
+    /// Emit `pending` as a winner: project to the public schema, track its
+    /// labels dictionary's pointer against the rest of `self.out` (see
+    /// [`Self::track_out_dict`]), count it, and enforce the sample budget.
     ///
-    /// This still leaves one dictionary-bearing slice per row in `self.out`;
-    /// [`Self::flush`] collapses those slices into one shared dictionary
-    /// later, via `concat_batches`. So this call does not shrink the emitted
-    /// batch shape (`flush`'s own compaction already owns that) -- it bounds
-    /// *peak* allocation at `concat_batches` time. `concat_batches` shares an
-    /// input's dictionary only on pointer equality; without this call, every
-    /// accumulated slice still points at its whole upstream dictionary, so
-    /// concatenating rows drawn from several non-pointer-equal upstream
-    /// dictionaries appends one full dictionary per accumulated row instead
-    /// of a single already-bounded one. Compacting here first means every
-    /// slice already carries an at-most-one-entry dictionary going in, so one
-    /// flush's peak dictionary memory is O(rows accumulated since the last
-    /// flush, i.e. up to one upstream batch plus `FLUSH_ROWS`) one-entry
-    /// dictionaries, not O(rows x distinct-source-dictionaries). Measured on
-    /// a 10,000-series corpus split across 500 small segments, each with its
-    /// own dictionary (`tests/dedup_finalize_allocation.rs`): scan -> merge ->
-    /// dedup peak allocation of 387,118,145 bytes without this, 201,280,657
-    /// bytes with it.
-    ///
-    /// This does cost a per-row `MapBuilder` rebuild. Measured on 4095 winner
-    /// rows of a single series, where every slice's dictionary is already
-    /// pointer-equal so `concat_batches` alone stays cheap: pre-flush-
-    /// compaction labels memory of 27,336 bytes without this, 443,056 bytes
-    /// with it -- 16x, but still roughly 450x under the many-series bound
-    /// above, and the true peak there is bounded by rows accumulated since
-    /// the last flush rather than by `FLUSH_ROWS` alone (see above), so the
-    /// trade is kept.
+    /// Unlike an earlier version of this operator, this does not compact the
+    /// row's labels dictionary itself: whether that is worth doing at all
+    /// depends on what the *other* rows accumulated in this flush window
+    /// look like, which only [`Self::flush`] can see. See its docs.
     fn finalize(&mut self, pending: Pending) -> DFResult<()> {
         let public = pending
             .row
             .project(&(0..PUBLIC_COLUMNS).collect::<Vec<_>>())
             .map_err(DataFusionError::from)?;
-        let mut columns = public.columns().to_vec();
-        columns[COL_LABELS] = self.compact_row_labels(&columns[COL_LABELS])?;
-        let public = RecordBatch::try_new(Arc::clone(&self.schema), columns)
-            .map_err(DataFusionError::from)?;
+        self.track_out_dict(public.column(COL_LABELS));
         self.out.push(public);
         self.out_rows += 1;
         self.yielded += 1;
@@ -280,6 +263,37 @@ impl DedupStream {
             .into());
         }
         Ok(())
+    }
+
+    /// Update `out_multi_dict` with one more accumulated row's labels
+    /// dictionary. Cheap: a pointer comparison against the first dictionary
+    /// seen since the last flush, never a walk of `self.out`. Once
+    /// `out_multi_dict` is set it stays set until the next flush clears it,
+    /// so later rows are skipped once the answer is already "more than one".
+    ///
+    /// A labels column that is not a one-row `Dictionary(Int32, _)` (the
+    /// `compact_row_labels` fallback shape, e.g. a null row) is treated as
+    /// automatically distinct, forcing the real-compaction path in `flush`
+    /// rather than risking a shared-dictionary assumption that does not
+    /// hold.
+    fn track_out_dict(&mut self, labels: &ArrayRef) {
+        if self.out_multi_dict {
+            return;
+        }
+        let this_values = labels
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .filter(|dict| dict.len() == 1 && !dict.is_null(0))
+            .map(|dict| Arc::clone(dict.values()));
+        match (&self.out_dict_values, this_values) {
+            (None, Some(values)) => self.out_dict_values = Some(values),
+            (Some(seen), Some(values)) => {
+                if !Arc::ptr_eq(seen, &values) {
+                    self.out_multi_dict = true;
+                }
+            }
+            (_, None) => self.out_multi_dict = true,
+        }
     }
 
     /// Compact a one-row labels slice's dictionary down to the single entry
@@ -312,16 +326,69 @@ impl DedupStream {
         Ok(crate::labels::compact_labels(labels)?)
     }
 
+    /// Collapse the accumulated winner rows in `self.out` into one output
+    /// batch.
+    ///
+    /// `concat_batches` shares an input's labels dictionary with the output
+    /// only on pointer equality between adjacent inputs; the moment two
+    /// accumulated rows point at different upstream dictionaries, it
+    /// concatenates instead of sharing, appending one full dictionary per
+    /// such row. `self.out_multi_dict` (maintained by `finalize` via
+    /// `track_out_dict`, cheaply, without walking `self.out`) answers that
+    /// exactly: if every accumulated row shares one dictionary pointer,
+    /// `concat_batches` was always going to share it for free, and compacting
+    /// each row down to one entry first (a `MapBuilder` rebuild per row) buys
+    /// nothing -- it is pure overhead paid to defend against a copy that was
+    /// never going to happen. Only when `out_multi_dict` is set does this
+    /// compact each row first, exactly as an earlier version of this
+    /// operator did unconditionally.
+    ///
+    /// Measured on a 5,000-series/1-segment corpus, where every accumulated
+    /// row shares one dictionary pointer so the unconditional per-row
+    /// compaction bought nothing: peak allocation of 100,683,176 bytes
+    /// compacting unconditionally, 29,948,424 bytes skipping it here (the
+    /// same figure as deleting the compaction outright; measured with a
+    /// scratch corpus, not committed as a permanent test).
+    ///
+    /// Measured on the 10,000-series/500-segment corpus in
+    /// `tests/dedup_finalize_allocation.rs`: 84,838,905 bytes, well under the
+    /// 201,280,697 an earlier round of this operator allocated compacting
+    /// unconditionally. `out_multi_dict` being set less often than the
+    /// per-segment split alone would suggest is why: the upstream
+    /// `SortPreservingMergeExec` already rebuilds one shared dictionary per
+    /// *its own* output batch when interleaving several small segments'
+    /// worth of rows into it (arrow's merge shares a dictionary across an
+    /// output batch only by first materializing one, same as
+    /// `concat_batches`), so most flush windows here draw from a single
+    /// already-unified dictionary and only the rare window spanning a merge
+    /// batch boundary needs real per-row compaction.
     fn flush(&mut self) -> DFResult<RecordBatch> {
-        let batch = concat_batches(&self.schema, self.out.iter()).map_err(DataFusionError::from)?;
+        let batch = if self.out_multi_dict {
+            let rows = std::mem::take(&mut self.out);
+            let compacted = rows
+                .into_iter()
+                .map(|row| {
+                    let mut columns = row.columns().to_vec();
+                    columns[COL_LABELS] = self.compact_row_labels(&columns[COL_LABELS])?;
+                    RecordBatch::try_new(Arc::clone(&self.schema), columns)
+                        .map_err(DataFusionError::from)
+                })
+                .collect::<DFResult<Vec<_>>>()?;
+            concat_batches(&self.schema, compacted.iter()).map_err(DataFusionError::from)?
+        } else {
+            concat_batches(&self.schema, self.out.iter()).map_err(DataFusionError::from)?
+        };
         self.out.clear();
         self.out_rows = 0;
-        // `finalize` already compacted each slice's labels dictionary to one
-        // entry, but `concat_batches` can still append them back up to one
-        // entry per row (see `crate::labels::compact_labels` for when
-        // dictionaries share vs. append). Compact once more so the flushed
-        // batch holds exactly one entry per distinct series it references;
-        // the schema and every decoded label set are unchanged.
+        self.out_dict_values = None;
+        self.out_multi_dict = false;
+        // Whether or not the loop above ran, `concat_batches` can still leave
+        // the flushed batch's dictionary holding more entries than this batch
+        // actually references (a shared source dictionary carries every
+        // series in its upstream scan batch, not just the ones that ended up
+        // here). Compact once more so the flushed batch holds exactly one
+        // entry per distinct series it references; the schema and every
+        // decoded label set are unchanged.
         //
         // This holds per flush only: each flush is compacted independently of
         // every other, so two flush batches' dictionaries are never merged
@@ -506,6 +573,8 @@ mod tests {
             out_rows: 0,
             yielded: 0,
             input_done: false,
+            out_dict_values: None,
+            out_multi_dict: false,
             labels_memo: None,
         }
     }
@@ -589,6 +658,12 @@ mod tests {
     /// key, not also the source dictionary's `values` array by pointer, would
     /// reuse the first row's compacted array for the second, silently
     /// relabeling the second series' output with the first series' labels.
+    ///
+    /// `finalize` itself no longer compacts (that decision is deferred to
+    /// `flush`, see its docs), so this drives a real `flush` to exercise
+    /// `compact_row_labels`/`LabelsMemo`: the two rows' distinct source
+    /// dictionaries set `out_multi_dict`, which is what makes `flush` take
+    /// the per-row-compaction path at all.
     #[test]
     fn memo_distinguishes_same_key_across_different_source_dictionaries() {
         let mut stream = new_dedup_stream();
@@ -607,8 +682,14 @@ mod tests {
         stream.finalize(pending_b).expect("finalize b");
 
         assert_eq!(stream.out.len(), 2, "both rows must have been finalized");
-        let got_a = decode_row0_labels(stream.out[0].column(COL_LABELS));
-        let got_b = decode_row0_labels(stream.out[1].column(COL_LABELS));
+        assert!(
+            stream.out_multi_dict,
+            "the two rows come from distinct source dictionaries"
+        );
+        let flushed = stream.flush().expect("flush");
+        assert_eq!(flushed.num_rows(), 2, "both rows must survive the flush");
+        let got_a = decode_row0_labels(&flushed.slice(0, 1).column(COL_LABELS).clone());
+        let got_b = decode_row0_labels(&flushed.slice(1, 1).column(COL_LABELS).clone());
         assert_eq!(
             got_a,
             vec![("job".to_string(), "a".to_string())],

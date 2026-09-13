@@ -1,20 +1,22 @@
 //! Peak allocation for `RsegDedupExec`'s labels-dictionary handling
-//! (`src/dedup.rs`, `DedupStream::flush`) on the worst case for it: one
-//! series with many samples. Issue #1582 measurement round, deferral round.
+//! (`src/dedup.rs`, `DedupStream::flush`) on the shape its deferral round
+//! (issue #1582) exists for: many distinct series in one segment, so every
+//! row shares one dictionary pointer but no two rows share a key.
 //!
-//! Unlike `tests/dedup_finalize_allocation.rs`'s many-small-segments corpus,
-//! every row here shares the *same* series and so the *same* one-entry
-//! dictionary key within any given upstream batch (`RsegScanExec`'s
-//! `BATCH_ROWS` = 8192, `src/scan.rs`, or `SortPreservingMergeExec`'s own
-//! output batch size, whichever bounds a given flush window). Most flush
-//! windows here draw from a single dictionary pointer throughout, so `flush`
-//! skips per-row compaction for them entirely (see `DedupStream::flush`'s
-//! docs); a flush window straddling a batch boundary is exactly the shape
-//! `flush`'s labels memo (`LabelsMemo` in `src/dedup.rs`) targets, since
-//! consecutive winner rows there still share both the source dictionary (by
-//! pointer, within one upstream batch) and the key (always 0, since there is
-//! only one series), so the memo turns all but a handful of that window's
-//! rebuilds into a cheap `Arc::clone`.
+//! Unlike `tests/dedup_finalize_allocation.rs`'s many-small-segments corpus
+//! or `tests/dedup_finalize_allocation_single_series.rs`'s one-series
+//! corpus, this corpus is the shape the labels memo (`LabelsMemo` in
+//! `src/dedup.rs`) cannot help at all: every row is a different series, so
+//! the dictionary key differs every row even though every row's dictionary
+//! *pointer* is the same one segment-wide dictionary. An earlier round of
+//! this operator compacted every row's labels down to one entry
+//! unconditionally in `finalize`, which on this corpus paid a `MapBuilder`
+//! rebuild on all 5,000 winner rows to defend against a `concat_batches`
+//! copy that was never going to happen (every row already shares one
+//! dictionary pointer, so `concat_batches` shares it for free). `flush`'s
+//! `out_multi_dict` tracking (see its docs) answers "does this flush window
+//! actually need real compaction" before doing any, and skips the rebuild
+//! entirely here.
 //!
 //! Same one-test-per-binary / current-thread-runtime constraints as
 //! `tests/dedup_finalize_allocation.rs`; see that file's header for why.
@@ -40,56 +42,57 @@ use uuid::Uuid;
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
-const TENANT: TenantHash = TenantHash([12u8; 16]);
-const SAMPLES: usize = 20_000;
+const TENANT: TenantHash = TenantHash([13u8; 16]);
+const SERIES: usize = 5_000;
 
 /// Bytes the whole scan -> merge -> dedup pipeline may allocate to answer
-/// `SELECT * FROM samples` over one series with 20,000 samples in one
-/// segment. Measured on this fixture (debug build, cargo test default
-/// profile, the same profile as `tests/dedup_finalize_allocation.rs`):
+/// `SELECT * FROM samples` over 5,000 distinct series, one sample each, in
+/// one segment (so one shared labels dictionary throughout). Measured on
+/// this fixture (debug build, cargo test default profile):
 ///
-///   - compaction skipped/deleted outright:                65,194,710 bytes
-///   - as committed pre-memo (issue #1582 round 1):       345,644,574 bytes
-///   - as committed, memo but unconditional (round 2):     65,236,104 bytes
-///   - as committed today, deferred to `flush` (this round): 64,875,832 bytes
+///   - compaction skipped/deleted outright:                29,948,424 bytes
+///   - compacting every row unconditionally (pre-deferral): 100,683,176 bytes
+///   - as committed today, deferred to `flush`:              29,566,211 bytes
 ///
-/// The current figure is within noise of the no-compaction floor: on this
-/// corpus almost every flush window already draws from a single dictionary
-/// pointer, so `flush` skips per-row compaction outright rather than relying
-/// on the memo to make it cheap; the memo still covers the rare window that
-/// straddles a batch boundary. The bound sits at roughly 1.4x the current
-/// figure (headroom for allocator noise) and less than 1/3 of the pre-memo
-/// figure, so it stays decisive against a regression in either the skip or
-/// the memo (silently no longer firing, or being removed) without being so
-/// tight that unrelated allocator jitter trips it.
-const MAX_BYTES: usize = 90_000_000;
+/// This is the corpus the deferral exists for: unconditional per-row
+/// compaction cost 3.36x more than doing nothing, and the memo could not
+/// help at all (every row is a different series, so the dictionary key never
+/// repeats) -- only skipping the rebuild when it provably buys nothing does.
+/// The current figure lands at the no-compaction floor, as expected. The
+/// bound sits at roughly 1.5x the current figure (headroom for allocator
+/// noise) and well under half the unconditional-compaction figure, so it
+/// stays decisive against the skip silently no longer firing.
+const MAX_BYTES: usize = 45_000_000;
 
-fn one_series_corpus(samples_each: usize) -> Vec<(LabelSet, Vec<(i64, f64)>)> {
-    let labels = LabelSet::new(vec![
-        Label {
-            name: "__name__".to_string(),
-            value: "http_requests".to_string(),
-        },
-        Label {
-            name: "job".to_string(),
-            value: "api".to_string(),
-        },
-        Label {
-            name: "host".to_string(),
-            value: "host-0".to_string(),
-        },
-    ])
-    .expect("valid labels");
-    let samples = (0..samples_each)
-        .map(|t| (t as i64 + 1, t as f64))
-        .collect();
-    vec![(labels, samples)]
+/// A corpus of `count` series, each with a distinct multi-label set and one
+/// label unique to it, plus a shared and a per-series-absent label so the
+/// shapes vary. One sample per series. Same shape as
+/// `tests/dedup_finalize_allocation.rs`'s `varied_corpus`.
+fn varied_corpus(count: usize) -> Vec<(LabelSet, Vec<(i64, f64)>)> {
+    (0..count)
+        .map(|s| {
+            let mut pairs = vec![
+                ("__name__".to_string(), "http_requests".to_string()),
+                ("job".to_string(), "api".to_string()),
+                ("host".to_string(), format!("host-{s}")),
+            ];
+            if s % 2 == 0 {
+                pairs.push(("region".to_string(), format!("r{}", s % 3)));
+            }
+            let labels = LabelSet::new(
+                pairs
+                    .into_iter()
+                    .map(|(name, value)| Label { name, value })
+                    .collect(),
+            )
+            .expect("valid labels");
+            (labels, vec![(1i64, s as f64)])
+        })
+        .collect()
 }
 
-/// Write `series` into one segment (unlike
-/// `tests/dedup_finalize_allocation.rs`'s many-segment split, everything
-/// here is one series in one segment, so scan/merge draws every row from one
-/// locally-built dictionary).
+/// Write all of `series` into one segment, so scan/merge draws every row
+/// from one locally-built labels dictionary.
 async fn write_fixture_one_segment(
     series: &[(LabelSet, Vec<(i64, f64)>)],
 ) -> (Arc<dyn ObjectStoreBackend>, Snapshot) {
@@ -157,6 +160,9 @@ async fn write_fixture_one_segment(
     (store, snapshot)
 }
 
+/// Run the scan -> merge -> dedup pipeline against an already-written
+/// fixture (the segment write itself is not part of what this test bounds
+/// and must stay outside the timed region).
 async fn run_pipeline(store: Arc<dyn ObjectStoreBackend>, snapshot: Snapshot) -> usize {
     let fetcher = SegmentFetcher::new(store);
     let provider = RavelTableProvider::new(
@@ -174,39 +180,39 @@ async fn run_pipeline(store: Arc<dyn ObjectStoreBackend>, snapshot: Snapshot) ->
 }
 
 #[test]
-fn finalize_labels_compaction_on_single_series_many_samples() {
+fn finalize_labels_compaction_on_many_series_one_segment() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
-    let series = one_series_corpus(SAMPLES);
+    let series = varied_corpus(SERIES);
     let (store, snapshot) = rt.block_on(write_fixture_one_segment(&series));
 
+    // One untimed warm run outside the region: the first scan of a process
+    // initializes DataFusion's lazily-built state, and those allocations
+    // belong to no query.
     let warm_rows = rt.block_on(run_pipeline(Arc::clone(&store), snapshot.clone()));
     assert_eq!(
-        warm_rows, SAMPLES,
-        "the warm run must emit one winner row per sample"
+        warm_rows, SERIES,
+        "the warm run must emit one winner per series"
     );
 
     let region = Region::new(&INSTRUMENTED_SYSTEM);
     let rows = rt.block_on(run_pipeline(store, snapshot));
     let stats = region.change();
 
-    assert_eq!(
-        rows, SAMPLES,
-        "every sample is a distinct (series, ts), so none dedup away"
-    );
+    assert_eq!(rows, SERIES, "every series is a distinct group");
     eprintln!(
-        "finalize_labels_compaction_on_single_series_many_samples: {rows} rows, \
+        "finalize_labels_compaction_on_many_series_one_segment: {rows} rows, \
          {} allocations, {} bytes allocated",
         stats.allocations, stats.bytes_allocated,
     );
     assert!(
         stats.bytes_allocated <= MAX_BYTES,
-        "scan -> merge -> dedup over one series x {SAMPLES} samples allocated \
-         {} bytes, exceeding the {MAX_BYTES} bound (measured as committed, \
-         with the finalize labels memo in place); this guards the memo \
-         against silently no longer firing on the shape it targets",
+        "scan -> merge -> dedup over 5,000 series in one segment allocated \
+         {} bytes, exceeding the {MAX_BYTES} bound; this guards \
+         RsegDedupExec::flush's out_multi_dict skip (src/dedup.rs) against \
+         silently no longer firing on the shape it targets",
         stats.bytes_allocated,
     );
 }
