@@ -291,7 +291,7 @@ use datafusion::arrow::array::{
     Int64Builder, MapBuilder, StringArray, StringBuilder, StringDictionaryBuilder,
     TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
 };
-use datafusion::arrow::datatypes::{Int32Type, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -337,7 +337,7 @@ use crate::late_materialization::{RowRef, row_ref_field};
 use crate::logs_schema::{
     FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS,
     LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
-    SPAN_ID_WIDTH, TRACE_ID_WIDTH,
+    SPAN_ID_WIDTH, TRACE_ID_WIDTH, attr_key_field_name,
 };
 use crate::rlog_attrs::{
     attr_value_to_string, decode_stream_attrs, find_attr, merged_attrs, retain_unerased,
@@ -484,6 +484,8 @@ fn resolve_columns(
     content: &[Predicate],
     erasure: &[ErasurePredicate],
     declared: &[DeclaredColumn],
+    attr_keys: &[String],
+    full_len: usize,
 ) -> ResolvedColumns {
     // Accumulated as sets first, and turned into a `ColumnSelection` below, so
     // the same walk that decides what to decode also counts how many distinct
@@ -511,7 +513,18 @@ fn resolve_columns(
             // The merged `attrs` map exposes every key, so referencing it at
             // all means every dynamic column plus the overflow.
             LOG_COL_ATTRS => all_attrs = true,
-            // A declared typed attribute column (index >= FIRST_DECLARED_COL):
+            // A synthetic per-key attribute column (index >= full_len): decode
+            // exactly that key's FIELD_DIR column(s) plus `attrs_raw`, the same
+            // per-key selection a declared column resolves to (issue #1768).
+            // This is what keeps the whole `attrs` map off the selection so the
+            // scan decodes one key's pages instead of every dynamic column.
+            other if other >= full_len => match attr_keys.get(other - full_len) {
+                Some(key) => {
+                    attrs.insert(key.clone());
+                }
+                None => all = true,
+            },
+            // A declared typed attribute column (FIRST_DECLARED_COL..full_len):
             // decode exactly that key's dynamic column, the same per-key path
             // an erasure predicate uses. `i` here is never a fixed index
             // (0..=8 are matched above), so the subtraction cannot underflow;
@@ -1066,6 +1079,18 @@ pub struct LogsScanExec {
     /// Empty for a zero-declaration query, which is byte-identical to the
     /// pre-ADR-0090 scan.
     declared: Arc<Vec<DeclaredColumn>>,
+    /// Synthetic per-key attribute columns (issue #1768). Each renders one
+    /// `attrs['k']` subscript as a `Utf8` column using the merged map's rules
+    /// (record-wins over resource/scope, values rendered as text, NULL for an
+    /// absent key), so a projection that reaches the `attrs` map only through
+    /// literal-key subscripts drops the whole-map projection: the reader decodes
+    /// only these keys' FIELD_DIR columns plus `attrs_raw` (like a declared
+    /// column) instead of every dynamic column, and the scan stays on the
+    /// columnar fast path. Index `j` here is the synthetic schema index
+    /// `full_schema.fields().len() + j`, past every declared column. Empty for
+    /// every query the [`crate::attrs_per_key::AttrsPerKeyProjection`] rule did
+    /// not rewrite, which is byte-identical to the pre-#1768 scan.
+    attr_keys: Arc<Vec<String>>,
     /// Exact per-segment column statistics for the tenant's declared columns
     /// (ADR-0850), loaded once per plan and threaded down from
     /// [`crate::executor::SqlExecutor`]. `None` when no usable column-stats
@@ -1411,6 +1436,7 @@ impl LogsScanExec {
             phase_accounting,
             full_schema,
             declared,
+            Vec::new(),
             false,
         )
     }
@@ -1443,7 +1469,45 @@ impl LogsScanExec {
             self.phase_accounting.clone(),
             Arc::clone(&self.full_schema),
             Arc::clone(&self.declared),
+            self.attr_keys.as_ref().clone(),
             row_refs,
+        )
+        .map(|scan| scan.with_column_stats(self.column_stats.clone()))
+    }
+
+    /// A sibling scan over the same table that materializes `attr_keys` as
+    /// synthetic per-key `Utf8` columns instead of the whole `attrs` map (issue
+    /// #1768). `projection` is over this scan's EXTENDED schema: the resolved
+    /// full schema (`logs_schema_with_declared`) followed by one `Utf8` field
+    /// per entry of `attr_keys`, in `attr_keys` order, so a projection index
+    /// `full_schema.fields().len() + j` selects `attr_keys[j]`. The whole-map
+    /// projection index [`LOG_COL_ATTRS`] must not appear in `projection`; the
+    /// [`crate::attrs_per_key::AttrsPerKeyProjection`] rule that calls this
+    /// replaces it with the per-key indices and rewrites the `get_field` above
+    /// the scan to match. Everything that decides which bytes are read is
+    /// carried over unchanged, so the surviving-block and surviving-row sets are
+    /// identical to the wide scan this replaces.
+    pub(crate) fn reproject_attr_keys(
+        &self,
+        projection: Vec<usize>,
+        attr_keys: Vec<String>,
+    ) -> DFResult<Self> {
+        Self::build(
+            self.tenant_hash,
+            self.fetcher.clone(),
+            &self.segments,
+            self.target_partitions,
+            self.ts_min,
+            self.ts_max,
+            Arc::clone(&self.content),
+            Arc::clone(&self.prune),
+            Arc::clone(&self.erasure),
+            Some(projection),
+            self.phase_accounting.clone(),
+            Arc::clone(&self.full_schema),
+            Arc::clone(&self.declared),
+            attr_keys,
+            false,
         )
         .map(|scan| scan.with_column_stats(self.column_stats.clone()))
     }
@@ -1477,6 +1541,7 @@ impl LogsScanExec {
         phase_accounting: PhaseAccounting,
         full_schema: SchemaRef,
         declared: Arc<Vec<DeclaredColumn>>,
+        attr_keys: Vec<String>,
         row_refs: bool,
     ) -> DFResult<Self> {
         // Blocks, not segments, are what get striped (ADR-0102), but the
@@ -1512,24 +1577,46 @@ impl LogsScanExec {
             target_partitions.max(1).min(segments.len().max(1))
         };
         let full = full_schema;
+        let full_len = full.fields().len();
+        // The scan's EXTENDED schema is the resolved full schema followed by one
+        // `Utf8` field per synthetic per-key attribute column (issue #1768), in
+        // `attr_keys` order. A projection index at or past `full_len` selects
+        // `attr_keys[i - full_len]`. With no per-key columns this is exactly the
+        // full schema, so every pre-#1768 caller is unaffected.
+        let effective: SchemaRef = if attr_keys.is_empty() {
+            Arc::clone(&full)
+        } else {
+            let mut fields = full.fields().to_vec();
+            for key in &attr_keys {
+                fields.push(Arc::new(Field::new(
+                    attr_key_field_name(key),
+                    DataType::Utf8,
+                    true,
+                )));
+            }
+            Arc::new(Schema::new(fields))
+        };
         // A `None` projection means every column, in schema order. Resolving it
         // here rather than carrying an `Option` keeps one code path for the
-        // schema, the batch builder, and the column-set resolution.
+        // schema, the batch builder, and the column-set resolution. A `None`
+        // projection never selects a synthetic per-key column: those are only
+        // ever introduced through an explicit projection by the
+        // `AttrsPerKeyProjection` rule.
         let projection: Vec<usize> = match projection {
             Some(p) => p,
-            None => (0..full.fields().len()).collect(),
+            None => (0..full_len).collect(),
         };
         for &i in &projection {
-            if i >= full.fields().len() {
+            if i >= effective.fields().len() {
                 return Err(DataFusionError::Internal(format!(
                     "logs scan projection index {i} out of range"
                 )));
             }
         }
-        let resolved = resolve_columns(&projection, &content, &erasure, &declared);
+        let resolved = resolve_columns(&projection, &content, &erasure, &declared, &attr_keys, full_len);
         let projected_fraction = resolved.fraction_of(declared.len());
         let columns = resolved.selection;
-        let projected = full.project(&projection)?;
+        let projected = effective.project(&projection)?;
         // The row-ref column is synthesized per row from the scan's own cursor
         // position, not decoded, so it contributes nothing to `columns` and
         // sits last, past every projected column, where a remapped column index
@@ -1558,6 +1645,7 @@ impl LogsScanExec {
             columns,
             projected_fraction,
             declared,
+            attr_keys: Arc::new(attr_keys),
             column_stats: None,
             full_schema: full,
             schema,
@@ -2047,6 +2135,22 @@ impl LogsScanExec {
         &self.projection
     }
 
+    /// The width of the resolved full schema
+    /// (`logs_schema_with_declared(&declared).fields().len()`). A projection
+    /// index at or past this selects a synthetic per-key attribute column
+    /// (issue #1768); the [`crate::attrs_per_key::AttrsPerKeyProjection`] rule
+    /// builds its per-key indices as `full_schema_len() + j`.
+    pub(crate) fn full_schema_len(&self) -> usize {
+        self.full_schema.fields().len()
+    }
+
+    /// Whether this scan already carries synthetic per-key attribute columns
+    /// (issue #1768). The `AttrsPerKeyProjection` rule refuses to rewrite a scan
+    /// twice, so a scan it already touched reports `true` and is left alone.
+    pub(crate) fn has_attr_keys(&self) -> bool {
+        !self.attr_keys.is_empty()
+    }
+
     /// Whether this scan can be split into a narrow phase 1 and a row-ref
     /// fetch (ADR-0774).
     ///
@@ -2081,6 +2185,8 @@ impl LogsScanExec {
             columns: self.columns.clone(),
             projection: Arc::clone(&self.projection),
             declared: Arc::clone(&self.declared),
+            attr_keys: Arc::clone(&self.attr_keys),
+            full_len: self.full_schema.fields().len(),
             schema: Arc::clone(&self.schema),
             accounting: self.phase_accounting.scan().clone(),
             concurrency: self.target_partitions,
@@ -2123,6 +2229,12 @@ pub(crate) struct RowFetchSource {
     columns: ColumnSelection,
     projection: Arc<Vec<usize>>,
     declared: Arc<Vec<DeclaredColumn>>,
+    /// Synthetic per-key attribute columns (issue #1768), so phase 2 rebuilds
+    /// the same per-key `Utf8` columns the single-phase scan would have.
+    attr_keys: Arc<Vec<String>>,
+    /// The resolved full schema width, so a projection index past it maps to
+    /// `attr_keys[index - full_len]` (issue #1768).
+    full_len: usize,
     /// The scan's original output schema, which is also this fetch's: the
     /// rewrite restores column order, names, and nullability exactly.
     schema: SchemaRef,
@@ -2237,6 +2349,8 @@ impl RowFetchSource {
             Arc::clone(&self.schema),
             &self.projection,
             &self.declared,
+            &self.attr_keys,
+            self.full_len,
             None,
         )
     }
@@ -2487,6 +2601,8 @@ impl ExecutionPlan for LogsScanExec {
             schema: Arc::clone(&self.schema),
             projection: Arc::clone(&self.projection),
             declared: Arc::clone(&self.declared),
+            attr_keys: Arc::clone(&self.attr_keys),
+            full_len: self.full_schema.fields().len(),
             ctx,
             erasure: Arc::clone(&self.erasure),
             columnar_eligible: self.columnar_eligible,
@@ -3230,6 +3346,14 @@ struct LogScanStream {
     /// [`build_batch`] and [`build_columnar_batches`] for a projected declared
     /// index.
     declared: Arc<Vec<DeclaredColumn>>,
+    /// Synthetic per-key attribute columns (issue #1768), consulted by
+    /// [`build_batch`] and [`build_columnar_batches`] for a projected per-key
+    /// index (>= [`Self::full_len`]).
+    attr_keys: Arc<Vec<String>>,
+    /// The resolved full schema width (`full_schema.fields().len()`): a
+    /// projection index at or past it selects a synthetic per-key attribute
+    /// column, `attr_keys[index - full_len]`.
+    full_len: usize,
     ctx: Arc<PartitionCtx>,
     erasure: Arc<Vec<ErasurePredicate>>,
     /// Whether this scan may attempt the columnar fast path (the query-shape
@@ -3382,6 +3506,8 @@ impl LogScanStream {
             Arc::clone(&self.schema),
             &self.projection,
             &self.declared,
+            &self.attr_keys,
+            self.full_len,
             pending_range.map(|r| RowRefRange {
                 first_row: r.first_row + *pos,
                 ..r
@@ -3743,6 +3869,8 @@ impl LogScanStream {
                                         &this.schema,
                                         &this.projection,
                                         &this.declared,
+                                        &this.attr_keys,
+                                        this.full_len,
                                         block.map(|block| RowRefRange {
                                             segment: this.current_seg_ordinal,
                                             block,
@@ -3947,6 +4075,8 @@ fn build_batch(
     schema: SchemaRef,
     projection: &[usize],
     declared: &[DeclaredColumn],
+    attr_keys: &[String],
+    full_len: usize,
     row_refs: Option<RowRefRange>,
 ) -> DFResult<RecordBatch> {
     // Precompute the merged attribute view once per record when any projected
@@ -4036,6 +4166,23 @@ fn build_batch(
                 }
                 Arc::new(attrs.finish())
             }
+            // A synthetic per-key attribute column (issue #1768): index
+            // >= full_len selects `attr_keys[i - full_len]`, rendered as `Utf8`
+            // straight from the merged view with the map's own rules. This is
+            // the row-path (attrs_raw fallback) sibling of the columnar
+            // [`build_attr_key_columnar_array`], and it renders each value with
+            // the same [`attr_value_to_string`] the `attrs` map arm above uses,
+            // so the divergence from a declared column (a non-`Str` value under
+            // a `Str` declaration renders as text here, reads NULL there) is
+            // reproduced exactly.
+            other if other >= full_len => match attr_keys.get(other - full_len) {
+                Some(key) => attr_key_column_array(key, &merged),
+                None => {
+                    return Err(DataFusionError::Internal(format!(
+                        "logs scan projection index {other} out of range"
+                    )));
+                }
+            },
             // A declared typed attribute column (ADR-0090 decisions 5-7):
             // index >= FIRST_DECLARED_COL selects `declared[i - FIRST_DECLARED_COL]`.
             // The declared key is still present in the `attrs` map arm above
@@ -4138,6 +4285,29 @@ fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>
             Arc::new(b.finish())
         }
     }
+}
+
+/// Build one synthetic per-key attribute column as a `Utf8` array from the
+/// per-record precomputed merged views (issue #1768), the row-path sibling of
+/// [`build_attr_key_columnar_array`].
+///
+/// For each record the key is looked up in that record's merged view via
+/// [`find_attr`] and rendered to text with [`attr_value_to_string`], exactly as
+/// the `attrs` map column renders it; an absent key is NULL. This is what makes
+/// `attrs['k']` diverge from a declared `Str` column `"k"` by design: a record
+/// holding a non-`Str` value under the key renders as text here (`7`) while the
+/// declared column reads NULL. The row path runs only for the `attrs_raw`
+/// overflow fallback of an otherwise-columnar query; the common case is
+/// [`build_attr_key_columnar_array`].
+fn attr_key_column_array(key: &str, merged: &[Vec<(String, AttrValue)>]) -> ArrayRef {
+    let mut b = StringBuilder::new();
+    for row in merged {
+        match find_attr(row, key) {
+            Some(v) => b.append_value(attr_value_to_string(v)),
+            None => b.append_null(),
+        }
+    }
+    Arc::new(b.finish())
 }
 
 // ---------------------------------------------------------------------------
@@ -4649,6 +4819,123 @@ fn build_declared_str_columnar(
     )
 }
 
+/// One synthetic per-key attribute column's FIELD_DIR resolution for a block
+/// (issue #1768), the map-rendering sibling of [`DeclaredPlan`]. It resolves
+/// every FIELD_DIR column of the key to a cursor once, so the row loop reads a
+/// value with no per-cell column lookup.
+struct AttrKeyPlan<'a> {
+    key: String,
+    /// The raw FIELD_DIR columns of this key, across all stored types.
+    cols: Vec<AttrColumn>,
+    /// Cursors parallel to [`Self::cols`], resolved once for the block.
+    cursors: Vec<DeclaredCursor<'a>>,
+}
+
+impl<'a> AttrKeyPlan<'a> {
+    fn build(view: &ColumnarBlockView<'a>, key: &str) -> AttrKeyPlan<'a> {
+        let cols: Vec<AttrColumn> = view.attr_columns_for(key).collect();
+        let cursors = cols
+            .iter()
+            .map(|&c| DeclaredCursor::resolve(view, c))
+            .collect();
+        AttrKeyPlan {
+            key: key.to_string(),
+            cols,
+            cursors,
+        }
+    }
+
+    /// The index of the record's WINNING occurrence of the key at surviving row
+    /// `i`, or `None` when the record sets the key in no FIELD_DIR column.
+    /// Identical rule to [`DeclaredPlan::winning_idx`]: the highest FIELD_DIR
+    /// type byte wins (the record layer's last-occurrence-wins order,
+    /// docs/log-segment-format.md), and a `Str` cell that is not valid UTF-8 is
+    /// not "present", so it does not shadow the resource/scope fallback. The
+    /// `attrs_raw` overflow tier cannot appear here: a block carrying an
+    /// `attrs_raw` page falls the whole segment back to the row path before this
+    /// builds a column.
+    fn winning_idx(&self, i: usize) -> Option<usize> {
+        self.cursors
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.present_at(i))
+            .max_by_key(|(k, _)| self.cols[*k].ty.to_u8())
+            .map(|(k, _)| k)
+    }
+}
+
+/// Per-key, per-block resolver for a synthetic attribute column's merged value
+/// rendered as text (issue #1768). Unlike [`DeclaredResolver`], which yields
+/// NULL for a record value whose variant does not match the declared type, this
+/// renders the WINNING value of any variant to text with
+/// [`attr_value_to_string`], reproducing the `attrs` map's own rendering and its
+/// divergence from a declared column. The resource/scope fallback is memoized
+/// per `stream_ref` exactly as `DeclaredResolver` does.
+struct AttrKeyResolver<'p, 'a> {
+    plan: &'p AttrKeyPlan<'a>,
+    fallback: HashMap<u32, Option<String>>,
+}
+
+impl<'p, 'a> AttrKeyResolver<'p, 'a> {
+    fn new(plan: &'p AttrKeyPlan<'a>) -> Self {
+        AttrKeyResolver {
+            plan,
+            fallback: HashMap::new(),
+        }
+    }
+
+    /// The merged value of the key at surviving row `i`, rendered to text, or
+    /// `None` (NULL) when the key is absent. The record's own winning
+    /// occurrence wins over the resource/scope value; only a record that sets
+    /// the key in no FIELD_DIR column consults the fallback.
+    fn text_at(
+        &mut self,
+        view: &ColumnarBlockView<'_>,
+        i: usize,
+        cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+    ) -> DFResult<Option<String>> {
+        if let Some(win) = self.plan.winning_idx(i) {
+            // A winning occurrence is present by construction, so `value_at` is
+            // `Some`; render it to text like the `attrs` map column does.
+            return Ok(self.plan.cursors[win]
+                .value_at(i)
+                .as_ref()
+                .map(attr_value_to_string));
+        }
+        let Some(stream_ref) = view.stream_ref(i) else {
+            return Ok(None);
+        };
+        match self.fallback.entry(stream_ref) {
+            std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut().clone()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let resource = resource_attrs(view, cache, stream_ref)?;
+                let value = find_attr(resource, &self.plan.key).map(attr_value_to_string);
+                Ok(e.insert(value).clone())
+            }
+        }
+    }
+}
+
+/// Build one synthetic per-key attribute column as a `Utf8` array for surviving
+/// rows `start..end` straight from the view (issue #1768). Byte-identical to
+/// [`attr_key_column_array`] over the same input.
+fn build_attr_key_columnar_array(
+    view: &ColumnarBlockView<'_>,
+    resolver: &mut AttrKeyResolver<'_, '_>,
+    start: usize,
+    end: usize,
+    cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+) -> DFResult<ArrayRef> {
+    let mut b = StringBuilder::new();
+    for i in start..end {
+        match resolver.text_at(view, i, cache)? {
+            Some(s) => b.append_value(s),
+            None => b.append_null(),
+        }
+    }
+    Ok(Arc::new(b.finish()))
+}
+
 /// A UTF-8 log field (`body`, `severity_text`) read from the view; a violation
 /// is the same client-visible corruption class the row path's `string_from_bytes`
 /// produces, never a panic or silently-wrong data.
@@ -4668,18 +4955,32 @@ fn build_columnar_batches(
     schema: &SchemaRef,
     projection: &[usize],
     declared: &[DeclaredColumn],
+    attr_keys: &[String],
+    full_len: usize,
     row_refs: Option<RowRefRange>,
 ) -> DFResult<Vec<RecordBatch>> {
     let n = view.surviving_count();
     // Resolve each projected declared column's FIELD_DIR columns to cursors once
     // for the whole block (ADR-0099 decision 2, #875), not per row and not per
     // chunk: the row loop then reads through the cursors with no column lookup.
+    // A synthetic per-key column (index >= full_len) is out of `declared`'s
+    // range, so this loop skips it; it gets its own plan below.
     let mut plans: HashMap<usize, DeclaredPlan<'_, '_>> = HashMap::new();
     for &idx in projection {
-        if idx >= FIRST_DECLARED_COL
+        if (FIRST_DECLARED_COL..full_len).contains(&idx)
             && let Some(dc) = declared.get(idx - FIRST_DECLARED_COL)
         {
             plans.insert(idx, DeclaredPlan::build(view, dc));
+        }
+    }
+    // Synthetic per-key attribute columns (issue #1768): one plan per projected
+    // per-key index, resolved once for the whole block like the declared plans.
+    let mut attr_plans: HashMap<usize, AttrKeyPlan<'_>> = HashMap::new();
+    for &idx in projection {
+        if idx >= full_len
+            && let Some(key) = attr_keys.get(idx - full_len)
+        {
+            attr_plans.insert(idx, AttrKeyPlan::build(view, key));
         }
     }
     // One resolver per declared column for the WHOLE block, not per chunk:
@@ -4689,6 +4990,10 @@ fn build_columnar_batches(
     let mut resolvers: HashMap<usize, DeclaredResolver<'_, '_, '_>> = plans
         .iter()
         .map(|(idx, plan)| (*idx, DeclaredResolver::new(plan)))
+        .collect();
+    let mut attr_resolvers: HashMap<usize, AttrKeyResolver<'_, '_>> = attr_plans
+        .iter()
+        .map(|(idx, plan)| (*idx, AttrKeyResolver::new(plan)))
         .collect();
     let mut cache: HashMap<u32, Arc<Vec<(String, AttrValue)>>> = HashMap::new();
     let mut out = Vec::new();
@@ -4700,6 +5005,7 @@ fn build_columnar_batches(
             schema,
             projection,
             &mut resolvers,
+            &mut attr_resolvers,
             &mut cache,
             start,
             end,
@@ -4723,6 +5029,7 @@ fn build_columnar_batch(
     schema: &SchemaRef,
     projection: &[usize],
     resolvers: &mut HashMap<usize, DeclaredResolver<'_, '_, '_>>,
+    attr_resolvers: &mut HashMap<usize, AttrKeyResolver<'_, '_>>,
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
     start: usize,
     end: usize,
@@ -4818,14 +5125,17 @@ fn build_columnar_batch(
                     "columnar fast path reached with an attrs map projection".into(),
                 ));
             }
-            other => match resolvers.get_mut(&other) {
-                Some(resolver) => build_declared_columnar_array(view, resolver, start, end, cache)?,
-                None => {
+            other => {
+                if let Some(resolver) = resolvers.get_mut(&other) {
+                    build_declared_columnar_array(view, resolver, start, end, cache)?
+                } else if let Some(resolver) = attr_resolvers.get_mut(&other) {
+                    build_attr_key_columnar_array(view, resolver, start, end, cache)?
+                } else {
                     return Err(DataFusionError::Internal(format!(
                         "logs columnar scan projection index {other} out of range"
                     )));
                 }
-            },
+            }
         };
         columns.push(array);
     }
@@ -5902,7 +6212,9 @@ mod projection_width_tests {
     }
 
     fn resolve(projection: &[usize]) -> ResolvedColumns {
-        resolve_columns(projection, &[], &[], &declared())
+        let declared = declared();
+        let full_len = FIRST_DECLARED_COL + declared.len();
+        resolve_columns(projection, &[], &[], &declared, &[], full_len)
     }
 
     /// `ts` plus one declared column: three object columns, the q07 shape.
@@ -5955,11 +6267,15 @@ mod projection_width_tests {
             "d00".to_string(),
             "v".to_string(),
         )])];
+        let declared = declared();
+        let full_len = FIRST_DECLARED_COL + declared.len();
         let r = resolve_columns(
             &[LOG_COL_TS, FIRST_DECLARED_COL],
             &[],
             &erasure,
-            &declared(),
+            &declared,
+            &[],
+            full_len,
         );
         assert_eq!(r.width, Some(3));
     }
@@ -5972,7 +6288,9 @@ mod projection_width_tests {
             field: FieldSel::Body,
             word: "x".to_string(),
         }];
-        let r = resolve_columns(&[LOG_COL_TS], &content, &[], &declared());
+        let declared = declared();
+        let full_len = FIRST_DECLARED_COL + declared.len();
+        let r = resolve_columns(&[LOG_COL_TS], &content, &[], &declared, &[], full_len);
         assert_eq!(r.width, Some(3), "ts, stream_ref, body");
     }
 
@@ -5981,7 +6299,7 @@ mod projection_width_tests {
     /// the tenant's, not a constant.
     #[test]
     fn the_denominator_follows_the_declared_set() {
-        let r = resolve_columns(&[LOG_COL_TS], &[], &[], &[]);
+        let r = resolve_columns(&[LOG_COL_TS], &[], &[], &[], &[], FIRST_DECLARED_COL);
         assert_eq!(r.width, Some(2));
         assert_eq!(r.fraction_of(0), 2.0 / 10.0);
     }
