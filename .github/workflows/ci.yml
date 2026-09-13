@@ -527,13 +527,14 @@ jobs:
   #                                              not merely compile it)
   #
   # The `ravel-server --features otap` lane used to live here too. It was split
-  # out into `features-otap` below (issue #1590): with the otap lane's
-  # `--all-targets` clippy plus lib-test added by commit 6951146b, this single
-  # job reached 28m13s against its 30m cap on main, one slow runner from timing
-  # out a required check. Splitting keeps either half well under budget and,
-  # more importantly, means the next feature added to one crate does not push
-  # the other crate's lane toward the cap. `flight-sql` was similarly probed
-  # here once and moved to its own job.
+  # out into `features-otap` below (issue #1590): commit 6951146b added the
+  # otap lane's `--all-targets` clippy plus lib-test AND raised this job's cap
+  # 30m -> 40m in the same change, so main's cap for the combined job is 40m,
+  # not 30m. Against that 40m cap, 28m13s is 70% of budget, not a near-timeout;
+  # splitting is not fixing an imminent timeout. It is still worth doing so the
+  # next feature added to one crate does not push the other crate's lane
+  # toward a shared cap. `flight-sql` was similarly probed here once and moved
+  # to its own job.
   #
   # This job is a required check (main's protect-main ruleset lists it), so a
   # break here blocks a merge. A feature added to ravel-bench therefore
@@ -542,14 +543,19 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    # 30m: the ravel-bench probes are separate, mutually non-sharing compile
-    # configurations (arrow, parquet, object_store, datafusion, arrow-flight
-    # all appear across them) with no shared incremental state. These lanes ran
-    # inside the old combined `features` job at 14m40s-17m59s before the otap
-    # lane was added (main runs c94c581f/3f9f71df/361a4432); 30m is ~1.7x that
-    # worst case, matching the flight-sql job's budget for a comparably
-    # multi-config non-sharing compile, with the otap lane's cost now carried
-    # by features-otap.
+    # 30m (provisional): the ravel-bench probes are separate, mutually
+    # non-sharing compile configurations (arrow, parquet, object_store,
+    # datafusion, arrow-flight all appear across them). This split job's own
+    # bench-only duration has NOT been measured: the previously-cited
+    # "14m40s-17m59s before the otap lane was added" (main runs
+    # c94c581f/3f9f71df/361a4432) is wrong as a baseline -- 6951146b added the
+    # otap lane, and `git merge-base --is-ancestor 6951146b <sha>` is true for
+    # all three, so those samples are combined-job runs WITH otap already in
+    # them, not a pre-otap, bench-only figure. No bench-only duration can be
+    # derived from them by subtraction. 30m is a placeholder carried over from
+    # the flight-sql job's budget for a comparably shaped multi-config,
+    # non-sharing compile; tighten or loosen it once a run of this split job
+    # supplies its own measured duration.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -557,6 +563,8 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: features-otap-common
       - name: Check ravel-bench --features parquet-baseline
         run: cargo check --locked -p ravel-bench --features parquet-baseline
       - name: Check ravel-bench --features flight-egress
@@ -618,22 +626,34 @@ jobs:
   # probe (`cargo check`) left the feature's own tests unexecuted and a clippy
   # finding in feature-gated code could not fail anything.
   #
-  # Same runner, toolchain, rust-cache setup, and `changes` gate as
-  # `features`; it carries no ravel-bench step and no shared incremental
-  # state with that job, so the two run fully in parallel.
+  # Same runner, toolchain, and `changes` gate as `features`; it carries no
+  # ravel-bench step, and the two run fully in parallel (no `needs` between
+  # them). They are NOT free of shared compile state, though: ravel-bench
+  # (default build) and `ravel-server --features otap` both pull in most of
+  # the same internal crate graph (ravel-types, ravel-object-store,
+  # ravel-catalog, ravel-commit, ravel-maintain, ravel-ingest, ravel-logseg,
+  # ravel-otlp, ravel-promql, ravel-proto, ravel-query, ravel-segment). The
+  # `shared-key` on both jobs' rust-cache steps below is what lets that common
+  # subgraph compile once and be reused by whichever job runs second, instead
+  # of each job's own default (job-scoped) cache paying for it separately.
   #
-  # NOTE: this is a NEW required check. Until main's protect-main ruleset lists
-  # `features-otap`, a break in the otap lane does not block a merge. See the
-  # task report; branch protection is not edited here.
+  # NOTE: this job is NOT yet a required check. Until main's protect-main
+  # ruleset lists `features-otap`, a break in the otap lane does not block a
+  # merge. See the task report; branch protection is not edited here.
   features-otap:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    # 25m: this lane compiles, lints (--all-targets), and lib-tests a single
-    # ravel-server feature, the same shape and crate as the `sql` job, which
-    # carries a 25m budget. Under the old combined `features` job the otap
-    # lane's addition took the whole job from ~15-18m to 24m49s-28m13s, so its
-    # own share is ~10-13m; 25m is roughly 2x that, matching `sql`.
+    # 25m (provisional): this lane compiles, lints (--all-targets), and
+    # lib-tests a single ravel-server feature, the same shape and crate as the
+    # `sql` job, which carries a 25m budget, and is used as a starting point
+    # here rather than a measured figure. The "~10-13m own share" this cap was
+    # previously derived from was itself a subtraction of the same
+    # combined-job samples used (and rejected) as the `features` job's
+    # baseline above -- those samples already include the otap lane, so they
+    # cannot supply a "before otap" side for that subtraction either. This
+    # job's own duration has not been measured; tighten or loosen 25m once a
+    # run of this split job supplies it.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -641,6 +661,8 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: features-otap-common
       - name: Clippy ravel-server --features otap
         run: cargo clippy --locked -p ravel-server --features otap --all-targets -- -D warnings
         # `--lib`, not the whole test set: `tests/cli_reference.rs` asserts
