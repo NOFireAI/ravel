@@ -191,6 +191,27 @@ refuses if the branch moved since:
 gh pr merge <number> --rebase --delete-branch --match-head-commit <sha>
 ```
 
+**A merge queue landed on `protect-main` on 2026-09-13, and it changes what
+that command does.** The PR is added to the queue rather than merged on the
+spot: GitHub rebases it onto current main, runs full CI on the combined result
+(`ci.yml` already carries the `merge_group:` trigger), and lands it only if
+that is green. Consequences here:
+
+- **Do not hand-rebase a PR because main moved.** That was how CI was got onto
+  main-plus-PR before, and the queue now does it. Rebasing anyway costs a CI
+  cycle and invalidates the review at head for no gain.
+- `mergeStateStatus` and the merge-base guard stay worth reading, but a
+  behind-ness count is no longer a reason to act. The guard covers a merge that
+  bypasses the queue.
+- The PR does not merge the instant the command returns. Poll
+  `gh pr view <number> --json state,mergedAt` as under `FLEET_MERGE_AUTO=1`.
+  A queue entry can also be ejected (its batch went red, or it conflicted after
+  the rebase); an ejected PR sits open with the queue gone, so "still open ten
+  minutes later" is something to look at rather than something to wait out.
+- The queue is `ALLGREEN` and batches up to 5, so one bad PR fails its whole
+  batch and the rest requeue. When a batch fails, read which check went red on
+  the `merge_group` run, not on the PR.
+
 This removes the `task/$TASK/merge` head once it merges. The script
 deliberately leaves `task/$TASK/result` and `task/$TASK/start` in place
 regardless of merge mode: opening a PR is not landing, and deleting them
