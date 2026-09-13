@@ -632,12 +632,20 @@ groups:
       - alert: RavelMaintenanceNoFullSweeps
         # A healthy loop runs an unscoped full sweep on each owned unit's
         # interior re-verify cadence (default 1h) and on the cold first tick,
-        # so this counter advances at least hourly on a live deployment. A
-        # window of several hours with zero increase corroborates the stall
-        # gauge for the class of hang where the loop is alive enough to scrape
-        # but is no longer sweeping.
+        # so this counter advances at least hourly on a process that owns at
+        # least one unit. A window of several hours with zero increase
+        # corroborates the stall gauge for the class of hang where the loop is
+        # alive enough to scrape but is no longer sweeping.
+        #
+        # The counter advances per swept unit, so a process that owns none
+        # never moves it while completing cycles normally: an empty cluster,
+        # or a replica whose peers hold every unit under the ADR-0065 split.
+        # The `ravel_maintain_units_owned` term is what keeps that healthy
+        # case quiet, and it is why this rule is not a bare counter check.
         expr: |
           increase(ravel_maintain_full_sweep_passes_total[3h]) == 0
+          and
+          ravel_maintain_units_owned > 0
         for: 30m
         labels:
           severity: warning
