@@ -906,14 +906,10 @@ fn main() {
     print!("{}", env_header("page_codec_bakeoff"));
     println!("{:<9}{}", "profile:", build_profile());
     println!("{:<9}{}", "target:", target_triple());
+    println!("{:<9}{}", "zstd:", resolved_dependency_version("zstd"));
     println!(
         "{:<9}{}",
-        "zstd crate:",
-        resolved_dependency_version("zstd")
-    );
-    println!(
-        "{:<9}{}",
-        "lz4_flex crate:",
+        "lz4_flex:",
         resolved_dependency_version("lz4_flex")
     );
     println!("load avg (start): {load_start}");
