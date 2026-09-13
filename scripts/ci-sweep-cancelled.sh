@@ -167,7 +167,10 @@ while IFS= read -r row; do
         [[ -z "${job_name}" ]] && continue
         [[ "${conclusion}" == "success" || "${conclusion}" == "skipped" ]] && continue
         dur=$(duration_seconds "${started}" "${completed}")
-        [[ -z "${dur}" ]] && continue
+        if [[ -z "${dur}" ]]; then
+          echo "PR #${pr_num}: could not compute duration for job '${job_name}' in run ${run_id}; skipping it in the timeout guard" >&2
+          continue
+        fi
         ((dur <= 0)) && continue
 
         # cap_map is keyed on the workflow job key (the `  <key>:` line under

@@ -563,8 +563,6 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: features-otap-common
       - name: Check ravel-bench --features parquet-baseline
         run: cargo check --locked -p ravel-bench --features parquet-baseline
       - name: Check ravel-bench --features flight-egress
@@ -610,24 +608,29 @@ jobs:
   #
   # Same runner, toolchain, and `changes` gate as `features`; it carries no
   # ravel-bench step, and the two run fully in parallel (no `needs` between
-  # them). They are NOT free of shared compile state, though: ravel-bench
-  # (default build) and `ravel-server --features otap` both pull in most of
-  # the same internal crate graph (ravel-types, ravel-object-store,
-  # ravel-catalog, ravel-commit, ravel-maintain, ravel-ingest, ravel-logseg,
-  # ravel-otlp, ravel-promql, ravel-proto, ravel-query, ravel-segment). The
-  # `shared-key` on both jobs' rust-cache steps below is what lets that common
-  # subgraph be shared: both jobs have `needs: changes` and no `needs` between
-  # them, so within one workflow run they start in parallel and race to save
-  # the same shared-key cache, not one compiling first and the other reusing
-  # it. The reuse the shared-key buys is across runs (a later run restores
-  # what an earlier run saved) rather than one job in the same run reusing the
-  # other's build, and it also lets both jobs restore the same cache entry at
-  # start within a run instead of each paying its own default job-scoped cache
-  # separately.
+  # them). They are NOT free of shared compile state: ravel-bench (default
+  # build) and `ravel-server --features otap` both pull in most of the same
+  # internal crate graph (ravel-types, ravel-object-store, ravel-catalog,
+  # ravel-commit, ravel-maintain, ravel-ingest, ravel-logseg, ravel-otlp,
+  # ravel-promql, ravel-proto, ravel-query, ravel-segment). Splitting this job
+  # out of `features` therefore costs a second compile of that shared internal
+  # graph on a second runner. Each job below uses its own default job-scoped
+  # rust-cache key (no `shared-key`): Swatinem/rust-cache does not cache
+  # workspace-member artifacts by default (`cache-workspace-crates` defaults
+  # to false, and `cleanTargetDir`/`cleanProfileTarget` strip every ravel-*
+  # crate before saving), so a shared key across these two jobs would not
+  # actually reuse the internal graph above -- it would only share external
+  # dependency crates, and because both jobs would then compute an identical
+  # key with no job-id component, only one of the two would ever populate it
+  # (the loser recompiles its exclusive dependencies cold on every run,
+  # forever). There is no cache mechanism here that reclaims the shared
+  # internal graph's compile cost; the second compile is the accepted price of
+  # the split.
   #
   # NOTE: this job is NOT yet a required check. Until main's protect-main
   # ruleset lists `features-otap`, a break in the otap lane does not block a
-  # merge. See the task report; branch protection is not edited here.
+  # merge. Tracked in issue #1673 ("Add features-otap to main's required
+  # status checks"); branch protection is not edited here.
   features-otap:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
@@ -649,8 +652,6 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: features-otap-common
       - name: Clippy ravel-server --features otap
         run: cargo clippy --locked -p ravel-server --features otap --all-targets -- -D warnings
         # `--lib`, not the whole test set: `tests/cli_reference.rs` asserts
