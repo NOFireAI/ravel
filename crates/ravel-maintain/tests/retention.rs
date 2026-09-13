@@ -2221,3 +2221,275 @@ async fn part_less_rewrite_record_expires_on_its_created_ts() {
     assert_eq!(outcome, RetentionOutcome::Swept);
     assert_eq!(key_set(&store).await, BTreeSet::new());
 }
+
+// --- #530: retention holds objects readable elsewhere, sweeps corrupt ones --
+//
+// A rolling upgrade or rollback across an RSEG version bump leaves objects a
+// given binary cannot read but a peer binary can. Retention must not turn
+// "unreadable by this build" into "deleted"; it must still sweep genuinely
+// corrupt objects. The distinction is the typed
+// `SegmentError::UnsupportedVersion` (surfaced by
+// `ravel_segment::classify_object_version`), never a string match.
+
+/// The single L0 data-object key a bucket's one commit record names.
+async fn sole_data_key(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> String {
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .unwrap();
+    let commit_key = list_all(store, &prefix)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.key)
+        .find(|k| {
+            matches!(
+                keys::partition_bucket_entry(k),
+                Ok(keys::BucketEntry::CommitRecord(_))
+            )
+        })
+        .expect("exactly one commit record");
+    let bytes = store
+        .get(&commit_key, ravel_object_store::GetRange::Full)
+        .await
+        .unwrap()
+        .data;
+    let record = ravel_commit::record::decode(&bytes).unwrap();
+    keys::reconstruct_data_key(&record).unwrap()
+}
+
+/// Overwrite the object at `key` with a copy of its own bytes, patched by
+/// `patch`. Reuses the real object so only the patched trailer field differs
+/// from a valid v7 object (the version field, or the magic).
+async fn patch_object<F: FnOnce(&mut Vec<u8>)>(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    patch: F,
+) {
+    let mut obj = store
+        .get(key, ravel_object_store::GetRange::Full)
+        .await
+        .unwrap()
+        .data
+        .to_vec();
+    patch(&mut obj);
+    store
+        .put(key, Bytes::from(obj), PutOptions::default())
+        .await
+        .unwrap();
+}
+
+/// Patch the 2-byte RSEG trailer version field (bytes `total-8 .. total-6`).
+fn set_trailer_version(obj: &mut [u8], version: u16) {
+    let n = obj.len();
+    obj[n - 8..n - 6].copy_from_slice(&version.to_le_bytes());
+}
+
+/// #530 deliverable 2: retention does NOT sweep an object rejected only for
+/// being outside this binary's reader window. The tombstoned, horizon-elapsed
+/// bucket is HELD: nothing is deleted and `HeldUnreadable(1)` is returned. The
+/// exact surviving key set is asserted (the held object, its commit record, and
+/// the tombstone all remain).
+///
+/// To watch this FAIL against pre-fix code, delete the out-of-window gate in
+/// `physical_sweep` (the `if bucket.signal == Signal::Metrics { ... }` block
+/// that returns `HeldUnreadable`): the sweep then deletes the
+/// readable-elsewhere object and returns `Swept`, so both the outcome equality
+/// and the surviving-key-set equality fail.
+#[tokio::test]
+async fn retention_holds_object_outside_reader_window() {
+    let store = MemoryStore::new();
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let bucket = bucket();
+    seed_input(
+        &store,
+        &InputSpec::new(
+            Uuid::from_u128(0x530),
+            10,
+            1,
+            vec![raw_series("m", &[("k", "a")], &[(1_000, 1.0)])],
+        ),
+    )
+    .await;
+    let config = cfg();
+    let retention = retention_at_floor(&config);
+
+    // Tombstone the expired bucket.
+    let out = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &bucket)
+        .await
+        .expect("tombstone pass");
+    assert_eq!(out, RetentionOutcome::Tombstoned);
+
+    // Its L0 data object now carries a retired (out-of-window) trailer version,
+    // exactly what a rollback onto an old binary would see for new-format data.
+    let data_key = sole_data_key(&store, &bucket).await;
+    patch_object(&store, &data_key, |obj| {
+        set_trailer_version(obj, ravel_segment::VERSION_V6);
+    })
+    .await;
+
+    let before = key_set(&store).await;
+
+    // Past the horizon: the sweep holds the whole bucket and deletes nothing.
+    clock.set(created + config.protection_horizon_ns + 1);
+    let held = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &bucket)
+        .await
+        .expect("held pass");
+    assert_eq!(
+        held,
+        RetentionOutcome::HeldUnreadable(1),
+        "one out-of-window object is held, not swept"
+    );
+    assert_eq!(
+        key_set(&store).await,
+        before,
+        "nothing is deleted while an object is readable by another binary"
+    );
+    assert!(
+        store.head(&data_key).await.is_ok(),
+        "the held object survives"
+    );
+    assert!(
+        has_tombstone(&store, &bucket).await,
+        "the tombstone is left in place so exclusion still holds"
+    );
+}
+
+/// #530 deliverable 2 mirror: retention DOES still sweep a genuinely corrupt
+/// object. Without this, a fix that merely stopped sweeping unreadable objects
+/// would pass the hold test above while silently retaining corruption forever.
+/// A bad-magic trailer classifies as corruption (not a foreign version), so the
+/// sweep runs to completion and the object is deleted.
+///
+/// To watch this FAIL, make the out-of-window gate hold on ANY read failure
+/// (classify the corrupt object as held): the sweep would then return
+/// `HeldUnreadable` and leave the junk object in place forever.
+#[tokio::test]
+async fn retention_still_sweeps_corrupt_object() {
+    let store = MemoryStore::new();
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let bucket = bucket();
+    seed_input(
+        &store,
+        &InputSpec::new(
+            Uuid::from_u128(0x531),
+            10,
+            1,
+            vec![raw_series("m", &[("k", "a")], &[(1_000, 1.0)])],
+        ),
+    )
+    .await;
+    let config = cfg();
+    let retention = retention_at_floor(&config);
+
+    let out = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &bucket)
+        .await
+        .expect("tombstone pass");
+    assert_eq!(out, RetentionOutcome::Tombstoned);
+
+    // Corrupt the L0 data object's magic: junk, not a foreign version.
+    let data_key = sole_data_key(&store, &bucket).await;
+    patch_object(&store, &data_key, |obj| {
+        let n = obj.len();
+        obj[n - 4..n].copy_from_slice(b"XXXX");
+    })
+    .await;
+
+    clock.set(created + config.protection_horizon_ns + 1);
+    let swept = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &bucket)
+        .await
+        .expect("sweep pass");
+    assert_eq!(
+        swept,
+        RetentionOutcome::Swept,
+        "a genuinely corrupt object is still swept"
+    );
+    assert!(
+        store.head(&data_key).await.is_err(),
+        "the corrupt object is deleted"
+    );
+    assert!(bucket_is_empty(&store, &bucket).await);
+    assert!(!has_tombstone(&store, &bucket).await);
+}
+
+/// #530 deliverable 3: the held-object count is surfaced on `MaintainReport`,
+/// driven end to end through the production `scan_and_maintain` pass. The exact
+/// value is asserted, never merely `> 0`.
+///
+/// To watch this FAIL, remove the `report.held_unreadable += held as usize`
+/// line in `scan.rs`'s `HeldUnreadable` arm: the counter stays 0 while the
+/// object is still (correctly) held.
+#[tokio::test]
+async fn scan_reports_held_unreadable_counter() {
+    let store = MemoryStore::new();
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let bucket = bucket();
+    seed_input(
+        &store,
+        &InputSpec::new(
+            Uuid::from_u128(0x532),
+            10,
+            1,
+            vec![raw_series("m", &[("k", "a")], &[(1_000, 1.0)])],
+        ),
+    )
+    .await;
+    let config = cfg();
+    let retention = retention_at_floor(&config);
+
+    // Pass 1 tombstones the expired bucket (no fold -> HEAD absent -> the later
+    // sweep proceeds instead of blocking).
+    let r1 = scan_and_maintain(
+        &store,
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("scan pass 1");
+    assert_eq!(r1.held_unreadable, 0);
+
+    // The object becomes out-of-window (a future version) before the sweep.
+    let data_key = sole_data_key(&store, &bucket).await;
+    patch_object(&store, &data_key, |obj| {
+        set_trailer_version(obj, ravel_segment::VERSION_V7 + 1);
+    })
+    .await;
+
+    // Pass 2, past the horizon: the sweep holds the object and counts it.
+    clock.set(created + config.protection_horizon_ns + 1);
+    let r2 = scan_and_maintain(
+        &store,
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("scan pass 2");
+    assert_eq!(
+        r2.held_unreadable, 1,
+        "exactly one held out-of-window object is counted"
+    );
+    assert_eq!(
+        r2.retired, 1,
+        "the held bucket counts as retired work-in-progress"
+    );
+    assert!(
+        store.head(&data_key).await.is_ok(),
+        "the held object survives the scan sweep"
+    );
+}

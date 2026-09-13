@@ -133,6 +133,17 @@ pub struct MaintainReport {
     /// refused. A persistent nonzero value is an operator signal that a HEAD or
     /// part object is corrupt or missing, not the ordinary lagging-fold case.
     pub blocked_by_unreadable_head: usize,
+    /// Out-of-window RSEG data objects the physical sweep HELD this pass rather
+    /// than delete, summed across the pass's buckets
+    /// ([`RetentionOutcome::HeldUnreadable`], issue #530, ADR-0066 decisions
+    /// 1-2). Each held object carries a trailer version outside this build's
+    /// [`ravel_segment::SUPPORTED_VERSIONS`] window, so it is readable by a peer
+    /// binary mid-rolling-upgrade or the pre-rollback binary and must not be
+    /// swept. A persistent nonzero value is an operator signal that a deployment
+    /// is holding data it cannot read, awaiting a `maintain migrate` pass or a
+    /// reader-window widening; it is not corruption (corrupt objects are swept
+    /// as before and never counted here).
+    pub held_unreadable: usize,
     /// Buckets skipped this pass because the [`MaintainMemo`] already knows them
     /// terminal, so no per-bucket LIST/GET was issued for them.
     /// Always zero on a cold pass and for the non-memoized
@@ -1053,7 +1064,8 @@ fn classify_terminal(
         // never memoize it as terminal.
         RetentionOutcome::Tombstoned
         | RetentionOutcome::SweptPartial
-        | RetentionOutcome::BlockedBySnapshot(_) => None,
+        | RetentionOutcome::BlockedBySnapshot(_)
+        | RetentionOutcome::HeldUnreadable(_) => None,
         // Retention left the bucket live; the compaction outcome decides.
         RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
             match compaction {
@@ -1201,6 +1213,14 @@ pub async fn scan_and_maintain_with_memo(
             | RetentionOutcome::Swept
             | RetentionOutcome::SweptPartial => {
                 report.retired += 1;
+            }
+            // Held because at least one data object is outside this build's
+            // reader window (issue #530): treated as retired work-in-progress
+            // like a tombstone (compaction skipped), and the held-object count
+            // is surfaced so an operator sees data being withheld from the sweep.
+            RetentionOutcome::HeldUnreadable(held) => {
+                report.retired += 1;
+                report.held_unreadable += held as usize;
             }
             // The expired bucket's physical sweep was blocked by HEAD
             // reachability (ADR-0020): count by reason and treat as retired

@@ -12,8 +12,8 @@ use ravel_types::{Label, LabelSet, SeriesId};
 use crate::crc::page_crc;
 use crate::error::SegmentError;
 use crate::format::{
-    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, SUPPORTED_VERSIONS, VERSION_V7, compression,
-    page_comp, page_enc, section_kind,
+    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, SUPPORTED_VERSIONS, compression, page_comp,
+    page_enc, section_kind,
 };
 use crate::histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 use crate::varint::{read_uvarint, read_zigzag_varint};
@@ -133,13 +133,22 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
     }))
 }
 
-/// Validates footer-level section invariants (docs/segment-format.md).
-/// ADR-0027 leaves v7 the only supported version, so this dispatches to the
-/// v7 rule set or rejects with `UnsupportedVersion`: at most one section per
-/// known kind, every mandatory kind present, exactly one of the whole
-/// SERIES_META or the sparse SERIES_IDX+SERIES_META_CHUNKS pair, every
+/// Validates footer-level section invariants (docs/segment-format.md): at most
+/// one section per known kind, every mandatory kind present, exactly one of the
+/// whole SERIES_META or the sparse SERIES_IDX+SERIES_META_CHUNKS pair, every
 /// section range within `[0, page_region_end)` with checked arithmetic, and
 /// section `uncompressed_len` within `limits`.
+///
+/// Admission (which versions this build accepts) is decided ONLY by
+/// [`SUPPORTED_VERSIONS`], the same window [`parse_footer`] gates on. That is
+/// what makes a validator/gate disagreement impossible rather than merely
+/// unlikely (issue #530, ADR-0066 decision 1): `UnsupportedVersion` has exactly
+/// one origin in the whole reader -- `!SUPPORTED_VERSIONS.contains(version)` --
+/// evaluated at both the `parse_footer` gate and here, over one shared const.
+/// There is no second version list (no per-version `match` whose fallthrough
+/// could reject a version the window admits), and the structural checks below
+/// never return `UnsupportedVersion` of their own, so the two sites cannot
+/// drift when the window later widens to N/N-1.
 ///
 /// The count-equality check (SERIES_IDS `count`, SERIES_META `count`, and
 /// `Footer.series_count` must all be equal) is deliberately NOT performed
@@ -156,10 +165,19 @@ pub fn validate_sections(
     page_region_end: u64,
     limits: ReaderLimits,
 ) -> Result<(), SegmentError> {
-    match version {
-        VERSION_V7 => validate_sections_v7(footer, page_region_end, limits),
-        other => Err(SegmentError::UnsupportedVersion(other)),
+    if !SUPPORTED_VERSIONS.contains(version) {
+        return Err(SegmentError::UnsupportedVersion(version));
     }
+    // Admitted by the window above. Every version the N/N-1 window can hold
+    // shares the v7 run-major section grammar: ADR-0066 opens the window only
+    // for a bump whose on-object section layout is unchanged (a page- or
+    // section-grammar change is a Class A migration through `maintain migrate`,
+    // decision 5, not a widened reader), so one structural ruleset validates
+    // the whole window. A future bump that did change the section layout would
+    // add its dispatch here in the same change that widened the window; it
+    // could never reach this point without one, because the gate above admits
+    // only versions inside `SUPPORTED_VERSIONS`.
+    validate_sections_v7(footer, page_region_end, limits)
 }
 
 /// v7 mandatory-kind validation: LABEL_DICT and SERIES_IDS always; exactly
@@ -262,6 +280,55 @@ pub fn open_from_suffix(
             Ok(FooterOutcome::Ready(loc))
         }
         need @ FooterOutcome::NeedRange { .. } => Ok(need),
+    }
+}
+
+/// The readability verdict for one stored object, computed from a
+/// trailer-covering suffix without decoding the body. The three cases are
+/// exactly the three the retention sweep must tell apart (issue #530,
+/// ADR-0066 decisions 1-2):
+///
+/// - [`Supported`](ObjectVersionClass::Supported): the trailer parsed and its
+///   version is inside this build's [`SUPPORTED_VERSIONS`] window, so this
+///   binary can read the object.
+/// - [`OutsideWindow`](ObjectVersionClass::OutsideWindow): the trailer parsed
+///   but its version is outside the window
+///   ([`SegmentError::UnsupportedVersion`]). A binary whose window includes the
+///   version -- a peer mid-rolling-upgrade, or the pre-rollback binary -- can
+///   read it, so retention must HOLD it, never sweep it. The `u16` is the exact
+///   version seen, for an operator-facing hold count.
+/// - [`Corrupt`](ObjectVersionClass::Corrupt): the trailer did not parse for
+///   any other reason (bad magic, wrong signal, reserved byte nonzero, object
+///   below the 16-byte trailer, or an invalid footer length). Not merely
+///   foreign-versioned; retention sweeps it as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectVersionClass {
+    Supported,
+    OutsideWindow(u16),
+    Corrupt,
+}
+
+/// Classify an object from `tail` -- a suffix covering at least its 16-byte
+/// trailer (`tail == object[total_size - tail.len() .. total_size]`) -- and its
+/// `total_size`, reading only the trailer via [`parse_footer`], never the body.
+///
+/// The verdict is [`ObjectVersionClass::OutsideWindow`] for exactly the
+/// versions `parse_footer` rejects with [`SegmentError::UnsupportedVersion`],
+/// so a retention hold built on this and the full reader can never disagree
+/// about which versions are foreign: both flow from the one
+/// [`SUPPORTED_VERSIONS`] window. The typed error is the mechanism; no caller
+/// matches on a string.
+///
+/// The version field is checked before the footer-length arithmetic in
+/// `parse_footer`, so a trailer-only suffix (16 bytes) is enough: a supported
+/// version yields `Ready`/`NeedRange` (both `Supported` here), and an
+/// out-of-window version yields `UnsupportedVersion` before the uncovered
+/// footer would matter.
+pub fn classify_object_version(total_size: u64, tail: &[u8]) -> ObjectVersionClass {
+    match parse_footer(total_size, tail) {
+        Ok(_) => ObjectVersionClass::Supported,
+        Err(SegmentError::UnsupportedVersion(v)) => ObjectVersionClass::OutsideWindow(v),
+        Err(_) => ObjectVersionClass::Corrupt,
     }
 }
 
@@ -2528,5 +2595,102 @@ mod provenance_extension_tests {
         let err = take_encoded_i64_block(&meta, &mut pos, 1)
             .expect_err("an empty column block has no Enc tag");
         assert!(matches!(err, SegmentError::ProvenanceColumnCodec(_)));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod version_window_tests {
+    use super::{ObjectVersionClass, classify_object_version, validate_sections};
+    use crate::error::SegmentError;
+    use crate::format::{MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, SUPPORTED_VERSIONS};
+    use crate::format::{VERSION_V6, VERSION_V7};
+    use ravel_proto::segment::v1::Footer;
+
+    /// A 16-byte RSEG trailer carrying `version`, with a nonzero `footer_len`
+    /// and valid magic/signal/reserved so the version is the sole discriminant:
+    /// on a supported version `parse_footer` stops only because the 16-byte tail
+    /// does not cover the footer (`NeedRange`), never for a malformed field.
+    fn trailer(version: u16) -> [u8; 16] {
+        let mut t = [0u8; 16];
+        t[0..4].copy_from_slice(&100u32.to_le_bytes()); // footer_len
+        // 4..8 footer_crc32c: unchecked on the NeedRange path.
+        t[8..10].copy_from_slice(&version.to_le_bytes());
+        t[10] = SIGNAL_METRICS;
+        t[11] = RESERVED;
+        t[12..16].copy_from_slice(&MAGIC);
+        t
+    }
+
+    /// Large enough that `footer_start_abs = total - 16 - footer_len` does not
+    /// underflow, so a supported version reaches `NeedRange` rather than
+    /// `InvalidFooterLen`.
+    const TOTAL: u64 = 1000;
+
+    #[test]
+    fn current_version_classifies_supported() {
+        assert_eq!(
+            classify_object_version(TOTAL, &trailer(VERSION_V7)),
+            ObjectVersionClass::Supported
+        );
+    }
+
+    #[test]
+    fn out_of_window_version_classifies_outside_window_with_exact_version() {
+        // v6 (retired) is below the floor; a hypothetical N+1 is above the
+        // ceiling. Both are OutsideWindow and carry the exact version seen, so
+        // an operator hold count can name the version being held.
+        assert_eq!(
+            classify_object_version(TOTAL, &trailer(VERSION_V6)),
+            ObjectVersionClass::OutsideWindow(VERSION_V6)
+        );
+        assert_eq!(
+            classify_object_version(TOTAL, &trailer(VERSION_V7 + 1)),
+            ObjectVersionClass::OutsideWindow(VERSION_V7 + 1)
+        );
+    }
+
+    #[test]
+    fn bad_magic_classifies_corrupt_not_outside_window() {
+        let mut t = trailer(VERSION_V7);
+        t[12] ^= 0xff; // break the magic
+        assert_eq!(
+            classify_object_version(TOTAL, &t),
+            ObjectVersionClass::Corrupt
+        );
+    }
+
+    #[test]
+    fn below_trailer_size_classifies_corrupt() {
+        // Below the 16-byte trailer: a corruption error (TooSmall), never
+        // mistaken for a foreign version.
+        assert_eq!(
+            classify_object_version(8, &[0u8; 8]),
+            ObjectVersionClass::Corrupt
+        );
+    }
+
+    /// The reader gate and the structural validator can never disagree about
+    /// which versions are admitted, for whatever window `SUPPORTED_VERSIONS`
+    /// resolves to: `validate_sections` returns `UnsupportedVersion(v)` for
+    /// EXACTLY the versions outside the window, and never for a version inside
+    /// it (an in-window version may fail structurally on a dummy footer, but
+    /// never with `UnsupportedVersion`). Because both this validator and
+    /// `parse_footer` read the same `SUPPORTED_VERSIONS.contains`, widening the
+    /// window can never split the two gates without this assertion catching it.
+    #[test]
+    fn validator_admits_exactly_the_supported_window() {
+        let footer = Footer::default();
+        let limits = ReaderLimits::default();
+        for v in 0u16..=12 {
+            let admitted = SUPPORTED_VERSIONS.contains(v);
+            let got = validate_sections(&footer, v, 0, limits);
+            let rejected_as_unsupported =
+                matches!(got, Err(SegmentError::UnsupportedVersion(u)) if u == v);
+            assert_eq!(
+                rejected_as_unsupported, !admitted,
+                "version {v}: window admits={admitted}, validator UnsupportedVersion={rejected_as_unsupported}"
+            );
+        }
     }
 }

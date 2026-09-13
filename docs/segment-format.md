@@ -29,6 +29,24 @@ a verbatim page copy -- conserving the sample count exactly, ADR-0066 decision
 floor. Support for reading N-1 is deleted only once every bucket's recorded
 floor is >= N, in a separate change that cites those floors.
 
+**Reader admission is single-sourced (issue #530, ADR-0066 decisions 1-2).**
+Both the trailer gate in `parse_footer` and the structural validator
+(`validate_sections`) decide admission by the same
+`SUPPORTED_VERSIONS.contains(version)` predicate, so they cannot disagree about
+which versions are foreign: `UnsupportedVersion` has exactly one origin in the
+reader, and the structural checks never raise it themselves. An object whose
+version is inside the window reads normally; one outside it fails closed with
+`UnsupportedVersion`, and no caller may treat that as corruption or absence. In
+particular, age-based retention does NOT delete an object solely because the
+running binary cannot read its version: an out-of-window object is readable by a
+peer binary (mid-rolling-upgrade) or the pre-rollback binary, so retention HOLDS
+the bucket -- it leaves the tombstone in place, deletes nothing, and reports the
+held-object count -- rather than converting unreadable-here into deleted. A
+genuinely corrupt object (any other trailer defect: bad magic, wrong signal,
+reserved byte nonzero, sub-trailer size, invalid footer length) is still swept
+as before; the distinction is the typed error, never a heuristic or string
+match.
+
 Parsers treat every offset, length, and count as untrusted input:
 bounds-check everything, fuzz all decoders, return typed errors and never
 panic. No `unsafe`. All integers little-endian. "varint" means
@@ -87,8 +105,9 @@ closed with `UnsupportedVersion`, never a silent misdecode.
 ### Reader protocol
 
 1. Reject objects smaller than 16 bytes as Corrupted.
-2. Suffix-GET 64 KiB (or the whole object if smaller). Verify magic,
-   `version == 7`, signal, reserved.
+2. Suffix-GET 64 KiB (or the whole object if smaller). Verify magic, that the
+   version is inside `SUPPORTED_VERSIONS` (today the single value 7; a version
+   outside the window fails closed with `UnsupportedVersion`), signal, reserved.
 3. Require `footer_len > 0` and `16 + footer_len <= total_size`; otherwise
    Corrupted. If the suffix does not cover the footer, issue one more ranged
    GET.

@@ -425,3 +425,35 @@ and re-encodes an input recorded below the current output version instead of
 only copying pages verbatim (see that module's doc comment). The Context
 sentence is left as written, a record of the gap this ADR closes; this note
 points forward to where it closed.
+
+## Amendment (2026-09-13, #530): decision 1's reader window and decision 2's retention caller land
+
+Decisions 1 and 2 are now partly in force on the reader side, which is the
+half of #530 that stops the data loss (the exercised end-to-end migration and
+the documented rollback stance remain #530's other half, not yet done):
+
+- The single-source window shipped: `SUPPORTED_VERSIONS`
+  (`crates/ravel-segment/src/format.rs`) is a two-wide-capable
+  `SupportedVersions` window holding exactly v7 today. Both the trailer gate in
+  `parse_footer` and the structural validator `validate_sections` now decide
+  admission by the same `SUPPORTED_VERSIONS.contains(version)` predicate, so a
+  future N/N-1 widening is a one-line change to that constant and the two gates
+  cannot drift (there is no per-version `match` whose fallthrough could reject a
+  version the window admits, and the structural checks never raise
+  `UnsupportedVersion` themselves). This is a change to which versions the
+  reader admits and how that decision is sourced, NOT a change to the on-object
+  layout, so no version bump is required.
+- Decision 2's "no caller may treat that error as absence, corruption, or a
+  miss" now binds age-based retention. The physical sweep
+  (`crates/ravel-maintain/src/retention.rs`) probes each RSEG data object's
+  trailer and, on `SegmentError::UnsupportedVersion`
+  (`ravel_segment::ObjectVersionClass::OutsideWindow`), HOLDS the whole bucket
+  (leaves the tombstone, deletes nothing) and reports the held-object count on
+  `MaintainReport.held_unreadable`. A genuinely corrupt object is still swept;
+  the distinction is the typed error, not a string match. This closes the
+  "retention converts unreadable objects into deleted ones on schedule" arm of
+  the problem statement.
+
+Still open under #530 (its remaining half, to be filed as a follow-up): one
+migration exercised end to end through `maintain migrate` (decision 5), and a
+documented rollback stance (a decision, not an implementation).

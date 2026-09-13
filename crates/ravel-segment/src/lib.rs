@@ -32,10 +32,11 @@ pub use format::{
 pub use histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 pub use identity::{ExpectedIdentity, check_identity};
 pub use reader::{
-    FooterLocation, FooterOutcome, PlannedRunRange, RunEntry, SampleProvenance, SeriesEntry,
-    SeriesEntryV4, ValPageKind, ValueKind, decode_catalog_matching_v4, decode_catalog_v4,
-    decode_run_histogram_pages, decode_run_pages_soa, open_from_full, open_from_suffix,
-    parse_footer, plan_ranges_v4, validate_sections,
+    FooterLocation, FooterOutcome, ObjectVersionClass, PlannedRunRange, RunEntry, SampleProvenance,
+    SeriesEntry, SeriesEntryV4, ValPageKind, ValueKind, classify_object_version,
+    decode_catalog_matching_v4, decode_catalog_v4, decode_run_histogram_pages,
+    decode_run_pages_soa, open_from_full, open_from_suffix, parse_footer, plan_ranges_v4,
+    validate_sections,
 };
 /// RSEG v5 catalog (docs/segment-format.md): `decode_catalog_v5` is the
 /// whole-catalog decode over the whole object (folding to the run-major

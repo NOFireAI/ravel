@@ -51,7 +51,7 @@ use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all,
 };
 use ravel_proto::commit::v1::{CommitRecord, CompactionRecord, RetentionTombstone, RewriteRecord};
-use ravel_types::TenantHash;
+use ravel_types::{Signal, TenantHash};
 
 use crate::bucket::Bucket;
 use crate::clock::Clock;
@@ -97,6 +97,23 @@ pub enum RetentionOutcome {
     /// retention-frontier reconcile, crates/ravel-catalog). The [`SnapshotBlock`]
     /// says why the block fired.
     BlockedBySnapshot(SnapshotBlock),
+    /// Tombstone present and horizon elapsed, but the physical sweep held the
+    /// bucket because at least one of its RSEG data objects carries a trailer
+    /// version outside this binary's supported window
+    /// ([`ravel_segment::SUPPORTED_VERSIONS`]). Such an object is unreadable
+    /// HERE but readable by a binary whose window includes the version (a peer
+    /// mid-rolling-upgrade, or the pre-rollback binary), so retention must not
+    /// convert "unreadable by this build" into "deleted" (issue #530, ADR-0066
+    /// decisions 1-2). Nothing was deleted and the tombstone was left in place,
+    /// so bucket-wide exclusion still holds and a later pass -- or the
+    /// `maintain migrate` job -- finishes once the fleet can read the version.
+    /// The `u64` is the count of held out-of-window objects, so an operator can
+    /// see a deployment is holding data it cannot read. A genuinely corrupt
+    /// object is NOT held here: it classifies as corruption, not a foreign
+    /// version, and is swept as before -- the distinction is the typed
+    /// [`ravel_segment::SegmentError::UnsupportedVersion`], never a string
+    /// match.
+    HeldUnreadable(u64),
 }
 
 /// Resolve a tenant's effective retention window the same way the catalog fold
@@ -286,7 +303,8 @@ pub async fn maintain_bucket_with_reach(
         RetentionOutcome::Tombstoned
         | RetentionOutcome::Swept
         | RetentionOutcome::SweptPartial
-        | RetentionOutcome::BlockedBySnapshot(_) => None,
+        | RetentionOutcome::BlockedBySnapshot(_)
+        | RetentionOutcome::HeldUnreadable(_) => None,
         RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
             Some(compact_bucket(store, clock, config, bucket).await?)
         }
@@ -469,6 +487,24 @@ async fn physical_sweep(
         .map(|meta| meta.key)
         .collect();
 
+    // Do not convert an object this binary merely cannot read into a deleted
+    // one (issue #530, ADR-0066 decisions 1-2). An RSEG object whose trailer
+    // version is outside this build's supported window is readable by a binary
+    // whose window includes it (a peer mid-rolling-upgrade, or the pre-rollback
+    // binary), so holding the whole bucket -- deleting nothing, leaving the
+    // tombstone -- keeps bucket-wide exclusion until a later pass or the
+    // `maintain migrate` job converges the version. A genuinely corrupt object
+    // is NOT held: it classifies as corruption, not a foreign version, and is
+    // swept below. Only metrics buckets carry RSEG objects; logs (RLOG) and
+    // spans (RSPAN) have their own version windows in their own crates, out of
+    // this task's scope, so their objects are swept exactly as before.
+    if bucket.signal == Signal::Metrics {
+        let held = count_out_of_window_objects(store, &l0_data_keys, &l1_part_keys).await?;
+        if held > 0 {
+            return Ok(RetentionOutcome::HeldUnreadable(held));
+        }
+    }
+
     // Deletion order (docs/consistency-model.md "Deletion and GC", ADR-0019
     // decision 4): records, then data objects, then L1 parts, tombstone last.
     delete_all(store, lease, &listing.commit_keys, dry_run).await?;
@@ -516,6 +552,49 @@ async fn delete_all(
         }
     }
     Ok(())
+}
+
+/// The trailer-only probe size: an RSEG trailer is 16 bytes and carries the
+/// version, so a `Suffix` GET of the last 16 bytes classifies an object's
+/// version without fetching its (potentially large) body.
+const VERSION_PROBE_BYTES: u64 = 16;
+
+/// Count the bucket's RSEG data objects (L0 segments and L1 parts) whose
+/// trailer version is outside this build's supported window
+/// ([`ravel_segment::SUPPORTED_VERSIONS`]). These are readable by a binary
+/// whose window includes the version, so retention must hold them, never sweep
+/// them (issue #530, ADR-0066 decisions 1-2).
+///
+/// The distinction between "hold" and "sweep" is the typed
+/// [`ravel_segment::SegmentError::UnsupportedVersion`], surfaced by
+/// [`ravel_segment::classify_object_version`]: only
+/// [`ravel_segment::ObjectVersionClass::OutsideWindow`] is counted. A supported
+/// object (readable here, being retired normally) and a genuinely corrupt one
+/// (any other trailer defect) are both swept as before, so this never widens
+/// what retention deletes -- it only withholds objects another binary can read.
+///
+/// Reads only each object's trailer (a `Suffix` GET), never its body. A key
+/// already absent (a prior partial pass deleted it) is not held.
+async fn count_out_of_window_objects(
+    store: &dyn ObjectStoreBackend,
+    l0_data_keys: &[String],
+    l1_part_keys: &[String],
+) -> Result<u64> {
+    let mut held = 0u64;
+    for key in l0_data_keys.iter().chain(l1_part_keys.iter()) {
+        match store.get(key, GetRange::Suffix(VERSION_PROBE_BYTES)).await {
+            Ok(got) => {
+                if let ravel_segment::ObjectVersionClass::OutsideWindow(_) =
+                    ravel_segment::classify_object_version(got.total_size, &got.data)
+                {
+                    held += 1;
+                }
+            }
+            Err(StoreError::NotFound) => {}
+            Err(e) => return Err(MaintainError::Store(e)),
+        }
+    }
+    Ok(held)
 }
 
 /// A fresh strongly consistent check that the bucket holds nothing but its
