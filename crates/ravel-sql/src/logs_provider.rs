@@ -2002,8 +2002,7 @@ mod tests {
     /// carries real, incompressible page bytes and the decode band is a
     /// meaningful measurement.
     fn cell(k: usize, i: usize) -> String {
-        let mut x = (i as u64)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (k as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
         let mut out = String::with_capacity(96);
         for _ in 0..6 {
@@ -2197,7 +2196,10 @@ mod tests {
         // either way under the stock policy.
         assert!(dec.gets > 0, "the scan issued at least one GET");
         assert_eq!(map.gets, dec.gets, "GET count must be unchanged");
-        assert_eq!(map.wire_bytes, dec.wire_bytes, "wire bytes must be unchanged");
+        assert_eq!(
+            map.wire_bytes, dec.wire_bytes,
+            "wire bytes must be unchanged"
+        );
     }
 
     /// The group-by shape: `GROUP BY attrs['k3']` stays columnar and within the
@@ -2224,7 +2226,10 @@ mod tests {
         .await;
 
         assert_eq!(map.rowpath_batches, 0, "group-by must not fall to row path");
-        assert!(map.columnar_batches > 0, "group-by must build columnar batches");
+        assert!(
+            map.columnar_batches > 0,
+            "group-by must build columnar batches"
+        );
         assert!(
             within_band(map.page_bytes_decoded, dec.page_bytes_decoded),
             "group-by map decoded {} stored page bytes, declared {}, outside the 1.5x band",
@@ -2233,7 +2238,10 @@ mod tests {
         );
         assert!(dec.gets > 0, "the scan issued at least one GET");
         assert_eq!(map.gets, dec.gets, "GET count must be unchanged");
-        assert_eq!(map.wire_bytes, dec.wire_bytes, "wire bytes must be unchanged");
+        assert_eq!(
+            map.wire_bytes, dec.wire_bytes,
+            "wire bytes must be unchanged"
+        );
     }
 
     /// The project-limit shape: `SELECT ts, attrs['k3'] ... ORDER BY ts LIMIT k`
@@ -2277,7 +2285,10 @@ mod tests {
         );
         assert!(dec.gets > 0, "the scan issued at least one GET");
         assert_eq!(map.gets, dec.gets, "GET count must be unchanged");
-        assert_eq!(map.wire_bytes, dec.wire_bytes, "wire bytes must be unchanged");
+        assert_eq!(
+            map.wire_bytes, dec.wire_bytes,
+            "wire bytes must be unchanged"
+        );
     }
 
     /// The band is tight, not vacuous: the correct single-key form is inside it,
@@ -2342,10 +2353,7 @@ mod tests {
                 m.columnar_batches, 0,
                 "{sql} needs the whole map and must stay on the row path"
             );
-            assert!(
-                m.rowpath_batches > 0,
-                "{sql} must build row-path batches"
-            );
+            assert!(m.rowpath_batches > 0, "{sql} must build row-path batches");
         }
     }
 }

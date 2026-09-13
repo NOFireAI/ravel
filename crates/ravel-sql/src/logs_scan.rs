@@ -1613,7 +1613,14 @@ impl LogsScanExec {
                 )));
             }
         }
-        let resolved = resolve_columns(&projection, &content, &erasure, &declared, &attr_keys, full_len);
+        let resolved = resolve_columns(
+            &projection,
+            &content,
+            &erasure,
+            &declared,
+            &attr_keys,
+            full_len,
+        );
         let projected_fraction = resolved.fraction_of(declared.len());
         let columns = resolved.selection;
         let projected = effective.project(&projection)?;
