@@ -25,7 +25,7 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_query::io_shape::PlanClass;
 use ravel_query::phase_accounting::QueryPhase;
-use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{GetLimiter, LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7};
 use ravel_sql::{SqlConfig, SqlExecutor, SqlRequest};
 use ravel_types::accounting::AccountedOp;
@@ -182,6 +182,69 @@ async fn fixture() -> (SqlExecutor, TenantHash, u64, u64, TimeRange, i64) {
     (executor, th, len_a, len_b, window, now)
 }
 
+/// Like `fixture()` (same two segments, same tenant/hour/window), but with
+/// `sql_partition_count` overridden to `partition_count` and the metrics
+/// `SegmentFetcher`'s shared `GetLimiter` overridden to `get_limiter_permits`
+/// permits, so the two bounds `sql_io_shape` mins together can be made to
+/// differ: `get_limiter_permits < partition_count` makes the limiter, not the
+/// partition count, the one that binds `service_batches`.
+async fn fixture_with_low_get_limiter(
+    partition_count: usize,
+    get_limiter_permits: usize,
+) -> (SqlExecutor, TenantHash, TimeRange, i64) {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tid = tenant("acme");
+    let th = tid.hash();
+    let hour = 9_501u32;
+    let now = now_at_seal(hour);
+
+    publish_segment(
+        store.as_ref(),
+        &tid,
+        1,
+        hour,
+        "a",
+        i64::from(hour) * NS_PER_HOUR + 10 * 60 * NS_PER_SEC,
+        1.0,
+    )
+    .await;
+    publish_segment(
+        store.as_ref(),
+        &tid,
+        2,
+        hour,
+        "b",
+        i64::from(hour) * NS_PER_HOUR + 20 * 60 * NS_PER_SEC,
+        2.0,
+    )
+    .await;
+
+    let cat = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
+        .await
+        .expect("fold seals both segments, building the postings index prune needs");
+
+    let get_limiter = Arc::new(GetLimiter::new(get_limiter_permits).expect("valid permit count"));
+    let fetcher = SegmentFetcher::new(store.clone()).with_get_limiter(get_limiter);
+
+    let mut config = SqlConfig::default();
+    config.engine.sql_partition_count = Some(partition_count);
+
+    let executor = SqlExecutor::new(
+        cat,
+        fetcher,
+        LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
+        config,
+        1 << 30,
+    );
+    let window = TimeRange {
+        start_ns: i64::from(hour) * NS_PER_HOUR,
+        end_ns: i64::from(hour + 1) * NS_PER_HOUR,
+    };
+    (executor, th, window, now)
+}
+
 const PRUNED_SQL: &str = "SELECT ts, value FROM samples WHERE label(labels, '__name__') = 'a'";
 const UNPRUNED_SQL: &str =
     "SELECT ts, value FROM samples WHERE label_match(labels, '__name__', 'a|b')";
@@ -290,14 +353,18 @@ async fn wire_rendering_names_each_phase_exactly_once_on_a_real_query() {
 /// `sql_partition_count()` to `DEFAULT_FETCH_CONCURRENCY` (8) and
 /// `SegmentFetcher::new`'s `GetLimiter` defaults to `DEFAULT_MAX_CONCURRENT_GETS`
 /// (16), so the bound is `min(8, 16) = 8` for both queries here, and
-/// `ceil(1 / 8) = ceil(2 / 8) = 1` either way. `plan_class` is the pair this
-/// test exists to pin post-fix: the `Metrics` target still tells a pruned
-/// fetch from a full scan via `Snapshot::segments_pruned`, so the pruned
-/// single-segment query classifies as `SelectiveIndexed` (one of the two
-/// window segments was excluded) and the unpruned two-segment query as
-/// `ExhaustiveScan` (no segment was excluded) -- neither is `Unclassified`,
-/// because that fix only changed the `Logs`/`Spans`/`Alerts`/`Audit` targets,
-/// not `Metrics`.
+/// `ceil(1 / 8) = ceil(2 / 8) = 1` either way -- this pins the inert case,
+/// where `sql_partition_count` alone already gives the same answer as the
+/// min. The case where the `.min(shared_get_permits)` bound actually binds
+/// (a `GetLimiter` narrower than `sql_partition_count`) is pinned separately,
+/// by `service_batches_is_bound_by_shared_get_limiter_permits_not_partition_count`
+/// below. `plan_class` is the pair this test exists to pin post-fix: the
+/// `Metrics` target still tells a pruned fetch from a full scan via
+/// `Snapshot::segments_pruned`, so the pruned single-segment query classifies
+/// as `SelectiveIndexed` (one of the two window segments was excluded) and
+/// the unpruned two-segment query as `ExhaustiveScan` (no segment was
+/// excluded) -- neither is `Unclassified`, because that fix only changed the
+/// `Logs`/`Spans`/`Alerts`/`Audit` targets, not `Metrics`.
 #[tokio::test]
 async fn io_shape_pins_dependency_depth_service_batches_and_plan_class() {
     let (executor, th, _len_a, _len_b, window, now) = fixture().await;
@@ -317,4 +384,26 @@ async fn io_shape_pins_dependency_depth_service_batches_and_plan_class() {
     assert_eq!(unpruned.io_shape.dependency_depth, 1);
     assert_eq!(unpruned.io_shape.service_batches, 1);
     assert_eq!(unpruned.io_shape.plan_class, PlanClass::ExhaustiveScan);
+}
+
+/// `sql_io_shape` computes `service_batches(segments, min(sql_partition_count,
+/// shared_get_permits))`. `io_shape_pins_dependency_depth_service_batches_and_plan_class`
+/// above never exercises the `.min` doing any work: its fixture's
+/// `sql_partition_count` (8) is already below the default `GetLimiter`'s 16
+/// permits, so `min(8, 16) == 8` and the un-minned `sql_partition_count`
+/// alone would report the same `service_batches` value. This test makes the
+/// two bounds differ: `sql_partition_count` is 4 and the shared `GetLimiter`
+/// has only 1 permit, so `min(4, 1) == 1` is the binding bound over the
+/// fixture's 2 matched segments -- `ceil(2 / 1) = 2`, where
+/// `sql_partition_count` alone would give `ceil(2 / 4) = 1`.
+#[tokio::test]
+async fn service_batches_is_bound_by_shared_get_limiter_permits_not_partition_count() {
+    let (executor, th, window, now) = fixture_with_low_get_limiter(4, 1).await;
+
+    let unpruned = executor
+        .execute(th, &sql_request(UNPRUNED_SQL, window, now))
+        .await
+        .expect("unpruned query");
+    assert_eq!(unpruned.stats.segments, 2, "both segments match a|b");
+    assert_eq!(unpruned.io_shape.service_batches, 2);
 }
