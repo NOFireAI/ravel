@@ -85,15 +85,52 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// retrying forever.
 const MAX_HEAD_CAS_ATTEMPTS: u32 = 8;
 
-/// Placeholder for future compaction/retention transactions.
-/// `fold`'s entry point accepts a
-/// `&[Transaction]` today so a later phase can apply compaction/retention
-/// records without a signature change, but this phase never constructs one:
-/// no public constructor exists, so callers can only ever pass an empty
-/// slice.
+/// A directive the caller hands the next fold, applied in addition to the
+/// hours the fold discovers on its own (`fold`'s entry point has always
+/// accepted a `&[Transaction]` so this could arrive without a signature
+/// change, ADR-0063 section 4).
+///
+/// The one directive today is [`Transaction::reconcile_hour`]: reconcile a
+/// specific already-sealed hour even when it falls outside the fixed reconcile
+/// window and the retention-frontier band. The superseded-input sweep
+/// (crates/ravel-maintain) discovers, as a byproduct of its HEAD-reachability
+/// gate, exactly the hours whose pre-rewrite inputs the live snapshot still
+/// names (a late compaction or rewrite record landed in an old hour and no
+/// fold has reconciled it), and hands them back through this slice so the fold
+/// re-folds them instead of leaking the inputs until retention drops the hour
+/// (issue #526). The fold cannot find these hours on its own: doing so would
+/// mean re-listing every sealed hour on every fold, the unbounded work the
+/// fixed window exists to bound.
 #[derive(Debug, Clone)]
 pub struct Transaction {
-    _private: (),
+    kind: TransactionKind,
+}
+
+/// The kind of a [`Transaction`]. A single-directive enum today, kept an enum
+/// so a later compaction/retention directive is an additive variant rather
+/// than a signature change.
+#[derive(Debug, Clone, Copy)]
+enum TransactionKind {
+    /// Reconcile this ingest hour on the next incremental fold, regardless of
+    /// the fixed reconcile window and the retention-frontier band.
+    ReconcileHour(u32),
+}
+
+impl Transaction {
+    /// Ask the next incremental fold to reconcile `hour` even if it sits
+    /// outside the fixed reconcile window and the retention-frontier band. The
+    /// hour is reconciled by the same [`Catalog::classify_bucket`] diff every
+    /// other reconcile route uses, so a late compaction or rewrite record in
+    /// that hour supersedes the snapshot's pre-rewrite inputs. No effect on a
+    /// first fold or a rebuild (both re-derive every hour already), or when the
+    /// hour is at or above the fold's previous watermark (already folded
+    /// incrementally). The superseded-input sweep constructs one per blocked
+    /// hour; see [`Transaction`].
+    pub fn reconcile_hour(hour: u32) -> Self {
+        Self {
+            kind: TransactionKind::ReconcileHour(hour),
+        }
+    }
 }
 
 /// Outcome of one [`Catalog::fold`] call.
@@ -197,6 +234,17 @@ pub struct FoldReport {
     /// drains the backlog oldest-first. Nonzero here is the signal that the
     /// frontier is behind; steady state is always zero.
     pub frontier_hours_deferred: u64,
+    /// Hours the caller-requested reconcile pass (issue #526) re-listed this
+    /// fold: the sweep-blocked hours passed via [`Transaction::reconcile_hour`]
+    /// that fell outside the fixed reconcile window and the retention-frontier
+    /// band and so would otherwise never be reconciled. Bounded by the set the
+    /// caller passed, deduped, and with hours already covered by the fixed
+    /// window or the frontier band this fold removed, so it is exactly the
+    /// number of distinct additional hours this fold re-listed on the caller's
+    /// behalf. `0` on a first fold or a rebuild (both re-derive every hour, so
+    /// the pass is skipped) and whenever no `Transaction::reconcile_hour` was
+    /// passed.
+    pub requested_hours_reconciled: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -913,9 +961,20 @@ impl Catalog {
         signal: Signal,
         folder_id: Uuid,
         now_ns: i64,
-        _transactions: &[Transaction],
+        transactions: &[Transaction],
         default_retention_ns: Option<i64>,
     ) -> Result<FoldReport, CatalogError> {
+        // Hours the caller asks the reconcile pass to reach beyond the fixed
+        // window and the frontier band (issue #526), deduped. Empty for every
+        // caller that passes `&[]`, which is the ordinary maintain-tier and
+        // on-demand fold today; the superseded-input sweep is the follow-up
+        // that populates it.
+        let requested_reconcile_hours: HashSet<u32> = transactions
+            .iter()
+            .map(|t| match t.kind {
+                TransactionKind::ReconcileHour(hour) => hour,
+            })
+            .collect();
         let head_key = head_object_key(tenant, signal);
         // Fold never runs on the query path (module docs above) and keeps
         // its own `RequestCounters`; this handle exists only to satisfy the
@@ -1154,6 +1213,12 @@ impl Catalog {
             let mut dirty_hours: HashSet<u32> = HashSet::new();
             let mut frontier_hours_reconciled: u64 = 0;
             let mut frontier_hours_deferred: u64 = 0;
+            let mut requested_hours_reconciled: u64 = 0;
+            // Hours the frontier band re-listed this fold, so the
+            // caller-requested pass below does not list any of them a second
+            // time (keeping its own count exactly the additional hours it
+            // reached, and avoiding a double LIST charge).
+            let mut frontier_reconciled_hours: HashSet<u32> = HashSet::new();
             if let Some(watermark_hour_old) = reconcile_watermark {
                 let window = self.config().fold_reconcile_window_hours;
                 let lo = watermark_hour_old.saturating_sub(window);
@@ -1255,7 +1320,69 @@ impl Catalog {
                             .await?;
                         counters.list_requests += frontier_buckets.len() as u64;
                         frontier_hours_reconciled = frontier_hours.len() as u64;
+                        frontier_reconciled_hours.extend(frontier_hours.iter().copied());
                         for (shard, hour, listing) in &frontier_listings {
+                            self.reconcile_one_bucket(
+                                tenant,
+                                signal,
+                                *shard,
+                                *hour,
+                                listing,
+                                &accounting,
+                                &mut entries,
+                                &mut seen,
+                                &mut dirty_hours,
+                                &mut counters,
+                                &mut layout_drift_count,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+
+                // ---- Caller-requested reconcile (issue #526) ----
+                //
+                // The fixed window reaches `fold_reconcile_window_hours` behind
+                // the watermark; the frontier band reaches the retirement
+                // frontier. Neither reaches an arbitrary older hour that
+                // received a late compaction or rewrite record: a rewrite is
+                // scoped to already-sealed buckets by construction (ADR-0064
+                // §3.1) and a compaction can land in any sealed hour, and the
+                // fold cannot discover such an hour on its own without
+                // re-listing every sealed hour every fold -- the unbounded work
+                // the fixed window exists to bound. The superseded-input sweep
+                // (crates/ravel-maintain) already discovers exactly these hours
+                // as a byproduct of its HEAD-reachability gate (it returns
+                // `Named` for a bucket whose superseded inputs the live
+                // snapshot still names) and hands them back through
+                // `transactions`. Reconcile precisely those, minus any already
+                // covered by the fixed window `[lo, watermark_hour_old]` or the
+                // frontier band this fold, so no bucket is listed twice and the
+                // count is exactly the additional hours reached. A requested
+                // hour at or above `watermark_hour_old` was folded incrementally
+                // already, so it is dropped here rather than re-listed.
+                if !requested_reconcile_hours.is_empty() {
+                    let mut requested_hours: Vec<u32> = requested_reconcile_hours
+                        .iter()
+                        .copied()
+                        .filter(|&h| {
+                            h <= watermark_hour_old
+                                && !(lo..=watermark_hour_old).contains(&h)
+                                && !frontier_reconciled_hours.contains(&h)
+                        })
+                        .collect();
+                    // Deterministic order keeps the fold byte-for-byte
+                    // reproducible (content addressing depends on merge order).
+                    requested_hours.sort_unstable();
+                    if !requested_hours.is_empty() {
+                        let requested_buckets =
+                            frontier_hour_set_buckets(&generations, &requested_hours);
+                        let requested_listings = self
+                            .discover_bucket_listings(tenant, signal, &requested_buckets)
+                            .await?;
+                        counters.list_requests += requested_buckets.len() as u64;
+                        requested_hours_reconciled = requested_hours.len() as u64;
+                        for (shard, hour, listing) in &requested_listings {
                             self.reconcile_one_bucket(
                                 tenant,
                                 signal,
@@ -1979,6 +2106,7 @@ impl Catalog {
                         layout_drift_count,
                         frontier_hours_reconciled,
                         frontier_hours_deferred,
+                        requested_hours_reconciled,
                     });
                 }
                 // Another folder's HEAD CAS won first. Re-GET HEAD next
@@ -2735,6 +2863,7 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         layout_drift_count: 0,
         frontier_hours_reconciled: 0,
         frontier_hours_deferred: 0,
+        requested_hours_reconciled: 0,
     }
 }
 
