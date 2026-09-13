@@ -188,7 +188,7 @@ to the head SHA it just checked via `--match-head-commit` so the merge
 refuses if the branch moved since:
 
 ```sh
-gh pr merge <number> --rebase --delete-branch --match-head-commit <sha>
+gh pr merge <number> --rebase --match-head-commit <sha>
 ```
 
 **A merge queue landed on `protect-main` on 2026-09-13, and it changes what
@@ -211,6 +211,12 @@ that is green. Consequences here:
 - The queue is `ALLGREEN` and batches up to 5, so one bad PR fails its whole
   batch and the rest requeue. When a batch fails, read which check went red on
   the `merge_group` run, not on the PR.
+- **`--delete-branch` is gone from that command and must not come back.** `gh`
+  refuses it once a queue is enabled ("Cannot use `-d` or `--delete-branch`
+  when merge queue enabled") and fails before merging anything. Nothing is
+  lost: the repository sets `delete_branch_on_merge`, so the `task/<id>/merge`
+  head is removed when the merge lands. `gh` also prints "The merge strategy
+  for main is set by the merge queue", which is informational, not an error.
 
 This removes the `task/$TASK/merge` head once it merges. The script
 deliberately leaves `task/$TASK/result` and `task/$TASK/start` in place

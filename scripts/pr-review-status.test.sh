@@ -400,7 +400,7 @@ check_eq "no findings: verdict is clean" \
   "  -> clean: CI green, review at the current head with zero findings" \
   "$(printf '%s\n' "${clean_out}" | sed -n 2p)"
 check_eq "no findings: merge command printed" \
-  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${clean_out}" | sed -n 3p)"
 
 # The #908 regression: same PR, same green CI, same zero inline comments, one
@@ -420,7 +420,7 @@ check_eq "outside-diff body finding: --confirm-addressed clears it" \
   "  -> clean (operator confirmed all 1 outside-diff body finding(s) addressed): CI green, review at the current head" \
   "$(printf '%s\n' "${confirmed_out}" | sed -n 2p)"
 check_eq "outside-diff body finding: --confirm-addressed prints the merge command" \
-  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${confirmed_out}" | sed -n 3p)"
 
 # An inline comment blocks the same way, and names the other flag path.
@@ -590,7 +590,7 @@ check_eq "prove: without the review conjunct, an unreviewed PR reads clean" \
   "  -> clean: CI green, review at the current head with zero findings" \
   "$(printf '%s\n' "${flipped_out}" | sed -n 2p)"
 check_eq "prove: without it, the merge command is even offered" \
-  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${flipped_out}" | sed -n 3p)"
 
 unset E2E_REVIEWS
@@ -812,7 +812,7 @@ check_eq "all checks skipped: the verdict does not claim CI green" \
   "  -> clean: every check skipped, nothing ran, review at the current head with zero findings" \
   "$(printf '%s\n' "${all_skipped_out}" | sed -n 2p)"
 check_eq "all checks skipped: the merge command is still offered" \
-  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${all_skipped_out}" | sed -n 3p)"
 
 # The mirror: one real pass beside one skip still says CI green, so the case
