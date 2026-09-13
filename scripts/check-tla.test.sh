@@ -862,6 +862,35 @@ if [ "$xcode" -ne 0 ]; then ok; else bad "x: expected nonzero exit on a non-nume
 FORMAL_DIR="$orig_formal_dir5"
 rm -rf "$xdir"
 
+echo "--- (y) check_bands: sentinel band '-' '-' with an EMPTY depth figure still fails closed"
+ydir="$(mktemp -d)"
+yarea_dir="$ydir/farea"
+mkdir -p "$yarea_dir"
+printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\nsmoke.cfg\t100\t100\t-\t-\n' \
+    > "$yarea_dir/bands.tsv"
+FORMAL_DIR="$ydir"
+yout="$(check_bands farea smoke.cfg 100 '' 2>&1)"; ycode=$?
+if [ "$ycode" -ne 0 ]; then ok; else bad "y: expected nonzero exit on an empty depth figure under a sentinel band, got 0; out: $yout"; fi
+if printf '%s' "$yout" | grep -qF "depth figure missing or non-numeric ('')"; then
+    ok
+else
+    bad "y: expected a 'depth figure missing or non-numeric' note; out: $yout"
+fi
+FORMAL_DIR="$orig_formal_dir5"
+rm -rf "$ydir"
+
+echo "--- (z) check_bands: sentinel band '-' '-' with a valid numeric depth still passes"
+zdir="$(mktemp -d)"
+zarea_dir="$zdir/farea"
+mkdir -p "$zarea_dir"
+printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\nsmoke.cfg\t100\t100\t-\t-\n' \
+    > "$zarea_dir/bands.tsv"
+FORMAL_DIR="$zdir"
+zout="$(check_bands farea smoke.cfg 100 25 2>&1)"; zcode=$?
+if [ "$zcode" -eq 0 ]; then ok; else bad "z: expected exit 0 on a valid numeric depth under a sentinel band, got $zcode; out: $zout"; fi
+FORMAL_DIR="$orig_formal_dir5"
+rm -rf "$zdir"
+
 rm -f "$LIB_SRC"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
