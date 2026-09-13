@@ -233,6 +233,12 @@ struct DedupStream {
 /// and comparing the key alone would silently relabel one series' rows with
 /// another's.
 struct LabelsMemo {
+    /// A strong reference, not merely an address or a `Weak`: it keeps the
+    /// source dictionary's `values` allocation alive, which is what makes
+    /// the `Arc::ptr_eq` comparison in `compact_row_labels` valid -- a
+    /// dropped `values` array's address can be reused by a later batch's
+    /// dictionary, which would otherwise turn the comparison into a false
+    /// positive.
     values: ArrayRef,
     key: i32,
     compacted: ArrayRef,
@@ -336,36 +342,11 @@ impl DedupStream {
     /// [`crate::labels::compact_labels`] for why `concat_batches` cares about
     /// that. `self.out_multi_dict` (maintained by `finalize` via
     /// `track_out_dict`, cheaply, without walking `self.out`) answers that
-    /// exactly: if every accumulated row shares one dictionary pointer,
-    /// `concat_batches` was always going to share it for free, and compacting
-    /// each row down to one entry first (a `MapBuilder` rebuild per row) buys
-    /// nothing -- it is pure overhead paid to defend against a copy that was
-    /// never going to happen. Only when `out_multi_dict` is set does this
-    /// compact each row first, exactly as an earlier version of this
-    /// operator did unconditionally.
-    ///
-    /// Allocation churn (cumulative bytes allocated over the run, via
-    /// `stats_alloc`; not peak resident bytes -- see
-    /// `tests/dedup_finalize_allocation*.rs`) measured on a
-    /// 5,000-series/1-segment corpus, where every accumulated row shares
-    /// one dictionary pointer so the unconditional per-row compaction
-    /// bought nothing: 100,683,176 bytes
-    /// allocated compacting unconditionally, 29,948,424 bytes allocated
-    /// skipping it here (the same figure as deleting the compaction outright;
-    /// measured with a scratch corpus, not committed as a permanent test).
-    ///
-    /// Allocation churn measured on the 10,000-series/500-segment corpus in
-    /// `tests/dedup_finalize_allocation.rs`: 84,838,905 bytes allocated, well
-    /// under the 201,280,697 an earlier round of this operator allocated
-    /// compacting unconditionally. `out_multi_dict` being set less often than
-    /// the per-segment split alone would suggest is why: the upstream
-    /// `SortPreservingMergeExec` already rebuilds one shared dictionary per
-    /// *its own* output batch when interleaving several small segments'
-    /// worth of rows into it (same pointer-equality-or-copy rule
-    /// `compact_labels` describes for `concat_batches` applies to arrow's
-    /// merge machinery too), so most flush windows here draw from a single
-    /// already-unified dictionary and only the rare window spanning a merge
-    /// batch boundary needs real per-row compaction.
+    /// exactly, so this only compacts each row first when `out_multi_dict` is
+    /// set, exactly as an earlier version of this operator did
+    /// unconditionally. See `tests/dedup_finalize_allocation*.rs` for the
+    /// measured allocation-churn figures this bound is based on, and for why
+    /// `out_multi_dict` is set less often than it may look like it should be.
     fn flush(&mut self) -> DFResult<RecordBatch> {
         let batch = if self.out_multi_dict {
             let rows = std::mem::take(&mut self.out);

@@ -1,19 +1,21 @@
 //! Allocation-churn bound (cumulative bytes allocated over the run, via
 //! `stats_alloc`; not peak resident bytes) for `RsegDedupExec`'s
 //! labels-dictionary handling across a flush window (`src/dedup.rs`'s
-//! `DedupStream::flush`, deferred from an earlier per-row `finalize` call
-//! to `crate::labels::compact_labels`; issue #1582 fix-round finding at
-//! `src/dedup.rs:233`, deferral round).
+//! `DedupStream::flush`, deferred from an earlier per-row `finalize` call to
+//! `crate::labels::compact_labels`; see `DedupStream::flush`'s docs).
 //!
 //! This file contains EXACTLY ONE test on purpose, following
 //! `tests/scan_batch_allocations.rs`: the measurement is a `stats_alloc::Region`
 //! around the global allocator, so a second test running concurrently in this
-//! binary (`cargo test`/nextest run test functions concurrently within one
-//! binary) would land its own allocations in the count. The pipeline is
-//! driven on a current-thread tokio runtime for the same reason. Valid under
-//! a debug (`cargo test`) or release build alike, single-threaded within its
-//! own process, which is guaranteed here because this file compiles to its
-//! own test binary and holds no other `#[test]`.
+//! process would land its own allocations in the count. `cargo test`'s own
+//! thread pool runs every test in one process, so a second `#[test]` in this
+//! binary would corrupt the count even under nextest, which runs each test
+//! in its own process but does not change what `cargo test --doc` does (also
+//! run by `scripts/gates.sh`). The pipeline is driven on a current-thread
+//! tokio runtime for the same reason. Valid under a debug (`cargo test`) or
+//! release build alike, single-threaded within its own process, which is
+//! guaranteed here because this file compiles to its own test binary and
+//! holds no other `#[test]`.
 //!
 //! The corpus is `varied_corpus(10000, 1)`: 10,000 distinct series, one
 //! sample each, none of them true (series, ts) duplicates, split across 500
@@ -203,7 +205,7 @@ async fn run_pipeline(store: Arc<dyn ObjectStoreBackend>, snapshot: Snapshot) ->
 }
 
 #[test]
-fn finalize_labels_compaction_bounds_peak_allocation() {
+fn finalize_labels_compaction_bounds_allocation_churn() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -226,7 +228,7 @@ fn finalize_labels_compaction_bounds_peak_allocation() {
 
     assert_eq!(rows, 10000, "every group must dedup to its one winner");
     eprintln!(
-        "finalize_labels_compaction_bounds_peak_allocation: {rows} rows, \
+        "finalize_labels_compaction_bounds_allocation_churn: {rows} rows, \
          {} allocations, {} bytes allocated",
         stats.allocations, stats.bytes_allocated,
     );
