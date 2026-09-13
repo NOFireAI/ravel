@@ -372,8 +372,10 @@ fn reconcile_rate(configured: crate::admission::RateLimit, n: u64) -> Option<u64
 /// GETs all succeed, so `ravel_admission_reconciliation_failures_total` stays
 /// at zero while every sibling ages past `2 * R` before it is read.
 ///
-/// Rendered by the server's exporter under the names each field names, beside
-/// the existing `ravel_admission_*` families.
+/// Returned by [`reconcile_once`] and published on the controller, where
+/// [`AdmissionController::last_reconcile_cycle_stats`] reads the most recent
+/// cycle's copy. Each field names the `ravel_admission_*` series it belongs
+/// under, beside the existing families.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReconcileCycleStats {
     /// `ravel_admission_reconciliation_cycle_duration_seconds` (gauge, exported
@@ -560,6 +562,7 @@ pub async fn reconcile_once(
     // drawn from, so a test drives it deterministically and no library logic
     // reads wall time of its own.
     stats.cycle_duration_ns = controller.now_ns().saturating_sub(now_ns).max(0);
+    controller.record_reconcile_cycle(stats);
     stats
 }
 
@@ -1293,6 +1296,11 @@ mod tests {
         assert_eq!(
             stats.cycle_duration_ns, STEP_NS,
             "the cycle's end stamp comes from the same injected clock as its start"
+        );
+        assert_eq!(
+            controller.last_reconcile_cycle_stats(),
+            stats,
+            "the cycle publishes the same figures it returned, for the exporter to read"
         );
     }
 }
