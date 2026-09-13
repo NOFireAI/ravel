@@ -220,6 +220,7 @@ async fn cache_dir_attaches_disk_tier_and_a_query_is_served_from_a_disk_hit() {
         ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
         cli.cache_dir.clone(),
         cli.catalog_resolve_concurrency,
+        None,
     )
     .expect("catalog");
     let mut tokens = HashMap::new();

@@ -47,6 +47,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
@@ -348,6 +349,7 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         limits: LimitsConfig {
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,
@@ -571,6 +573,7 @@ async fn start_attribution_server() -> ravel_server::Running {
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         limits: LimitsConfig {
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,

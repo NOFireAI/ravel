@@ -300,7 +300,19 @@ async fn main() -> anyhow::Result<()> {
         interior_reverify_ns,
         ..CompactorConfig::default()
     };
-    let catalog_max_ingest_lag_ns = ravel_catalog::CatalogConfig::default().max_ingest_lag_ns;
+    // The catalog listing window and the OTLP admission bound are one
+    // coordinated value (ADR-0051 section 4), from `--max-ingest-lag`. Resolve
+    // the pair here so the retention floor below is validated against the SAME
+    // window the catalog actually resolves with, not the compiled-in 2h default:
+    // a deployment that raised the flag would otherwise validate retention
+    // against the wrong lag. `ravel_server::start` resolves it again from the
+    // `max_ingest_lag` duration threaded onto `ServerConfig`.
+    let max_ingest_lag = cli
+        .parse_max_ingest_lag()
+        .context("failed to parse --max-ingest-lag")?;
+    let ingest_lag =
+        ravel_server::resolve_ingest_lag(max_ingest_lag).context("invalid --max-ingest-lag")?;
+    let catalog_max_ingest_lag_ns = ingest_lag.catalog_window_ns;
     let retention_policy = cli
         .parse_retention_policy()
         .context("failed to parse retention flags")?;
@@ -535,6 +547,7 @@ async fn main() -> anyhow::Result<()> {
             .parse_shutdown_timeout()
             .context("failed to parse --shutdown-timeout")?,
         drain_settle_interval: ravel_server::DEFAULT_DRAIN_SETTLE_INTERVAL,
+        max_ingest_lag,
     };
 
     let running =
