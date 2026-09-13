@@ -923,13 +923,18 @@ fn main() {
     println!("load avg (start): {load_start}");
     println!("load avg (end):   {load_end}");
     println!("========================================================================");
+    // out_bytes is what the store policy kept (floor-and-shrink applied);
+    // comp_bytes is the codec's own output length before that policy runs.
+    // The two differ exactly on a cell the policy rejected, where ratio
+    // reflects only out_bytes.
     println!(
-        "{:<24} {:<12} {:<28} {:>10} {:>10} {:>8} {:>6} {:>10} {:>10} {:>6}",
+        "{:<24} {:<12} {:<28} {:>10} {:>10} {:>10} {:>8} {:>6} {:>10} {:>10} {:>6}",
         "dataset",
         "size",
         "arm",
         "in_bytes",
         "out_bytes",
+        "comp_bytes",
         "ratio",
         "comp?",
         "enc_MB/s",
@@ -938,12 +943,13 @@ fn main() {
     );
     for r in &reports {
         println!(
-            "{:<24} {:<12} {:<28} {:>10} {:>10} {:>8.3} {:>6} {:>10.1} {:>10.1} {:>6}",
+            "{:<24} {:<12} {:<28} {:>10} {:>10} {:>10} {:>8.3} {:>6} {:>10.1} {:>10.1} {:>6}",
             r.dataset,
             r.size_label,
             r.arm,
             r.input_bytes,
             r.stored_bytes,
+            r.compressed_bytes,
             r.ratio,
             r.stored_compressed,
             r.encode_mb_s,
