@@ -4177,6 +4177,16 @@ pub fn render(
     // tenant from `crate::alerting::spawn` and holds no router or state struct
     // the `/metrics` route is given. `None` when this process built no
     // evaluator, which omits the family.
+    //
+    // That omission is load-bearing: every alert rule in
+    // `docs/guides/observability.md` relies on the family being absent, not
+    // zero, on a deployment that configured no alerting, since an expression
+    // over an absent series is the empty vector. It is deliberately not
+    // covered by a `render`-level test. The handle is a process-global
+    // `OnceLock`, so a test asserting absence passes or fails on whether some
+    // other test in the same binary spawned an evaluator first, and a test
+    // that depends on binary-internal ordering is worse than none.
+    // `render_alert_family`'s own test covers the present case.
     if let Some(metrics) = crate::alerting::active_alert_metrics() {
         use crate::alerting::AlertTickOutcome;
         render_alert_family(
