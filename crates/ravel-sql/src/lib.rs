@@ -135,8 +135,8 @@ pub use error::{
     MSG_SPILL_QUOTA_MARKER, MSG_SPILL_UNAVAILABLE, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, SqlError,
 };
 pub use executor::{
-    ExplainReport, LiveAccounting, PinnedQuery, PinnedStream, SqlExecutor, SqlOutcome, SqlRequest,
-    SqlStats, TargetSignal,
+    ExplainReport, LiveAccounting, PinnedQuery, PinnedStream, ScanTiming, SegmentTiming,
+    SqlExecutor, SqlOutcome, SqlRequest, SqlStats, TargetSignal,
 };
 #[cfg(feature = "flight-sql")]
 pub use flight::{
