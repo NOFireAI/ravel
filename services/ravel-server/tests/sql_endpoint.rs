@@ -606,7 +606,10 @@ async fn sql_response_carries_phase_and_io_shape_stats() {
     assert_eq!(status, StatusCode::OK, "{value}");
     let phases = value["stats"]["phases"].as_array().expect("phases array");
     assert_eq!(phases.len(), 4, "{value}");
-    assert_eq!(value["stats"]["io"]["planClass"], "exhaustive_scan", "{value}");
+    assert_eq!(
+        value["stats"]["io"]["planClass"], "exhaustive_scan",
+        "{value}"
+    );
 }
 
 /// NaN and the infinities have no JSON literal, so they arrive as the

@@ -39,8 +39,8 @@ use ravel_catalog::{LoadedColumnStats, SegmentRef, Snapshot};
 #[cfg(feature = "flight-sql")]
 use ravel_query::ByteLimit;
 use ravel_query::LogSegmentFetcher;
+use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
-use ravel_query::phase_accounting::PhaseAccounting;
 use ravel_types::TenantHash;
 #[cfg(test)]
 use ravel_types::accounting::QueryAccounting;

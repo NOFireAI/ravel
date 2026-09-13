@@ -21,7 +21,7 @@
 //! comparable or summable with each other.
 
 use ravel_query::io_shape::QueryIoShape;
-use ravel_query::phase_accounting::{PhaseAccountingSnapshot, QueryPhase};
+use ravel_query::{PhaseAccountingSnapshot, QueryPhase};
 use ravel_types::accounting::AccountedOp;
 use serde_json::{Value as Json, json};
 
@@ -66,8 +66,8 @@ pub fn io_shape_json(shape: &QueryIoShape) -> Json {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use ravel_query::PhaseAccounting;
     use ravel_query::io_shape::PlanClass;
-    use ravel_query::phase_accounting::PhaseAccounting;
 
     use super::*;
 

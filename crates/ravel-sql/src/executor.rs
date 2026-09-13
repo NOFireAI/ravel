@@ -96,10 +96,9 @@ use ravel_memory::MemoryBudget;
 use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::io_shape::{IoShapeCounts, PlanClass, QueryIoShape, count_unfolded_segments};
-use ravel_query::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
 use ravel_query::{
-    LogSegmentFetcher, QueryError, RequestBudgets, SegmentAdmission, SegmentFetcher, admit,
-    request_budget_exceeded,
+    LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError, RequestBudgets,
+    SegmentAdmission, SegmentFetcher, admit, request_budget_exceeded,
 };
 use ravel_types::accounting::{
     AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
@@ -617,7 +616,7 @@ impl LiveAccounting {
     /// mid-await: the attempt's counter block lives behind an `Arc` this view
     /// shares, so it outlives the dropped future.
     pub fn snapshot(&self) -> QueryAccountingSnapshot {
-        self.lock().snapshot().pooled()
+        self.lock().pooled_snapshot()
     }
 
     /// Like [`Self::snapshot`], split by phase.
@@ -1748,11 +1747,15 @@ impl SqlExecutor {
     ) -> QueryIoShape {
         let whole_object_threshold = match target {
             TargetSignal::Metrics => self.fetcher.whole_object_threshold(),
-            // `block_range_threshold` is the RLOG read path's own name for
-            // the same knob `effective_whole_object_threshold` returns
-            // verbatim (`ravel_query::config`'s doc comment on
-            // `with_block_range_threshold`); alerts and audit read through
-            // this same `log_fetcher`.
+            // `block_range_threshold` is the knob `plan_segment` itself
+            // routes on (`log_fetcher.rs:1368,1398`): at or below it there is
+            // no probe at all and the read is one whole-object GET, above it
+            // a footer probe precedes a dependent read, so it is the correct
+            // input to `depth_for_object`. `effective_whole_object_threshold`
+            // is a different, larger-by-default knob governing a later,
+            // pre-probe crossover inside `BlockRangeFetcher`
+            // (`log_fetcher.rs:4481`) and would be the wrong choice here;
+            // alerts and audit read through this same `log_fetcher`.
             TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => {
                 self.log_fetcher.block_range_threshold()
             }
