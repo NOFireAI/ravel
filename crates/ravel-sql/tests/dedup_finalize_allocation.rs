@@ -1,7 +1,7 @@
-//! Peak allocation bound for `RsegDedupExec::finalize`'s per-row labels
-//! compaction (`src/dedup.rs`'s call to `crate::labels::compact_labels`
-//! ahead of `flush`'s own compaction; issue #1582 fix-round finding at
-//! `src/dedup.rs:233`).
+//! Peak allocation bound for `RsegDedupExec`'s labels-dictionary handling
+//! across a flush window (`src/dedup.rs`'s `DedupStream::flush`, deferred
+//! from an earlier per-row `finalize` call to `crate::labels::compact_labels`;
+//! issue #1582 fix-round finding at `src/dedup.rs:233`, deferral round).
 //!
 //! This file contains EXACTLY ONE test on purpose, following
 //! `tests/scan_batch_allocations.rs`: the measurement is a `stats_alloc::Region`
@@ -16,19 +16,19 @@
 //! The corpus is `varied_corpus(10000, 1)`: 10,000 distinct series, one
 //! sample each, none of them true (series, ts) duplicates, split across 500
 //! small segments (`write_fixture_many_small_segments`) of 20 series each.
-//! Each segment gets its own locally-built labels dictionary, and each
-//! segment's own scan output (20 rows) sits far under `RsegDedupExec::
-//! FLUSH_ROWS` (1024), so `poll_next`'s outer loop keeps folding winners from
-//! many different segments -- each with a distinct, non-pointer-equal
-//! dictionary -- into the same accumulator before a flush is due. Without
-//! `finalize`'s per-row `compact_labels` call, each accumulated one-row slice
-//! still points at its *whole* source segment's dictionary, so `flush`'s
-//! `concat_batches` (which shares a dictionary only on pointer equality
-//! between inputs) appends one full per-segment dictionary per accumulated
-//! row instead of one shared, already-bounded one; with the call in place,
-//! every slice already carries at most one entry, so the transient payload
-//! scales with the row count times one entry rather than the row count times
-//! a whole segment's dictionary.
+//! Each segment gets its own locally-built labels dictionary. `flush` decides
+//! per flush window, not per row: `DedupStream::out_multi_dict` tracks
+//! whether every row accumulated since the last flush still points at one
+//! dictionary by pointer. Naively that sounds like it should almost never
+//! hold here (500 distinct per-segment dictionaries, interleaved by
+//! `series_id` order upstream of this operator, not by segment), but the
+//! upstream `SortPreservingMergeExec` already materializes one shared
+//! dictionary per *its own* output batch when it interleaves several small
+//! segments' rows into it -- the same pointer-equality-or-copy rule
+//! `concat_batches` follows applies to arrow's merge machinery too. So most
+//! flush windows here draw from one already-unified merge-batch dictionary,
+//! and `flush` skips the per-row `compact_labels` rebuild for them; only a
+//! flush window that straddles a merge-batch boundary needs it for real.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -55,14 +55,18 @@ const TENANT: TenantHash = TenantHash([11u8; 16]);
 
 /// Bytes the whole scan -> merge -> dedup pipeline may allocate to answer
 /// `SELECT * FROM samples` over the 10,000-series/500-segment corpus
-/// described above. Measured on this fixture: with `finalize`'s per-row
-/// `compact_labels` call in place, 201,280,657 bytes; with that call
-/// deleted (leaving `flush`'s own compaction as the only guard),
-/// 387,118,145 bytes, 1.92x more. This bound sits about a third above the
-/// fixed measurement and a third below the broken one, so it is decisive
-/// against allocator noise (the fixed run has headroom to grow) without
-/// being a bare `> 0` or a restatement of either measured number.
-const MAX_BYTES: usize = 260_000_000;
+/// described above. Measured on this fixture, as committed today
+/// (`flush` skips per-row compaction for a flush window whose rows all share
+/// one dictionary pointer, compacting only when they don't -- see
+/// `DedupStream::flush`): 84,838,905 bytes. Two superseded variants, kept for
+/// scale: the per-row call made unconditionally in `finalize` (an earlier
+/// round of this fix), 201,280,697 bytes; that call deleted outright,
+/// 387,118,145 bytes. This bound sits about a third of the way from the
+/// current measurement towards the unconditional-compaction figure, so it
+/// stays decisive against either superseded variant (a skip that silently
+/// stops firing, or a compaction step deleted outright) without being a bare
+/// `> 0` or a restatement of the measured number.
+const MAX_BYTES: usize = 150_000_000;
 
 /// A corpus of `count` series, each with a distinct multi-label set and one
 /// label unique to it, plus a shared and a per-series-absent label so the
@@ -225,8 +229,8 @@ fn finalize_labels_compaction_bounds_peak_allocation() {
         stats.bytes_allocated <= MAX_BYTES,
         "scan -> merge -> dedup over the 10,000-series/500-segment corpus \
          allocated {} bytes, exceeding the {MAX_BYTES} bound; this guards \
-         RsegDedupExec::finalize's per-row labels compaction (src/dedup.rs) \
-         against being deleted",
+         RsegDedupExec::flush's labels-dictionary compaction (src/dedup.rs) \
+         against being deleted or made unconditional again",
         stats.bytes_allocated,
     );
 }
