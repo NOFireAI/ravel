@@ -534,37 +534,10 @@ fn normalize_impl(
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
     let total_points = count_total_points(batch);
     if total_points > limits.max_data_points_per_request {
-        // No payload past the count is decoded, so no exemplar is even read
-        // (this is as true of `NUMBER_DP_EXEMPLARS` as of the histogram table),
-        // let alone offered to the cap. This is where OTAP differs from the
-        // other two surfaces: OTLP and Remote Write both hold their exemplars
-        // in memory at the count check, so both count the request's exemplars
-        // as dropped here, and a counter that ignored them would under-report a
-        // whole-request rejection. OTAP cannot count what it never decoded.
-        // The difference is structural, not an oversight, and the differential
-        // gate compares rejection classes at the shared admission layer rather
-        // than at this return for exactly that reason.
-        return (
-            MetricsNormalizeResult {
-                output: NormalizeOutput {
-                    points: Vec::new(),
-                    // OTAP carries only scalar metric points; native-histogram
-                    // admission is the OTLP/Remote Write surface's concern, so
-                    // this vector is always empty here
-                    // (ravel_otlp::NormalizeOutput gained it for those
-                    // surfaces).
-                    histogram_points: Vec::new(),
-                    rejected: vec![Rejection::TooManyDataPoints {
-                        count: total_points,
-                        max: limits.max_data_points_per_request,
-                    }],
-                },
-                exemplars: Vec::new(),
-            },
-            // A whole-request rejection stored no point, so it describes no
-            // family: no metadata, exactly as OTLP's own early return.
-            Vec::new(),
-        );
+        return whole_request_rejection(Rejection::TooManyDataPoints {
+            count: total_points,
+            max: limits.max_data_points_per_request,
+        });
     }
 
     let mut rejected = Vec::new();
@@ -602,6 +575,25 @@ fn normalize_impl(
     let flat_number_exemplar_attrs = flatten_attrs(&number_exemplar_attr_batches, &mut rejected);
     let flat_summary_dp = flatten_summary_dp(&summary_dp_batches, &mut rejected);
     let flat_summary_attrs = flatten_attrs(&summary_attr_batches, &mut rejected);
+
+    // Second bound, on what the request expands to rather than on what it
+    // carries on the wire, mirroring `ravel_otlp::normalize_impl`. One classic
+    // histogram or summary data point becomes one point per bucket or quantile
+    // plus its `_sum`/`_count` (ADR-0016), each copying the whole base label
+    // set, so a request well under `max_data_points_per_request` in wire points
+    // can still expand into an arbitrary number of allocated ones. Unlike OTLP,
+    // whose protobuf is decoded before its wire-count check, OTAP learns the
+    // per-point bound counts only after flattening the columnar payloads, so
+    // this sits here rather than beside the wire-count check above; it still
+    // runs before any per-point series is built (the explode loops below).
+    let exploded_points = count_exploded_points(&flat_dp, &flat_hist_dp, &flat_summary_dp);
+    if exploded_points > limits.max_data_points_per_request {
+        return whole_request_rejection(Rejection::TooManyExplodedPoints {
+            exploded: exploded_points,
+            count: total_points,
+            max: limits.max_data_points_per_request,
+        });
+    }
 
     let root_ids = decode_root_ids(&root_batches, &mut rejected);
     let dense_size = dense_size_for(
@@ -971,6 +963,73 @@ fn count_total_points(batch: &DecodedBatch) -> usize {
             .sum::<usize>()
     })
     .sum()
+}
+
+/// Normalized points a flattened request would expand into: one per number data
+/// point, and the exploded series count (ADR-0016) for the two metric types
+/// that do not admit one point per data point. The OTAP twin of
+/// `ravel_otlp::count_exploded_data_points`, but it counts what this path
+/// actually builds, not what OTLP builds: exponential histograms are rejected
+/// wholesale upstream ([`push_unsupported_type_rejections`]) and never reach a
+/// flattened vector, so they explode into nothing and are absent here. Reads the
+/// flattened vectors' lengths (and, per histogram, whether a `sum` is present)
+/// only, never bucket or quantile contents, so it allocates nothing.
+fn count_exploded_points(
+    flat_dp: &[FlatDp],
+    flat_hist_dp: &[FlatHistogramDp],
+    flat_summary_dp: &[FlatSummaryDp],
+) -> usize {
+    let number = flat_dp.len();
+    // `{name}_bucket` per explicit bound, plus the `+Inf` bucket, `_count`, and
+    // `_sum` when present: exactly what [`explode_histogram_point`] pushes.
+    let histogram = flat_hist_dp
+        .iter()
+        .map(|dp| {
+            dp.explicit_bounds
+                .len()
+                .saturating_add(2)
+                .saturating_add(usize::from(dp.sum.is_some()))
+        })
+        .fold(0usize, usize::saturating_add);
+    // `{name}{quantile=...}` per quantile, plus `_sum` and `_count`, both
+    // unconditional: exactly what [`explode_summary_point`] pushes.
+    let summary = flat_summary_dp
+        .iter()
+        .map(|dp| dp.quantiles.len().saturating_add(2))
+        .fold(0usize, usize::saturating_add);
+    number.saturating_add(histogram).saturating_add(summary)
+}
+
+/// Reject a whole request for `reason` before any data point is built, so
+/// nothing it carried is admitted. Both OTAP whole-request early returns share
+/// this shape, the same way `ravel_otlp::whole_request_rejection` is shared by
+/// both of its own early returns.
+///
+/// Unlike OTLP and Remote Write, OTAP does not count dropped exemplars here:
+/// no exemplar payload is decoded at either OTAP early return (the count check
+/// runs before any payload past the row count is read, and the exploded check
+/// reads only flattened point lengths), so there is nothing to count. That
+/// difference is structural, not an oversight, and the differential gate
+/// compares rejection classes at the shared admission layer rather than at
+/// this return for exactly that reason.
+///
+/// A whole-request rejection stored no point, so it describes no metric family:
+/// the metadata vector is empty, exactly as OTLP's own early returns.
+/// `histogram_points` is likewise always empty; OTAP admits only scalar points
+/// (`ravel_otlp::NormalizeOutput` gained that vector for the OTLP and Remote
+/// Write native-histogram surfaces).
+fn whole_request_rejection(reason: Rejection) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
+    (
+        MetricsNormalizeResult {
+            output: NormalizeOutput {
+                points: Vec::new(),
+                histogram_points: Vec::new(),
+                rejected: vec![reason],
+            },
+            exemplars: Vec::new(),
+        },
+        Vec::new(),
+    )
 }
 
 /// Exponential histograms are the one remaining unsupported metric payload
@@ -2255,6 +2314,16 @@ fn explode_histogram_point(
     }
     if !dp.explicit_bounds.windows(2).all(|w| w[0] < w[1]) {
         return Err(Rejection::HistogramBoundsNotIncreasing);
+    }
+    // Last of the validity checks, and the one that has to precede
+    // `build_base_labels`: everything below allocates per bucket, and the bound
+    // list is the sender's to choose. Mirrors `ravel_otlp::explode_histogram`,
+    // reading the same `max_histogram_buckets` value the OTLP surface reads.
+    if dp.explicit_bounds.len() > limits.max_histogram_buckets {
+        return Err(Rejection::TooManyHistogramBuckets {
+            bounds: dp.explicit_bounds.len(),
+            max: limits.max_histogram_buckets,
+        });
     }
 
     let base_labels = build_base_labels(range, attrs, limits)?;
