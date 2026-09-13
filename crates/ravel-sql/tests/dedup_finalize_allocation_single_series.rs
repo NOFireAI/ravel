@@ -1,9 +1,8 @@
 //! Allocation-churn figures (cumulative bytes allocated over the run, via
-//! `stats_alloc`; not peak resident bytes -- see
-//! `tests/peak_alloc_instrument.rs`) for `RsegDedupExec`'s labels-dictionary
-//! handling (`src/dedup.rs`, `DedupStream::flush`) on the worst case for it:
-//! one series with many samples. Issue #1582 measurement round, deferral
-//! round.
+//! `stats_alloc`; not peak resident bytes) for `RsegDedupExec`'s
+//! labels-dictionary handling (`src/dedup.rs`, `DedupStream::flush`) on the
+//! worst case for it: one series with many samples. Issue #1582
+//! measurement round, deferral round.
 //!
 //! Unlike `tests/dedup_finalize_allocation.rs`'s many-small-segments corpus,
 //! every row here shares the *same* series and so the *same* one-entry
