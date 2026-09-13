@@ -112,6 +112,7 @@ pub use audit_schema::{
     AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
 };
 pub use bounded_topk::{BOUNDED_TOPK_AGGREGATE_RULE, BoundedTopKAggregate};
+pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex};
 pub use config::{
     DEFAULT_BOUNDED_TOPK_MAX_LIMIT, DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS,
     DEFAULT_MAX_QUERY_BYTES, ENV_SPILL_DIR, ENV_SPILL_MAX_BYTES, GROUP_VALUES_CEILING_COMPENSATION,
@@ -199,7 +200,6 @@ pub use spans_schema::{
     SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID, spans_schema,
 };
 pub use spill::{OperatorSpill, SpillCounts, SpillScratch};
-pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex};
 pub use udf::{label_match_udf, label_udf};
 pub use validate::{ValidationError, validate};
 
