@@ -429,9 +429,14 @@ there before changing a rule.
   `ALLOW_STALE_REF=1` to dispatch an intentionally older ref.
 - `scripts/guards/assert-fresh-merge-base.sh <pr-number>`: exits non-zero
   when a PR's merge base is behind `origin/main`, printing how far and what
-  it has not seen. `pr-review-status.sh` runs it, so a stale PR never gets
-  the merge command printed; run it directly for any merge that bypasses
-  that script. Green CI on a stale base is not evidence about the merge: a
+  it has not seen. **Since 2026-09-13 a merge queue on `protect-main` is what
+  actually enforces freshness**: it rebases each entry onto current main and
+  runs full CI on the combined result before landing, so do NOT hand-rebase a
+  PR merely because main moved, and do not treat a behind-ness count as a
+  reason to pay a CI cycle. The queue is `REBASE`/`ALLGREEN`, batches up to 5,
+  and `ci.yml` already carried the `merge_group:` trigger. This guard remains
+  the check for a merge that BYPASSES the queue, and for diagnosing a branch
+  that will not enter it. Green CI on a stale base is not evidence about the merge: a
   PR green against an older base can still break `main` (8a534f43 left main
   uncompilable exactly this way, a five-argument call site landing minutes
   before another PR made the function take six, both PRs green), and a gate
