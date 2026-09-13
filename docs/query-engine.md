@@ -688,7 +688,12 @@ with no double-free.
 typed `FetchMemoryExhausted { requested, reserved, limit }` (on each fetcher's
 error enum), mapped onto the query error path. The refusal carries only byte
 counts -- never an object key or tenant identity -- and is never a smaller fetch
-or a partial result: zero GETs are issued and the budget is left unchanged.
+or a partial result: no GET is issued for the refused bytes, and the budget is
+left unchanged. This holds before any GET for the RSEG range, whole-object, and
+block-range object-assembly reservations. The transient summed-run
+reservations in `fetch_blocks`/`fetch_chunk_ranges` are taken after the probe
+and directory-section GETs, so a refusal there aborts a read that has already
+issued those GETs.
 
 ## Endpoints (Prometheus compatibility subset)
 

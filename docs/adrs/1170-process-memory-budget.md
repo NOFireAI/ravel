@@ -273,8 +273,10 @@ that are not yet reserved or tracked.
    - a cache **hit** (`Source::Cache`), where the returned buffer is the resident
      cache entry and the fetch guard reserves the same bytes the cache cap
      already holds. This one is now marked in both fetchers, so the residual `d`
-     below is the SQL boundary alone; the reasoning is kept because it is the
-     same shape and because a hit was as real an overlap as an insert all along.
+     below was believed to be the SQL boundary alone -- the 2026-09-13 amendment
+     below found a third untracked site, so that is no longer the case; the
+     reasoning is kept because it is the same shape and because a hit was as
+     real an overlap as an insert all along.
 
    The direction is an overcount of `unique` by the untracked overlap `d`, and
    that overcount does not stop at the decision-4 acceptance assertion: decision
@@ -314,8 +316,9 @@ marked):
   `MemoryBudget::unlimited()`: `QueryEngine::with_memory_budget` reaches only its
   `fetcher` and `log_fetcher`, and no server task installs a finite budget yet.
 - The SQL cross-boundary overlap is untracked by `handoff_overlap`. The
-  cache-hit overlap was too, and is now marked in both the log and span
-  fetchers, so the residual is the SQL boundary alone.
+  cache-hit overlap was too, and is now marked at every cache-hit call site.
+  The residual is the SQL boundary plus `covering_read`'s own cache-insert
+  branch (2026-09-13 amendment below), not the SQL boundary alone.
 - **Idle assembly buffers.** The invariant above is stated over LIVE bytes for
   a reason: `AssemblyBuffer::drop` returns its allocation to
   `AssemblyBufferPool`'s free list, not to the allocator, so those bytes stay
@@ -329,6 +332,39 @@ marked):
   Anything comparing `resident_t` against reserved totals, decision 4's
   acceptance assertion included, must count the pool's idle bytes on the
   resident side or it will read the difference as an accounting error.
+
+#### Amendment (2026-09-13, Refs: #1170)
+
+The 2026-09-06 amendment above marked cache hits in the whole-object funnel
+(`log_fetcher.rs`/`span_fetcher.rs`, `Source::Cache`) and concluded that doing
+so left the SQL boundary as the only untracked overlap. That conclusion
+undercounted by one call site: `BlockRangeFetcher::covering_read`'s
+single-GET branch (`log_fetcher.rs`, used both directly and by
+`whole_object_bytes`'s above-threshold segmented funnel) also returns a
+cache-resident buffer on a hit, and left it unmarked. That branch is now
+marked too.
+
+Marking it exposed a second, distinct gap the whole-object funnel does not
+have: `covering_read`'s single-GET branch also leaves a cache **insert**
+(`cached_extent` returning `live == true`, the `Source::Upstream` equivalent)
+unmarked. The whole-object funnel and both `span_fetcher` call sites mark
+their insert arm (the original decision-2 behavior); `covering_read` never
+did. Reproduced directly: a fetch of an object above the suffix-probe window
+(so the probe and the covering read land on different cache keys) and below
+`max_fetch_run_bytes` (so it takes the single-GET branch) leaves
+`handoff_overlap()` at `0` while the covering read's buffer is held, though
+the same bytes just went to cache with the store's own eviction cap covering
+them.
+
+So after this amendment the untracked residual `d` in decision 2's `unique`
+expression is the SQL cross-boundary overlap (still unmarked) **plus**
+`covering_read`'s cache-insert overlap (also still unmarked), not the SQL
+boundary alone. Both are the same shape as an already-marked site elsewhere
+in the same file, so closing either is a mirror of existing code, not new
+design; neither is done in this amendment; the reserve derivation must
+account for both terms of `d`, or mark both sites, before decision 3's
+`1.25 x d` sizing can be measured against a value smaller than what the
+calibration run linked from decision 2 already computes.
 
 ### 3. A static carve under one number
 
@@ -362,13 +398,14 @@ subtracts.
 
 This paragraph originally said that expression was exact by construction. It is
 exact only if every overlap is marked, which the first implementation did not
-achieve: see the amendment under decision 2. Cache hits are now marked
-alongside cache inserts, so the remaining unmarked overlap is the SQL
-cross-boundary one, where the fetch guard and the scan's `try_grow` both cover
-the buffer. Until that is marked too, `unique` is an upper bound, the reserve
-derived from it is undersized by roughly 1.25 times the residual, and the
-calibration run must either mark it first or measure the residual and widen the
-multiplier. The margin covers allocator slack and sampling, not accounting
+achieve: see the amendments under decision 2. Cache hits are now marked at
+every call site, but two overlaps remain unmarked: the SQL cross-boundary one,
+where the fetch guard and the scan's `try_grow` both cover the buffer, and
+`covering_read`'s own cache-insert overlap (2026-09-13 amendment). Until both
+are marked, `unique` is an upper bound, the reserve derived from it is
+undersized by roughly 1.25 times their combined residual, and the
+calibration run must either mark them first or measure the residual and widen
+the multiplier. The margin covers allocator slack and sampling, not accounting
 overlap, so it cannot be leaned on to absorb this. That value lands as a
 constant in the derivation with the calibration figures in its doc comment, the
 way `CACHE_MEMORY_PERCENT` carries the sweep, in a commit that precedes the

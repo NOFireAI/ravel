@@ -3824,7 +3824,7 @@ impl BlockRangeFetcher {
         // hand the freed extent to another task in between, turning a fetch that
         // a handover would have completed into a typed refusal. That is
         // fail-closed and allowed.
-        let reservation = self.reserve_fetch(total_size)?;
+        let mut reservation = self.reserve_fetch(total_size)?;
         if total_size <= self.max_fetch_run_bytes {
             let (bytes, live) = self
                 .cached_extent(
@@ -3840,6 +3840,12 @@ impl BlockRangeFetcher {
                 .await?;
             if live {
                 self.observe_fetch_run(total_size);
+            } else {
+                // Cache hit: `bytes` clones the cache entry's allocation, so
+                // the cache cap and this guard both cover it for as long as
+                // the caller holds it (ADR-1170 decision 2), same as the
+                // whole-object funnel's hit arm.
+                reservation.mark_handed_off();
             }
             let live_bytes = if live { total_size } else { 0 };
             return Ok((
@@ -7635,6 +7641,101 @@ mod whole_object_get_limiter_tests {
             0,
             "dropping the scan releases the single reservation"
         );
+    }
+
+    /// `covering_read`'s single-GET branch (`total_size <= max_fetch_run_bytes`)
+    /// on a cache HIT: `cached_extent` returns `(bytes, false)`, a clone of the
+    /// resident cache entry, so the cache cap and this fetch guard both cover
+    /// the same allocation for the buffer's life. This is the same class the
+    /// whole-object funnel's `Source::Cache` arm handles
+    /// (`cache_hit_marks_the_reservation_handed_off` above), left unmarked here
+    /// because `covering_read` is a separate call site.
+    ///
+    /// Reached via the coverage crossover (`with_block_range_threshold(0)`,
+    /// same routing `coverage_crossover_reserves_the_object_once` uses): the
+    /// object is small enough that `total_size` stays under
+    /// `max_fetch_run_bytes`, so this exercises the single-GET branch, not the
+    /// segmented loop.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call added to
+    /// the `else` arm of `covering_read`'s single-GET branch leaves
+    /// `handoff_overlap()` at 0 while the second (cache-hit) scan's buffer is
+    /// held, so the hit assertion below fails with: assertion `left == right`
+    /// failed: a covering-read cache hit holds the same bytes under the cache
+    /// cap and this guard -- left: 0, right: 477 (the fixture object's size;
+    /// confirmed by making exactly that edit, observing the failure, and
+    /// reverting it by hand).
+    #[tokio::test]
+    async fn covering_read_cache_hit_marks_the_reservation_handed_off() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+            16 * 1024 * 1024,
+            100,
+            16 * 1024 * 1024,
+        )));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(16 * 1024 * 1024));
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_block_range_threshold(0)
+            .with_cache(cache)
+            .with_memory_budget(budget.clone());
+
+        // First scan admits the object to the cache (the insert case); drop it
+        // so the only overlap the second scan can report is its own.
+        let first = fetcher
+            .scan_accounted_with_tenant(
+                &seg_ref(size),
+                TENANT,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                &ColumnSelection::all(),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("first scan")
+            .expect("the segment is relevant to a full-window query");
+        drop(first);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the insert's overlap clears before the hit is measured"
+        );
+
+        let accounting = QueryAccounting::new();
+        let hit = fetcher
+            .scan_accounted_with_tenant(
+                &seg_ref(size),
+                TENANT,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                &ColumnSelection::all(),
+                &accounting,
+            )
+            .await
+            .expect("second scan")
+            .expect("the segment is relevant to a full-window query");
+        // Two hits, not one: the suffix probe (ADR-0107) and the covering GET
+        // each read a distinct cache-keyed extent of this small object, and
+        // both are now cache-resident from the first scan.
+        assert_eq!(
+            accounting.snapshot().cache_hits,
+            2,
+            "the second scan's suffix probe and covering read are both served \
+             from the cache, not the store"
+        );
+        assert_eq!(
+            budget.handoff_overlap(),
+            size,
+            "a covering-read cache hit holds the same bytes under the cache cap \
+             and this guard"
+        );
+        drop(hit);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the buffer drops"
+        );
+        assert_eq!(budget.reserved(), 0, "the reservation releases with it");
     }
 }
 
