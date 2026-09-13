@@ -584,6 +584,15 @@ backoff, so a single transient panic self-heals and the next completed cycle
 re-stamps the gauge. A rising panic counter with a stalling gauge is a loop
 that cannot make progress between crashes.
 
+The panic counter needs its own rule, because a crash loop does not always
+stall the gauge. An attempt that completes a cycle and then panics re-stamps
+the gauge on that cycle, and the supervisor resets the backoff to its initial
+value whenever the dead attempt completed at least one cycle. A loop that
+crashes on every attempt after one cycle therefore keeps the gauge fresh, and
+keeps the full-sweep counter moving when the panic lands after the sweep.
+Neither of the two rules above fires, and the panic counter is the only signal
+that moves.
+
 #### The maintenance-stalled alert
 
 ```yaml
@@ -656,6 +665,29 @@ groups:
             The GC sweeper reclaims nothing while this holds. It precedes the
             operator-visible symptom (a refused recent-window query) and
             corroborates RavelMaintenanceLoopStalled.
+      - alert: RavelMaintenanceLoopCrashLooping
+        # The shape neither rule above catches. A supervised attempt that
+        # completes a cycle and then panics re-stamps the liveness gauge on
+        # that cycle, and the supervisor resets its backoff to the initial
+        # value because the dead attempt completed at least one cycle. The
+        # gauge stays fresh, the full-sweep counter keeps moving when the
+        # panic lands after the sweep, and the panic counter is the only
+        # signal that moves. A single transient panic self-heals by design,
+        # so the threshold is a repeat rate rather than any panic at all.
+        expr: |
+          increase(ravel_maintain_loop_panics_total[1h]) > 3
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            The Ravel maintenance loop is panicking and restarting repeatedly
+          description: >-
+            The supervisor is catching a panic and restarting the loop faster
+            than the loop is making progress. Read the maintain process logs
+            for the panic itself. This fires while the liveness gauge is still
+            fresh, so it is the only signal for a crash loop that completes a
+            cycle between panics.
 ```
 
 The staleness threshold is `1800s` (30 minutes, six default 5m maintain
