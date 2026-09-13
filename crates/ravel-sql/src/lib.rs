@@ -53,6 +53,7 @@ mod audit_scan;
 mod audit_schema;
 mod avg;
 mod bounded_topk;
+pub mod complexity_guard;
 mod config;
 pub mod conformance;
 mod cost;
@@ -199,6 +200,7 @@ pub use spans_schema::{
     SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID, spans_schema,
 };
 pub use spill::{OperatorSpill, SpillCounts, SpillScratch};
+pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex};
 pub use udf::{label_match_udf, label_udf};
 pub use validate::{ValidationError, validate};
 
