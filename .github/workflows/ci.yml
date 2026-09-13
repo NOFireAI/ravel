@@ -616,8 +616,14 @@ jobs:
   # ravel-catalog, ravel-commit, ravel-maintain, ravel-ingest, ravel-logseg,
   # ravel-otlp, ravel-promql, ravel-proto, ravel-query, ravel-segment). The
   # `shared-key` on both jobs' rust-cache steps below is what lets that common
-  # subgraph compile once and be reused by whichever job runs second, instead
-  # of each job's own default (job-scoped) cache paying for it separately.
+  # subgraph be shared: both jobs have `needs: changes` and no `needs` between
+  # them, so within one workflow run they start in parallel and race to save
+  # the same shared-key cache, not one compiling first and the other reusing
+  # it. The reuse the shared-key buys is across runs (a later run restores
+  # what an earlier run saved) rather than one job in the same run reusing the
+  # other's build, and it also lets both jobs restore the same cache entry at
+  # start within a run instead of each paying its own default job-scoped cache
+  # separately.
   #
   # NOTE: this job is NOT yet a required check. Until main's protect-main
   # ruleset lists `features-otap`, a break in the otap lane does not block a
