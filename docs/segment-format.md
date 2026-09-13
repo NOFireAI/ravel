@@ -1,13 +1,32 @@
 # RSEG v7: Ravel Segment Format (metrics)
 
 Persistent contract. ADR-0027 leaves exactly one supported version until the
-first public release: v7. The reader accepts trailer `version = 7` only;
-versions 1 through 6 fail closed with the same typed `UnsupportedVersion`
-error as any unknown future version. Any change to the layout bumps the
-version and retires the previous one in the same change (an ADR plus a
-version bump, never an in-place edit under the same number). v7 (ADR-0092)
-retired v6 read and write support in the same change that introduced it, so a
-stray v6 object is rejected, never half-parsed.
+first public release: v7. Any change to the layout bumps the version and
+retires the previous one in the same change (an ADR plus a version bump, never
+an in-place edit under the same number). v7 (ADR-0092) retired v6 read and
+write support in the same change that introduced it, so a stray v6 object is
+rejected, never half-parsed.
+
+**Which versions the reader admits.** The reader admits exactly the versions in
+`ravel_segment::SUPPORTED_VERSIONS`, which today is the single version 7. That
+window is a projection of one slice, `SegmentVersion::WINDOW`; the trailer gate
+and the structural validator both resolve a raw trailer number against it
+through one function, and the validator selects its rule set by an exhaustive
+match over the resulting token, so the two cannot admit different sets and an
+admitted version without a rule set does not compile. An object whose trailer
+version is outside the window fails closed with the typed
+`SegmentError::UnsupportedVersion(v)`, carrying the version it declared, before
+the footer crc is checked and before any layout-dependent byte is touched.
+
+That rejection is NOT corruption, and no caller may treat it as corruption,
+absence, or a miss (ADR-0066 decision 2). `ravel_segment::classify_trailer`
+draws the distinction from a 16-byte suffix, through the same gate: an object
+is readable here, outside this build's window, or corrupt. A caller holding a
+delete decision must use it. Retention does: its physical sweep declines to
+delete anything in a tombstoned bucket that holds an out-of-window object,
+leaves the tombstone in place, and counts the hold, because a peer on the other
+side of a rolling upgrade (or the build a rollback returns to) reads that object
+normally. A corrupt object is swept as usual.
 
 **Version lifecycle and migration (ADR-0066, normative).** RSEG is a Class A
 bulk data-object format. Until the first public release, ADR-0027's
@@ -81,14 +100,19 @@ protobuf-style LEB128; signed values use zigzag.
 LE), version (u16 LE), signal, reserved, magic. Every trailer byte except
 the crc field itself is covered (ADR-0010 §4). `magic` identifies the format
 family, not a specific layout; the version field selects the layout and is
-covered by `footer_crc32c`, so a reader that meets any non-7 version fails
-closed with `UnsupportedVersion`, never a silent misdecode.
+covered by `footer_crc32c`, so a reader that meets a version outside its window
+fails closed with `UnsupportedVersion`, never a silent misdecode. The version is
+checked before the crc, so an object carrying a version this build does not
+admit is reported as that version rather than as a crc failure, which is what
+lets a 16-byte probe tell an unadmitted version from corruption.
 
 ### Reader protocol
 
 1. Reject objects smaller than 16 bytes as Corrupted.
-2. Suffix-GET 64 KiB (or the whole object if smaller). Verify magic,
-   `version == 7`, signal, reserved.
+2. Suffix-GET 64 KiB (or the whole object if smaller). Verify magic, then the
+   version against `SUPPORTED_VERSIONS` (version 7 only today), then signal and
+   reserved. A version outside the window is `UnsupportedVersion`, never
+   Corrupted.
 3. Require `footer_len > 0` and `16 + footer_len <= total_size`; otherwise
    Corrupted. If the suffix does not cover the footer, issue one more ranged
    GET.
