@@ -541,7 +541,11 @@ impl AdmissionController {
         self.process_id
     }
 
-    fn now_ns(&self) -> i64 {
+    /// This controller's injected clock reading. Crate-visible so the
+    /// reconciliation cycle in [`crate::reconcile`] can stamp its own duration
+    /// from the same injected clock the rest of the controller uses, rather
+    /// than reaching for wall time of its own.
+    pub(crate) fn now_ns(&self) -> i64 {
         self.clock.now_ns()
     }
 
