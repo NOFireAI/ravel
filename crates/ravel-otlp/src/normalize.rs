@@ -386,7 +386,7 @@ fn metric_data_point_count(metric: &Metric) -> usize {
 /// [`count_data_points`] for every metric type that admits one point per data
 /// point, and the exploded series count (ADR-0016) for the two that do not.
 /// Read from vector lengths and the presence of `sum` only, never from bucket
-/// contents, so it costs one traversal and no allocation.
+/// contents, so it is a second traversal that allocates nothing.
 fn count_exploded_data_points(req: &ExportMetricsServiceRequest) -> usize {
     req.resource_metrics
         .iter()
