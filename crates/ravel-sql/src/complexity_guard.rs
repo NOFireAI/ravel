@@ -66,14 +66,29 @@
 //! - `--` line comments, and `/* ... */` block comments, nested, because
 //!   `GenericDialect::supports_nested_comments()` is true.
 //!
-//! One exclusion that would be UNSOUND, and is therefore not made:
-//! `/*!...*/`. `GenericDialect::supports_multiline_comment_hints()` is true
+//! One exclusion that is UNSOUND, and is therefore not made: `/*!...*/`. `GenericDialect::supports_multiline_comment_hints()` is true
 //! (sqlparser `dialect/generic.rs`), and the tokenizer re-tokenizes a block
 //! comment whose body opens with `!` into real tokens (`tokenizer.rs`), on the
 //! path `DFParserBuilder::build` uses. Skipping it would hide structure the
 //! parser reads: measured before the fix, `SELECT 1/*!` + `+1` x2000 + `*/`
 //! scored 7 while the tokenizer produced 4003 tokens from it. The scan
-//! therefore counts a hint body exactly as the tokenizer does.
+//! therefore counts a hint body rather than skipping it.
+//!
+//! The hint region gets its own scan mode, and that mode enters no sub-mode.
+//! An earlier fix fell through to the ordinary counting mode instead, which
+//! reopened the same bypass through another door: a `--` inside the hint body
+//! put the scan in line-comment mode, which runs to newline or EOF, so
+//! `SELECT 1/*! -- */` followed by a 4000-operator chain scored 5 while the
+//! tokenizer emitted 8005 tokens. A quote, a backtick, a dollar quote and a
+//! nested `/*` each open the same door. The tokenizer confines all of them to
+//! the hint body and resumes at the matching `*/`, and a flat count of the
+//! region does too.
+//!
+//! Both ways of mis-locating that matching `*/` over-count, so the mode is
+//! sound whatever nesting does. Stopping early resumes ordinary counting
+//! sooner and counts more text as top-level structure. Running past it counts
+//! every remaining character. Neither direction can admit a statement the
+//! tokenizer sees as deeper than the bound allows.
 //!
 //! Every token costs one unit, whatever its length: a literal through its
 //! opening delimiter, an identifier or number through its first character.
@@ -184,6 +199,10 @@ enum Mode {
     LineComment,
     /// Inside a `/* ... */` block comment, holding the nesting depth.
     BlockComment(usize),
+    /// Inside a `/*!...*/` hint comment, holding the nesting depth. Every
+    /// non-whitespace character here is counted and NO sub-mode is entered:
+    /// see the `scan` comment where this mode is set.
+    Hint(usize),
 }
 
 /// Scans `sql`'s raw text for excessive structural complexity, outside
@@ -236,6 +255,26 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                     mode = Mode::Normal;
                 }
             }
+            Mode::Hint(depth) => {
+                if rest.starts_with("/*") {
+                    count += 2;
+                    skip = 1;
+                    mode = Mode::Hint(depth + 1);
+                } else if rest.starts_with("*/") {
+                    count += 2;
+                    skip = 1;
+                    mode = if depth == 1 {
+                        Mode::Normal
+                    } else {
+                        Mode::Hint(depth - 1)
+                    };
+                } else if !c.is_whitespace() {
+                    count += 1;
+                }
+                if count > stop_above {
+                    return count;
+                }
+            }
             Mode::BlockComment(depth) => {
                 if rest.starts_with("/*") {
                     mode = Mode::BlockComment(depth + 1);
@@ -269,12 +308,35 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                 // `/*!...*/` is NOT opaque to this dialect. `GenericDialect`
                 // returns true from `supports_multiline_comment_hints`, and the
                 // tokenizer re-tokenizes a block comment whose body opens with
-                // `!` into real tokens. Treating it as a comment would skip a
-                // region the parser reads, which is the unsound direction: a
-                // measured probe scored `SELECT 1/*!` + `+1` x2000 + `*/` at 7
-                // while the tokenizer produced 4003 tokens from it. So fall
-                // through and count the body, exactly as the tokenizer does.
-                if rest.starts_with("/*") && !rest.starts_with("/*!") {
+                // `!` into real tokens. Treating it as a comment skips a region
+                // the parser reads, which is the unsound direction: a measured
+                // probe scored `SELECT 1/*!` + `+1` x2000 + `*/` at 7 while the
+                // tokenizer produced 4003 tokens from it.
+                //
+                // The region gets its OWN mode rather than falling through to
+                // `Normal`, and that mode enters no sub-mode. Falling through
+                // was tried and reopened the same bypass through another door:
+                // a `--` inside the hint body put the scan in `LineComment`,
+                // which runs to newline or EOF, so `SELECT 1/*! -- */` + a
+                // 4000-operator chain scored 5 while the tokenizer emitted
+                // 8005 tokens. The tokenizer confines a `--` to the hint body
+                // and resumes at the matching `*/`; a flat count does too.
+                //
+                // Both ways of mis-locating that matching `*/` over-count, so
+                // the mode is safe whatever nesting does. Stopping early
+                // resumes `Normal` sooner and counts more text as top-level
+                // structure. Running past it counts every remaining character.
+                // Neither can admit a statement the tokenizer sees as deeper.
+                if rest.starts_with("/*!") {
+                    count += 3;
+                    if count > stop_above {
+                        return count;
+                    }
+                    skip = 2;
+                    mode = Mode::Hint(1);
+                    continue;
+                }
+                if rest.starts_with("/*") {
                     mode = Mode::BlockComment(1);
                     skip = 1;
                     continue;
@@ -480,6 +542,30 @@ mod tests {
         // did not simply stop skipping comments.
         let sql = format!("SELECT 1/*{chain}*/");
         assert!(check(&sql).is_ok(), "a plain block comment stays uncounted");
+    }
+
+    /// A sub-mode cannot carry an operator chain out of a hint body. The
+    /// first fix for the hint bypass fell through to `Normal` inside the
+    /// body, where `--` entered `LineComment` and ran to EOF, so
+    /// `SELECT 1/*! -- */` plus a chain scored 5 while the tokenizer emitted
+    /// 8005 tokens. Each opener below is the same argument through a
+    /// different door, and the hint mode enters none of them.
+    ///
+    /// Flip to watch it fail: in `scan`'s `Normal` arm, replace the
+    /// `Mode::Hint(1)` assignment with a `continue` that leaves `mode` as
+    /// `Normal`. Every case below then scores single digits and is admitted.
+    #[test]
+    fn no_sub_mode_carries_a_chain_out_of_a_hint_body() {
+        let chain = "+1".repeat(MAX_STATEMENT_COMPLEXITY);
+        for opener in ["--", "'", "\"", "`", "$$", "/*"] {
+            let sql = format!("SELECT 1/*! {opener} */{chain}");
+            let err = check(&sql).expect_err("a hint body must not hide the chain");
+            assert!(
+                err.count > MAX_STATEMENT_COMPLEXITY,
+                "`{opener}` inside a hint body hid the chain: counted {}",
+                err.count
+            );
+        }
     }
 
     /// One token costs one unit whatever its length, so the bound does not
