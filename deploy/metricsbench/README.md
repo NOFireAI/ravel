@@ -101,14 +101,38 @@ This check runs in CI, wired into the `doc-scripts` job in
 
 ## Pinned image digests
 
-Every digest below is the multi-arch manifest-list digest reported by the Docker
-Hub registry v2 API for the named tag, resolved with:
+Every digest below is the multi-arch manifest-list digest reported by the
+named tag's own registry. The recipe differs by registry, so the two below
+are not interchangeable: substituting a quay.io repo path into the Docker
+Hub URL (or vice versa) resolves nothing.
+
+**`prom/prometheus`, `victoriametrics/victoria-metrics`, and `grafana/mimir`**
+are still on Docker Hub and resolve with the Docker Hub registry v2 API:
 
 ```sh
 curl -sI -H "Authorization: Bearer $TOKEN" \
   -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
   https://registry-1.docker.io/v2/<repo>/manifests/<tag> \
   | grep -i docker-content-digest
+```
+
+**`quay.io/minio/minio` and `quay.io/minio/mc`** (see deploy/README.md for why
+the MinIO pair lives on quay.io) resolve with quay's own v2 API instead: quay
+issues a bearer token from a separate auth endpoint rather than accepting one
+minted for Docker Hub.
+
+```sh
+# 1. Get a bearer token scoped to the repo.
+TOKEN=$(curl -s "https://quay.io/v2/auth?service=quay.io&scope=repository:minio/minio:pull" \
+  | jq -r .token)
+
+# 2. HEAD the manifest list with that token.
+curl -sI -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+  https://quay.io/v2/minio/minio/manifests/RELEASE.2025-04-08T15-41-24Z \
+  | grep -i docker-content-digest
+
+# 3. The `docker-content-digest` response header is the pinned digest.
 ```
 
 | Image | Tag | Digest |

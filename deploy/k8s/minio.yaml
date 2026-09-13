@@ -44,10 +44,7 @@ spec:
         app.kubernetes.io/component: fake-s3
     spec:
       containers:
-        # MinIO images are pulled from quay.io, not Docker Hub: Docker Hub's
-        # anonymous pull allowance is per-IP and shared across every project
-        # on a runner, so an unauthenticated pull from there fails
-        # unpredictably.
+        # quay.io rather than Docker Hub: rationale in deploy/README.md.
         - name: minio
           image: quay.io/minio/minio:latest
           imagePullPolicy: IfNotPresent
