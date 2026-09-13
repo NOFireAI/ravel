@@ -11,8 +11,9 @@ rust-version.workspace = true
 # by default: with it off, `WriteStats` carries no bloom timing field and no
 # `Instant` is read in the block-write loop, so the crate compiles and behaves
 # exactly as today. On, `RlogWriter` measures each block's `BloomBuilder`
-# insert-plus-`finish` window and reports it through `WriteStats::bloom_block_ns`
-# for `ravel-ingest` to fold into its `LogStage::Bloom` accumulator. Enabled
+# insert-plus-`finish` window and reports the per-object sum and block count
+# through `WriteStats::bloom_total_ns` and `WriteStats::bloom_blocks` for
+# `ravel-ingest` to fold into its `LogStage::Bloom` accumulator. Enabled
 # transitively by `ravel-ingest/stage-timing`.
 stage-timing = []
 

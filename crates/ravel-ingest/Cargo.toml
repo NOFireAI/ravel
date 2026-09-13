@@ -13,9 +13,9 @@ rust-version.workspace = true
 # by the bench reporter. A CI lane must build and run this feature.
 #
 # Also turns on `ravel-logseg/stage-timing`, which is what makes the RLOG
-# block-write loop report per-block bloom-construction nanoseconds through
-# `WriteStats::bloom_block_ns` for the `LogStage::Bloom` boundary below to
-# fold in (issue #1516).
+# block-write loop report bloom-construction nanoseconds and block count
+# through `WriteStats::bloom_total_ns` and `WriteStats::bloom_blocks` for
+# the `LogStage::Bloom` boundary below to fold in (issue #1516).
 stage-timing = ["ravel-logseg/stage-timing"]
 
 [dependencies]

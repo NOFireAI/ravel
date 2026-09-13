@@ -642,6 +642,19 @@ fn print_flush_mix(report: &LoadReport) {
     }
 }
 
+/// Display name for the stage-timings table (ADR-0104 decision 1). `Bloom` is
+/// nested inside `Encode`'s window rather than a disjoint fifth slice, so its
+/// row is marked as contained: a reader summing the printed column would
+/// otherwise double-count it against `Encode`. Every other stage renders its
+/// bare [`ravel_ingest::LogStage::name`].
+#[cfg(feature = "stage-timing")]
+fn stage_display_name(stage: ravel_ingest::LogStage) -> &'static str {
+    match stage {
+        ravel_ingest::LogStage::Bloom => "bloom (in encode)",
+        other => other.name(),
+    }
+}
+
 /// Print the logs pipeline's per-stage timing breakdown (ADR-0104 decision 1)
 /// after [`print_summary`]'s totals. A stage with zero samples (never wired,
 /// or never reached) is omitted rather than printed as zero, matching
@@ -658,8 +671,8 @@ fn print_stage_timings(report: &LoadReport) {
         };
         let avg_us = (totals.total_ns as f64 / totals.samples.max(1) as f64) / 1e3;
         println!(
-            "    {name:<8} samples={samples:<10} total_ms={total_ms:<12.3} avg_us={avg_us:.3}",
-            name = stage.name(),
+            "    {name:<18} samples={samples:<10} total_ms={total_ms:<12.3} avg_us={avg_us:.3}",
+            name = stage_display_name(stage),
             samples = totals.samples,
             total_ms = totals.total_ns as f64 / 1e6,
         );
@@ -4239,6 +4252,25 @@ type = "i64"
                 .expect("a stage in `stages()` has totals");
             assert!(totals.samples > 0, "{stage:?} recorded zero samples");
         }
+    }
+
+    /// `bloom` is nested inside `encode`'s timing window, not a disjoint fifth
+    /// stage (ADR-0104 decision 1): its printed row must say so, or an
+    /// operator summing the `stage timings` table's `total_ms` column
+    /// double-counts it against `encode`. This pins the exact rendered name
+    /// for every stage, not a substring, so a later rename of the marker text
+    /// cannot quietly drop it.
+    #[cfg(feature = "stage-timing")]
+    #[test]
+    fn stage_display_name_marks_bloom_as_nested_in_encode() {
+        assert_eq!(stage_display_name(ravel_ingest::LogStage::Admit), "admit");
+        assert_eq!(stage_display_name(ravel_ingest::LogStage::Route), "route");
+        assert_eq!(stage_display_name(ravel_ingest::LogStage::Merge), "merge");
+        assert_eq!(stage_display_name(ravel_ingest::LogStage::Encode), "encode");
+        assert_eq!(
+            stage_display_name(ravel_ingest::LogStage::Bloom),
+            "bloom (in encode)"
+        );
     }
 
     /// A load whose object crosses the 1000-column dynamic budget produces the
