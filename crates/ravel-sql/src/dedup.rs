@@ -18,12 +18,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::array::{
-    FixedSizeBinaryArray, Float64Array, Int64Array, TimestampNanosecondArray, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, DictionaryArray, FixedSizeBinaryArray, Float64Array, Int64Array,
+    TimestampNanosecondArray, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::compute::concat_batches;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Int32Type, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
@@ -173,6 +173,7 @@ impl ExecutionPlan for RsegDedupExec {
             out_rows: 0,
             yielded: 0,
             input_done: false,
+            labels_memo: None,
         }))
     }
 }
@@ -200,6 +201,30 @@ struct DedupStream {
     out_rows: usize,
     yielded: usize,
     input_done: bool,
+    /// Last one-row labels compaction `finalize` performed, for reuse when
+    /// the next row's source dictionary and key are unchanged. See
+    /// [`LabelsMemo`].
+    labels_memo: Option<LabelsMemo>,
+}
+
+/// The last (source dictionary, key) pair `finalize`'s per-row labels
+/// compaction was run on, plus the one-entry array it produced.
+///
+/// Two consecutive winner rows folded from the same upstream batch
+/// (`process_batch`'s loop) share both their labels dictionary's `values`
+/// array (by pointer -- `batch.slice` never copies it) and, when they also
+/// share a dictionary key, resolve to the exact same one-row label set. The
+/// one-entry array `compact_labels` would rebuild for the second row is then
+/// bit-identical to the one already produced for the first, so it is reused
+/// instead of rebuilt. `values` must be compared alongside `key`: a new
+/// upstream batch renumbers its dictionary from key 0, so the same key can
+/// mean an entirely different label set once the source dictionary changes,
+/// and comparing the key alone would silently relabel one series' rows with
+/// another's.
+struct LabelsMemo {
+    values: ArrayRef,
+    key: i32,
+    compacted: ArrayRef,
 }
 
 impl DedupStream {
@@ -241,7 +266,7 @@ impl DedupStream {
             .project(&(0..PUBLIC_COLUMNS).collect::<Vec<_>>())
             .map_err(DataFusionError::from)?;
         let mut columns = public.columns().to_vec();
-        columns[COL_LABELS] = crate::labels::compact_labels(&columns[COL_LABELS])?;
+        columns[COL_LABELS] = self.compact_row_labels(&columns[COL_LABELS])?;
         let public = RecordBatch::try_new(Arc::clone(&self.schema), columns)
             .map_err(DataFusionError::from)?;
         self.out.push(public);
@@ -255,6 +280,36 @@ impl DedupStream {
             .into());
         }
         Ok(())
+    }
+
+    /// Compact a one-row labels slice's dictionary down to the single entry
+    /// it references, reusing the previous call's result when this row's
+    /// source dictionary and key match the last one seen. See
+    /// [`LabelsMemo`]. Falls back to a plain [`crate::labels::compact_labels`]
+    /// call for any shape the memo does not cover (not a one-row
+    /// `Dictionary(Int32, _)`, or a null row).
+    fn compact_row_labels(&mut self, labels: &ArrayRef) -> DFResult<ArrayRef> {
+        if let Some(dict) = labels.as_any().downcast_ref::<DictionaryArray<Int32Type>>()
+            && dict.len() == 1
+            && !dict.is_null(0)
+        {
+            let key = dict.keys().value(0);
+            let values = dict.values();
+            if let Some(memo) = &self.labels_memo
+                && memo.key == key
+                && Arc::ptr_eq(&memo.values, values)
+            {
+                return Ok(Arc::clone(&memo.compacted));
+            }
+            let compacted = crate::labels::compact_labels(labels)?;
+            self.labels_memo = Some(LabelsMemo {
+                values: Arc::clone(values),
+                key,
+                compacted: Arc::clone(&compacted),
+            });
+            return Ok(compacted);
+        }
+        Ok(crate::labels::compact_labels(labels)?)
     }
 
     fn flush(&mut self) -> DFResult<RecordBatch> {
@@ -420,5 +475,150 @@ impl<'a> InternalCols<'a> {
     }
     fn in_page(&self, i: usize) -> u32 {
         self.in_page.value(i)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use datafusion::arrow::array::{MapArray, StringArray};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use ravel_types::{Label, LabelSet};
+
+    use super::*;
+    use crate::labels::build_labels_dict;
+    use crate::schema::{internal_schema, public_schema};
+
+    fn empty_input() -> SendableRecordBatchStream {
+        Box::pin(RecordBatchStreamAdapter::new(
+            internal_schema(),
+            futures::stream::empty(),
+        ))
+    }
+
+    fn new_dedup_stream() -> DedupStream {
+        DedupStream {
+            input: empty_input(),
+            schema: public_schema(),
+            max_samples: usize::MAX,
+            pending: None,
+            out: Vec::new(),
+            out_rows: 0,
+            yielded: 0,
+            input_done: false,
+            labels_memo: None,
+        }
+    }
+
+    fn label_set(pairs: &[(&str, &str)]) -> LabelSet {
+        LabelSet::new(
+            pairs
+                .iter()
+                .map(|(name, value)| Label {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                })
+                .collect(),
+        )
+        .expect("valid labels")
+    }
+
+    /// A one-row internal-schema batch carrying a freshly-built labels
+    /// dictionary with exactly one entry, so its single row's dictionary key
+    /// is always 0 -- but the dictionary's `values` array is a distinct
+    /// allocation each call, standing in for two different upstream scan
+    /// batches.
+    fn one_row_batch(series_id: [u8; 16], ts: i64, value: f64, labels: &LabelSet) -> RecordBatch {
+        let labels_col =
+            build_labels_dict(std::slice::from_ref(labels), &[0]).expect("labels dict");
+        RecordBatch::try_new(
+            internal_schema(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![ts])),
+                Arc::new(Float64Array::from(vec![value])),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(std::iter::once(series_id))
+                        .expect("series_id array"),
+                ),
+                labels_col,
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(UInt64Array::from(vec![1u64])),
+                Arc::new(UInt64Array::from(vec![1u64])),
+                Arc::new(UInt32Array::from(vec![0u32])),
+            ],
+        )
+        .expect("build internal batch")
+    }
+
+    /// Decode a one-row `Dictionary(Int32, Map(Utf8, Utf8))` labels column
+    /// into its `(name, value)` pairs.
+    fn decode_row0_labels(labels: &ArrayRef) -> Vec<(String, String)> {
+        let dict = labels
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("dictionary labels");
+        let maps = dict
+            .values()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map values");
+        let keys = maps
+            .keys()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("map keys utf8");
+        let values = maps
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("map values utf8");
+        let entry = dict.keys().value(0) as usize;
+        let offsets = maps.value_offsets();
+        let start = offsets[entry] as usize;
+        let end = offsets[entry + 1] as usize;
+        (start..end)
+            .map(|j| (keys.value(j).to_string(), values.value(j).to_string()))
+            .collect()
+    }
+
+    /// Regression for `LabelsMemo`: two winner rows finalized back to back can
+    /// each be dictionary key 0 in their own freshly-built one-entry
+    /// dictionary while carrying entirely different label sets -- exactly
+    /// what happens across two separate upstream scan batches, each of which
+    /// numbers its own local dictionary from 0. A memo that compared only the
+    /// key, not also the source dictionary's `values` array by pointer, would
+    /// reuse the first row's compacted array for the second, silently
+    /// relabeling the second series' output with the first series' labels.
+    #[test]
+    fn memo_distinguishes_same_key_across_different_source_dictionaries() {
+        let mut stream = new_dedup_stream();
+        let labels_a = label_set(&[("job", "a")]);
+        let labels_b = label_set(&[("job", "b")]);
+        let batch_a = one_row_batch([1u8; 16], 1, 1.0, &labels_a);
+        let batch_b = one_row_batch([2u8; 16], 1, 2.0, &labels_b);
+
+        // Folding batch_b's row finalizes batch_a's pending row first (a new
+        // group starts), so this exercises two `finalize` calls back to
+        // back, each seeing a dictionary key of 0 from a distinct `values`
+        // array.
+        stream.process_batch(&batch_a).expect("process batch a");
+        stream.process_batch(&batch_b).expect("process batch b");
+        let pending_b = stream.pending.take().expect("pending b row");
+        stream.finalize(pending_b).expect("finalize b");
+
+        assert_eq!(stream.out.len(), 2, "both rows must have been finalized");
+        let got_a = decode_row0_labels(stream.out[0].column(COL_LABELS));
+        let got_b = decode_row0_labels(stream.out[1].column(COL_LABELS));
+        assert_eq!(
+            got_a,
+            vec![("job".to_string(), "a".to_string())],
+            "first finalized row must keep its own label set"
+        );
+        assert_eq!(
+            got_b,
+            vec![("job".to_string(), "b".to_string())],
+            "second finalized row must not inherit the first row's labels \
+             via a key-only memo match"
+        );
     }
 }
