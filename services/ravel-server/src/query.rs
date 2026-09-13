@@ -107,6 +107,11 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// `resolve_get_concurrency` is the CLI's `--catalog-resolve-concurrency`.
 /// `None` leaves `ravel_catalog::CatalogConfig`'s own default in place;
 /// `Some(n)` overrides it for this catalog instance.
+///
+/// `max_ingest_lag_ns` is the catalog listing window (ADR-0051 section 4), from
+/// `--max-ingest-lag`. `None` leaves `CatalogConfig`'s own 2h default; `Some(ns)`
+/// is the value `start` keeps equal to the OTLP admission bound so admitted late
+/// data stays discoverable.
 pub fn build_catalog(
     store: Arc<dyn ObjectStoreBackend>,
     shard_count: u32,
@@ -114,6 +119,7 @@ pub fn build_catalog(
     cache_max_bytes: u64,
     cache_dir: Option<PathBuf>,
     resolve_get_concurrency: Option<usize>,
+    max_ingest_lag_ns: Option<i64>,
 ) -> anyhow::Result<Arc<Catalog>> {
     // `0` is the byte cache's disabled sentinel (ravel_catalog::CatalogConfig):
     // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
@@ -124,6 +130,13 @@ pub fn build_catalog(
         byte_cache_max_bytes,
         ..CatalogConfig::default()
     };
+    // The catalog listing window (ADR-0051 section 4), from `--max-ingest-lag`.
+    // `None` leaves `CatalogConfig`'s own 2h default; `Some(ns)` is the value
+    // `start` resolves through `resolve_ingest_lag`, kept equal to the OTLP
+    // admission bound so admitted late data stays discoverable.
+    if let Some(ns) = max_ingest_lag_ns {
+        catalog_config.max_ingest_lag_ns = ns;
+    }
     // `None` leaves ravel-catalog's own default (currently 128) as the sole
     // source of truth; only override when the CLI passed an explicit value.
     if let Some(concurrency) = resolve_get_concurrency {
@@ -436,6 +449,7 @@ mod catalog_cache_tests {
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
             None,
             None,
+            None,
         )
         .expect("catalog");
         let engine_config = EngineConfig {
@@ -476,6 +490,7 @@ mod catalog_cache_tests {
             1,
             true,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
             None,
             None,
         )
@@ -536,7 +551,8 @@ mod catalog_cache_tests {
     fn build_catalog_wires_cache_max_bytes_through_to_the_byte_cache() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let budget = 7 * 1024 * 1024;
-        let catalog = build_catalog(store, 1, false, budget, None, None).expect("catalog builds");
+        let catalog =
+            build_catalog(store, 1, false, budget, None, None, None).expect("catalog builds");
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
             budget,
@@ -585,6 +601,7 @@ mod catalog_cache_tests {
             resolved.catalog_cache_max_bytes,
             cli.cache_dir.clone(),
             None,
+            None,
         )
         .expect("catalog builds");
         assert_eq!(
@@ -609,6 +626,7 @@ mod catalog_cache_tests {
             flagged.disable_cache,
             resolved.catalog_cache_max_bytes,
             flagged.cache_dir.clone(),
+            None,
             None,
         )
         .expect("catalog builds");
@@ -641,6 +659,7 @@ mod tests {
             1,
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
             None,
             None,
         )
@@ -699,6 +718,7 @@ mod tests {
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
             None,
             None,
+            None,
         )
         .expect("catalog");
         let engine_config = EngineConfig {
@@ -742,6 +762,7 @@ mod tests {
             1,
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
             None,
             None,
         )

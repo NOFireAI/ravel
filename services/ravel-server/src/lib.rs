@@ -579,6 +579,19 @@ pub struct ServerConfig {
     /// set it to zero so a suite that shuts a server down on every case does not
     /// pay it hundreds of times.
     pub drain_settle_interval: Duration,
+    /// The coordinated ingest-lag bound, from `--max-ingest-lag` (default
+    /// [`DEFAULT_MAX_INGEST_LAG`], 2h), ADR-0051 section 4. One value drives BOTH
+    /// the catalog listing window (`ravel_catalog::CatalogConfig::max_ingest_lag_ns`,
+    /// set first) AND the three OTLP admission bounds
+    /// (`IngestLimits`/`LogIngestLimits`/`SpanIngestLimits::max_ingest_lag_ns`,
+    /// set second) at every ingest construction site [`start`] builds, so
+    /// ADR-0051's "widen the window first, then the admission bound" order holds
+    /// by construction and the two can never be set inconsistently. [`start`]
+    /// resolves it through [`resolve_ingest_lag`], which validates the pair
+    /// before building the catalog or any limits. Raise it to replay telemetry
+    /// older than the default after an outage or bulk import; the change reaches
+    /// the OTLP HTTP, OTLP gRPC, OTAP, Remote Write, and span surfaces at once.
+    pub max_ingest_lag: Duration,
 }
 
 /// Default `--shutdown-timeout`: the ceiling on the graceful-shutdown drain.
@@ -587,6 +600,93 @@ pub struct ServerConfig {
 /// headroom for the preStop hook and final flush that the operator half of
 /// issue #1291 configures.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Default `--max-ingest-lag`: how far behind ingest time a data point's event
+/// time may fall before admission rejects it as [`ravel_otlp::Rejection::TooOld`]
+/// (2h, ADR-0051 section 4). Sourced from [`ravel_catalog::DEFAULT_MAX_INGEST_LAG_NS`]
+/// so this server-side default cannot drift from the catalog listing window's
+/// own default; a test also pins it equal to the three OTLP limit defaults
+/// ([`ravel_otlp::IngestLimits`], [`ravel_otlp::LogIngestLimits`],
+/// [`ravel_otlp::SpanIngestLimits`]). One flag drives both the admission bound
+/// and the catalog window (see [`resolve_ingest_lag`]), so a deployment that
+/// leaves it unset sees byte-identical behavior to before the flag existed.
+pub const DEFAULT_MAX_INGEST_LAG: Duration =
+    Duration::from_nanos(ravel_catalog::DEFAULT_MAX_INGEST_LAG_NS as u64);
+
+/// The coordinated ingest-lag pair resolved from a single `--max-ingest-lag`
+/// value (ADR-0051 section 4): the catalog listing window and the OTLP admission
+/// bound, in nanoseconds. Kept as two fields, not one, so the invariant that
+/// makes late data discoverable -- the admission bound must never exceed the
+/// listing window -- is a value a validator can check, not merely a convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestLagConfig {
+    /// The catalog listing window (`ravel_catalog::CatalogConfig::max_ingest_lag_ns`):
+    /// how far behind a query's range start the commit listing extends. This is
+    /// what decides whether old data is *discoverable*.
+    pub catalog_window_ns: i64,
+    /// The OTLP admission bound
+    /// (`IngestLimits`/`LogIngestLimits`/`SpanIngestLimits::max_ingest_lag_ns`):
+    /// how far behind ingest time an event may lag before it is rejected as too
+    /// old. This is what decides whether old data is *admitted*.
+    pub admission_lag_ns: i64,
+}
+
+/// Why a configured ingest-lag pair was refused at startup: the admission bound
+/// exceeds the catalog listing window, so a point admitted in the gap between
+/// them would be stored and acknowledged yet invisible to every non-token query
+/// (ADR-0051, "Raising max_ingest_lag: a coordinated change"). Both values are
+/// named so the operator can see the exact inconsistency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "admission max_ingest_lag of {admission_lag_ns} ns exceeds the catalog listing window of \
+     {catalog_window_ns} ns: a point admitted in that gap would be stored and acknowledged but \
+     invisible to every listing-window query. Widen the catalog window first, then the admission \
+     bound (ADR-0051)."
+)]
+pub struct IngestLagWindowError {
+    pub catalog_window_ns: i64,
+    pub admission_lag_ns: i64,
+}
+
+/// Build the coordinated ingest-lag pair from one resolved `--max-ingest-lag`
+/// duration. The catalog listing window is assigned FIRST, then the admission
+/// bound is derived from the same value, so ADR-0051's "widen the window first,
+/// then the admission bound" order holds by construction and the two can never
+/// be set inconsistently through this path. The validation is still run: it is
+/// the mechanical guard (the docs' "startup equality assertion") that a future
+/// edge which decouples the two is caught at startup rather than silently losing
+/// data, and it is what [`validate_ingest_lag_window`] pins by test.
+pub fn resolve_ingest_lag(max_ingest_lag: Duration) -> anyhow::Result<IngestLagConfig> {
+    let ns = crate::config::duration_nanos_saturating(max_ingest_lag);
+    // Window first, then admission bound: both from the same source, so the
+    // admission bound cannot exceed the window by construction.
+    let catalog_window_ns = ns;
+    let admission_lag_ns = ns;
+    validate_ingest_lag_window(catalog_window_ns, admission_lag_ns)?;
+    Ok(IngestLagConfig {
+        catalog_window_ns,
+        admission_lag_ns,
+    })
+}
+
+/// Refuse an ingest-lag pair whose admission bound exceeds the catalog listing
+/// window, with a typed [`IngestLagWindowError`] naming both values. Split out
+/// from [`resolve_ingest_lag`] so a test can drive an inconsistent pair through
+/// it directly: the production path always feeds it equal values, so this is the
+/// only way to exercise the refusal.
+pub fn validate_ingest_lag_window(
+    catalog_window_ns: i64,
+    admission_lag_ns: i64,
+) -> Result<(), IngestLagWindowError> {
+    if admission_lag_ns > catalog_window_ns {
+        Err(IngestLagWindowError {
+            catalog_window_ns,
+            admission_lag_ns,
+        })
+    } else {
+        Ok(())
+    }
+}
 
 /// Upper bound accepted for `--shutdown-timeout`. The CLI rejects a larger
 /// value at flag parse (`Cli::parse_shutdown_timeout`); `start` copies the
@@ -1264,12 +1364,16 @@ fn gateway_state(
     normalize_reject_metrics: &Arc<normalize_reject_metrics::NormalizeRejectMetrics>,
     ingest_buffer_budget: &Arc<ravel_ingest::IngestByteBudget>,
     metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
+    max_ingest_lag_ns: i64,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
         ingest: ingest::IngestState {
             router: ingest_router.clone(),
-            limits: IngestLimits::default(),
+            limits: IngestLimits {
+                max_ingest_lag_ns,
+                ..IngestLimits::default()
+            },
             ack_deadline: DEFAULT_ACK_DEADLINE,
             admission: admission.clone(),
             recovery: recovery.clone(),
@@ -1279,7 +1383,10 @@ fn gateway_state(
         },
         logs_ingest: logs_ingest::LogIngestState {
             router: log_ingest_router.clone(),
-            limits: LogIngestLimits::default(),
+            limits: LogIngestLimits {
+                max_ingest_lag_ns,
+                ..LogIngestLimits::default()
+            },
             ack_deadline: DEFAULT_ACK_DEADLINE,
             admission: admission.clone(),
             store: store.clone(),
@@ -1289,7 +1396,10 @@ fn gateway_state(
         },
         traces_ingest: traces_ingest::SpanIngestState {
             router: span_ingest_router.clone(),
-            limits: SpanIngestLimits::default(),
+            limits: SpanIngestLimits {
+                max_ingest_lag_ns,
+                ..SpanIngestLimits::default()
+            },
             ack_deadline: DEFAULT_ACK_DEADLINE,
             admission: admission.clone(),
             store: store.clone(),
@@ -1314,11 +1424,15 @@ fn remote_write_state(
     ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
     metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
     ingest_buffer_budget: &Arc<ravel_ingest::IngestByteBudget>,
+    max_ingest_lag_ns: i64,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
         tenant_resolver,
         router: ingest_router.clone(),
-        limits: IngestLimits::default(),
+        limits: IngestLimits {
+            max_ingest_lag_ns,
+            ..IngestLimits::default()
+        },
         ack_deadline: DEFAULT_ACK_DEADLINE,
         metrics: remote_write::RemoteWriteMetrics::default(),
         admission: admission.clone(),
@@ -1707,6 +1821,12 @@ pub async fn start(
     // exactly in the query-serving modes that spawn one; carried out to
     // `Running` so `shutdown` can drain it.
     let mut running_audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>> = None;
+    // The coordinated ingest-lag pair (ADR-0051 section 4), resolved once here so
+    // the catalog listing window and every OTLP admission bound below are built
+    // from the same value. `resolve_ingest_lag` assigns the window first and
+    // derives the admission bound from it, so the "widen the window first" order
+    // holds by construction, and it validates the pair before either is built.
+    let ingest_lag = resolve_ingest_lag(config.max_ingest_lag)?;
     if let (Some(router), Some(log_router), Some(span_router)) =
         (&ingest_router, &log_ingest_router, &span_ingest_router)
     {
@@ -1724,6 +1844,7 @@ pub async fn start(
             &normalize_reject_metrics,
             &ingest_buffer_budget,
             &metadata_sink,
+            ingest_lag.admission_lag_ns,
         );
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(
@@ -1735,6 +1856,7 @@ pub async fn start(
             &ingest_concurrency,
             &metadata_sink,
             &ingest_buffer_budget,
+            ingest_lag.admission_lag_ns,
         );
         http_router = http_router.merge(remote_write::router(rw_state));
 
@@ -1753,6 +1875,7 @@ pub async fn start(
                 &normalize_reject_metrics,
                 &ingest_buffer_budget,
                 &metadata_sink,
+                ingest_lag.admission_lag_ns,
             );
             let mtls_rw_state = remote_write_state(
                 router,
@@ -1763,6 +1886,7 @@ pub async fn start(
                 &ingest_concurrency,
                 &metadata_sink,
                 &ingest_buffer_budget,
+                ingest_lag.admission_lag_ns,
             );
             mtls_router = mtls_router
                 .merge(otlp_http::router(mtls_state))
@@ -1776,6 +1900,7 @@ pub async fn start(
         config.catalog_cache_max_bytes,
         config.cache_dir.clone(),
         config.catalog_resolve_concurrency,
+        Some(ingest_lag.catalog_window_ns),
     )?;
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
     // The two cache flags reach the catalog byte cache here, not only the
@@ -2549,6 +2674,7 @@ pub async fn start(
             &normalize_reject_metrics,
             &ingest_buffer_budget,
             &metadata_sink,
+            ingest_lag.admission_lag_ns,
         )),
         _ => None,
     };

@@ -1414,6 +1414,24 @@ pub struct Cli {
     #[arg(long, value_name = "DURATION")]
     pub shutdown_timeout: Option<String>,
 
+    /// How far behind ingest time a data point's event time may fall before it
+    /// is rejected as too old, as a humantime duration (e.g. `2h`, `720h`),
+    /// ADR-0051 section 4. One flag drives BOTH the OTLP admission bound
+    /// (`IngestLimits`/`LogIngestLimits`/`SpanIngestLimits::max_ingest_lag_ns`
+    /// on metrics, logs, and spans) AND the catalog listing window
+    /// (`ravel_catalog::CatalogConfig::max_ingest_lag_ns`), so the two cannot be
+    /// set inconsistently: raising the flag widens the listing window first,
+    /// then the admission bound, the order
+    /// [`docs/guides/admission-limits.md`] prescribes. Raise it to replay
+    /// telemetry older than the default after an outage or a bulk import.
+    /// Matches the humantime-duration flag convention of `--store-probe-interval`.
+    /// Omitted defaults to [`crate::DEFAULT_MAX_INGEST_LAG`] (2h), so a
+    /// deployment that does not set it sees byte-identical behavior. A zero
+    /// duration is rejected: it would reject every point not exactly at ingest
+    /// time, discarding all normally-delayed telemetry. (default: 2h)
+    #[arg(long, value_name = "DURATION")]
+    pub max_ingest_lag: Option<String>,
+
     /// OTLP/gRPC endpoint this process exports its own query-path `tracing`
     /// spans to (ADR-0060). Absent by default: with no endpoint the subscriber
     /// is byte-identical to before, spans stay on the local log stream only.
@@ -3199,6 +3217,31 @@ impl Cli {
                         "--shutdown-timeout '{s}' exceeds the maximum of {:?}: a larger value \
                          serves no grace period and overflows the listener sub-budget at shutdown",
                         crate::MAX_SHUTDOWN_TIMEOUT
+                    );
+                }
+                Ok(dur)
+            }
+        }
+    }
+
+    /// Parse `--max-ingest-lag` into a duration (ADR-0051 section 4), defaulting
+    /// to [`crate::DEFAULT_MAX_INGEST_LAG`] (2h) when unset. Rejects a zero or
+    /// unparseable duration rather than a zero-length window that would reject
+    /// every normally-delayed data point, mirroring
+    /// [`Self::parse_shutdown_timeout`]. The resolved value drives both the OTLP
+    /// admission bound and the catalog listing window; see
+    /// [`crate::resolve_ingest_lag`] for how the coordinated pair is built.
+    pub fn parse_max_ingest_lag(&self) -> anyhow::Result<Duration> {
+        match self.max_ingest_lag.as_deref() {
+            None => Ok(crate::DEFAULT_MAX_INGEST_LAG),
+            Some(s) => {
+                let dur = humantime::parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --max-ingest-lag '{s}': {e}"))?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--max-ingest-lag '{s}' must be a positive duration: a zero window would \
+                         reject every data point whose event time is not exactly ingest time, \
+                         discarding all normally-delayed telemetry"
                     );
                 }
                 Ok(dur)
