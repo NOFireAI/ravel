@@ -583,6 +583,32 @@ async fn a_select_returns_json_rows() {
     assert_eq!(rows[1][1], serde_json::json!(2.5));
 }
 
+/// `/api/v1/sql`'s JSON response is the one shipping surface for the
+/// per-phase accounting and I/O shape issue #1367 adds
+/// (`ravel_sql::stats_json::phase_costs_json`/`io_shape_json`, wired in by
+/// `services/ravel-server/src/sql.rs`'s two `map.insert` calls): nothing
+/// below this test asserted that the two JSON keys actually reach a client,
+/// only that the ravel-sql crate boundary produces the right shape
+/// internally. `one_tenant_app`'s single segment is never folded, so
+/// `Snapshot::segments_pruned` is 0 and the unfiltered scan below classifies
+/// as `exhaustive_scan`, not `selective_indexed` -- the specific string this
+/// query must produce, not merely a string.
+#[tokio::test]
+async fn sql_response_carries_phase_and_io_shape_stats() {
+    let app = one_tenant_app("m", &[(100, 1.0), (200, 2.5)]).await;
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT ts, value FROM samples ORDER BY ts",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let phases = value["stats"]["phases"].as_array().expect("phases array");
+    assert_eq!(phases.len(), 4, "{value}");
+    assert_eq!(value["stats"]["io"]["planClass"], "exhaustive_scan", "{value}");
+}
+
 /// NaN and the infinities have no JSON literal, so they arrive as the
 /// Prometheus spellings rather than as `null` or a parse error.
 #[tokio::test]
