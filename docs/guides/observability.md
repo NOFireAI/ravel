@@ -876,9 +876,9 @@ groups:
 ```
 
 The `600s` staleness threshold is ten default 60s evaluation intervals. It is
-far tighter than the maintenance group's `1800s` because the alert loop's
-interval is twelve times shorter: ten missed ticks here is the same evidence
-six missed cycles is there.
+tighter than the maintenance group's `1800s` because the alert loop's interval
+is five times shorter (60s against the 300s maintain default): ten missed
+ticks here is the same evidence six missed cycles is there.
 
 ### At-rest scrubber (`ravel_scrub_*`)
 
