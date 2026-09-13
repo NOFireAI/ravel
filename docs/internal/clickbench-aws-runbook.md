@@ -262,6 +262,56 @@ export RAVEL_S3_BUCKET=$B RAVEL_S3_REGION=us-east-1 \
        RAVEL_S3_ACCESS_KEY_ID=$AK RAVEL_S3_SECRET_ACCESS_KEY=$SK
 ```
 
+### Two startup preconditions, both of which stop the server dead
+
+Neither is a failure of the box or the bucket, and both surface only when the
+server first tries to serve, which on this path is after a twenty-minute load.
+Satisfy them before you start, not after.
+
+**The bucket's qualification record must match the binary's suite version.**
+The server refuses to start against a backend qualified by an older suite:
+
+```
+Error: store backend is not qualified (sys/qualification); refusing to start
+  ... recorded under suite version 1, but this binary requires at least
+  version 2 ...
+```
+
+A bucket qualified for an earlier build hits this whenever the suite version is
+bumped. Re-qualify with the binary you are about to run, which rewrites the
+record:
+
+```sh
+"$CLI" --store s3 --s3-auth instance-role store qualify
+```
+
+**A key for the default audit policy.** `--audit-text` defaults to `redacted`,
+which needs a tokenization key, and this benchmark passes
+`--tenant-hash-unkeyed` precisely so it holds no deployment secret, so there is
+nothing to derive one from:
+
+```
+Error: failed to resolve --audit-text
+  ... needs a tokenization key and none is configured: set
+  RAVEL_AUDIT_TOKEN_KEY to 64 hex characters (32 bytes), or configure
+  --tenant-hash-key-file ..., or pass --audit-text plaintext ...
+```
+
+Pick one and keep it for the whole run, because the choice decides what the
+audit trail records:
+
+```sh
+# Either: keep the stock redacted default and give it a key.
+export RAVEL_AUDIT_TOKEN_KEY=$(openssl rand -hex 32)
+
+# Or: record query text verbatim, defensible here because the corpus is public
+# and the statements are the published ClickBench set.
+#   ... --audit-text plaintext
+```
+
+Say which one a published run used: `--audit-text plaintext` is a deviation
+from the stock defaults such a run otherwise measures.
+
 ### Load
 
 ```sh
