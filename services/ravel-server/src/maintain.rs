@@ -677,7 +677,8 @@ struct LoopOutcome {
 /// before ending (no leaked heartbeat task across restarts). The supervisor
 /// then backs off (bounded, [`RESTART_BACKOFF_INITIAL`]..=[`RESTART_BACKOFF_MAX`])
 /// and spawns the next attempt. Shutdown is still the existing oneshot: on it
-/// the supervisor signals the current attempt and joins it cleanly.
+/// the supervisor signals the current attempt and joins it cleanly, and the
+/// backoff wait races the same receiver so a drain is never held behind it.
 async fn run_supervisor(
     ctx: LoopContext,
     mut shutdown: oneshot::Receiver<()>,
@@ -685,7 +686,20 @@ async fn run_supervisor(
     max_backoff: Duration,
 ) {
     let mut backoff = initial_backoff;
+    let mut pending_backoff: Option<Duration> = None;
     loop {
+        // The backoff waits here, raced against shutdown, rather than in the
+        // resolved `select!` arm below: there the shutdown receiver is no
+        // longer polled, so a drain arriving during a 60 s backoff would wait
+        // it out and then pay for one more throwaway attempt before being
+        // observed.
+        if let Some(wait) = pending_backoff.take() {
+            tokio::select! {
+                _ = &mut shutdown => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+
         let (attempt_tx, attempt_rx) = oneshot::channel();
         let mut attempt = tokio::spawn(run_loop(ctx.clone(), attempt_rx));
 
@@ -728,7 +742,7 @@ async fn run_supervisor(
                     }
                 }
 
-                tokio::time::sleep(backoff).await;
+                pending_backoff = Some(backoff);
                 backoff = (backoff * 2).min(max_backoff);
             }
         }
@@ -6092,6 +6106,55 @@ mod tests {
             maintained,
             "ravel_maintain_tenants_maintained also freezes at its last healthy value, which is \
              exactly why it cannot itself distinguish a dead loop from a healthy one"
+        );
+    }
+
+    /// Shutdown is observed DURING the restart backoff, not after it. The
+    /// backoff is 60 s and the drain is wrapped in a 5 s deadline, both on the
+    /// paused runtime's virtual clock: a supervisor that waits the backoff out
+    /// leaves both timers pending, the runtime advances to the earlier one,
+    /// and the deadline elides. No real time is measured, so the assertion is
+    /// deterministic rather than a band.
+    ///
+    /// Flip to watch it fail: move the wait back into the resolved `select!`
+    /// arm (`tokio::time::sleep(backoff).await;` in place of
+    /// `pending_backoff = Some(backoff);`). The receiver is no longer polled
+    /// while that sleep runs, so the drain misses the deadline below.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_the_restart_backoff_is_not_held_behind_it() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+        const BACKOFF: Duration = Duration::from_secs(60);
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+
+        // Every cycle panics, so the supervisor is always inside its backoff
+        // when the shutdown below arrives.
+        let cycle_hook: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(|| panic!("injected maintenance loop panic (test)"));
+
+        let (ctx, ownership, _metrics) = liveness_loop_context(clock, cycle_hook).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_supervisor(ctx, shutdown_rx, BACKOFF, BACKOFF));
+
+        let panicked = advance_until(400, Duration::from_millis(50), || {
+            ownership.loop_panics_total() >= 1
+        })
+        .await;
+        assert!(panicked, "the first attempt must panic and be counted");
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let drained = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            drained.is_ok(),
+            "a drain arriving during the {BACKOFF:?} backoff must be observed at once, not held \
+             behind it"
+        );
+        drained.expect("deadline").expect("supervisor joins");
+        assert_eq!(
+            ownership.loop_panics_total(),
+            1,
+            "no further attempt is spawned once shutdown arrives, so the panic total stays at \
+             the one attempt that ran"
         );
     }
 

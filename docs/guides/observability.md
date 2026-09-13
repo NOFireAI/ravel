@@ -602,6 +602,13 @@ groups:
         # while healthy peers keep their gauges fresh. The rule must fire on
         # ANY instance going stale, so it is left per-series. The operator
         # default is one maintain replica anyway.
+        #
+        # The gauge reads 0 from process start until the first cycle
+        # completes, so this expression is true on a fresh process and the
+        # `for:` below is what suppresses it until the first cycle lands.
+        # Keep `for:` comfortably above the configured maintenance interval:
+        # a deployment that raises the interval past 10m, or that has a slow
+        # cold first scan, pages on every restart otherwise.
         expr: |
           (
             time() - ravel_maintain_last_cycle_completed_timestamp_seconds > 1800
