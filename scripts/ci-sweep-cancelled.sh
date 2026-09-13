@@ -20,6 +20,12 @@
 # printed, and the script exits non-zero so the refusal is visible rather
 # than silent.
 #
+# This margin cannot distinguish a real timeout from a push that supersedes
+# a job within that same margin of its own cap: a long-budget job cancelled
+# within the window is treated as a timeout and refused, even on the rare
+# run where it was genuinely superseded, because duration alone carries no
+# other signal to tell the two cases apart.
+#
 # Where the cap is read from: the workflow file at the run's OWN commit
 # (gh api .../contents/<path>?ref=<head_sha>), not the checked-out working
 # tree. A PR head can carry a different ci.yml than main, and the cap that
