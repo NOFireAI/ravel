@@ -143,8 +143,8 @@ fn every_clickbench_corpus_statement_is_accepted() {
 
     assert_eq!(
         widest,
-        (901, "q30_resolution_running_sums".to_string()),
-        "the widest corpus statement, and its exact structural count"
+        (630, "q30_resolution_running_sums".to_string()),
+        "the widest corpus statement, and its exact token count"
     );
     assert!(
         widest.0 < MAX_STATEMENT_COMPLEXITY,
@@ -176,16 +176,31 @@ fn nested_parentheses_are_refused_by_the_parser_recursion_limit() {
 }
 
 /// `structural_count` is the figure the gate decides on, so it is pinned
-/// exactly, not just in relation to the bound: whitespace is free, a literal
-/// costs one character however long it is, and a comment costs none.
+/// exactly, not just in relation to the bound: whitespace is free, every
+/// token costs one however long it is, and a comment costs none.
+///
+/// `SELECT 1` is two tokens, not seven characters. The unit is the token
+/// because the invariant the guard rests on is about tokens, and counting
+/// characters made the bound depend on whether an author quoted an
+/// identifier.
 #[test]
 fn the_structural_count_is_exact() {
-    assert_eq!(structural_count("SELECT 1"), 7);
-    assert_eq!(structural_count("SELECT   \n  1"), 7);
-    assert_eq!(structural_count("SELECT 'aaaaaaaaaaaaaaaaaaaa'"), 7);
-    assert_eq!(structural_count("SELECT 1 -- aaaaaaaaaaaaaaaaaaaa\n"), 7);
-    assert_eq!(structural_count("SELECT 1 /* aaaa */"), 7);
-    assert_eq!(structural_count("SELECT 1+1"), 9);
+    assert_eq!(structural_count("SELECT 1"), 2);
+    assert_eq!(structural_count("SELECT   \n  1"), 2);
+    assert_eq!(structural_count("SELECT 'aaaaaaaaaaaaaaaaaaaa'"), 2);
+    assert_eq!(structural_count("SELECT 1 -- aaaaaaaaaaaaaaaaaaaa\n"), 2);
+    assert_eq!(structural_count("SELECT 1 /* aaaa */"), 2);
+    assert_eq!(structural_count("SELECT 1+1"), 4);
+
+    // A long bare identifier is one token, exactly as its quoted form is.
+    assert_eq!(structural_count("SELECT ResolutionWidth"), 2);
+    assert_eq!(structural_count(r#"SELECT "ResolutionWidth""#), 2);
+
+    // A hint comment is NOT a comment to this dialect, so its body counts:
+    // SELECT, 1, then each of `/ * ! + 1 * /`. The same text as an ordinary
+    // `/* +1 */` comment costs 2, which is the whole difference.
+    assert_eq!(structural_count("SELECT 1 /*! +1 */"), 9);
+    assert_eq!(structural_count("SELECT 1 /* +1 */"), 2);
 }
 
 /// The guard counts structure, not characters: a statement whose string
@@ -227,10 +242,17 @@ fn a_long_comment_does_not_count() {
 #[test]
 fn the_gate_fires_one_character_past_the_bound() {
     on_worker_stack(|| {
-        // 7 characters for `SELECT1`, then two for each `,1`.
-        let items = (MAX_STATEMENT_COMPLEXITY - 7) / 2;
+        // `SELECT` and `1` are one token each, then two for every `,1`.
+        // div_ceil so the count lands exactly on the bound rather than one
+        // under it: with plain division an odd remainder left `at_bound` at
+        // 999 and the message below overstated what the case pinned.
+        let items = (MAX_STATEMENT_COMPLEXITY - 2).div_ceil(2);
         let at_bound = format!("SELECT 1{}", ",1".repeat(items));
-        assert_eq!(at_bound.replace(' ', "").len(), 7 + 2 * items);
+        assert_eq!(
+            ravel_sql::complexity_guard::structural_count(&at_bound),
+            MAX_STATEMENT_COMPLEXITY,
+            "the probe must sit exactly on the bound for this case to pin it"
+        );
         validate(&at_bound).expect("a statement at the bound passes the gate");
 
         let over = format!("{at_bound},1");
