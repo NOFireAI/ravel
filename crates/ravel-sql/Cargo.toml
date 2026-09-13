@@ -235,6 +235,12 @@ ravel-codec = { workspace = true }
 # read-only one to prove the `spill_unavailable` refusal. Already a workspace
 # pin, and already in the lockfile as a datafusion dependency.
 tempfile = { workspace = true }
+# Dev-only: tests/peak_alloc_instrument.rs measures true peak live-byte
+# allocation (issue #1582 finding: `stats_alloc`'s `bytes_allocated` is
+# cumulative churn, not peak resident bytes). Owns the `unsafe impl
+# GlobalAlloc` itself, same pattern `stats_alloc` above is used for; not
+# yet a workspace pin, so this is a new external dependency.
+peak_alloc = "0.3.0"
 
 [[bench]]
 name = "samples_scan"

@@ -222,8 +222,9 @@ struct DedupStream {
 ///
 /// Two consecutive winner rows folded from the same upstream batch
 /// (`process_batch`'s loop) share both their labels dictionary's `values`
-/// array (by pointer -- `batch.slice` never copies it) and, when they also
-/// share a dictionary key, resolve to the exact same one-row label set. The
+/// array (by pointer -- see [`crate::labels::compact_labels`] on why slicing
+/// never copies it) and, when they also share a dictionary key, resolve to
+/// the exact same one-row label set. The
 /// one-entry array `compact_labels` would rebuild for the second row is then
 /// bit-identical to the one already produced for the first, so it is reused
 /// instead of rebuilt. `values` must be compared alongside `key`: a new
@@ -329,11 +330,11 @@ impl DedupStream {
     /// Collapse the accumulated winner rows in `self.out` into one output
     /// batch.
     ///
-    /// `concat_batches` shares an input's labels dictionary with the output
-    /// only on pointer equality between adjacent inputs; the moment two
-    /// accumulated rows point at different upstream dictionaries, it
-    /// concatenates instead of sharing, appending one full dictionary per
-    /// such row. `self.out_multi_dict` (maintained by `finalize` via
+    /// Compacting each row's labels dictionary down to its one referenced
+    /// entry before concatenating is worth doing only when the accumulated
+    /// rows do not already share one dictionary pointer; see
+    /// [`crate::labels::compact_labels`] for why `concat_batches` cares about
+    /// that. `self.out_multi_dict` (maintained by `finalize` via
     /// `track_out_dict`, cheaply, without walking `self.out`) answers that
     /// exactly: if every accumulated row shares one dictionary pointer,
     /// `concat_batches` was always going to share it for free, and compacting
@@ -343,23 +344,26 @@ impl DedupStream {
     /// compact each row first, exactly as an earlier version of this
     /// operator did unconditionally.
     ///
-    /// Measured on a 5,000-series/1-segment corpus, where every accumulated
-    /// row shares one dictionary pointer so the unconditional per-row
-    /// compaction bought nothing: peak allocation of 100,683,176 bytes
-    /// compacting unconditionally, 29,948,424 bytes skipping it here (the
-    /// same figure as deleting the compaction outright; measured with a
-    /// scratch corpus, not committed as a permanent test).
+    /// Allocation churn (cumulative bytes allocated over the run, via
+    /// `stats_alloc`; not peak resident bytes -- see
+    /// `tests/dedup_finalize_allocation*.rs` and
+    /// `tests/peak_alloc_instrument.rs`) measured on a 5,000-series/1-segment
+    /// corpus, where every accumulated row shares one dictionary pointer so
+    /// the unconditional per-row compaction bought nothing: 100,683,176 bytes
+    /// allocated compacting unconditionally, 29,948,424 bytes allocated
+    /// skipping it here (the same figure as deleting the compaction outright;
+    /// measured with a scratch corpus, not committed as a permanent test).
     ///
-    /// Measured on the 10,000-series/500-segment corpus in
-    /// `tests/dedup_finalize_allocation.rs`: 84,838,905 bytes, well under the
-    /// 201,280,697 an earlier round of this operator allocated compacting
-    /// unconditionally. `out_multi_dict` being set less often than the
-    /// per-segment split alone would suggest is why: the upstream
+    /// Allocation churn measured on the 10,000-series/500-segment corpus in
+    /// `tests/dedup_finalize_allocation.rs`: 84,838,905 bytes allocated, well
+    /// under the 201,280,697 an earlier round of this operator allocated
+    /// compacting unconditionally. `out_multi_dict` being set less often than
+    /// the per-segment split alone would suggest is why: the upstream
     /// `SortPreservingMergeExec` already rebuilds one shared dictionary per
     /// *its own* output batch when interleaving several small segments'
-    /// worth of rows into it (arrow's merge shares a dictionary across an
-    /// output batch only by first materializing one, same as
-    /// `concat_batches`), so most flush windows here draw from a single
+    /// worth of rows into it (same pointer-equality-or-copy rule
+    /// `compact_labels` describes for `concat_batches` applies to arrow's
+    /// merge machinery too), so most flush windows here draw from a single
     /// already-unified dictionary and only the rare window spanning a merge
     /// batch boundary needs real per-row compaction.
     fn flush(&mut self) -> DFResult<RecordBatch> {
