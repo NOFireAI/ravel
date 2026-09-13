@@ -26,10 +26,9 @@ use datafusion::prelude::SessionContext;
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{EngineConfig, SegmentFetcher};
+use ravel_query::{EngineConfig, PhaseAccounting, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{RavelTableProvider, label_udf};
-use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
 use uuid::Uuid;
 
@@ -143,7 +142,7 @@ async fn build_provider(series: &[Series]) -> RavelTableProvider {
         TENANT,
         fetcher,
         EngineConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
 }
 
