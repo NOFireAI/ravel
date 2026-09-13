@@ -12,7 +12,7 @@
 //! error; it never corrupts HEAD or leaves a torn snapshot visible.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -94,6 +94,82 @@ const MAX_HEAD_CAS_ATTEMPTS: u32 = 8;
 #[derive(Debug, Clone)]
 pub struct Transaction {
     _private: (),
+}
+
+/// Per-fold cap on how many requested re-fold hours
+/// ([`RefoldRequest`]) one fold re-lists, so a caller that reports a large
+/// blocked set cannot turn one fold into an unbounded LIST fan-out. Matches
+/// [`crate::DEFAULT_FRONTIER_RECONCILE_MAX_HOURS`] (168 = seven days of hourly
+/// buckets) for the same reason: far above the steady-state set (the hours that
+/// received a late record since the last sweep), so the cap only ever bounds a
+/// recovery case. The remainder is not lost, and needs no deferral bookkeeping
+/// in the snapshot: the requester re-derives its blocked set every pass and a
+/// still-blocked hour is requested again on the next one.
+const REFOLD_REQUEST_MAX_HOURS: usize = 168;
+
+/// The ingest hours a caller wants this fold to re-list and reconcile, on top
+/// of the fold's own fixed reconcile window and retention-frontier band
+/// (ADR-0063 section 4). The receiving end of issue #526's re-fold half.
+///
+/// The fold cannot derive this set itself. An hour that received a late
+/// compaction or rewrite record is indistinguishable, from the snapshot
+/// entries alone, from an hour that did not: proving the difference needs a
+/// LIST of that hour's commit buckets, and the hours that could have received
+/// one are every hour the snapshot names, so a self-derived version would cost
+/// a full-history LIST fan-out on every fold. The fixed window bounds that by
+/// recency and the frontier band bounds it by the retention frontier; neither
+/// reaches a late record in the middle of a tenant's history, which is exactly
+/// the hour that leaks (the sweep's HEAD-reachability gate holds the
+/// pre-rewrite inputs because the snapshot still names them).
+///
+/// The maintain tier's superseded-input sweep already pays for those LISTs and
+/// already computes the answer: a bucket it holds on
+/// `SnapshotBlock::Named` is an hour whose snapshot entries still name inputs a
+/// published compaction or rewrite record superseded. Those hours are what
+/// belongs here.
+///
+/// Requesting an hour is a hint, never a durability dependency: an unrequested
+/// or dropped hour degrades to today's behavior (the hour keeps naming its
+/// pre-rewrite inputs until retention drops it), and the sweep's gate remains
+/// the delete blocker either way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefoldRequest {
+    /// Ascending and deduplicated, so a fold spends its cap oldest-first (the
+    /// hours whose held inputs have occupied storage longest).
+    hours: BTreeSet<u32>,
+}
+
+impl RefoldRequest {
+    /// An empty request: the fold behaves exactly as [`Catalog::fold`] does.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request a re-fold of one ingest hour.
+    pub fn insert(&mut self, ingest_hour_bucket: u32) {
+        self.hours.insert(ingest_hour_bucket);
+    }
+
+    /// Build a request from an hour iterator; duplicates collapse.
+    pub fn from_hours(hours: impl IntoIterator<Item = u32>) -> Self {
+        Self {
+            hours: hours.into_iter().collect(),
+        }
+    }
+
+    /// The requested hours, ascending.
+    pub fn hours(&self) -> impl Iterator<Item = u32> + '_ {
+        self.hours.iter().copied()
+    }
+
+    /// Number of distinct hours requested.
+    pub fn len(&self) -> usize {
+        self.hours.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hours.is_empty()
+    }
 }
 
 /// Outcome of one [`Catalog::fold`] call.
@@ -605,6 +681,34 @@ fn reset_column_stats_concat_calls_for_test() {
     COLUMN_STATS_CONCAT_CALLS.with(|c| c.set(0));
 }
 
+// Test-only instrumentation for issue #526: the number of hours the targeted
+// re-fold pass actually re-listed on the last fold, so a bounded-work test can
+// pin that number exactly rather than inferring it from LIST arithmetic. It is
+// not a `FoldReport` field because every field of that struct must also be
+// rendered by `ravel-cli`'s human fold report
+// (services/ravel-cli/src/catalog.rs, pinned by
+// services/ravel-cli/tests/catalog_fold_report.rs), which is outside this
+// change's scope; see the follow-up named in the issue.
+#[cfg(test)]
+thread_local! {
+    static REFOLD_HOURS_RECONCILED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_refold_hours_for_test(hours: u64) {
+    REFOLD_HOURS_RECONCILED.with(|c| c.set(hours));
+}
+
+#[cfg(test)]
+fn refold_hours_reconciled_for_test() -> u64 {
+    REFOLD_HOURS_RECONCILED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_refold_hours_for_test() {
+    REFOLD_HOURS_RECONCILED.with(|c| c.set(0));
+}
+
 /// One part's span in the fully-sorted entry set: the `[start, end)` index
 /// range into `entries` and the `[min_hour, watermark_hour]` ingest-hour range
 /// those entries occupy (ADR-0063 section 1). Ranges are disjoint and
@@ -813,11 +917,12 @@ fn retirement_frontier_hour(
 
 /// `(shard, hour)` pairs for an explicit, arbitrary set of ingest hours, one
 /// per shard in each hour's own `scan_count(h)` fan-out (ADR-0052 section 4).
-/// The retention-frontier reconcile (ADR-0020) needs the shard buckets for a
-/// sparse, non-contiguous hour set (the snapshot-named hours at or below the
-/// frontier), which [`hour_range_buckets`]' contiguous `[lo, hi]` range cannot
-/// express.
-fn frontier_hour_set_buckets(generations: &[ShardGeneration], hours: &[u32]) -> Vec<(u32, u32)> {
+/// Both sparse reconcile passes need this shape, which
+/// [`hour_range_buckets`]' contiguous `[lo, hi]` range cannot express: the
+/// retention-frontier reconcile (ADR-0020) over the snapshot-named hours at or
+/// below the frontier, and the targeted re-fold pass (issue #526) over the
+/// hours a [`RefoldRequest`] names.
+fn hour_set_buckets(generations: &[ShardGeneration], hours: &[u32]) -> Vec<(u32, u32)> {
     let mut buckets = Vec::new();
     for &hour in hours {
         let scan = scan_count(generations, hour, DEFAULT_SCAN_SLACK_HOURS);
@@ -889,6 +994,53 @@ impl Catalog {
         transactions: &[Transaction],
         default_retention_ns: Option<i64>,
     ) -> Result<FoldReport, CatalogError> {
+        self.fold_with_refold_request(
+            tenant,
+            signal,
+            folder_id,
+            now_ns,
+            transactions,
+            default_retention_ns,
+            &RefoldRequest::new(),
+        )
+        .await
+    }
+
+    /// [`Catalog::fold`], plus a targeted re-fold of the ingest hours
+    /// `refold_request` names (issue #526).
+    ///
+    /// The fixed reconcile window reaches only
+    /// `fold_reconcile_window_hours` behind the previous watermark and the
+    /// retention-frontier band reaches only the hours near the tenant's
+    /// retirement frontier. A compaction or rewrite record that lands in an
+    /// already-folded hour between those two bands is never observed by any
+    /// later fold, so the snapshot keeps naming that hour's pre-rewrite
+    /// inputs, the maintain tier's superseded-input sweep holds those objects
+    /// on its HEAD-reachability gate (ADR-0020), and they occupy storage until
+    /// retention drops the hour. This entry point is how the holder tells the
+    /// fold which hours to re-list; see [`RefoldRequest`] for why the fold
+    /// cannot derive that set itself.
+    ///
+    /// The requested hours are reconciled through exactly the same per-bucket
+    /// path as the other two passes, so a re-fold can only ever make the
+    /// snapshot agree with the commit layout. The pass is bounded by
+    /// [`REFOLD_REQUEST_MAX_HOURS`], skips hours the other two passes already
+    /// list, and skips hours the snapshot does not name (a re-fold of an hour
+    /// no part covers would be pure cost). It also inherits ADR-0063 section
+    /// 4's carve-outs: a first fold and a rebuild do no reconcile work at all,
+    /// so a request made against either is ignored rather than adding LISTs to
+    /// a fold that already derives every hour from the commit layout.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fold_with_refold_request(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        folder_id: Uuid,
+        now_ns: i64,
+        transactions: &[Transaction],
+        default_retention_ns: Option<i64>,
+        refold_request: &RefoldRequest,
+    ) -> Result<FoldReport, CatalogError> {
         let result = self
             .fold_inner(
                 tenant,
@@ -897,6 +1049,7 @@ impl Catalog {
                 now_ns,
                 transactions,
                 default_retention_ns,
+                refold_request,
             )
             .await;
         self.record_fold_outcome(signal, now_ns, result.is_ok());
@@ -907,6 +1060,7 @@ impl Catalog {
     /// in place because the body returns from a dozen points and through `?`,
     /// and a counter maintained at each of those is a counter that a later
     /// early return silently stops feeding.
+    #[allow(clippy::too_many_arguments)]
     async fn fold_inner(
         &self,
         tenant: &TenantHash,
@@ -915,6 +1069,7 @@ impl Catalog {
         now_ns: i64,
         _transactions: &[Transaction],
         default_retention_ns: Option<i64>,
+        refold_request: &RefoldRequest,
     ) -> Result<FoldReport, CatalogError> {
         let head_key = head_object_key(tenant, signal);
         // Fold never runs on the query path (module docs above) and keeps
@@ -1154,6 +1309,11 @@ impl Catalog {
             let mut dirty_hours: HashSet<u32> = HashSet::new();
             let mut frontier_hours_reconciled: u64 = 0;
             let mut frontier_hours_deferred: u64 = 0;
+            // Hours the retention-frontier pass listed this fold, so the
+            // targeted re-fold pass below does not list any of them a second
+            // time (issue #526).
+            let mut frontier_listed_hours: HashSet<u32> = HashSet::new();
+            let mut refold_hours_reconciled: u64 = 0;
             if let Some(watermark_hour_old) = reconcile_watermark {
                 let window = self.config().fold_reconcile_window_hours;
                 let lo = watermark_hour_old.saturating_sub(window);
@@ -1248,13 +1408,13 @@ impl Catalog {
                     frontier_hours_deferred = (candidate_hours.len() - take) as u64;
                     let frontier_hours = &candidate_hours[..take];
                     if !frontier_hours.is_empty() {
-                        let frontier_buckets =
-                            frontier_hour_set_buckets(&generations, frontier_hours);
+                        let frontier_buckets = hour_set_buckets(&generations, frontier_hours);
                         let frontier_listings = self
                             .discover_bucket_listings(tenant, signal, &frontier_buckets)
                             .await?;
                         counters.list_requests += frontier_buckets.len() as u64;
                         frontier_hours_reconciled = frontier_hours.len() as u64;
+                        frontier_listed_hours.extend(frontier_hours.iter().copied());
                         for (shard, hour, listing) in &frontier_listings {
                             self.reconcile_one_bucket(
                                 tenant,
@@ -1273,7 +1433,99 @@ impl Catalog {
                         }
                     }
                 }
+
+                // ---- Targeted re-fold pass (issue #526) ----
+                //
+                // The two passes above are bounded by recency and by the
+                // retention frontier. A compaction or rewrite record that
+                // lands in an already-folded hour between those bands is
+                // reached by neither, so the snapshot keeps naming that hour's
+                // pre-rewrite inputs; the superseded-input sweep's
+                // HEAD-reachability gate (ADR-0020) then holds those objects
+                // instead of deleting them, and they occupy storage until
+                // retention drops the hour. `refold_request` is how the holder
+                // names those hours (see `RefoldRequest` for why the fold
+                // cannot derive them itself), and this pass re-lists them
+                // through the same per-bucket reconcile the other two use.
+                //
+                // Three filters keep the pass targeted, and together they are
+                // what bounds its work to the hours that can actually be
+                // leaking:
+                //
+                // - `< lo` drops anything the fixed window already lists,
+                //   which also drops every hour at or above the old watermark
+                //   (the incremental range folds those fresh this cycle).
+                // - `!frontier_listed_hours` drops what the frontier pass just
+                //   listed, so no bucket is listed twice in one fold.
+                // - `named_hours` drops hours no snapshot entry covers. Such an
+                //   hour cannot be blocking a delete on HEAD reachability, so
+                //   listing it is pure cost.
+                //
+                // Whatever survives is capped at `REFOLD_REQUEST_MAX_HOURS`,
+                // oldest-first. The remainder is not tracked in the snapshot:
+                // the requester re-derives its blocked set each pass, so a
+                // still-blocked hour comes back on the next request.
+                if !refold_request.is_empty() {
+                    let named_hours: HashSet<u32> =
+                        entries.iter().map(|e| e.ingest_hour_bucket).collect();
+                    // `RefoldRequest` iterates ascending, so this is
+                    // oldest-first without a sort: the hours whose held inputs
+                    // have occupied storage longest are reconciled before the
+                    // cap is spent.
+                    let candidates: Vec<u32> = refold_request
+                        .hours()
+                        .filter(|hour| {
+                            *hour < lo
+                                && !frontier_listed_hours.contains(hour)
+                                && named_hours.contains(hour)
+                        })
+                        .collect();
+                    let take = candidates.len().min(REFOLD_REQUEST_MAX_HOURS);
+                    if take < candidates.len() {
+                        tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            requested = candidates.len(),
+                            reconciled = take,
+                            "targeted re-fold request exceeds the per-fold cap; the remainder is \
+                             carried to whichever later fold the requester asks for it again"
+                        );
+                    }
+                    let refold_hours = &candidates[..take];
+                    if !refold_hours.is_empty() {
+                        let refold_buckets = hour_set_buckets(&generations, refold_hours);
+                        let refold_listings = self
+                            .discover_bucket_listings(tenant, signal, &refold_buckets)
+                            .await?;
+                        counters.list_requests += refold_buckets.len() as u64;
+                        refold_hours_reconciled = refold_hours.len() as u64;
+                        for (shard, hour, listing) in &refold_listings {
+                            self.reconcile_one_bucket(
+                                tenant,
+                                signal,
+                                *shard,
+                                *hour,
+                                listing,
+                                &accounting,
+                                &mut entries,
+                                &mut seen,
+                                &mut dirty_hours,
+                                &mut counters,
+                                &mut layout_drift_count,
+                            )
+                            .await?;
+                        }
+                    }
+                }
             }
+            if refold_hours_reconciled > 0 {
+                tracing::debug!(
+                    tenant = %tenant.to_hex(),
+                    hours = refold_hours_reconciled,
+                    "fold reconciled the ingest hours a re-fold request named"
+                );
+            }
+            #[cfg(test)]
+            record_refold_hours_for_test(refold_hours_reconciled);
             // A reconcile that changed any hour invalidates the append-only,
             // stable-ordinal assumption the forward postings merge relies on
             // (a superseded or removed entry shifts every later ordinal), so
