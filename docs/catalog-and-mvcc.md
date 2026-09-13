@@ -786,13 +786,12 @@ already-sealed hours:
   whose supersession could invalidate a snapshot entry is observed by a
   reconcile pass before its inputs can disappear, provided the record lands
   inside this window. Compaction does: it targets hours near the watermark.
-  A selective-erasure rewrite record can land in any sealed hour, and this
-  window and the retention-frontier band below are the fold's only
-  reconciliation of a late record; no hook lets a rewrite pass force one
-  hour. A rewrite whose hour is older than this window and newer than the
-  retirement frontier is re-listed by neither pass, so its covering part
-  keeps naming the pre-rewrite inputs until the frontier band reaches that
-  hour, or until an operator rebuilds HEAD. Subject erasure stays correct
+  A selective-erasure rewrite record can land in any sealed hour. A rewrite
+  whose hour is older than this window and newer than the retirement frontier
+  is re-listed by neither this window nor the frontier band below, so its
+  covering part keeps naming the pre-rewrite inputs until the frontier band
+  reaches that hour, until a caller names that hour in a targeted re-fold
+  request (below), or until an operator rebuilds HEAD. Subject erasure stays correct
   meanwhile (the query-time predicate outlives the inputs), and the sweeper
   does not delete an input the covering part still names: it holds it until
   one of those two events, so a query over the hour keeps resolving normally.
@@ -851,10 +850,12 @@ normally days) behind the watermark, so the fixed window alone would never
 observe it, and the snapshot would keep naming the retired bucket's segments
 forever. The retention-frontier reconcile below covers exactly that case.
 (This closes a latent correctness gap; see ADR-0063 Consequences and
-ADR-0020.) A rewrite record takes the same two routes and no third: inside
-the fixed window it is applied on the next fold, in an hour at or
-approaching the retirement frontier it is applied by the frontier band, and
-in between it waits for the frontier band to reach its hour.
+ADR-0020.) A rewrite record takes three routes: inside the fixed window it is
+applied on the next fold, in an hour at or approaching the retirement
+frontier it is applied by the frontier band, and in between it is applied
+only by a fold a caller asked to re-list that hour (targeted re-fold
+requests, below). Absent such a request it waits for the frontier band to
+reach its hour.
 
 ## Retention-frontier reconcile (ADR-0020 delete blocker)
 
@@ -918,6 +919,56 @@ ravel-maintain's default, since the dependency runs the other way); a drift from
 a deployment's true horizon only resizes the bounded band and is never a
 correctness property, because the sweep's HEAD gate is the actual delete
 blocker.
+
+## Targeted re-fold requests (ADR-0063 section 4 amendment)
+
+The fixed window is bounded by recency and the frontier band by the tenant's
+retirement frontier. An hour between the two that receives a late compaction
+or rewrite record is re-listed by neither, so its covering part keeps naming
+the pre-rewrite inputs, the superseded-input sweep's HEAD-reachability gate
+holds those inputs rather than deleting them, and they occupy storage until
+retention drops the hour. Queries keep resolving throughout and no delete is
+ever wrongly permitted: this is a liveness and storage gap, not a
+durability or availability one.
+
+The fold cannot close it alone. Which already-folded hour received a late
+record is not derivable from the snapshot entries; proving it requires
+listing that hour's commit buckets, and the candidate set is every hour the
+snapshot names, so a self-derived pass would cost a full-history LIST
+fan-out on every fold. The sweep already pays for those LISTs and already
+computes the answer: a bucket it holds on `SnapshotBlock::Named` is exactly
+an hour whose snapshot entries still name superseded inputs.
+
+`Catalog::fold_with_refold_request` is the receiving end. It takes a
+`RefoldRequest` (a set of ingest hours) and runs a third reconcile pass over
+those hours, after the fixed window and the frontier band:
+
+- **Which hours.** Of the hours requested, the pass re-lists only those
+  below the fixed window's floor (which also excludes every hour at or above
+  the old watermark, since the incremental range folds those fresh), not
+  already listed by the frontier band this fold, and named by at least one
+  snapshot entry. An hour no entry names cannot be blocking a delete on HEAD
+  reachability, so listing it would be pure cost.
+- **Bounded per fold.** What survives those filters is capped at 168 hours,
+  oldest-first, matching `frontier_reconcile_max_hours`. The remainder needs
+  no deferral bookkeeping in the snapshot: the requester re-derives its
+  blocked set on each pass, so a still-blocked hour is requested again.
+- **Same diff-and-apply, same CAS.** Requested buckets go through the
+  identical `Catalog::classify_bucket` diff, mark their covering parts dirty
+  the same way, and land in the same single HEAD CAS. A re-fold can
+  therefore only ever make the snapshot agree with the commit layout.
+- **Skipped when redundant.** The pass sits inside the same reconcile block
+  as the other two, so a first fold and a rebuilt fold ignore a request
+  entirely: a rebuild already re-derives every hour from the commit layout.
+- **A hint, never a durability dependency.** An hour nobody requests
+  degrades to the behaviour above (it keeps naming its pre-rewrite inputs
+  until the frontier band reaches it), and the sweep's HEAD-reachability
+  gate remains the delete blocker in every case.
+
+The maintain-tier wiring that turns the sweep's blocked hours into a
+`RefoldRequest` is a separate change; until it lands this entry point has no
+production caller and every fold behaves exactly as the two preceding
+sections describe.
 
 ## Commit sequence (strict mode)
 
