@@ -663,10 +663,11 @@ impl LogFlushCtx {
         let encode_elapsed = encode_start.elapsed();
         let bytes = match finish_result {
             Ok((bytes, stats)) => {
-                // Per-block bloom-construction time (issue #1516), nested inside
-                // the `Encode` window this whole match arm sits in: folded in as
-                // one `bloom_blocks`-sample batch, read before `record_postings`
-                // moves `stats`.
+                // Per-block bloom-construction time (issue #1516). The measurement
+                // itself is nested inside the `Encode` window, taken inside
+                // `finish_with_stats`; this fold is not, and runs after
+                // `encode_elapsed` was read. Folded in as one `bloom_blocks`-sample
+                // batch, read before `record_postings` moves `stats`.
                 #[cfg(feature = "stage-timing")]
                 self.stage_timings.record_n(
                     LogStage::Bloom,
