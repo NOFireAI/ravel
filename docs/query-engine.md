@@ -2440,12 +2440,17 @@ bounded, including ones nobody has tested.
 
 Three numbers, one decision:
 
-- `ravel_sql::MAX_STATEMENT_COMPLEXITY` is 600 structural characters. It is
-  set at a third of the tightest measured survival figure: on a 2 MiB stack
-  in a release build, DataFusion's SQL-to-`LogicalPlan` conversion survives
-  1,807 characters of a binary-operator chain and aborts at 1,907. (The
-  validation walk itself survives 50,007 and aborts at 60,007, so the
-  planner, not the gate's own caller, is the binding consumer.)
+- `ravel_sql::MAX_STATEMENT_COMPLEXITY` is 1,000 structural characters. On a
+  2 MiB stack in a release build, DataFusion's SQL-to-`LogicalPlan`
+  conversion survives 1,807 characters of a binary-operator chain and aborts
+  at 1,907, about 950 tree levels. (The validation walk itself survives
+  50,007 and aborts at 60,007, so the planner, not the gate's own caller, is
+  the binding consumer.) No construct costs fewer than two characters per
+  tree level, so an admitted statement cannot exceed 500 levels against those
+  950. The bound is not lower because a lower one refuses real analytic SQL:
+  the widest statement in `benchmarks/clickbench/hits.corpus.json` counts 901
+  structural characters, and the whole corpus is pinned as accepted in
+  `crates/ravel-sql/tests/statement_complexity.rs`.
 - The parser recursion limit is pinned at 50 rather than inherited from
   `datafusion-sql`'s default. It is a second, independent bound: it catches
   nested constructs (parentheses, subqueries) that the complexity count would

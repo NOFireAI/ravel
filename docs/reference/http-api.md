@@ -107,7 +107,7 @@ ceiling as the other query routes, and a request refused by it gets the same
 
 `/api/v1/sql` caps its request body at 64 KiB; a larger body is 400. The
 statement itself is gated before it is parsed: a statement carrying more than
-600 structural characters (non-whitespace characters outside string literals
+1,000 structural characters (non-whitespace characters outside string literals
 and comments) is 400, with a message naming the measured count and the
 maximum. The gate bounds the depth of the expression tree a statement can
 build, which no body-size cap does on its own, and it applies to Flight SQL
