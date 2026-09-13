@@ -293,3 +293,22 @@ statement `narrow_count_filter` (backend `memory+get-delay-20ms`):
 The scan's partition critical path is the serialized opens; decode is 2 to 4
 percent of it in this configuration; the rest of `cold_ms` is the resolve
 phase (about 45 ms at every setting) and DataFusion overhead.
+
+## Gates run on the committed tree (6609e73), all `CARGO_BUILD_JOBS=4`
+
+| Gate | Exit |
+|---|---|
+| `cargo fmt --all --check` | 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 0 |
+| `cargo clippy -p ravel-server -p ravel-sql --features sql --all-targets -- -D warnings` | 0 |
+| `cargo clippy -p ravel-bench --features sql-latency,profiling,flight-lane --all-targets -- -D warnings` | 0 |
+| `scripts/affected-tests.sh -p ravel-sql -p ravel-query -p ravel-bench` (11 crates, 3790 tests) | 0 |
+| `cargo test -p ravel-bench --features sql-latency` | 0 |
+| `cargo test -p ravel-server --features sql` | 0 |
+| `cargo test -p ravel-sql --test attrs_map_vs_declared` (and shown failing with the expected divergence row flipped from `[1]` to `[2]`: `left: [1] right: [2]`) | 0 / 101 |
+
+Not run: the `flight-sql` clippy and test lanes (`-p ravel-server -p
+ravel-sql --features flight-sql`); the change touches no Flight surface,
+but CLAUDE.md lists the lane for any ravel-sql change and it was skipped
+for the runtime ceiling. The `stage-timing` lane is untouched by this
+change (no ravel-ingest or ravel-logseg edits).
