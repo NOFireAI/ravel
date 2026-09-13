@@ -2635,8 +2635,15 @@ pub async fn start(
                 // The Flight SQL lane derives its ticket-signing key from a
                 // stable cluster secret; feed it the fragment-key-derived secret
                 // so the whole cluster agrees (ADR-0071 amendment, decision 2).
+                // The self-id cell keeps this coordinator out of its own SQL
+                // roster: it reads its own slices locally, so a slice
+                // dispatched to itself over Flight is a wasted hop. The cell is
+                // filled below, once the gRPC listener has bound and the
+                // heartbeat identity exists; the roster resolves per query, so
+                // the exclusion takes effect from that point on.
                 sql_distrib::distributed_flight_config(
                     distrib_live_workers.clone(),
+                    distrib_self_id.clone(),
                     settings.thresholds,
                     &settings.sql_ticket_secret(),
                 )

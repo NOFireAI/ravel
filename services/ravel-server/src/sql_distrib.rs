@@ -7,8 +7,8 @@
 //! lives here, in the server crate. [`FleetWorkerEndpoints`] reads the same live
 //! query-worker set the PromQL distributed lane's [`crate::distrib`] router
 //! reads (written by the heartbeat loop under `sys/query/workers/`), filtered to
-//! the coordinator's protocol version, and returns each live worker's endpoint
-//! as a Flight location.
+//! the coordinator's protocol version and with the coordinator itself removed,
+//! and returns each remaining live worker's endpoint as a Flight location.
 //!
 //! # Why the fragment endpoint is the Flight location
 //!
@@ -31,31 +31,42 @@
 //! to the workers this roster resolves. Absent the config, the service runs
 //! every statement whole-set on the coordinator, byte-identical to before.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 use ravel_fleet::query_workers::QueryWorkerRecord;
 use ravel_query::distrib::codec::PROTOCOL_VERSION;
 use ravel_sql::{DistributedFlightConfig, WorkerEndpoints};
+use uuid::Uuid;
 
 /// The shared live query-worker set, refreshed by the heartbeat loop. The same
 /// handle [`crate::distrib::RoutingSliceFetcher`] reads for the PromQL lane.
 type LiveWorkers = Arc<RwLock<Arc<Vec<QueryWorkerRecord>>>>;
 
+/// This process's own query-worker id, published once the gRPC listener is bound
+/// and the heartbeat identity exists. The same cell
+/// [`crate::distrib::RoutingSliceFetcher`] reads to recognize a self-mapped
+/// slice; empty until then.
+type SelfId = Arc<OnceLock<Uuid>>;
+
 /// A [`WorkerEndpoints`] over the ravel-fleet query-worker registry (ADR-0071
-/// SQL lane). Returns the Flight location of every live,
-/// protocol-matched worker, in the registry's order. An empty result means no
-/// workers are available, and ravel-sql runs the query fully local (a single
-/// self-endpoint over the whole pinned set), which is always correct.
+/// SQL lane). Returns the Flight location of every live, protocol-matched
+/// worker OTHER than this coordinator, in the registry's order. An empty result
+/// means no workers are available, and ravel-sql runs the query fully local (a
+/// single self-endpoint over the whole pinned set), which is always correct.
 pub struct FleetWorkerEndpoints {
     live_workers: LiveWorkers,
+    self_id: SelfId,
 }
 
 impl FleetWorkerEndpoints {
-    /// Build over the shared live-worker set (the same one the PromQL router and
-    /// the heartbeat loop share).
-    pub fn new(live_workers: LiveWorkers) -> Self {
-        FleetWorkerEndpoints { live_workers }
+    /// Build over the shared live-worker set and the shared self-id cell (the
+    /// same two the PromQL router and the heartbeat loop share).
+    pub fn new(live_workers: LiveWorkers, self_id: SelfId) -> Self {
+        FleetWorkerEndpoints {
+            live_workers,
+            self_id,
+        }
     }
 
     /// The Flight location for a worker record: its cluster-internal gRPC
@@ -70,11 +81,24 @@ impl FleetWorkerEndpoints {
 impl WorkerEndpoints for FleetWorkerEndpoints {
     fn endpoints(&self) -> Vec<String> {
         let live = Arc::clone(&self.live_workers.read());
+        // `QueryWorkers::live_set` always includes this process ("a process
+        // never disowns itself"), so the coordinator's own record is in the
+        // roster unless it is dropped here.
+        let own = self.self_id.get().map(Uuid::to_string);
         live.iter()
             // A version-skewed worker is dropped here, exactly as the PromQL
             // router drops it at routing time: dispatching a slice to a worker
             // that speaks a different protocol would fail the fetch.
             .filter(|record| record.protocol_version == PROTOCOL_VERSION)
+            // The coordinator serves its own slices through the local path
+            // (ravel_sql::distributed::CoordinatorSliceReader, the last step of
+            // the fan-out's failure sequence), so dispatching one to itself over
+            // Flight is a wasted hop: an extra connection, an extra ticket MAC,
+            // and an extra encode/decode round for bytes it can read directly.
+            // Before the self-id cell is populated (the identity exists only
+            // once the gRPC listener has bound) nothing is excluded, which is
+            // the pre-existing behavior and is correct, just one hop slower.
+            .filter(|record| own.as_deref() != Some(record.process_id.as_str()))
             .map(Self::location)
             .collect()
     }
@@ -87,6 +111,10 @@ impl WorkerEndpoints for FleetWorkerEndpoints {
 /// installs the returned value through
 /// `RavelFlightSqlService::with_distributed_scan`.
 ///
+/// `self_id` is the shared cell holding this process's own query-worker id (the
+/// one the PromQL router reads to recognize a self-mapped slice). It is what
+/// keeps the coordinator out of its own SQL roster.
+///
 /// `auth_token` is the cluster-internal fragment secret every process in the
 /// deployment already shares (`DistribSettings::auth_token`). The Flight ticket
 /// MAC key is derived from it (ADR-0071) so a coordinator's slice
@@ -94,11 +122,12 @@ impl WorkerEndpoints for FleetWorkerEndpoints {
 /// cross-process slice fan-out would fail every ticket MAC.
 pub fn distributed_flight_config(
     live_workers: LiveWorkers,
+    self_id: SelfId,
     thresholds: ravel_query::distrib::partition::DistribThresholds,
     auth_token: &str,
 ) -> DistributedFlightConfig {
     DistributedFlightConfig {
-        workers: Arc::new(FleetWorkerEndpoints::new(live_workers)),
+        workers: Arc::new(FleetWorkerEndpoints::new(live_workers, self_id)),
         thresholds,
         shared_ticket_key: Some(ravel_sql::derive_ticket_key(auth_token.as_bytes())),
     }
@@ -118,12 +147,24 @@ mod tests {
         }
     }
 
+    /// An empty self-id cell, for the cases that are not about self-exclusion.
+    fn no_self() -> SelfId {
+        Arc::new(OnceLock::new())
+    }
+
+    /// A populated self-id cell.
+    fn self_id(id: Uuid) -> SelfId {
+        let cell: SelfId = Arc::new(OnceLock::new());
+        cell.set(id).expect("set self id");
+        cell
+    }
+
     /// The endpoints reflect the live set, in order, and drop version-skewed
     /// workers, mirroring the PromQL router's routing-time version filter.
     #[test]
     fn endpoints_reflect_live_set_and_drop_version_skew() {
         let live: LiveWorkers = Arc::new(RwLock::new(Arc::new(Vec::new())));
-        let endpoints = FleetWorkerEndpoints::new(live.clone());
+        let endpoints = FleetWorkerEndpoints::new(live.clone(), no_self());
 
         // Empty registry: no workers, ravel-sql runs local.
         assert!(endpoints.endpoints().is_empty());
@@ -153,6 +194,48 @@ mod tests {
         );
     }
 
+    /// The coordinator's own record is dropped from its SQL roster: it serves
+    /// its own slices through the local path, so a slice dispatched to itself
+    /// over Flight would be a wasted hop. `QueryWorkers::live_set` always puts
+    /// this process in the live set, so without this filter the coordinator is
+    /// always in the roster it fans out to.
+    #[test]
+    fn endpoints_exclude_the_coordinator_itself() {
+        let current = PROTOCOL_VERSION;
+        let me = Uuid::from_u128(1);
+        let sibling = Uuid::from_u128(2);
+        let live: LiveWorkers = Arc::new(RwLock::new(Arc::new(vec![
+            record(&me.to_string(), "10.0.0.1:9000", current),
+            record(&sibling.to_string(), "10.0.0.2:9000", current),
+        ])));
+
+        // With the self-id cell populated, only the sibling is dispatchable.
+        let endpoints = FleetWorkerEndpoints::new(live.clone(), self_id(me));
+        assert_eq!(
+            endpoints.endpoints(),
+            vec!["http://10.0.0.2:9000".to_string()],
+            "the coordinator's own endpoint is not a fan-out target"
+        );
+
+        // A single-node cluster fans out to nothing at all, so
+        // `plan_distributed_slices` returns None and the statement runs
+        // whole-set locally instead of dispatching every slice to itself.
+        *live.write() = Arc::new(vec![record(&me.to_string(), "10.0.0.1:9000", current)]);
+        assert!(
+            endpoints.endpoints().is_empty(),
+            "a lone coordinator advertises no workers"
+        );
+
+        // Before the identity exists (the cell is filled once the gRPC listener
+        // binds), nothing is excluded: correct, one hop slower.
+        let early = FleetWorkerEndpoints::new(live.clone(), no_self());
+        assert_eq!(
+            early.endpoints(),
+            vec!["http://10.0.0.1:9000".to_string()],
+            "an unpopulated self-id cell excludes nothing"
+        );
+    }
+
     /// The config builder carries the fleet roster and the supplied thresholds
     /// through unchanged.
     #[test]
@@ -168,7 +251,7 @@ mod tests {
             min_segments: 0,
             max_parallel_slices: 4,
         };
-        let config = distributed_flight_config(live, thresholds, "cluster-secret");
+        let config = distributed_flight_config(live, no_self(), thresholds, "cluster-secret");
         assert_eq!(
             config.workers.endpoints(),
             vec!["http://10.0.0.1:9000".to_string()]
