@@ -545,7 +545,14 @@ async fn prepare_partition(
         // segment or fetching the next one. This loop is genuinely
         // sequential, so a trip here straightforwardly means the remaining
         // segments' GETs never happen.
-        let scanned = phase_accounting.snapshot().pooled().total_s3_bytes();
+        //
+        // `pooled_snapshot()`, not `snapshot().pooled()`: this handle can be
+        // `PhaseAccounting::pooled_over` a single shared `QueryAccounting`
+        // (see `executor.rs`'s `plan_pinned`/`plan_pinned_distributed`/
+        // `worker_fragment_stream`), whose four phases are clones of one
+        // counter. Summing four snapshots of that one counter would report
+        // 4x the real total.
+        let scanned = phase_accounting.pooled_snapshot().total_s3_bytes();
         if max_bytes_scanned.is_exceeded_by(scanned) {
             let max = match max_bytes_scanned {
                 ByteLimit::Bounded(max) => max,
@@ -556,10 +563,12 @@ async fn prepare_partition(
         // Per-tenant S3 request budget (ADR-0073 decision
         // 4): same checkpoint as the bytes-scanned budget above, so a trip
         // here also means the remaining segments' GETs never happen. Mirrors
-        // `ravel_query::engine`'s PromQL enforcement exactly.
+        // `ravel_query::engine`'s PromQL enforcement exactly. Same aliasing
+        // hazard as the bytes-scanned check above, so `pooled_snapshot()`
+        // here too.
         if let Some(ravel_query::QueryError::RequestBudgetExceeded { requests, max }) =
             request_budget_exceeded(
-                phase_accounting.snapshot().pooled().total_s3_requests(),
+                phase_accounting.pooled_snapshot().total_s3_requests(),
                 max_s3_requests,
             )
         {

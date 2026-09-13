@@ -243,6 +243,13 @@ pub struct PhaseAccounting {
     plan: QueryAccounting,
     probe: QueryAccounting,
     scan: QueryAccounting,
+    /// True when the four phases above are clones of one shared
+    /// `QueryAccounting` (built by [`pooled_over`](Self::pooled_over)),
+    /// rather than four independent handles. Set once at construction, so
+    /// [`pooled_snapshot`](Self::pooled_snapshot) can tell which reduction is
+    /// correct without the caller having to remember which constructor built
+    /// this handle.
+    shared: bool,
 }
 
 impl PhaseAccounting {
@@ -279,6 +286,7 @@ impl PhaseAccounting {
             plan: accounting.clone(),
             probe: accounting.clone(),
             scan: accounting.clone(),
+            shared: true,
         }
     }
 
@@ -328,6 +336,26 @@ impl PhaseAccounting {
             plan: self.plan.snapshot(),
             probe: self.probe.snapshot(),
             scan: self.scan.snapshot(),
+        }
+    }
+
+    /// The query-wide pooled total, correct regardless of which constructor
+    /// built this handle. A caller that only wants "how much has this query
+    /// cost so far" (a running budget check, for instance) should call this
+    /// instead of `snapshot().pooled()`.
+    ///
+    /// [`pooled_over`](Self::pooled_over)'s four phases are clones of one
+    /// shared `QueryAccounting`, so `snapshot().pooled()` would read that same
+    /// underlying counter four times and sum it, reporting 4x the real total;
+    /// this reads it once instead. A [`new`](Self::new) handle's four phases
+    /// are genuinely independent, so its pooled total is the real sum of the
+    /// four, exactly what `snapshot().pooled()` already computes.
+    #[must_use]
+    pub fn pooled_snapshot(&self) -> QueryAccountingSnapshot {
+        if self.shared {
+            self.resolve.snapshot()
+        } else {
+            self.snapshot().pooled()
         }
     }
 }

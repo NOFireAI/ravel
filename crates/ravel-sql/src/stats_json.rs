@@ -66,6 +66,7 @@ pub fn io_shape_json(shape: &QueryIoShape) -> Json {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use ravel_query::io_shape::PlanClass;
     use ravel_query::phase_accounting::PhaseAccounting;
 
     use super::*;
@@ -120,5 +121,39 @@ mod tests {
         assert_eq!(total_requests, 4, "one GET recorded per phase");
         assert_eq!(total_bytes, snapshot.pooled().total_s3_bytes());
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());
+    }
+
+    /// `io_shape_json`'s key set is exactly the six fields below, no more and
+    /// no fewer: a renamed or newly-added `QueryIoShape` field that isn't
+    /// wired into this renderer would otherwise ship silently, since nothing
+    /// else in this crate reads `stats.io` back. Exact set equality, not a
+    /// per-key `contains`, so a stray extra key fails this the same way a
+    /// missing one does.
+    #[test]
+    fn io_shape_json_names_every_field_exactly_once() {
+        let shape = QueryIoShape {
+            dependency_depth: 1,
+            list_page_depth: 2,
+            service_batches: 3,
+            unfolded_segments_resolved: 4,
+            unfolded_records_served_from_cache: 5,
+            plan_class: PlanClass::SelectiveIndexed,
+        };
+        let rendered = io_shape_json(&shape);
+        let object = rendered
+            .as_object()
+            .expect("io_shape_json renders an object");
+        let keys: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "dependencyDepth",
+            "listPageDepth",
+            "serviceBatches",
+            "unfoldedSegmentsResolved",
+            "unfoldedRecordsServedFromCache",
+            "planClass",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected);
     }
 }
