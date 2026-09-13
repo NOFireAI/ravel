@@ -75,10 +75,12 @@
 //! ([`crate::maintain::seed_memo_from_snapshots`],
 //! [`crate::maintain::persist_memo_snapshot`]).
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures::FutureExt;
 use ravel_commit::keys;
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_ingest::{Clock as _, SystemClock};
@@ -321,6 +323,18 @@ pub struct MaintenanceOwnershipMetrics {
     memo_warm_start_units: AtomicU64,
     full_sweep_passes_total: AtomicU64,
     units_stalled: AtomicU64,
+    /// Unix nanoseconds the supervised maintenance loop last completed a full
+    /// cycle, from the injected clock; `0` until the first cycle completes.
+    /// This is the liveness signal the discovery/safety/ownership gauges lack:
+    /// they are all written at the end of a cycle that completed, so a dead
+    /// loop freezes them at their last healthy values, while the age of this
+    /// gauge grows without bound once the loop stops cycling (issue #1683,
+    /// mirroring `ravel_catalog_fold_last_success_timestamp_seconds`).
+    last_cycle_completed_unix_ns: AtomicI64,
+    /// Panics caught in the loop body and restarted by the supervisor. Its
+    /// only record: the supervisor swallows the panic so the pod stays up, so
+    /// this counter is how an operator learns the loop is crash-looping.
+    loop_panics_total: AtomicU64,
     stalls: UnitStallTracker,
     /// This cycle's owned-unit accumulator, paired with `set_units_owned(0)`:
     /// cleared in `begin_cycle`, filled by `note_owned_unit` as `run_tick`
@@ -338,6 +352,8 @@ impl MaintenanceOwnershipMetrics {
             memo_warm_start_units: AtomicU64::new(0),
             full_sweep_passes_total: AtomicU64::new(0),
             units_stalled: AtomicU64::new(0),
+            last_cycle_completed_unix_ns: AtomicI64::new(0),
+            loop_panics_total: AtomicU64::new(0),
             stalls: UnitStallTracker::new(stalled_after_intervals),
             owned_this_cycle: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
@@ -389,6 +405,19 @@ impl MaintenanceOwnershipMetrics {
         self.full_sweep_passes_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Stamps `now_ns` (from the injected clock) as the completion time of the
+    /// cycle that just finished. Called once at the end of every completed
+    /// cycle in [`run_loop`], never on a cycle the supervisor caught panicking.
+    fn set_last_cycle_completed(&self, now_ns: i64) {
+        self.last_cycle_completed_unix_ns
+            .store(now_ns, Ordering::Relaxed);
+    }
+
+    /// Records one panic the supervisor caught and restarted the loop after.
+    fn inc_loop_panics(&self) {
+        self.loop_panics_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records one tick outcome for the given owned unit, updating the
     /// stalled-unit count if this tick crossed (or cleared) the threshold.
     fn observe_unit_tick(&self, tenant: TenantHash, signal: Signal, shard: u32, ok: bool) {
@@ -414,6 +443,14 @@ impl MaintenanceOwnershipMetrics {
 
     pub fn units_stalled(&self) -> u64 {
         self.units_stalled.load(Ordering::Relaxed)
+    }
+
+    pub fn last_cycle_completed_unix_ns(&self) -> i64 {
+        self.last_cycle_completed_unix_ns.load(Ordering::Relaxed)
+    }
+
+    pub fn loop_panics_total(&self) -> u64 {
+        self.loop_panics_total.load(Ordering::Relaxed)
     }
 }
 
@@ -546,33 +583,45 @@ pub fn spawn(
     };
 
     let (tx, rx) = oneshot::channel();
-    let interval = config.interval;
-    let shard_count = config.shard_count;
-    let handle = tokio::spawn(async move {
-        run_loop(
-            store,
-            fallback_allow,
-            compactor,
-            retention,
-            shard_count,
-            interval,
-            metrics,
-            safety,
-            ownership,
-            worker,
-            rng,
-            rx,
-        )
-        .await;
-    });
+    let ctx = LoopContext {
+        store,
+        fallback_allow,
+        compactor,
+        retention,
+        shard_count: config.shard_count,
+        interval: config.interval,
+        metrics,
+        safety,
+        ownership,
+        worker,
+        rng,
+        // The one blessed wall clock in this process; tests inject a
+        // `FixedClock` here instead.
+        clock: Arc::new(WallClock),
+        // Production has no test seam, so the per-cycle hook is a no-op. Tests
+        // pass a closure that panics to exercise the supervisor's restart path.
+        cycle_hook: Arc::new(|| {}),
+    };
+    let handle = tokio::spawn(run_supervisor(
+        ctx,
+        rx,
+        RESTART_BACKOFF_INITIAL,
+        RESTART_BACKOFF_MAX,
+    ));
     Ok(MaintenanceTasks {
         shutdown: vec![tx],
         handles: vec![handle],
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_loop(
+/// Everything one maintenance-loop attempt needs, bundled so the supervisor can
+/// clone it and re-spawn a fresh attempt after a panic. Every field is cheap to
+/// clone (an `Arc`, a `Copy`, or a small owned value): a restart rebuilds the
+/// attempt task from the same context, and each attempt's [`run_loop`] builds
+/// its own fresh memo and heartbeat, so a torn in-memory state from a panicked
+/// cycle is discarded rather than carried into the restart.
+#[derive(Clone)]
+struct LoopContext {
     store: Arc<dyn ObjectStoreBackend>,
     fallback_allow: Option<Vec<TenantHash>>,
     compactor: Arc<CompactorConfig>,
@@ -584,8 +633,129 @@ async fn run_loop(
     ownership: Arc<MaintenanceOwnershipMetrics>,
     worker: Arc<WorkerSet>,
     rng: Arc<dyn RngSource>,
+    clock: Arc<dyn Clock>,
+    /// Called once at the top of every cycle body, inside the `catch_unwind`
+    /// boundary. A no-op in production; a test seam for driving a panic through
+    /// the supervisor.
+    cycle_hook: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Backoff before the first restart after a panic. Doubles up to
+/// [`RESTART_BACKOFF_MAX`] across consecutive panics, and resets once an
+/// attempt completes at least one cycle before dying, so a genuinely healthy
+/// loop that hits a single transient panic restarts promptly while a
+/// crash-looping one is bounded rather than spinning.
+const RESTART_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+
+/// Ceiling for the panic-restart backoff.
+const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Why one supervised [`run_loop`] attempt returned.
+enum LoopExit {
+    /// The shutdown channel fired: the supervisor must stop, not restart.
+    Shutdown,
+    /// A cycle body panicked and was caught. The supervisor restarts the loop.
+    Panicked,
+}
+
+/// The outcome of one [`run_loop`] attempt: why it ended, and how many cycles
+/// it completed first (so the supervisor can reset its backoff after a healthy
+/// run).
+struct LoopOutcome {
+    exit: LoopExit,
+    completed_cycles: u64,
+}
+
+/// Owns the loop's `JoinHandle` and restarts a fresh attempt after a caught
+/// panic, so a panic anywhere in the discovery or sweep call graph no longer
+/// leaves a Running/Ready pod with a dead maintenance loop (issue #1683).
+///
+/// Each attempt is a spawned [`run_loop`] whose cycle body is guarded by
+/// `catch_unwind`: a panic is caught inside the attempt, counted on
+/// [`MaintenanceOwnershipMetrics::inc_loop_panics`], and returned as
+/// [`LoopExit::Panicked`] so the attempt still runs its own heartbeat cleanup
+/// before ending (no leaked heartbeat task across restarts). The supervisor
+/// then backs off (bounded, [`RESTART_BACKOFF_INITIAL`]..=[`RESTART_BACKOFF_MAX`])
+/// and spawns the next attempt. Shutdown is still the existing oneshot: on it
+/// the supervisor signals the current attempt and joins it cleanly.
+async fn run_supervisor(
+    ctx: LoopContext,
     mut shutdown: oneshot::Receiver<()>,
+    initial_backoff: Duration,
+    max_backoff: Duration,
 ) {
+    let mut backoff = initial_backoff;
+    loop {
+        let (attempt_tx, attempt_rx) = oneshot::channel();
+        let mut attempt = tokio::spawn(run_loop(ctx.clone(), attempt_rx));
+
+        tokio::select! {
+            // Server shutdown: stop the current attempt and join it so its
+            // heartbeat task is not left running, then return without restart.
+            _ = &mut shutdown => {
+                let _ = attempt_tx.send(());
+                let _ = attempt.await;
+                return;
+            }
+            joined = &mut attempt => {
+                match joined {
+                    Ok(LoopOutcome { exit: LoopExit::Shutdown, .. }) => return,
+                    Ok(LoopOutcome { exit: LoopExit::Panicked, completed_cycles }) => {
+                        // The panic counter was already bumped inside the
+                        // attempt. Reset the backoff if the attempt was
+                        // otherwise healthy (it completed at least one cycle).
+                        if completed_cycles > 0 {
+                            backoff = initial_backoff;
+                        }
+                        tracing::error!(
+                            completed_cycles,
+                            backoff_ms = backoff.as_millis(),
+                            "maintenance: loop task panicked; restarting after backoff \
+                             (see ravel_maintain_loop_panics_total)"
+                        );
+                    }
+                    Err(join_err) => {
+                        // A panic escaped the cycle-body guard (or the task was
+                        // aborted). Count it too so the panic total never
+                        // undercounts, then restart.
+                        ctx.ownership.inc_loop_panics();
+                        tracing::error!(
+                            error = %join_err,
+                            backoff_ms = backoff.as_millis(),
+                            "maintenance: loop task died outside the cycle guard; restarting \
+                             after backoff (see ravel_maintain_loop_panics_total)"
+                        );
+                    }
+                }
+
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
+/// One supervised attempt of the maintenance loop. Runs discovery cycles until
+/// either the shutdown channel fires (returns [`LoopExit::Shutdown`]) or a
+/// cycle body panics and is caught (returns [`LoopExit::Panicked`], after
+/// counting the panic and cleaning up the heartbeat task). The supervisor
+/// ([`run_supervisor`]) owns this task's handle and restarts it on a panic.
+async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> LoopOutcome {
+    let LoopContext {
+        store,
+        fallback_allow,
+        compactor,
+        retention,
+        shard_count,
+        interval,
+        metrics,
+        safety,
+        ownership,
+        worker,
+        rng,
+        clock,
+        cycle_hook,
+    } = ctx;
     // One memo for the whole process, held across every tick and every
     // discovered tenant until shutdown. Its key includes
     // the tenant and signal, so this single instance safely spans every
@@ -618,7 +788,10 @@ async fn run_loop(
     let mut reseed = true;
     let mut last_memo_body: Option<Vec<u8>> = None;
 
-    let clock = WallClock;
+    // `clock` is the injected [`Clock`] from the context (the real [`WallClock`]
+    // in the running service, a `FixedClock` in tests). Every cycle-completion
+    // stamp, memo timestamp, and reseed "now" below reads it, so the liveness
+    // gauge advances by the same clock a test drives.
 
     // Worker membership (ADR-0065 decision 1) runs on its own heartbeat cadence
     // `H`, independent of the (coarser) discovery interval, and in its OWN
@@ -701,102 +874,143 @@ async fn run_loop(
     // only when it actually fires.
     let discovery_sleep = tokio::time::sleep(jittered(interval, rng.as_ref()));
     tokio::pin!(discovery_sleep);
-    loop {
+    let mut completed_cycles: u64 = 0;
+    let exit = loop {
         tokio::select! {
             () = &mut discovery_sleep => {
-                // Latest live set from the heartbeat task (fail-open: the
-                // receiver holds the last-known set across a read failure). A
-                // membership change since the previous cycle may have moved a
-                // unit's ownership onto this process; request a warm start so its
-                // terminal facts are seeded from the departing worker's snapshot
-                // rather than rescanned cold (ADR-0065 decision 3). `borrow`
-                // returns a guard, so clone out of it immediately and never hold
-                // it across an await.
-                let live_set = live_rx.borrow().clone();
-                if membership_changed(&prev_live_set, &live_set) {
-                    reseed = true;
-                }
-                prev_live_set = live_set.clone();
+                // The whole cycle body runs inside `catch_unwind` so a panic
+                // anywhere in the discovery or sweep call graph is caught here,
+                // counted, and turned into a supervised restart rather than a
+                // silently dead loop on a Running/Ready pod (issue #1683).
+                // `AssertUnwindSafe` is honest: on a caught panic this attempt
+                // is discarded entirely -- the supervisor spawns a fresh
+                // `run_loop` with a fresh memo -- so a torn `memo`/`reseed`
+                // state is never observed by the next cycle.
+                let cycle = AssertUnwindSafe(async {
+                    // Test seam (a no-op in production): drives a panic through
+                    // the guard to exercise the supervisor's restart path.
+                    (*cycle_hook)();
 
-                // Warm start / handoff seeding (ADR-0065 decision 3): before a
-                // cycle runs cold, seed the memo from durable snapshots for the
-                // units this process now owns. Fail-open: a read fault logs and
-                // degrades to a cold start, never blocks the loop.
-                if reseed {
-                    match read_all_memo_snapshots(store.as_ref()).await {
-                        Ok(snapshots) => {
-                            let now = clock.now_ns();
-                            let (units, buckets) = seed_memo_from_snapshots(
-                                &mut memo, &snapshots, now, &worker, &live_set,
-                            );
-                            ownership.add_memo_warm_start_units(units as u64);
-                            if buckets > 0 {
-                                tracing::info!(
-                                    seeded_units = units,
-                                    seeded_buckets = buckets,
-                                    "maintenance: warm-started memo from durable snapshots"
+                    // Latest live set from the heartbeat task (fail-open: the
+                    // receiver holds the last-known set across a read failure). A
+                    // membership change since the previous cycle may have moved a
+                    // unit's ownership onto this process; request a warm start so its
+                    // terminal facts are seeded from the departing worker's snapshot
+                    // rather than rescanned cold (ADR-0065 decision 3). `borrow`
+                    // returns a guard, so clone out of it immediately and never hold
+                    // it across an await.
+                    let live_set = live_rx.borrow().clone();
+                    if membership_changed(&prev_live_set, &live_set) {
+                        reseed = true;
+                    }
+                    prev_live_set = live_set.clone();
+
+                    // Warm start / handoff seeding (ADR-0065 decision 3): before a
+                    // cycle runs cold, seed the memo from durable snapshots for the
+                    // units this process now owns. Fail-open: a read fault logs and
+                    // degrades to a cold start, never blocks the loop.
+                    if reseed {
+                        match read_all_memo_snapshots(store.as_ref()).await {
+                            Ok(snapshots) => {
+                                let now = clock.now_ns();
+                                let (units, buckets) = seed_memo_from_snapshots(
+                                    &mut memo, &snapshots, now, &worker, &live_set,
                                 );
+                                ownership.add_memo_warm_start_units(units as u64);
+                                if buckets > 0 {
+                                    tracing::info!(
+                                        seeded_units = units,
+                                        seeded_buckets = buckets,
+                                        "maintenance: warm-started memo from durable snapshots"
+                                    );
+                                }
+                                // Clear the pending reseed only on a successful read.
+                                // A single transient LIST/GET fault must leave reseed
+                                // set so the next cycle retries: in a single-replica
+                                // deployment the live set never changes (it is always
+                                // solo_live_set()), so `membership_changed` is
+                                // structurally never true and this first-cycle reseed
+                                // is the only warm-start trigger the worker ever gets.
+                                // Clearing it on the Err arm would leave that worker
+                                // cold for its whole process life.
+                                reseed = false;
                             }
-                            // Clear the pending reseed only on a successful read.
-                            // A single transient LIST/GET fault must leave reseed
-                            // set so the next cycle retries: in a single-replica
-                            // deployment the live set never changes (it is always
-                            // solo_live_set()), so `membership_changed` is
-                            // structurally never true and this first-cycle reseed
-                            // is the only warm-start trigger the worker ever gets.
-                            // Clearing it on the Err arm would leave that worker
-                            // cold for its whole process life.
-                            reseed = false;
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                "maintenance: memo snapshot read failed; cold start for all units \
+                                 this cycle, reseed retried next cycle (fail-open, ADR-0065 decision 3)"
+                            ),
                         }
-                        Err(err) => tracing::warn!(
-                            error = %err,
-                            "maintenance: memo snapshot read failed; cold start for all units \
-                             this cycle, reseed retried next cycle (fail-open, ADR-0065 decision 3)"
-                        ),
+                    }
+
+                    run_discovery_cycle(
+                        store.as_ref(),
+                        fallback_allow.as_deref(),
+                        &compactor,
+                        &retention,
+                        shard_count,
+                        &mut memo,
+                        metrics.as_ref(),
+                        safety.as_ref(),
+                        ownership.as_ref(),
+                        &worker,
+                        &live_set,
+                    )
+                    .await;
+
+                    // Persist the updated memo, debounced (ADR-0065 decision 3): a
+                    // tick whose terminal set and verify times are unchanged writes
+                    // nothing. Fail-open: a write fault logs and retries next cycle.
+                    persist_memo_snapshot(
+                        store.as_ref(),
+                        &worker,
+                        &memo,
+                        &mut last_memo_body,
+                        clock.now_ns(),
+                    )
+                    .await;
+                });
+
+                match cycle.catch_unwind().await {
+                    Ok(()) => {
+                        // The liveness stamp is written only on a cycle that
+                        // actually completed, from the same injected clock the
+                        // rest of the loop reads (issue #1683, mirroring
+                        // `ravel_catalog_fold_last_success_timestamp_seconds`).
+                        ownership.set_last_cycle_completed(clock.now_ns());
+                        completed_cycles = completed_cycles.saturating_add(1);
+                        discovery_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + jittered(interval, rng.as_ref()));
+                    }
+                    Err(_panic) => {
+                        // Count the panic and end this attempt; the supervisor
+                        // restarts a fresh loop after a bounded backoff. The
+                        // liveness gauge is deliberately not stamped, so its age
+                        // grows while the loop is down.
+                        ownership.inc_loop_panics();
+                        break LoopExit::Panicked;
                     }
                 }
-
-                run_discovery_cycle(
-                    store.as_ref(),
-                    fallback_allow.as_deref(),
-                    &compactor,
-                    &retention,
-                    shard_count,
-                    &mut memo,
-                    metrics.as_ref(),
-                    safety.as_ref(),
-                    ownership.as_ref(),
-                    &worker,
-                    &live_set,
-                )
-                .await;
-
-                // Persist the updated memo, debounced (ADR-0065 decision 3): a
-                // tick whose terminal set and verify times are unchanged writes
-                // nothing. Fail-open: a write fault logs and retries next cycle.
-                persist_memo_snapshot(
-                    store.as_ref(),
-                    &worker,
-                    &memo,
-                    &mut last_memo_body,
-                    clock.now_ns(),
-                )
-                .await;
-
-                discovery_sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + jittered(interval, rng.as_ref()));
             }
-            _ = &mut shutdown => break,
+            _ = &mut shutdown => break LoopExit::Shutdown,
         }
-    }
+    };
 
     // Stop the heartbeat task so no spawned task outlives this loop: signal it
     // and await its handle. On return the heartbeat task is
     // guaranteed finished rather than detached, matching
-    // `MaintenanceTasks::shutdown`'s join of the supervisor task itself.
+    // `MaintenanceTasks::shutdown`'s join of the supervisor task itself. This
+    // runs on the panic path too (the cycle body's `catch_unwind` returns here
+    // rather than unwinding past it), so a caught panic never leaks a heartbeat
+    // task into the restarted attempt.
     let _ = heartbeat_shutdown_tx.send(());
     let _ = heartbeat_handle.await;
+
+    LoopOutcome {
+        exit,
+        completed_cycles,
+    }
 }
 
 /// One discovery cycle: re-enumerate tenants from storage, narrow by lifecycle
@@ -4488,17 +4702,21 @@ mod tests {
 
         let discovery_interval = Duration::from_secs(300);
         let handle = tokio::spawn(run_loop(
-            store,
-            None,
-            compactor,
-            retention,
-            1,
-            discovery_interval,
-            metrics.clone(),
-            safety,
-            ownership,
-            worker,
-            Arc::new(SystemRng),
+            LoopContext {
+                store,
+                fallback_allow: None,
+                compactor,
+                retention,
+                shard_count: 1,
+                interval: discovery_interval,
+                metrics: metrics.clone(),
+                safety,
+                ownership,
+                worker,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(WallClock),
+                cycle_hook: Arc::new(|| {}),
+            },
             shutdown_rx,
         ));
 
@@ -5582,17 +5800,21 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let handle = tokio::spawn(run_loop(
-            store,
-            None,
-            compactor,
-            retention,
-            1,
-            Duration::from_secs(1),
-            metrics,
-            safety,
-            ownership,
-            worker,
-            Arc::new(SystemRng),
+            LoopContext {
+                store,
+                fallback_allow: None,
+                compactor,
+                retention,
+                shard_count: 1,
+                interval: Duration::from_secs(1),
+                metrics,
+                safety,
+                ownership,
+                worker,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(WallClock),
+                cycle_hook: Arc::new(|| {}),
+            },
             shutdown_rx,
         ));
 
@@ -5664,19 +5886,23 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let handle = tokio::spawn(run_loop(
-            store,
-            None,
-            compactor,
-            retention,
-            1,
-            // Discovery interval far past the test window: only the heartbeat
-            // task runs, so this test isolates its lifecycle.
-            Duration::from_secs(300),
-            metrics,
-            safety,
-            ownership,
-            worker,
-            Arc::new(SystemRng),
+            LoopContext {
+                store,
+                fallback_allow: None,
+                compactor,
+                retention,
+                shard_count: 1,
+                // Discovery interval far past the test window: only the
+                // heartbeat task runs, so this test isolates its lifecycle.
+                interval: Duration::from_secs(300),
+                metrics,
+                safety,
+                ownership,
+                worker,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(WallClock),
+                cycle_hook: Arc::new(|| {}),
+            },
             shutdown_rx,
         ));
 
@@ -5707,6 +5933,232 @@ mod tests {
             writes_at_stop,
             "the heartbeat task must stop when the loop ends -- no writes after shutdown, no leak"
         );
+    }
+
+    /// A `LoopContext` for the liveness/supervisor tests: one discovered tenant
+    /// behind a fault-free `FaultStore`, a solo worker, a 1s discovery interval,
+    /// and the injected `FixedClock`/`cycle_hook` the test drives. Returns the
+    /// context plus the shared `ownership` and `metrics` handles the test reads
+    /// its assertions off.
+    async fn liveness_loop_context(
+        clock: ravel_maintain::FixedClock,
+        cycle_hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> (
+        LoopContext,
+        Arc<MaintenanceOwnershipMetrics>,
+        Arc<TenantDiscoveryMetrics>,
+    ) {
+        let inner = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        publish_terminal_bucket(&inner, &tenant_id).await;
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(FaultStore::new(inner, FaultPlan::empty()));
+
+        let metrics = Arc::new(TenantDiscoveryMetrics::default());
+        let ownership = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let ctx = LoopContext {
+            store,
+            fallback_allow: None,
+            compactor: Arc::new(CompactorConfig::default()),
+            retention: Arc::new(RetentionConfig::default()),
+            shard_count: 1,
+            interval: Duration::from_secs(1),
+            metrics: Arc::clone(&metrics),
+            safety: Arc::new(MaintenanceSafetyMetrics::default()),
+            ownership: Arc::clone(&ownership),
+            worker: Arc::new(solo_worker()),
+            rng: Arc::new(SystemRng),
+            clock: Arc::new(clock),
+            cycle_hook,
+        };
+        (ctx, ownership, metrics)
+    }
+
+    /// Advances the paused clock in small steps until `pred` holds or the step
+    /// budget runs out, returning whether it held. Small steps so the paused
+    /// runtime actually wakes the spawned loop between each.
+    async fn advance_until(steps: usize, step: Duration, pred: impl Fn() -> bool) -> bool {
+        for _ in 0..steps {
+            if pred() {
+                return true;
+            }
+            tokio::time::advance(step).await;
+            tokio::task::yield_now().await;
+        }
+        pred()
+    }
+
+    /// Deliverable 1+2: a completed cycle stamps
+    /// `ravel_maintain_last_cycle_completed_timestamp_seconds` from the injected
+    /// clock, to that clock's exact value (issue #1683). Asserts the exact
+    /// number, not merely that it moved off zero: a stamp taken from the wrong
+    /// clock, or scaled wrong, fails here.
+    ///
+    /// Flip to watch it fail against pre-fix code: delete the
+    /// `ownership.set_last_cycle_completed(clock.now_ns())` call in `run_loop`'s
+    /// `Ok(())` arm. The gauge then never leaves zero and the `NOW_NS` assertion
+    /// fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_cycle_stamps_the_liveness_gauge_from_the_injected_clock() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+        let (ctx, ownership, metrics) = liveness_loop_context(clock, Arc::new(|| {})).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_loop(ctx, shutdown_rx));
+
+        let completed = advance_until(200, Duration::from_millis(100), || {
+            ownership.last_cycle_completed_unix_ns() != 0
+        })
+        .await;
+        assert!(completed, "a discovery cycle must have completed");
+
+        assert_eq!(
+            ownership.last_cycle_completed_unix_ns(),
+            NOW_NS,
+            "the liveness gauge must hold the injected clock's exact value"
+        );
+        assert_eq!(
+            metrics.tenants_maintained(),
+            1,
+            "the storage-discovered tenant was maintained this cycle"
+        );
+        assert_eq!(
+            ownership.loop_panics_total(),
+            0,
+            "a healthy cycle records no panic"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let _ = handle.await;
+    }
+
+    /// The contrast that is the whole point of the ticket (issue #1683): once
+    /// the loop stops, the liveness gauge does NOT advance even as the clock
+    /// moves past two intervals, while `ravel_maintain_tenants_maintained` still
+    /// reads its old value. A gauge that merely passed the wall clock through
+    /// would keep moving and read as healthy on a dead loop; both figures
+    /// freezing at their last healthy value is exactly the failure this gauge
+    /// exists to make visible through its age.
+    ///
+    /// Flip to watch it fail against pre-fix code: move the
+    /// `ownership.set_last_cycle_completed(...)` stamp out of the completed-cycle
+    /// guard and into the top of the `run_loop` iteration (or drive it off
+    /// `WallClock`). It would then advance without a completed cycle and the
+    /// "did not advance" assertion below fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_loop_freezes_the_gauge_and_the_maintained_count() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+        const INTERVAL_NS: i64 = 1_000_000_000;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+        // Keep a handle to drive the clock forward after the loop stops.
+        let clock_handle = clock.clone();
+        let (ctx, ownership, metrics) = liveness_loop_context(clock, Arc::new(|| {})).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_loop(ctx, shutdown_rx));
+
+        let completed = advance_until(200, Duration::from_millis(100), || {
+            ownership.last_cycle_completed_unix_ns() != 0
+        })
+        .await;
+        assert!(
+            completed,
+            "one cycle must complete before the loop is stopped"
+        );
+        let stamped = ownership.last_cycle_completed_unix_ns();
+        let maintained = metrics.tenants_maintained();
+        assert_eq!(stamped, NOW_NS);
+        assert_eq!(maintained, 1);
+
+        // End the loop, then advance the injected clock past two intervals.
+        shutdown_tx.send(()).expect("send shutdown");
+        handle.await.expect("run_loop joins cleanly on shutdown");
+        clock_handle.set(NOW_NS + 3 * INTERVAL_NS);
+        // Advance simulated time past two intervals too, proving no cycle sneaks
+        // in after shutdown.
+        let _ = advance_until(30, Duration::from_millis(100), || false).await;
+
+        assert_eq!(
+            ownership.last_cycle_completed_unix_ns(),
+            stamped,
+            "the liveness gauge must not advance once the loop stopped, even as the clock moves \
+             past two intervals -- its frozen age is the dead-loop signal"
+        );
+        assert_eq!(
+            metrics.tenants_maintained(),
+            maintained,
+            "ravel_maintain_tenants_maintained also freezes at its last healthy value, which is \
+             exactly why it cannot itself distinguish a dead loop from a healthy one"
+        );
+    }
+
+    /// Deliverables 3+4: a panic in the loop body is caught, counted exactly
+    /// once on `ravel_maintain_loop_panics_total`, and the supervisor restarts
+    /// the loop so a later cycle stamps the liveness gauge again (issue #1683).
+    ///
+    /// Flip to watch it fail against pre-fix code: in `run_loop`'s cycle arm,
+    /// drop the `catch_unwind` and `await` the cycle body directly. The injected
+    /// panic then aborts the whole task; `run_supervisor`'s `Err(join_err)` arm
+    /// still restarts it, but `inc_loop_panics` runs there too, so to see the
+    /// count assertion fail also remove that arm's `inc_loop_panics()` -- the
+    /// counter then reads 0. To see the restart itself matter, replace
+    /// `run_supervisor` with a bare `tokio::spawn(run_loop(...))`: the gauge
+    /// never leaves zero after the panic and the `NOW_NS` assertion fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_caught_panic_is_counted_and_the_supervisor_restarts_the_loop() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+
+        // Panic on the first cycle only; every later cycle runs normally. The
+        // supervisor clones the context (and this shared flag) into each attempt,
+        // so the second attempt sees the flag already consumed.
+        let panic_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook_flag = Arc::clone(&panic_armed);
+        let cycle_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if hook_flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                panic!("injected maintenance loop panic (test)");
+            }
+        });
+
+        let (ctx, ownership, _metrics) = liveness_loop_context(clock, cycle_hook).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        // Small, fixed backoff so the paused-time advance drives the restart.
+        let handle = tokio::spawn(run_supervisor(
+            ctx,
+            shutdown_rx,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+
+        let recovered = advance_until(400, Duration::from_millis(50), || {
+            ownership.last_cycle_completed_unix_ns() != 0
+        })
+        .await;
+        assert!(
+            recovered,
+            "the supervisor must restart the loop and complete a later cycle after the panic"
+        );
+        assert_eq!(
+            ownership.loop_panics_total(),
+            1,
+            "exactly one panic was caught and counted, not zero (uncounted) or a restart loop"
+        );
+        assert_eq!(
+            ownership.last_cycle_completed_unix_ns(),
+            NOW_NS,
+            "the restarted loop stamps the liveness gauge from the injected clock"
+        );
+        assert!(
+            !panic_armed.load(std::sync::atomic::Ordering::SeqCst),
+            "the one-shot panic must have fired"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let _ = handle.await;
     }
 
     /// The fail-closed re-assert (closing the write-fence gap): a stored

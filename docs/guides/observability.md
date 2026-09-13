@@ -557,6 +557,101 @@ dimension.
 | `ravel_maintain_memo_warm_start_units_total` | Units seeded from a durable memo snapshot on handoff or startup, instead of rescanning cold. |
 | `ravel_maintain_full_sweep_passes_total` | Full (unscoped) sweep passes run, as opposed to a zone-scoped sweep. |
 
+### Maintenance loop liveness (`ravel_maintain_last_cycle_completed_timestamp_seconds`, `ravel_maintain_loop_panics_total`)
+
+Labels: `mode`. Both series are process-wide, with no `tenant_hash` dimension.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_maintain_last_cycle_completed_timestamp_seconds` | Gauge. Unix time the maintenance loop last completed a cycle in this process, `0` if none has completed since it started. Its age is the maintain-liveness signal. |
+| `ravel_maintain_loop_panics_total` | Panics caught in the loop body and restarted by the supervisor. An `increase()` here is the loop crash-looping. |
+
+This is the maintenance analogue of the [catalog fold liveness
+gauge](#catalog-fold-liveness-ravel_catalog_fold_) above, and it exists for the
+same reason. Every other maintenance figure -- `ravel_maintain_tenants_maintained`,
+`ravel_maintain_units_stalled`, the safety gauges -- is written at the end of a
+cycle that completed, so if the single spawned supervisor task dies (a panic
+anywhere in the discovery or sweep call graph), they all freeze at their last
+healthy values: `tenants_maintained` still equals `tenants_discovered`,
+`units_stalled` still reads `0`, and the pod stays Running and Ready. Retention
+deletes nothing, compaction stops, and the sweeper reclaims nothing, but nothing
+on `/metrics` moves to say so until a recent-window query is refused days later.
+
+The gauge is the family's point: only its age moves when the loop stops. The
+loop now runs under a supervisor that catches a panicking cycle, counts it on
+`ravel_maintain_loop_panics_total`, and restarts the loop after a bounded
+backoff, so a single transient panic self-heals and the next completed cycle
+re-stamps the gauge. A rising panic counter with a stalling gauge is a loop
+that cannot make progress between crashes.
+
+#### The maintenance-stalled alert
+
+```yaml
+groups:
+  - name: ravel-maintain-liveness
+    # These rules assume at least one maintain-mode process is scraped. A
+    # deployment that runs no maintain mode at all (retention, compaction, and
+    # GC disabled by design) has no maintenance loop to be alive, and must drop
+    # or inhibit this group; the family is absent there and the absent() branch
+    # would otherwise fire permanently.
+    rules:
+      - alert: RavelMaintenanceLoopStalled
+        # No max()/min() aggregation: unlike the fold, the maintenance loop is
+        # NOT covered by peers. Ownership of units is partitioned across
+        # replicas (ADR-0065), so a single dead loop strands its own units
+        # while healthy peers keep their gauges fresh. The rule must fire on
+        # ANY instance going stale, so it is left per-series. The operator
+        # default is one maintain replica anyway.
+        expr: |
+          (
+            time() - ravel_maintain_last_cycle_completed_timestamp_seconds > 1800
+          )
+          or
+          absent(ravel_maintain_last_cycle_completed_timestamp_seconds)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel maintenance loop has not completed a cycle for longer than
+            several maintain intervals
+          description: >-
+            Retention, compaction, and GC have stopped for the units this
+            process owns, and the pod still reads Running and Ready. Check
+            ravel_maintain_loop_panics_total for a crash-looping loop and the
+            maintain process logs for the panic. The threshold is set well
+            above the default 5m maintain interval so a slow cycle does not
+            page; a stall this long is the loop being down, not busy.
+      - alert: RavelMaintenanceNoFullSweeps
+        # A healthy loop runs an unscoped full sweep on each owned unit's
+        # interior re-verify cadence (default 1h) and on the cold first tick,
+        # so this counter advances at least hourly on a live deployment. A
+        # window of several hours with zero increase corroborates the stall
+        # gauge for the class of hang where the loop is alive enough to scrape
+        # but is no longer sweeping.
+        expr: |
+          increase(ravel_maintain_full_sweep_passes_total[3h]) == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            No Ravel maintenance full sweep has run in the last several hours
+          description: >-
+            The GC sweeper reclaims nothing while this holds. It precedes the
+            operator-visible symptom (a refused recent-window query) and
+            corroborates RavelMaintenanceLoopStalled.
+```
+
+The staleness threshold is `1800s` (30 minutes, six default 5m maintain
+intervals) rather than the fold rule's `4800s`: the fold's is sized to the
+unsealed-span budget it protects, whereas here any lapse of a few cycles means
+retention and GC have stopped, so the bar is lower. The `or absent(...)` branch
+covers the same total-outage case the fold rule's does -- a maintain mode
+scaled to zero, crash-looping fast enough to go stale, or dropped from the
+scrape config -- which the staleness comparison alone cannot see because
+`time() - <empty>` is itself empty.
+
 ### Merge memory (`ravel_maintain_rlog_merge_peak_bytes`)
 
 Labels: `mode` and `kind`. No `tenant_hash`: the tracker is one process-wide
