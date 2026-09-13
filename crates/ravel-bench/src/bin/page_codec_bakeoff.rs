@@ -78,6 +78,14 @@
 //! on what a full reuse implementation (retained output buffer too) would
 //! buy, not the whole answer.
 //!
+//! This same confound sits in the zstd-vs-lz4 rows: `zstd-1`/`zstd-3`/
+//! `zstd-6` each pay a fresh `CCtx`/`DCtx` construction per call
+//! (`zstd::bulk::compress`/`decompress`), while `lz4` (`lz4_flex`'s free
+//! functions) pays none. Comparing `lz4` against `zstd-3` therefore measures
+//! codec-plus-context-cost against codec-alone; `zstd-3-reused` is the row
+//! with the context cost removed, so compare `lz4` against `zstd-3-reused`
+//! for a like-for-like codec throughput reading.
+//!
 //! The two low-cardinality datasets spend most of their swept points under
 //! [`ravel_logseg::page::COMPRESSION_FLOOR`] (`low_cardinality_level` is 40
 //! bytes at 64 rows, 280 at 1024; `low_cardinality_service` is 93 and 453),
@@ -327,8 +335,8 @@ fn rseg_whole_section_pages() -> Vec<(String, Vec<u8>)> {
         FooterOutcome::Ready(loc) => loc.footer,
         FooterOutcome::NeedRange { .. } => panic!("whole bench object must cover its own footer"),
     };
-    // `Compression` is not re-exported by ravel_segment; ADR-0004 freezes its
-    // wire value at 2 for zstd, mirrored here exactly as
+    // `Compression` is not re-exported by ravel_segment; docs/segment-format.md
+    // freezes its wire value at 2 for zstd, mirrored here exactly as
     // `ravel_bench::segment_support` mirrors the section_kind numbers.
     const SECTION_COMP_ZSTD: i32 = 2;
     [
@@ -497,6 +505,12 @@ struct CellReport {
     size_label: String,
     arm: String,
     input_bytes: usize,
+    /// The codec's own output length, before the floor-and-shrink store
+    /// policy is applied. Populated on every cell, including one where
+    /// `stored_bytes`/`ratio` fall back to the raw form: this is the field
+    /// that answers "did the codec itself shrink or grow this page", which
+    /// `ratio` alone cannot on a cell the store policy rejected.
+    compressed_bytes: usize,
     stored_bytes: usize,
     ratio: f64,
     stored_compressed: bool,
@@ -513,19 +527,21 @@ struct CellReport {
 
 /// (median, min, max) seconds-per-call, as returned by [`timed`].
 type TimingStats = (f64, f64, f64);
-/// One arm's outcome for a cell: stored bytes, whether the store policy kept
-/// the compressed form, encode timing, decode timing, and the decoded bytes
-/// (the last decode call's output, reused as the round-trip check input so
-/// the same operation is both timed and verified).
-type ArmOutcome = (Vec<u8>, bool, TimingStats, TimingStats, Vec<u8>);
+/// One arm's outcome for a cell: stored bytes, the codec's own output length
+/// before the store policy is applied, whether the store policy kept the
+/// compressed form, encode timing, decode timing, and the decoded bytes (the
+/// last decode call's output, reused as the round-trip check input so the
+/// same operation is both timed and verified).
+type ArmOutcome = (Vec<u8>, usize, bool, TimingStats, TimingStats, Vec<u8>);
 
 /// Measures one (dataset, size, arm) cell. `decode_mb_s` always times a real
 /// decode of the arm's compressed output, independent of whether the store
 /// policy (`stored_compressed`) would have kept the compressed form or
 /// fallen back to raw: a `dec_MB/s` cell must always mean "decompress",
-/// never sometimes mean "memcpy" depending on the row (see the SHOULD_FIX in
-/// PR #1548 review). `stored_compressed` reports the store-policy decision
-/// on its own.
+/// never sometimes mean "memcpy" depending on the row -- except for the
+/// `Raw` arm itself, which has no codec and whose decode is the passthrough
+/// baseline (a memcpy by construction). `stored_compressed` reports the
+/// store-policy decision on its own.
 ///
 /// Pushes a human-readable string into `failures` for every integrity
 /// violation found (round-trip mismatch, production-baseline policy
@@ -544,117 +560,123 @@ fn measure_cell(
     let reps = inner_reps_for(n);
     let cell_id = format!("{dataset}/{size_label}/{}", arm.name());
 
-    let (stored, stored_compressed, enc_stats, dec_stats, decoded): ArmOutcome = match arm {
-        Arm::Raw => {
-            let (_, em, emin, emax) = timed(|| encoded.to_vec(), reps);
-            let (decoded, dm, dmin, dmax) = timed(|| encoded.to_vec(), reps);
-            (
-                encoded.to_vec(),
-                false,
-                (em, emin, emax),
-                (dm, dmin, dmax),
-                decoded,
-            )
-        }
-        Arm::Zstd1 | Arm::Zstd3 | Arm::Zstd6 => {
-            let level = match arm {
-                Arm::Zstd1 => 1,
-                Arm::Zstd3 => PRODUCTION_ZSTD_LEVEL,
-                Arm::Zstd6 => 6,
-                _ => unreachable!(),
-            };
-            let (compressed, em, emin, emax) = timed(
-                || zstd::bulk::compress(encoded, level).expect("zstd compress"),
-                reps,
-            );
-            let use_compressed = should_compress(n, compressed.len());
-            let stored = if use_compressed {
-                compressed.clone()
-            } else {
-                encoded.to_vec()
-            };
-            if arm == Arm::Zstd3 {
-                let mut scratch = Vec::new();
-                let desc = write_page(&mut scratch, 0, Enc::Plain, encoded, PRODUCTION_ZSTD_LEVEL);
-                let production_compressed = desc.comp == COMP_ZSTD;
-                if production_compressed != use_compressed {
+    let (stored, compressed_bytes, stored_compressed, enc_stats, dec_stats, decoded): ArmOutcome =
+        match arm {
+            Arm::Raw => {
+                let (_, em, emin, emax) = timed(|| encoded.to_vec(), reps);
+                let (decoded, dm, dmin, dmax) = timed(|| encoded.to_vec(), reps);
+                (
+                    encoded.to_vec(),
+                    n,
+                    false,
+                    (em, emin, emax),
+                    (dm, dmin, dmax),
+                    decoded,
+                )
+            }
+            Arm::Zstd1 | Arm::Zstd3 | Arm::Zstd6 => {
+                let level = match arm {
+                    Arm::Zstd1 => 1,
+                    Arm::Zstd3 => PRODUCTION_ZSTD_LEVEL,
+                    Arm::Zstd6 => 6,
+                    _ => unreachable!(),
+                };
+                let (compressed, em, emin, emax) = timed(
+                    || zstd::bulk::compress(encoded, level).expect("zstd compress"),
+                    reps,
+                );
+                let use_compressed = should_compress(n, compressed.len());
+                let stored = if use_compressed {
+                    compressed.clone()
+                } else {
+                    encoded.to_vec()
+                };
+                if arm == Arm::Zstd3 {
+                    let mut scratch = Vec::new();
+                    let desc =
+                        write_page(&mut scratch, 0, Enc::Plain, encoded, PRODUCTION_ZSTD_LEVEL);
+                    let production_compressed = desc.comp == COMP_ZSTD;
+                    if production_compressed != use_compressed {
+                        failures.push(format!(
+                            "production-baseline policy mismatch on {cell_id}: bake-off decided compress={use_compressed}, page::write_page decided compress={production_compressed}"
+                        ));
+                    }
+                }
+                let (decoded, dm, dmin, dmax) = timed(
+                    || zstd::bulk::decompress(&compressed, n).expect("zstd decompress"),
+                    reps,
+                );
+                (
+                    stored,
+                    compressed.len(),
+                    use_compressed,
+                    (em, emin, emax),
+                    (dm, dmin, dmax),
+                    decoded,
+                )
+            }
+            Arm::Zstd3Reused => {
+                let (compressed, em, emin, emax) = timed(
+                    || {
+                        reused_compressor
+                            .compress(encoded)
+                            .expect("reused zstd compress")
+                    },
+                    reps,
+                );
+                let one_shot = zstd::bulk::compress(encoded, PRODUCTION_ZSTD_LEVEL)
+                    .expect("zstd compress for identity check");
+                if compressed != one_shot {
                     failures.push(format!(
-                        "production-baseline policy mismatch on {cell_id}: bake-off decided compress={use_compressed}, page::write_page decided compress={production_compressed}"
+                        "zstd-3-reused NOT byte-identical to zstd-3 one-shot on {cell_id}"
                     ));
                 }
+                let use_compressed = should_compress(n, compressed.len());
+                let stored = if use_compressed {
+                    compressed.clone()
+                } else {
+                    encoded.to_vec()
+                };
+                let (decoded, dm, dmin, dmax) = timed(
+                    || {
+                        reused_decompressor
+                            .decompress(&compressed, n)
+                            .expect("reused zstd decompress")
+                    },
+                    reps,
+                );
+                (
+                    stored,
+                    compressed.len(),
+                    use_compressed,
+                    (em, emin, emax),
+                    (dm, dmin, dmax),
+                    decoded,
+                )
             }
-            let (decoded, dm, dmin, dmax) = timed(
-                || zstd::bulk::decompress(&compressed, n).expect("zstd decompress"),
-                reps,
-            );
-            (
-                stored,
-                use_compressed,
-                (em, emin, emax),
-                (dm, dmin, dmax),
-                decoded,
-            )
-        }
-        Arm::Zstd3Reused => {
-            let (compressed, em, emin, emax) = timed(
-                || {
-                    reused_compressor
-                        .compress(encoded)
-                        .expect("reused zstd compress")
-                },
-                reps,
-            );
-            let one_shot = zstd::bulk::compress(encoded, PRODUCTION_ZSTD_LEVEL)
-                .expect("zstd compress for identity check");
-            if compressed != one_shot {
-                failures.push(format!(
-                    "zstd-3-reused NOT byte-identical to zstd-3 one-shot on {cell_id}"
-                ));
+            Arm::Lz4 => {
+                let (compressed, em, emin, emax) =
+                    timed(|| lz4_flex::compress_prepend_size(encoded), reps);
+                let use_compressed = should_compress(n, compressed.len());
+                let stored = if use_compressed {
+                    compressed.clone()
+                } else {
+                    encoded.to_vec()
+                };
+                let (decoded, dm, dmin, dmax) = timed(
+                    || lz4_flex::decompress_size_prepended(&compressed).expect("lz4 decompress"),
+                    reps,
+                );
+                (
+                    stored,
+                    compressed.len(),
+                    use_compressed,
+                    (em, emin, emax),
+                    (dm, dmin, dmax),
+                    decoded,
+                )
             }
-            let use_compressed = should_compress(n, compressed.len());
-            let stored = if use_compressed {
-                compressed.clone()
-            } else {
-                encoded.to_vec()
-            };
-            let (decoded, dm, dmin, dmax) = timed(
-                || {
-                    reused_decompressor
-                        .decompress(&compressed, n)
-                        .expect("reused zstd decompress")
-                },
-                reps,
-            );
-            (
-                stored,
-                use_compressed,
-                (em, emin, emax),
-                (dm, dmin, dmax),
-                decoded,
-            )
-        }
-        Arm::Lz4 => {
-            let (compressed, em, emin, emax) =
-                timed(|| lz4_flex::compress_prepend_size(encoded), reps);
-            let use_compressed = should_compress(n, compressed.len());
-            let stored = if use_compressed {
-                compressed.clone()
-            } else {
-                encoded.to_vec()
-            };
-            let (decoded, dm, dmin, dmax) = timed(
-                || lz4_flex::decompress_size_prepended(&compressed).expect("lz4 decompress"),
-                reps,
-            );
-            (
-                stored,
-                use_compressed,
-                (em, emin, emax),
-                (dm, dmin, dmax),
-                decoded,
-            )
-        }
-    };
+        };
 
     let roundtrip_ok = decoded == encoded;
     if !roundtrip_ok {
@@ -675,6 +697,7 @@ fn measure_cell(
         size_label: size_label.to_string(),
         arm: arm.name().to_string(),
         input_bytes: n,
+        compressed_bytes,
         stored_bytes: stored.len(),
         ratio,
         stored_compressed,
@@ -885,10 +908,18 @@ fn main() {
     let load_end = load_average();
 
     print!("{}", env_header("page_codec_bakeoff"));
-    println!("profile:       {}", build_profile());
-    println!("target:        {}", target_triple());
-    println!("zstd crate:    {}", resolved_dependency_version("zstd"));
-    println!("lz4_flex crate:{}", resolved_dependency_version("lz4_flex"));
+    println!("{:<16}{}", "profile:", build_profile());
+    println!("{:<16}{}", "target:", target_triple());
+    println!(
+        "{:<16}{}",
+        "zstd crate:",
+        resolved_dependency_version("zstd")
+    );
+    println!(
+        "{:<16}{}",
+        "lz4_flex crate:",
+        resolved_dependency_version("lz4_flex")
+    );
     println!("load avg (start): {load_start}");
     println!("load avg (end):   {load_end}");
     println!("========================================================================");
@@ -1049,6 +1080,67 @@ mod tests {
         let err = check_cell_completeness(&expected, &duplicated)
             .expect_err("a duplicated cell must fail completeness");
         assert!(err.contains("mismatch"), "unexpected error message: {err}");
+    }
+
+    /// `compressed_bytes` must report the codec's own output length even on
+    /// a cell where the store policy rejects it: the raw arm has no codec,
+    /// so its `compressed_bytes` must equal `input_bytes` exactly; a
+    /// high-entropy page must grow under zstd's framing (compressed strictly
+    /// larger than input), and the store policy must then fall back to raw
+    /// (`stored_bytes == input_bytes`, `ratio == 1.0`) while `compressed_bytes`
+    /// still carries the real, larger codec output.
+    #[test]
+    fn compressed_bytes_reports_codec_output_not_store_policy() {
+        let mut rng = StdRng::seed_from_u64(0xC0FF_EE01);
+        let raw_bytes: Vec<u8> = (0..8192)
+            .map(|_| rng.random_range(0u16..=255) as u8)
+            .collect();
+        let mut compressor =
+            zstd::bulk::Compressor::new(PRODUCTION_ZSTD_LEVEL).expect("build compressor");
+        let mut decompressor = zstd::bulk::Decompressor::new().expect("build decompressor");
+        let mut failures = Vec::new();
+
+        let raw_report = measure_cell(
+            "test",
+            "8192_rows",
+            Arm::Raw,
+            &raw_bytes,
+            &mut compressor,
+            &mut decompressor,
+            &mut failures,
+        );
+        assert_eq!(
+            raw_report.compressed_bytes, raw_report.input_bytes,
+            "raw arm has no codec: compressed_bytes must equal input_bytes exactly"
+        );
+
+        let zstd_report = measure_cell(
+            "test",
+            "8192_rows",
+            Arm::Zstd3,
+            &raw_bytes,
+            &mut compressor,
+            &mut decompressor,
+            &mut failures,
+        );
+        assert!(
+            zstd_report.compressed_bytes > zstd_report.input_bytes,
+            "incompressible input must grow under a framed codec: compressed_bytes={} input_bytes={}",
+            zstd_report.compressed_bytes,
+            zstd_report.input_bytes
+        );
+        assert_eq!(
+            zstd_report.stored_bytes, zstd_report.input_bytes,
+            "store policy must reject growth and fall back to raw storage"
+        );
+        assert!(
+            (zstd_report.ratio - 1.0).abs() < f64::EPSILON,
+            "ratio must reflect the store-policy fallback, not the codec's growth"
+        );
+        assert!(
+            failures.is_empty(),
+            "unexpected integrity failures: {failures:?}"
+        );
     }
 
     /// The tiny dataset's whole point is proving the floor is respected: its
