@@ -2473,7 +2473,7 @@ Surface: 133 constructs over 242 corpus entries in 10 corpus files.
 | subquery per-node point cap | accepted divergence | accepted divergence | ADR-0030, 2 corpus entries; Ravel's per-subquery-node 11,000-point budget has no Prometheus counterpart, so Ravel rejects by design where Prometheus accepts; the comparator asserts exactly that shape |
 <!-- END GENERATED PROMQL CONFORMANCE TABLE -->
 
-## SQL statement complexity gate (issue #1680)
+## SQL statement complexity gate
 
 `ravel_sql::validate` is the single gate every SQL surface reaches: the
 `POST /api/v1/sql` handler, Flight SQL's `get_flight_info_statement` and

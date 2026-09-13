@@ -313,6 +313,7 @@ failure.
 | `presentation.cursor` in the envelope | 4 KiB | fixed | no; a cursor over its bound is dropped, as an `internal` failure on an otherwise-successful result and as a counted drop with a warning on one that already failed |
 | metric families per `ravel_describe_data` page | 100 | fixed | no |
 | segments admitted for `ravel_find_labels` resolution | 2,000 | fixed | no |
+| structural characters in a SQL statement | 1,000 | fixed | no; a statement over it is refused before it is parsed, as `validation` |
 
 The effective budget for a call is the smallest of the server's ceiling,
 the tenant's ceiling, and the value the caller sent. A caller can never
