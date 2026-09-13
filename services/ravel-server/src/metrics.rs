@@ -247,6 +247,10 @@ pub enum Label {
     Cache(CacheFamily),
     CacheTier(CacheTier),
     MergeMemoryKind(MergeMemoryKind),
+    /// How one alert evaluation tick ended (issue #532). A closed enum owned by
+    /// [`crate::alerting`], since the outcomes are the alerting loop's own, not
+    /// a dimension this renderer invents.
+    AlertOutcome(crate::alerting::AlertTickOutcome),
     /// The allocator this process runs under (#1170): `"jemalloc"` on every
     /// target this repo builds, or whatever [`crate::mem_stats::read`] names
     /// otherwise. A bare `&'static str` rather than a closed enum because the
@@ -359,6 +363,7 @@ impl Label {
             Label::Cache(_) => "cache",
             Label::CacheTier(_) => "tier",
             Label::MergeMemoryKind(_) => "kind",
+            Label::AlertOutcome(_) => "outcome",
             Label::Allocator(_) => "allocator",
             Label::AllocatorStat(_) => "stat",
         }
@@ -378,6 +383,7 @@ impl Label {
             Label::Cache(family) => family.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
+            Label::AlertOutcome(outcome) => alert_outcome_name(*outcome).to_string(),
             Label::Allocator(name) => name.to_string(),
             Label::AllocatorStat(stat) => stat.name().to_string(),
         }
@@ -394,6 +400,19 @@ fn signal_name(signal: Signal) -> &'static str {
         Signal::Profiles => "profiles",
         Signal::Alerts => "alerts",
         Signal::Audit => "audit",
+    }
+}
+
+/// Exhaustive: adding an [`crate::alerting::AlertTickOutcome`] variant breaks
+/// this compile until it is handled here, so a new tick outcome cannot reach
+/// `/metrics` without a spelling.
+fn alert_outcome_name(outcome: crate::alerting::AlertTickOutcome) -> &'static str {
+    use crate::alerting::AlertTickOutcome;
+    match outcome {
+        AlertTickOutcome::Evaluated => "evaluated",
+        AlertTickOutcome::LeaseNotHeld => "lease_not_held",
+        AlertTickOutcome::LeaseUnavailable => "lease_unavailable",
+        AlertTickOutcome::HistoryUnavailable => "history_unavailable",
     }
 }
 
@@ -2429,6 +2448,182 @@ fn render_merge_memory_family(
     );
 }
 
+/// One scrape's alert-evaluation counters (issue #532), folded across every
+/// tenant this process evaluates, plus the loop's liveness gauge.
+///
+/// Decoupled from [`crate::alerting::AlertMetrics`] so the renderer is testable
+/// with a plain struct literal, matching [`MaintenanceOwnershipSnapshot`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AlertSnapshot {
+    pub rules_evaluated: u64,
+    pub rules_failed: u64,
+    pub records_written: u64,
+    pub repeats_queued: u64,
+    pub notifications_delivered: u64,
+    pub notifications_failed: u64,
+    /// Ticks that held the lease and evaluated every rule.
+    pub ticks_evaluated: u64,
+    /// Ticks that skipped evaluation because a peer replica held the lease.
+    /// Healthy, and the steady state of every non-holding replica.
+    pub ticks_lease_not_held: u64,
+    /// Ticks that skipped evaluation because the lease read or write failed.
+    pub ticks_lease_unavailable: u64,
+    /// Ticks that evaluated nothing because the alert history was unreadable.
+    pub ticks_history_unavailable: u64,
+    /// Unix nanoseconds the alert loop last completed a tick, `0` if none has
+    /// completed yet. Rendered as
+    /// `ravel_alert_last_tick_completed_timestamp_seconds`; its age is the
+    /// alert-loop liveness signal.
+    pub last_tick_completed_unix_ns: i64,
+}
+
+impl AlertSnapshot {
+    /// This scrape's tick count for one outcome. Exhaustive, so adding an
+    /// outcome breaks the compile here rather than rendering a silent zero.
+    fn ticks(&self, outcome: crate::alerting::AlertTickOutcome) -> u64 {
+        use crate::alerting::AlertTickOutcome;
+        match outcome {
+            AlertTickOutcome::Evaluated => self.ticks_evaluated,
+            AlertTickOutcome::LeaseNotHeld => self.ticks_lease_not_held,
+            AlertTickOutcome::LeaseUnavailable => self.ticks_lease_unavailable,
+            AlertTickOutcome::HistoryUnavailable => self.ticks_history_unavailable,
+        }
+    }
+}
+
+/// No `tenant_hash` label on any series here (ADR-0044 section 4): one process
+/// runs one evaluator per tenant that has rules, and every counter below is the
+/// sum across them. A per-tenant breakdown would put a raw tenant hash on this
+/// unauthenticated route, which that section blocks.
+///
+/// Rendered only when this process built at least one evaluator
+/// ([`crate::alerting::active_alert_metrics`]). A deployment that configured no
+/// alert rules therefore carries none of these series at all, rather than a row
+/// of permanent zeros an alert rule would have to special-case.
+fn render_alert_family(out: &mut String, mode: Mode, snapshot: &AlertSnapshot) {
+    write_header(
+        out,
+        "ravel_alert_rules_evaluated_total",
+        "Alert rules whose query ran and whose condition was decided, cumulative across ticks and tenants.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_rules_evaluated_total",
+        &[Label::Mode(mode)],
+        snapshot.rules_evaluated,
+    );
+
+    write_header(
+        out,
+        "ravel_alert_rules_failed_total",
+        "Alert rules skipped because the query, the condition, or the write failed. Every one is logged; the rule is retried next tick.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_rules_failed_total",
+        &[Label::Mode(mode)],
+        snapshot.rules_failed,
+    );
+
+    write_header(
+        out,
+        "ravel_alert_records_written_total",
+        "Alert transition records durably written.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_records_written_total",
+        &[Label::Mode(mode)],
+        snapshot.records_written,
+    );
+
+    write_header(
+        out,
+        "ravel_alert_repeats_queued_total",
+        "Repeat notifications queued for a still-firing alert. A repeat re-sends the folded latest record with no new durable write, so it advances this counter and then ravel_alert_notifications_delivered_total, never ravel_alert_records_written_total.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_repeats_queued_total",
+        &[Label::Mode(mode)],
+        snapshot.repeats_queued,
+    );
+
+    write_header(
+        out,
+        "ravel_alert_notifications_delivered_total",
+        "Notifications delivered to every configured sink, including ones carried over from an earlier tick's failure.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_notifications_delivered_total",
+        &[Label::Mode(mode)],
+        snapshot.notifications_delivered,
+    );
+
+    write_header(
+        out,
+        "ravel_alert_notifications_failed_total",
+        "Notifications still undelivered after a tick's attempt, counted once per tick per notification, so one stuck notification keeps advancing this while it is retried.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_notifications_failed_total",
+        &[Label::Mode(mode)],
+        snapshot.notifications_failed,
+    );
+
+    // One counter split by a closed outcome, not three independent flags. The
+    // outcomes are mutually exclusive per tick, and `lease_not_held` is the
+    // healthy steady state of every replica that is not the lease holder, so it
+    // has to be countable without being failure: an alert rule that sums it
+    // with the two store-failure outcomes turns a normal multi-replica
+    // deployment into a permanent alarm.
+    write_header(
+        out,
+        "ravel_alert_ticks_total",
+        "Alert evaluation ticks by outcome: evaluated (this replica held the tenant lease and evaluated every rule), lease_not_held (a peer held it, the healthy multi-replica steady state), lease_unavailable (the lease read or write failed), history_unavailable (the alert history was unreadable, so nothing was evaluated).",
+        "counter",
+    );
+    for outcome in crate::alerting::AlertTickOutcome::ALL {
+        write_sample(
+            out,
+            "ravel_alert_ticks_total",
+            &[Label::Mode(mode), Label::AlertOutcome(outcome)],
+            snapshot.ticks(outcome),
+        );
+    }
+
+    // The liveness gauge, and the only figure in this family that moves when
+    // the loop STOPS rather than when it runs. Every counter above is
+    // cumulative, so a dead evaluator leaves them frozen and indistinguishable
+    // from a healthy deployment whose rules never fire; this one's age keeps
+    // growing. `0` means no tick has completed since this process started,
+    // which is why the alert rule in docs/guides/observability.md carries a
+    // `for:` long enough to cover a freshly started process's first interval
+    // (the same shape as ravel_maintain_last_cycle_completed_timestamp_seconds).
+    // A tick that ended in lease_not_held stamps it: a standby replica is
+    // alive, and holding it back would alarm on the steady state.
+    write_header(
+        out,
+        "ravel_alert_last_tick_completed_timestamp_seconds",
+        "Unix time the alert evaluation loop last completed a tick in this process, 0 if none has completed yet. Its age is the alert-loop liveness signal.",
+        "gauge",
+    );
+    write_sample_f64(
+        out,
+        "ravel_alert_last_tick_completed_timestamp_seconds",
+        &[Label::Mode(mode)],
+        snapshot.last_tick_completed_unix_ns as f64 / 1e9,
+    );
+}
+
 /// One signal's at-rest scrubber counters for one scrape (ADR-0059 decisions
 /// 1, 3).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3976,6 +4171,32 @@ pub fn render(
     if let Some(tracker) = merge_memory {
         render_merge_memory_family(&mut out, mode, tracker);
     }
+    // Read from the process-global alerting handle rather than an argument,
+    // like `crate::query_postings_metrics::snapshot` and
+    // `crate::store_probe::store_reachable` above: the evaluator is spawned per
+    // tenant from `crate::alerting::spawn` and holds no router or state struct
+    // the `/metrics` route is given. `None` when this process built no
+    // evaluator, which omits the family.
+    if let Some(metrics) = crate::alerting::active_alert_metrics() {
+        use crate::alerting::AlertTickOutcome;
+        render_alert_family(
+            &mut out,
+            mode,
+            &AlertSnapshot {
+                rules_evaluated: metrics.rules_evaluated(),
+                rules_failed: metrics.rules_failed(),
+                records_written: metrics.records_written(),
+                repeats_queued: metrics.repeats_queued(),
+                notifications_delivered: metrics.notifications_delivered(),
+                notifications_failed: metrics.notifications_failed(),
+                ticks_evaluated: metrics.ticks(AlertTickOutcome::Evaluated),
+                ticks_lease_not_held: metrics.ticks(AlertTickOutcome::LeaseNotHeld),
+                ticks_lease_unavailable: metrics.ticks(AlertTickOutcome::LeaseUnavailable),
+                ticks_history_unavailable: metrics.ticks(AlertTickOutcome::HistoryUnavailable),
+                last_tick_completed_unix_ns: metrics.last_tick_completed_unix_ns(),
+            },
+        );
+    }
     if let Some(snapshot) = scrub {
         render_scrub_family(&mut out, mode, snapshot);
     }
@@ -4531,7 +4752,9 @@ mod tests {
         // ADR-0065 decision 4 for the RLOG merge-memory gauge; `tier` is the
         // eleventh, added by #97 to split each read cache into its RAM and
         // local-disk tiers; `allocator` and `stat` are the twelfth and
-        // thirteenth, added by #1170 for the process allocator gauges.
+        // thirteenth, added by #1170 for the process allocator gauges;
+        // `outcome` is the fourteenth, added by #532 to split the alert
+        // evaluation tick counter.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -4545,6 +4768,7 @@ mod tests {
             Label::Cache(CacheFamily::Fetch),
             Label::CacheTier(CacheTier::Ram),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
+            Label::AlertOutcome(crate::alerting::AlertTickOutcome::Evaluated),
             Label::Allocator("jemalloc"),
             Label::AllocatorStat(AllocatorStat::Allocated),
         ];
@@ -4563,6 +4787,7 @@ mod tests {
                 Label::Cache(_) => "cache",
                 Label::CacheTier(_) => "tier",
                 Label::MergeMemoryKind(_) => "kind",
+                Label::AlertOutcome(_) => "outcome",
                 Label::Allocator(_) => "allocator",
                 Label::AllocatorStat(_) => "stat",
             })
@@ -4585,18 +4810,19 @@ mod tests {
                 "cache",
                 "tier",
                 "kind",
+                "outcome",
                 "allocator",
                 "stat",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), the `cache` label, #97's `tier` \
-             label, ADR-0065 decision 4's `kind`, and #1170's `allocator`/`stat`; `shard` must \
-             never appear here"
+             label, ADR-0065 decision 4's `kind`, #532's `outcome`, and #1170's \
+             `allocator`/`stat`; `shard` must never appear here"
         );
         assert_eq!(
             one_of_each.len(),
-            14,
-            "exactly 14 label variants, 13 distinct keys"
+            15,
+            "exactly 15 label variants, 14 distinct keys"
         );
     }
 
@@ -5669,6 +5895,79 @@ mod tests {
                 "expected exactly one `{expected}` sample line:\n{out}"
             );
         }
+    }
+
+    /// The alerting family renders every `AlertEvalReport` figure with the
+    /// right TYPE lines and values (issue #532). Each counter gets a distinct
+    /// value, so a renderer that wires two headers to one snapshot field fails
+    /// here rather than reading as a healthy pipeline. The timestamp is driven
+    /// with a fractional second, so a renderer emitting nanoseconds where
+    /// seconds are declared reads as a 54-year-old tick at the alert and fails
+    /// here instead.
+    #[test]
+    fn alert_family_renders_every_counter_and_the_liveness_gauge() {
+        let snapshot = AlertSnapshot {
+            rules_evaluated: 11,
+            rules_failed: 2,
+            records_written: 3,
+            repeats_queued: 4,
+            notifications_delivered: 5,
+            notifications_failed: 6,
+            ticks_evaluated: 7,
+            ticks_lease_not_held: 8,
+            ticks_lease_unavailable: 9,
+            ticks_history_unavailable: 10,
+            // 1_758_000_123_500_000_000 ns is 1758000123.5 s.
+            last_tick_completed_unix_ns: 1_758_000_123_500_000_000,
+        };
+        let mut out = String::new();
+        render_alert_family(&mut out, Mode::Query, &snapshot);
+
+        for expected_type in [
+            "# TYPE ravel_alert_rules_evaluated_total counter",
+            "# TYPE ravel_alert_rules_failed_total counter",
+            "# TYPE ravel_alert_records_written_total counter",
+            "# TYPE ravel_alert_repeats_queued_total counter",
+            "# TYPE ravel_alert_notifications_delivered_total counter",
+            "# TYPE ravel_alert_notifications_failed_total counter",
+            "# TYPE ravel_alert_ticks_total counter",
+            "# TYPE ravel_alert_last_tick_completed_timestamp_seconds gauge",
+        ] {
+            assert_eq!(
+                out.lines().filter(|line| *line == expected_type).count(),
+                1,
+                "expected exactly one `{expected_type}` line:\n{out}"
+            );
+        }
+
+        for expected in [
+            "ravel_alert_rules_evaluated_total{mode=\"query\"} 11",
+            "ravel_alert_rules_failed_total{mode=\"query\"} 2",
+            "ravel_alert_records_written_total{mode=\"query\"} 3",
+            "ravel_alert_repeats_queued_total{mode=\"query\"} 4",
+            "ravel_alert_notifications_delivered_total{mode=\"query\"} 5",
+            "ravel_alert_notifications_failed_total{mode=\"query\"} 6",
+            "ravel_alert_ticks_total{mode=\"query\",outcome=\"evaluated\"} 7",
+            "ravel_alert_ticks_total{mode=\"query\",outcome=\"lease_not_held\"} 8",
+            "ravel_alert_ticks_total{mode=\"query\",outcome=\"lease_unavailable\"} 9",
+            "ravel_alert_ticks_total{mode=\"query\",outcome=\"history_unavailable\"} 10",
+            "ravel_alert_last_tick_completed_timestamp_seconds{mode=\"query\"} 1758000123.5",
+        ] {
+            assert_eq!(
+                out.lines().filter(|line| *line == expected).count(),
+                1,
+                "expected exactly one `{expected}` sample line:\n{out}"
+            );
+        }
+
+        // Four outcomes and no fifth: an outcome that renders no series on a
+        // scrape where it has not happened yet would make an alert rule's
+        // `increase()` silently undefined until the first occurrence.
+        let tick_samples = out
+            .lines()
+            .filter(|line| line.starts_with("ravel_alert_ticks_total{"))
+            .count();
+        assert_eq!(tick_samples, 4, "one series per outcome, always:\n{out}");
     }
 
     /// The scrape path reads the fold figures off the live `Catalog`, not off

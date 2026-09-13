@@ -144,6 +144,44 @@ ravel-server --mode all \
 The full flag list, with defaults and help, is in
 [ravel-server-flags.md](../reference/ravel-server-flags.md).
 
+## Watching the pipeline itself
+
+The evaluator exports its own figures on `/metrics`, so a pipeline that
+evaluates nothing, writes nothing, or delivers nothing is visible before the
+symptom is. Without them the first sign of a broken evaluator is an alert that
+never arrived, which is indistinguishable from a condition that never occurred.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_alert_rules_evaluated_total` | Rules whose query ran and whose condition was decided. |
+| `ravel_alert_rules_failed_total` | Rules skipped because the query, the condition, or the write failed. Each is logged with its `rule_id` and retried next tick. |
+| `ravel_alert_records_written_total` | Transition records durably written. |
+| `ravel_alert_repeats_queued_total` | Repeat notifications queued for a still-firing alert. A repeat writes no new record. |
+| `ravel_alert_notifications_delivered_total` | Notifications accepted by every configured sink. |
+| `ravel_alert_notifications_failed_total` | Notifications still undelivered after a tick's attempt, counted once per tick while they are retried. |
+| `ravel_alert_ticks_total` | Evaluation ticks, split by an `outcome` label: `evaluated`, `lease_not_held`, `lease_unavailable`, `history_unavailable`. |
+| `ravel_alert_last_tick_completed_timestamp_seconds` | Unix time this process last completed a tick. Its age is the liveness signal. |
+
+Two of these need reading with their semantics in hand.
+
+`outcome="lease_not_held"` is healthy. Only the replica holding a tenant's
+alert lease evaluates rules; every other replica ticks, skips evaluation, and
+reports this outcome forever. It is a separate outcome from the two
+store-failure ones (`lease_unavailable`, `history_unavailable`) precisely so an
+alert rule can leave the steady state alone.
+
+`ravel_alert_last_tick_completed_timestamp_seconds` is the only figure that
+moves when the loop stops rather than when it runs. Every counter above is
+cumulative, so a dead evaluator freezes them at values that look exactly like a
+healthy deployment whose rules never fire. A tick that skipped evaluation
+because a peer held the lease still stamps this gauge: that replica is alive.
+
+The whole family is absent from a process that built no evaluator (no
+`--alert-rules-file`, or a file with no rules), rather than exporting a row of
+zeros. Ready-made `for:`-guarded PromQL rules over these series, including a
+dead-loop rule and a notifications-failing-to-every-sink rule, are in the
+[observability guide](observability.md#alert-evaluation-ravel_alert_).
+
 ## Querying alert history
 
 Every transition an evaluator writes is a row in the `alerts` table, served by
