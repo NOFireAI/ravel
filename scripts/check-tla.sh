@@ -299,19 +299,24 @@ log_field() {
 # check_bands <area> <cfg-name> <distinct> <depth>
 # Compares a PASS run's figures against the optional bands.tsv row for this cfg.
 # A missing bands.tsv, or a bands.tsv with no row for this cfg, is not an error
-# (bands are opt-in). A row that exists is enforced: the figure must be present
-# (not "-") and inside [min,max]. Returns non-zero on any violation.
+# (bands are opt-in). A row that exists is enforced: every figure must be
+# present (not "-" or non-numeric) regardless of enforcement, and inside
+# [min,max] whenever that bound is enforced. Returns non-zero on any
+# violation. "-" means two different things in two different files: a missing
+# figure in last-run.tsv is always a failure, while a "-" bound in bands.tsv
+# only means that bound isn't range-checked.
 #
 # min_depth/max_depth may instead both be the literal sentinel "-", meaning
-# depth is not enforced for this row: TLC's reported BFS search depth can
+# depth is not range-checked for this row: TLC's reported BFS search depth can
 # overshoot the true diameter by a level when multiple workers race (issues
 # #1353, #1439, #1638), so a row measured and enforced under a parallel
 # `-workers auto` configuration cannot pin an exact depth the way it can pin
-# distinct, which is worker-independent. One sentinel, not two: min_depth and
-# max_depth must agree (both "-" or both integers) so a half-specified range
-# fails closed as malformed rather than silently comparing against an empty
-# bound. min_distinct/max_distinct take no sentinel; distinct stays exactly
-# enforced.
+# distinct, which is worker-independent. The sentinel waives the range check
+# only; a run that fails to produce a depth figure at all is still a broken
+# parse and still fails. One sentinel, not two: min_depth and max_depth must
+# agree (both "-" or both integers) so a half-specified range fails closed as
+# malformed rather than silently comparing against an empty bound.
+# min_distinct/max_distinct take no sentinel; distinct stays exactly enforced.
 check_bands() {
     local area="$1" cfg_name="$2" distinct="$3" depth="$4"
     local bands="$FORMAL_DIR/$area/bands.tsv"
@@ -362,18 +367,16 @@ check_bands() {
                 note "$area bands: $cfg_name distinct=$distinct outside [$mind,$maxd]"; rc=1
             fi ;;
     esac
-    if [ "$depth_enforced" -eq 0 ]; then
-        note "$area bands: $cfg_name depth=$depth (not enforced, band is '-')"
-    else
-        case "$depth" in
-            ''|*[!0-9]*)
-                note "$area bands: $cfg_name depth figure missing or non-numeric ('$depth')"; rc=1 ;;
-            *)
-                if [ "$depth" -lt "$mindepth" ] || [ "$depth" -gt "$maxdepth" ]; then
-                    note "$area bands: $cfg_name depth=$depth outside [$mindepth,$maxdepth]"; rc=1
-                fi ;;
-        esac
-    fi
+    case "$depth" in
+        ''|*[!0-9]*)
+            note "$area bands: $cfg_name depth figure missing or non-numeric ('$depth')"; rc=1 ;;
+        *)
+            if [ "$depth_enforced" -eq 0 ]; then
+                note "$area bands: $cfg_name depth=$depth (not enforced, band is '-')"
+            elif [ "$depth" -lt "$mindepth" ] || [ "$depth" -gt "$maxdepth" ]; then
+                note "$area bands: $cfg_name depth=$depth outside [$mindepth,$maxdepth]"; rc=1
+            fi ;;
+    esac
     return $rc
 }
 
