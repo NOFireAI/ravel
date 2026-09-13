@@ -462,6 +462,24 @@ raised as a typed error. It is never turned into a partial merge. Only
 cross-cluster federation can return partial coverage, and only when an
 operator opted that remote into it.
 
+The rule holds on both lanes for metrics. A metrics statement over the cost gate
+runs the same three steps per slice (the assigned worker, one re-dispatch to
+another worker, then a coordinator-local read of the same slice ticket), and its
+local read runs the identical worker fragment over the identical pinned
+segments, so a statement that falls back returns the same bytes it would have
+returned with every worker healthy. Two differences from the PromQL lane are
+worth knowing while reading a trace: the SQL lane places slice `k` on roster
+entry `k % len` rather than by rendezvous rank, and it keeps no quarantine map,
+so a dead worker is tried again by the next statement instead of being skipped
+until its heartbeat stamp advances. It costs one refused connection per slice
+assigned to that worker, not a failed statement. The SQL lane's own counters are
+per query rather than on `/metrics`; its coordinator logs a `warn` naming the
+slice on every re-dispatch and every local read.
+
+Log and trace *search* on the SQL lane does not have this sequence yet: a worker
+error there still fails the statement, so a dead-but-registered worker is
+visible for the rest of its staleness window on those tables.
+
 ![Failure flow: intra-cluster slice re-dispatch and local fallback, and the cross-cluster skip path](../diagrams/distributed-query-failure.svg)
 
 What an operator will actually observe, case by case:

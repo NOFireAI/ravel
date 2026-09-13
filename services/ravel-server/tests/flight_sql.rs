@@ -1138,7 +1138,11 @@ async fn distributed_flight_sql_reachable_end_to_end() {
         min_segments: 0,
         max_parallel_slices: 8,
     };
-    let config = distributed_flight_config(live_workers, thresholds, "cluster-secret");
+    // An empty self-id cell: this fixture has no query-worker identity of its
+    // own, so nothing is excluded from the roster. The coordinator's
+    // self-exclusion has its own cases in `sql_distrib`.
+    let self_id = Arc::new(std::sync::OnceLock::new());
+    let config = distributed_flight_config(live_workers, self_id, thresholds, "cluster-secret");
     assert_eq!(
         config.workers.endpoints(),
         vec![format!("http://{worker_endpoint}")],
