@@ -220,6 +220,35 @@ run_sweep -y
 check_eq "F: successful near-cap job is not a false timeout (rerun)" "600" "${RERUNS}"
 check_eq "F: successful near-cap run exits 0" "0" "${RC}"
 
+# === Case G: the workflow file at the run's commit cannot be read (the
+#     contents API call fails). The timeout guard degrades rather than
+#     silently doing nothing: it warns on stderr and falls through to the
+#     GitHub default cap. A job far below that default -> RERUN, with the
+#     warning present in the output.
+new_scenario; cleanup_dirs+=("${SCN_DIR}")
+rm -f "${SCN_DIR}/workflow.b64"
+printf '700 ci\n' >"${SCN_DIR}/runs.txt"
+printf '.github/workflows/ci.yml\taaaaaaaaaaaa\n' >"${SCN_DIR}/run-700.meta"
+job_row features 2026-09-10T06:00:00Z 2026-09-10T06:12:00Z >"${SCN_DIR}/run-700.jobs"
+run_sweep -y
+check_eq "G: unreadable caps run is still rerun" "700" "${RERUNS}"
+check_eq "G: unreadable caps run exits 0" "0" "${RC}"
+grep -q "could not read timeout-minutes caps" "${SCN_DIR}/out.txt" && g_warn=1 || g_warn=0
+check_eq "G: output warns caps could not be read" "1" "${g_warn}"
+
+# === Case H: the job-timings API call fails (no run-<id>.jobs fixture for
+#     gh run view to cat). The guard warns on stderr rather than silently
+#     treating the run as having no jobs at all, and still reruns it since
+#     an empty job list can never produce a timeout refusal.
+new_scenario; cleanup_dirs+=("${SCN_DIR}")
+printf '800 ci\n' >"${SCN_DIR}/runs.txt"
+printf '.github/workflows/ci.yml\taaaaaaaaaaaa\n' >"${SCN_DIR}/run-800.meta"
+run_sweep -y
+check_eq "H: unreadable job timings run is still rerun" "800" "${RERUNS}"
+check_eq "H: unreadable job timings run exits 0" "0" "${RC}"
+grep -q "could not read job timings" "${SCN_DIR}/out.txt" && h_warn=1 || h_warn=0
+check_eq "H: output warns job timings could not be read" "1" "${h_warn}"
+
 echo
 echo "passed: ${pass}  failed: ${fail}"
 [[ ${fail} -eq 0 ]]
