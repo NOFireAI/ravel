@@ -153,6 +153,28 @@ fn every_clickbench_corpus_statement_is_accepted() {
     );
 }
 
+/// The parser's own recursion limit is the second bound, and it is pinned
+/// here because the complexity gate cannot stand in for it: 200 nested
+/// parentheses cost 400 structural characters, well under the bound, and the
+/// parser must refuse them on its own. A statement nested just under the limit
+/// still parses, so this pins a limit rather than a blanket refusal.
+#[test]
+fn nested_parentheses_are_refused_by_the_parser_recursion_limit() {
+    on_worker_stack(|| {
+        let deep = format!("SELECT {}1{}", "(".repeat(200), ")".repeat(200));
+        assert!(structural_count(&deep) < MAX_STATEMENT_COMPLEXITY);
+        match validate(&deep).expect_err("must be refused") {
+            ValidationError::Parse(message) => assert!(
+                message.contains("Recursion"),
+                "the parser's own limit must be what refuses it: {message}"
+            ),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+
+        validate("SELECT ((((((((((1))))))))))").expect("shallow nesting still parses");
+    });
+}
+
 /// `structural_count` is the figure the gate decides on, so it is pinned
 /// exactly, not just in relation to the bound: whitespace is free, a literal
 /// costs one character however long it is, and a comment costs none.
