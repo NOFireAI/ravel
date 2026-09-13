@@ -884,7 +884,12 @@ pub async fn sweep(
         })?;
 
     let SweepReport {
-        orphans_deleted,
+        // Equal to orphans_quarantined since the ADR-0058 amendment; the
+        // quarantined figure is the one reported below.
+        orphans_deleted: _,
+        orphans_quarantined,
+        orphans_quarantine_refused,
+        quarantine_reaped,
         superseded_records_deleted,
         superseded_data_deleted,
         unreferenced_parts_deleted,
@@ -905,8 +910,18 @@ pub async fn sweep(
     .map_err(|err| anyhow::anyhow!("sweep failed: {err}"))?;
 
     let verb = if dry_run { "would delete" } else { "deleted" };
+    let q_verb = if dry_run {
+        "would quarantine"
+    } else {
+        "quarantined"
+    };
     println!("dry_run: {dry_run}");
-    println!("orphans ({verb}): {orphans_deleted}");
+    // Orphan GC moves candidates to quarantine rather than deleting them
+    // (ADR-0058 amendment); orphans_deleted counts candidates removed from the
+    // live keyspace and equals orphans_quarantined.
+    println!("orphans ({q_verb}): {orphans_quarantined}");
+    println!("orphans quarantine refused (left live): {orphans_quarantine_refused}");
+    println!("quarantine reaped (physically deleted past 2nd horizon): {quarantine_reaped}");
     println!("superseded_records ({verb}): {superseded_records_deleted}");
     println!("superseded_data ({verb}): {superseded_data_deleted}");
     println!("unreferenced_parts ({verb}): {unreferenced_parts_deleted}");
