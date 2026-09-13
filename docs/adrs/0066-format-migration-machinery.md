@@ -425,3 +425,67 @@ and re-encodes an input recorded below the current output version instead of
 only copying pages verbatim (see that module's doc comment). The Context
 sentence is left as written, a record of the gap this ADR closes; this note
 points forward to where it closed.
+
+## Amendment (2026-09-13, #530): retention ages out only what this build can read
+
+Decision 4, Class A, convergence force 1 reads: "Retention: old-version objects
+age out with their hour buckets at zero marginal cost." That is true of an
+object this build can read. Applied to one it cannot, it is decision 2 inverted:
+the running binary meets a version outside its window, gets the typed
+`UnsupportedVersion` decision 2 requires, and then the retention sweep deletes
+the object anyway on its ordinary age schedule. The object was only unreadable
+*here* -- the other side of a rolling upgrade reads it, and so does the build a
+rollback returns to -- so what decision 4 called convergence at zero marginal
+cost was, across an unfinished bump, destruction of the only copy. This is the
+first half of issue #530.
+
+Force 1 is therefore narrowed: **retention ages out an object only when this
+build can read its version.** Concretely, in
+`crates/ravel-maintain/src/retention.rs`:
+
+- Before the first delete of the horizon-gated physical sweep, every data object
+  the sweep would delete is probed for its trailer version through
+  `ravel_segment::classify_trailer`, which applies the same version gate a full
+  read applies and answers readable-here, outside-this-build's-window, or
+  corrupt. The distinction is a typed classification, never a string match, per
+  decision 2.
+- An out-of-window object holds the whole bucket: nothing in it is deleted this
+  pass, the tombstone stays in place (so bucket-wide exclusion still holds), and
+  the outcome is `SweptPartial`. The hold is bucket-wide rather than per object
+  because deleting a commit record while the object it names survives leaves
+  that object undiscoverable, which loses the data by a slower route.
+- A corrupt object is swept exactly as before. No build reads it, so holding it
+  protects nothing and would strand the bucket forever.
+- Holding is counted, not silent:
+  `ravel_maintain::retention::held_out_of_window_objects_total` rises once per
+  held object per declining pass.
+
+The cost of the narrowing is that a held bucket retains data past its retention
+window for as long as the hold lasts. That is deliberate and bounded by operator
+action, and it is the reason the counter exists rather than being optional: a
+nonzero rate means a deployment is refusing deletes right now, and the remedies
+are the ones this ADR already names -- finish the readers-first rollout, run
+`maintain migrate` (decision 5) so the objects converge to the current version,
+or roll back. Once the window covers the version again the next pass sweeps the
+bucket normally, with no state to reconcile: the sweep is stateless and
+idempotent.
+
+Scope: RSEG (metrics) only. RLOG and RSPAN objects carry their own trailers and
+their own windows in `ravel-logseg` and `ravel-rspan`; probing them with the
+RSEG gate would classify every one of them as corrupt, which is exactly the
+collapse decision 2 forbids. Those two signals keep the unnarrowed sweep until
+their readers grow the same probe.
+
+Decision 1's window also changed shape in the same change, without changing
+which versions it admits. The trailer gate and the structural validator each
+carried their own version literal (`SUPPORTED_VERSIONS.contains` and a `match`
+on `VERSION_V7`); with a one-version window they agreed by coincidence, and at
+the first bump they would not have. The admitted set is now written down once,
+as `SegmentVersion::WINDOW`, and both the gate and the validator resolve through
+one function against it; the validator's rule set is selected by an exhaustive
+match over the token type, so an admitted version without a rule set fails to
+compile. Adding N-1 at a bump is one line in that slice plus the variant and the
+rule set the compiler then demands.
+
+Still open from #530, not addressed here: one migration exercised end to end
+through `maintain migrate` across a real bump, and a documented rollback stance.

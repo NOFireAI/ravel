@@ -602,10 +602,7 @@ async fn held_out_of_window(
 /// The trailer version of one RSEG object when it is outside this build's
 /// reader window, `None` when the object is readable here, is corrupt, or is
 /// already gone (a delete that a previous pass completed is not a hold).
-async fn out_of_window_version(
-    store: &dyn ObjectStoreBackend,
-    key: &str,
-) -> Result<Option<u16>> {
+async fn out_of_window_version(store: &dyn ObjectStoreBackend, key: &str) -> Result<Option<u16>> {
     let got = match store.get(key, GetRange::Suffix(TRAILER_LEN)).await {
         Ok(got) => got,
         Err(StoreError::NotFound) => return Ok(None),

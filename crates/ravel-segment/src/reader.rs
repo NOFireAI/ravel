@@ -12,8 +12,8 @@ use ravel_types::{Label, LabelSet, SeriesId};
 use crate::crc::page_crc;
 use crate::error::SegmentError;
 use crate::format::{
-    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, SegmentVersion, compression, page_comp, page_enc,
-    section_kind,
+    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, SegmentVersion, compression, page_comp,
+    page_enc, section_kind,
 };
 use crate::histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 use crate::varint::{read_uvarint, read_zigzag_varint};
@@ -205,13 +205,8 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
     let footer_end_in_tail = tail.len() - TRAILER_LEN_USIZE;
     let footer_bytes = &tail[footer_start_in_tail..footer_end_in_tail];
 
-    let expected_crc = crate::crc::footer_crc(
-        footer_bytes,
-        footer_len,
-        version.number(),
-        signal,
-        reserved,
-    );
+    let expected_crc =
+        crate::crc::footer_crc(footer_bytes, footer_len, version.number(), signal, reserved);
     if expected_crc != footer_crc32c {
         return Err(SegmentError::FooterCrcMismatch);
     }
