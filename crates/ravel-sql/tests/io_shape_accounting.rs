@@ -360,12 +360,12 @@ async fn wire_rendering_names_each_phase_exactly_once_on_a_real_query() {
 /// min. The case where the `.min(shared_get_permits)` bound actually binds
 /// (a `GetLimiter` narrower than `sql_partition_count`) is pinned separately,
 /// by `service_batches_is_bound_by_shared_get_limiter_permits_not_partition_count`
-/// below. `plan_class` is the pair this test exists to pin post-fix: the
-/// `Metrics` target still tells a pruned fetch from a full scan via
-/// `Snapshot::segments_pruned`, so the pruned single-segment query classifies
-/// as `SelectiveIndexed` (one of the two window segments was excluded) and
-/// the unpruned two-segment query as `ExhaustiveScan` (no segment was
-/// excluded) -- neither is `Unclassified`, because that fix only changed the
+/// below. `plan_class` is the pair this test pins: the `Metrics` target still
+/// tells a pruned fetch from a full scan via `Snapshot::segments_pruned`, so
+/// the pruned single-segment query classifies as `SelectiveIndexed` (one of
+/// the two window segments was excluded) and the unpruned two-segment query
+/// as `ExhaustiveScan` (no segment was excluded) -- neither is
+/// `Unclassified`, because `Unclassified` applies only to the
 /// `Logs`/`Spans`/`Alerts`/`Audit` targets, not `Metrics`.
 #[tokio::test]
 async fn io_shape_pins_dependency_depth_service_batches_and_plan_class() {
@@ -474,15 +474,13 @@ async fn publish_log_segment(store: &dyn ObjectStoreBackend, tenant_id: &TenantI
         .expect("publish logs commit record");
 }
 
-/// The `Logs`/`Spans`/`Alerts`/`Audit` targets' resolve always passes
-/// `name_filter: None` (`resolve_admitted` in `executor.rs`), so
-/// `Snapshot::segments_pruned` is structurally always 0 for them and
-/// reporting `SelectiveIndexed`/`ExhaustiveScan` off it would be fabricated;
-/// `sql_io_shape` reports `PlanClass::Unclassified` for all four instead.
-/// This pins that over a real executed `FROM logs` query, so a regression
-/// that routes the `Logs` arm back through the `Metrics`-style
-/// pruned/unpruned classification is caught here rather than only by a
-/// downstream plan-shape lint keyed on `planClass`.
+/// The `Logs`/`Spans`/`Alerts`/`Audit` targets report
+/// `PlanClass::Unclassified` (see that variant's doc on
+/// `ravel_query::io_shape::PlanClass` for why). This pins that over a real
+/// executed `FROM logs` query, so a regression that routes the `Logs` arm
+/// back through the `Metrics`-style pruned/unpruned classification is caught
+/// here rather than only by a downstream plan-shape lint keyed on
+/// `planClass`.
 #[tokio::test]
 async fn logs_query_reports_unclassified_plan_class() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());

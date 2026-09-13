@@ -222,6 +222,15 @@ impl SpanSegmentFetcher {
         self
     }
 
+    /// This fetcher's `GetLimiter` permit count (ADR-1195): the process-wide
+    /// GET concurrency bound, shared with every other fetcher and engine that
+    /// took the same `Arc` via [`Self::with_get_limiter`]. Mirrors
+    /// [`SegmentFetcher::get_limiter_permits`](crate::fetcher::SegmentFetcher::get_limiter_permits).
+    #[must_use]
+    pub fn get_limiter_permits(&self) -> usize {
+        self.get_limiter.permits()
+    }
+
     /// Overrides the [`RspanConfig`] used for section-size caps when decoding.
     #[must_use]
     pub fn with_config(mut self, cfg: RspanConfig) -> Self {

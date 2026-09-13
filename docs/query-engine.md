@@ -2139,12 +2139,12 @@ leftover request, so the model is one round too many. The same sliding
   any segment is opened, from the query's shape and the resolve's own
   pruning outcome, not from the fetch's actual cost.
 
-  `ravel-sql`'s `sql_io_shape` reports the same `unclassified` value for the
-  same reason on its `Logs`/`Spans`/`Alerts`/`Audit` targets: `resolve_admitted`
-  hardcodes `name_filter: None` for those targets too, so `segments_pruned`
-  is structurally 0 there regardless of window width. Only a `Metrics`
-  target's resolve carries a real name-postings filter, so only `Metrics`
-  distinguishes `selective_indexed` from `exhaustive_scan` on the SQL side.
+  `ravel-sql`'s `sql_io_shape` reports the same `unclassified` value on its
+  `Logs`/`Spans`/`Alerts`/`Audit` targets, for the same structural reason (see
+  `ravel_query::io_shape::PlanClass::Unclassified`'s own doc comment for the
+  full rationale). Only a `Metrics` target's resolve carries a real
+  name-postings filter, so only `Metrics` distinguishes `selective_indexed`
+  from `exhaustive_scan` on the SQL side.
   This does not yet cover SQL's metadata-only fast paths (a predicate-free
   `SELECT COUNT(*)` answered from partition statistics, or a declared-column
   min/max/count answered from ingest stamps, both with no scan node in the

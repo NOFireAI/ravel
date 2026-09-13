@@ -735,6 +735,17 @@ impl LogSegmentFetcher {
         self.block_range.get_limiter_for_test()
     }
 
+    /// This fetcher's `GetLimiter` permit count (ADR-1195): the bound both
+    /// its own whole-object funnel and the block-range path draw from, and,
+    /// when wired via [`Self::with_get_limiter`], the process-wide GET
+    /// concurrency bound shared with every other fetcher and engine holding
+    /// the same `Arc`. Mirrors
+    /// [`SegmentFetcher::get_limiter_permits`](crate::fetcher::SegmentFetcher::get_limiter_permits).
+    #[must_use]
+    pub fn get_limiter_permits(&self) -> usize {
+        self.get_limiter.permits()
+    }
+
     /// Pins the block-range fetcher's suffix-probe length
     /// ([`BlockRangeFetcher::with_suffix_len`]), overriding the per-object
     /// derivation ([`derive_suffix_len`], #883). This is the seam a measurement

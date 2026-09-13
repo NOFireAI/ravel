@@ -123,6 +123,41 @@ mod tests {
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());
     }
 
+    /// `phase_costs_json`'s per-phase key set is exactly the eleven fields
+    /// below, no more and no fewer, matching `ravel_query::http::json`'s
+    /// PromQL `stats.phases` rendering (`http/json.rs`'s `PhaseCostJson`)
+    /// exactly: a renamed, added, or dropped key here would otherwise ship
+    /// silently, since the two renderings are independently maintained.
+    /// Exact set equality, not a per-key `contains`, so a stray extra key
+    /// fails this the same way a missing one does.
+    #[test]
+    fn phase_costs_json_names_every_field_exactly_once() {
+        let phases = PhaseAccounting::new();
+        let snapshot = phases.snapshot();
+        let entries = phase_costs_json(&snapshot);
+        let expected: std::collections::BTreeSet<&str> = [
+            "phase",
+            "s3GetRequests",
+            "s3GetWireBytes",
+            "s3ListRequests",
+            "cacheHits",
+            "cacheMisses",
+            "cacheServedBytes",
+            "decompressedOutputBytes",
+            "reusedRegionBytes",
+            "segmentsOpened",
+            "seriesMatched",
+        ]
+        .into_iter()
+        .collect();
+        for entry in &entries {
+            let object = entry.as_object().expect("phase entry renders an object");
+            let keys: std::collections::BTreeSet<&str> =
+                object.keys().map(String::as_str).collect();
+            assert_eq!(keys, expected);
+        }
+    }
+
     /// `io_shape_json`'s key set is exactly the six fields below, no more and
     /// no fewer: a renamed or newly-added `QueryIoShape` field that isn't
     /// wired into this renderer would otherwise ship silently, since nothing

@@ -478,8 +478,7 @@ async fn max_s3_requests_rejects_before_every_segment_is_fetched() {
     );
 }
 
-/// Regression for PR #1665's fix round (blocking finding on `scan.rs`): a
-/// `PhaseAccounting` built by `pooled_over` has four phases that are clones
+/// A `PhaseAccounting` built by `pooled_over` has four phases that are clones
 /// of one shared `QueryAccounting`, so reducing its snapshot with
 /// `.pooled()` reads that one counter four times and reports 4x the real
 /// total. `RsegScanExec`'s S3-request budget check must cost an aliased

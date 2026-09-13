@@ -619,15 +619,10 @@ impl LiveAccounting {
         self.lock().pooled_snapshot()
     }
 
-    /// Like [`Self::snapshot`], split by phase.
-    pub fn phase_snapshot(&self) -> PhaseAccountingSnapshot {
-        self.lock().snapshot()
-    }
-
     /// Point this view at `phase_accounting` (the attempt about to run).
     /// Clones the handle, so the two share the same four atomic counter
     /// blocks and every increment the attempt makes is visible through
-    /// [`Self::snapshot`]/[`Self::phase_snapshot`].
+    /// [`Self::snapshot`].
     fn install(&self, phase_accounting: &PhaseAccounting) {
         *self.lock() = phase_accounting.clone();
     }
@@ -1745,8 +1740,11 @@ impl SqlExecutor {
         phase_accounting: &PhaseAccounting,
         unfolded_segments_resolved: u64,
     ) -> QueryIoShape {
-        let whole_object_threshold = match target {
-            TargetSignal::Metrics => self.fetcher.whole_object_threshold(),
+        let (whole_object_threshold, shared_get_permits) = match target {
+            TargetSignal::Metrics => (
+                self.fetcher.whole_object_threshold(),
+                self.fetcher.get_limiter_permits() as u64,
+            ),
             // `block_range_threshold` is the knob `plan_segment` itself
             // routes on (`log_fetcher.rs:1368,1398`): at or below it there is
             // no probe at all and the read is one whole-object GET, above it
@@ -1756,9 +1754,10 @@ impl SqlExecutor {
             // pre-probe crossover inside `BlockRangeFetcher`
             // (`log_fetcher.rs:4481`) and would be the wrong choice here;
             // alerts and audit read through this same `log_fetcher`.
-            TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => {
-                self.log_fetcher.block_range_threshold()
-            }
+            TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => (
+                self.log_fetcher.block_range_threshold(),
+                self.log_fetcher.get_limiter_permits() as u64,
+            ),
             // `SpanSegmentFetcher` has no block-range/whole-object split: it
             // always issues one whole-object GET per segment, so every span
             // segment with a nonzero `object_size` reports dependency depth 1
@@ -1767,7 +1766,7 @@ impl SqlExecutor {
             // depth 4 (see its own doc comment); a published commit record
             // should never carry a zero object size, so that case does not
             // arise here in practice.
-            TargetSignal::Spans => u64::MAX,
+            TargetSignal::Spans => (u64::MAX, self.span_fetcher.get_limiter_permits() as u64),
         };
         let mut counts = IoShapeCounts::default();
         let depth = snapshot
@@ -1782,13 +1781,16 @@ impl SqlExecutor {
         // The two bounds `service_batches` divides by, mirroring
         // `ravel_query::engine::io_shape_for_resolve`: the fan-out this
         // crate's own scan partitions the segments into
-        // (`sql_partition_count`) and the permit count of the process-wide
-        // `GetLimiter` every fetcher this executor holds shares (ADR-1195).
-        // Reading the permits off the fetcher rather than caching them here
-        // keeps one source of truth, exactly like the PromQL engine reads
-        // its own `get_limiter` rather than a copy.
+        // (`sql_partition_count`) and `target`'s own fetcher's permit count,
+        // read off the same per-target match as `whole_object_threshold`
+        // above. The three fetchers this executor holds are not guaranteed to
+        // share one `GetLimiter` (ADR-1195 lets a caller wire each to its own
+        // private limiter, which `crates/ravel-bench/src/sql_latency.rs`'s
+        // `cold_executor` does for its logs fetcher); reading permits off
+        // `target`'s own fetcher rather than a fixed one keeps this figure
+        // correct regardless of how the embedder wired them, exactly like the
+        // PromQL engine reads its own `get_limiter` rather than a copy.
         let concurrency = self.config.engine.sql_partition_count().max(1) as u64;
-        let shared_get_permits = self.fetcher.get_limiter_permits() as u64;
         counts.record_service_batches(ravel_query::io_shape::service_batches(
             snapshot.segments.len() as u64,
             concurrency.min(shared_get_permits),
@@ -1799,13 +1801,9 @@ impl SqlExecutor {
         // A metrics query's resolve carries a real pruning signal
         // (`pushed_down_name_filter` above), so its `Snapshot::segments_pruned`
         // genuinely distinguishes a pruned fetch from a full scan. The
-        // RLOG/RSPAN/alerts/audit lanes' resolve always passes `name_filter:
-        // None` (see `resolve_admitted` above), so `segments_pruned` is
-        // structurally always 0 for them regardless of whether the resolved
-        // window is actually narrow: reporting `ExhaustiveScan` there would be
-        // fabricated, matching the PromQL log lane's own
-        // `PlanClass::Unclassified` (`ravel_query::engine`'s
-        // `log_plan_class`).
+        // RLOG/RSPAN/alerts/audit lanes report `PlanClass::Unclassified`
+        // instead; see that variant's doc on
+        // `ravel_query::io_shape::PlanClass` for why.
         //
         // This does not yet distinguish SQL's metadata-only fast paths (a
         // predicate-free `SELECT COUNT(*)` answered from partition statistics
