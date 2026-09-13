@@ -55,7 +55,7 @@ pub use config::{
 pub use covering_postings::{LoadPostingsError, LoadedCoveringPostings, load_covering_postings};
 pub use declared_stats::{DeclaredColumnStats, read_snapshot_entry};
 pub use error::CatalogError;
-pub use fold::{FoldReport, PostingsBuildError, Transaction, fetch_segment_names};
+pub use fold::{FoldReport, PostingsBuildError, RefoldRequest, Transaction, fetch_segment_names};
 pub use key_epoch::{
     EpochDefect, KEY_EPOCH_FORMAT_VERSION, KEY_EPOCH_MAX_READ_VERSION, KEY_EPOCH_MIN_READ_VERSION,
     KeyEpoch, KeyEpochError, KeyEpochOutcome, enc_key, epoch_for_write, read_epochs,
