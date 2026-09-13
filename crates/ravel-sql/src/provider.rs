@@ -313,6 +313,20 @@ impl TableProvider for RavelTableProvider {
         // dedup's single partition, so the SQL determinism ban is untouched.
         #[cfg(feature = "flight-sql")]
         if let Some(dist) = &self.distributed {
+            // The last step of the fan-out's failure sequence is this
+            // coordinator reading the slice itself (crate::distributed,
+            // "Failure behavior"), so it is built from exactly what the local
+            // scan path below uses: the same tenant, fetcher, config, and
+            // accounting handle. One dead but still-registered worker then
+            // costs the slices assigned to it one failed attempt each, not the
+            // statement.
+            let local: Arc<dyn crate::distributed::WorkerSliceClient> =
+                Arc::new(crate::distributed::CoordinatorSliceReader::new(
+                    self.tenant_hash,
+                    self.fetcher.clone(),
+                    self.config.clone(),
+                    self.phase_accounting.clone(),
+                ));
             let plan = crate::distributed::distributed_samples_plan(
                 dist.endpoints.clone(),
                 Arc::clone(&dist.client),
@@ -320,6 +334,7 @@ impl TableProvider for RavelTableProvider {
                 _limit,
                 self.phase_accounting.scan().clone(),
                 self.config.engine.max_bytes_scanned,
+                crate::distributed::SliceFallback::with_local(local),
             )?;
             return self.apply_projection(plan, projection);
         }

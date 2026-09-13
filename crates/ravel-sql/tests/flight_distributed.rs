@@ -626,6 +626,7 @@ async fn distributed_plan_shape_is_dedup_over_merge_over_scan() {
         None,
         QueryAccounting::new(),
         ByteLimit::Unlimited,
+        SliceFallback::remote_only(),
     )
     .expect("distributed plan");
 
