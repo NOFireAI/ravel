@@ -8,6 +8,15 @@ restore procedure, rehearsal-derived RPO/RTO). Decisions 1-4 stand
 unchanged and become load-bearing steps of that runbook's restore
 reconciliation.
 
+Amended (issue #528): decision 6 below makes orphan GC recoverable at every
+scale, not just observable. The orphan-presence gauge (decision 1) closes
+the *detection* gap for small loss but not the *permanence* gap: below the
+mass-orphan breaker's thresholds the sweeper still deleted the data at the
+first horizon. Decision 6 replaces that direct delete with a
+quarantine-then-reap, so a small out-of-band commit-record loss is
+recoverable for a second horizon instead of permanent. Decisions 1-5 stand
+unchanged.
+
 ## Context
 
 Commit records are the sole metadata root in Ravel. A reader trusts nothing
@@ -254,6 +263,35 @@ work this ADR does not build; and includes this epic's reconstruction
 tool as the recovery path for the one failure mode (commit-record loss)
 that this program does close today.
 
+### 6. Quarantine orphan candidates instead of deleting (issue #528)
+
+Orphan GC no longer physically deletes a record-less L0 data object at the
+first horizon. Once a candidate clears the age gate, the batched re-verify,
+and the (untripped or overridden) breaker, the sweeper moves it to a
+`quarantine/<original key>/q<quarantined_at_ns>` key and a reaper deletes it
+only after a second horizon, `quarantine_horizon_ns` (default 7 days,
+`crates/ravel-maintain/src/config.rs`). The move is copy-first,
+delete-second: the bytes are copied to the quarantine key and only then is
+the live key deleted, so a crash or store fault between the two never
+destroys the only copy; a candidate whose copy fails is left live, counted,
+and retried, and the live delete never runs for it. The quarantine key
+carries its own timestamp (read by the reaper, not the copy's store
+`last_modified`) and the whole original key verbatim, so recovery is a copy
+of the bytes back to the original key. The reaper lists the per-shard
+quarantine prefix on the same maintain tick as the sweep, fails closed on a
+key whose timestamp does not parse, and is the only place orphan-GC'd data is
+physically removed; without it the `quarantine/` prefix would leak, so it is
+part of this decision, not a follow-up. `force_orphan_gc` still quarantines
+rather than deletes, keeping the recovery window even for a forced pass.
+
+This closes the permanence half of the gap decision 1 only made visible: the
+orphan-presence gauge tells an operator a small loss happened, but before
+this the data was already scheduled for permanent deletion at hour ~25 and
+nothing gave the operator time to act. A quarantined object is recoverable
+for a week and reported per pass by `ravel_maintain_orphans_quarantined` and
+`ravel_maintain_orphans_quarantine_refused`, with a `warn`-level event on any
+nonzero count.
+
 ## Rejected alternatives
 
 **Reconstruct via `verify-custody`'s existing scan, extended.**
@@ -273,6 +311,34 @@ deleting records specifically to trigger a mass "repair" that writes
 attacker-controlled data) — out of scope for this ADR's threat model,
 but a reason not to remove the human step regardless.
 
+**Make the deletion loud instead of recoverable (decision 6).** The issue
+frames the fix as "recoverable OR loud", and the loud-only option is: keep
+deleting below the breaker but refuse without an operator acknowledgement, or
+emit a distinct alarm on every orphan delete. Rejected. A pure alarm does not
+change the outcome — the data is still permanently gone the moment the sweep
+runs, and decision 1's orphan-presence gauge is already the loud signal for
+small loss, yet the acceptance criterion this epic serves ("no data object
+deleted without a recovery path for an accidental record loss") is about
+permanence, not just visibility. Refuse-and-require-acknowledgement was
+rejected because orphans are routine (crash remnants, abandoned flushes clear
+this path constantly), so gating every orphan delete on a human turns normal
+cleanup into perpetual operator toil and trains operators to rubber-stamp the
+prompt, which is worse than silence. Quarantine gives both properties at once:
+it is loud (the quarantined/refused counters and their events) and
+recoverable (a week-long window and a verbatim original key), and it keeps
+routine cleanup fully automatic — the object still leaves the live keyspace
+immediately, only its physical deletion is deferred. Its cost, a second
+storage horizon and a reaper to bound it, is accepted and built here rather
+than deferred.
+
+**Quarantine with no reaper (rely on lifecycle rules to expire the prefix).**
+Rejected: it trades a data-loss bug for a storage-leak bug, and a bucket
+lifecycle rule expiring `quarantine/` is exactly the class of out-of-band
+deletion this ADR exists to defend against — it would delete recoverable data
+on a schedule Ravel does not control and cannot reason about. The reaper is in
+Ravel, gated on the injected clock and the key's own timestamp, and fails
+closed on a malformed key.
+
 **Treat `last_modified`-derived `created_unix_ns` as exact and skip
 documenting the approximation.** Rejected on Ravel's own "exact semantics
 by default, approximation opt-in and visible" invariant — the honest
@@ -290,6 +356,12 @@ the fix is a few lines against data the sweeper already computes.
   presence gauge catches small-scale record loss the breaker's
   ratio/count thresholds are too coarse for; the reconstruction tool
   recovers from it once noticed.
+- **Small loss is recoverable, not just visible (decision 6, issue #528).**
+  Orphan GC quarantines below the breaker instead of deleting, so an
+  operator has a second horizon (default 7 days) to restore the lost commit
+  records or copy the bytes back before the loss becomes permanent. The cost
+  is a second storage horizon per quarantined object and a reaper to bound the
+  `quarantine/` prefix.
 - **Reconstructed records are honest approximations on two fields**
   (`created_unix_ns` from data-object `last_modified`, not the true
   flush-open time; and for RLOG, `ingest_hour_bucket` derived rather than

@@ -19,7 +19,11 @@ retention tombstone, a compaction record, or a rewrite record), then logical
 exclusion from new snapshots, then physical removal via a sweeper. Orphan
 collection, which removes objects no commit record ever published, has no
 record to anchor on and is gated by age and a fresh re-listing instead (the
-first rule below). One sweeper component implements all rules below; all are
+first rule below). Orphan collection does not delete the object outright: it
+moves it to a `quarantine/` prefix for a second horizon and a reaper deletes it
+only after that, so a small out-of-band commit-record loss below the
+mass-orphan breaker's thresholds is recoverable rather than permanent
+(ADR-0058 amendment; see the orphan-GC section below). One sweeper component implements all rules below; all are
 stateless per pass and restartable from zero, and every delete is
 idempotent. Reader leases are not implemented: the "not lease-protected"
 precondition holds trivially everywhere below, because the `LeaseCheck`
@@ -110,7 +114,8 @@ own parameters, not gaps a correctly declared config leaves open.
 
 | rule | targets | preconditions (ALL must hold) | anchor |
 |---|---|---|---|
-| orphan (first implementation, ADR-0010 §11; batched re-verify and breaker, ADR-0048 decisions 4-5) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified by one fresh LIST shared by every candidate in the pass; the mass-orphan circuit breaker not tripped (or deliberately overridden) | object last_modified |
+| orphan (first implementation, ADR-0010 §11; batched re-verify and breaker, ADR-0048 decisions 4-5; quarantine, ADR-0058 amendment) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified by one fresh LIST shared by every candidate in the pass; the mass-orphan circuit breaker not tripped (or deliberately overridden). A candidate that clears these is moved to `quarantine/`, not deleted | object last_modified |
+| quarantine reaper (ADR-0058 amendment) | a `quarantine/<original key>/q<ns>` object an orphan pass moved out of the live keyspace | age since the quarantine timestamp embedded in the key > quarantine_horizon (default 7 days); a key whose `/q<ns>` segment does not parse is skipped, never deleted | quarantine key's own `/q<ns>` timestamp |
 | superseded input (ADR-0018, HEAD-reachability gate ADR-0020) | L0 commit records + data objects named in a compaction or rewrite record's input list, or a whole superseded predecessor record together with the parts it names | now >= record.created_unix_ns + protection_horizon; the live catalog HEAD snapshot names none of the objects the delete would remove (delete blocker, see below) | compaction or rewrite record created_unix_ns |
 | unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
 | retention (ADR-0019, HEAD-reachability gate ADR-0020) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; the live catalog HEAD snapshot names no object inside the bucket (delete blocker, see below); bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
@@ -195,8 +200,10 @@ window would still call a Hit.
   that same commit prefix, shared by every surviving candidate, dropping
   any whose identity now appears (the batched re-verify, ADR-0048 decision
   5, one extra LIST per pass, not one per candidate); then the
-  mass-orphan circuit breaker gate below. Deletes are all-or-nothing: a
-  tripped, non-overridden breaker deletes zero candidates that pass.
+  mass-orphan circuit breaker gate below; then, for every surviving
+  candidate, a move to quarantine (see "Quarantine and the second horizon"
+  below), never a direct delete. The breaker is all-or-nothing: a
+  tripped, non-overridden breaker quarantines zero candidates that pass.
 - The mass-orphan circuit breaker (ADR-0048 decision 4) trips when a
   pass's surviving candidate count is at least `orphan_breaker_min_count`
   (default 50) AND exceeds `orphan_breaker_max_ratio` (default 0.10) of
@@ -240,6 +247,56 @@ window would still call a Hit.
   never sets. The other two sweep rules are unaffected by a tripped
   orphan breaker and still run, since they are anchored on durable records
   an operator or compactor deliberately wrote, never on record absence.
+
+### Quarantine and the second horizon (ADR-0058 amendment)
+
+The breaker catches mass loss but, by design, lets small or thinly-spread
+loss through: fewer than `orphan_breaker_min_count` candidates, or a count
+under `orphan_breaker_max_ratio` of a large shard, does not trip it (the
+three scope limits above). Before this amendment those candidates were
+deleted permanently at the first horizon, so an out-of-band commit-record
+loss below the thresholds became permanent data loss with no recovery
+window and nothing paging. Orphan GC therefore no longer deletes a
+candidate at all. It moves each surviving candidate to a `quarantine/`
+prefix and a separate reaper deletes it only after a second horizon:
+
+- **The move is copy-first, delete-second.** An object store has no atomic
+  rename, so the move is a copy (`get` the bytes, `put` them under
+  `quarantine/<original key>/q<quarantined_at_ns>`) followed by a delete of
+  the live key. The copy always precedes the delete, so a crash or a store
+  fault between the two leaves the bytes in at least one location, never
+  none. A candidate whose copy fails is left live and counted as refused
+  (`ravel_maintain_orphans_quarantine_refused`), and the live delete never
+  runs for it; the candidate is retried on the next pass. The `put` is an
+  overwrite, so re-quarantining the same object after a crash is idempotent.
+- **The quarantine key carries its own timestamp.** The trailing `/q<ns>`
+  segment records when the object was quarantined, taken from the injected
+  clock. The reaper reads the second horizon from that segment, not from the
+  copy's store `last_modified`, so the horizon is deterministic and does not
+  depend on the store preserving a copy's modification time. The whole
+  original key is preserved verbatim (strip the `quarantine/` prefix and the
+  `/q<ns>` segment) so an operator can copy the bytes back to their original
+  key to recover.
+- **The reaper is the only place orphan-GC'd data is physically deleted.**
+  It lists `quarantine/t/<tenant_hash>/<signal>/l0/<shard>/`, and for each
+  object whose embedded timestamp is more than `quarantine_horizon_ns`
+  (default 7 days) behind the clock, deletes it. A key whose `/q<ns>`
+  segment cannot be parsed is skipped, never deleted (fail-closed: an
+  unreadable age is treated as not-yet-expired). It runs on the same
+  maintain tick as the sweep, whole-shard like orphan GC itself (quarantine
+  keys are not hour-bucketed), and is stateless and idempotent.
+- **The event is visible.** A pass reports objects quarantined
+  (`ravel_maintain_orphans_quarantined`, equal to the retained
+  `orphans_deleted` count of candidates removed from the live set), refused,
+  and reaped, and emits a `warn`-level tracing event for each nonzero
+  count, so an operator can alert on quarantine activity below the breaker
+  without waiting for the breaker to trip.
+
+The cost is storage: a quarantined object occupies the bucket for the
+second horizon before it is reclaimed, and the `quarantine/` prefix would
+leak without the reaper, which is why the reaper is part of the mechanism,
+not a follow-up. `force_orphan_gc` (the breaker override) still quarantines
+rather than deletes, so even a forced pass keeps the recovery window.
 
 ## Superseded input and unreferenced part
 
