@@ -104,6 +104,14 @@ pub enum RedactError {
 /// is never partially redacted, because returning the redacted prefix of a
 /// batch whose remainder went unredacted would still leak.
 pub fn redact(query: &str, token_key: &[u8; 32]) -> Result<String, RedactError> {
+    // This is the second entry point that parses caller text, and it is NOT
+    // behind `validate`: `sql_execute` audits the raw statement before it
+    // returns the executor's result, so text that `validate` just rejected as
+    // too complex still arrives here. Both walks below recurse per tree level
+    // (`VisitMut::visit`, then `Display`), and the parser's own recursion limit
+    // does not bound a flat operator chain, so the guard has to run here too.
+    // `ravel-promql`'s redact carries the same call for the same reason.
+    crate::complexity_guard::check(query).map_err(|_| RedactError::Parse)?;
     let mut statements = DFParser::parse_sql(query).map_err(|_| RedactError::Parse)?;
 
     let mut redactor = LiteralRedactor {
@@ -563,5 +571,53 @@ mod tests {
             !unsup_err.to_string().contains("alice"),
             "Unsupported Display leaked a literal: {unsup_err}"
         );
+    }
+
+    /// The audit-redaction path takes untrusted text that `validate` never
+    /// admitted: `sql_execute` audits `request.sql` before it returns the
+    /// executor's result, so a statement rejected as too complex still reaches
+    /// `redact`. Both walks here recurse per tree level, so without the guard
+    /// this aborts the process on a flat operator chain, which is the #1680
+    /// failure on the surface that ticket did not cover.
+    ///
+    /// The chain runs at [`MAX_STATEMENT_COMPLEXITY`] + 1 rather than at the
+    /// half-million of the execution-path test: the point here is that the
+    /// bound is enforced at all on this entry point, and a test that overflows
+    /// the stack to prove it would abort the whole test binary.
+    ///
+    /// Flip to watch it fail: delete the `complexity_guard::check` call at the
+    /// top of `redact`. The over-bound statement then parses and is redacted,
+    /// and the `expect_err` below panics.
+    #[test]
+    fn an_over_complex_statement_is_refused_before_it_is_parsed() {
+        let chain = "+1".repeat(crate::complexity_guard::MAX_STATEMENT_COMPLEXITY);
+        let sql = format!("SELECT 1{chain}");
+        assert!(
+            crate::complexity_guard::structural_count(&sql)
+                > crate::complexity_guard::MAX_STATEMENT_COMPLEXITY,
+            "the probe must exceed the bound to be testing anything"
+        );
+
+        let err = redact(&sql, &KEY_A).expect_err("an over-bound statement is refused");
+        assert!(
+            matches!(err, RedactError::Parse),
+            "the guard maps to the input-independent Parse label, not a new variant: {err}"
+        );
+    }
+
+    /// The mirror: a statement at the bound is still redacted normally, so the
+    /// guard cannot be satisfied by refusing everything.
+    #[test]
+    fn a_statement_within_the_bound_is_still_redacted() {
+        let sql = "SELECT value FROM samples WHERE service = 'checkout'";
+        assert!(
+            crate::complexity_guard::structural_count(sql)
+                <= crate::complexity_guard::MAX_STATEMENT_COMPLEXITY,
+            "this probe must sit inside the bound"
+        );
+
+        let out = redact(sql, &KEY_A).expect("redacts");
+        assert!(!out.contains("checkout"), "string literal leaked: {out}");
+        reparse(&out);
     }
 }
