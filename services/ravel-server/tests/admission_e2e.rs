@@ -120,6 +120,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         oidc_refresh: None,
         otap: false,
         metrics_tenant_labels: false,
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         limits: LimitsConfig {
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,

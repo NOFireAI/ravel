@@ -240,27 +240,43 @@ loud, attributable rejection spike (honest clients' current timestamps fall
 outside the bad clock's shifted window and are rejected `reason="skew"`)
 instead of silent pollution of the hour-partitioned layout.
 
-## Raising max_ingest_lag: a coordinated change
+## Raising max_ingest_lag to replay old telemetry
 
-`max_ingest_lag` is one shared bound, not a per-signal one, in the sense
-that matters operationally: the three admission checks (metrics, logs, spans)
-and the catalog listing window each hold their own `max_ingest_lag_ns`
-constant, duplicated rather than shared by reference. Maintenance carries a
-startup equality assertion against its own copy, and that assertion plus
-convention is the whole of the enforcement: nothing else keeps the values
-equal, which is exactly why the coordinated-raise rule below exists. The
-admission bound decides what old data is *admitted*;
-the listing window decides what old data is *discoverable*. If you raise the
-admission lag alone, you admit and acknowledge records that the listing
-window can then fail to find on any non-token query.
+`max_ingest_lag` is one shared bound, not a per-signal one: the three
+admission checks (metrics, logs, spans) and the catalog listing window each
+hold their own `max_ingest_lag_ns` constant. The admission bound decides what
+old data is *admitted*; the listing window decides what old data is
+*discoverable*. Admitting records the listing window cannot find loses them
+silently on any non-token query, so the two must move together: widen the
+catalog window first, then the admission bound. Lowering the bound is always
+safe.
 
-Raising the admission lag for a signal or tenant is therefore legal only
-together with the catalog-side listing-window config: widen the catalog
-window first, then the admission bound. Lowering the admission lag is always
-safe. This is the same coordinated-config discipline `max_flush_lifetime`
-follows between writers and folders
-([catalog-and-mvcc.md](../catalog-and-mvcc.md), "Config discipline"); the
-normative statement of this rule lives in
+The `--max-ingest-lag` flag makes that coordinated move a single knob. One
+value drives both the catalog listing window
+(`ravel_catalog::CatalogConfig::max_ingest_lag_ns`) and all three OTLP
+admission bounds
+(`IngestLimits`/`LogIngestLimits`/`SpanIngestLimits::max_ingest_lag_ns`),
+resolved so the window is set first and the admission bound derived from it,
+so the "widen the window first" order holds by construction and the two can
+never be set inconsistently. It defaults to `2h`; omitting it is
+byte-identical to before the flag existed. Set it to replay telemetry older
+than 2h after an outage, or to bulk-import an archive:
+
+```
+ravel-server --max-ingest-lag 720h ...
+```
+
+The change takes effect at startup and reaches every network ingest surface
+at once (OTLP HTTP, OTLP gRPC, OTAP, Remote Write, and the span surface). It
+is a humantime duration (e.g. `2h`, `720h`, `30d`); a zero duration is
+rejected. Startup also refuses a value the catalog listing window cannot
+serve, naming both values, rather than silently admitting data no query can
+find. Because the flag couples the two bounds, the raise still respects the
+`max_flush_lifetime` retention-floor discipline
+([catalog-and-mvcc.md](../catalog-and-mvcc.md), "Config discipline"): a
+`--max-ingest-lag` above the configured retention window fails startup at the
+ADR-0019 retention-floor check. The normative statement of the late-data rule
+lives in
 [consistency-model.md](../consistency-model.md#late-and-skewed-data).
 
 ## Fleet-wide enforcement via reconciliation

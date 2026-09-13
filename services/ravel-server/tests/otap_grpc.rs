@@ -71,6 +71,7 @@ async fn start_test_server() -> ravel_server::Running {
         otap: true,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
@@ -141,6 +142,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         oidc_refresh: None,
         otap: true,
         metrics_tenant_labels: false,
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         limits: LimitsConfig {
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,
@@ -219,6 +221,7 @@ async fn start_test_server_fault(
         otap: true,
         metrics_tenant_labels: false,
         limits: LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
