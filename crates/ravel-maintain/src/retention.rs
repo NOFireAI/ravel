@@ -23,7 +23,19 @@
 //!    with an injected `retired_at_ns`. It is durable and irreversible:
 //!    raising `R` later never resurrects a tombstoned bucket (ADR-0019
 //!    decision 2).
-//! 3. **Physical sweep** runs once `now >= retired_at_ns + protection_horizon`,
+//! 3. **Version hold** (ADR-0066 decisions 1 and 2) runs before any delete in
+//!    the physical sweep. Each data object the sweep is about to delete is
+//!    probed for its trailer version through a 16-byte suffix GET, and the
+//!    answer is a typed classification, never a string: readable here, outside
+//!    this build's reader window, or corrupt. An object outside the window is
+//!    not garbage -- a peer running the other side of a rolling upgrade, or the
+//!    build a rollback returns to, reads it normally -- so the sweep declines to
+//!    delete anything in that bucket this pass, leaves the tombstone in place,
+//!    counts the hold, and reports `SweptPartial`. A corrupt object is swept as
+//!    before: no build can read it, holding it protects nothing. This narrows
+//!    ADR-0066 decision 4's "retention ages old-version objects out" to objects
+//!    this build can actually read; see that ADR's 2026-09-13 amendment.
+//! 4. **Physical sweep** runs once `now >= retired_at_ns + protection_horizon`,
 //!    deleting in the fixed order L0 commit records, compaction records,
 //!    rewrite records, L0 data objects, L1 parts, then the tombstone last, and
 //!    only after a verifying LIST shows the bucket's commit prefix holds only
@@ -43,6 +55,8 @@
 //! declines when it lists a tombstone, but ADR-0019 calls that "an efficiency
 //! measure only": its absence would only waste work, never corrupt data.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use prost::Message;
 use ravel_commit::erasure;
 use ravel_commit::keys;
@@ -51,7 +65,8 @@ use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all,
 };
 use ravel_proto::commit::v1::{CommitRecord, CompactionRecord, RetentionTombstone, RewriteRecord};
-use ravel_types::TenantHash;
+use ravel_segment::{TRAILER_LEN, TrailerClass, classify_trailer};
+use ravel_types::{Signal, TenantHash};
 
 use crate::bucket::Bucket;
 use crate::clock::Clock;
@@ -68,6 +83,25 @@ use crate::sweep::LeaseCheck;
 /// names it here.
 pub use crate::reachability::{SnapshotBlock, SnapshotReachability};
 
+/// Counter seam for `ravel_maintain_retention_held_out_of_window_objects_total`
+/// (ADR-0066 decisions 1 and 2): data objects the physical sweep declined to
+/// delete because their trailer version is outside this build's reader window.
+///
+/// Process-wide and monotonic, incremented once per object per pass that
+/// declined it, so a nonzero rate (not just a nonzero total) is the signal: it
+/// means a deployment is refusing deletes right now because it is holding
+/// objects some other build can read. Holding is the safe answer to an
+/// unfinished rolling upgrade, and it is also the only way retention can retain
+/// data past its window, so this must not stay nonzero: the remedy is to finish
+/// the upgrade, complete `maintain migrate`, or roll back, after which the next
+/// pass sweeps the bucket normally.
+static HELD_OUT_OF_WINDOW_OBJECTS: AtomicU64 = AtomicU64::new(0);
+
+/// Read [`HELD_OUT_OF_WINDOW_OBJECTS`]. Zero on a healthy deployment.
+pub fn held_out_of_window_objects_total() -> u64 {
+    HELD_OUT_OF_WINDOW_OBJECTS.load(Ordering::Relaxed)
+}
+
 /// The outcome of one retention pass over a bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetentionOutcome {
@@ -80,9 +114,12 @@ pub enum RetentionOutcome {
     /// Expired: a tombstone is present (written this pass or already there)
     /// and the protection horizon has not elapsed, so no bytes were deleted.
     Tombstoned,
-    /// Tombstone present and horizon elapsed, but a verifying LIST still found
-    /// residue (a delete lost to a lease or a concurrent write), so the
-    /// tombstone was left in place for the next pass to finish.
+    /// Tombstone present and horizon elapsed, but the bucket was not emptied:
+    /// either a verifying LIST still found residue (a delete lost to a lease or
+    /// a concurrent write), or the sweep declined to delete anything because at
+    /// least one data object's format version is outside this build's reader
+    /// window (ADR-0066, see [`held_out_of_window_objects_total`]). Either way
+    /// the tombstone was left in place for the next pass to finish.
     SweptPartial,
     /// Tombstone present, horizon elapsed, bucket verified empty, tombstone
     /// deleted last: the bucket is fully retired.
@@ -469,6 +506,29 @@ async fn physical_sweep(
         .map(|meta| meta.key)
         .collect();
 
+    // Version hold (ADR-0066 decisions 1 and 2): before deleting anything,
+    // refuse if any data object about to be deleted carries a format version
+    // outside this build's reader window. Such an object is readable by the
+    // other side of a rolling upgrade and by the build a rollback returns to,
+    // so deleting it destroys data that is only unreadable HERE. The hold
+    // covers the whole bucket rather than the individual object: a commit
+    // record deleted while the object it names survives leaves that object
+    // undiscoverable, which loses the data by a slower route.
+    let held = held_out_of_window(store, bucket, &l0_data_keys, &l1_part_keys).await?;
+    if !held.is_empty() {
+        HELD_OUT_OF_WINDOW_OBJECTS.fetch_add(held.len() as u64, Ordering::Relaxed);
+        tracing::warn!(
+            tenant = %bucket.tenant_hash.to_hex(),
+            signal = ?bucket.signal,
+            shard = bucket.shard,
+            ingest_hour_bucket = bucket.ingest_hour_bucket,
+            held_objects = held.len(),
+            versions = ?held.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+            "retention sweep held a tombstoned bucket: format versions outside this build's reader window"
+        );
+        return Ok(RetentionOutcome::SweptPartial);
+    }
+
     // Deletion order (docs/consistency-model.md "Deletion and GC", ADR-0019
     // decision 4): records, then data objects, then L1 parts, tombstone last.
     delete_all(store, lease, &listing.commit_keys, dry_run).await?;
@@ -496,6 +556,65 @@ async fn physical_sweep(
         return Ok(RetentionOutcome::SweptPartial);
     }
     Ok(RetentionOutcome::Swept)
+}
+
+/// The data objects of one bucket whose format version is outside this build's
+/// reader window, as `(key, version)` pairs in probe order.
+///
+/// The distinction this draws is the whole point (ADR-0066 decision 2): a
+/// version this build does not admit and bytes no build can read are both
+/// "cannot read this", and collapsing them turns a rolling upgrade into data
+/// loss. It is drawn from [`ravel_segment::classify_trailer`]'s typed answer,
+/// which applies the same version gate a full read applies, so this cannot
+/// disagree with the reader about which versions are admitted. A corrupt object
+/// is deliberately NOT held: no build reads it, so holding it keeps nothing
+/// alive and would only stall the bucket forever.
+///
+/// Scope: RSEG (metrics) only. RLOG and RSPAN objects carry their own trailers
+/// and their own windows in `ravel-logseg` and `ravel-rspan`; probing them with
+/// the RSEG gate would report every one of them as corrupt, which is the exact
+/// collapse this function exists to prevent. Those two signals keep today's
+/// unconditional sweep until their readers grow the same probe (the remaining
+/// half of issue #530).
+///
+/// Cost: one 16-byte suffix GET per data object, charged to the sweep phase,
+/// and only in the pass that would delete (after the tombstone's protection
+/// horizon has elapsed and the HEAD-reachability gate is clear). The GET also
+/// returns the object's total size, so no separate HEAD is needed.
+async fn held_out_of_window(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    l0_data_keys: &[String],
+    l1_part_keys: &[String],
+) -> Result<Vec<(String, u16)>> {
+    if bucket.signal != Signal::Metrics {
+        return Ok(Vec::new());
+    }
+    let mut held = Vec::new();
+    for key in l0_data_keys.iter().chain(l1_part_keys.iter()) {
+        if let Some(version) = out_of_window_version(store, key).await? {
+            held.push((key.clone(), version));
+        }
+    }
+    Ok(held)
+}
+
+/// The trailer version of one RSEG object when it is outside this build's
+/// reader window, `None` when the object is readable here, is corrupt, or is
+/// already gone (a delete that a previous pass completed is not a hold).
+async fn out_of_window_version(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Result<Option<u16>> {
+    let got = match store.get(key, GetRange::Suffix(TRAILER_LEN)).await {
+        Ok(got) => got,
+        Err(StoreError::NotFound) => return Ok(None),
+        Err(e) => return Err(MaintainError::Store(e)),
+    };
+    match classify_trailer(got.total_size, got.data.as_ref()) {
+        TrailerClass::OutsideVersionWindow(version) => Ok(Some(version)),
+        TrailerClass::Readable(_) | TrailerClass::Corrupt(_) => Ok(None),
+    }
 }
 
 /// Delete each key idempotently, skipping any the [`LeaseCheck`] protects
