@@ -2267,6 +2267,13 @@ pub struct MaintenanceOwnershipSnapshot {
     pub units_stalled: u64,
     pub memo_warm_start_units: u64,
     pub full_sweep_passes_total: u64,
+    /// Unix nanoseconds the supervised maintenance loop last completed a cycle,
+    /// `0` if none has completed yet. Rendered as
+    /// `ravel_maintain_last_cycle_completed_timestamp_seconds`; its age is the
+    /// maintain-liveness signal (issue #1683).
+    pub last_cycle_completed_unix_ns: i64,
+    /// Panics the supervisor caught in the loop body and restarted after.
+    pub loop_panics_total: u64,
 }
 
 /// No `tenant_hash` label on any series here (ADR-0044 section 4): every
@@ -2347,6 +2354,42 @@ fn render_maintain_ownership_family(
         "ravel_maintain_full_sweep_passes_total",
         &[Label::Mode(mode)],
         snapshot.full_sweep_passes_total,
+    );
+
+    // The liveness gauge, and the only figure in this family that moves when the
+    // loop STOPS rather than when it runs. Every other maintenance gauge is
+    // written at the end of a cycle that completed, so a dead loop freezes them
+    // at their last healthy values; this one's age keeps growing. `0` means no
+    // cycle has completed since this process started, which is why the alert
+    // rule in docs/guides/observability.md carries a `for:` long enough to
+    // cover a freshly started process's first interval (issue #1683, mirroring
+    // ravel_catalog_fold_last_success_timestamp_seconds).
+    write_header(
+        out,
+        "ravel_maintain_last_cycle_completed_timestamp_seconds",
+        "Unix time the maintenance loop last completed a cycle in this process, 0 if none has completed yet. Its age is the maintain-liveness signal.",
+        "gauge",
+    );
+    write_sample_f64(
+        out,
+        "ravel_maintain_last_cycle_completed_timestamp_seconds",
+        &[Label::Mode(mode)],
+        snapshot.last_cycle_completed_unix_ns as f64 / 1e9,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_loop_panics_total",
+        "Panics caught in the maintenance loop body and restarted by the supervisor. \
+         The loop's only crash record: the supervisor keeps the pod up, so an \
+         increase() here is the signal that the loop is crash-looping.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_loop_panics_total",
+        &[Label::Mode(mode)],
+        snapshot.loop_panics_total,
     );
 }
 
@@ -4189,6 +4232,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                 units_stalled: metrics.units_stalled(),
                 memo_warm_start_units: metrics.memo_warm_start_units(),
                 full_sweep_passes_total: metrics.full_sweep_passes_total(),
+                last_cycle_completed_unix_ns: metrics.last_cycle_completed_unix_ns(),
+                loop_panics_total: metrics.loop_panics_total(),
             });
 
     let scrub_snapshot = state.scrub.as_ref().map(|metrics| ScrubSnapshot {
@@ -5579,6 +5624,49 @@ mod tests {
             assert_eq!(
                 samples, 3,
                 "{family} must render one series per folded signal and no other:\n{body}"
+            );
+        }
+    }
+
+    /// The maintenance-liveness gauge and panic counter render on `/metrics`
+    /// with the right TYPE lines and values (issue #1683), mirroring the fold
+    /// liveness family test above. The timestamp is driven with a fractional
+    /// second, so a renderer emitting nanoseconds where seconds are declared
+    /// (or truncating to whole seconds) fails here rather than reading as a
+    /// 54-year-old cycle at the alert.
+    #[test]
+    fn maintain_liveness_family_renders_the_gauge_and_panic_counter() {
+        let snapshot = MaintenanceOwnershipSnapshot {
+            workers_live: 1,
+            units_owned: 4,
+            units_stalled: 0,
+            memo_warm_start_units: 0,
+            full_sweep_passes_total: 7,
+            // 1_758_000_123_500_000_000 ns is 1758000123.5 s.
+            last_cycle_completed_unix_ns: 1_758_000_123_500_000_000,
+            loop_panics_total: 2,
+        };
+        let mut out = String::new();
+        render_maintain_ownership_family(&mut out, Mode::All, &snapshot);
+
+        assert!(
+            out.contains("# TYPE ravel_maintain_last_cycle_completed_timestamp_seconds gauge"),
+            "the liveness timestamp is a gauge, not a counter:\n{out}"
+        );
+        assert!(
+            out.contains("# TYPE ravel_maintain_loop_panics_total counter"),
+            "the panic tally is a counter:\n{out}"
+        );
+
+        for expected in [
+            "ravel_maintain_last_cycle_completed_timestamp_seconds{mode=\"all\"} 1758000123.5",
+            "ravel_maintain_loop_panics_total{mode=\"all\"} 2",
+            "ravel_maintain_full_sweep_passes_total{mode=\"all\"} 7",
+        ] {
+            assert_eq!(
+                out.lines().filter(|line| *line == expected).count(),
+                1,
+                "expected exactly one `{expected}` sample line:\n{out}"
             );
         }
     }
