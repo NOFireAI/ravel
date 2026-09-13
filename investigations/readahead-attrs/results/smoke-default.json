@@ -1,0 +1,788 @@
+{
+  "provenance": {
+    "store_backend": "memory",
+    "region": "n/a",
+    "endpoint": "n/a",
+    "host_logical_cores": 16,
+    "source": "generate",
+    "dataset_id": "sql-latency-gen-9422b100-16a0-4381-8da3-1b517d0156ba",
+    "runs": 1,
+    "cache_bytes": 0,
+    "deadline_secs": 30,
+    "fetch_concurrency": 8,
+    "logs_request_cost_bytes_requested": 1887437,
+    "logs_request_cost_bytes_effective": 18446744073709551615,
+    "logs_fetch_policy": "cost-based",
+    "logs_block_range_threshold_effective": 18446744073709551615,
+    "sql_max_query_bytes_requested": 268435456,
+    "sql_max_query_bytes_effective": 268435456,
+    "tenant_max_bytes": 1073741824,
+    "sql_max_segments": 1024,
+    "parallel_final_aggregation_requested": true,
+    "parallel_final_aggregation_effective": true,
+    "explain": false,
+    "warm_catalog": false,
+    "logs_suffix_len": null,
+    "allocator": "system",
+    "store_cost_profile_requested": {
+      "name": "s3-intra-region-2026",
+      "put_class_nanodollars": 5000,
+      "get_class_nanodollars": 400,
+      "delete_class_nanodollars": 0,
+      "transfer_nanodollars_per_gib": 0,
+      "retrieval_nanodollars_per_gib": 0
+    },
+    "store_cost_profile_effective": {
+      "name": "s3-intra-region-2026",
+      "put_class_nanodollars": 5000,
+      "get_class_nanodollars": 400,
+      "delete_class_nanodollars": 0,
+      "transfer_nanodollars_per_gib": 0,
+      "retrieval_nanodollars_per_gib": 0
+    }
+  },
+  "dataset": {
+    "load_wall_ms": 28.220034000000002,
+    "stored_bytes": 35304,
+    "object_count": 4,
+    "rows": 2000,
+    "layout": "pre-compaction"
+  },
+  "entries": [
+    {
+      "id": "filtered_error_count",
+      "min_ms": 3.384765,
+      "median_ms": 3.384765,
+      "max_ms": 3.384765,
+      "cold_ms": 3.384765,
+      "rows_returned": 1,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 9,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 9,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 5,
+          "page_stored_bytes_decoded": 3024,
+          "fetch_amplification": 11.674603174603174,
+          "logs_whole_object_opens": 4,
+          "logs_ranged_opens": 0
+        }
+      ]
+    },
+    {
+      "id": "filtered_time_span",
+      "min_ms": 1.59304,
+      "median_ms": 1.59304,
+      "max_ms": 1.59304,
+      "cold_ms": 1.59304,
+      "rows_returned": 1,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 9,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 9,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 5,
+          "page_stored_bytes_decoded": 2612,
+          "fetch_amplification": 13.516079632465544,
+          "logs_whole_object_opens": 4,
+          "logs_ranged_opens": 0
+        }
+      ]
+    },
+    {
+      "id": "distinct_severity_count",
+      "min_ms": 1.381235,
+      "median_ms": 1.381235,
+      "max_ms": 1.381235,
+      "cold_ms": 1.381235,
+      "rows_returned": 1,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 9,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 9,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 5,
+          "page_stored_bytes_decoded": 2612,
+          "fetch_amplification": 13.516079632465544,
+          "logs_whole_object_opens": 4,
+          "logs_ranged_opens": 0
+        }
+      ]
+    },
+    {
+      "id": "typed_duration_threshold_count",
+      "min_ms": 1.763885,
+      "median_ms": 1.763885,
+      "max_ms": 1.763885,
+      "cold_ms": 1.763885,
+      "rows_returned": 1,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 9,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 9,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 5,
+          "page_stored_bytes_decoded": 2320,
+          "fetch_amplification": 0.0,
+          "logs_whole_object_opens": 0,
+          "logs_ranged_opens": 0
+        }
+      ]
+    },
+    {
+      "id": "typed_duration_sum",
+      "min_ms": 1.473257,
+      "median_ms": 1.473257,
+      "max_ms": 1.473257,
+      "cold_ms": 1.473257,
+      "rows_returned": 1,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 10,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 10,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 6,
+          "page_stored_bytes_decoded": 3328,
+          "fetch_amplification": 10.608173076923077,
+          "logs_whole_object_opens": 4,
+          "logs_ranged_opens": 0
+        }
+      ]
+    },
+    {
+      "id": "body_word_search",
+      "min_ms": 2.228247,
+      "median_ms": 2.228247,
+      "max_ms": 2.228247,
+      "cold_ms": 2.228247,
+      "rows_returned": 1,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 9,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 9,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 5,
+          "page_stored_bytes_decoded": 6835,
+          "fetch_amplification": 0.0,
+          "logs_whole_object_opens": 0,
+          "logs_ranged_opens": 0
+        }
+      ]
+    },
+    {
+      "id": "severity_case_insensitive_match",
+      "min_ms": 1.426896,
+      "median_ms": 1.426896,
+      "max_ms": 1.426896,
+      "cold_ms": 1.426896,
+      "rows_returned": 1,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 9,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 9,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 5,
+          "page_stored_bytes_decoded": 2612,
+          "fetch_amplification": 13.516079632465544,
+          "logs_whole_object_opens": 4,
+          "logs_ranged_opens": 0
+        }
+      ]
+    },
+    {
+      "id": "body_shape_histogram",
+      "min_ms": 2.481673,
+      "median_ms": 2.481673,
+      "max_ms": 2.481673,
+      "cold_ms": 2.481673,
+      "rows_returned": 10,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 9,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 9,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 5,
+          "page_stored_bytes_decoded": 6835,
+          "fetch_amplification": 5.165179224579371,
+          "logs_whole_object_opens": 4,
+          "logs_ranged_opens": 0
+        }
+      ]
+    },
+    {
+      "id": "count_by_severity",
+      "min_ms": 1.5686,
+      "median_ms": 1.5686,
+      "max_ms": 1.5686,
+      "cold_ms": 1.5686,
+      "rows_returned": 4,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 9,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 9,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 5,
+          "page_stored_bytes_decoded": 2612,
+          "fetch_amplification": 13.516079632465544,
+          "logs_whole_object_opens": 4,
+          "logs_ranged_opens": 0
+        }
+      ]
+    },
+    {
+      "id": "busy_hours",
+      "min_ms": 1.845356,
+      "median_ms": 1.845356,
+      "max_ms": 1.845356,
+      "cold_ms": 1.845356,
+      "rows_returned": 1,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 9,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 9,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 5,
+          "page_stored_bytes_decoded": 2016,
+          "fetch_amplification": 17.511904761904763,
+          "logs_whole_object_opens": 4,
+          "logs_ranged_opens": 0
+        }
+      ]
+    },
+    {
+      "id": "severity_bucket_split",
+      "min_ms": 2.405471,
+      "median_ms": 2.405471,
+      "max_ms": 2.405471,
+      "cold_ms": 2.405471,
+      "rows_returned": 2,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 9,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 9,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 5,
+          "page_stored_bytes_decoded": 3620,
+          "fetch_amplification": 9.752486187845303,
+          "logs_whole_object_opens": 4,
+          "logs_ranged_opens": 0
+        }
+      ]
+    },
+    {
+      "id": "recent_errors_top_n",
+      "min_ms": 1.494677,
+      "median_ms": 1.494677,
+      "max_ms": 1.494677,
+      "cold_ms": 1.494677,
+      "rows_returned": 20,
+      "scan": {
+        "segments": 4,
+        "blocks_total": 4,
+        "blocks_scanned": 4,
+        "blocks_pruned_by_postings": 0,
+        "object_store_get_requests": 9,
+        "object_store_list_requests": 2,
+        "object_store_bytes": 36440,
+        "cache_hits": 4,
+        "cache_misses": 5,
+        "cache_bytes": 1136
+      },
+      "per_run_accounting": [
+        {
+          "object_store_get_requests": 9,
+          "object_store_list_requests": 2,
+          "object_store_bytes": 36440,
+          "object_store_get_bytes": 36440,
+          "cache_hits": 4,
+          "cache_misses": 5,
+          "cache_bytes": 1136,
+          "probe_misses_plan": 0,
+          "probe_misses_scan": 0,
+          "wire_bytes_by_phase": [
+            {
+              "phase": "resolve",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "plan",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "probe",
+              "wire_bytes": 0,
+              "get_requests": 0
+            },
+            {
+              "phase": "scan",
+              "wire_bytes": 35304,
+              "get_requests": 4
+            }
+          ],
+          "wire_bytes_unattributed": 1136,
+          "get_requests_unattributed": 5,
+          "page_stored_bytes_decoded": 8439,
+          "fetch_amplification": 4.183434056167792,
+          "logs_whole_object_opens": 4,
+          "logs_ranged_opens": 0
+        }
+      ]
+    }
+  ],
+  "skipped": [],
+  "failed": [],
+  "modeled_cost": {}
+}

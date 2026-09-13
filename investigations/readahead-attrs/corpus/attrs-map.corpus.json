@@ -1,0 +1,113 @@
+{
+ "version": 1,
+ "entries": [
+  {
+   "id": "narrow_count_filter",
+   "sql": "SELECT count(*) FROM logs WHERE severity_num >= 17",
+   "constructs": [
+    "logs -> Signal::Logs",
+    "Filter (WHERE)",
+    "count"
+   ],
+   "expected_rows": 1
+  },
+  {
+   "id": "fastpath_minmax_ts",
+   "sql": "SELECT min(ts), max(ts), count(*) FROM logs WHERE severity_num >= 9",
+   "constructs": [
+    "logs -> Signal::Logs",
+    "Filter (WHERE)",
+    "min",
+    "max",
+    "count"
+   ],
+   "expected_rows": 1
+  },
+  {
+   "id": "agg_group_severity_dur",
+   "sql": "SELECT severity_text, count(*), sum(\"duration_ms\"), max(\"duration_ms\") FROM logs GROUP BY severity_text ORDER BY severity_text",
+   "constructs": [
+    "logs -> Signal::Logs",
+    "GROUP BY",
+    "count",
+    "sum",
+    "max",
+    "ORDER BY",
+    "declared i64 typed aggregate"
+   ],
+   "expected_rows": 4,
+   "required_declarations": [
+    {
+     "key": "duration_ms",
+     "ty": "i64"
+    }
+   ]
+  },
+  {
+   "id": "selective_limit_planpath",
+   "sql": "SELECT ts, body FROM logs WHERE has_word(body, 'timeout') ORDER BY ts DESC LIMIT 10",
+   "constructs": [
+    "logs -> Signal::Logs",
+    "has_word",
+    "Filter (WHERE)",
+    "ORDER BY",
+    "LIMIT"
+   ],
+   "expected_rows": 10
+  },
+  {
+   "id": "cpu_regex_histogram",
+   "sql": "SELECT regexp_replace(body, '[0-9]+', 'N'), count(*) FROM logs GROUP BY 1 ORDER BY 2 DESC LIMIT 10",
+   "constructs": [
+    "logs -> Signal::Logs",
+    "regexp_replace",
+    "GROUP BY ordinal",
+    "count",
+    "ORDER BY",
+    "LIMIT"
+   ],
+   "expected_rows": 2
+  },
+  {
+   "id": "attr_eq_count",
+   "sql": "SELECT count(*) FROM logs WHERE attrs['attr_3'] = 'v2'",
+   "constructs": [
+    "logs -> Signal::Logs",
+    "Filter (WHERE)",
+    "count"
+   ],
+   "expected_rows": 1
+  },
+  {
+   "id": "attr_group",
+   "sql": "SELECT attrs['attr_3'] AS k, count(*) FROM logs GROUP BY k ORDER BY k",
+   "constructs": [
+    "logs -> Signal::Logs",
+    "GROUP BY",
+    "count",
+    "ORDER BY"
+   ],
+   "expected_rows": 7
+  },
+  {
+   "id": "dur_sum_threshold",
+   "sql": "SELECT sum(CAST(attrs['duration_ms'] AS BIGINT)) FROM logs WHERE CAST(attrs['duration_ms'] AS BIGINT) >= 1000",
+   "constructs": [
+    "logs -> Signal::Logs",
+    "Filter (WHERE)",
+    "sum"
+   ],
+   "expected_rows": 1
+  },
+  {
+   "id": "attr_project_limit",
+   "sql": "SELECT ts, attrs['attr_5'] AS v FROM logs ORDER BY ts LIMIT 100",
+   "constructs": [
+    "logs -> Signal::Logs",
+    "ORDER BY",
+    "LIMIT"
+   ],
+   "expected_rows": 100
+  }
+ ]
+}
