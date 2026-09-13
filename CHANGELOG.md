@@ -8,6 +8,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Retention no longer deletes a metric object whose format version this
+  build's reader does not admit** (issue #530). The horizon-gated physical
+  sweep probes each object's trailer first and distinguishes an unadmitted
+  version from corruption: an unadmitted version holds the whole bucket (the
+  tombstone stays, the outcome is `SweptPartial`, and the new
+  `ravel_maintain_retention_held_out_of_window_objects_total` counter rises),
+  because the other side of a rolling upgrade reads that object normally. A
+  corrupt object is still swept. A held bucket retains data past its retention
+  window until the upgrade, migration, or rollback completes, so a nonzero
+  counter rate needs operator action. Metrics (RSEG) only; logs and spans keep
+  today's sweep.
 - **RavelClusters without a deployment key must now reference an audit token
   key Secret through `spec.auditTokenKeySecretRef`.** Until they do, the
   operator reports `AuditTokenKeyMissing` and leaves the query Deployment as

@@ -367,6 +367,7 @@ impl Default for ReaderLimits {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -427,7 +428,7 @@ mod tests {
     #[test]
     fn the_window_keeps_the_n_and_prev_shape() {
         let window = SUPPORTED_VERSIONS;
-        assert!(window.len() >= 1 && window.len() <= 2, "N/N-1 at most");
+        assert!(!window.is_empty() && window.len() <= 2, "N/N-1 at most");
         assert!(!window.is_empty());
         assert_eq!(window.newest(), VERSION_V7, "writers emit the newest");
 
