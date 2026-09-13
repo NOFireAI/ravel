@@ -76,6 +76,7 @@ async fn start_keyed_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server:
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         deployment_key: Some(Box::new(DEPLOYMENT_KEY)),
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,

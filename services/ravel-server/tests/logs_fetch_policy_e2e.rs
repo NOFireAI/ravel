@@ -232,6 +232,7 @@ async fn run(argv: &[&str]) -> Routed {
         ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
         cli.cache_dir.clone(),
         cli.catalog_resolve_concurrency,
+        None,
     )
     .expect("catalog");
     let state = build_sql_state(
