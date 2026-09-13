@@ -65,7 +65,8 @@
 //! UDAF landed; no walk here guards min/max any more, because the registry
 //! replacement is structurally total.
 
-use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use crate::complexity_guard;
+use datafusion::sql::parser::{DFParserBuilder, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, SetExpr, Statement,
     TableFactor, Visit, Visitor,
@@ -206,13 +207,59 @@ pub enum ValidationError {
          (docs/adrs/0097-sql-scalar-function-surface.md)"
     )]
     ExcludedWindow { name: String },
+
+    /// The statement text carries more structural characters than
+    /// [`MAX_STATEMENT_COMPLEXITY`](crate::complexity_guard::MAX_STATEMENT_COMPLEXITY),
+    /// so it is refused before it is parsed (crate::complexity_guard, issue
+    /// #1680). The message carries the two counts and nothing else of the
+    /// caller's input, so it is safe to return verbatim like the other
+    /// validation errors.
+    #[error("{0}")]
+    TooComplex(#[from] complexity_guard::StatementTooComplex),
+}
+
+/// Recursion limit set on the [`DFParserBuilder`] below, pinned here rather
+/// than inherited from `datafusion-sql`'s own default (50 in 54.1.0), which is
+/// a value an upgrade may change without notice.
+///
+/// This is a second bound, independent of
+/// [`complexity_guard`](crate::complexity_guard), and it is not redundant with
+/// it: this one caps the parser's own descent through nested constructs
+/// (parentheses, subqueries) cheaply and early, while the guard caps the total
+/// tree size a flat construct can build, which the parser's counter never
+/// sees because same-precedence infix operators are consumed in a loop. Each
+/// covers a case the other does not, so neither is dropped because the other
+/// passed.
+const PARSER_RECURSION_LIMIT: usize = 50;
+
+/// Parse `sql` with the pinned recursion limit above.
+///
+/// Every parse in this module goes through here so the limit cannot be set on
+/// one call site and inherited from the dependency's default on another.
+fn parse_statements(sql: &str) -> Result<std::collections::VecDeque<DFStatement>, ValidationError> {
+    DFParserBuilder::new(sql)
+        .with_recursion_limit(PARSER_RECURSION_LIMIT)
+        .build()
+        .and_then(|mut parser| parser.parse_statements())
+        .map_err(|e| ValidationError::Parse(strip_prefix(&e.to_string())))
 }
 
 /// Parse `sql` and accept it only if it is exactly one read-only
 /// `Statement::Query` inside the v1 subset. Returns before any planning.
+///
+/// The structural-complexity guard runs first, before the text is parsed at
+/// all: parsing a deep enough statement, and every recursive walk over the
+/// tree it produces (the two below, `crate::page_plan`'s rewrites, DataFusion's
+/// SQL-to-`LogicalPlan` conversion, and the tree's own `Drop`) recurses once
+/// per tree level, and a stack overflow on a 2 MiB tokio worker stack aborts
+/// the process rather than raising a catchable panic (issue #1680). Because
+/// this is the single funnel every SQL surface reaches -- the HTTP handler,
+/// `get_flight_info_statement`, `do_get_statement`, and the page plan -- one
+/// call here covers all four.
 pub fn validate(sql: &str) -> Result<(), ValidationError> {
-    let statements = DFParser::parse_sql(sql)
-        .map_err(|e| ValidationError::Parse(strip_prefix(&e.to_string())))?;
+    complexity_guard::check(sql)?;
+
+    let statements = parse_statements(sql)?;
 
     if statements.len() > 1 {
         return Err(ValidationError::MultipleStatements {
@@ -281,8 +328,13 @@ pub fn validate(sql: &str) -> Result<(), ValidationError> {
 /// any query that reads both real tables (no CTE shadows a name it also
 /// reads as a base table without the query being nonsensical).
 pub(crate) fn referenced_base_tables(sql: &str) -> Result<BTreeSet<String>, ValidationError> {
-    let statements = DFParser::parse_sql(sql)
-        .map_err(|e| ValidationError::Parse(strip_prefix(&e.to_string())))?;
+    // This parses and walks a tree of its own, so it carries the same guard
+    // [`validate`] does rather than relying on every caller having run
+    // `validate` on the same text first. The scan stops one character past
+    // the bound, so a statement that already passed `validate` pays a bounded
+    // rescan and nothing else.
+    complexity_guard::check(sql)?;
+    let statements = parse_statements(sql)?;
     let mut tables = BTreeSet::new();
     let mut ctes = BTreeSet::new();
     for statement in &statements {
