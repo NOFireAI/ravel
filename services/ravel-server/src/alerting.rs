@@ -67,7 +67,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -386,6 +387,195 @@ pub struct AlertEvalReport {
     pub lease_unavailable: bool,
 }
 
+impl AlertEvalReport {
+    /// How this tick ended, as one value of a closed set.
+    ///
+    /// The three state flags are mutually exclusive by construction in
+    /// [`AlertEvaluator::run_tick`]: an unreadable history returns before the
+    /// lease is touched, and the lease attempt sets at most one of
+    /// `lease_unavailable` and `lease_not_held`. Collapsing them into one
+    /// outcome is what lets `/metrics` render them as one counter split by a
+    /// closed `outcome` label rather than three independent flags whose
+    /// combinations an operator would have to reason about.
+    pub fn outcome(&self) -> AlertTickOutcome {
+        if self.history_unavailable {
+            AlertTickOutcome::HistoryUnavailable
+        } else if self.lease_unavailable {
+            AlertTickOutcome::LeaseUnavailable
+        } else if self.lease_not_held {
+            AlertTickOutcome::LeaseNotHeld
+        } else {
+            AlertTickOutcome::Evaluated
+        }
+    }
+}
+
+/// How one evaluation tick ended, the `outcome` dimension of
+/// `ravel_alert_ticks_total`.
+///
+/// `LeaseNotHeld` is a healthy outcome, not a failure: in a multi-replica
+/// deployment every replica but the lease holder reports it on every tick. It
+/// is a separate outcome rather than folded into a failure count precisely so
+/// an alert rule can leave the steady state alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertTickOutcome {
+    /// The lease was held and every configured rule was evaluated.
+    Evaluated,
+    /// A peer replica held the tenant's lease, so rule evaluation was skipped.
+    /// Expected steady state, not an error.
+    LeaseNotHeld,
+    /// The lease could not be acquired or renewed because the object store
+    /// failed.
+    LeaseUnavailable,
+    /// The alert history could not be read, so no rule was evaluated at all.
+    HistoryUnavailable,
+}
+
+impl AlertTickOutcome {
+    /// Every outcome, so the renderer emits one series per variant on every
+    /// scrape rather than only the ones seen so far. Adding a variant without
+    /// adding it here is caught by the exhaustive match in
+    /// `crate::metrics::alert_outcome_name`.
+    pub const ALL: [AlertTickOutcome; 4] = [
+        AlertTickOutcome::Evaluated,
+        AlertTickOutcome::LeaseNotHeld,
+        AlertTickOutcome::LeaseUnavailable,
+        AlertTickOutcome::HistoryUnavailable,
+    ];
+
+    /// Whether a tick with this outcome advances the liveness gauge. Only a
+    /// tick that observed the tenant's state and reached its end does:
+    /// `LeaseNotHeld` qualifies (a standby replica is alive and evaluating
+    /// nothing by design), the two failure outcomes do not.
+    fn completed(self) -> bool {
+        match self {
+            AlertTickOutcome::Evaluated | AlertTickOutcome::LeaseNotHeld => true,
+            AlertTickOutcome::LeaseUnavailable | AlertTickOutcome::HistoryUnavailable => false,
+        }
+    }
+}
+
+/// The alerting pipeline's `/metrics` counters, folded across every tenant this
+/// process evaluates.
+///
+/// Process-wide with no `tenant_hash` dimension, the same constraint every
+/// other family on this unauthenticated route carries (ADR-0044 section 4).
+/// One handle per process, reached through [`active_alert_metrics`]; an
+/// evaluator built for a test can hold its own instead, so a test asserts
+/// exact values without racing the process-global one.
+#[derive(Debug, Default)]
+pub struct AlertMetrics {
+    rules_evaluated: AtomicU64,
+    rules_failed: AtomicU64,
+    records_written: AtomicU64,
+    repeats_queued: AtomicU64,
+    notifications_delivered: AtomicU64,
+    notifications_failed: AtomicU64,
+    ticks_evaluated: AtomicU64,
+    ticks_lease_not_held: AtomicU64,
+    ticks_lease_unavailable: AtomicU64,
+    ticks_history_unavailable: AtomicU64,
+    /// Unix nanoseconds of the last tick that reached its end, from the
+    /// injected clock; `0` until one does. Every other figure here is
+    /// cumulative and stops moving when the loop dies, so only this gauge's age
+    /// separates a dead evaluator from a healthy one with nothing to do.
+    last_tick_completed_unix_ns: AtomicI64,
+}
+
+impl AlertMetrics {
+    /// Fold one finished tick in. `now_ns` is the clock reading that tick ran
+    /// at, so the liveness gauge is the injected clock's value and never
+    /// `SystemTime::now`.
+    ///
+    /// Called once per tick from [`AlertEvaluator::run_tick`], on every path
+    /// including the ones that fail: a tick that could not read history still
+    /// records what it observed, and only the liveness gauge distinguishes it.
+    pub fn record_tick(&self, report: &AlertEvalReport, now_ns: i64) {
+        let add = |counter: &AtomicU64, value: u32| {
+            counter.fetch_add(u64::from(value), Ordering::Relaxed);
+        };
+        add(&self.rules_evaluated, report.rules_evaluated);
+        add(&self.rules_failed, report.rules_failed);
+        add(&self.records_written, report.records_written);
+        add(&self.repeats_queued, report.repeats_queued);
+        add(
+            &self.notifications_delivered,
+            report.notifications_delivered,
+        );
+        add(&self.notifications_failed, report.notifications_failed);
+
+        let outcome = report.outcome();
+        self.tick_counter(outcome).fetch_add(1, Ordering::Relaxed);
+        if outcome.completed() {
+            self.last_tick_completed_unix_ns
+                .store(now_ns, Ordering::Relaxed);
+        }
+    }
+
+    fn tick_counter(&self, outcome: AlertTickOutcome) -> &AtomicU64 {
+        match outcome {
+            AlertTickOutcome::Evaluated => &self.ticks_evaluated,
+            AlertTickOutcome::LeaseNotHeld => &self.ticks_lease_not_held,
+            AlertTickOutcome::LeaseUnavailable => &self.ticks_lease_unavailable,
+            AlertTickOutcome::HistoryUnavailable => &self.ticks_history_unavailable,
+        }
+    }
+
+    pub fn rules_evaluated(&self) -> u64 {
+        self.rules_evaluated.load(Ordering::Relaxed)
+    }
+
+    pub fn rules_failed(&self) -> u64 {
+        self.rules_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn records_written(&self) -> u64 {
+        self.records_written.load(Ordering::Relaxed)
+    }
+
+    pub fn repeats_queued(&self) -> u64 {
+        self.repeats_queued.load(Ordering::Relaxed)
+    }
+
+    pub fn notifications_delivered(&self) -> u64 {
+        self.notifications_delivered.load(Ordering::Relaxed)
+    }
+
+    pub fn notifications_failed(&self) -> u64 {
+        self.notifications_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn ticks(&self, outcome: AlertTickOutcome) -> u64 {
+        self.tick_counter(outcome).load(Ordering::Relaxed)
+    }
+
+    pub fn last_tick_completed_unix_ns(&self) -> i64 {
+        self.last_tick_completed_unix_ns.load(Ordering::Relaxed)
+    }
+}
+
+/// The one handle every evaluator in this process folds into, created on the
+/// first [`AlertEvaluator::new`].
+static ALERT_METRICS: OnceLock<Arc<AlertMetrics>> = OnceLock::new();
+
+/// The process handle, creating it if this is the first evaluator.
+fn global_alert_metrics() -> Arc<AlertMetrics> {
+    Arc::clone(ALERT_METRICS.get_or_init(|| Arc::new(AlertMetrics::default())))
+}
+
+/// The process handle for `/metrics`, or `None` when this process has built no
+/// evaluator at all.
+///
+/// `None` is what keeps the whole `ravel_alert_*` family off the exposition of
+/// a deployment that configured no alert rules, rather than exporting a row of
+/// permanent zeros there (the same choice `render_durable_auth_family` makes).
+/// It is also what keeps the alert rules in docs/guides/observability.md quiet
+/// on such a deployment: with no series to match, each rule's expression is the
+/// empty vector.
+pub fn active_alert_metrics() -> Option<Arc<AlertMetrics>> {
+    ALERT_METRICS.get().map(Arc::clone)
+}
+
 /// The evaluator for one tenant.
 pub struct AlertEvaluator {
     store: Arc<dyn ObjectStoreBackend>,
@@ -434,6 +624,10 @@ pub struct AlertEvaluator {
     /// at-least-once contract ADR-0043 decision 6 actually states, rather
     /// than at-most-once across a restart.
     bootstrapped: bool,
+    /// Where every tick's report is folded for `/metrics`. The process-global
+    /// handle by default; a test swaps in its own with
+    /// [`AlertEvaluator::with_metrics`] so it can assert exact counter values.
+    metrics: Arc<AlertMetrics>,
 }
 
 impl AlertEvaluator {
@@ -465,7 +659,20 @@ impl AlertEvaluator {
             undelivered: HashMap::new(),
             repeat_marks: HashMap::new(),
             bootstrapped: false,
+            // Constructing an evaluator is what marks this process as one that
+            // runs alerting, and therefore what makes `/metrics` render the
+            // family at all.
+            metrics: global_alert_metrics(),
         })
+    }
+
+    /// Fold this evaluator's ticks into `metrics` instead of the process-global
+    /// handle. For tests: a shared global cannot carry an exact-value
+    /// assertion when other tests in the same binary tick their own evaluators.
+    #[cfg(test)]
+    fn with_metrics(mut self, metrics: Arc<AlertMetrics>) -> AlertEvaluator {
+        self.metrics = metrics;
+        self
     }
 
     /// One evaluation pass over every rule of this tenant, then one delivery
@@ -479,9 +686,22 @@ impl AlertEvaluator {
     /// reached, and a sink failure only leaves an entry in `undelivered` for
     /// the next tick. No sink result can prevent, delay past its own write, or
     /// alter a record.
+    ///
+    /// Every exit of the tick body funnels through the single
+    /// [`AlertMetrics::record_tick`] call here, so a tick that ends in a
+    /// failure still records what it observed. Splitting the body out is what
+    /// makes that structural rather than a rule to remember at each early
+    /// return.
     pub async fn run_tick(&mut self) -> AlertEvalReport {
-        let mut report = AlertEvalReport::default();
         let now_ns = self.clock.now_ns();
+        let report = self.evaluate_tick(now_ns).await;
+        self.metrics.record_tick(&report, now_ns);
+        report
+    }
+
+    /// The tick body, at the clock reading [`Self::run_tick`] took.
+    async fn evaluate_tick(&mut self, now_ns: i64) -> AlertEvalReport {
+        let mut report = AlertEvalReport::default();
 
         // Read the derived state memo first, before the lease and unguarded: it
         // is an advisory cache every replica reads, so each folds only the ingest
@@ -2123,11 +2343,25 @@ mod tick_tests {
     /// Each call mints a fresh `writer_id`, so two evaluators over one store are
     /// two distinct "replicas" for the lease test.
     fn evaluator(store: Arc<dyn ObjectStoreBackend>, clock: Arc<TestClock>) -> AlertEvaluator {
+        evaluator_with(store, clock, Vec::new(), Arc::new(AlertMetrics::default()))
+    }
+
+    /// [`evaluator`] with explicit sinks and an explicit metrics handle. The
+    /// handle is never the process-global one: other tests in this binary tick
+    /// their own evaluators, so only a per-test handle can carry an exact-value
+    /// assertion.
+    fn evaluator_with(
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<TestClock>,
+        sinks: Vec<AlertSink>,
+        metrics: Arc<AlertMetrics>,
+    ) -> AlertEvaluator {
         let catalog =
             Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
         let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default());
         let config = AlertEvalConfig {
             enabled: true,
+            sinks: Arc::new(sinks),
             ..AlertEvalConfig::default()
         };
         AlertEvaluator::new(
@@ -2143,6 +2377,7 @@ mod tick_tests {
             &config,
         )
         .expect("build evaluator")
+        .with_metrics(metrics)
     }
 
     /// Every alert record this tenant has, read through its commit records and
@@ -3942,6 +4177,305 @@ mod tick_tests {
             store.call_count(),
             2,
             "the violation is detected on the second page, after both are fetched"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // `/metrics` (issue #532). Every counter of the family is pinned at an
+    // exact value driven by a real tick, not asserted to be merely nonzero.
+    // ---------------------------------------------------------------------
+
+    /// A webhook URL whose port was bound and immediately released, so every
+    /// POST to it is refused at once. Refused, not hung: there is no wall-clock
+    /// wait anywhere in this test, and the delivery failure is deterministic.
+    /// The same technique `analytics_endpoint.rs`'s `dead_endpoint` uses.
+    async fn dead_sink_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dead sink");
+        let addr = listener.local_addr().expect("dead sink addr");
+        drop(listener);
+        format!("http://{addr}/hook")
+    }
+
+    /// A webhook endpoint that answers every POST `200`, so `flush_sinks`
+    /// records a delivery. Aborted on drop.
+    struct OkSink {
+        url: String,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for OkSink {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn ok_sink() -> OkSink {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ok sink");
+        let addr = listener.local_addr().expect("ok sink addr");
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                // Drain the whole request (headers, then `content-length`
+                // bytes) before answering. Replying while the client is still
+                // writing its body would surface as a broken pipe and read as
+                // a delivery failure, which is the opposite of what this sink
+                // exists to produce.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let read = socket.read(&mut chunk).await;
+                    match read {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                    let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                    let body_len = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= head_end + 4 + body_len {
+                        break;
+                    }
+                }
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                let _ = socket.flush().await;
+            }
+        });
+        OkSink {
+            url: format!("http://{addr}/hook"),
+            task,
+        }
+    }
+
+    /// Every counter the family exports, folded from one real tick and asserted
+    /// against that tick's own report field by field. The sink is unreachable,
+    /// so this tick is the one that pins `notifications_failed`; the repeat and
+    /// delivery counters are pinned by the test below it.
+    #[tokio::test]
+    async fn one_tick_records_every_counter_exactly() {
+        let store = seeded_store().await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let sink = AlertSink::webhook(dead_sink_url().await);
+        let mut ev = evaluator_with(
+            store,
+            TestClock::at(NOW_NS),
+            vec![sink],
+            Arc::clone(&metrics),
+        );
+
+        let report = ev.run_tick().await;
+        assert_eq!(
+            report,
+            AlertEvalReport {
+                rules_evaluated: 1,
+                rules_failed: 0,
+                records_written: 1,
+                repeats_queued: 0,
+                notifications_delivered: 0,
+                notifications_failed: 1,
+                history_unavailable: false,
+                lease_not_held: false,
+                lease_unavailable: false,
+            },
+            "the tick fires the one rule, writes its transition, and fails to \
+             deliver it to the unreachable sink"
+        );
+
+        assert_eq!(metrics.rules_evaluated(), 1);
+        assert_eq!(metrics.rules_failed(), 0);
+        assert_eq!(metrics.records_written(), 1);
+        assert_eq!(metrics.repeats_queued(), 0);
+        assert_eq!(metrics.notifications_delivered(), 0);
+        assert_eq!(metrics.notifications_failed(), 1);
+        assert_eq!(metrics.ticks(AlertTickOutcome::Evaluated), 1);
+        assert_eq!(metrics.ticks(AlertTickOutcome::LeaseNotHeld), 0);
+        assert_eq!(metrics.ticks(AlertTickOutcome::LeaseUnavailable), 0);
+        assert_eq!(metrics.ticks(AlertTickOutcome::HistoryUnavailable), 0);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "the liveness gauge carries the injected clock's reading, not a wall clock"
+        );
+    }
+
+    /// The two counters the test above leaves at zero: a second tick one
+    /// repeat window later re-queues the still-firing alert and a reachable
+    /// sink accepts both sends.
+    #[tokio::test]
+    async fn a_repeat_tick_counts_the_repeat_and_both_deliveries() {
+        let store = seeded_store().await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let sink = ok_sink().await;
+        let clock = TestClock::at(NOW_NS);
+        let mut ev = evaluator_with(
+            store,
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::clone(&metrics),
+        );
+
+        let first = ev.run_tick().await;
+        assert_eq!(first.records_written, 1, "the onset fires");
+        assert_eq!(first.notifications_delivered, 1, "the sink accepted it");
+
+        // One default repeat window (60s) later: still firing, so no new
+        // record, but the repeat pass re-queues the folded latest record.
+        clock.set(NOW_NS + 60 * NS_PER_SEC);
+        let second = ev.run_tick().await;
+        assert_eq!(
+            second,
+            AlertEvalReport {
+                rules_evaluated: 1,
+                rules_failed: 0,
+                records_written: 0,
+                repeats_queued: 1,
+                notifications_delivered: 1,
+                notifications_failed: 0,
+                history_unavailable: false,
+                lease_not_held: false,
+                lease_unavailable: false,
+            },
+            "a repeat re-sends the folded record and writes nothing durable"
+        );
+
+        assert_eq!(metrics.rules_evaluated(), 2);
+        assert_eq!(metrics.rules_failed(), 0);
+        assert_eq!(metrics.records_written(), 1);
+        assert_eq!(metrics.repeats_queued(), 1);
+        assert_eq!(metrics.notifications_delivered(), 2);
+        assert_eq!(metrics.notifications_failed(), 0);
+        assert_eq!(metrics.ticks(AlertTickOutcome::Evaluated), 2);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS + 60 * NS_PER_SEC,
+            "the second tick re-stamps the gauge"
+        );
+    }
+
+    /// The liveness gauge is the only figure that separates a dead loop from a
+    /// healthy idle one, so it must advance on a tick that reached its end and
+    /// stay put on one that did not. The failing tick runs an hour later on a
+    /// store whose alert-history listing always fails, which is the
+    /// `history_unavailable` path; both evaluators fold into one handle,
+    /// exactly as every tenant's evaluator does in a real process.
+    #[tokio::test]
+    async fn the_liveness_gauge_advances_only_on_a_completed_tick() {
+        let metrics = Arc::new(AlertMetrics::default());
+
+        let healthy = seeded_store().await;
+        let mut ok = evaluator_with(
+            healthy,
+            TestClock::at(NOW_NS),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+        assert!(!ok.run_tick().await.history_unavailable);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "a completed tick stamps the gauge with the clock it ran at"
+        );
+
+        let tenant = TenantId::new(TENANT).hash();
+        let commit_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::List,
+                ScriptedFault::Transient("alert history listing unavailable".into()),
+            )
+            .with_key_contains(commit_prefix)
+            .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(seeded_store().await, plan));
+        let broken: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let later = NOW_NS + 3_600 * NS_PER_SEC;
+        let mut dead = evaluator_with(
+            broken,
+            TestClock::at(later),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+
+        let report = dead.run_tick().await;
+        assert!(
+            report.history_unavailable,
+            "the listing fault makes the history unreadable"
+        );
+        assert!(
+            fault.fault_count(Op::List, FaultKind::Transient) >= 1,
+            "the injected listing fault actually fired"
+        );
+        assert_eq!(
+            metrics.ticks(AlertTickOutcome::HistoryUnavailable),
+            1,
+            "the failed tick is still counted, under its own outcome"
+        );
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "a tick that could not read history must NOT advance the gauge, or a \
+             permanently broken loop would look alive"
+        );
+    }
+
+    /// A replica that loses the lease is healthy, not failing. It must count as
+    /// its own tick outcome and keep stamping the liveness gauge: folding it
+    /// into a failure counter, or withholding the gauge, turns the expected
+    /// multi-replica steady state into a permanent alarm.
+    #[tokio::test]
+    async fn a_lease_not_held_tick_records_the_state_without_a_failure() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let holder_metrics = Arc::new(AlertMetrics::default());
+        let standby_metrics = Arc::new(AlertMetrics::default());
+
+        let mut holder = evaluator_with(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            Vec::new(),
+            Arc::clone(&holder_metrics),
+        );
+        let mut standby = evaluator_with(store, clock, Vec::new(), Arc::clone(&standby_metrics));
+
+        assert_eq!(
+            holder.run_tick().await.records_written,
+            1,
+            "the holder fires"
+        );
+        let report = standby.run_tick().await;
+        assert!(report.lease_not_held, "the peer holds the lease");
+        assert!(!report.lease_unavailable, "the store is healthy");
+
+        assert_eq!(standby_metrics.ticks(AlertTickOutcome::LeaseNotHeld), 1);
+        assert_eq!(standby_metrics.ticks(AlertTickOutcome::Evaluated), 0);
+        assert_eq!(
+            standby_metrics.ticks(AlertTickOutcome::LeaseUnavailable),
+            0,
+            "a peer holding the lease is not a store failure"
+        );
+        assert_eq!(
+            standby_metrics.rules_failed(),
+            0,
+            "skipping evaluation is not a rule failure"
+        );
+        assert_eq!(standby_metrics.rules_evaluated(), 0);
+        assert_eq!(standby_metrics.records_written(), 0);
+        assert_eq!(
+            standby_metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "a standby replica is alive; its liveness gauge must keep advancing"
         );
     }
 }

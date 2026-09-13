@@ -103,6 +103,11 @@ concurrency, merge memory, and the at-rest scrubber, render only in a
 the sweep, and the scrubber. An operator scraping an `all` mode process never
 sees those families move, and that is expected.
 
+The alerting family is absent unless the process built an alert evaluator,
+which needs `--alert-rules-file` naming at least one rule. It renders wherever
+rule evaluation runs, which is every `all` or `query` mode process configured
+with rules, whether or not that process currently holds a tenant's alert lease.
+
 ### Object store (`ravel_store_*`)
 
 Labels: `mode`, `op`, and `error_kind` on the error counter only.
@@ -713,6 +718,162 @@ bytes at any instant during a merge) or `total` (transient plus the writer's
 buffered output bytes). This is the gauge to watch when a maintain process is
 under memory pressure during compaction merges.
 
+### Alert evaluation (`ravel_alert_*`)
+
+Labels: `mode`, plus `outcome` on the tick counter. Every series here is
+process-wide, with no `tenant_hash` dimension: one process runs one evaluator
+per tenant that has rules, and each figure is the sum across them.
+
+The whole family is absent unless this process built at least one alert
+evaluator, which means `--alert-rules-file` was given and the file named at
+least one rule. A deployment that configured no alerting exports none of these
+series rather than a row of permanent zeros, and that absence is what keeps the
+alert rules below quiet there.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_alert_rules_evaluated_total` | Alert rules whose query ran and whose condition was decided. |
+| `ravel_alert_rules_failed_total` | Alert rules skipped because the query, the condition, or the write failed. Every one is logged; the rule is retried next tick. |
+| `ravel_alert_records_written_total` | Alert transition records durably written. |
+| `ravel_alert_repeats_queued_total` | Repeat notifications queued for a still-firing alert. A repeat writes no new record, so it advances this and then the delivery counter, never `ravel_alert_records_written_total`. |
+| `ravel_alert_notifications_delivered_total` | Notifications delivered to every configured sink, including ones carried over from an earlier tick's failure. |
+| `ravel_alert_notifications_failed_total` | Notifications still undelivered after a tick's attempt, counted once per tick per notification, so one stuck notification keeps advancing it while it is retried. |
+| `ravel_alert_ticks_total` | Evaluation ticks by `outcome`. |
+| `ravel_alert_last_tick_completed_timestamp_seconds` | Gauge. Unix time the alert loop last completed a tick in this process, `0` if none has completed since it started. Its age is the alert-loop liveness signal. |
+
+The `outcome` label carries one of four values, exactly one per tick:
+
+| `outcome` | Meaning |
+|---|---|
+| `evaluated` | This replica held the tenant's alert lease and evaluated every rule. |
+| `lease_not_held` | A peer replica held the lease, so this one skipped evaluation. Healthy, and the steady state of every replica that is not the holder. |
+| `lease_unavailable` | The lease read or write failed against object storage. Evaluation was skipped and is retried next tick. |
+| `history_unavailable` | The tenant's alert history could not be read, so nothing was evaluated. The evaluator never acts on a partial history, because that would re-fire an alert that is already firing. |
+
+`lease_not_held` is deliberately its own outcome and not part of any failure
+count. In a multi-replica deployment every replica but one reports it on every
+tick, forever; a rule that sums it with the two failure outcomes pages on the
+expected steady state.
+
+The liveness gauge is this family's point, for the same reason the maintenance
+one is. Every counter above is cumulative, so an evaluator that dies leaves
+them all frozen, and a frozen `ravel_alert_rules_failed_total` looks exactly
+like a healthy pipeline whose rules never fail. Only the gauge's age moves when
+the loop stops. A tick that ended in `lease_not_held` stamps the gauge: a
+standby replica is alive and evaluating nothing by design.
+
+#### The alerting-pipeline alerts
+
+```yaml
+groups:
+  - name: ravel-alerting-pipeline
+    # None of these rules carries an `absent()` branch, unlike the maintenance
+    # group above, and that is deliberate. A deployment with no alert rules
+    # configured builds no evaluator and therefore exports none of this family,
+    # which is a legitimate steady state, not an outage. With no series to
+    # match, every expression below is the empty vector and no rule fires. The
+    # cost is that this group cannot tell "alerting was never configured" from
+    # "the whole process is gone"; the latter belongs to a scrape-level `up`
+    # rule, which covers every subsystem at once rather than this one.
+    rules:
+      - alert: RavelAlertLoopStalled
+        # Per-series, no aggregation: a replica that is not the lease holder
+        # still ticks and still stamps this gauge, so a healthy peer does not
+        # cover a dead one and the rule must fire on any instance going stale.
+        #
+        # The gauge reads 0 from process start until the first tick completes,
+        # so this expression is true on a fresh process and the `for:` below is
+        # what suppresses it until that first tick lands. Keep `for:` well above
+        # `--alert-eval-interval-secs` (default 60s).
+        expr: |
+          time() - ravel_alert_last_tick_completed_timestamp_seconds > 600
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel alert evaluation loop has not completed a tick for ten
+            evaluation intervals
+          description: >-
+            No rule is being evaluated and no transition is being written or
+            notified on this process, while the pod still reads Running and
+            Ready. The first operator-visible symptom would otherwise be an
+            alert that never arrived. Check the process logs for a panic in the
+            evaluator task.
+      - alert: RavelAlertNotificationsAllFailing
+        # Delivery failure is retried every tick, so a genuinely broken sink
+        # advances the failure counter continuously while the delivered counter
+        # stays flat. The second term is what keeps a partial failure (one
+        # notification stuck behind a bad URL while the rest get through) out of
+        # this critical rule; it belongs to RavelAlertRuleEvaluationFailing's
+        # quieter class.
+        #
+        # Quiet on a healthy deployment with no rules configured: the family is
+        # absent, so both terms are empty. Quiet on one whose rules simply never
+        # fire: nothing is ever queued, so the failure counter never increases
+        # and the first term is false.
+        expr: |
+          increase(ravel_alert_notifications_failed_total[15m]) > 0
+          and
+          increase(ravel_alert_notifications_delivered_total[15m]) == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Every Ravel alert notification is failing to reach its sinks
+          description: >-
+            Transitions are still being written durably, so no alert history is
+            lost, but nothing is reaching Alertmanager or the configured
+            webhooks. Check the sink URLs and credentials, and the evaluator
+            logs for the per-sink delivery error.
+      - alert: RavelAlertRuleEvaluationFailing
+        # A rule whose query, condition, or write fails is retried next tick, so
+        # a persistently broken rule (a PromQL expression that no longer parses
+        # against the data, a SQL statement naming a dropped column) advances
+        # this every tick and never self-heals.
+        #
+        # Quiet with no rules configured, for the same reason as above: no
+        # series to match. Quiet on a deployment whose rules all evaluate
+        # cleanly: the counter never moves.
+        expr: |
+          increase(ravel_alert_rules_failed_total[30m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A Ravel alert rule has been failing to evaluate for half an hour
+          description: >-
+            The rule is skipped and retried every tick, so the condition it
+            watches is unguarded for as long as this holds. The evaluator logs
+            name the rule_id and the error.
+      - alert: RavelAlertPipelineBlocked
+        # The two store-failure outcomes, and ONLY those two. `lease_not_held`
+        # is excluded on purpose: it is the steady state of every replica that
+        # is not the lease holder, so including it would page on a normal
+        # two-replica deployment forever.
+        expr: |
+          increase(ravel_alert_ticks_total{outcome=~"history_unavailable|lease_unavailable"}[30m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Ravel alert evaluation is blocked on object storage
+          description: >-
+            The evaluator can neither read the tenant's alert history nor hold
+            its lease, so no rule is evaluated on these ticks. The liveness
+            gauge does not advance on them either, so a sustained case also
+            trips RavelAlertLoopStalled; this rule names the cause. Check the
+            store reachability family.
+```
+
+The `600s` staleness threshold is ten default 60s evaluation intervals. It is
+far tighter than the maintenance group's `1800s` because the alert loop's
+interval is twelve times shorter: ten missed ticks here is the same evidence
+six missed cycles is there.
+
 ### At-rest scrubber (`ravel_scrub_*`)
 
 Labels: `mode` and `signal`, plus `reason` on the seal-divergence counter.
@@ -1079,4 +1240,5 @@ read caches and their disk tier: ADR-0046, ADR-0064. Maintenance safety,
 ownership, merge memory, and the at-rest scrubber: ADR-0048, ADR-0058,
 ADR-0059, ADR-0065. Log POSTINGS and dynamic columns: ADR-0049, ADR-0100.
 Distributed read fan-out: ADR-0071. Wire-byte accounting: ADR-0084. The metric
-metadata cache: ADR-0085.
+metadata cache: ADR-0085. Alert evaluation and its at-least-once notification
+contract: ADR-0043.
