@@ -1,22 +1,27 @@
 //! Allocation-churn figures (cumulative bytes allocated over the run, via
 //! `stats_alloc`; not peak resident bytes) for `RsegDedupExec`'s
 //! labels-dictionary handling (`src/dedup.rs`, `DedupStream::flush`) on the
-//! worst case for it: one series with many samples. Issue #1582
-//! measurement round, deferral round.
+//! worst case for it: one series with many samples.
 //!
 //! Unlike `tests/dedup_finalize_allocation.rs`'s many-small-segments corpus,
 //! every row here shares the *same* series and so the *same* one-entry
 //! dictionary key within any given upstream batch (`RsegScanExec`'s
 //! `BATCH_ROWS` = 8192, `src/scan.rs`, or `SortPreservingMergeExec`'s own
-//! output batch size, whichever bounds a given flush window). Most flush
-//! windows here draw from a single dictionary pointer throughout, so `flush`
-//! skips per-row compaction for them entirely (see `DedupStream::flush`'s
-//! docs); a flush window straddling a batch boundary is exactly the shape
-//! `flush`'s labels memo (`LabelsMemo` in `src/dedup.rs`) targets, since
-//! consecutive winner rows there still share both the source dictionary (by
-//! pointer, within one upstream batch) and the key (always 0, since there is
-//! only one series), so the memo turns all but a handful of that window's
-//! rebuilds into a cheap `Arc::clone`.
+//! output batch size, whichever bounds a given flush window). On this corpus
+//! (20,000 samples) `flush` runs four windows: 8191 rows (single-dict, skip),
+//! 8192 rows (multi-dict, compact), 3616 rows (multi-dict, compact), 1 row
+//! (single-dict, skip) -- so the two multi-dict windows carry 11,808 of the
+//! 20,000 rows through the per-row compaction path, not the rare exception
+//! the skip alone would suggest. Both are multi-dict for the same reason:
+//! `flush` leaves exactly one `pending` row behind at each upstream batch
+//! boundary, and that single carried-over row finalizes at the head of the
+//! next window under the *previous* batch's dictionary, so the window sees
+//! two distinct source dictionaries even though only one row disagrees.
+//! Within each such window, 8191 (or 3615) of its rows still share one
+//! pointer; the labels memo (`LabelsMemo` in `src/dedup.rs`) is what turns
+//! those rebuilds into a cheap `Arc::clone` instead of a fresh
+//! `compact_labels` call per row -- on this corpus the memo, not the skip,
+//! is what keeps the multi-dict windows cheap.
 //!
 //! Same one-test-per-binary / current-thread-runtime constraints as
 //! `tests/dedup_finalize_allocation.rs`; see that file's header for why.
@@ -51,20 +56,22 @@ const SAMPLES: usize = 20_000;
 /// segment. Measured on this fixture (debug build, cargo test default
 /// profile, the same profile as `tests/dedup_finalize_allocation.rs`):
 ///
-///   - compaction skipped/deleted outright:                65,194,710 bytes allocated
-///   - as committed pre-memo (issue #1582 round 1):       345,644,574 bytes allocated
-///   - as committed, memo but unconditional (round 2):     65,236,104 bytes allocated
-///   - as committed today, deferred to `flush` (this round): 64,875,832 bytes allocated
+///   - compaction skipped/deleted outright:                 65,194,710 bytes allocated
+///   - unconditional per-row compaction, no memo:          345,644,574 bytes allocated
+///   - unconditional per-row compaction, with memo:         65,236,104 bytes allocated
+///   - as committed, memo hit disabled (`&& false` in the memo check
+///     inside `compact_row_labels`):                       227,761,222 bytes allocated
+///   - as committed, skip disabled (`flush`'s `if` forced to the
+///     compaction branch unconditionally):                 65,727,800 bytes allocated
+///   - as committed today (skip + memo both live):          64,875,832 bytes allocated
 ///
-/// The current figure is within noise of the no-compaction floor: on this
-/// corpus almost every flush window already draws from a single dictionary
-/// pointer, so `flush` skips per-row compaction outright rather than relying
-/// on the memo to make it cheap; the memo still covers the rare window that
-/// straddles a batch boundary. The bound sits at roughly 1.4x the current
-/// figure (headroom for allocator noise) and less than 1/3 of the pre-memo
-/// figure, so it stays decisive against a regression in either the skip or
-/// the memo (silently no longer firing, or being removed) without being so
-/// tight that unrelated allocator jitter trips it.
+/// The current figure is within noise of the skip-disabled figure and far
+/// from the memo-disabled one: on this corpus the memo, not the skip, is
+/// what keeps the multi-dict windows cheap (see the header). The bound sits
+/// at roughly 1.4x the current figure (headroom for allocator noise) and
+/// less than half the memo-disabled figure, so it stays decisive against a
+/// regression in the memo (silently no longer firing, or being removed)
+/// without being so tight that unrelated allocator jitter trips it.
 const MAX_CHURN_BYTES: usize = 90_000_000;
 
 fn one_series_corpus(samples_each: usize) -> Vec<(LabelSet, Vec<(i64, f64)>)> {
