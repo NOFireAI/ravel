@@ -832,7 +832,7 @@ mod tests {
     use ravel_catalog::Snapshot;
     use ravel_object_store::memory::MemoryStore;
 
-    use ravel_query::phase_accounting::PhaseAccounting;
+    use ravel_query::PhaseAccounting;
     use ravel_types::accounting::QueryAccounting;
 
     use super::*;

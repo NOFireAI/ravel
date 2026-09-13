@@ -127,9 +127,8 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_promql::LabelMatcher;
 use ravel_query::erasure::{ErasurePredicate, retain_series_soa};
-use ravel_query::phase_accounting::PhaseAccounting;
 use ravel_query::{
-    ByteLimit, FetchedSeriesSoa, RequestLimit, SamplePriority, SegmentFetcher,
+    ByteLimit, FetchedSeriesSoa, PhaseAccounting, RequestLimit, SamplePriority, SegmentFetcher,
     request_budget_exceeded,
 };
 use ravel_types::{LabelSet, TenantHash};

@@ -38,9 +38,9 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_promql::LabelMatcher;
+use ravel_query::PhaseAccounting;
 use ravel_query::SegmentFetcher;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
-use ravel_query::phase_accounting::PhaseAccounting;
 use ravel_types::TenantHash;
 
 use crate::config::SqlConfig;

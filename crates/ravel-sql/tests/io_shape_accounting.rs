@@ -24,11 +24,10 @@ use ravel_commit::{keys, publish, record};
 use ravel_logseg::writer::ObjectIdentity as LogObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::PutOptions;
+use ravel_object_store::memory::MemoryStore;
 use ravel_query::io_shape::PlanClass;
-use ravel_query::phase_accounting::QueryPhase;
-use ravel_query::{GetLimiter, LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{GetLimiter, LogSegmentFetcher, QueryPhase, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7};
 use ravel_sql::{SqlConfig, SqlExecutor, SqlRequest};
 use ravel_types::accounting::AccountedOp;
@@ -415,7 +414,10 @@ async fn service_batches_is_bound_by_shared_get_limiter_permits_not_partition_co
 /// real `Catalog::resolve` for `Signal::Logs` finds it. Mirrors
 /// `logs_declared_columns.rs`'s `publish_logs`.
 async fn publish_log_segment(store: &dyn ObjectStoreBackend, tenant_id: &TenantId, ts_ns: i64) {
-    let resource = vec![("service.name".to_string(), AttrValue::Str("api".to_string()))];
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
     let record = LogRecord {
         stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
         stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
