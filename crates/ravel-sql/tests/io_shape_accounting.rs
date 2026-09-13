@@ -21,8 +21,11 @@ use ravel_catalog::{
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
+use ravel_logseg::writer::ObjectIdentity as LogObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::PutOptions;
 use ravel_query::io_shape::PlanClass;
 use ravel_query::phase_accounting::QueryPhase;
 use ravel_query::{GetLimiter, LogSegmentFetcher, SegmentFetcher};
@@ -406,4 +409,103 @@ async fn service_batches_is_bound_by_shared_get_limiter_permits_not_partition_co
         .expect("unpruned query");
     assert_eq!(unpruned.stats.segments, 2, "both segments match a|b");
     assert_eq!(unpruned.io_shape.service_batches, 2);
+}
+
+/// Publish one real RLOG object plus its `Signal::Logs` commit record, so a
+/// real `Catalog::resolve` for `Signal::Logs` finds it. Mirrors
+/// `logs_declared_columns.rs`'s `publish_logs`.
+async fn publish_log_segment(store: &dyn ObjectStoreBackend, tenant_id: &TenantId, ts_ns: i64) {
+    let resource = vec![("service.name".to_string(), AttrValue::Str("api".to_string()))];
+    let record = LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns,
+        observed_ts_ns: ts_ns,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: "hello world".into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    };
+
+    let tenant_hash = tenant_id.hash();
+    let identity = LogObjectIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: [2u8; 16],
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    writer.push(record).expect("push log record");
+    let bytes = writer.finish().expect("finish rlog object");
+
+    let new_record = NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Logs,
+        shard: 0,
+        writer_id: Uuid::from_u128(9_501),
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: bytes.len() as u64,
+        content_hash: [7u8; 32],
+        sample_count: 1,
+        series_count: 1,
+        min_event_ts_ns: ts_ns,
+        max_event_ts_ns: ts_ns,
+        min_ingest_ts_ns: ts_ns,
+        max_ingest_ts_ns: ts_ns,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        created_unix_ns: 10,
+        ingest_hour_bucket: 0,
+    };
+    let rec = record::build(new_record).expect("valid logs commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("logs data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put rlog object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish logs commit record");
+}
+
+/// The `Logs`/`Spans`/`Alerts`/`Audit` targets' resolve always passes
+/// `name_filter: None` (`resolve_admitted` in `executor.rs`), so
+/// `Snapshot::segments_pruned` is structurally always 0 for them and
+/// reporting `SelectiveIndexed`/`ExhaustiveScan` off it would be fabricated;
+/// `sql_io_shape` reports `PlanClass::Unclassified` for all four instead.
+/// This pins that over a real executed `FROM logs` query, so a regression
+/// that routes the `Logs` arm back through the `Metrics`-style
+/// pruned/unpruned classification is caught here rather than only by a
+/// downstream plan-shape lint keyed on `planClass`.
+#[tokio::test]
+async fn logs_query_reports_unclassified_plan_class() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tid = tenant("acme-logs");
+    let th = tid.hash();
+    publish_log_segment(store.as_ref(), &tid, 100).await;
+
+    let cat = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+    let executor = SqlExecutor::new(
+        cat,
+        SegmentFetcher::new(store.clone()),
+        LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
+        SqlConfig::default(),
+        1 << 30,
+    );
+    let window = TimeRange {
+        start_ns: 0,
+        end_ns: 1_000,
+    };
+    let now = 1_000;
+
+    let outcome = executor
+        .execute(th, &sql_request("SELECT ts, body FROM logs", window, now))
+        .await
+        .expect("logs query");
+    assert_eq!(outcome.io_shape.plan_class, PlanClass::Unclassified);
 }
