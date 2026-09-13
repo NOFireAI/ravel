@@ -2640,25 +2640,25 @@ aborts the process rather than raising a catchable panic, taking every other
 tenant on the node with it.
 
 What is bounded is not nesting depth but a sound invariant: a
-recursive-descent parser cannot produce more tree levels than it has
-structural characters to consume. The count is of non-whitespace characters
-outside literals and comments, so a long `LIKE` pattern, an embedded JSON
-document, or a long comment costs nothing beyond one character for the
-literal token itself, while every construct that can deepen a tree is
-bounded, including ones nobody has tested.
+recursive-descent parser cannot produce more tree levels than it has tokens
+to consume. The count is of tokens outside literals and comments, so a long
+`LIKE` pattern, an embedded JSON document, a long identifier, or a long
+comment costs nothing beyond the one token itself, while every construct that
+can deepen a tree is bounded, including ones nobody has tested. Counting
+tokens rather than characters is what keeps the bound independent of quoting:
+a bare identifier and a quoted one cost the same.
 
 Three numbers, one decision:
 
-- `ravel_sql::MAX_STATEMENT_COMPLEXITY` is 1,000 structural characters. On a
-  2 MiB stack in a release build, DataFusion's SQL-to-`LogicalPlan`
-  conversion survives 1,807 characters of a binary-operator chain and aborts
-  at 1,907, about 950 tree levels. (The validation walk itself survives
-  50,007 and aborts at 60,007, so the planner, not the gate's own caller, is
-  the binding consumer.) No construct costs fewer than two characters per
-  tree level, so an admitted statement cannot exceed 500 levels against those
-  950. The bound is not lower because a lower one refuses real analytic SQL:
-  the widest statement in `benchmarks/clickbench/hits.corpus.json` counts 901
-  structural characters, and the whole corpus is pinned as accepted in
+- `ravel_sql::MAX_STATEMENT_COMPLEXITY` is 1,000 tokens. On a 2 MiB stack in
+  a release build, DataFusion's SQL-to-`LogicalPlan` conversion survives
+  1,807 units of a binary-operator chain and aborts at 1,907, about 950 tree
+  levels. (The validation walk itself survives 50,007 and aborts at 60,007,
+  so the planner, not the gate's own caller, is the binding consumer.) No
+  construct costs fewer than two tokens per tree level, so an admitted
+  statement cannot exceed 500 levels against those 950. The bound is not
+  lower because a lower one refuses real analytic SQL: the whole ClickBench
+  corpus in `benchmarks/clickbench/hits.corpus.json` is pinned as accepted in
   `crates/ravel-sql/tests/statement_complexity.rs`.
 - The parser recursion limit is pinned at 50 rather than inherited from
   `datafusion-sql`'s default. It is a second, independent bound: it catches

@@ -107,13 +107,13 @@ ceiling as the other query routes, and a request refused by it gets the same
 
 `/api/v1/sql` caps its request body at 64 KiB; a larger body is 400. The
 statement itself is gated before it is parsed: a statement carrying more than
-1,000 structural characters (non-whitespace characters outside string literals
-and comments) is 400, with a message naming the measured count and the
-maximum. The gate bounds the depth of the expression tree a statement can
-build, which no body-size cap does on its own, and it applies to Flight SQL
-too, where it surfaces as `InvalidArgument`. A long string literal or comment
-costs one character against the count, so the bound constrains structure
-rather than text length. See docs/query-engine.md, "SQL statement complexity
+1,000 tokens (tokens outside string literals and comments) is 400, with a
+message naming the measured count and the maximum. The gate bounds the depth
+of the expression tree a statement can build, which no body-size cap does on
+its own, and it applies to Flight SQL too, where it surfaces as
+`InvalidArgument`. A string literal costs one token however long its payload
+is, an identifier or number costs one however long it is, and a comment costs
+nothing, so the bound constrains structure rather than text length. See docs/query-engine.md, "SQL statement complexity
 gate".
 
 `/api/v1/sql` is behind the `sql` cargo feature. The published server image

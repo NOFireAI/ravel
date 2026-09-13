@@ -22,17 +22,27 @@
 //! arbitrarily deep tree. Rather than enumerate every construct that can
 //! deepen a tree, this guard bounds a simpler, sound invariant: a
 //! recursive-descent parser cannot produce more tree levels than it has
-//! structural characters to consume, so capping
-//! `count(non-whitespace characters outside literals and comments)` caps
-//! parse depth, AST depth, and therefore every downstream walk depth by
-//! construction, for every construct, tested or not.
+//! TOKENS to consume, so capping the count of tokens outside literals and
+//! comments caps parse depth, AST depth, and therefore every downstream walk
+//! depth by construction, for every construct, tested or not.
+//!
+//! The unit is the token, not the character. An earlier form of this guard
+//! counted characters, which made the bound depend on how an author quoted an
+//! identifier (`"ResolutionWidth"` cost 1 and `ResolutionWidth` cost 15) and
+//! refused a dashboard's hundred-element numeric `IN` list at 1,036 while
+//! admitting a four-hundred-element quoted one at 936, though the numeric one
+//! is the shallower tree of the two. Counting a run of identifier, keyword, or
+//! number characters as the one token it is removes that variance and leaves
+//! the depth argument untouched, because a loop-consumed chain still spends
+//! one operand token plus one operator token per level.
 //!
 //! # What is excluded, and why the exclusions are sound
 //!
 //! Literal payloads are excluded because they are single tokens to the
 //! parser: a `LIKE` pattern, an `IN` list of long strings, or an embedded
-//! JSON document can be long without adding one tree level. Comments are
-//! excluded because they are not tokens at all.
+//! JSON document can be long without adding one tree level. Ordinary comments
+//! are excluded because they are not tokens at all. A `/*!...*/` hint comment
+//! is NOT excluded, because for this dialect it is tokens: see below.
 //!
 //! The exclusion regions must be a *subset* of the regions `sqlparser`'s
 //! tokenizer itself treats as opaque; a region this scan skips that the
@@ -56,18 +66,31 @@
 //! - `--` line comments, and `/* ... */` block comments, nested, because
 //!   `GenericDialect::supports_nested_comments()` is true.
 //!
-//! Each literal's opening delimiter is itself counted, so every literal token
-//! costs at least one structural character no matter how long its payload is.
+//! One exclusion that would be UNSOUND, and is therefore not made:
+//! `/*!...*/`. `GenericDialect::supports_multiline_comment_hints()` is true
+//! (sqlparser `dialect/generic.rs`), and the tokenizer re-tokenizes a block
+//! comment whose body opens with `!` into real tokens (`tokenizer.rs`), on the
+//! path `DFParserBuilder::build` uses. Skipping it would hide structure the
+//! parser reads: measured before the fix, `SELECT 1/*!` + `+1` x2000 + `*/`
+//! scored 7 while the tokenizer produced 4003 tokens from it. The scan
+//! therefore counts a hint body exactly as the tokenizer does.
+//!
+//! Every token costs one unit, whatever its length: a literal through its
+//! opening delimiter, an identifier or number through its first character.
 //!
 //! # Calibrating [`MAX_STATEMENT_COMPLEXITY`]
 //!
 //! Measured on a 2 MiB stack (the tokio worker default the server runs on),
 //! release profile, by spawning
 //! `std::thread::Builder::new().stack_size(2 << 20)` and growing each
-//! construct until the process aborted. Counts below are structural
-//! characters as this module counts them, not raw bytes:
+//! construct until the process aborted. Counts below are units as this module
+//! counts them, not raw bytes. They were measured under the earlier
+//! character-based rule, and every construct in the table is built from
+//! single-character operands and operators, so each figure is the same under
+//! the token rule; a table entry using multi-character operands would count
+//! lower today:
 //!
-//! | construct                             | chars/level | `validate` survives | `validate` aborts | planner survives | planner aborts |
+//! | construct                             | units/level | `validate` survives | `validate` aborts | planner survives | planner aborts |
 //! |---------------------------------------|:-----------:|:-------------------:|:-----------------:|:----------------:|:--------------:|
 //! | `SELECT 1+1+1+...` (binary chain)     | 2           | 50,007              | 60,007            | 1,807            | 1,907          |
 //! | `SELECT 'a'\|\|'a'\|\|...` (concat)   | 3           | 75,007              | 90,007            | 2,707            | 3,307          |
@@ -76,14 +99,14 @@
 //! | `SELECT * FROM (SELECT * FROM (...))` | 13          | rejected by the parser recursion limit at depth 50 | | | |
 //!
 //! The binding floor is not this crate's own walk. `validate`'s visitors
-//! survive 50,007 structural characters, but a statement they accept is then
+//! survive 50,007 units, but a statement they accept is then
 //! handed to DataFusion's SQL-to-`LogicalPlan` conversion, which walks the
-//! same tree with much larger frames and aborts at 1,907 characters of the
+//! same tree with much larger frames and aborts at 1,907 units of the
 //! same chain, about 950 tree levels. So the guard is calibrated against that
 //! consumer, not against its own caller.
 //!
-//! The margin is stated in levels rather than characters, because that is
-//! what the stack spends: no construct costs fewer than two characters per
+//! The margin is stated in levels rather than units, because that is
+//! what the stack spends: no construct costs fewer than two units per
 //! tree level (a binary operator and its right operand; parenthesis nesting
 //! also costs two and is capped by the parser's recursion limit long before
 //! this one bites), so a statement at [`MAX_STATEMENT_COMPLEXITY`] cannot
@@ -96,14 +119,15 @@
 //! The bound is not set lower than that because a lower one refuses real
 //! analytic SQL. The largest statement in this repository's ClickBench corpus
 //! (`benchmarks/clickbench/hits.corpus.json`, `q30_resolution_running_sums`,
-//! 90 `SUM("ResolutionWidth" + n)` terms) counts 901 structural characters,
+//! 90 `SUM("ResolutionWidth" + n)` terms) counts 901 units under the earlier
+//! character rule and fewer under the token rule,
 //! and it is a flat projection list, not a deep tree.
 //! `tests/statement_complexity.rs` pins that whole corpus as accepted, so a
 //! later tightening of this bound fails there rather than in a user's query.
 //!
 //! A debug build's frames are roughly two orders of magnitude larger than a
 //! release build's: the same binary chain aborts inside `validate` alone at
-//! 407 structural characters unoptimized. The published server image is a
+//! 407 units unoptimized. The published server image is a
 //! release build (`Dockerfile`), and a bound low enough to protect a debug
 //! build would reject ordinary analytic SQL, so the bound is sized for the
 //! release profile.
@@ -112,9 +136,9 @@
 //! a `Vec`; 500,000 elements parse and walk without incident, confirmed by
 //! the same probe), but this guard does not special-case it: the whole point
 //! of the sound-invariant approach is to not depend on a per-construct safety
-//! argument. A list of quoted values stays cheap anyway, since each element
-//! costs one character for its opening quote plus one for the comma; a list
-//! of long numeric literals is the shape that spends the budget fastest.
+//! argument. Every element costs the same two units, one for the value token
+//! and one for the comma, whether the value is quoted or bare, so the list
+//! that fits the bound is the same list either way.
 
 use std::fmt;
 
@@ -139,7 +163,7 @@ impl fmt::Display for StatementTooComplex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "statement complexity {} exceeds the maximum of {} structural characters; simplify the statement",
+            "statement complexity {} exceeds the maximum of {} tokens; simplify the statement",
             self.count, self.max
         )
     }
@@ -188,7 +212,7 @@ pub fn structural_count(sql: &str) -> usize {
     scan(sql, usize::MAX)
 }
 
-/// Count structural characters, stopping as soon as the count exceeds
+/// Count tokens outside literals and comments, stopping as soon as the count exceeds
 /// `stop_above`. The returned count is then `stop_above + 1`, never the full
 /// figure: that is all [`check`] needs, and it keeps a 1 MiB adversarial body
 /// from being scanned to its end.
@@ -242,7 +266,15 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                     skip = 1;
                     continue;
                 }
-                if rest.starts_with("/*") {
+                // `/*!...*/` is NOT opaque to this dialect. `GenericDialect`
+                // returns true from `supports_multiline_comment_hints`, and the
+                // tokenizer re-tokenizes a block comment whose body opens with
+                // `!` into real tokens. Treating it as a comment would skip a
+                // region the parser reads, which is the unsound direction: a
+                // measured probe scored `SELECT 1/*!` + `+1` x2000 + `*/` at 7
+                // while the tokenizer produced 4003 tokens from it. So fall
+                // through and count the body, exactly as the tokenizer does.
+                if rest.starts_with("/*") && !rest.starts_with("/*!") {
                     mode = Mode::BlockComment(1);
                     skip = 1;
                     continue;
@@ -251,8 +283,18 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                     continue;
                 }
 
-                // Every literal token costs one structural character, however
-                // long its payload is.
+                // One token, one unit, whatever its length. A quoted literal
+                // and a dollar-quoted body already cost one; an identifier,
+                // keyword, or number run costs one for the same reason, since
+                // the invariant this guard rests on is about tokens rather
+                // than characters. Counting per character instead made the
+                // bound depend on quoting: `"ResolutionWidth"` cost 1 and
+                // `ResolutionWidth` cost 15, so the same statement passed or
+                // failed on how its author quoted it, and a dashboard's
+                // hundred-element numeric IN list was refused while a
+                // four-hundred-element quoted one was admitted. The depth
+                // argument is unchanged, because a loop-consumed chain still
+                // spends one operand token plus one operator token per level.
                 count += 1;
                 if count > stop_above {
                     return count;
@@ -267,6 +309,17 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                 {
                     skip = end.chars().count() - 1;
                     mode = Mode::Dollar(end);
+                    continue;
+                }
+                if c.is_alphanumeric() || c == '_' {
+                    // Consume the rest of the identifier/keyword/number run.
+                    // A `.` inside a number (`1.5`, `1e-3`) is deliberately
+                    // NOT consumed: it costs its own unit, which only makes
+                    // the count stricter, never more permissive.
+                    let run = rest
+                        .find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                        .unwrap_or(rest.len());
+                    skip = rest[..run].chars().count() - 1;
                 }
             }
         }
@@ -329,9 +382,11 @@ mod tests {
         check(&sql).expect("a long literal is not structure");
     }
 
-    /// `MAX_STATEMENT_COMPLEXITY - n` counted characters, as a run of `a`.
+    /// `MAX_STATEMENT_COMPLEXITY - n` counted units, as that many separate
+    /// `a` tokens. Space-separated because a run of `a` is ONE identifier
+    /// token and therefore one unit, however long it is.
     fn filler(n: usize) -> String {
-        "a".repeat(MAX_STATEMENT_COMPLEXITY - n)
+        "a ".repeat(MAX_STATEMENT_COMPLEXITY - n)
     }
 
     /// The exact contribution of a string literal is one character, whatever
@@ -399,6 +454,70 @@ mod tests {
         assert_eq!(err.count, MAX_STATEMENT_COMPLEXITY + 1);
     }
 
+    /// A `/*!...*/` hint comment cannot hide an operator chain. This dialect
+    /// re-tokenizes such a body into real tokens
+    /// (`GenericDialect::supports_multiline_comment_hints` is true, and
+    /// `Tokenizer` expands a `MultiLineComment` whose body opens with `!`), so
+    /// a scan that skipped the region would admit exactly the flat chain this
+    /// guard exists to refuse. Measured before the fix: this statement at
+    /// n=2000 scored 7 while the tokenizer produced 4003 tokens from it.
+    ///
+    /// Flip to watch it fail: drop the `&& !rest.starts_with("/*!")` term from
+    /// the block-comment arm in `scan`. The chain is skipped, the count falls
+    /// to single digits, and the `expect_err` below panics.
+    #[test]
+    fn a_hint_comment_cannot_hide_an_operator_chain() {
+        let chain = "+1".repeat(MAX_STATEMENT_COMPLEXITY);
+        let sql = format!("SELECT 1/*!{chain}*/");
+        let err = check(&sql).expect_err("a hint body is structure, not a comment");
+        assert!(
+            err.count > MAX_STATEMENT_COMPLEXITY,
+            "the hint body must be counted, got {}",
+            err.count
+        );
+
+        // The mirror: an ordinary block comment is still opaque, so the fix
+        // did not simply stop skipping comments.
+        let sql = format!("SELECT 1/*{chain}*/");
+        assert!(check(&sql).is_ok(), "a plain block comment stays uncounted");
+    }
+
+    /// One token costs one unit whatever its length, so the bound does not
+    /// depend on how an author quoted an identifier. Before this rule a
+    /// hundred-element numeric IN list was refused while a four-hundred-element
+    /// quoted one was admitted, though the numeric one is the shallower tree.
+    ///
+    /// Flip to watch it fail: delete the identifier-run `skip` at the end of
+    /// `scan`'s `Normal` arm. Each character of every bare identifier and
+    /// number is then counted again and the numeric list below is rejected.
+    #[test]
+    fn a_token_costs_one_unit_whatever_its_length() {
+        let quoted = std::iter::repeat_n("\'series-0001\'", 100)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let numeric = std::iter::repeat_n("80231457", 100)
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let q = structural_count(&format!("SELECT v FROM t WHERE id IN ({quoted})"));
+        let n = structural_count(&format!("SELECT v FROM t WHERE id IN ({numeric})"));
+        assert_eq!(
+            q, n,
+            "the same hundred-element list must cost the same quoted or bare"
+        );
+        assert!(
+            n <= MAX_STATEMENT_COMPLEXITY,
+            "a hundred-element IN list must fit the bound, got {n}"
+        );
+
+        // A long bare identifier costs the same as a short one.
+        assert_eq!(
+            structural_count("SELECT ResolutionWidth FROM t"),
+            structural_count("SELECT w FROM t"),
+            "identifier length must not change the cost"
+        );
+    }
+
     /// A `$` that opens no dollar-quoted string is an ordinary character and
     /// keeps being counted.
     #[test]
@@ -464,9 +583,9 @@ mod tests {
     /// asserted on both sides rather than "somewhere around" it.
     #[test]
     fn the_bound_is_inclusive() {
-        let at = "a".repeat(MAX_STATEMENT_COMPLEXITY);
+        let at = "a ".repeat(MAX_STATEMENT_COMPLEXITY);
         assert_eq!(check(&at), Ok(()));
-        let over = "a".repeat(MAX_STATEMENT_COMPLEXITY + 1);
+        let over = "a ".repeat(MAX_STATEMENT_COMPLEXITY + 1);
         assert_eq!(
             check(&over),
             Err(StatementTooComplex {
@@ -477,7 +596,7 @@ mod tests {
     }
 
     /// Whitespace is free, so a statement formatted across many lines is not
-    /// penalised for its formatting: the same seven structural characters
+    /// penalised for its formatting: the same seven units
     /// pass however much whitespace surrounds them, and adding whitespace to
     /// a statement already at the bound does not push it over.
     #[test]
