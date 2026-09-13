@@ -346,10 +346,10 @@ impl DedupStream {
     ///
     /// Allocation churn (cumulative bytes allocated over the run, via
     /// `stats_alloc`; not peak resident bytes -- see
-    /// `tests/dedup_finalize_allocation*.rs` and
-    /// `tests/peak_alloc_instrument.rs`) measured on a 5,000-series/1-segment
-    /// corpus, where every accumulated row shares one dictionary pointer so
-    /// the unconditional per-row compaction bought nothing: 100,683,176 bytes
+    /// `tests/dedup_finalize_allocation*.rs`) measured on a
+    /// 5,000-series/1-segment corpus, where every accumulated row shares
+    /// one dictionary pointer so the unconditional per-row compaction
+    /// bought nothing: 100,683,176 bytes
     /// allocated compacting unconditionally, 29,948,424 bytes allocated
     /// skipping it here (the same figure as deleting the compaction outright;
     /// measured with a scratch corpus, not committed as a permanent test).

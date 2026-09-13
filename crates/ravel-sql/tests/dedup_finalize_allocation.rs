@@ -1,9 +1,9 @@
 //! Allocation-churn bound (cumulative bytes allocated over the run, via
-//! `stats_alloc`; not peak resident bytes -- see `tests/peak_alloc_instrument.rs`
-//! for that) for `RsegDedupExec`'s labels-dictionary handling across a flush
-//! window (`src/dedup.rs`'s `DedupStream::flush`, deferred from an earlier
-//! per-row `finalize` call to `crate::labels::compact_labels`; issue #1582
-//! fix-round finding at `src/dedup.rs:233`, deferral round).
+//! `stats_alloc`; not peak resident bytes) for `RsegDedupExec`'s
+//! labels-dictionary handling across a flush window (`src/dedup.rs`'s
+//! `DedupStream::flush`, deferred from an earlier per-row `finalize` call
+//! to `crate::labels::compact_labels`; issue #1582 fix-round finding at
+//! `src/dedup.rs:233`, deferral round).
 //!
 //! This file contains EXACTLY ONE test on purpose, following
 //! `tests/scan_batch_allocations.rs`: the measurement is a `stats_alloc::Region`
