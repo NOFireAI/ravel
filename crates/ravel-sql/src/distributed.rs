@@ -32,8 +32,8 @@
 //!
 //! # Reachability
 //!
-//! Nothing in the shipping binary reaches this yet, and no client-facing RPC
-//! ever will. An external Flight SQL client always receives exactly ONE
+//! No client-facing RPC ever reaches this, and none ever will. An external
+//! Flight SQL client always receives exactly ONE
 //! endpoint from `get_flight_info_statement`, distribution installed or not:
 //! Arrow Flight's two-RPC contract makes the N endpoints of one FlightInfo the
 //! *partitions of a single result set* a client unions, which a cross-shard
@@ -44,11 +44,14 @@
 //! and a worker serves each one over its `do_get` slice-fragment path
 //! (internal schema, scan-only, no statement planning or dedup).
 //!
-//! The coordinator that mints slices and installs the fan-out lands with the
-//! server wiring; until then the whole minting-plus-fan-out path
-//! is exercised only by the in-process worker in the acceptance tests
-//! (`tests/flight_distributed.rs`), the sole caller of [`plan_distributed_slices`],
-//! [`DistributedScanExec`], and [`distributed_samples_plan`] today.
+//! The coordinator that mints slices and installs the fan-out is the running
+//! server: `ravel-server` builds a [`DistributedFlightConfig`] over its live
+//! query-worker roster (`services/ravel-server/src/sql_distrib.rs`) and installs
+//! it on the Flight SQL service under `--distributed-query` in a query-serving
+//! mode, so every statement over the cost gate builds a
+//! [`DistributedScanExec`]. The acceptance tests
+//! (`tests/flight_distributed.rs`) drive the same minting-plus-fan-out path
+//! against an in-process worker, the real service `do_get`, and a refused port.
 //!
 //! # No dependency on the fleet registry
 //!
