@@ -169,10 +169,12 @@ Every rejection reason:
 | Rejection | Meaning |
 |---|---|
 | `TooManyDataPoints` | The whole request exceeds `max_data_points_per_request`. Ravel admits nothing in the request. |
+| `TooManyExplodedPoints` | The request fits `max_data_points_per_request` in data points, but the normalized points its classic histograms and summaries explode into do not. Ravel admits nothing in the request. The reported rejected count stays in data points, the unit the sender sent. |
 | `TooManyResourceAttributes` | A `Resource` has more attributes than `max_resource_attributes`. Ravel rejects every point under it. |
 | `MetricNameTooLong` | The metric name (before sanitization) exceeds `max_metric_name_len`. Ravel rejects every point on that metric. |
 | `EmptyMetricName` | The metric name sanitizes to empty. Ravel rejects every point on that metric. |
 | `TooManyAttributes` | One data point has more attributes than `max_attributes_per_point`. |
+| `TooManyHistogramBuckets` | One classic `Histogram` data point has more `explicit_bounds` than `max_histogram_buckets`. Only that data point is rejected. |
 | `LabelNameTooLong` | A label name (after sanitization) exceeds `max_label_name_len`. This also applies to the synthesized `job` label after its `namespace/name` join. |
 | `LabelValueTooLong` | A label value exceeds `max_label_value_len`. |
 | `DuplicateLabelName` | Two attributes sanitize to the same label name (or a data-point attribute collides with a synthesized `job`/`instance` label). |
@@ -353,12 +355,31 @@ Defaults. No `ravel-server` flag configures them:
 |---|---|
 | `max_data_points_per_request` | 100,000 |
 | `max_attributes_per_point` | 64 |
+| `max_histogram_buckets` | 160 |
 | `max_label_name_len` | 256 bytes |
 | `max_label_value_len` | 4,096 bytes |
 | `max_metric_name_len` | 512 bytes |
 | `max_resource_attributes` | 128 |
 | `max_future_skew_ns` | 10 minutes |
 | `max_ingest_lag_ns` | 2 hours |
+
+`max_data_points_per_request` is checked twice: once against the data points
+the request carries on the wire, and once against the normalized points those
+data points expand into, since one classic `Histogram` data point becomes one
+point per explicit bound plus `+Inf`, `_sum`, and `_count`, and one `Summary`
+data point becomes one point per quantile plus `_sum` and `_count`. Both
+checks read vector lengths only, so neither costs an allocation. The count a
+rejection reports back to the sender stays in wire data points.
+
+`max_histogram_buckets` bounds the `explicit_bounds` of a single classic
+`Histogram` data point. It exists because that bound list is the sender's to
+choose and each bound it carries becomes a stored series with its own copy of
+the point's labels; it is a memory-safety bound, not a shape you are meant to
+tune. The default is an order of magnitude above the widest bound list a real
+exporter emits (the Prometheus Go client's `DefBuckets` is 11 bounds, the
+OpenTelemetry SDK's default explicit boundaries are 15), so a real histogram
+never meets it. Exponential (native) histograms are not exploded and are not
+subject to it.
 
 ## Event-time skew bounds
 
