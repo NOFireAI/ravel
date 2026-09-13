@@ -1,9 +1,9 @@
 //! Allocation-churn figures (cumulative bytes allocated over the run, via
-//! `stats_alloc`; not peak resident bytes -- see
-//! `tests/peak_alloc_instrument.rs`) for `RsegDedupExec`'s labels-dictionary
-//! handling (`src/dedup.rs`, `DedupStream::flush`) on the shape its deferral
-//! round (issue #1582) exists for: many distinct series in one segment, so
-//! every row shares one dictionary pointer but no two rows share a key.
+//! `stats_alloc`; not peak resident bytes) for `RsegDedupExec`'s
+//! labels-dictionary handling (`src/dedup.rs`, `DedupStream::flush`) on the
+//! shape its deferral round (issue #1582) exists for: many distinct series
+//! in one segment, so every row shares one dictionary pointer but no two
+//! rows share a key.
 //!
 //! Unlike `tests/dedup_finalize_allocation.rs`'s many-small-segments corpus
 //! or `tests/dedup_finalize_allocation_single_series.rs`'s one-series
