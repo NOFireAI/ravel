@@ -79,14 +79,27 @@
 //! survive 50,007 structural characters, but a statement they accept is then
 //! handed to DataFusion's SQL-to-`LogicalPlan` conversion, which walks the
 //! same tree with much larger frames and aborts at 1,907 characters of the
-//! same chain. So the guard is calibrated against that consumer, not against
-//! its own caller: [`MAX_STATEMENT_COMPLEXITY`] is set to a third of the
-//! tightest measured survival figure. The remaining margin absorbs two things
-//! this guard must not have to prove separately: that the worker stack is
-//! empty when the statement runs (it is not; the axum/tower/hyper or tonic
-//! frames below it are already tens of kilobytes, and the probe's thread was
-//! nearly empty), and that a future compiler or dependency version keeps the
-//! same frame sizes.
+//! same chain, about 950 tree levels. So the guard is calibrated against that
+//! consumer, not against its own caller.
+//!
+//! The margin is stated in levels rather than characters, because that is
+//! what the stack spends: no construct costs fewer than two characters per
+//! tree level (a binary operator and its right operand; parenthesis nesting
+//! also costs two and is capped by the parser's recursion limit long before
+//! this one bites), so a statement at [`MAX_STATEMENT_COMPLEXITY`] cannot
+//! reach more than 500 levels against the ~950 measured to abort. Worst case,
+//! an admitted statement can use a little over half the 2 MiB budget, leaving
+//! the rest for the frames below it (the axum/tower/hyper or tonic stack, on
+//! which the probe's nearly-empty thread says nothing) and for whatever frame
+//! growth a future compiler or dependency version brings.
+//!
+//! The bound is not set lower than that because a lower one refuses real
+//! analytic SQL. The largest statement in this repository's ClickBench corpus
+//! (`benchmarks/clickbench/hits.corpus.json`, `q30_resolution_running_sums`,
+//! 90 `SUM("ResolutionWidth" + n)` terms) counts 901 structural characters,
+//! and it is a flat projection list, not a deep tree.
+//! `tests/statement_complexity.rs` pins that whole corpus as accepted, so a
+//! later tightening of this bound fails there rather than in a user's query.
 //!
 //! A debug build's frames are roughly two orders of magnitude larger than a
 //! release build's: the same binary chain aborts inside `validate` alone at
@@ -109,7 +122,7 @@ use std::fmt;
 /// SQL statement's text may contain. See the module documentation for how
 /// this was measured and why it bounds parse depth, AST depth, and every
 /// AST-walk depth, for every construct rather than just the ones tested.
-pub const MAX_STATEMENT_COMPLEXITY: usize = 600;
+pub const MAX_STATEMENT_COMPLEXITY: usize = 1_000;
 
 /// A statement's structural character count exceeded
 /// [`MAX_STATEMENT_COMPLEXITY`].
@@ -154,6 +167,32 @@ enum Mode {
 /// the abort this guards against happens while the parsed tree is walked, and
 /// on a deep enough tree during the parse itself.
 pub fn check(sql: &str) -> Result<(), StatementTooComplex> {
+    let count = scan(sql, MAX_STATEMENT_COMPLEXITY);
+    if count > MAX_STATEMENT_COMPLEXITY {
+        return Err(StatementTooComplex {
+            count,
+            max: MAX_STATEMENT_COMPLEXITY,
+        });
+    }
+    Ok(())
+}
+
+/// `sql`'s structural character count, by the same rules [`check`] applies.
+///
+/// [`check`] stops as soon as it knows the answer, so it reports a count only
+/// on rejection; this scans the whole text. It exists for callers that need
+/// the figure for an accepted statement (a corpus test asserting how much of
+/// the budget real statements spend, an operator sizing the bound), not for
+/// the request path.
+pub fn structural_count(sql: &str) -> usize {
+    scan(sql, usize::MAX)
+}
+
+/// Count structural characters, stopping as soon as the count exceeds
+/// `stop_above`. The returned count is then `stop_above + 1`, never the full
+/// figure: that is all [`check`] needs, and it keeps a 1 MiB adversarial body
+/// from being scanned to its end.
+fn scan(sql: &str, stop_above: usize) -> usize {
     let mut mode = Mode::Normal;
     let mut count: usize = 0;
     // Characters already consumed by a lookahead below, skipped when the
@@ -215,11 +254,8 @@ pub fn check(sql: &str) -> Result<(), StatementTooComplex> {
                 // Every literal token costs one structural character, however
                 // long its payload is.
                 count += 1;
-                if count > MAX_STATEMENT_COMPLEXITY {
-                    return Err(StatementTooComplex {
-                        count,
-                        max: MAX_STATEMENT_COMPLEXITY,
-                    });
+                if count > stop_above {
+                    return count;
                 }
 
                 if c == '\'' || c == '"' || c == '`' {
@@ -236,7 +272,7 @@ pub fn check(sql: &str) -> Result<(), StatementTooComplex> {
         }
     }
 
-    Ok(())
+    count
 }
 
 /// The closing delimiter of the dollar-quoted string opening at the start of
