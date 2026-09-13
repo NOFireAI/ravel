@@ -320,10 +320,9 @@ use ravel_logseg::{
 use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
 use ravel_query::erasure::ErasurePredicate;
-use ravel_query::phase_accounting::PhaseAccounting;
 use ravel_query::{
     CarriedWholeObject, ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher,
-    LogSegmentScan,
+    LogSegmentScan, PhaseAccounting,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
