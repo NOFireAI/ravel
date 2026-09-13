@@ -311,6 +311,7 @@ fn validation_variant(err: &ValidationError) -> &'static str {
         ValidationError::ExcludedAggregate { .. } => "ValidationError::ExcludedAggregate",
         ValidationError::ExcludedScalar { .. } => "ValidationError::ExcludedScalar",
         ValidationError::ExcludedWindow { .. } => "ValidationError::ExcludedWindow",
+        ValidationError::TooComplex(_) => "ValidationError::TooComplex",
     }
 }
 

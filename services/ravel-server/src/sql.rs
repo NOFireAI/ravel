@@ -72,9 +72,16 @@ use crate::service::{ApiError, QueryService, ServiceError};
 /// The Arrow IPC stream media type, as registered by the Arrow project.
 pub const ARROW_STREAM_MEDIA_TYPE: &str = "application/vnd.apache.arrow.stream";
 
-/// Cap on the request body. SQL text is not large in legitimate use; this is
-/// a defensive bound, mirroring the one the Prometheus-shaped handlers apply.
-const MAX_BODY_BYTES: usize = 1 << 20;
+/// Cap on the request body, sized against the statement gate rather than
+/// picked as a round number: `ravel_sql::MAX_STATEMENT_COMPLEXITY` admits 600
+/// structural characters, and 64 KiB leaves a statement that large all the
+/// room it needs for whitespace, string literals (which the gate does not
+/// count), and a list of `min_commit_token` values, while keeping the text a
+/// deep-expression payload can reach two orders of magnitude below the old
+/// 1 MiB (issue #1680). The cap is the outer bound; the complexity guard in
+/// ravel-sql is what actually bounds parse and walk depth, on every SQL
+/// surface rather than only this one.
+const MAX_BODY_BYTES: usize = 64 << 10;
 
 const NS_PER_SEC: f64 = 1_000_000_000.0;
 const ONE_HOUR_NS: i64 = 60 * 60 * 1_000_000_000;
