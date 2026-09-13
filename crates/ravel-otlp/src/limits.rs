@@ -39,6 +39,19 @@ pub struct IngestLimits {
     pub max_data_points_per_request: usize,
     /// Attributes on a single data point.
     pub max_attributes_per_point: usize,
+    /// Explicit bounds on a single classic `Histogram` data point (ADR-0016).
+    /// A security control, not a tuning knob, for the same reason the
+    /// exemplar cap below is one: a classic histogram explodes into one
+    /// series per bound plus `+Inf`/`_sum`/`_count`, each carrying its own
+    /// copy of the base label set, so an uncapped bound list lets one data
+    /// point multiply in-process allocation at will, and nothing else in the
+    /// request bounds it (`max_data_points_per_request` counts wire data
+    /// points, of which such a request needs only a handful). Default 160,
+    /// an order of magnitude above the widest bound list a real exporter
+    /// emits: the Prometheus Go client's `DefBuckets` is 11 bounds and the
+    /// OpenTelemetry SDK's default explicit-bucket boundaries are 15, and
+    /// hand-configured exponential ladders top out in the tens.
+    pub max_histogram_buckets: usize,
     /// Bytes in a label name, checked after sanitization.
     pub max_label_name_len: usize,
     /// Bytes in a label value.
@@ -77,6 +90,7 @@ impl Default for IngestLimits {
         IngestLimits {
             max_data_points_per_request: 100_000,
             max_attributes_per_point: 64,
+            max_histogram_buckets: 160,
             max_label_name_len: 256,
             max_label_value_len: 4096,
             max_metric_name_len: 512,
@@ -113,6 +127,20 @@ pub fn default_resource_attribute_allowlist() -> Vec<String> {
 pub enum Rejection {
     #[error("request has {count} data points, more than the per-request limit of {max}")]
     TooManyDataPoints { count: usize, max: usize },
+
+    /// The request's wire data-point count fits `max_data_points_per_request`,
+    /// but the normalized points its classic histograms and summaries explode
+    /// into (ADR-0016) do not. `count` stays the wire data-point count, which
+    /// is the unit ADR-0016 keeps the sender-facing rejected total in;
+    /// `exploded` is the figure that breached the limit.
+    #[error(
+        "request expands to {exploded} normalized points from {count} data points, more than the per-request limit of {max}"
+    )]
+    TooManyExplodedPoints {
+        exploded: usize,
+        count: usize,
+        max: usize,
+    },
 
     #[error(
         "resource has more attributes than the limit of {max}; rejecting {count} data points under it"
@@ -184,6 +212,9 @@ pub enum Rejection {
         buckets: usize,
         expected: usize,
     },
+
+    #[error("histogram has {bounds} explicit bounds, more than the per-point limit of {max}")]
+    TooManyHistogramBuckets { bounds: usize, max: usize },
 
     #[error("histogram explicit_bounds contains a NaN or infinite value")]
     NonFiniteHistogramBound,
@@ -358,6 +389,7 @@ impl Rejection {
             // Structural arm: a shape, type, limit, or value the storage
             // format cannot represent.
             Rejection::TooManyDataPoints { .. }
+            | Rejection::TooManyExplodedPoints { .. }
             | Rejection::TooManyResourceAttributes { .. }
             | Rejection::MetricNameTooLong { .. }
             | Rejection::EmptyMetricName { .. }
@@ -371,6 +403,7 @@ impl Rejection {
             | Rejection::UnsupportedTemporality { .. }
             | Rejection::OversizedSeriesComponent
             | Rejection::HistogramBucketCountMismatch { .. }
+            | Rejection::TooManyHistogramBuckets { .. }
             | Rejection::NonFiniteHistogramBound
             | Rejection::HistogramBoundsNotIncreasing
             | Rejection::HistogramCountOverflow
@@ -404,6 +437,7 @@ impl Rejection {
     pub fn rejected_count(&self) -> usize {
         match self {
             Rejection::TooManyDataPoints { count, .. }
+            | Rejection::TooManyExplodedPoints { count, .. }
             | Rejection::TooManyResourceAttributes { count, .. }
             | Rejection::MetricNameTooLong { count, .. }
             | Rejection::EmptyMetricName { count }
@@ -428,6 +462,7 @@ mod tests {
         let limits = IngestLimits::default();
         assert_eq!(limits.max_data_points_per_request, 100_000);
         assert_eq!(limits.max_attributes_per_point, 64);
+        assert_eq!(limits.max_histogram_buckets, 160);
         assert_eq!(limits.max_label_name_len, 256);
         assert_eq!(limits.max_label_value_len, 4096);
         assert_eq!(limits.max_metric_name_len, 512);
@@ -503,6 +538,7 @@ mod tests {
                 Rejection::TooOld { .. } => skew,
 
                 Rejection::TooManyDataPoints { .. } => structural,
+                Rejection::TooManyExplodedPoints { .. } => structural,
                 Rejection::TooManyResourceAttributes { .. } => structural,
                 Rejection::MetricNameTooLong { .. } => structural,
                 Rejection::EmptyMetricName { .. } => structural,
@@ -516,6 +552,7 @@ mod tests {
                 Rejection::UnsupportedTemporality { .. } => structural,
                 Rejection::OversizedSeriesComponent => structural,
                 Rejection::HistogramBucketCountMismatch { .. } => structural,
+                Rejection::TooManyHistogramBuckets { .. } => structural,
                 Rejection::NonFiniteHistogramBound => structural,
                 Rejection::HistogramBoundsNotIncreasing => structural,
                 Rejection::HistogramCountOverflow => structural,
@@ -540,6 +577,11 @@ mod tests {
         // variant missing; this list is what makes each case run.
         let variants = [
             Rejection::TooManyDataPoints {
+                count: 1,
+                max: 100_000,
+            },
+            Rejection::TooManyExplodedPoints {
+                exploded: 200_003,
                 count: 1,
                 max: 100_000,
             },
@@ -582,6 +624,10 @@ mod tests {
                 buckets: 1,
                 expected: 2,
             },
+            Rejection::TooManyHistogramBuckets {
+                bounds: 161,
+                max: 160,
+            },
             Rejection::NonFiniteHistogramBound,
             Rejection::HistogramBoundsNotIncreasing,
             Rejection::HistogramCountOverflow,
@@ -601,7 +647,7 @@ mod tests {
 
         // One entry per variant, each a distinct one, so no variant is
         // covered twice while another is missing.
-        assert_eq!(variants.len(), 29);
+        assert_eq!(variants.len(), 31);
         for (i, a) in variants.iter().enumerate() {
             for b in &variants[i + 1..] {
                 assert_ne!(

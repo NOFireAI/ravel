@@ -121,6 +121,8 @@ points/records/spans and admits the rest through OTLP partial success.
 | Byte rate | request | 429 + `Retry-After` | `RESOURCE_EXHAUSTED` | 429 + `Retry-After` |
 | Series-creation rate | request | 429 + `Retry-After` | `RESOURCE_EXHAUSTED` | 429 + `Retry-After` |
 | Active-series/stream cap | per series | 200 + partial success | OK + partial success | 204, written-count header excludes rejected samples |
+| Data points per request | request | 200 + partial success, whole-request count | OK + partial success | not applicable |
+| Histogram bucket cap | per point | 200 + partial success | OK + partial success | not applicable |
 | Event-time skew | per point | 200 + partial success | OK + partial success | 204, written-count header excludes rejected samples |
 | Informational field drop | per item, costs no item | 200 + partial success, zero count | OTLP: OK + partial success, zero count. OTAP: not reported | not reported (no partial-success message) |
 
@@ -176,6 +178,27 @@ Prometheus retry or drop the whole batch, including its admitted samples, so
 `429` is reserved for the rate limits, where a retry genuinely succeeds
 later. The dropped over-cap series is observable through the per-tenant
 rejection counters.
+
+### Data points per request and the histogram bucket cap
+
+Both are structural bounds in normalization, not deployment knobs: they live
+in `IngestLimits` and no flag or `--limits-file` key configures them.
+[ingest.md](ingest.md#admission-limits) lists them with their defaults.
+
+`max_data_points_per_request` (100,000) is checked against the wire data-point
+count and again against the normalized points those data points expand into,
+because one classic `Histogram` data point explodes into one point per
+explicit bound plus `+Inf`/`_sum`/`_count`. The second check
+rejects the whole request like the first, and both report the rejected total
+in wire data points.
+
+`max_histogram_buckets` (160) bounds the `explicit_bounds` of one classic
+`Histogram` data point and rejects only that data point. It is a memory-safety
+bound: the bound list is the sender's to choose, every bound becomes a series
+carrying its own copy of the point's labels, and the transport body limit
+alone would let one request expand into millions of them. A real exporter
+never meets it, so a deployment that sees this rejection is looking at a
+misconfigured or hostile sender, not at a limit to raise.
 
 ### Event-time skew
 
