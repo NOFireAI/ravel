@@ -594,7 +594,7 @@ fi
 
 if [[ "${FLEET_MERGE_AUTO:-0}" == "1" ]]; then
   echo "==> FLEET_MERGE_AUTO=1: enabling auto-merge (--rebase)"
-  gh pr merge --auto --rebase --delete-branch "${pr_number}"
+  gh pr merge --auto --rebase "${pr_number}"
   echo "Opened PR for task ${task_id}; auto-merge (--rebase) will land it once required checks pass."
   echo "The review will land after the merge, so sweep it afterwards rather than skipping it."
 else
@@ -608,7 +608,7 @@ else
   echo "  Once ${script_dir}/pr-review-status.sh ${pr_number} reports clean, run the"
   echo "  exact merge command it prints (it pins --match-head-commit to the SHA it"
   echo "  just checked, so the merge refuses if the branch moved since):"
-  echo "    gh pr merge ${pr_number} --rebase --delete-branch --match-head-commit <sha from pr-review-status.sh>"
+  echo "    gh pr merge ${pr_number} --rebase --match-head-commit <sha from pr-review-status.sh>"
 fi
 
 # Do NOT delete the task/<id>/result and task/<id>/start refs here, with or

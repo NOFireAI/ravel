@@ -327,5 +327,11 @@ else
   # for however long the operator takes to run this line; `--match-head-commit`
   # pins the PR head, not `main`. So the printed command re-runs the guard and
   # merges only if it still passes.
-  echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} && gh pr merge ${pr} --rebase --delete-branch --match-head-commit ${head_sha}"
+  #
+  # No `--delete-branch`: gh refuses it outright once a merge queue is enabled
+  # ("Cannot use `-d` or `--delete-branch` when merge queue enabled"), so the
+  # printed command would fail before merging anything. Nothing is lost; the
+  # repository sets `delete_branch_on_merge`, which removes the head branch
+  # when the merge lands.
+  echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} && gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
 fi
