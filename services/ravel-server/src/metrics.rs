@@ -5274,6 +5274,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -5721,6 +5722,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -5930,6 +5932,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         for signal in ["metrics", "logs", "spans"] {
@@ -7549,6 +7552,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
         let hash = hash.to_hex();
         assert!(
