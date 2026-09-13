@@ -1,7 +1,9 @@
-//! Peak allocation for `RsegDedupExec`'s labels-dictionary handling
-//! (`src/dedup.rs`, `DedupStream::flush`) on the shape its deferral round
-//! (issue #1582) exists for: many distinct series in one segment, so every
-//! row shares one dictionary pointer but no two rows share a key.
+//! Allocation-churn figures (cumulative bytes allocated over the run, via
+//! `stats_alloc`; not peak resident bytes -- see
+//! `tests/peak_alloc_instrument.rs`) for `RsegDedupExec`'s labels-dictionary
+//! handling (`src/dedup.rs`, `DedupStream::flush`) on the shape its deferral
+//! round (issue #1582) exists for: many distinct series in one segment, so
+//! every row shares one dictionary pointer but no two rows share a key.
 //!
 //! Unlike `tests/dedup_finalize_allocation.rs`'s many-small-segments corpus
 //! or `tests/dedup_finalize_allocation_single_series.rs`'s one-series
@@ -11,9 +13,9 @@
 //! *pointer* is the same one segment-wide dictionary. An earlier round of
 //! this operator compacted every row's labels down to one entry
 //! unconditionally in `finalize`, which on this corpus paid a `MapBuilder`
-//! rebuild on all 5,000 winner rows to defend against a `concat_batches`
-//! copy that was never going to happen (every row already shares one
-//! dictionary pointer, so `concat_batches` shares it for free). `flush`'s
+//! rebuild on all 5,000 winner rows for nothing: every row already shared
+//! one dictionary pointer, so `concat_batches` would have shared it for free
+//! (see `crate::labels::compact_labels` in `ravel-sql` for why). `flush`'s
 //! `out_multi_dict` tracking (see its docs) answers "does this flush window
 //! actually need real compaction" before doing any, and skips the rebuild
 //! entirely here.
@@ -45,14 +47,15 @@ static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 const TENANT: TenantHash = TenantHash([13u8; 16]);
 const SERIES: usize = 5_000;
 
-/// Bytes the whole scan -> merge -> dedup pipeline may allocate to answer
+/// Allocation churn (cumulative bytes allocated, not peak resident bytes)
+/// the whole scan -> merge -> dedup pipeline may accumulate answering
 /// `SELECT * FROM samples` over 5,000 distinct series, one sample each, in
 /// one segment (so one shared labels dictionary throughout). Measured on
 /// this fixture (debug build, cargo test default profile):
 ///
-///   - compaction skipped/deleted outright:                29,948,424 bytes
-///   - compacting every row unconditionally (pre-deferral): 100,683,176 bytes
-///   - as committed today, deferred to `flush`:              29,566,211 bytes
+///   - compaction skipped/deleted outright:                29,948,424 bytes allocated
+///   - compacting every row unconditionally (pre-deferral): 100,683,176 bytes allocated
+///   - as committed today, deferred to `flush`:              29,566,211 bytes allocated
 ///
 /// This is the corpus the deferral exists for: unconditional per-row
 /// compaction cost 3.36x more than doing nothing, and the memo could not
@@ -62,7 +65,7 @@ const SERIES: usize = 5_000;
 /// bound sits at roughly 1.5x the current figure (headroom for allocator
 /// noise) and well under half the unconditional-compaction figure, so it
 /// stays decisive against the skip silently no longer firing.
-const MAX_BYTES: usize = 45_000_000;
+const MAX_CHURN_BYTES: usize = 45_000_000;
 
 /// A corpus of `count` series, each with a distinct multi-label set and one
 /// label unique to it, plus a shared and a per-series-absent label so the
@@ -208,11 +211,11 @@ fn finalize_labels_compaction_on_many_series_one_segment() {
         stats.allocations, stats.bytes_allocated,
     );
     assert!(
-        stats.bytes_allocated <= MAX_BYTES,
+        stats.bytes_allocated <= MAX_CHURN_BYTES,
         "scan -> merge -> dedup over 5,000 series in one segment allocated \
-         {} bytes, exceeding the {MAX_BYTES} bound; this guards \
-         RsegDedupExec::flush's out_multi_dict skip (src/dedup.rs) against \
-         silently no longer firing on the shape it targets",
+         {} bytes (churn), exceeding the {MAX_CHURN_BYTES} churn bound; this \
+         guards RsegDedupExec::flush's out_multi_dict skip (src/dedup.rs) \
+         against silently no longer firing on the shape it targets",
         stats.bytes_allocated,
     );
 }
