@@ -64,7 +64,9 @@ pub use metrics_meta_sink::{
     DEFAULT_MAX_CAS_RETRIES, DEFAULT_METADATA_FLUSH_WINDOW, FlushSummary, MetadataSink,
     MetadataSinkConfig, catalog_metric_kind,
 };
-pub use reconcile::{DEFAULT_ADMISSION_RECONCILE_INTERVAL, reconcile_once, snapshot_key};
+pub use reconcile::{
+    DEFAULT_ADMISSION_RECONCILE_INTERVAL, ReconcileCycleStats, reconcile_once, snapshot_key,
+};
 pub use router::{IngestRouter, WriteMode, WriteReceipt};
 pub use span_error::SpanWriteError;
 pub use span_metrics::{SpanIngestMetrics, SpanIngestMetricsSnapshot};
