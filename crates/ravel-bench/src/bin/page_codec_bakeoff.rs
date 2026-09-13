@@ -800,10 +800,6 @@ fn load_average() -> String {
 /// range. Best-effort: `"unknown"` on any failure, matching
 /// `ravel_bench::bench_env`'s philosophy of never failing the stamp.
 fn resolved_dependency_version(crate_name: &str) -> String {
-    dependency_version_from_full_graph(crate_name)
-}
-
-fn dependency_version_from_full_graph(crate_name: &str) -> String {
     let Ok(output) = std::process::Command::new("cargo")
         .args(["metadata", "--format-version", "1", "-q"])
         .output()
@@ -908,15 +904,15 @@ fn main() {
     let load_end = load_average();
 
     print!("{}", env_header("page_codec_bakeoff"));
-    println!("{:<16}{}", "profile:", build_profile());
-    println!("{:<16}{}", "target:", target_triple());
+    println!("{:<9}{}", "profile:", build_profile());
+    println!("{:<9}{}", "target:", target_triple());
     println!(
-        "{:<16}{}",
+        "{:<9}{}",
         "zstd crate:",
         resolved_dependency_version("zstd")
     );
     println!(
-        "{:<16}{}",
+        "{:<9}{}",
         "lz4_flex crate:",
         resolved_dependency_version("lz4_flex")
     );
