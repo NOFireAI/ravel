@@ -787,9 +787,18 @@ impl From<&ScanTiming> for ScanTimingReport {
 }
 
 /// Process CPU time (user plus system, all threads) in nanoseconds, from
-/// `/proc/self/stat` fields 14 and 15 at the kernel's `CLK_TCK` of 100 Hz
-/// (the value every Linux target this bench runs on reports). `None` when the
-/// file cannot be read or parsed, which is every non-Linux host.
+/// Kernel tick rate assumed when converting `/proc/self/stat` times, in Hz.
+///
+/// Not read from the kernel: `sysconf(_SC_CLK_TCK)` needs a `libc` dependency
+/// this crate does not have. Verified as 100 on both executor classes this
+/// bench runs on (`getconf CLK_TCK`). A host reporting anything else scales
+/// `cpu_ms` by `USER_HZ / 100` with no error, so check it before reading a
+/// `cpu_ms` figure from an unfamiliar machine.
+const ASSUMED_CLK_TCK_HZ: u64 = 100;
+
+/// `/proc/self/stat` fields 14 and 15, converted at [`ASSUMED_CLK_TCK_HZ`].
+/// `None` when the file cannot be read or parsed, which is every non-Linux
+/// host.
 fn process_cpu_ns() -> Option<u64> {
     let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
     // The command name (field 2) is parenthesised and may contain spaces, so
@@ -799,7 +808,7 @@ fn process_cpu_ns() -> Option<u64> {
     // `rest` starts at field 3 (state); utime is field 14 and stime field 15.
     let utime: u64 = fields.nth(11)?.parse().ok()?;
     let stime: u64 = fields.next()?.parse().ok()?;
-    Some((utime + stime) * 10_000_000)
+    Some((utime + stime) * (1_000_000_000 / ASSUMED_CLK_TCK_HZ))
 }
 
 /// Process peak resident set in KiB (`VmHWM` from `/proc/self/status`), or
@@ -2731,6 +2740,7 @@ fn build_records(count: usize, extra_attrs: usize) -> Vec<LogRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::DelayedGetStore;
     use crate::sql_corpus::Modification;
     use ravel_catalog::{AbsentPolicy, validate_or_adopt};
     use ravel_object_store::memory::MemoryStore;
@@ -5900,6 +5910,72 @@ mod tests {
         assert!(
             json.get("load_wall_ms").is_some(),
             "load_wall_ms must be present in JSON when the lane actually loaded: {json}"
+        );
+    }
+
+    /// `--inject-get-delay-ms` exists to prove where the scan's timing
+    /// intervals begin and end: a stall added to every `get` must land in the
+    /// open interval and nowhere else. That claim is what every figure read off
+    /// `scan_timing` rests on, so it is asserted here rather than checked by
+    /// hand once.
+    ///
+    /// Both bounds matter and they fail differently. Moving the stall's
+    /// `Instant` inside the decode interval flips the second assertion red;
+    /// dropping the open interval's start back to after the GET completes
+    /// flips the first.
+    ///
+    /// The margin is wide on purpose: the fixture decodes a handful of tiny
+    /// objects, microseconds of work against a 200 ms stall, so the assertions
+    /// hold on a loaded host without pinning a wall-clock band that would flake.
+    #[tokio::test]
+    async fn injected_get_delay_lands_in_the_open_interval() {
+        const DELAY: Duration = Duration::from_millis(200);
+        let inner = empty_store();
+        let tenant = TenantId::new("delay-boundary-tenant");
+        write_shard_objects(&inner, &tenant, 0, 4).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(DelayedGetStore::new(inner, DELAY));
+        let entries = vec![entry("delayed", "SELECT body FROM logs")];
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let (measured, _skipped, failed) = measure_corpus(
+            &store,
+            tenant.hash(),
+            &entries,
+            &[],
+            1,
+            window,
+            NOW_NS,
+            0,
+            Duration::from_secs(60),
+            false,
+            None,
+            ExecutorSettings::default(),
+            false,
+            None,
+        )
+        .await
+        .expect("measure_corpus runs");
+        assert!(failed.is_empty(), "no statement fails: {failed:?}");
+        let timing = measured
+            .first()
+            .and_then(|e| e.per_run_accounting.as_ref())
+            .and_then(|runs| runs.first())
+            .and_then(|r| r.scan_timing.as_ref())
+            .expect("the logs scan reports timing");
+        let delay_ns = u64::try_from(DELAY.as_nanos()).expect("200 ms fits u64");
+        assert!(
+            timing.open_elapsed_max_ns >= delay_ns,
+            "a partition's open interval must contain at least one injected \
+             {DELAY:?} stall, got {} ns",
+            timing.open_elapsed_max_ns
+        );
+        assert!(
+            timing.decode_build_elapsed_max_ns < delay_ns,
+            "the injected stall must not land in the decode interval: decode \
+             {} ns against a {DELAY:?} stall",
+            timing.decode_build_elapsed_max_ns
         );
     }
 }
