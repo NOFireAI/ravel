@@ -52,5 +52,21 @@ See `BLOCKERS.md` for the full list. In short:
 | `RECOMMENDATION.md` | the measured recommendation with limits |
 | `WORKITEMS.md` | ranked, bounded work items (draft only) |
 | `BLOCKERS.md` | exact blockers for anything unmeasured |
-| `diagrams/` | execution and buffer-lifetime diagrams |
+| `S5-READAHEAD-CHECKLIST.md` | read-ahead design checklist against the code, and the verdict |
+| `diagrams/README.md` | execution and buffer-lifetime diagrams (text) |
+| `corpus/` | the two attribute corpora the runs use (`--corpus`) |
 | `results/` | raw result JSON from bench runs |
+| `check_bands.py` | asserts the pre-registered bands of runs 3 to 6 against `results/` |
+
+## Code changes in this checkout (gated, committed separately)
+
+- `crates/ravel-sql/src/logs_scan.rs`: `Time` metrics beside the existing
+  block counters (open stall, decode/build, emit, plan barrier once, first
+  batch, stream end, polls) and a per-segment labelled timeline.
+- `crates/ravel-sql/src/executor.rs`: `SqlStats::scan_timing` folded from
+  the same plan-metrics walk as the block counters.
+- `crates/ravel-bench/src/sql_latency.rs`, `bin/sql_latency_bench.rs`,
+  `harness.rs`: `scan_timing`, `cpu_ms`, `peak_rss_kb` per run; a timing
+  table; `--inject-get-delay-ms` through `DelayedGetStore`.
+- `crates/ravel-sql/tests/attrs_map_vs_declared.rs`: the S4 semantic
+  agreement test (columnar layout and `attrs_raw` overflow).

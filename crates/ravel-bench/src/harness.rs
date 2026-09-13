@@ -8,11 +8,86 @@
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use bytes::Bytes;
 use clap::ValueEnum;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store};
-use ravel_object_store::{ObjectStoreBackend, StoreMetrics};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError, StoreMetrics,
+};
+
+/// A backend wrapper that sleeps a fixed duration before every `get`,
+/// delegating everything else unchanged. It exists to give an in-process
+/// store a controllable per-request stall so a scan's exposed open time can
+/// be measured against a known injected figure. It is a measurement device:
+/// a number produced through it describes the scan's structure under that
+/// stall, never an object store's latency.
+pub struct DelayedGetStore<S> {
+    inner: S,
+    delay: Duration,
+}
+
+impl<S> DelayedGetStore<S> {
+    pub fn new(inner: S, delay: Duration) -> Self {
+        DelayedGetStore { inner, delay }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S: ObjectStoreBackend> ObjectStoreBackend for DelayedGetStore<S> {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        self.inner.put_multipart(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.inner.list_after(prefix, start_after, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum StoreKind {

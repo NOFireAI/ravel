@@ -299,14 +299,147 @@ pub struct SqlStats {
     /// existed. False both when no cap was set and when the whole result fit
     /// inside it.
     pub row_cap_hit: bool,
+    /// The successful attempt's `LogsScanExec` wall-clock timing, read off the
+    /// same DataFusion metric set as the block counters. All zero for a plan
+    /// with no logs scan.
+    pub scan_timing: ScanTiming,
 }
 
-/// The `LogsScanExec` block counters, summed over a plan tree.
-#[derive(Clone, Copy, Default)]
+/// Wall-clock timing of a query's `LogsScanExec` partitions (see
+/// `crate::logs_scan::BlockMetrics`). Every `*_ns` figure is nanoseconds on
+/// the exec's own monotonic clock. Sums add the partitions' intervals, which
+/// overlap in wall time, so a sum is never a query latency; the `*_max_ns` and
+/// `*_min_ns` figures are the per-partition extremes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScanTiming {
+    /// Segment-open stall, summed over partitions and the per-partition max.
+    pub open_elapsed_ns: u64,
+    pub open_elapsed_max_ns: u64,
+    /// `Opening` polls that returned `Pending`.
+    pub open_pending_polls: u64,
+    /// First opens, all partitions.
+    pub segments_opened: u64,
+    /// `attrs_raw` fallback reopens and their open stall.
+    pub reopen_elapsed_ns: u64,
+    pub reopens: u64,
+    /// Synchronous decode plus Arrow build inside `poll_next`.
+    pub decode_build_elapsed_ns: u64,
+    pub decode_build_elapsed_max_ns: u64,
+    /// Buffered-output hand-off (includes the row path's batch build).
+    pub emit_elapsed_ns: u64,
+    /// Longest single partition's wait on the shared plan barrier.
+    pub planning_wait_elapsed_max_ns: u64,
+    /// The barrier's own cost, counted once per query.
+    pub plan_init_elapsed_ns: u64,
+    /// Offset from exec creation to the earliest batch any partition emitted;
+    /// zero when no partition emitted one.
+    pub first_batch_elapsed_min_ns: u64,
+    /// Offset from exec creation to the last partition's `Done`.
+    pub stream_elapsed_max_ns: u64,
+    /// `poll_next` calls and how many returned `Pending`, all partitions.
+    pub polls: u64,
+    pub polls_pending: u64,
+    /// Partitions that ran to `Done`.
+    pub partitions: u64,
+    /// Per-segment timeline points, one row per `(partition, segment)`.
+    pub segments: Vec<SegmentTiming>,
+}
+
+/// One segment's timeline on one partition: offsets in nanoseconds from the
+/// exec's creation. A point that never happened (a segment pruned at open, a
+/// stream that failed) reads zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SegmentTiming {
+    pub partition: u64,
+    pub segment: u64,
+    pub open_start_ns: u64,
+    pub open_ready_ns: u64,
+    pub done_ns: u64,
+}
+
+/// Fold every `LogsScanExec` timing metric under `plan` into `timing`.
+fn accumulate_scan_timing(plan: &Arc<dyn ExecutionPlan>, timing: &mut ScanTiming) {
+    if let Some(metrics) = plan.metrics() {
+        let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
+        timing.open_elapsed_ns += sum("open_elapsed");
+        timing.open_pending_polls += sum("open_pending_polls");
+        timing.segments_opened += sum("segments_opened");
+        timing.reopen_elapsed_ns += sum("reopen_elapsed");
+        timing.reopens += sum("reopens");
+        timing.decode_build_elapsed_ns += sum("decode_build_elapsed");
+        timing.emit_elapsed_ns += sum("emit_elapsed");
+        timing.plan_init_elapsed_ns += sum("plan_init_elapsed");
+        timing.polls += sum("polls");
+        timing.polls_pending += sum("polls_pending");
+        let mut segments: HashMap<(u64, u64), SegmentTiming> = HashMap::new();
+        for metric in metrics.iter() {
+            let value = metric.value().as_usize() as u64;
+            let partition = metric.partition().unwrap_or(0) as u64;
+            match metric.value().name() {
+                "open_elapsed" => {
+                    timing.open_elapsed_max_ns = timing.open_elapsed_max_ns.max(value);
+                }
+                "decode_build_elapsed" => {
+                    timing.decode_build_elapsed_max_ns =
+                        timing.decode_build_elapsed_max_ns.max(value);
+                }
+                "planning_wait_elapsed" => {
+                    timing.planning_wait_elapsed_max_ns =
+                        timing.planning_wait_elapsed_max_ns.max(value);
+                }
+                "first_batch_elapsed" if value > 0 => {
+                    timing.first_batch_elapsed_min_ns = if timing.first_batch_elapsed_min_ns == 0 {
+                        value
+                    } else {
+                        timing.first_batch_elapsed_min_ns.min(value)
+                    };
+                }
+                "stream_elapsed" if value > 0 => {
+                    timing.stream_elapsed_max_ns = timing.stream_elapsed_max_ns.max(value);
+                    timing.partitions += 1;
+                }
+                name @ ("seg_open_start_offset" | "seg_open_ready_offset" | "seg_done_offset") => {
+                    let Some(segment) = metric
+                        .labels()
+                        .iter()
+                        .find(|l| l.name() == "segment")
+                        .and_then(|l| l.value().parse::<u64>().ok())
+                    else {
+                        continue;
+                    };
+                    let row = segments
+                        .entry((partition, segment))
+                        .or_insert(SegmentTiming {
+                            partition,
+                            segment,
+                            ..SegmentTiming::default()
+                        });
+                    match name {
+                        "seg_open_start_offset" => row.open_start_ns = value,
+                        "seg_open_ready_offset" => row.open_ready_ns = value,
+                        _ => row.done_ns = value,
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut rows: Vec<SegmentTiming> = segments.into_values().collect();
+        rows.sort_by_key(|r| (r.open_start_ns, r.partition, r.segment));
+        timing.segments.extend(rows);
+    }
+    for child in plan.children() {
+        accumulate_scan_timing(child, timing);
+    }
+}
+
+/// The `LogsScanExec` block counters, summed over a plan tree, and the scan's
+/// wall-clock timing read off the same metric set.
+#[derive(Clone, Default)]
 struct BlockCounts {
     total: u64,
     scanned: u64,
     pruned_by_postings: u64,
+    timing: ScanTiming,
 }
 
 /// Sum the `blocks_total` / `blocks_scanned` / `blocks_pruned_by_postings`
@@ -1100,6 +1233,7 @@ impl SqlExecutor {
                     stats.blocks_total = blocks.total;
                     stats.blocks_scanned = blocks.scanned;
                     stats.blocks_pruned_by_postings = blocks.pruned_by_postings;
+                    stats.scan_timing = blocks.timing;
                     let phase_snapshot = phase_accounting.snapshot();
                     return Ok(SqlOutcome {
                         output,
@@ -2534,6 +2668,7 @@ impl PinnedStream {
     fn block_counts(&self) -> BlockCounts {
         let mut counts = BlockCounts::default();
         accumulate_block_counts(&self.plan, &mut counts);
+        accumulate_scan_timing(&self.plan, &mut counts.timing);
         counts
     }
 

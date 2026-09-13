@@ -64,8 +64,8 @@ use ravel_query::{
     ResolvedLogsFetch, SegmentFetcher, resolve_logs_fetch,
 };
 use ravel_sql::{
-    DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig,
-    SqlExecutor, SqlRequest, StaticDeclaredColumns,
+    DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, ScanTiming, SpanSegmentFetcher,
+    SqlConfig, SqlExecutor, SqlRequest, StaticDeclaredColumns,
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::cost_profile::StoreCostProfile;
@@ -693,6 +693,121 @@ pub struct RunAccounting {
     /// [`Self::logs_whole_object_opens`]; one ranged open issues several GETs.
     #[serde(default)]
     pub logs_ranged_opens: u64,
+    /// This run's `LogsScanExec` wall-clock timing (`SqlStats::scan_timing`),
+    /// `None` on a report written before it existed or on a Flight run, where
+    /// the executor is out of process. Sums over partitions overlap in wall
+    /// time and are never a latency; see the field docs on
+    /// [`ScanTimingReport`].
+    #[serde(default)]
+    pub scan_timing: Option<ScanTimingReport>,
+    /// Process CPU time (user plus system, every thread) this run consumed,
+    /// from `/proc/self/stat`; `None` where that file is unreadable. Divided
+    /// by the elapsed wall time it is the run's mean core occupancy.
+    #[serde(default)]
+    pub cpu_ms: Option<f64>,
+    /// Process peak resident set (`VmHWM`, KiB) after this run. Cumulative
+    /// over the process: it never falls, so only its growth across a run is
+    /// attributable to that run.
+    #[serde(default)]
+    pub peak_rss_kb: Option<u64>,
+}
+
+/// The report form of `ravel_sql::ScanTiming`: nanoseconds on the exec's
+/// monotonic clock, folded over every logs-scan partition of the plan.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanTimingReport {
+    /// Segment-open stall summed over partitions, and the largest single
+    /// partition's total. The sum overlaps in wall time across partitions.
+    pub open_elapsed_ns: u64,
+    pub open_elapsed_max_ns: u64,
+    pub open_pending_polls: u64,
+    pub segments_opened: u64,
+    pub reopen_elapsed_ns: u64,
+    pub reopens: u64,
+    /// Synchronous decode plus Arrow build, summed and per-partition max.
+    pub decode_build_elapsed_ns: u64,
+    pub decode_build_elapsed_max_ns: u64,
+    pub emit_elapsed_ns: u64,
+    /// Longest single partition's wait on the shared plan barrier, and the
+    /// barrier's own cost counted once.
+    pub planning_wait_elapsed_max_ns: u64,
+    pub plan_init_elapsed_ns: u64,
+    /// Exec creation to the earliest batch, and to the last partition's end.
+    pub first_batch_elapsed_min_ns: u64,
+    pub stream_elapsed_max_ns: u64,
+    pub polls: u64,
+    pub polls_pending: u64,
+    pub partitions: u64,
+    /// Per-`(partition, segment)` open-start, open-ready and done offsets.
+    pub segments: Vec<SegmentTimingReport>,
+}
+
+/// One row of [`ScanTimingReport::segments`].
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SegmentTimingReport {
+    pub partition: u64,
+    pub segment: u64,
+    pub open_start_ns: u64,
+    pub open_ready_ns: u64,
+    pub done_ns: u64,
+}
+
+impl From<&ScanTiming> for ScanTimingReport {
+    fn from(t: &ScanTiming) -> Self {
+        ScanTimingReport {
+            open_elapsed_ns: t.open_elapsed_ns,
+            open_elapsed_max_ns: t.open_elapsed_max_ns,
+            open_pending_polls: t.open_pending_polls,
+            segments_opened: t.segments_opened,
+            reopen_elapsed_ns: t.reopen_elapsed_ns,
+            reopens: t.reopens,
+            decode_build_elapsed_ns: t.decode_build_elapsed_ns,
+            decode_build_elapsed_max_ns: t.decode_build_elapsed_max_ns,
+            emit_elapsed_ns: t.emit_elapsed_ns,
+            planning_wait_elapsed_max_ns: t.planning_wait_elapsed_max_ns,
+            plan_init_elapsed_ns: t.plan_init_elapsed_ns,
+            first_batch_elapsed_min_ns: t.first_batch_elapsed_min_ns,
+            stream_elapsed_max_ns: t.stream_elapsed_max_ns,
+            polls: t.polls,
+            polls_pending: t.polls_pending,
+            partitions: t.partitions,
+            segments: t
+                .segments
+                .iter()
+                .map(|s| SegmentTimingReport {
+                    partition: s.partition,
+                    segment: s.segment,
+                    open_start_ns: s.open_start_ns,
+                    open_ready_ns: s.open_ready_ns,
+                    done_ns: s.done_ns,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Process CPU time (user plus system, all threads) in nanoseconds, from
+/// `/proc/self/stat` fields 14 and 15 at the kernel's `CLK_TCK` of 100 Hz
+/// (the value every Linux target this bench runs on reports). `None` when the
+/// file cannot be read or parsed, which is every non-Linux host.
+fn process_cpu_ns() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The command name (field 2) is parenthesised and may contain spaces, so
+    // fields are counted from after the closing parenthesis.
+    let rest = stat.rsplit_once(')')?.1;
+    let mut fields = rest.split_whitespace();
+    // `rest` starts at field 3 (state); utime is field 14 and stime field 15.
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some((utime + stime) * 10_000_000)
+}
+
+/// Process peak resident set in KiB (`VmHWM` from `/proc/self/status`), or
+/// `None` where it cannot be read.
+fn process_peak_rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// One phase's share of a run's WIRE bytes (issue #913).
@@ -1719,6 +1834,7 @@ pub async fn measure_corpus(
             // written for `--explain-dir` is not charged to run 0.
             let probe_misses_before = probe_misses.snapshot();
             let wire_bytes_before = wire_bytes.snapshot();
+            let cpu_before = process_cpu_ns();
             let start = Instant::now();
             let outcome = match executor.execute(tenant_hash, &req).await {
                 Ok(outcome) => outcome,
@@ -1742,6 +1858,10 @@ pub async fn measure_corpus(
                 }
             };
             let elapsed_ns = start.elapsed().as_nanos() as u64;
+            let cpu_ms = match (cpu_before, process_cpu_ns()) {
+                (Some(before), Some(after)) => Some(after.saturating_sub(before) as f64 / 1e6),
+                _ => None,
+            };
             latencies_ns.push(elapsed_ns);
             // Record accounting for every run, not only the cold one: the warm
             // run exists to answer whether the second execution drops to plan
@@ -1785,6 +1905,9 @@ pub async fn measure_corpus(
                 // own handle.
                 logs_whole_object_opens: acc.logs_whole_object_opens,
                 logs_ranged_opens: acc.logs_ranged_opens,
+                scan_timing: Some(ScanTimingReport::from(&outcome.stats.scan_timing)),
+                cpu_ms,
+                peak_rss_kb: process_peak_rss_kb(),
             });
             // #857: check the split against the pooled figures the moment it is
             // recorded. This is not a statement failure, so `continue_on_error`
@@ -4901,6 +5024,9 @@ mod tests {
             fetch_amplification: amplification(by_phase[QueryPhase::Scan.index()], 75),
             logs_whole_object_opens: 0,
             logs_ranged_opens: 1,
+            scan_timing: None,
+            cpu_ms: None,
+            peak_rss_kb: None,
         }
     }
 

@@ -24,10 +24,11 @@
 #![allow(clippy::expect_used)]
 
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use ravel_bench::harness::{StoreKind, store_from_env};
+use ravel_bench::harness::{DelayedGetStore, StoreKind, store_from_env};
 use ravel_bench::sql_corpus::{checked_default_corpus, load_external_corpus};
 use ravel_bench::sql_latency::{
     Compaction, DatasetInfo, FlightTarget, GenerateConfig, Provenance, RunAccounting,
@@ -130,6 +131,14 @@ struct Args {
     /// declared `duration_ms` column.
     #[arg(long, default_value_t = 16)]
     extra_attrs: usize,
+    /// Sleep this many milliseconds inside every object-store `get` before
+    /// serving it, wrapping whichever store `--store` selected. A measurement
+    /// device for the scan's exposed open time against a known stall, not a
+    /// model of any backend: the report's `store_backend` is suffixed
+    /// `+get-delay-<N>ms` so no figure produced this way can be read as a
+    /// store's own latency. Unset injects nothing and leaves the store as is.
+    #[arg(long = "inject-get-delay-ms", value_name = "MS")]
+    inject_get_delay_ms: Option<u64>,
 
     // --- tenant lane knobs ------------------------------------------------
     /// The operator's belief about which layout the tenant is in, checked
@@ -421,8 +430,12 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
         Some(path) => load_external_corpus(path)?,
         None => checked_default_corpus()?,
     };
-    let (store_backend, region, endpoint) = provenance_strings(args.store);
-    let store = store_from_env(args.store);
+    let (mut store_backend, region, endpoint) = provenance_strings(args.store);
+    let mut store = store_from_env(args.store);
+    if let Some(ms) = args.inject_get_delay_ms {
+        store = Arc::new(DelayedGetStore::new(store, Duration::from_millis(ms)));
+        store_backend = format!("{store_backend}+get-delay-{ms}ms");
+    }
 
     // `--explain` requires `--explain-dir` (clap enforces it), so a set
     // `--explain` always carries a directory; an unset flag writes no plans.
@@ -763,6 +776,7 @@ fn print_human_table(report: &SqlLatencyReport) {
     }
     print_open_shapes(report);
     print_fetch_amplification(report);
+    print_scan_timing(report);
     if !report.skipped.is_empty() {
         eprintln!("\n  skipped (unsatisfied declared column):");
         for s in &report.skipped {
@@ -774,6 +788,72 @@ fn print_human_table(report: &SqlLatencyReport) {
         for f in &report.failed {
             eprintln!("    {:<32} run {}: {}", f.id, f.run, f.error);
         }
+    }
+}
+
+/// The cold run's logs-scan wall-clock split (`SqlStats::scan_timing`) beside
+/// the process CPU time the run consumed. Every `ms` column except `cold`,
+/// `first_batch` and `plan_init` is a SUM over the scan's partitions, whose
+/// intervals overlap in wall time, so those sums are comparable with each
+/// other and with `cpu_ms`, never with `cold`. `open_max` is the single
+/// partition that waited longest on segment opens, which is the only open
+/// figure that can sit on the critical path.
+fn print_scan_timing(report: &SqlLatencyReport) {
+    let rows: Vec<(&str, f64, &RunAccounting)> = report
+        .entries
+        .iter()
+        .filter_map(|e| match e.per_run_accounting.as_deref() {
+            Some([cold, ..]) if cold.scan_timing.is_some() => {
+                Some((e.id.as_str(), e.cold_ms, cold))
+            }
+            _ => None,
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let ms = |ns: u64| ns as f64 / 1e6;
+    eprintln!(
+        "\n  logs-scan timing, cold run: partition-summed ms (overlapping), plus the per-partition"
+    );
+    eprintln!("  max open stall, the once-per-query plan barrier, and process CPU ms for the run.");
+    eprintln!(
+        "  {:<32} | {:>8} | {:>8} | {:>9} | {:>9} | {:>9} | {:>8} | {:>9} | {:>6} | {:>7} | {:>8}",
+        "id",
+        "cold",
+        "cpu_ms",
+        "decode",
+        "emit",
+        "open_sum",
+        "open_max",
+        "plan_init",
+        "opens",
+        "pending",
+        "first_b",
+    );
+    eprintln!(
+        "  {:-<32}-+-{:-<8}-+-{:-<8}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<8}-+-{:-<9}-+-{:-<6}-+-{:-<7}-+-{:-<8}",
+        "", "", "", "", "", "", "", "", "", "", ""
+    );
+    for (id, cold_ms, acc) in rows {
+        let Some(t) = acc.scan_timing.as_ref() else {
+            continue;
+        };
+        eprintln!(
+            "  {:<32} | {:>8.3} | {:>8} | {:>9.3} | {:>9.3} | {:>9.3} | {:>8.3} | {:>9.3} | {:>6} | {:>7} | {:>8.3}",
+            id,
+            cold_ms,
+            acc.cpu_ms
+                .map_or_else(|| "-".to_string(), |c| format!("{c:.1}")),
+            ms(t.decode_build_elapsed_ns),
+            ms(t.emit_elapsed_ns),
+            ms(t.open_elapsed_ns),
+            ms(t.open_elapsed_max_ns),
+            ms(t.plan_init_elapsed_ns),
+            t.segments_opened,
+            t.open_pending_polls,
+            ms(t.first_batch_elapsed_min_ns),
+        );
     }
 }
 
