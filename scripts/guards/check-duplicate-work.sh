@@ -94,7 +94,21 @@ patch_id_of() {
 # either side. Same silent-cap class the scan note above exists for, and a
 # field-addition PR reaches 100 files easily.
 files_of() {
-    gh api "repos/${repo}/pulls/$1/files" --paginate --jq '.[].path' 2>/dev/null | sort
+    _files="$(gh api "repos/${repo}/pulls/$1/files" --paginate --jq '.[].path' 2>/dev/null | sort)"
+    if [ -n "${_files}" ]; then
+        _count="$(printf '%s\n' "${_files}" | wc -l | tr -d '[:space:]')"
+        # The endpoint itself stops at 3000 files and --paginate cannot follow
+        # past that, so at the ceiling the list is truncated rather than
+        # complete. Implausible for a real PR, but an OVERLAP miss that reports
+        # two branches as disjoint is the one outcome worth never doing
+        # silently, however unlikely the input.
+        if [ "${_count}" -ge 3000 ]; then
+            echo "check-duplicate-work: NOTE: #$1 returned ${_count} files, the REST" >&2
+            echo "    endpoint's ceiling. Its file list is truncated, so an OVERLAP" >&2
+            echo "    against it may be undercounted or missed entirely." >&2
+        fi
+    fi
+    printf '%s\n' "${_files}"
 }
 
 mine_id="$(patch_id_of "${pr}" || true)"
