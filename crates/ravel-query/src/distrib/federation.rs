@@ -20,6 +20,20 @@
 //! tenant from *its own* auth, never from the wire. This is structural, not a
 //! runtime check -- there is no client-credential parameter to misuse here.
 //!
+//! That credential authorizes exactly one tenant's data on the remote, so it
+//! belongs to exactly one LOCAL tenant. [`RemoteCluster::tenant`] names that
+//! local tenant and [`Federation::fetch`] dials a remote only for it: a query
+//! from any other local tenant selects no remote, presents no credential, and
+//! receives no remote series. Without that mapping, one process credential is
+//! shared by every local tenant a coordinator serves, and each of them reads the
+//! remote tenant's data. A local tenant with no mapped remote is answered from
+//! local data alone; it is not marked partial, because a remote it holds no
+//! credential for is outside its query, not missing from it.
+//!
+//! `tenant: None` (an unkeyed remote) still serves every local tenant. It is the
+//! shape of every deployment predating the mapping, and `ravel-server` refuses
+//! it at startup on a coordinator that can resolve more than one local tenant.
+//!
 //! # Availability
 //!
 //! Each remote is dispatched under a per-cluster soft timeout. A remote that
@@ -90,6 +104,20 @@ pub struct RemoteCluster {
     pub name: String,
     /// The credentialed slice fetcher for this remote.
     pub fetcher: Arc<dyn SliceFetcher>,
+    /// The single local tenant whose queries fan out to this remote. `fetcher`
+    /// carries one credential, so it authorizes one remote tenant's data; this
+    /// is the local tenant that data belongs to. [`Federation::fetch`] dials
+    /// this remote only for that tenant, so a query from any other local tenant
+    /// costs nothing here and receives nothing.
+    ///
+    /// `None` means the remote is unkeyed and serves every local tenant. That is
+    /// the pre-mapping shape, and it is safe only on a coordinator that can
+    /// resolve at most one local tenant; `ravel-server` refuses an unkeyed
+    /// remote on a multi-tenant coordinator at startup
+    /// (`ensure_federation_tenant_mapping`). This variant exists so a
+    /// single-tenant deployment that never wrote a mapping keeps working
+    /// unchanged, not as a wildcard to reach for.
+    pub tenant: Option<TenantHash>,
     /// When true, an unavailable/timed-out remote is skipped (with a warning)
     /// rather than failing the query. Defaults to false at the config layer.
     pub skip_unavailable: bool,
@@ -164,9 +192,31 @@ impl Federation {
         Federation { remotes }
     }
 
-    /// The configured remotes (for diagnostics and tests).
+    /// The configured remotes (for diagnostics and tests). This is every
+    /// remote the process holds, across all local tenants; a query never fans
+    /// out to all of them. Use [`Self::remotes_for`] for what one tenant
+    /// actually reaches.
     pub fn remotes(&self) -> &[RemoteCluster] {
         &self.remotes
+    }
+
+    /// The remotes `tenant_hash` fans out to: those mapped to exactly this
+    /// local tenant, plus any unkeyed remote (see [`RemoteCluster::tenant`]).
+    /// This is the single place the local-tenant-to-remote-credential mapping is
+    /// applied, so [`Self::fetch`] and every caller asking "does this tenant
+    /// federate at all" agree by construction.
+    pub fn remotes_for(&self, tenant_hash: TenantHash) -> impl Iterator<Item = &RemoteCluster> {
+        self.remotes
+            .iter()
+            .filter(move |r| r.tenant.is_none_or(|t| t == tenant_hash))
+    }
+
+    /// Whether `tenant_hash` reaches any remote at all. A federation context is
+    /// installed process-wide, but a local tenant with no mapped remote runs a
+    /// fully local query; callers that would otherwise say "this query is
+    /// federated" ask here instead of testing for the context's presence.
+    pub fn has_remotes_for(&self, tenant_hash: TenantHash) -> bool {
+        self.remotes_for(tenant_hash).next().is_some()
     }
 
     /// Fans the query's matchers and window out to every remote under its soft
@@ -206,7 +256,14 @@ impl Federation {
         config: EngineConfig,
     ) -> Result<FederationOutcome, QueryError> {
         let mut outcome = FederationOutcome::default();
-        if self.remotes.is_empty() {
+        // Only the remotes mapped to THIS local tenant. A remote's fetcher
+        // carries one operator credential, which authorizes one tenant's data on
+        // that remote; dialing it for a different local tenant would hand that
+        // tenant another tenant's series. Filtering before dispatch (rather than
+        // testing the response) means an unmapped local tenant presents no
+        // credential, issues no request, and pays no cost.
+        let remotes: Vec<&RemoteCluster> = self.remotes_for(tenant_hash).collect();
+        if remotes.is_empty() {
             return Ok(outcome);
         }
 
@@ -237,13 +294,13 @@ impl Federation {
         // ever holds `JoinHandle`s across an await, and the lifetime-bearing
         // fetch future stays encapsulated in the task.
         let mut guard = DispatchGuard {
-            handles: Vec::with_capacity(self.remotes.len()),
+            handles: Vec::with_capacity(remotes.len()),
         };
         // Metadata parallel to `guard.handles` by index: the tasks own their
         // request/fetcher, so the lifetime-bearing fetch future stays inside the
         // task and this future only ever holds `JoinHandle`s across an await.
-        let mut meta: Vec<(String, bool, Duration)> = Vec::with_capacity(self.remotes.len());
-        for remote in &self.remotes {
+        let mut meta: Vec<(String, bool, Duration)> = Vec::with_capacity(remotes.len());
+        for remote in remotes {
             let name = remote.name.clone();
             let skip_unavailable = remote.skip_unavailable;
             let timeout = remote.soft_timeout;
@@ -577,6 +634,7 @@ mod tests {
         Federation::new(vec![RemoteCluster {
             name: "eu-west".to_string(),
             fetcher,
+            tenant: None,
             skip_unavailable: skip,
             soft_timeout: timeout,
         }])

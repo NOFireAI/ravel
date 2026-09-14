@@ -50,6 +50,7 @@ fn remote(name: &str, endpoint: &str, tls: bool) -> RemoteClusterConfig {
         name: name.to_string(),
         endpoint: endpoint.to_string(),
         credential: "operator-token".to_string(),
+        tenant: None,
         tls,
         tls_ca_file: None,
         skip_unavailable: false,
