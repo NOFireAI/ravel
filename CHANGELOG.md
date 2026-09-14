@@ -889,8 +889,14 @@ falls from 96.40 s to 72.52 s and the cold total from 320.18 s to 222.19 s.
 ## [0.10.0]
 
 The metrics segment format moves to RSEG v7 and the L1 compactor stops
-copying runs verbatim. Measured over 500 series at a 15-second scrape, an
-L1 object falls from 26.52 to 8.88 bytes per sample, a 2.99x reduction.
+copying runs verbatim. Measured over 500 series at a 15-second scrape, a
+merged L1 object costs 2.50 to 3.00 bytes per sample on representative value
+shapes (integer and low-precision-decimal gauges and counters), the arms
+ADR-0092's 2026-08-21 amendment identifies as representative. The 26.52 to
+8.88 bytes per sample and 2.99x reduction quoted here previously is the
+incompressible-value control arm (full-mantissa random floats), which that
+amendment reclassifies as a worst-case bound rather than the representative
+cost.
 
 ### Changed
 
