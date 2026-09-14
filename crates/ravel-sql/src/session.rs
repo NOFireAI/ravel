@@ -120,6 +120,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use url::Url;
 
 use crate::alerts_provider::AlertsTableProvider;
+use crate::attrs_per_key::AttrsPerKeyProjection;
 use crate::audit_provider::AuditTableProvider;
 use crate::avg::sequential_avg_udaf;
 use crate::bounded_topk::BoundedTopKAggregate;
@@ -670,7 +671,19 @@ pub fn build_session(
         // default rules for the same reason `DictionaryGroupKeysAsViews` is:
         // it must see the final partial/final aggregation split
         // `EnforceDistribution` chose. See `crate::metadata_agg`.
-        .with_physical_optimizer_rule(Arc::new(MetadataOnlyAggregate));
+        .with_physical_optimizer_rule(Arc::new(MetadataOnlyAggregate))
+        // Issue #1768: rewrite a `logs` scan whose `attrs` map is read only
+        // through literal-key `attrs['k']` subscripts into one that
+        // materializes those keys as per-key `Utf8` columns, so the scan
+        // decodes one key's pages instead of every dynamic column and stays on
+        // the columnar path. Appended after the default rules for the same
+        // reason the rules above are: it must see the final
+        // projection/filter/aggregate shape the default rules chose (projection
+        // pushdown decides which columns the scan projects, and this rewrite
+        // keys off the `attrs` map being one of them). It is fail-safe: any
+        // shape it does not recognize is left on the existing row path. See
+        // `crate::attrs_per_key`.
+        .with_physical_optimizer_rule(Arc::new(AttrsPerKeyProjection));
     // ADR-0774: split a wide `logs` TopK into a narrow scan carrying row refs
     // and a `k`-row block fetch. Appended after `DictionaryGroupKeysAsViews`
     // for the same reason that one is appended after the defaults: it must see
