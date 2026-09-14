@@ -1429,6 +1429,67 @@ fn histogram_over_exploded_total_agrees() {
     assert_histogram_paths_agree_with_limits(&workload, &limits);
 }
 
+/// The exploded-points rejection counts the exemplars it drops, on BOTH
+/// surfaces, for the same input.
+///
+/// This is the case `histogram_over_exploded_total_agrees` cannot reach: its
+/// points carry `exemplar_count: 0`, so the suite never exercised a rejected
+/// request that was carrying exemplars. OTLP counts them at both early returns
+/// (ADR-0047 decision 2: the dropped-data counter must not read zero while data
+/// is lost), and OTAP decodes exemplars only BELOW the exploded check, so it
+/// counts them from the columnar row counts instead of from a decode.
+///
+/// Without that row count the two surfaces diverge on the same overload input,
+/// an OTAP-fronted deployment under-reporting dropped histogram exemplars
+/// against an OTLP-fronted one. Pinning it here is what stops the decode/check
+/// ordering regressing that back into a silent difference.
+///
+/// Flip to watch it fail: have `whole_request_rejection` ignore its
+/// `dropped_exemplars` argument. The OTAP rejection then carries only
+/// `TooManyExplodedPoints` and the exemplar assertion below fails.
+#[test]
+fn an_over_exploded_request_counts_its_dropped_exemplars_on_both_surfaces() {
+    let limits = IngestLimits {
+        max_data_points_per_request: 100,
+        ..IngestLimits::default()
+    };
+    // Ten points, each 20 bounds and carrying two exemplars: over the
+    // post-explosion total, and carrying data the rejection drops.
+    let workload = vec![WorkloadHistogramMetric {
+        name: "latency".to_string(),
+        temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+        points: (0..10)
+            .map(|_| {
+                let mut p = wide_histogram_workload_point(20);
+                p.exemplar_count = 2;
+                p
+            })
+            .collect(),
+    }];
+
+    let otap_out = otap_histogram_normalize(&workload, &limits);
+    assert!(otap_out.points.is_empty(), "the whole request is rejected");
+
+    let dropped: usize = otap_out
+        .rejected
+        .iter()
+        .filter_map(|r| match r {
+            Rejection::HistogramExemplarsDropped { count } => Some(*count),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        dropped, 20,
+        "ten points of two exemplars each must be counted as dropped, not lost \
+         silently: got {:?}",
+        otap_out.rejected
+    );
+
+    // And the two surfaces still return the same thing for this input, which
+    // is the property the reorder had to preserve.
+    assert_histogram_paths_agree_with_limits(&workload, &limits);
+}
+
 #[test]
 fn summary_non_finite_quantile_agrees() {
     let point = WorkloadSummaryPoint {

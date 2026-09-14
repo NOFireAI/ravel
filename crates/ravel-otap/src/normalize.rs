@@ -534,10 +534,13 @@ fn normalize_impl(
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
     let total_points = count_total_points(batch);
     if total_points > limits.max_data_points_per_request {
-        return whole_request_rejection(Rejection::TooManyDataPoints {
-            count: total_points,
-            max: limits.max_data_points_per_request,
-        });
+        return whole_request_rejection(
+            Rejection::TooManyDataPoints {
+                count: total_points,
+                max: limits.max_data_points_per_request,
+            },
+            dropped_exemplar_rows(batch),
+        );
     }
 
     let mut rejected = Vec::new();
@@ -582,21 +585,25 @@ fn normalize_impl(
     // this sits here rather than beside the wire-count check above; it still
     // runs before any per-point series is built (the explode loops below).
     //
-    // The exemplar payloads are decoded BELOW this check, not above it. They
-    // were above it once, and that made the rejection drop decoded exemplars
-    // uncounted: `whole_request_rejection` emits no `HistogramExemplarsDropped`
-    // here, while OTLP's twin counts them at both of its early returns, so the
-    // ADR-0047 decision 2 hazard applied, a dropped-data counter reading zero
-    // while exemplars were lost. Rejecting before the decode is the same
-    // principle as the per-point cap below: bound it before it allocates, and
-    // then there is genuinely nothing decoded to count.
+    // The exemplar payloads are decoded BELOW this check, not above it, and the
+    // rejection still counts them. They were decoded above it once, which made
+    // rejecting here drop them uncounted while OTLP's twin counted them at both
+    // of its early returns: the ADR-0047 decision 2 hazard, a dropped-data
+    // counter reading zero while data is lost. Moving the decode below keeps
+    // the bound-before-allocate principle the per-point cap uses, and
+    // `dropped_exemplar_rows` restores the count from the columnar row counts,
+    // which is metadata rather than a decode. Parity with OTLP is a property
+    // here, not a documented divergence.
     let exploded_points = count_exploded_points(&flat_dp, &flat_hist_dp, &flat_summary_dp);
     if exploded_points > limits.max_data_points_per_request {
-        return whole_request_rejection(Rejection::TooManyExplodedPoints {
-            exploded: exploded_points,
-            count: total_points,
-            max: limits.max_data_points_per_request,
-        });
+        return whole_request_rejection(
+            Rejection::TooManyExplodedPoints {
+                exploded: exploded_points,
+                count: total_points,
+                max: limits.max_data_points_per_request,
+            },
+            dropped_exemplar_rows(batch),
+        );
     }
 
     let hist_exemplar_rows = group_exemplars_by_parent_id(&hist_exemplar_batches, &mut rejected);
@@ -1028,18 +1035,46 @@ fn count_exploded_points(
 /// `histogram_points` is likewise always empty; OTAP admits only scalar points
 /// (`ravel_otlp::NormalizeOutput` gained that vector for the OTLP and Remote
 /// Write native-histogram surfaces).
-fn whole_request_rejection(reason: Rejection) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
+fn whole_request_rejection(
+    reason: Rejection,
+    dropped_exemplars: usize,
+) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
+    let mut rejected = vec![reason];
+    if dropped_exemplars > 0 {
+        rejected.push(Rejection::HistogramExemplarsDropped {
+            count: dropped_exemplars,
+        });
+    }
     (
         MetricsNormalizeResult {
             output: NormalizeOutput {
                 points: Vec::new(),
                 histogram_points: Vec::new(),
-                rejected: vec![reason],
+                rejected,
             },
             exemplars: Vec::new(),
         },
         Vec::new(),
     )
+}
+
+/// Exemplars a whole-request rejection drops, counted from the columnar
+/// payloads' row counts.
+///
+/// One row is one exemplar, so this is batch metadata rather than a decode:
+/// it costs nothing and it does not reach the values, which is what lets the
+/// exploded-points check keep rejecting before `group_exemplars_by_parent_id`
+/// runs. Counting it matters because the OTLP twin counts exemplars at both of
+/// its early returns (ADR-0047 decision 2, the dropped-data counter must not
+/// read zero while data is lost), and an OTAP-fronted deployment that
+/// under-reported them would diverge from an OTLP-fronted one on the same
+/// overload input.
+fn dropped_exemplar_rows(batch: &DecodedBatch) -> usize {
+    payloads_of(batch, ArrowPayloadType::HistogramDpExemplars)
+        .iter()
+        .chain(payloads_of(batch, ArrowPayloadType::NumberDpExemplars).iter())
+        .map(|b| b.num_rows())
+        .sum()
 }
 
 /// Exponential histograms are the one remaining unsupported metric payload
