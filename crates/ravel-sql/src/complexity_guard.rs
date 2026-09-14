@@ -502,7 +502,20 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                         rest.find(|ch: char| !is_identifier_part(ch))
                             .unwrap_or(rest.len())
                     };
-                    skip = rest[..run].chars().count() - 1;
+                    // `run` can be 0. This branch is entered on
+                    // `is_alphanumeric()`, which is wider than
+                    // `is_identifier_part`: a non-ASCII numeric such as `²` or
+                    // an Arabic-Indic digit is alphanumeric, is neither
+                    // alphabetic nor an ASCII digit, and so ends the run at
+                    // offset 0. Subtracting 1 there wraps `usize` and sets
+                    // `skip` to `usize::MAX`, which silently skips the rest of
+                    // the statement: `SELECT ²` + a 2,000-term chain scored 2
+                    // units in release and panicked under overflow checks.
+                    // Saturating leaves `skip` at 0, so the character costs
+                    // the unit already charged above and the scan advances
+                    // normally. `run.max(1)` would be wrong: `rest[..1]` can
+                    // split a multi-byte character and panic.
+                    skip = rest[..run].chars().count().saturating_sub(1);
                 }
             }
         }
@@ -762,6 +775,44 @@ mod tests {
         // its note.
         let sql = format!("SELECT 1 / 2 /* {chain} */");
         check(&sql).expect("a block comment after a single slash is still a comment");
+    }
+
+    /// A character that is `is_alphanumeric()` but not an identifier part
+    /// ends its run at offset 0, and subtracting one there wraps `usize`.
+    ///
+    /// The run branch is entered on `is_alphanumeric()`, which is wider than
+    /// `is_identifier_part` (that is `is_alphabetic() || is_ascii_digit()`
+    /// plus four symbols). A non-ASCII numeric such as `²`, `½` or an
+    /// Arabic-Indic digit falls in the gap. Before the fix `skip` became
+    /// `usize::MAX` and the scan skipped the whole rest of the statement:
+    /// `SELECT ²` + 2,000 `+1` terms scored 2 units in release, and panicked
+    /// with `attempt to subtract with overflow` under overflow checks.
+    ///
+    /// No deep payload reaches the planner, because the tokenizer turns such
+    /// a character into `Token::Char` and that is a parse error in structural
+    /// position. It is fixed anyway: it is a skip of a region the tokenizer
+    /// reads, which is the soundness invariant this guard rests on.
+    ///
+    /// Flip to watch it fail: change `saturating_sub(1)` back to `- 1`. Under
+    /// the test profile's overflow checks this panics rather than
+    /// mis-counting, which is itself the assertion.
+    #[test]
+    fn a_non_identifier_alphanumeric_does_not_underflow_the_skip() {
+        let chain = "+1".repeat(MAX_STATEMENT_COMPLEXITY);
+        for odd in ["²", "½", "٣", "Ⅻ"] {
+            let sql = format!("SELECT {odd}{chain}");
+            let count = check(&sql)
+                .expect_err("the chain after the character is structure")
+                .count;
+            assert!(
+                count > MAX_STATEMENT_COMPLEXITY,
+                "{odd}: the scan must not skip to the end, got {count} units"
+            );
+        }
+
+        // The short form the reviewer named, pinned exactly rather than by
+        // inequality: `SELECT`, the character, and three `+1` pairs.
+        assert_eq!(scan("SELECT ²+1+1+1", usize::MAX), 8);
     }
 
     /// A `/*!...*/` hint comment cannot hide an operator chain. This dialect
