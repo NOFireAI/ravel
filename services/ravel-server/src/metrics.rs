@@ -1738,26 +1738,6 @@ fn render_ingest_buffer_budget_family(
     );
 }
 
-/// The ADR-1170 decisions 3/4 process memory budget family: the derived
-/// ceiling, the reserved share per component, and the tenant handoff overlap
-/// the same one `ravel_memory::MemoryBudget` tracks. Unconditional, like
-/// `render_ingest_buffer_budget_family` above: `MetricsState::process_memory_budget`
-/// is always built (`crate::start`), regardless of the `sql` feature or mode,
-/// so this family renders in every build even where nothing yet reserves
-/// against the budget.
-///
-/// `ravel_memory_budget_bytes` is `u64::MAX` when the process was built with
-/// no derived budget (matching `ravel_memory::MemoryBudget::unlimited`'s own
-/// convention), not `0`: a `0` ceiling would misread as "everything refused."
-/// The raw `MemoryBudget::limit()` on that path is actually `u64::MAX` minus
-/// the two hard cache carves (a near-miss a `== u64::MAX` dashboard check
-/// would never match), so [`exposed_memory_budget_limit`] clamps it before
-/// it reaches this family.
-///
-/// `ravel_memory_reserved_bytes{component="fetch"}` is always `0`: decision 2
-/// (fetch-layer reservation against this budget) has not landed upstream, so
-/// `reserved` below is entirely the SQL side's usage. See
-/// [`Label::MemoryComponent`]'s doc comment.
 /// Clamps the exposed `ravel_memory_budget_bytes` reading to `u64::MAX` when
 /// `is_fallback` is set (the budget was sized on an unmeasured host,
 /// `config::PERF_SOURCE_FALLBACK`). On that path `raw_limit` is
@@ -1770,6 +1750,27 @@ fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
     if is_fallback { u64::MAX } else { raw_limit }
 }
 
+/// The ADR-1170 decisions 3/4 process memory budget family: the derived
+/// ceiling, the reserved share per component, and the tenant handoff overlap
+/// the same one `ravel_memory::MemoryBudget` tracks. Unconditional, like
+/// `render_ingest_buffer_budget_family` above: `MetricsState::process_memory_budget`
+/// is always built (`crate::start`), regardless of the `sql` feature or mode,
+/// so this family renders in every build even where nothing yet reserves
+/// against the budget.
+///
+/// `ravel_memory_budget_bytes` is `u64::MAX` when the process was built with
+/// no derived budget (matching `ravel_memory::MemoryBudget::unlimited`'s own
+/// convention), not `0`: a `0` ceiling would misread as "everything refused."
+/// [`exposed_memory_budget_limit`] clamps that path before it reaches this
+/// family.
+///
+/// `ravel_memory_reserved_bytes{component="fetch"}` and
+/// `ravel_memory_handoff_overlap_bytes` are both always `0` here.
+/// `ravel-query`'s fetchers do reserve and mark handoffs, but against the
+/// private `MemoryBudget::unlimited` each one carries by default:
+/// `crate::query::build_sql_state` wires no fetcher to the process-wide
+/// instance, so nothing this family reads ever sees a fetch reservation. See
+/// [`Label::MemoryComponent`]'s doc comment.
 fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudgetSnapshot) {
     write_header(
         out,

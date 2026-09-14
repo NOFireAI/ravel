@@ -319,9 +319,14 @@ is a convenience that builds a private limiter for callers outside an engine
 (the benches). The knob ADR-1195 left for this ADR to name is
 `--store-get-concurrency`.
 
-One thing this amendment does not change: sharing one limiter across
-`ravel-server`'s engines and standalone fetchers lands with the server half of
-ADR-1195; until then the pool is per engine.
+The server half of ADR-1195 has since landed, so the sharing this amendment
+described as pending is implemented: `ravel-server` builds one
+`Arc<GetLimiter>` from `--store-get-concurrency` (the legacy
+`--fetch-concurrency` when only that is set) and hands that same instance to
+its query engine, its SQL state's RSEG/RLOG/RSPAN fetchers, the distributed
+fragment service's fetcher, and the standalone fetchers of the startup cache
+warm, so the pool is process-wide there rather than per engine. Outside the
+server, a fetcher built without one (the benches) still carries its own.
 
 The RLOG whole-object funnel (`fetch_accounted` and `whole_object_bytes`) was
 still unpermitted at the time this amendment was written; the ADR-1195
