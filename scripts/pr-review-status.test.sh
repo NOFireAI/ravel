@@ -281,7 +281,7 @@ case "$*" in
   *"/pulls/"*"/reviews"*)   cat "${FIXTURES}/reviews.json" ;;
   *"/issues/"*"/comments"*) cat "${FIXTURES}/issue-comments.json" ;;
   *"/pulls/"*"/comments"*)  cat "${FIXTURES}/review-comments.json" ;;
-  *"/rules/branches/"*)     cat "${FIXTURES}/rules.json" ;;
+  *"/rules/branches/"*)     echo "gh rules" >>"${FIXTURES}/calls.log"; cat "${FIXTURES}/rules.json" ;;
   *) echo "unexpected gh call: $*" >&2; exit 90 ;;
 esac
 SHIM
@@ -294,6 +294,8 @@ chmod +x "${E2E_DIR}/bin/gh"
 # both before the text reaches a terminal, and a test below checks that it did.
 cat >"${E2E_DIR}/bin/git" <<'SHIM'
 #!/usr/bin/env bash
+# Recorded so a test can assert the freshness check was NOT reached.
+[[ -n "${FIXTURES:-}" ]] && echo "git $1" >>"${FIXTURES}/calls.log"
 tip=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 old=cccccccccccccccccccccccccccccccccccccccc
 resolve() {
@@ -365,8 +367,13 @@ e2e() {
   if [[ -z "${rollup}" ]]; then
     rollup='[{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]'
   fi
-  printf '{"state":"OPEN","mergeStateStatus":"CLEAN","statusCheckRollup":%s,"headRefOid":"%s"}\n' \
-    "${rollup}" "${SHA}" >"${fx}/pr-view.json"
+  if [[ -n "${E2E_PR_VIEW:-}" ]]; then
+    printf '%s\n' "${E2E_PR_VIEW}" >"${fx}/pr-view.json"
+  else
+    printf '{"state":"OPEN","mergeStateStatus":"CLEAN","statusCheckRollup":%s,"headRefOid":"%s"}\n' \
+      "${rollup}" "${SHA}" >"${fx}/pr-view.json"
+  fi
+  : >"${fx}/calls.log"
   printf '%s\n' "${E2E_REVIEWS:-$(printf '[{"user":{"login":"%s"},"state":"%s","commit_id":"%s","body":%s}]' \
     "${BOT}" "${E2E_REVIEW_STATE:-COMMENTED}" "${SHA}" "${review_body}")}" >"${fx}/reviews.json"
   printf '%s\n' "${E2E_ISSUE_COMMENTS:-${DONE_TASK_COMMENT}}" >"${fx}/issue-comments.json"
@@ -723,6 +730,21 @@ unset E2E_GIT_STALE E2E_GIT_FAIL_AT
 check_eq "#1758 queue present but the guard could not run: still blocks" \
   "1" \
   "$(printf '%s\n' "${queue_unreadable_guard_out}" | grep -c 'could not check merge-base freshness')"
+
+# Laziness. The freshness check is reached from the verdict chain, not computed
+# ahead of it, so a pull request an earlier branch answers costs no fetch and
+# no rules call. Asserting the calls that must NOT happen, because the version
+# that computed this eagerly passed every other test in this file.
+closed_pr_json='{"state":"MERGED","mergeStateStatus":"UNKNOWN","statusCheckRollup":[{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}],"headRefOid":"'"${SHA}"'"}'
+export E2E_GIT_STALE=1
+closed_out="$(E2E_PR_VIEW="${closed_pr_json}" e2e "${CLEAN_BODY_JSON}")"
+unset E2E_GIT_STALE
+check_eq "#1758 a closed PR is answered without touching git or the rules API" \
+  "0" \
+  "$(cat "${E2E_DIR}/fx/calls.log" 2>/dev/null | wc -l | tr -d ' ')"
+check_eq "#1758 a closed PR still gets its own verdict" \
+  "  -> PR is MERGED, not open; nothing to merge" \
+  "$(printf '%s\n' "${closed_out}" | sed -n 2p)"
 # The stand-in git puts an escape sequence and a carriage return in the first
 # unseen subject. Both must be gone by the time the text is printed: a subject
 # is attacker-controlled and this output is what the operator reads before
