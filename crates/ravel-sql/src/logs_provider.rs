@@ -2374,4 +2374,85 @@ mod tests {
             assert!(m.rowpath_batches > 0, "{sql} must build row-path batches");
         }
     }
+
+    /// Count the scan's per-segment timeline points (`seg_open_start_offset`,
+    /// `seg_open_ready_offset`, `seg_done_offset`) on the plan `sql` produces,
+    /// with `segment_timing` turned on.
+    async fn segment_timing_points(
+        store: &Arc<dyn ObjectStoreBackend>,
+        seg: &SegmentRef,
+        sql: &str,
+    ) -> usize {
+        let snapshot = Snapshot {
+            segments: vec![seg.clone()],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            LogSegmentFetcher::new(Arc::clone(store)),
+            PhaseAccounting::new(),
+        )
+        .with_declared_columns(k3_declared())
+        .with_segment_timing(true);
+        let ctx = logs_session(provider).expect("build session");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("collect");
+        find_logs_scan(&plan)
+            .expect("a LogsScanExec leaf")
+            .metrics()
+            .expect("the scan publishes metrics")
+            .iter()
+            .filter(|m| m.value().name().starts_with("seg_"))
+            .count()
+    }
+
+    /// The per-key rewrite rebuilds the scan through `reproject_attr_keys`, and
+    /// a builder field dropped there is invisible: the query still answers
+    /// correctly and the instrument just reports nothing, which reads as "this
+    /// shape has no per-segment cost" rather than "the instrument was dropped".
+    ///
+    /// Comparing against the declared form is what makes it a check rather than
+    /// a guess: both plans scan the same segment, so the rewritten one must
+    /// publish the same number of timeline points. Dropping
+    /// `.with_segment_timing(self.segment_timing)` from `reproject_attr_keys`
+    /// takes the map form to 0 and fails this.
+    #[tokio::test]
+    async fn the_per_key_rewrite_keeps_the_segment_timeline() {
+        let store = MemoryStore::new();
+        let seg = wide_attr_segment(&store).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+        let declared = segment_timing_points(
+            &store,
+            &seg,
+            "SELECT ts, \"k3\" AS v FROM logs ORDER BY ts LIMIT 10",
+        )
+        .await;
+        let per_key = segment_timing_points(
+            &store,
+            &seg,
+            "SELECT ts, attrs['k3'] AS v FROM logs ORDER BY ts LIMIT 10",
+        )
+        .await;
+
+        assert!(
+            declared > 0,
+            "the declared form must publish timeline points for this to compare against"
+        );
+        assert_eq!(
+            per_key, declared,
+            "the per-key rewrite must carry segment_timing through \
+             reproject_attr_keys: got {per_key} points against {declared}"
+        );
+    }
 }
