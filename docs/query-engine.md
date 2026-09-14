@@ -2656,7 +2656,12 @@ Three numbers, one decision:
   levels. (The validation walk itself survives 50,007 and aborts at 60,007,
   so the planner, not the gate's own caller, is the binding consumer.) No
   construct costs fewer than two tokens per tree level, so an admitted
-  statement cannot exceed 500 levels against those 950. The bound is not
+  statement cannot exceed 500 levels against those 950. (Two constructs sit
+  below that floor and are excluded for the same reason: a prefix unary chain
+  such as `SELECT NOT NOT ... TRUE` or `SELECT - - - ... 1` adds one level per
+  token, and parenthesis nesting costs two, but all three descend through
+  `parse_subexpr` and the pinned recursion limit below refuses them long
+  before the token bound bites.) The bound is not
   lower because a lower one refuses real analytic SQL: the whole ClickBench
   corpus in `benchmarks/clickbench/hits.corpus.json` is pinned as accepted in
   `crates/ravel-sql/tests/statement_complexity.rs`.
