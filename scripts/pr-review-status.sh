@@ -49,7 +49,7 @@ guard_out=""
 merge_base_guard() {
   guard_rc=0
   guard_out="$( { { cd "${script_dir}/.." || exit 2; } && \
-    "${script_dir}/guards/assert-fresh-merge-base.sh" "${pr}"; } 2>&1)" || guard_rc=$?
+    "${script_dir}/guards/assert-fresh-merge-base.sh" "${pr}" origin "${base_ref}"; } 2>&1)" || guard_rc=$?
   return "${guard_rc}"
 }
 
@@ -283,11 +283,19 @@ echo "${summary}"
 base_behind_note=""
 queue_merges=0
 queue_lookup_failed=0
+# Memoised so the two callers below share one lookup, and still lazy: a pull
+# request answered by an earlier branch of the verdict chain reaches neither
+# caller and pays for no API call.
+_queue_rc=""
+queue_is_active() {
+  [[ -n "${_queue_rc}" ]] || { merge_queue_active "${base_ref}"; _queue_rc=$?; }
+  return "${_queue_rc}"
+}
 base_stale_blocks() {
   merge_base_guard && return 1
   [[ "${guard_rc}" == "1" ]] || return 0
   local qrc=0
-  merge_queue_active "${base_ref}" || qrc=$?
+  queue_is_active || qrc=$?
   if [[ "${qrc}" == "2" ]]; then
     # Could not ask is not an answer. Block, but say why, so the operator is
     # not handed the pre-#1758 advice with no hint it came from a failed
@@ -392,6 +400,13 @@ elif base_stale_blocks; then
   fi
 elif [[ "${merge_state}" != "CLEAN" && "${merge_state}" != "UNSTABLE" ]]; then
   echo "  -> every check and review looks clean, but mergeState is ${merge_state} (not CLEAN/UNSTABLE); verify by hand before merging"
+  if [[ "${queue_merges}" == "1" ]]; then
+    # Verifying by hand without the unseen-commit list means verifying without
+    # the one signal that catches a silently reverted concurrent landing. The
+    # note was computed above; print it here too rather than drop it.
+    echo "  -> the base is also behind; these are the commits it has not seen:"
+    echo "${base_behind_note//guard: /     }"
+  fi
 else
   if [[ "${inline_comments}" != "0" && "${outside_diff}" != "0" ]]; then
     echo "  -> clean (operator confirmed all ${inline_comments} inline comment(s) and ${outside_diff} outside-diff body finding(s) addressed): ${ci_phrase}, review at the current head"
@@ -437,6 +452,12 @@ else
     # rather than re-derived. Keeping the flag also means the printed command
     # stays correct if the queue is ever removed, where the strategy would
     # otherwise fall back to whatever the repository default happens to be.
+    echo "  -> gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
+  elif queue_is_active; then
+    # Base is fresh right now, but a queue is enforced, so the prefix would
+    # refuse the moment main moves between this check and the operator running
+    # the line -- the pre-#1758 refusal reached by the fresh path instead of
+    # the stale one. The queue re-validates the entry either way.
     echo "  -> gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
   else
     echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} && gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
