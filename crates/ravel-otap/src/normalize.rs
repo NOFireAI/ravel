@@ -568,11 +568,6 @@ fn normalize_impl(
     let flat_attrs = flatten_attrs(&attr_batches, &mut rejected);
     let flat_hist_dp = flatten_histogram_dp(&hist_dp_batches, &mut rejected);
     let flat_hist_attrs = flatten_attrs(&hist_attr_batches, &mut rejected);
-    let hist_exemplar_rows = group_exemplars_by_parent_id(&hist_exemplar_batches, &mut rejected);
-    let flat_hist_exemplar_attrs = flatten_attrs(&hist_exemplar_attr_batches, &mut rejected);
-    let number_exemplar_rows =
-        group_exemplars_by_parent_id(&number_exemplar_batches, &mut rejected);
-    let flat_number_exemplar_attrs = flatten_attrs(&number_exemplar_attr_batches, &mut rejected);
     let flat_summary_dp = flatten_summary_dp(&summary_dp_batches, &mut rejected);
     let flat_summary_attrs = flatten_attrs(&summary_attr_batches, &mut rejected);
 
@@ -586,6 +581,15 @@ fn normalize_impl(
     // per-point bound counts only after flattening the columnar payloads, so
     // this sits here rather than beside the wire-count check above; it still
     // runs before any per-point series is built (the explode loops below).
+    //
+    // The exemplar payloads are decoded BELOW this check, not above it. They
+    // were above it once, and that made the rejection drop decoded exemplars
+    // uncounted: `whole_request_rejection` emits no `HistogramExemplarsDropped`
+    // here, while OTLP's twin counts them at both of its early returns, so the
+    // ADR-0047 decision 2 hazard applied, a dropped-data counter reading zero
+    // while exemplars were lost. Rejecting before the decode is the same
+    // principle as the per-point cap below: bound it before it allocates, and
+    // then there is genuinely nothing decoded to count.
     let exploded_points = count_exploded_points(&flat_dp, &flat_hist_dp, &flat_summary_dp);
     if exploded_points > limits.max_data_points_per_request {
         return whole_request_rejection(Rejection::TooManyExplodedPoints {
@@ -594,6 +598,12 @@ fn normalize_impl(
             max: limits.max_data_points_per_request,
         });
     }
+
+    let hist_exemplar_rows = group_exemplars_by_parent_id(&hist_exemplar_batches, &mut rejected);
+    let flat_hist_exemplar_attrs = flatten_attrs(&hist_exemplar_attr_batches, &mut rejected);
+    let number_exemplar_rows =
+        group_exemplars_by_parent_id(&number_exemplar_batches, &mut rejected);
+    let flat_number_exemplar_attrs = flatten_attrs(&number_exemplar_attr_batches, &mut rejected);
 
     let root_ids = decode_root_ids(&root_batches, &mut rejected);
     let dense_size = dense_size_for(
