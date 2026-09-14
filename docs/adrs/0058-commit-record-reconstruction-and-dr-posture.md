@@ -284,13 +284,29 @@ physically removed; without it the `quarantine/` prefix would leak, so it is
 part of this decision, not a follow-up. `force_orphan_gc` still quarantines
 rather than deletes, keeping the recovery window even for a forced pass.
 
+The two horizons are not independent. A pass whose mass-orphan breaker trips
+does not run the reaper at all, whatever the quarantine ages say. A tripped
+breaker means a record loss large enough to page is live at that moment, and
+a loss that grows over time reaches the breaker's thresholds days after it
+began: reaping on such a pass destroys the copies taken while the loss was
+still small, which is exactly the permanence this decision removes, put back
+one horizon later. Holding the reaper trades an unbounded `quarantine/`
+prefix during an unresolved incident for keeping the recovery window, and the
+breaker tripping is already the signal that an operator has to act. A
+`force_orphan_gc` override is not a trip, so an operator who has decided
+still reclaims.
+
 This closes the permanence half of the gap decision 1 only made visible: the
 orphan-presence gauge tells an operator a small loss happened, but before
 this the data was already scheduled for permanent deletion at hour ~25 and
 nothing gave the operator time to act. A quarantined object is recoverable
-for a week and reported per pass by `ravel_maintain_orphans_quarantined` and
-`ravel_maintain_orphans_quarantine_refused`, with a `warn`-level event on any
-nonzero count.
+for a week and counted per pass as quarantined and quarantine-refused, with a
+`warn`-level event on any nonzero count. Those two counts reach an operator
+through the tracing events only. The names
+`ravel_maintain_orphans_quarantined` and
+`ravel_maintain_orphans_quarantine_refused` are not rendered on `/metrics`
+yet; #1762 adds them, and an alert rule written on either name before that
+can never fire.
 
 ## Rejected alternatives
 

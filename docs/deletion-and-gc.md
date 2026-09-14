@@ -290,18 +290,35 @@ prefix and a separate reaper deletes it only after a second horizon:
   unreadable age is treated as not-yet-expired). It runs on the same
   maintain tick as the sweep, whole-shard like orphan GC itself (quarantine
   keys are not hour-bucketed), and is stateless and idempotent.
-- **The event is visible.** A pass reports objects quarantined
-  (`ravel_maintain_orphans_quarantined`, equal to the retained
-  `orphans_deleted` count of candidates removed from the live set), refused,
-  and reaped, and emits a `warn`-level tracing event for each nonzero
-  count, so an operator can alert on quarantine activity below the breaker
-  without waiting for the breaker to trip.
+- **A tripped breaker holds the reaper.** A pass whose mass-orphan breaker
+  tripped reaps nothing, whatever the quarantine ages say. A loss that grows
+  over time reaches the breaker's thresholds days after it started, so
+  reaping on such a pass deletes the copies taken while it was still small.
+  The two horizons are therefore chained, not independent. A
+  `force_orphan_gc` override is not a trip and still reclaims.
+- **The event is visible in the logs, not yet on `/metrics`.** A pass counts
+  objects quarantined (equal to the retained `orphans_deleted` count of
+  candidates removed from the live set), refused, and reaped, and emits a
+  `warn`-level tracing event for each nonzero count. Today that tracing event
+  is the only operator-facing signal. The counter names
+  `ravel_maintain_orphans_quarantined` and
+  `ravel_maintain_orphans_quarantine_refused` are **not rendered on
+  `/metrics`** yet, so an alert rule written on either name can never fire.
+  Alert on `ravel_maintain_orphans_present` and on the tracing events
+  instead. `docs/observability.md` lists what `/metrics` actually exposes.
 
-The cost is storage: a quarantined object occupies the bucket for the
-second horizon before it is reclaimed, and the `quarantine/` prefix would
-leak without the reaper, which is why the reaper is part of the mechanism,
-not a follow-up. `force_orphan_gc` (the breaker override) still quarantines
-rather than deletes, so even a forced pass keeps the recovery window.
+The cost is storage plus transfer. A quarantined object occupies the bucket
+for the second horizon before it is reclaimed, and the `quarantine/` prefix
+would leak without the reaper, which is why the reaper is part of the
+mechanism, not a follow-up. The request cost changed shape too: orphan GC
+went from one DELETE per candidate to a full-object GET plus a full PUT per
+candidate, run serially with no cap on candidates per pass, and the reaper
+adds one unconditional LIST per swept unit per tick. The thin-spread record
+loss this feature exists for is also the expensive case, because it moves
+those bytes twice through a single maintain tick. The per-pass
+unboundedness is an acknowledged open item, not a property anything
+enforces. `force_orphan_gc` (the breaker override) still quarantines rather
+than deletes, so even a forced pass keeps the recovery window.
 
 ## Superseded input and unreferenced part
 
