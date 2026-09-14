@@ -90,6 +90,10 @@ pub struct LogsTableProvider {
     /// and every non-Flight build -- is the local scan path unchanged.
     #[cfg(feature = "flight-sql")]
     distributed: Option<DistributedRlogContext>,
+    /// Whether every `LogsScanExec` this provider builds publishes its
+    /// per-segment scan timeline (`SqlConfig::segment_timing`). `false` by
+    /// default, installed with [`Self::with_segment_timing`].
+    segment_timing: bool,
 }
 
 impl LogsTableProvider {
@@ -115,6 +119,7 @@ impl LogsTableProvider {
             column_stats: None,
             #[cfg(feature = "flight-sql")]
             distributed: None,
+            segment_timing: false,
         }
     }
 
@@ -199,6 +204,18 @@ impl LogsTableProvider {
         self
     }
 
+    /// Turn on every `LogsScanExec` this provider builds publishing its
+    /// per-segment scan timeline (issue #913). `false` (the default)
+    /// reproduces the pre-timeline-gate provider exactly: `LogsScanExec`
+    /// registers none of the `seg_*_offset` metrics and
+    /// `accumulate_scan_timing` finds no per-segment rows to fold. A builder
+    /// method for the same reason [`Self::with_declared_columns`] is one:
+    /// `LogsTableProvider::new` stays source-compatible.
+    pub fn with_segment_timing(mut self, segment_timing: bool) -> Self {
+        self.segment_timing = segment_timing;
+        self
+    }
+
     /// Build the scan over every segment in the snapshot with no pushdown and
     /// no projection (every column). Exposed (like the metrics provider's
     /// `plan`) so tests can execute the scan without a SQL front-end.
@@ -250,7 +267,8 @@ impl LogsTableProvider {
             Arc::clone(&self.schema),
             Arc::clone(&self.declared),
         )?
-        .with_column_stats(self.column_stats.clone());
+        .with_column_stats(self.column_stats.clone())
+        .with_segment_timing(self.segment_timing);
         Ok(Arc::new(scan))
     }
 

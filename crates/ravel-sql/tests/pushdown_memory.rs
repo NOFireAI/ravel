@@ -826,6 +826,8 @@ async fn byte_budget_exceeded_returns_typed_error() {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
+        // Issue #913: the per-segment timeline off, as on the shipped default.
+        segment_timing: false,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
@@ -921,6 +923,8 @@ async fn high_cardinality_trips_query_pool_before_tenant() {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
+        // Issue #913: the per-segment timeline off, as on the shipped default.
+        segment_timing: false,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
@@ -984,6 +988,8 @@ async fn tenant_budget_trips_and_rolls_back_the_query_reservation() {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
+        // Issue #913: the per-segment timeline off, as on the shipped default.
+        segment_timing: false,
     };
     let tenant = TenantMemoryAccountant::new(8);
     let (pool, _breach) = config.query_pool(Arc::clone(&tenant), QueryAccounting::new());
@@ -1049,6 +1055,8 @@ async fn query_budget_reported_first_when_both_ceilings_are_equally_reachable() 
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
+        // Issue #913: the per-segment timeline off, as on the shipped default.
+        segment_timing: false,
     };
     let tenant = TenantMemoryAccountant::new(8);
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
