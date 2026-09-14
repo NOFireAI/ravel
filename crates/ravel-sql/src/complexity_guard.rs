@@ -241,6 +241,14 @@ enum Mode {
     Normal,
     /// Inside a `'...'` string literal.
     Quoted(char),
+    /// Inside an `E'...'`, `e'...'`, `X'...'` or `x'...'` literal, where the
+    /// tokenizer treats `\` as consuming the next character
+    /// (`Unescape::unescape` for the escape-constant arm, and the hex arm's
+    /// hardcoded `backslash_escape = true`). Closing on the first unescaped
+    /// `'` is what keeps this scan's quote parity equal to the tokenizer's; a
+    /// doubled `''` reads as close-then-reopen and excludes the same text, as
+    /// it does for a bare literal.
+    EscapedQuote,
     /// Inside a `$tag$...$tag$` dollar-quoted string, holding the full
     /// closing delimiter (`$tag$`, or `$$` when the tag is empty).
     Dollar(String),
@@ -343,6 +351,16 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                     mode = Mode::Normal;
                 }
             }
+            Mode::EscapedQuote => {
+                if c == '\\' {
+                    // Consume whatever follows, including a quote. If the
+                    // backslash is the last character there is nothing to
+                    // skip and the loop simply ends.
+                    skip = 1;
+                } else if c == '\'' {
+                    mode = Mode::Normal;
+                }
+            }
             Mode::Dollar(ref end) => {
                 if rest.starts_with(end.as_str()) {
                     skip = end.chars().count() - 1;
@@ -377,16 +395,29 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                 // resumes `Normal` sooner and counts more text as top-level
                 // structure. Running past it counts every remaining character.
                 // Neither can admit a statement the tokenizer sees as deeper.
-                // A `/*` whose `/` follows another `/` opens no comment for
-                // this dialect: `//` is a single `DuckIntDiv` token
+                // `//` is one `DuckIntDiv` token for this dialect
                 // (`dialect_of!(self is DuckDbDialect | GenericDialect)`), so
-                // the `*` after it is `Mul` and the region that follows is
-                // ordinary structure. Entering a comment here would skip it.
-                // Declining to enter costs an over-count of a real comment
-                // that happens to sit after a division, which is the safe
-                // direction.
-                let after_slash = preceding_char(sql, at) == Some('/');
-                if !after_slash && rest.starts_with("/*!") {
+                // it is consumed here as one unit of lookahead rather than
+                // left for the comment arms below.
+                //
+                // Consuming it, rather than asking whether the preceding
+                // character was a slash, is what makes three slashes right.
+                // In `///*` the tokenizer takes the first two as `DuckIntDiv`
+                // and the third DOES start a token, so `/*` after it opens a
+                // real comment. A preceding-character test declines there and
+                // scans the comment body in `Normal`, where a `--` inside it
+                // runs `LineComment` to EOF and everything past the `*/` is
+                // excluded: `SELECT 1 ///*--*/` + 4,000 `+1` terms scored 6
+                // units against 8,003 tokens.
+                if rest.starts_with("//") {
+                    count += 1;
+                    if count > stop_above {
+                        return count;
+                    }
+                    skip = 1;
+                    continue;
+                }
+                if rest.starts_with("/*!") {
                     count += 3;
                     if count > stop_above {
                         return count;
@@ -395,7 +426,7 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                     mode = Mode::Hint(1);
                     continue;
                 }
-                if !after_slash && rest.starts_with("/*") {
+                if rest.starts_with("/*") {
                     mode = Mode::BlockComment(1);
                     skip = 1;
                     continue;
@@ -426,32 +457,44 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                 // and all three are live on `GenericDialect`:
                 //
                 // - `E'...'` / `e'...'`: `supports_string_escape_constant` is
-                //   true, so `\'` is an escaped quote rather than a terminator.
-                // - `X'...'` / `x'...'`: the hex-literal arm passes
+                //   true, so `\'` is an escaped quote, not a terminator.
+                // - `X'...'` / `x'...'`: the hex arm passes
                 //   `backslash_escape = true` for every dialect.
-                // - `q'...'` / `Q'...'` (and the `nq`/`NQ` spelling):
+                // - `q'...'` / `Q'...'` (and `nq`/`NQ`):
                 //   `supports_quote_delimited_string` is true, and the Oracle
                 //   form ends at its matching delimiter followed by `'`, so its
                 //   body can contain a quote.
                 //
-                // Each shifts the scan's quote parity against the tokenizer's,
-                // which puts the rest of the statement inside a literal the
-                // scan thinks it is outside of, or the reverse. `E'\''` +
-                // 1,100 `+1` terms scored 4 units and overflowed the stack in
-                // `SqlToRel::statement_to_plan`.
+                // An earlier fix declined to open a region at all for these,
+                // on the argument that counting the body as ordinary tokens
+                // over-counts and that over-counting is always safe. That
+                // argument is FALSE for a paired delimiter, and the mistake is
+                // worth keeping written down. Skipping the OPENING `'` leaves
+                // the CLOSING `'` to be read here, where it opens a region the
+                // tokenizer never entered; the scan then excludes everything
+                // to the next `'` or to EOF. `SELECT E''` + 4,000 `+1` terms
+                // scored 4 units against 8,002 tokens and a 4,000-level tree.
+                // The tests passed only because `E'\''` and `q'[' ]'` each
+                // carry an extra quote that restores parity by accident.
                 //
-                // So a `'` that follows one of those prefix characters opens no
-                // literal here: it costs its unit and the body is counted as
-                // ordinary tokens. That over-counts a real escape or hex
-                // literal, and over-counting never admits a statement the
-                // tokenizer sees as deeper.
-                if c == '\''
-                    && matches!(
-                        preceding_char(sql, at),
-                        Some('E' | 'e' | 'X' | 'x' | 'q' | 'Q')
-                    )
-                {
-                    continue;
+                // So the end is modelled, not declined. And the prefix only
+                // applies when it starts a token: the tokenizer reaches those
+                // arms from `next_token`, so in `DATE'2024-01-01'` the `'` is
+                // a plain opener and the `E` of `DATE` is not a prefix.
+                if c == '\'' {
+                    match quote_prefix(sql, at) {
+                        // `q'`-style bodies end at a delimiter pair this scan
+                        // cannot locate with a one-character rule, so the
+                        // statement is refused outright rather than guessed
+                        // at. `usize::MAX` is deliberately not a plausible
+                        // count: it means refused, not measured.
+                        Some(QuotePrefix::QuoteDelimited) => return usize::MAX,
+                        Some(QuotePrefix::BackslashEscaped) => {
+                            mode = Mode::EscapedQuote;
+                            continue;
+                        }
+                        None => {}
+                    }
                 }
                 if c == '\'' || c == '"' || c == '`' {
                     mode = Mode::Quoted(c);
@@ -533,6 +576,48 @@ fn scan(sql: &str, stop_above: usize) -> usize {
 /// a `/*` after a `/` is not a comment.
 fn preceding_char(sql: &str, at: usize) -> Option<char> {
     sql[..at].chars().next_back()
+}
+
+/// Which string-literal prefix, if any, the tokenizer would read immediately
+/// before the `'` at `at`.
+///
+/// The prefix has to START a token. The tokenizer enters its `E`/`X`/`q` arms
+/// from `next_token`, so in `DATE'2024-01-01'` the `'` is an ordinary opener
+/// and the `E` of `DATE` is just a letter. Testing only the character next to
+/// the quote made every identifier or keyword ending in one of those letters a
+/// door into the same parity bug.
+fn quote_prefix(sql: &str, at: usize) -> Option<QuotePrefix> {
+    let p1 = preceding_char(sql, at)?;
+    let p1_at = at - p1.len_utf8();
+    match p1 {
+        'E' | 'e' | 'X' | 'x' => starts_token(sql, p1_at).then_some(QuotePrefix::BackslashEscaped),
+        'q' | 'Q' => {
+            // `nq'...'` and `NQ'...'` spell the same construct, so the token
+            // starts one character earlier when an `n` precedes the `q`.
+            let start = match preceding_char(sql, p1_at) {
+                Some(n @ ('n' | 'N')) => p1_at - n.len_utf8(),
+                _ => p1_at,
+            };
+            starts_token(sql, start).then_some(QuotePrefix::QuoteDelimited)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a token can begin at byte offset `at`: nothing before it, or a
+/// character that is not part of an identifier.
+fn starts_token(sql: &str, at: usize) -> bool {
+    !preceding_char(sql, at).is_some_and(is_identifier_part)
+}
+
+/// The two kinds of prefixed string literal this scan has to tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotePrefix {
+    /// `E`/`e`/`X`/`x`: ends at the first `'` that a `\` did not escape.
+    BackslashEscaped,
+    /// `q`/`Q`/`nq`/`NQ`: ends at a matching delimiter pair, which no
+    /// one-character rule can locate, so the statement is refused instead.
+    QuoteDelimited,
 }
 
 /// `GenericDialect::is_identifier_part`, which decides where a `Word` ends.
@@ -723,7 +808,14 @@ mod tests {
     #[test]
     fn a_prefixed_string_literal_cannot_hide_an_operator_chain() {
         let chain = "+1".repeat(MAX_STATEMENT_COMPLEXITY);
-        for opener in ["E'\\''", "e'\\''", "X'\\''", "x'\\''", "q'[' ]'", "Q'[' ]'"] {
+        // The simplest spelling of each prefix is first. An earlier fix passed
+        // this test with only the escaped forms present, because `E'\''` and
+        // `q'[' ]'` each carry an extra quote that restores parity by
+        // accident, while `E''` and `X''` did not.
+        for opener in [
+            "E''", "e''", "X''", "x''", "q'[]'", "Q'[]'", "nq'[]'", "NQ'[]'", "E'\\''", "e'\\''",
+            "X'\\''", "x'\\''", "q'[' ]'", "Q'[' ]'", "X'ab'", "E'a''b'",
+        ] {
             let sql = format!("SELECT {opener}{chain}");
             let count = check(&sql)
                 .expect_err("the chain after the prefixed literal is structure")
@@ -738,6 +830,15 @@ mod tests {
         // body, which is what keeps a large IN list of strings affordable.
         let sql = format!("SELECT '{}'", "+1".repeat(MAX_STATEMENT_COMPLEXITY));
         check(&sql).expect("a bare string literal is one token");
+
+        // The prefix only applies when it STARTS a token. `DATE'...'` ends in
+        // `E`, and the tokenizer reads its quote as a plain opener, so the
+        // body must still be excluded. Testing only the character next to the
+        // quote made every keyword ending in one of these letters a door.
+        let sql = format!("SELECT DATE'{}'", "+1".repeat(MAX_STATEMENT_COMPLEXITY));
+        check(&sql).expect("DATE'...' is a plain literal, not a prefixed one");
+        let sql = format!("SELECT max'{}'", "+1".repeat(MAX_STATEMENT_COMPLEXITY));
+        check(&sql).expect("an identifier ending in x is not the hex prefix");
     }
 
     /// `//` is one `DuckIntDiv` token for this dialect, so the `*` after it is
@@ -769,6 +870,22 @@ mod tests {
             count > MAX_STATEMENT_COMPLEXITY,
             "the chain after `//*` is structure, got {count} units"
         );
+
+        // Three slashes. The tokenizer takes the first two as `DuckIntDiv`,
+        // and the third DOES start a token, so `/*` after it opens a real
+        // comment. A rule that asked whether the PRECEDING character was a
+        // slash declined here and scanned the comment body in `Normal`, where
+        // each of these sub-mode openers runs to EOF and hides the chain.
+        for body in ["--", "'", "`", "$$"] {
+            let sql = format!("SELECT 1 ///*{body}*/{chain}");
+            let count = check(&sql)
+                .expect_err("the chain after a real three-slash comment is structure")
+                .count;
+            assert!(
+                count > MAX_STATEMENT_COMPLEXITY,
+                "///*{body}*/: got {count} units"
+            );
+        }
 
         // The control: a real block comment after a single `/` is still a
         // comment, so ordinary `a / b /* note */` keeps costing nothing for
