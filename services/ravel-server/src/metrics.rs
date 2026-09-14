@@ -4853,17 +4853,17 @@ mod tests {
     fn memory_budget_gauge_clamps_fallback_near_miss_to_u64_max() {
         let raw_near_miss = u64::MAX - 2 * crate::config::DEFAULT_CACHE_MAX_BYTES;
         assert_eq!(raw_near_miss, 18_446_744_073_172_680_703);
-        assert_eq!(
-            exposed_memory_budget_limit(raw_near_miss, true),
-            u64::MAX
-        );
+        assert_eq!(exposed_memory_budget_limit(raw_near_miss, true), u64::MAX);
     }
 
     /// The non-fallback path exposes the raw limit unchanged: a derived
     /// budget's ceiling is meaningful and must not be clamped away.
     #[test]
     fn memory_budget_gauge_exposes_raw_limit_when_not_fallback() {
-        assert_eq!(exposed_memory_budget_limit(21_045_339_751, false), 21_045_339_751);
+        assert_eq!(
+            exposed_memory_budget_limit(21_045_339_751, false),
+            21_045_339_751
+        );
     }
 
     /// The acceptance test for the exposition renderer. Proves both halves: a populated
