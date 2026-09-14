@@ -75,10 +75,12 @@ use datafusion::arrow::array::{
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{collect, displayable, execute_stream};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::TryStreamExt;
 use prost::Message;
 use ravel_catalog::{Catalog, CatalogConfig, SegmentLevel, SegmentRef, Snapshot};
@@ -90,11 +92,14 @@ use ravel_query::{
     QueryConcurrencyLimit, SegmentFetcher,
 };
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
-use ravel_sql::distributed::{CoordinatorSliceReader, SliceFallback, SliceFallbackCounters};
+use ravel_sql::distributed::{
+    COORDINATOR_LOCAL_LOCATION, CoordinatorSliceReader, SliceFallback, SliceFallbackCounters,
+};
 use ravel_sql::{
-    DistributedFlightConfig, FlightAuth, FlightClock, FlightSqlConfig, FlightTicket,
-    FlightTicketError, FlightWorkerSliceClient, RavelFlightSqlService, RavelTableProvider,
-    SegmentPin, SqlConfig, SqlExecutor, StaticWorkerEndpoints, WorkerSlice, WorkerSliceClient,
+    CeilingBreach, DistributedFlightConfig, FlightAuth, FlightClock, FlightSqlConfig,
+    FlightTicket, FlightTicketError, FlightWorkerSliceClient, RavelFlightSqlService,
+    RavelTableProvider, SegmentPin, SqlConfig, SqlExecutor, StaticWorkerEndpoints,
+    TenantDelegatingPool, TenantMemoryAccountant, WorkerSlice, WorkerSliceClient,
     distributed_samples_plan, internal_schema, plan_distributed_slices,
 };
 use ravel_types::accounting::{NoopQueryCostRecorder, QueryAccounting};
@@ -336,6 +341,7 @@ impl WorkerSliceClient for InProcessWorker {
         _location: &str,
         ticket: &FlightTicket,
         limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         self.limits_seen.lock().expect("lock").push(limit);
         // Rebuild the slice's snapshot from the ticket and run the worker
@@ -429,6 +435,7 @@ impl WorkerSliceClient for WireWorker {
         _location: &str,
         ticket: &FlightTicket,
         _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         // Encode the slice ticket exactly as the coordinator would, then redeem
         // it against the real service. `slice_count > 1` routes it to the
@@ -1422,11 +1429,12 @@ impl WorkerSliceClient for RefusedPortWorkers {
         location: &str,
         ticket: &FlightTicket,
         limit: Option<usize>,
+        context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         if self.dead.contains(location) {
-            self.flight.fetch_slice(location, ticket, limit)
+            self.flight.fetch_slice(location, ticket, limit, context)
         } else {
-            self.healthy.fetch_slice(location, ticket, limit)
+            self.healthy.fetch_slice(location, ticket, limit, context)
         }
     }
 }
@@ -1452,10 +1460,11 @@ impl WorkerSliceClient for RefusingClient {
         location: &str,
         ticket: &FlightTicket,
         limit: Option<usize>,
+        context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         match &self.healthy {
             Some(worker) if !self.dead.contains(location) => {
-                worker.fetch_slice(location, ticket, limit)
+                worker.fetch_slice(location, ticket, limit, context)
             }
             _ => Err(DataFusionError::Internal(self.message.to_string())),
         }
@@ -1623,6 +1632,47 @@ async fn every_worker_dead_reads_on_the_coordinator() {
     // what distinguishes this case from the one above: a pooled "a fallback
     // happened" figure would read the same for both.
     assert_counters(&counters, 2, 2, 0);
+}
+
+/// The coordinator-local fallback step must be bounded by the same
+/// tenant-delegating pool as every other read in the query, not by an
+/// unbounded default (issue found in PR #1779 review). `RsegScanExec`
+/// registers a `MemoryReservation` per segment before it streams a single
+/// batch (`crate::scan`), so a 1-byte tenant ceiling refuses on the first
+/// poll: a tenant whose budget is this small must see a typed
+/// `ResourcesExhausted`, not an unbounded local read.
+#[tokio::test]
+async fn coordinator_local_read_is_bounded_by_the_tenant_memory_pool() {
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher = SegmentFetcher::new(Arc::clone(&backend));
+    let ticket = endpoints_for(&snapshot)[0].ticket.clone();
+
+    let tenant = TenantMemoryAccountant::new(1);
+    let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+        1,
+        tenant,
+        CeilingBreach::new(),
+        QueryAccounting::new(),
+    ));
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(pool)
+        .build_arc()
+        .expect("runtime");
+    let context = SessionContext::new_with_config_rt(SessionConfig::new(), runtime).task_ctx();
+
+    let mut stream = local_reader(&fetcher)
+        .fetch_slice(COORDINATOR_LOCAL_LOCATION, &ticket, None, &context)
+        .expect("the fragment plans even though it cannot execute within the ceiling");
+    let err = stream
+        .try_next()
+        .await
+        .expect_err("a 1-byte tenant ceiling refuses the coordinator-local read");
+
+    assert!(
+        matches!(err, DataFusionError::ResourcesExhausted(_)),
+        "expected a typed ResourcesExhausted, got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1881,6 +1931,7 @@ impl WorkerSliceClient for RlogWorker {
         _location: &str,
         ticket: &FlightTicket,
         _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let snapshot = ticket.snapshot();
         let target_partitions = snapshot.segments.len().max(1);
@@ -2538,6 +2589,7 @@ impl WorkerSliceClient for SpanWorker {
         _location: &str,
         ticket: &FlightTicket,
         _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let snapshot = ticket.snapshot();
         let target_partitions = snapshot.segments.len().max(1);

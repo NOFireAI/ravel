@@ -326,16 +326,16 @@ impl ExecutionPlan for DistributedSliceScanExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let endpoint = self.endpoints.get(partition).ok_or_else(|| {
             DataFusionError::Internal(format!(
                 "DistributedSliceScanExec: partition {partition} out of range"
             ))
         })?;
-        let inner = self
-            .client
-            .fetch_slice(&endpoint.location, &endpoint.ticket, self.limit)?;
+        let inner =
+            self.client
+                .fetch_slice(&endpoint.location, &endpoint.ticket, self.limit, &context)?;
 
         // Validate every worker batch against this exec's declared schema, then
         // fold its bytes into the coordinator's accounting and enforce the
