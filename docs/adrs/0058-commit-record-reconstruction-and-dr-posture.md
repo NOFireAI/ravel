@@ -362,6 +362,16 @@ the fix is a few lines against data the sweeper already computes.
   records or copy the bytes back before the loss becomes permanent. The cost
   is a second storage horizon per quarantined object and a reaper to bound the
   `quarantine/` prefix.
+
+  The quarantined copies sit under `quarantine/t/<tenant>/...`, which no
+  tenant-scoped erasure or retention scan lists, so bytes whose commit record
+  was lost out of band persist for up to the quarantine horizon beyond where
+  they otherwise would. This is intended, and it is a bounded extension rather
+  than a new exposure: selective erasure (ADR-0064) never reached a
+  record-less orphan in the first place, because an object no record names is
+  not discoverable by a subject scan. An operator who needs those bytes gone
+  sooner shortens the quarantine horizon, which trades the recovery window for
+  the retention window in the obvious direction.
 - **Reconstructed records are honest approximations on two fields**
   (`created_unix_ns` from data-object `last_modified`, not the true
   flush-open time; and for RLOG, `ingest_hour_bucket` derived rather than

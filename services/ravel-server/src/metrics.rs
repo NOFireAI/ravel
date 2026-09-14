@@ -2157,7 +2157,11 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// loss is resolved."
     pub orphans_withheld: u64,
     /// Orphan candidates the most recent sweep pass found, tripped or not
-    /// (ADR-0058 decision 1): `orphans_deleted + orphans_withheld`. Nonzero
+    /// (ADR-0058 decision 1): `orphans_deleted + orphans_withheld +
+    /// orphans_quarantine_refused`. The third term is not optional: a
+    /// candidate whose copy to `quarantine/` failed is left live, so it is
+    /// still present, and it fails in exactly the store-fault case this gauge
+    /// exists to surface. Nonzero
     /// for small-scale commit-record loss the breaker's ratio/count thresholds
     /// are deliberately too coarse to trip on, which is why it is a distinct
     /// gauge from `orphans_withheld` (that one stays `0` precisely when the

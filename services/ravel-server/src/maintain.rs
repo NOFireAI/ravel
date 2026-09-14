@@ -193,8 +193,12 @@ impl MaintenanceSafetyMetrics {
     }
 
     /// Orphan candidates the most recent sweep pass for `signal` found,
-    /// whether the breaker tripped or not: `orphans_deleted + orphans_withheld`
-    /// (exactly one of those is nonzero per pass). This is the signal for
+    /// whether the breaker tripped or not, summing `orphans_deleted`,
+    /// `orphans_withheld` and `orphans_quarantine_refused`. No one term is
+    /// guaranteed nonzero and more than one can be: a pass whose every copy
+    /// faulted has `deleted` and `withheld` both `0` with `refused` nonzero,
+    /// and a partially faulting pass has `deleted` and `refused` both nonzero.
+    /// This is the signal for
     /// small-scale commit-record loss the breaker's ratio/count thresholds are
     /// deliberately too coarse to catch (ADR-0058 decision 1): delete a handful
     /// of commit records for one shard and the breaker never trips, so
@@ -229,8 +233,8 @@ impl MaintenanceSafetyMetrics {
     /// gauges), matching [`orphans_withheld`]'s and [`orphans_present`]'s docs
     /// on why neither gauge alone can be read as "resolved". `present` is the
     /// pass's total orphan-candidate count (`orphans_deleted +
-    /// orphans_withheld`, exactly one of which is nonzero); `withheld` is `0`
-    /// unless the breaker tripped.
+    /// orphans_withheld + orphans_quarantine_refused`, any number of which can
+    /// be nonzero); `withheld` is `0` unless the breaker tripped.
     ///
     /// [`orphans_withheld`]: Self::orphans_withheld
     /// [`orphans_present`]: Self::orphans_present
@@ -1247,6 +1251,21 @@ fn note_owned_units(
 /// `.done` write -- can advance it deterministically instead of sleeping or
 /// shrinking the horizon to zero (CLAUDE.md testing patterns: time is
 /// injected).
+/// Every orphan candidate the pass left present in the live set (ADR-0058
+/// decision 1), which is what the `orphans_present` gauge reports.
+///
+/// A refused candidate counts. Its copy to `quarantine/` failed, so the live
+/// key was deliberately not deleted, and the failure happens in exactly the
+/// store-fault case the gauge exists to surface. Summing only the first two
+/// terms read zero at the moment the signal mattered.
+///
+/// This is a named function rather than an expression at the call site so the
+/// rule has somewhere to be tested. Dropping a term is then a red test rather
+/// than a silent regression of the bug this closes.
+fn orphans_present_total(report: &ravel_maintain::SweepReport) -> usize {
+    report.orphans_deleted + report.orphans_withheld + report.orphans_quarantine_refused
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tick_with_clock(
     clock: &dyn Clock,
@@ -1544,14 +1563,7 @@ pub(crate) async fn run_tick_with_clock(
                         signal,
                         report.orphan_breaker_tripped,
                         report.orphans_withheld,
-                        // ADR-0058 decision 1: everything still present in
-                        // the live set. A refused candidate is present too,
-                        // and it is refused in exactly the store-fault case
-                        // this gauge exists to surface, so dropping it read
-                        // zero at the moment the signal mattered.
-                        report.orphans_deleted
-                            + report.orphans_withheld
-                            + report.orphans_quarantine_refused,
+                        orphans_present_total(&report),
                     );
                 }
                 Err(err) => {
@@ -5125,6 +5137,54 @@ mod tests {
     /// carries the pass's total orphan-candidate count regardless of what
     /// happened to those candidates, and drops to whatever the latest pass
     /// found -- it is never sticky and never monotonic.
+    /// The `orphans_present` fold counts a refused quarantine. A candidate
+    /// whose copy failed is left live, so it is still present, and the copy
+    /// fails in exactly the store-fault case the gauge exists to surface.
+    ///
+    /// This guards the fold itself rather than the per-rule outcome one layer
+    /// below it: without it, an edit dropping the refused term regresses the
+    /// bug silently, because `orphans_present_gauge_tracks_latest_pass_and_is_not_sticky`
+    /// hands `record_sweep` a precomputed total and never exercises the sum.
+    ///
+    /// Flip to watch it fail: drop `+ report.orphans_quarantine_refused` from
+    /// `orphans_present_total`. The all-refused case then reports 0 present
+    /// while three objects sit live in the keyspace.
+    #[test]
+    fn orphans_present_total_counts_a_refused_quarantine() {
+        // Every copy faulted: nothing left the live set, nothing was withheld
+        // by the breaker, and three candidates are still there.
+        let all_refused = ravel_maintain::SweepReport {
+            orphans_deleted: 0,
+            orphans_withheld: 0,
+            orphans_quarantine_refused: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            orphans_present_total(&all_refused),
+            3,
+            "a pass whose every copy faulted still has three orphans present"
+        );
+
+        // The partially faulting pass: two terms nonzero at once, which the
+        // old "exactly one is nonzero" reading of this gauge ruled out.
+        let mixed = ravel_maintain::SweepReport {
+            orphans_deleted: 2,
+            orphans_withheld: 0,
+            orphans_quarantine_refused: 1,
+            ..Default::default()
+        };
+        assert_eq!(orphans_present_total(&mixed), 3);
+
+        // The breaker-tripped pass is unchanged by the new term.
+        let tripped = ravel_maintain::SweepReport {
+            orphans_deleted: 0,
+            orphans_withheld: 55,
+            orphans_quarantine_refused: 0,
+            ..Default::default()
+        };
+        assert_eq!(orphans_present_total(&tripped), 55);
+    }
+
     #[test]
     fn orphans_present_gauge_tracks_latest_pass_and_is_not_sticky() {
         let safety = MaintenanceSafetyMetrics::default();
