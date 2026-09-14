@@ -1060,12 +1060,12 @@ changes while the process runs, and a container whose cgroup limit changes
 later is not noticed until the next restart. The current state is visible
 live at `/metrics`: `ravel_memory_budget_bytes` (the resolved ceiling,
 `u64::MAX` meaning unlimited), `ravel_memory_reserved_bytes` split by a
-`component` label (`sql` or `fetch`; `fetch` reads `0` today because nothing
-yet reserves against the budget on the fetch layer's behalf, an honest gap
-rather than a bug), and `ravel_memory_handoff_overlap_bytes` (bytes
-double-counted because a tenant's memory handed off between components
-overlaps in the budget's accounting window; inactive (always `0`) until
-fetch handoff accounting lands).
+`component` label (`sql` or `fetch`; `fetch` reads `0` today because no
+fetcher this process builds reserves against this budget, an honest gap
+rather than a bug), and `ravel_memory_handoff_overlap_bytes` (the bytes a
+handoff between components would double-count in the budget's accounting
+window; inactive, always `0`, until fetch handoff accounting reaches this
+budget).
 `--cache-max-bytes` changes less than it used to about how many times a logs
 statement moves a given object's bytes: a query's plan-phase whole-object
 read (the `has_word`/text and other skip-index-undecidable fallback) is now
@@ -1076,8 +1076,14 @@ still turn the remaining segments' one wire GET into two; removing that
 residual duplication needs the carry to stream per partition instead of
 being held at the plan barrier, which is a separate, not-yet-shipped change.
 
-Every resolved value is logged once at startup with the source it came from
-(`derived`, `flag`, or `fallback`), so `journalctl -u ravel-server | grep
+Every resolved value is logged once at startup with the source it came from:
+`flag` (the operator set it, used verbatim), `legacy-flag` (no flag for this
+setting, but the legacy `--fetch-concurrency` was set and its value is used),
+`derived` (computed from the host profile, or from a host-independent rule),
+`budget-carve` (a fixed share of `memory_budget_bytes` rather than of raw
+`MemTotal`, which is what the two cache ceilings resolve to on a host whose
+memory could be read), or `fallback` (no flag and no readable `MemTotal`, so
+the compiled-in constant is used). So `journalctl -u ravel-server | grep
 'performance default resolved'` answers "what is this process actually running
 with" without reading the unit file:
 
@@ -1087,15 +1093,15 @@ INFO performance default resolved setting="store_get_concurrency" value=32 sourc
 INFO performance default resolved setting="sql_partition_count" value=32 source="derived"
 INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
 INFO performance default resolved setting="max_segments" value=1000000 source="derived"
-INFO performance default resolved setting="cache_max_bytes" value=7516192768 source="derived"
-INFO performance default resolved setting="catalog_cache_max_bytes" value=1503238553 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=7516192768 source="budget-carve"
+INFO performance default resolved setting="catalog_cache_max_bytes" value=1503238553 source="budget-carve"
 INFO performance default resolved setting="memory_budget_bytes" value=30064771072 source="derived"
 INFO performance default resolved setting="memory_overhead_reserve_bytes" value=2147483648 source="derived"
 INFO performance default resolved setting="memory_hard_caps_bytes" value=9019431321 source="derived"
 INFO performance default resolved setting="memory_remainder_bytes" value=21045339751 source="derived"
-INFO performance default resolved setting="sql_max_query_bytes" value=8053063680 source="derived"
-INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived"
-INFO performance default resolved setting="gc_max_query_duration" value=660 source="derived"
+INFO performance default resolved setting="sql_max_query_bytes" value=8053063680 source="derived" clamped=false
+INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived" raised=false
+INFO performance default resolved setting="gc_max_query_duration" value_ms=660000 source="derived"
 ```
 
 The last two flags are meaningful only in a build with the `sql` feature. See

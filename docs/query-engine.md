@@ -790,7 +790,12 @@ memory: the fetcher (RSEG) read cache takes 25%, and the catalog byte cache
 takes a separate 5%. Rebasing both onto the budget instead of raw memory
 keeps the percentages meaningful once the reserve is subtracted; deriving
 25% of raw `MemTotal` on a host that is mostly cgroup-limited would size the
-cache against memory the process can never actually use. Whatever remains
+cache against memory the process can never actually use. Neither percentage
+is taken on the unmeasured-memory path: a share of an unknown total is not a
+number, so when memory cannot be read each cache falls back to a flat
+compiled-in 256 MiB (`268435456`) rather than carving from the `u64::MAX`
+budget above. An explicit `--cache-max-bytes` bounds both caches at that one
+value on either path. Whatever remains
 after both carves (`memory_budget_bytes` minus the sum of the two resolved
 cache ceilings) sizes a single shared `ravel_memory::MemoryBudget`
 accountant, one instance per process, that the SQL executor's per-tenant
@@ -800,16 +805,25 @@ strictly positive remainder of `memory_budget_bytes` -- caps at or above the
 budget, not only strictly above it (see ADR-1170's 2026-09-07 amendment): a
 remainder of exactly `0` is exactly as unusable as a negative one, since it
 builds the same refuse-everything `MemoryBudget::new(0)`. A typed
-`MemoryBudgetExceeded` error names both figures so the fix (lower the flag,
-or raise the host's memory) is in the error message.
+`MemoryBudgetExceeded` error names both figures so the fix is in the error
+message: lower `--cache-max-bytes`, or, when the budget itself derived to
+`0` (the host's effective memory is at or below the overhead reserve, and no
+value of that flag can satisfy the check), give the process more memory or
+raise its cgroup memory limit.
 
 This derivation runs once, at process startup, from the host profile
-observed at that moment. There is no runtime re-derivation and no "grow"
-path: a `MemoryBudget` reservation that would exceed the shared ceiling is
-refused (`try_reserve` returns an error the caller must handle), never
-retried against a larger budget computed later. If the container's cgroup
-limit changes while the process is running, the process does not notice;
-only a restart re-derives the budget.
+observed at that moment. There is no runtime budget re-derivation: the
+ceiling never grows to match a host whose memory changed, and a reservation
+refused against it is never retried against a larger budget computed later.
+What a breach does depends on which of the two reservation paths took it.
+`try_reserve` is fallible: a reservation that would push the counter past the
+ceiling is refused and the caller handles the error. DataFusion's own memory
+pool `grow` is infallible and maps onto `reserve_unchecked`, which adds to
+the counter without checking it against the ceiling, so that path can
+allocate past the budget before the next `try_reserve` reports the breach;
+what bounds it is the overhead reserve, not a refusal. If the container's
+cgroup limit changes while the process is running, the process does not
+notice; only a restart re-derives the budget.
 
 The ceiling is process-wide, not per-tenant, so a breach cascades across
 tenants: once any one tenant's infallible `grow` (DataFusion's own memory
@@ -826,14 +840,16 @@ unconditionally in every mode: `ravel_memory_budget_bytes` (the resolved
 ceiling; `u64::MAX` means unlimited, which is what a host where memory could
 not be read but no explicit caps were set resolves to), `ravel_memory_reserved_bytes{component="sql"|"fetch"}`
 (bytes currently reserved against the budget, split by which side reserved
-them), and `ravel_memory_handoff_overlap_bytes` (bytes double-counted because
-a tenant's memory handed off between components overlaps in the budget's
-accounting window; inactive (always `0`) until fetch handoff accounting
-lands). `component="fetch"` always reads `0` today:
-the fetch layer does not yet reserve against this budget (only the SQL
-executor's per-tenant accountants do), so the gauge is an honest gap rather
-than a bug. It exists now so a dashboard built against it does not need to
-change shape once the fetch layer starts reserving.
+them), and `ravel_memory_handoff_overlap_bytes` (the bytes a handoff between
+components would double-count in the budget's accounting window; inactive,
+always `0`, until fetch handoff accounting reaches this budget).
+`component="fetch"` always reads `0` today for the same reason: only the SQL
+executor's per-tenant accountants reserve against this budget. The fetchers
+do have their own reservation and handoff accounting, but the server wires
+none of them to this instance, so neither gauge can move until that wiring
+lands. Both are an honest gap rather than a bug: they exist now so a
+dashboard built against them does not need to change shape once the fetch
+layer starts reserving here.
 
 ### Catalog resolve GET concurrency
 

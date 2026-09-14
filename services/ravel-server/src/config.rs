@@ -2679,13 +2679,32 @@ impl std::fmt::Display for MemoryBudgetExceeded {
             f,
             "cache_max_bytes ({}) + catalog_cache_max_bytes ({}) = {} bytes leaves no \
              strictly positive remainder of memory_budget_bytes ({} bytes) for the shared \
-             SQL/fetch memory budget; lower --cache-max-bytes or raise the host's available \
-             memory",
+             SQL/fetch memory budget; ",
             self.cache_max_bytes,
             self.catalog_cache_max_bytes,
             self.hard_caps_total,
             self.memory_budget_bytes
-        )
+        )?;
+        // A `0` budget is not fixable by any --cache-max-bytes value: an
+        // explicit `n` bounds both caches, so any `n >= 1` sums to `2n > 0`
+        // and `n == 0` still fails the `hard_caps >= budget` comparison.
+        // Naming the flag there sends the operator after a knob that cannot
+        // satisfy the check; the memory the process is given is the only
+        // thing that can.
+        if self.memory_budget_bytes == 0 {
+            write!(
+                f,
+                "no --cache-max-bytes value can satisfy this check against a 0-byte budget, \
+                 because an explicit value bounds both caches and any positive one sums \
+                 above 0. The host's effective memory (its cgroup memory limit when it runs \
+                 under a finite one, else MemTotal) is at or below the overhead reserve \
+                 ({MEMORY_OVERHEAD_RESERVE_BYTES} bytes) subtracted to derive the budget: \
+                 give the process more memory, or raise its cgroup memory limit, above that \
+                 reserve"
+            )
+        } else {
+            f.write_str("lower --cache-max-bytes or raise the host's available memory")
+        }
     }
 }
 
@@ -6829,9 +6848,19 @@ mod tests {
     /// looks healthy (`SELECT 1` reserves nothing) and then refuses every
     /// real query permanently. Startup must refuse instead.
     ///
+    /// The refusal message is asserted, not just the refusal: with a `0`
+    /// budget no `--cache-max-bytes` value satisfies the check (any `n >= 1`
+    /// makes the sum `2n > 0`, and `0` still fails the `>=` comparison), so a
+    /// message naming that flag as the fix sends the operator after a knob
+    /// that cannot help. The zero-budget arm must point at the host's memory
+    /// (or its cgroup limit) and at the overhead reserve instead.
+    ///
     /// Prove-the-test: this test fails against the pre-fix `>` comparison
     /// (`resolve_performance` returns `Ok` instead of the expected
-    /// `MemoryBudgetExceeded`, so `expect_err` panics).
+    /// `MemoryBudgetExceeded`, so `expect_err` panics). The message
+    /// assertions below fail against a `Display` that emits the single
+    /// "lower --cache-max-bytes or raise the host's available memory" tail on
+    /// every path.
     #[test]
     fn host_at_or_below_the_overhead_reserve_refuses_to_start() {
         let host = HostProfile::new(4, Some(MEMORY_OVERHEAD_RESERVE_BYTES));
@@ -6850,6 +6879,46 @@ mod tests {
             .expect("typed MemoryBudgetExceeded error");
         assert_eq!(exceeded.hard_caps_total, 0);
         assert_eq!(exceeded.memory_budget_bytes, 0);
+
+        let message = exceeded.to_string();
+        assert!(
+            message.contains("no --cache-max-bytes value can satisfy this check"),
+            "the zero-budget refusal must say the flag cannot fix it: {message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "overhead reserve ({MEMORY_OVERHEAD_RESERVE_BYTES} bytes)"
+            )),
+            "the zero-budget refusal must name the reserve that consumed the host's memory: \
+             {message}"
+        );
+        assert!(
+            message.contains("give the process more memory, or raise its cgroup memory limit"),
+            "the zero-budget refusal must name the action that helps: {message}"
+        );
+        assert!(
+            !message.contains("lower --cache-max-bytes"),
+            "the zero-budget refusal must not point at a flag that cannot satisfy it: {message}"
+        );
+
+        // The satisfiable case keeps the flag-oriented advice: a budget with a
+        // positive remainder available to it really is fixable by lowering the
+        // flag, and this arm is what that message is for.
+        let fixable = MemoryBudgetExceeded {
+            cache_max_bytes: 8 * 1024 * 1024 * 1024,
+            catalog_cache_max_bytes: 8 * 1024 * 1024 * 1024,
+            hard_caps_total: 16 * 1024 * 1024 * 1024,
+            memory_budget_bytes: 14 * 1024 * 1024 * 1024,
+        };
+        let fixable_message = fixable.to_string();
+        assert!(
+            fixable_message.contains("lower --cache-max-bytes"),
+            "a refusal against a positive budget must still name the flag: {fixable_message}"
+        );
+        assert!(
+            !fixable_message.contains("no --cache-max-bytes value can satisfy this check"),
+            "the unsatisfiable wording must not leak onto the fixable case: {fixable_message}"
+        );
     }
 
     /// An explicit flag wins over the derived value, one field at a time: each
