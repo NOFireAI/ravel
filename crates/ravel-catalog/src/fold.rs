@@ -6843,6 +6843,112 @@ mod tests {
     /// retention window so the frontier pass does not run): 1 incremental
     /// bucket for hour 41, 27 for the fixed window `[14, 40]`, and 1 for the
     /// requested hour 3.
+    /// The cap truncates oldest-first and carries the remainder, rather than
+    /// dropping it or deferring it into the snapshot. The requester re-derives
+    /// its blocked set each pass, so an hour the cap cut out comes back on the
+    /// next request.
+    ///
+    /// The cap is read from the runtime config, so this case sets it to 2 and
+    /// requests 4 hours rather than needing 169 of them. That is also what
+    /// makes the config read testable at all: with the previous hardcoded
+    /// const, reaching the branch meant building a 169-hour snapshot.
+    ///
+    /// Flip to watch it fail: drop the `.min(cap)` from `take`. All four
+    /// requested hours are then re-folded and the count below reads 4.
+    #[tokio::test]
+    async fn refold_request_is_capped_oldest_first_and_carries_the_remainder() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 1,
+                frontier_reconcile_max_hours: 2,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+
+        let mut old_segments = Vec::new();
+        for hour in [1u32, 2, 3, 5] {
+            old_segments.push(
+                publish_segment(
+                    &store,
+                    0,
+                    Uuid::new_v4(),
+                    1,
+                    hour,
+                    (i64::from(hour) + 1) * NS_PER_HOUR,
+                )
+                .await,
+            );
+        }
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        // Every one of the four old hours receives a late record, so all four
+        // are genuine candidates and the cap is what limits the pass.
+        for (i, hour) in [1u32, 2, 3, 5].iter().enumerate() {
+            publish_compaction(
+                &store,
+                0,
+                *hour,
+                &[&old_segments[i]],
+                (i64::from(*hour) + 1) * NS_PER_HOUR,
+            )
+            .await;
+        }
+
+        reset_refold_hours_for_test();
+        catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                &RefoldRequest::from_hours([1, 2, 3, 5]),
+            )
+            .await
+            .expect("capped fold");
+        assert_eq!(
+            refold_hours_reconciled_for_test(),
+            2,
+            "the cap of 2 bounds the pass, not the four requested hours"
+        );
+
+        // The remainder is not lost: requesting it again re-folds it, which is
+        // the property that lets the pass defer nothing into the snapshot.
+        reset_refold_hours_for_test();
+        catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(42),
+                &[],
+                None,
+                &RefoldRequest::from_hours([3, 5]),
+            )
+            .await
+            .expect("remainder fold");
+        assert_eq!(
+            refold_hours_reconciled_for_test(),
+            2,
+            "the hours the cap cut out are re-foldable on the next request"
+        );
+    }
+
     #[tokio::test]
     async fn refold_request_re_lists_only_the_requested_hours() {
         let store = Arc::new(MemoryStore::new());
