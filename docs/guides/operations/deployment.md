@@ -412,9 +412,9 @@ ravel-server --mode query \
   --remote-cluster name=apac,endpoint=apac.internal:9443,credential-file=/etc/ravel/apac.token,tls-ca-file=/etc/ravel/apac-ca.pem,soft-timeout=15s
 ```
 
-`name`, `endpoint` and `credential-file` are required. `tls` (default `true`),
-`tls-ca-file`, `skip-unavailable` (default `false`) and `soft-timeout` are
-optional. `--remote-cluster-soft-timeout` sets the default soft timeout for
+`name`, `endpoint` and `credential-file` are required. `tenant`, `tls` (default
+`true`), `tls-ca-file`, `skip-unavailable` (default `false`) and `soft-timeout`
+are optional. `--remote-cluster-soft-timeout` sets the default soft timeout for
 every remote that does not name its own; a remote that does not answer within
 its bound is treated as unavailable, which fails the query unless that remote
 has `skip-unavailable`.
@@ -423,30 +423,47 @@ The credential is an operator secret read from a file, never an inline value. It
 is the principal the remote sees. A federated query never forwards the calling
 client's credential across a cluster boundary.
 
-**Federation is single-tenant.** That credential is process-wide, one per
-remote, and cannot be keyed by the local tenant that issued the query, so both
-sides of a federation must be a single tenant (one canonical tenant on the
-coordinator, the same tenant on each remote). A coordinator that can resolve
-more than one local tenant therefore **refuses to start** with a
-`--remote-cluster` configured, rather than fanning every local tenant's
-selectors and discovery out under the one credential and returning another
-tenant's series. A coordinator can resolve more than one local tenant when two
-or more `--tenant-token` values name different tenants, or when any dynamic
-resolver is enabled (`--dev-insecure-tenant-header`, `--oidc-issuer`, or
-`--mtls-enabled`, each of which derives the tenant from a request header or a
-token claim). The startup error names the resolver that makes the deployment
-multi-tenant:
+**One remote credential per local tenant.** That credential authorizes one
+tenant's data on the remote, so it belongs to one local tenant. `tenant` names
+it, and a query from any other local tenant never dials that remote. A
+coordinator serving several local tenants writes one spec per local tenant, each
+with its own `name` and its own `credential-file`:
 
 ```
---remote-cluster is configured on a coordinator that can resolve more than one
-local tenant (...). ADR-0071 federation holds one remote credential per process
-and cannot express a per-tenant remote credential ... Single-tenant federation
-is the only supported configuration: run one local tenant, or remove
---remote-cluster.
+ravel-server --mode query \
+  --tenant-token acme-token:acme \
+  --tenant-token beta-token:beta \
+  --remote-cluster name=eu-acme,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-acme.token,tenant=acme \
+  --remote-cluster name=eu-beta,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-beta.token,tenant=beta
 ```
 
-To federate, run one local tenant on the coordinator; a multi-tenant
-coordinator cannot federate today.
+A local tenant no remote names gets local data only, reported as a complete
+result: a remote it holds no credential for is outside its query, not missing
+from it, so no warning and no `partial: true` appear.
+
+Omitting `tenant` leaves the remote reachable by every local tenant, which is
+correct only where one local tenant can ever resolve. A coordinator that can
+resolve more than one therefore **refuses to start** with such a spec, rather
+than fanning every local tenant's selectors and discovery out under the one
+credential and returning another tenant's series. A coordinator can resolve more
+than one local tenant when two or more `--tenant-token` values name different
+tenants, or when any dynamic resolver is enabled
+(`--dev-insecure-tenant-header`, `--oidc-issuer`, or `--mtls-enabled`, each of
+which derives the tenant from a request header or a token claim). The startup
+error names every spec needing a `tenant` and the resolver that makes the
+deployment multi-tenant:
+
+```
+--remote-cluster 'eu' names no local tenant on a coordinator that can resolve
+more than one local tenant (2 distinct --tenant-token tenants are configured).
+A remote cluster holds one remote credential and cannot express one credential
+per local tenant ... Add tenant=<local tenant> to each of those specs ...
+```
+
+Startup also refuses a `tenant` that no `--tenant-token` configures, where the
+tenant set is fully known (static bearer tokens, no dynamic resolver): the
+mapping could never fire, and the only symptom would be a remote that quietly
+answers nobody.
 
 **TLS is on unless the spec says otherwise.** Neither spec above names `tls`,
 and both dial over TLS, verifying the remote against the system trust roots plus

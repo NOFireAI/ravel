@@ -1597,15 +1597,22 @@ service, and the distinction is a security invariant, not an optimization:
 `RemoteClusterConfig`'s `Debug` is hand-written to print `credential:
 <redacted>` so a config dump never leaks the operator secret.
 
-The `Resolve` credential is **process-wide**: one `credential` per remote, not
-one per local tenant. It cannot be keyed by the local tenant that issued the
-query, so federation is single-tenant on both sides (one canonical tenant on
-the coordinator, the same tenant on each remote). A coordinator that can
-resolve more than one local tenant would fan every tenant's `Resolve` fetches
-out under that one credential and cross-serve their series, so `ravel-server`
-refuses to start with a `--remote-cluster` configured whenever its resolver can
-resolve more than one local tenant. The operator guide states which resolver
-configurations that covers: docs/guides/distributed-query.md.
+The `Resolve` credential authorizes one tenant's data on the remote, so it
+belongs to **one local tenant**: `RemoteClusterConfig::tenant` names it, and
+`Federation::fetch` selects a remote by the caller's `TenantHash` before
+dispatching anything. A query from any other local tenant presents no
+credential and receives no remote series; a local tenant no remote names runs a
+fully local query, reported complete rather than partial, because a remote it
+holds no credential for is outside its query rather than missing from it. Two
+local tenants sharing a remote endpoint is two `RemoteCluster` entries, each
+with its own credential.
+
+An entry with `tenant: None` is unkeyed and reachable by every local tenant.
+That is the shape of a deployment written before the mapping existed, and it is
+safe only where one local tenant can ever resolve, so `ravel-server` refuses one
+at startup whenever its resolver can resolve more than one. The operator guide
+states which resolver configurations that covers:
+docs/guides/distributed-query.md.
 
 ### Partial coverage is always surfaced, never silent
 

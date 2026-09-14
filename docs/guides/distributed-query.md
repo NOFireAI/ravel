@@ -274,6 +274,7 @@ comma-separated `key=value` spec:
 | `name` | yes | The cluster's stable operator-facing label. This is the only identity a client ever sees for the remote (in `warnings`). |
 | `endpoint` | yes | `host:port` of the remote's fragment surface. |
 | `credential-file` | yes | File holding the bearer token this coordinator presents to that remote. |
+| `tenant` | no | The one local tenant whose queries fan out to this remote. Omitting it makes the remote reachable by every local tenant, which only a coordinator resolving at most one local tenant may do. See [One remote credential per local tenant](#one-remote-credential-per-local-tenant). |
 | `tls` | no | `true` or `false`, default `true`. Those two literals only; any other value fails startup with a message naming it. |
 | `tls-ca-file` | no | CA bundle for the remote's server certificate. A spec carrying this key and no `tls` key means TLS is on with that CA trusted, and is accepted. Only the explicit `tls=false` alongside a CA file fails startup, because there the bundle would be inert. |
 | `skip-unavailable` | no | `true` or `false`, default `false`. Same two literals only. |
@@ -291,11 +292,11 @@ answered within its bound is treated as unavailable.
 Every one of these is validated at startup, not at the first federated query:
 a malformed spec, an unknown key, a `tls` or `skip-unavailable` value that is
 not `true` or `false`, a duplicate cluster name, `tls=false` next to a
-`tls-ca-file`, a zero soft timeout, or an unreadable or empty credential file
-all fail the process before it binds a listener. A remote cluster configured on
-a coordinator that can resolve more than one local tenant also fails startup
-here; see [One credential per process: federation is
-single-tenant](#one-credential-per-process-federation-is-single-tenant).
+`tls-ca-file`, a zero soft timeout, an empty `tenant` value, or an unreadable or
+empty credential file all fail the process before it binds a listener. A remote
+cluster that names no local tenant on a coordinator that can resolve more than
+one also fails startup here; see [One remote credential per local
+tenant](#one-remote-credential-per-local-tenant).
 
 ### What crosses the boundary, and what does not
 
@@ -319,32 +320,62 @@ tenant registry.
 `RemoteClusterConfig`'s debug formatting prints `credential: <redacted>`, so a
 config dump or a panic message never leaks the operator secret.
 
-### One credential per process: federation is single-tenant
+### One remote credential per local tenant
 
-Federation today holds **one remote credential per process**, and that
-credential is the only principal the remote sees for every federated fetch. It
-cannot be keyed by the local tenant that issued the query: there is no
-per-tenant remote credential to configure. Both sides of a federation are
-single-tenant; the intended and tested model is one canonical tenant on the
-coordinator and the same tenant on each remote.
+A remote cluster's `credential-file` holds **one** bearer token, and the remote
+resolves **one** tenant from it. So that credential belongs to one local tenant,
+and `tenant` names which. A query from any other local tenant does not reach
+that remote at all: it presents no credential, issues no request, and gets no
+remote series.
 
-That is why a coordinator that can resolve **more than one local tenant refuses
-to start with a remote cluster configured**. If it did not, every local
-tenant's metric selectors and discovery calls would fan out under that one
-credential, so each local tenant would receive the remote tenant's series and
-the remote tenant's data would reach whichever local tenant asked. A
-coordinator can resolve more than one local tenant when two or more
-`--tenant-token` values name different tenants, or when any dynamic resolver is
-enabled: `--dev-insecure-tenant-header`, `--oidc-issuer`, or `--mtls-enabled`,
-each of which derives the tenant from a request header or a token claim. In any
-of those cases, adding a `--remote-cluster` fails startup with an error naming
-the resolver that makes the deployment multi-tenant. Run exactly one local
-tenant to federate, or remove the remote cluster.
+A coordinator serving local tenants `acme` and `beta`, each with its own account
+on a shared remote, writes one spec per local tenant:
+
+```sh
+ravel-server --mode query \
+  --tenant-token acme-token:acme \
+  --tenant-token beta-token:beta \
+  --remote-cluster name=eu-acme,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-acme.token,tenant=acme \
+  --remote-cluster name=eu-beta,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-beta.token,tenant=beta
+```
+
+Two specs to the same endpoint under distinct `name`s is the supported shape.
+There is no syntax for naming several local tenants on one spec, because that
+would put them back behind one credential, which is the whole problem.
+
+**A local tenant no remote names gets local data only.** Its queries and its
+discovery calls resolve against this cluster's data and nothing else. That is a
+complete answer, not partial coverage: a remote it holds no credential for is
+outside its query rather than missing from it, so no `warnings` entry and no
+`partial: true` appear. Configuring a remote for a tenant that has none is
+adding a spec with its `tenant`.
+
+Omitting `tenant` makes a remote reachable by **every** local tenant. That is
+correct on a coordinator where only one local tenant can ever resolve, and it is
+what a single-tenant deployment writes. Anywhere else it is the exposure this
+key exists to remove, so **a coordinator that can resolve more than one local
+tenant refuses to start with an unmapped remote cluster**, naming every spec
+that needs a `tenant`. A coordinator can resolve more than one local tenant when
+two or more `--tenant-token` values name different tenants, or when any dynamic
+resolver is enabled: `--dev-insecure-tenant-header`, `--oidc-issuer`, or
+`--mtls-enabled`, each of which derives the tenant from a request header or a
+token claim.
+
+Startup also refuses a `tenant` that no `--tenant-token` configures, where the
+tenant set is fully known (static bearer tokens, no dynamic resolver). Such a
+mapping can never fire, and its only symptom would be a remote that quietly
+answers nobody. Under a dynamic resolver the static token list is not the tenant
+set, so the check does not apply there.
+
+None of this changes what the remote does with the credential it is presented:
+it resolves its own tenant from it and ignores any tenant on the wire. The
+mapping decides **which local tenant may present a given credential**; the
+remote still decides what that credential is entitled to see.
 
 Both the value-bearing endpoints (`/api/v1/query`, `/api/v1/query_range`) and
 the discovery endpoints (`/api/v1/series`, `/api/v1/labels`,
 `/api/v1/label/<name>/values`) federate, through the same coordinator and with
-the same semantics.
+the same semantics, so both honour the mapping.
 
 ### What a client sees when a remote is degraded
 
