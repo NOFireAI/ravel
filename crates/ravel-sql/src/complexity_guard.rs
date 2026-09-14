@@ -68,12 +68,20 @@
 //!
 //!   Four other string-literal prefixes are live for this dialect and need no
 //!   special handling, which is worth stating because the reason is a set of
-//!   dialect facts rather than anything visible in the scan: `B'...'`/`b'...'`
-//!   byte strings, `R'...'`/`r'...'` raw strings and `N'...'`/`n'...'`
-//!   national strings all close at the next undoubled `'`, because
-//!   `supports_string_literal_backslash_escape()` and
-//!   `supports_triple_quoted_string()` are both false here, which is exactly
-//!   what `Mode::Quoted` already does. `U&'...'` unicode strings
+//!   dialect facts rather than anything visible in the scan. `B'...'`/`b'...'`
+//!   byte strings and `N'...'`/`n'...'` national strings close at the next
+//!   undoubled `'`, which is exactly what `Mode::Quoted` already does: the
+//!   `B` arm consults `supports_triple_quoted_string()` and the `N` arm
+//!   consults `supports_string_literal_backslash_escape()`, and both are
+//!   false here. `R'...'`/`r'...'` raw strings are NOT in that set, and an
+//!   earlier revision of this paragraph said they were, on a flag its arm
+//!   never reads: the `R` arm calls
+//!   `tokenize_single_or_triple_quoted_string` unconditionally, and that
+//!   function counts up to three opening quotes and switches to a
+//!   three-quote terminator by itself, so a triple-quoted raw body is live
+//!   whatever the flags say and may hold a lone `'`. `R` is therefore
+//!   refused with the `q` form rather than modelled. `U&'...'` unicode
+//!   strings
 //!   (`supports_unicode_string_literal()` is true) diverge only through their
 //!   `\`-hex escape, which either ends the literal earlier than this scan
 //!   does, a safe over-count, or makes the tokenizer error. If any of those
@@ -231,15 +239,35 @@ pub const MAX_STATEMENT_COMPLEXITY: usize = 1_000;
 /// [`MAX_STATEMENT_COMPLEXITY`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatementTooComplex {
-    /// The count at which the scan stopped (one past the max).
+    /// The count at which the scan stopped (one past the max), or
+    /// [`REFUSED`] when the statement carries a construct this scan cannot
+    /// bound at all rather than one that is merely too large.
     pub count: usize,
     /// [`MAX_STATEMENT_COMPLEXITY`], carried alongside the measured count so
     /// callers can report both without reaching back into this module.
     pub max: usize,
 }
 
+/// The sentinel [`StatementTooComplex::count`] carries for a statement that
+/// is refused outright rather than measured.
+///
+/// A `q'...'` or `R'...'` literal ends at a delimiter pair no single-character
+/// rule can locate, so the scan cannot bound the statement at all. Reporting a
+/// number there would be a measurement that was never taken, and the raw
+/// sentinel reaching a client as "complexity 18446744073709551615" tells them
+/// nothing about what to change.
+pub const REFUSED: usize = usize::MAX;
+
 impl fmt::Display for StatementTooComplex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.count == REFUSED {
+            return write!(
+                f,
+                "statement uses a quote-delimited string literal (q'...' or \
+                 R'...') that this surface does not support; rewrite it as an \
+                 ordinary '...' literal"
+            );
+        }
         write!(
             f,
             "statement complexity {} exceeds the maximum of {} tokens; simplify the statement",
@@ -373,7 +401,20 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                     // skip and the loop simply ends.
                     skip = 1;
                 } else if c == '\'' {
-                    mode = Mode::Normal;
+                    // `Unescape::unescape` handles a doubled `''` BEFORE it
+                    // handles `\`, so a doubled quote stays inside the
+                    // literal here rather than closing it. Treating it as
+                    // close-then-reopen is only equivalent for a bare
+                    // `'...'`, where nothing else can move the end; with `\`
+                    // live the scan re-entered at the second quote of the
+                    // pair, closed on the `'` of a following `\'` that the
+                    // tokenizer escapes, and opened a third region that ran
+                    // to EOF. `SELECT E'a''\''` + 1,100 terms scored 5 units.
+                    if rest.starts_with("''") {
+                        skip = 1;
+                    } else {
+                        mode = Mode::Normal;
+                    }
                 }
             }
             Mode::Dollar(ref end) => {
@@ -503,7 +544,7 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                         // statement is refused outright rather than guessed
                         // at. `usize::MAX` is deliberately not a plausible
                         // count: it means refused, not measured.
-                        Some(QuotePrefix::QuoteDelimited) => return usize::MAX,
+                        Some(QuotePrefix::QuoteDelimited) => return REFUSED,
                         Some(QuotePrefix::BackslashEscaped) => {
                             mode = Mode::EscapedQuote;
                             continue;
@@ -606,6 +647,14 @@ fn quote_prefix(sql: &str, at: usize) -> Option<QuotePrefix> {
     let p1_at = at - p1.len_utf8();
     match p1 {
         'E' | 'e' | 'X' | 'x' => starts_token(sql, p1_at).then_some(QuotePrefix::BackslashEscaped),
+        // `R'...'` is not a plain literal. Its tokenizer arm calls
+        // `tokenize_single_or_triple_quoted_string` UNCONDITIONALLY, without
+        // consulting `supports_triple_quoted_string`, and that function
+        // counts up to three opening quotes and switches to a three-quote
+        // terminator on its own. A triple-quoted body may hold a lone `'`,
+        // which one-quote-at-a-time pairing cannot survive. Refused, like the
+        // `q` form.
+        'R' | 'r' => starts_token(sql, p1_at).then_some(QuotePrefix::QuoteDelimited),
         'q' | 'Q' => {
             // `nq'...'` and `NQ'...'` spell the same construct, so the token
             // starts one character earlier when an `n` precedes the `q`.
@@ -622,7 +671,17 @@ fn quote_prefix(sql: &str, at: usize) -> Option<QuotePrefix> {
 /// Whether a token can begin at byte offset `at`: nothing before it, or a
 /// character that is not part of an identifier.
 fn starts_token(sql: &str, at: usize) -> bool {
-    !preceding_char(sql, at).is_some_and(is_identifier_part)
+    match preceding_char(sql, at) {
+        // A number run ends at the first non-digit, because
+        // `supports_numeric_prefix()` is false, so a digit before the prefix
+        // letter is a token boundary and the prefix DOES start a token:
+        // `1E'...'` is `Number("1")` and then the `E` arm. The run rule at
+        // the bottom of `scan` already makes this distinction; this is the
+        // same correction on the prefix side.
+        Some(ch) if ch.is_ascii_digit() => true,
+        Some(ch) => !is_identifier_part(ch),
+        None => true,
+    }
 }
 
 /// The two kinds of prefixed string literal this scan has to tell apart.
@@ -828,8 +887,41 @@ mod tests {
         // `q'[' ]'` each carry an extra quote that restores parity by
         // accident, while `E''` and `X''` did not.
         for opener in [
-            "E''", "e''", "X''", "x''", "q'[]'", "Q'[]'", "nq'[]'", "NQ'[]'", "E'\\''", "e'\\''",
-            "X'\\''", "x'\\''", "q'[' ]'", "Q'[' ]'", "X'ab'", "E'a''b'",
+            "E''",
+            "e''",
+            "X''",
+            "x''",
+            "q'[]'",
+            "Q'[]'",
+            "nq'[]'",
+            "NQ'[]'",
+            "E'\\''",
+            "e'\\''",
+            "X'\\''",
+            "x'\\''",
+            "q'[' ]'",
+            "Q'[' ]'",
+            "X'ab'",
+            "E'a''b'",
+            // A doubled quote stays INSIDE an escape-constant literal:
+            // `Unescape::unescape` handles `''` before it handles `\`.
+            // Treating it as close-then-reopen inverted parity from there.
+            "E'a''\\''",
+            "e'a''\\''",
+            "X'a''\\''",
+            "x'a''\\''",
+            // `R'...'` reaches `tokenize_single_or_triple_quoted_string`
+            // unconditionally, so a triple-quoted raw body is live whatever
+            // the dialect flags say, and its body may hold a lone quote.
+            "R'''a'b'''",
+            "r'''a'b'''",
+            "R''",
+            "r''",
+            // A digit ends a number run, so the prefix after it DOES start a
+            // token: `1E'...'` is `Number("1")` then the `E` arm.
+            "1E'\\''",
+            "1q'[' ]'",
+            "1R'''a'b'''",
         ] {
             let sql = format!("SELECT {opener}{chain}");
             let count = check(&sql)
