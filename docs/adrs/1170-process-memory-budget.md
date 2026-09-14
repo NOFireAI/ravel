@@ -618,6 +618,20 @@ the budget; `emit` logs the derivation one line per figure; and `/metrics`
 exposes `ravel_memory_budget_bytes`, `ravel_memory_reserved_bytes{component=
 "sql"|"fetch"}`, and `ravel_memory_handoff_overlap_bytes` in every mode.
 
+`--disable-cache` is outside the carve and outside the refusal. The process
+then builds neither cache (`store::build_cache` returns `None`,
+`query::build_catalog` forces the byte cache's `0` sentinel), so both hard
+caps are `0`, the remainder is the whole budget, and `check_memory_budget`
+returns `Ok`. Decision 3's "hard caps plus remainder equals the budget"
+identity still holds; what changes is that the caps are not the two resolved
+cache ceilings on that path. The refusal cannot fire on a process that holds
+no cache memory, which is what keeps `--disable-cache` usable as the remedy
+the caching guide names it as, and what keeps a container whose effective
+memory is at or below the overhead reserve (budget `0`, caps `0`, refused by
+the `>=` comparison with no flag able to satisfy it) starting as it did
+before this decision landed. That is the one path allowed to run with a `0`
+remainder, and `emit` WARNs on it.
+
 Decision 1's accountant adapter is also already in place in `ravel-sql`
 (`TenantMemoryAccountant::with_process_budget`, `crates/ravel-sql/src/
 memory.rs`), forwarding each tenant `grow`/`try_grow`/`shrink` to the same
