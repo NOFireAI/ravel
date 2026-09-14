@@ -299,7 +299,7 @@ chmod +x "${E2E_DIR}/bin/gh"
 cat >"${E2E_DIR}/bin/git" <<'SHIM'
 #!/usr/bin/env bash
 # Recorded so a test can assert the freshness check was NOT reached.
-[[ -n "${FIXTURES:-}" ]] && echo "git $1" >>"${FIXTURES}/calls.log"
+[[ -n "${FIXTURES:-}" ]] && { echo "git $1" >>"${FIXTURES}/calls.log"; [[ "$1" == "fetch" ]] && echo "$*" >>"${FIXTURES}/fetch-args.log"; }
 tip=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 old=cccccccccccccccccccccccccccccccccccccccc
 resolve() {
@@ -379,6 +379,7 @@ e2e() {
   fi
   : >"${fx}/calls.log"
   : >"${fx}/rules-path.log"
+  : >"${fx}/fetch-args.log"
   printf '%s\n' "${E2E_REVIEWS:-$(printf '[{"user":{"login":"%s"},"state":"%s","commit_id":"%s","body":%s}]' \
     "${BOT}" "${E2E_REVIEW_STATE:-COMMENTED}" "${SHA}" "${review_body}")}" >"${fx}/reviews.json"
   printf '%s\n' "${E2E_ISSUE_COMMENTS:-${DONE_TASK_COMMENT}}" >"${fx}/issue-comments.json"
@@ -824,6 +825,52 @@ check_eq "#1758 base_ref: asks about the PR's own base branch" \
 check_eq "#1758 base_ref: a slash in the branch name is encoded" \
   "repos/NOFireAI/ravel/rules/branches/release%2F1.2" \
   "${slash_path}"
+
+# The guard must measure against the PR's OWN base, or the two halves of the
+# verdict are about different branches: the note would say "behind origin/main"
+# while the queue being consulted is the one on release/1.2.
+export E2E_GIT_STALE=1
+E2E_PR_VIEW="${slash_base_json}" E2E_RULES="${QUEUE_RULES}" e2e "${CLEAN_BODY_JSON}" >/dev/null
+slash_fetch="$(cat "${E2E_DIR}/fx/fetch-args.log")"
+unset E2E_GIT_STALE
+check_eq "#1758 base_ref: the freshness guard measures against the PR's base" \
+  "1" \
+  "$(printf '%s\n' "${slash_fetch}" | grep -c 'release/1.2')"
+
+# A queue plus a base that is fresh AT CHECK TIME. The prefix would refuse the
+# moment main moves between this check and the operator running the line, which
+# is the pre-#1758 refusal reached through the fresh path rather than the stale
+# one. No case covered this: every other queue case runs with a stale base.
+fresh_queue_out="$(E2E_RULES="${QUEUE_RULES}" e2e "${CLEAN_BODY_JSON}")"
+check_eq "#1758 queue + fresh base: the merge command carries no guard prefix" \
+  "0" \
+  "$(printf '%s\n' "${fresh_queue_out}" | grep -c 'assert-fresh-merge-base')"
+check_eq "#1758 queue + fresh base: the pinned merge command is still offered" \
+  "  -> gh pr merge 908 --rebase --match-head-commit ${SHA}" \
+  "$(printf '%s\n' "${fresh_queue_out}" | grep '^  -> gh pr merge')"
+# No queue and a fresh base keeps the prefix: that is the case it is for.
+noqueue_fresh_out="$(e2e "${CLEAN_BODY_JSON}")"
+check_eq "#1758 no queue + fresh base: the guard prefix stays" \
+  "1" \
+  "$(printf '%s\n' "${noqueue_fresh_out}" | grep -c 'assert-fresh-merge-base')"
+
+# A non-CLEAN mergeState with a stale base and a queue. base_stale_blocks lets
+# the chain fall through, so this branch answers instead of the clean one, and
+# the unseen-commit list must survive: an operator told to verify by hand is
+# otherwise verifying without the landing-loop detector.
+blocked_json='{"state":"OPEN","mergeStateStatus":"BLOCKED","statusCheckRollup":[{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}],"headRefOid":"'"${SHA}"'","baseRefName":"main"}'
+export E2E_GIT_STALE=1
+blocked_out="$(E2E_PR_VIEW="${blocked_json}" E2E_RULES="${QUEUE_RULES}" e2e "${CLEAN_BODY_JSON}")"
+unset E2E_GIT_STALE
+check_eq "#1758 queue + BLOCKED + stale: still says mergeState is the problem" \
+  "1" \
+  "$(printf '%s\n' "${blocked_out}" | grep -c 'mergeState is BLOCKED')"
+check_eq "#1758 queue + BLOCKED + stale: the unseen commits survive" \
+  "3" \
+  "$(printf '%s\n' "${blocked_out}" | grep -cE 'ccccccc1|cccccc2|cccccc3')"
+check_eq "#1758 queue + BLOCKED + stale: no merge command is offered" \
+  "0" \
+  "$(printf '%s\n' "${blocked_out}" | grep -c 'gh pr merge')"
 # The stand-in git puts an escape sequence and a carriage return in the first
 # unseen subject. Both must be gone by the time the text is printed: a subject
 # is attacker-controlled and this output is what the operator reads before
