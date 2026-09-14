@@ -60,7 +60,7 @@
 //! not handle is worse than one that fails: the caller must never store text
 //! this function did not actually redact.
 
-use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use datafusion::sql::parser::{DFParserBuilder, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
     Expr, LimitClause, OrderByKind, Query, Statement, Value, ValueWithSpan, VisitMut, VisitorMut,
 };
@@ -112,7 +112,14 @@ pub fn redact(query: &str, token_key: &[u8; 32]) -> Result<String, RedactError> 
     // does not bound a flat operator chain, so the guard has to run here too.
     // `ravel-promql`'s redact carries the same call for the same reason.
     crate::complexity_guard::check(query).map_err(|_| RedactError::Parse)?;
-    let mut statements = DFParser::parse_sql(query).map_err(|_| RedactError::Parse)?;
+    // Same pinned recursion limit `crate::validate` uses. The inherited
+    // default happens to match today; pinning it here means a change to that
+    // default cannot make one of the crate's parses deeper than another.
+    let mut statements = DFParserBuilder::new(query)
+        .with_recursion_limit(crate::validate::PARSER_RECURSION_LIMIT)
+        .build()
+        .and_then(|mut parser| parser.parse_statements())
+        .map_err(|_| RedactError::Parse)?;
 
     let mut redactor = LiteralRedactor {
         key: token_key,

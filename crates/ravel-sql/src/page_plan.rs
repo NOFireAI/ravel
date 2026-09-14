@@ -249,7 +249,7 @@
 use std::ops::ControlFlow;
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use datafusion::sql::parser::{DFParserBuilder, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
     Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByKind, Query, Select,
     SetExpr, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
@@ -728,7 +728,12 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
 /// [`validate`] has already accepted the text, and it accepts exactly one
 /// statement and only a `Statement::Query`.
 fn parse_query(sql: &str) -> Result<Query, PagePlanError> {
-    let statements = DFParser::parse_sql(sql).map_err(|e| ValidationError::Parse(e.to_string()))?;
+    // Same pinned recursion limit `crate::validate` uses; see the constant.
+    let statements = DFParserBuilder::new(sql)
+        .with_recursion_limit(crate::validate::PARSER_RECURSION_LIMIT)
+        .build()
+        .and_then(|mut parser| parser.parse_statements())
+        .map_err(|e| ValidationError::Parse(e.to_string()))?;
     match statements.front() {
         Some(DFStatement::Statement(inner)) => match inner.as_ref() {
             Statement::Query(query) => Ok(query.as_ref().clone()),
