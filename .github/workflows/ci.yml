@@ -165,8 +165,19 @@ jobs:
           # in the same diff must still force every area true for the
           # unlisted crate's sake, even though sql_area is already true.
           area_paths='^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$|^crates/ravel-sql/|^crates/ravel-query/|^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/'
-          if echo "$changed" | grep -E '^crates/|^services/' | grep -qvE "$area_paths"; then
-            echo "::notice::changed crate/service not in any named area list, running every area"
+          # Provably irrelevant to every Rust lane: prose, the TLA+ models, and
+          # the TLA+ harness (all three already handled above, and listed again
+          # here so this test can be read on its own).
+          known_irrelevant='\.(md|svg)$|^formal/|^scripts/check-tla\.sh$'
+          # Any changed path that is neither in a named area list nor provably
+          # irrelevant forces every area. The previous form asked this only of
+          # paths under crates/ or services/, so a change to deny.toml, the
+          # Makefile, or anything under scripts/ left every area false and
+          # skipped five REQUIRED checks (sql, flight-sql, object-store-contract,
+          # promql-difftest, tla). GitHub scores a skipped required check as
+          # passing, so those merges were gated by nothing.
+          if echo "$changed" | grep -qvE "${area_paths}|${known_irrelevant}"; then
+            echo "::notice::changed path not in any named area list, running every area"
             server_or_operator=true
             sql_area=true
             promql_area=true
