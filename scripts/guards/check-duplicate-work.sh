@@ -88,8 +88,13 @@ patch_id_of() {
     git diff "${_base}" "${remote}/_dupchk_$1" 2>/dev/null | git patch-id --stable | cut -d' ' -f1
 }
 
+# The REST files endpoint with --paginate rather than `gh pr view --json files`:
+# that field caps at about 100 entries, so a wide PR would silently drop paths
+# and undercount the overlap, or miss a shared file sitting past the cap on
+# either side. Same silent-cap class the scan note above exists for, and a
+# field-addition PR reaches 100 files easily.
 files_of() {
-    gh pr view "$1" --repo "${repo}" --json files --jq '[.files[].path] | sort | .[]' 2>/dev/null
+    gh api "repos/${repo}/pulls/$1/files" --paginate --jq '.[].path' 2>/dev/null | sort
 }
 
 mine_id="$(patch_id_of "${pr}" || true)"
@@ -111,8 +116,13 @@ others="$(gh pr list --repo "${repo}" --state open --limit "${scan_limit}" --jso
 # Say so when the scan is capped rather than reporting a clean result that only
 # means "no duplicate among the first N": a silent cap turns "I did not find
 # one" into "there is not one", which is the claim this guard must never make.
-scanned="$(printf '%s\n' "${others}" | wc -l | tr -d '[:space:]')"
-[ -n "${scanned}" ] || scanned=0
+# `printf '%s\n' ""` still emits one newline, so an empty list would count as 1.
+if [ -z "${others}" ]; then
+    scanned=0
+else
+    scanned="$(printf '%s\n' "${others}" | wc -l | tr -d '[:space:]')"
+    [ -n "${scanned}" ] || scanned=0
+fi
 if [ "${scanned}" -ge "${scan_limit}" ]; then
     echo "check-duplicate-work: NOTE: compared only the first ${scan_limit} open" >&2
     echo "    pull requests; more are open and were NOT compared, so a clean" >&2
