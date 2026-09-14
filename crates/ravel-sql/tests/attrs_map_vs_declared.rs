@@ -31,7 +31,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use datafusion::arrow::array::{Array, DictionaryArray, Int64Array, StringArray};
+use datafusion::arrow::array::{Array, DictionaryArray, Int64Array, MapArray, StringArray};
 use datafusion::arrow::datatypes::Int32Type;
 use datafusion::arrow::record_batch::RecordBatch;
 use ravel_catalog::{Catalog, CatalogConfig};
@@ -235,6 +235,43 @@ fn strings(batches: &[RecordBatch]) -> Vec<Option<String>> {
     out
 }
 
+/// The value of `key` in the `attrs` map column (column 1) per row, in batch
+/// order, or `None` where the row's map has no such key. Used to read the whole
+/// merged map back through the public surface, the path the per-key projection
+/// rewrite must NOT change.
+fn map_values(batches: &[RecordBatch], key: &str) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    for b in batches {
+        let m = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("attrs map column");
+        for i in 0..m.len() {
+            let entries = m.value(i);
+            let keys = entries
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("map keys are Utf8");
+            let vals = entries
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("map values are Utf8");
+            let mut found = None;
+            for j in 0..keys.len() {
+                if keys.value(j) == key {
+                    found = Some(vals.value(j).to_string());
+                    break;
+                }
+            }
+            out.push(found);
+        }
+    }
+    out
+}
+
 fn ints(batches: &[RecordBatch]) -> Vec<Option<i64>> {
     let mut out = Vec::new();
     for b in batches {
@@ -335,6 +372,32 @@ async fn compare_all(cfg: RlogConfig) {
     );
     assert_eq!(map, vec![Some(4_000)]);
     assert_eq!(map, dec);
+
+    // The per-key projection `attrs['k_str']` (issue #1768) must render exactly
+    // what reading the whole `attrs` map back does, key for key, INCLUDING the
+    // divergence row where the record holds a non-Str value under `k_str`: both
+    // render `7`, unlike the declared column which reads NULL. `SELECT attrs`
+    // takes the untouched whole-map path; `attrs['k_str']` takes the rewritten
+    // per-key path. They must agree.
+    let per_key = strings(&run(&ex, "SELECT ts, attrs['k_str'] AS v FROM logs ORDER BY ts").await);
+    let whole = map_values(
+        &run(&ex, "SELECT ts, attrs AS a FROM logs ORDER BY ts").await,
+        "k_str",
+    );
+    assert_eq!(
+        whole,
+        vec![
+            Some("alpha".into()),
+            Some("7".into()),
+            Some("resource-level".into()),
+            Some("beta".into()),
+        ],
+        "the whole attrs map renders the non-Str divergence value as text"
+    );
+    assert_eq!(
+        per_key, whole,
+        "the per-key projection reproduces the whole map's rendering exactly"
+    );
 }
 
 /// The default writer layout: every key gets its own dynamic column, so the

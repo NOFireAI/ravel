@@ -2002,4 +2002,376 @@ mod tests {
             ]
         );
     }
+
+    // --- per-key attrs projection (issue #1768) -----------------------------
+    //
+    // These pin what `AttrsPerKeyProjection` buys: an `attrs['k']` query stays
+    // on the columnar path (`rowpath_batches == 0`), decodes stored page bytes
+    // within a tight band of the declared-column form (only that key's
+    // FIELD_DIR pages plus `attrs_raw`, not every dynamic column), and moves the
+    // SAME wire bytes and GETs as the declared form. `SELECT attrs`/`SELECT *`
+    // are left on the row path unchanged.
+
+    use ravel_query::PhaseAccounting;
+
+    /// A deterministic high-entropy value for record `i`'s key `k`. Repeated
+    /// padding would compress to nothing under zstd and leave every per-key
+    /// column tiny; this splat-mixes `(k, i)` into 96 hex chars so each column
+    /// carries real, incompressible page bytes and the decode band is a
+    /// meaningful measurement.
+    fn cell(k: usize, i: usize) -> String {
+        let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (k as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
+        let mut out = String::with_capacity(96);
+        for _ in 0..6 {
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+            x ^= x >> 33;
+            out.push_str(&format!("{x:016x}"));
+        }
+        out
+    }
+
+    /// `rows` records on one stream, each carrying `keys` high-cardinality Str
+    /// record attributes `k0..k{keys-1}`, so each attribute's FIELD_DIR column
+    /// holds real page bytes and selecting one key versus several is a
+    /// measurable decode difference. All keys fit the default dynamic-column
+    /// budget, so no block overflows into `attrs_raw` and the columnar path is
+    /// available.
+    fn wide_attr_records(rows: usize, keys: usize) -> Vec<LogRecord> {
+        let resource = vec![("service.name".to_string(), s("api"))];
+        (0..rows)
+            .map(|i| {
+                let attrs: Vec<(String, AttrValue)> = (0..keys)
+                    .map(|k| (format!("k{k}"), s(&cell(k, i))))
+                    .collect();
+                record(&resource, &attrs, i as i64 + 1, &format!("body {i}"))
+            })
+            .collect()
+    }
+
+    /// What one executed `logs` query cost and returned, enough to prove which
+    /// path it took and how much it decoded.
+    struct PerKeyMeasured {
+        /// Column index 1 as text, accepting the map form's `Utf8` and the
+        /// declared form's `Dictionary(Int32, Utf8)`.
+        col1: Vec<Option<String>>,
+        page_bytes_decoded: u64,
+        wire_bytes: u64,
+        gets: u64,
+        columnar_batches: usize,
+        rowpath_batches: usize,
+    }
+
+    /// Column index 1 of every batch as `Option<String>`, in batch order,
+    /// accepting the map form's `Utf8` and the declared form's
+    /// `Dictionary(Int32, Utf8)`. Returns an empty vec when column 1 is neither
+    /// (a group-by count, a `SELECT *` timestamp): callers only compare it for
+    /// the shapes whose second column is the string value.
+    fn col1_strings(batches: &[RecordBatch]) -> Vec<Option<String>> {
+        use datafusion::arrow::array::{Array, DictionaryArray};
+        use datafusion::arrow::datatypes::Int32Type;
+        let mut out = Vec::new();
+        for b in batches {
+            if b.num_columns() < 2 {
+                return Vec::new();
+            }
+            let col = b.column(1);
+            if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+                out.extend((0..a.len()).map(|i| a.is_valid(i).then(|| a.value(i).to_string())));
+            } else if let Some(d) = col.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+                let values = d
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("utf8 dictionary values");
+                out.extend((0..d.len()).map(|i| {
+                    d.is_valid(i)
+                        .then(|| values.value(d.keys().value(i) as usize).to_string())
+                }));
+            } else {
+                return Vec::new();
+            }
+        }
+        out
+    }
+
+    /// Run `sql` against a FRESH provider/session over `seg` (so its accounting
+    /// is this query's alone), returning both the plan's columnar/row-path batch
+    /// counters and the phase accounting's decode/wire/request figures.
+    async fn measure_logs_query(
+        store: &Arc<dyn ObjectStoreBackend>,
+        seg: &SegmentRef,
+        declared: Vec<DeclaredColumn>,
+        sql: &str,
+    ) -> PerKeyMeasured {
+        let fetcher = LogSegmentFetcher::new(Arc::clone(store));
+        let snapshot = Snapshot {
+            segments: vec![seg.clone()],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let phase = PhaseAccounting::new();
+        let provider =
+            LogsTableProvider::new(snapshot, TenantHash([7u8; 16]), fetcher, phase.clone())
+                .with_declared_columns(declared);
+        let ctx = logs_session(provider).expect("build session");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("collect");
+        let metrics = find_logs_scan(&plan)
+            .expect("a LogsScanExec leaf")
+            .metrics()
+            .expect("the scan publishes metrics");
+        let count = |name: &str| metrics.sum_by_name(name).map(|v| v.as_usize()).unwrap_or(0);
+        let snap = phase.pooled_snapshot();
+        PerKeyMeasured {
+            col1: col1_strings(&batches),
+            page_bytes_decoded: snap.page_bytes_decoded,
+            wire_bytes: snap.total_s3_bytes(),
+            gets: snap.total_s3_requests(),
+            columnar_batches: count("columnar_batches"),
+            rowpath_batches: count("rowpath_batches"),
+        }
+    }
+
+    /// Write the wide fixture once and return its segment.
+    async fn wide_attr_segment(store: &MemoryStore) -> SegmentRef {
+        write_object_with(
+            store,
+            "logs/per-key.rlog",
+            &wide_attr_records(200, 10),
+            RlogConfig::default(),
+            &[],
+        )
+        .await
+    }
+
+    fn k3_declared() -> Vec<DeclaredColumn> {
+        vec![DeclaredColumn::new("k3", DeclaredType::Str)]
+    }
+
+    /// The band the acceptance criteria pin: the map form's stored page bytes
+    /// decoded stay within 1.5x of the declared form's, both directions.
+    fn within_band(map: u64, declared: u64) -> bool {
+        let hi = declared.saturating_mul(3) / 2;
+        let lo = map.saturating_mul(3) / 2;
+        map <= hi && declared <= lo
+    }
+
+    /// The equality shape: `WHERE attrs['k3'] = 'v'`. The map form takes the
+    /// columnar path, decodes within 1.5x of the declared column's stored page
+    /// bytes, and moves the same wire bytes and GETs.
+    #[tokio::test]
+    async fn attrs_equality_takes_columnar_path_within_the_decode_band() {
+        let store = MemoryStore::new();
+        let seg = wide_attr_segment(&store).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let value = cell(3, 50);
+
+        let map = measure_logs_query(
+            &store,
+            &seg,
+            k3_declared(),
+            &format!("SELECT ts, attrs['k3'] AS v FROM logs WHERE attrs['k3'] = '{value}'"),
+        )
+        .await;
+        let dec = measure_logs_query(
+            &store,
+            &seg,
+            k3_declared(),
+            &format!("SELECT ts, \"k3\" AS v FROM logs WHERE \"k3\" = '{value}'"),
+        )
+        .await;
+
+        // The whole point: the map form stayed columnar.
+        assert_eq!(
+            map.rowpath_batches, 0,
+            "attrs['k3'] equality must not fall to the row path"
+        );
+        assert!(
+            map.columnar_batches > 0,
+            "attrs['k3'] equality must build columnar batches"
+        );
+        // Same one matching row on both forms.
+        assert_eq!(map.col1.len(), 1, "exactly one row matches");
+        assert_eq!(map.col1, dec.col1, "map and declared select the same row");
+        // Stored page bytes decoded within 1.5x of the declared column's.
+        assert!(
+            within_band(map.page_bytes_decoded, dec.page_bytes_decoded),
+            "map decoded {} stored page bytes, declared {}, outside the 1.5x band",
+            map.page_bytes_decoded,
+            dec.page_bytes_decoded
+        );
+        // Wire bytes and GETs are unchanged: the fetch reads the whole object
+        // either way under the stock policy.
+        assert!(dec.gets > 0, "the scan issued at least one GET");
+        assert_eq!(map.gets, dec.gets, "GET count must be unchanged");
+        assert_eq!(
+            map.wire_bytes, dec.wire_bytes,
+            "wire bytes must be unchanged"
+        );
+    }
+
+    /// The group-by shape: `GROUP BY attrs['k3']` stays columnar and within the
+    /// decode band of the declared column.
+    #[tokio::test]
+    async fn attrs_group_by_takes_columnar_path_within_the_decode_band() {
+        let store = MemoryStore::new();
+        let seg = wide_attr_segment(&store).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+        let map = measure_logs_query(
+            &store,
+            &seg,
+            k3_declared(),
+            "SELECT attrs['k3'] AS v, COUNT(*) AS n FROM logs GROUP BY attrs['k3']",
+        )
+        .await;
+        let dec = measure_logs_query(
+            &store,
+            &seg,
+            k3_declared(),
+            "SELECT \"k3\" AS v, COUNT(*) AS n FROM logs GROUP BY \"k3\"",
+        )
+        .await;
+
+        assert_eq!(map.rowpath_batches, 0, "group-by must not fall to row path");
+        assert!(
+            map.columnar_batches > 0,
+            "group-by must build columnar batches"
+        );
+        assert!(
+            within_band(map.page_bytes_decoded, dec.page_bytes_decoded),
+            "group-by map decoded {} stored page bytes, declared {}, outside the 1.5x band",
+            map.page_bytes_decoded,
+            dec.page_bytes_decoded
+        );
+        assert!(dec.gets > 0, "the scan issued at least one GET");
+        assert_eq!(map.gets, dec.gets, "GET count must be unchanged");
+        assert_eq!(
+            map.wire_bytes, dec.wire_bytes,
+            "wire bytes must be unchanged"
+        );
+    }
+
+    /// The project-limit shape: `SELECT ts, attrs['k3'] ... ORDER BY ts LIMIT k`
+    /// stays columnar and within the decode band of the declared column.
+    #[tokio::test]
+    async fn attrs_project_limit_takes_columnar_path_within_the_decode_band() {
+        let store = MemoryStore::new();
+        let seg = wide_attr_segment(&store).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+        let map = measure_logs_query(
+            &store,
+            &seg,
+            k3_declared(),
+            "SELECT ts, attrs['k3'] AS v FROM logs ORDER BY ts LIMIT 10",
+        )
+        .await;
+        let dec = measure_logs_query(
+            &store,
+            &seg,
+            k3_declared(),
+            "SELECT ts, \"k3\" AS v FROM logs ORDER BY ts LIMIT 10",
+        )
+        .await;
+
+        assert_eq!(
+            map.rowpath_batches, 0,
+            "project-limit must not fall to row path"
+        );
+        assert!(
+            map.columnar_batches > 0,
+            "project-limit must build columnar batches"
+        );
+        assert_eq!(map.col1.len(), 10, "LIMIT 10 rows");
+        assert_eq!(map.col1, dec.col1, "map and declared agree row for row");
+        assert!(
+            within_band(map.page_bytes_decoded, dec.page_bytes_decoded),
+            "project-limit map decoded {} stored page bytes, declared {}, outside band",
+            map.page_bytes_decoded,
+            dec.page_bytes_decoded
+        );
+        assert!(dec.gets > 0, "the scan issued at least one GET");
+        assert_eq!(map.gets, dec.gets, "GET count must be unchanged");
+        assert_eq!(
+            map.wire_bytes, dec.wire_bytes,
+            "wire bytes must be unchanged"
+        );
+    }
+
+    /// The band is tight, not vacuous: the correct single-key form is inside it,
+    /// but selecting ONE extra column (`attrs['k4']` alongside `attrs['k3']`)
+    /// decodes that column's pages too and breaks the band against the same
+    /// declared baseline. Deliberately over-selecting is the line that makes
+    /// this fail; the extra column is `attrs['k4']`.
+    #[tokio::test]
+    async fn the_decode_band_fails_when_one_extra_column_is_selected() {
+        let store = MemoryStore::new();
+        let seg = wide_attr_segment(&store).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+        let dec = measure_logs_query(
+            &store,
+            &seg,
+            k3_declared(),
+            "SELECT ts, \"k3\" AS v FROM logs ORDER BY ts",
+        )
+        .await;
+        let one_key = measure_logs_query(
+            &store,
+            &seg,
+            k3_declared(),
+            "SELECT ts, attrs['k3'] AS v FROM logs ORDER BY ts",
+        )
+        .await;
+        // The deliberately over-selecting variant: one extra per-key column.
+        let two_keys = measure_logs_query(
+            &store,
+            &seg,
+            k3_declared(),
+            "SELECT ts, attrs['k3'] AS v, attrs['k4'] AS w FROM logs ORDER BY ts",
+        )
+        .await;
+
+        assert!(
+            within_band(one_key.page_bytes_decoded, dec.page_bytes_decoded),
+            "one key ({}) must be inside the band of declared ({})",
+            one_key.page_bytes_decoded,
+            dec.page_bytes_decoded
+        );
+        assert!(
+            !within_band(two_keys.page_bytes_decoded, dec.page_bytes_decoded),
+            "two keys ({}) must break the band of declared ({}): the band is tight",
+            two_keys.page_bytes_decoded,
+            dec.page_bytes_decoded
+        );
+    }
+
+    /// `SELECT attrs` and `SELECT *` still need the whole map, so the rule
+    /// leaves them on the row path unchanged: no columnar batches at all.
+    #[tokio::test]
+    async fn whole_map_projections_stay_on_the_row_path() {
+        let store = MemoryStore::new();
+        let seg = wide_attr_segment(&store).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+        for sql in ["SELECT attrs FROM logs", "SELECT * FROM logs"] {
+            let m = measure_logs_query(&store, &seg, k3_declared(), sql).await;
+            assert_eq!(
+                m.columnar_batches, 0,
+                "{sql} needs the whole map and must stay on the row path"
+            );
+            assert!(m.rowpath_batches > 0, "{sql} must build row-path batches");
+        }
+    }
 }
