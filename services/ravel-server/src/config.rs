@@ -2308,6 +2308,16 @@ pub struct PerformanceFlags {
     pub sql_tenant_max_bytes: Option<usize>,
     /// `--gc-max-query-duration`, already parsed from its humantime spelling.
     pub query_deadline: Option<Duration>,
+    /// `--disable-cache`. Not an `Option` because it is a bool flag with no
+    /// "derive" state: it is off unless the operator set it.
+    ///
+    /// It carves nothing itself, but it decides whether the two resolved cache
+    /// ceilings hold any memory at all. With it set, `store::build_cache`
+    /// returns no fetcher cache and `query::build_catalog` forces the catalog
+    /// byte cache to its `0` disabled sentinel, so both hard caps are
+    /// fictitious and the whole budget is really available to the shared
+    /// SQL/fetch accountant.
+    pub disable_cache: bool,
 }
 
 /// The six performance settings this process runs with, each with the source it
@@ -2375,6 +2385,9 @@ pub struct ResolvedPerformanceDefaults {
     /// is at or above the budget (issue #1255: a shared remainder of `0` is
     /// as unusable as a negative one, since a `MemoryBudget::new(0)` refuses
     /// every real reservation).
+    ///
+    /// `0` under [`Self::cache_disabled`], where the two ceilings above bound
+    /// caches that are never built, so this is NOT their sum on that path.
     pub memory_hard_caps_bytes: u64,
     /// `memory_budget_bytes - memory_hard_caps_bytes`: what sizes the shared
     /// `MemoryBudget` accountant SQL and fetch draw from. Always strictly
@@ -2382,7 +2395,18 @@ pub struct ResolvedPerformanceDefaults {
     /// `0` (not negative) remains the saturating floor for a fallback budget
     /// whose hard caps happen to consume all of `u64::MAX`, which does not
     /// occur with today's flat cache constants.
+    ///
+    /// Under [`Self::cache_disabled`] this is the whole budget, and startup
+    /// does not refuse it, so a `0` here is also reachable on a host whose
+    /// effective memory is at or below the overhead reserve. `emit` WARNs on
+    /// that combination rather than refusing: no flag can raise a budget the
+    /// host's memory did not produce, and the process still ingests.
     pub memory_remainder_bytes: u64,
+    /// `--disable-cache`: no fetcher cache and no catalog byte cache is built,
+    /// so [`Self::cache_max_bytes`] and [`Self::catalog_cache_max_bytes`] hold
+    /// no memory and [`Self::memory_hard_caps_bytes`] is `0` regardless of
+    /// them.
+    pub cache_disabled: bool,
     /// Where each of the six above came from: [`PERF_SOURCE_FLAG`],
     /// [`PERF_SOURCE_DERIVED`], or [`PERF_SOURCE_FALLBACK`].
     pub sources: PerformanceSources,
@@ -2480,6 +2504,9 @@ fn resolve_knob(
 ///   with the per-tenant ceiling below as the fairness bound WITHIN it, not a
 ///   second separate budget. `Cli::resolve_performance` refuses (does not
 ///   clamp) a flag combination whose hard caps alone exceed the budget.
+///   `--disable-cache` builds neither cache, so `memory_hard_caps_bytes` is
+///   `0`, the remainder is the whole budget, and there is nothing for that
+///   refusal to fire on.
 /// - `sql_max_query_bytes`: [`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal`, else
 ///   [`DEFAULT_SQL_MAX_QUERY_BYTES`].
 /// - `sql_tenant_max_bytes`: [`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal`, else
@@ -2580,7 +2607,16 @@ pub fn resolve_performance_defaults(
             (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
         };
 
-    let memory_hard_caps_bytes = cache_max_bytes.saturating_add(catalog_cache_max_bytes);
+    // `--disable-cache` builds neither cache: `store::build_cache` returns
+    // `None` and `query::build_catalog` forces the byte cache's `0` disabled
+    // sentinel. Both resolved ceilings above are then ceilings on nothing, so
+    // charging them against the budget would carve memory no cache holds and
+    // shrink the shared SQL/fetch remainder by up to 30% of the budget.
+    let memory_hard_caps_bytes = if flags.disable_cache {
+        0
+    } else {
+        cache_max_bytes.saturating_add(catalog_cache_max_bytes)
+    };
     let memory_remainder_bytes = memory_budget_bytes.saturating_sub(memory_hard_caps_bytes);
 
     let (sql_tenant_max_bytes, tenant_source) =
@@ -2642,6 +2678,7 @@ pub fn resolve_performance_defaults(
         memory_overhead_reserve_bytes: MEMORY_OVERHEAD_RESERVE_BYTES,
         memory_hard_caps_bytes,
         memory_remainder_bytes,
+        cache_disabled: flags.disable_cache,
         sources: PerformanceSources {
             fetch_concurrency: fetch_source,
             store_get_concurrency: store_get_concurrency_source,
@@ -2742,8 +2779,19 @@ impl ResolvedPerformanceDefaults {
     /// ceiling from), so there is no meaningful budget to check the flat
     /// fallback cache ceilings against, and the fallback remainder cannot be
     /// `0` with today's compiled-in cache constants.
+    ///
+    /// Also a no-op under `--disable-cache` ([`Self::cache_disabled`]), which
+    /// is what this refusal's own remedy reduces to on a small host: no cache
+    /// of either kind is built, so the process holds no read-cache memory,
+    /// `memory_hard_caps_bytes` is `0`, and the remainder is the whole budget.
+    /// Refusing there would refuse a process that has already given back
+    /// every byte the refusal asks it to give back, and a container whose
+    /// effective memory is at or below the overhead reserve derives a `0`
+    /// budget against `0` caps, which the `>=` comparison below would refuse
+    /// with no flag left that could satisfy it. `emit` WARNs about a `0`
+    /// remainder instead.
     pub fn check_memory_budget(&self) -> Result<(), MemoryBudgetExceeded> {
-        if self.sources.memory_budget_bytes == PERF_SOURCE_FALLBACK {
+        if self.sources.memory_budget_bytes == PERF_SOURCE_FALLBACK || self.cache_disabled {
             return Ok(());
         }
         if self.memory_hard_caps_bytes >= self.memory_budget_bytes {
@@ -2821,6 +2869,12 @@ impl ResolvedPerformanceDefaults {
         // caps, and what's left for the shared SQL/fetch accountant. One line
         // per figure, each exactly once, so an operator can reconstruct
         // budget = hard_caps + remainder from this log alone.
+        //
+        // All four carry the BUDGET's source, not a bare `derived`: on the
+        // fallback path the reserve was never subtracted from anything and
+        // both sums are taken against a `u64::MAX` budget, so a `derived`
+        // label there invites the reader to check
+        // `budget = effective - reserve` against arithmetic that never ran.
         tracing::info!(
             setting = "memory_budget_bytes",
             value = self.memory_budget_bytes,
@@ -2830,21 +2884,41 @@ impl ResolvedPerformanceDefaults {
         tracing::info!(
             setting = "memory_overhead_reserve_bytes",
             value = self.memory_overhead_reserve_bytes,
-            source = PERF_SOURCE_DERIVED,
+            source = self.sources.memory_budget_bytes,
             "performance default resolved"
         );
+        // `cache_disabled` rides on the hard-caps line for the reason
+        // `clamped` rides on `sql_max_query_bytes` below: when it is true this
+        // value is `0` rather than the sum of the two cache lines above it,
+        // and a reader adding those two up would not get this number.
         tracing::info!(
             setting = "memory_hard_caps_bytes",
             value = self.memory_hard_caps_bytes,
-            source = PERF_SOURCE_DERIVED,
+            source = self.sources.memory_budget_bytes,
+            cache_disabled = self.cache_disabled,
             "performance default resolved"
         );
         tracing::info!(
             setting = "memory_remainder_bytes",
             value = self.memory_remainder_bytes,
-            source = PERF_SOURCE_DERIVED,
+            source = self.sources.memory_budget_bytes,
             "performance default resolved"
         );
+        // Startup refuses a `0` remainder on every other path (see
+        // `check_memory_budget`), so this WARN is the only signal on the one
+        // path that is allowed to start with one: `--disable-cache` on a host
+        // whose effective memory is at or below the overhead reserve. The
+        // process ingests normally and refuses every query that reserves.
+        if self.cache_disabled && self.memory_remainder_bytes == 0 {
+            tracing::warn!(
+                memory_budget_bytes = self.memory_budget_bytes,
+                memory_overhead_reserve_bytes = self.memory_overhead_reserve_bytes,
+                "the shared SQL/fetch memory budget is 0 bytes: the host's effective memory is at \
+                 or below the overhead reserve, so every query that reserves memory will be \
+                 refused; give the process more memory, or raise its cgroup memory limit, above \
+                 that reserve"
+            );
+        }
         // The only line that carries `clamped`: when it is true the value is
         // the per-tenant ceiling, not what `source` resolved, and a reader who
         // saw `source="derived"` alone would go looking for a derivation that
@@ -4591,6 +4665,7 @@ impl Cli {
             sql_max_query_bytes: self.sql_max_query_bytes,
             sql_tenant_max_bytes: self.sql_tenant_max_bytes,
             query_deadline,
+            disable_cache: self.disable_cache,
         })
     }
 
@@ -7448,6 +7523,81 @@ mod tests {
             .expect("typed MemoryBudgetExceeded error");
         assert_eq!(exceeded.hard_caps_total, budget);
         assert_eq!(exceeded.memory_budget_bytes, budget);
+    }
+
+    /// `--disable-cache` builds no fetcher cache (`store::build_cache` returns
+    /// `None`) and no catalog byte cache (`query::build_catalog` forces the
+    /// `0` sentinel), so both hard caps hold no memory and the whole budget
+    /// belongs to the shared SQL/fetch accountant. Startup must not refuse a
+    /// process that holds no read-cache memory, on either of the two
+    /// configurations that otherwise refuse:
+    ///
+    /// - hard caps above the budget, where the docs name this exact flag as
+    ///   the remedy (`docs/guides/caching.md`: "the flag to set in a
+    ///   memory-constrained container");
+    /// - a host whose effective memory is at or below
+    ///   [`MEMORY_OVERHEAD_RESERVE_BYTES`], where the budget derives to `0`
+    ///   and `0 >= 0` refuses with no flag value that can satisfy it. A 2 GiB
+    ///   container is that case, and it started before ADR-1170.
+    ///
+    /// Prove-the-test, one half of the fix at a time. Dropping
+    /// `|| self.cache_disabled` from `check_memory_budget`'s early return
+    /// panics the second `expect`: "a container that ran before ADR-1170 must
+    /// keep starting" against a `0 >= 0` refusal on the 0-byte budget.
+    /// Restoring that and replacing the `flags.disable_cache` branch in
+    /// `resolve_performance_defaults` with the plain
+    /// `cache_max_bytes.saturating_add(catalog_cache_max_bytes)` panics the
+    /// first hard-caps assertion instead, reading 40,000,000,000 against the
+    /// expected 0. Both halves are needed: caps of `0` do not survive the
+    /// `>=` comparison against a budget of `0`.
+    #[test]
+    fn disabling_the_cache_starts_where_the_hard_caps_would_refuse() {
+        // Configuration 1: caps an operator set well above the budget, with
+        // the caches turned off. 20 GB bounds both caches, so the sum is
+        // 40 GB against the reference host's 30,064,771,072-byte budget.
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--disable-cache",
+            "--cache-max-bytes",
+            "20000000000",
+        ])
+        .expect("flags parse");
+        let resolved = cli.resolve_performance(reference_host()).expect(
+            "a process that builds no cache holds no cache memory, so the two fictitious hard \
+             caps must not refuse startup",
+        );
+        assert!(resolved.cache_disabled);
+        assert_eq!(
+            resolved.memory_hard_caps_bytes, 0,
+            "neither cache is built, so neither ceiling charges the budget"
+        );
+        assert_eq!(
+            resolved.memory_remainder_bytes, resolved.memory_budget_bytes,
+            "the whole budget is available to the shared SQL/fetch accountant"
+        );
+        // The resolved ceilings themselves are untouched: they are what the
+        // operator typed, and they are simply not carved from the budget.
+        assert_eq!(resolved.cache_max_bytes, 20_000_000_000);
+        assert_eq!(resolved.catalog_cache_max_bytes, 20_000_000_000);
+
+        // Configuration 2: the small container. Effective memory at the
+        // overhead reserve derives a `0` budget, which refuses with the caches
+        // on (`host_at_or_below_the_overhead_reserve_refuses_to_start`) and
+        // must start with them off.
+        let tiny = HostProfile::new(2, Some(MEMORY_OVERHEAD_RESERVE_BYTES));
+        let cli = Cli::try_parse_from(["ravel-server", "--disable-cache"]).expect("flag parses");
+        let resolved = cli
+            .resolve_performance(tiny)
+            .expect("a container that ran before ADR-1170 must keep starting with --disable-cache");
+        assert_eq!(resolved.memory_budget_bytes, 0);
+        assert_eq!(resolved.memory_hard_caps_bytes, 0);
+        assert_eq!(resolved.memory_remainder_bytes, 0);
+
+        // Without the flag, that same host still refuses: this test must not
+        // be passing because the refusal stopped working altogether.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        cli.resolve_performance(tiny)
+            .expect_err("the refusal still fires for a process that does build caches");
     }
 
     /// The four ADR-1170 decision 3/4 emit lines -- `memory_budget_bytes`,
