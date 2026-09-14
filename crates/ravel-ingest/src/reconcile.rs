@@ -89,10 +89,19 @@
 //!   [`last_modified_unix_ms`](ravel_object_store::ObjectMeta::last_modified_unix_ms),
 //!   so a key whose modification time is
 //!   already past the same `2 * R` window is skipped without a GET
-//!   ([`mtime_stale`]). The body's `snapshot_unix_ns` is stamped no later than
-//!   the write that set the modification time, so a key the LIST shows as past
-//!   the window can only hold a body that is at least as old: skipping it never
-//!   drops a sibling the decoded body would have counted as fresh.
+//!   ([`mtime_stale`]). Skipping never drops a sibling the decoded body would
+//!   have counted as fresh **under the assumption that the writer's clock and
+//!   the object store's agree**: `snapshot_unix_ns` is stamped by the
+//!   writer's clock, the modification time by the store's, and only when
+//!   those two agree is the body guaranteed no fresher than the mtime the
+//!   LIST already showed. A writer clock running far enough ahead of the
+//!   store's can in principle write a body that reads as fresh while the
+//!   store's own modification time already looks past the window, making the
+//!   skip drop it. In practice this needs skew large enough to also defeat
+//!   the direct [`is_stale`] check on the body, since a live sibling
+//!   refreshes its mtime every `R`; the skip is therefore no worse than that
+//!   check, not a stronger guarantee than it, and either way it
+//!   self-corrects the next interval.
 //! - A key past the *reap horizon* ([`reap_horizon_ns`], `2 * R` widened by the
 //!   same factor again) is deleted, which bounds the LIST itself. The extra
 //!   width is the clock-skew margin: the modification time comes from the
@@ -1226,6 +1235,73 @@ mod tests {
             keys_under(store.as_ref(), &tenant_hash, Signal::Metrics).await,
             expected,
             "the key inside the skew margin survives; the one past the horizon does not"
+        );
+    }
+
+    /// Pins the module doc's same-clock caveat on the read-side skip: the skip
+    /// judges `mtime_stale` off the object store's clock alone, while the
+    /// authoritative [`is_stale`] check the skip stands in for judges off the
+    /// writer's clock (`snapshot_unix_ns`). The two only agree when both
+    /// clocks agree. Here the sibling's *store* modification time is stamped
+    /// 3 * R old (past the 2 * R staleness window) while its body's
+    /// `snapshot_unix_ns` is stamped fresh (0 old) -- a writer clock reading
+    /// ahead of the store's -- so the skip fires and drops a sibling that
+    /// `is_stale` alone would have counted as live.
+    ///
+    /// This is deliberately not a bug fix: the skip is exactly as safe as the
+    /// pre-existing `is_stale` check it sits beside (a sibling this far
+    /// out of clock agreement already looks dead to `is_stale` too), and it
+    /// self-corrects the next interval. The point of this test is to hold the
+    /// doc's caveat to a concrete, checkable case rather than an unverified
+    /// claim.
+    #[tokio::test]
+    async fn a_skip_can_drop_a_fresh_sibling_when_the_writer_clock_leads_the_store_clock() {
+        let tenant = TenantId::new("acme");
+        let tenant_hash = tenant.hash();
+        let now_ns = 1_000 * R_NS;
+        let now_ms = (now_ns / 1_000_000) as u64;
+        let r_ms = (R_NS / 1_000_000) as u64;
+
+        let clock = TestClock::new(now_ns);
+        let controller = AdmissionController::new(clock.clone(), count_only_limits(100));
+        controller.set_tenant_limits(tenant.clone(), count_only_limits(100));
+        for i in 0..10u8 {
+            controller.admit_series(&tenant, [series(i)], clock.now_ns());
+        }
+
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        store.inner().set_clock_ms(now_ms);
+
+        // Store mtime 3 * R old (past the 2 * R window); body stamped fresh
+        // (`snapshot_unix_ns == now_ns`), as a writer clock ahead of the
+        // store's would produce.
+        let skewed = snapshot_key(&tenant_hash, Signal::Metrics, "skewed-writer");
+        seed_snapshot(
+            store.as_ref(),
+            &skewed,
+            now_ms - 3 * r_ms,
+            now_ms,
+            now_ns,
+            40,
+        )
+        .await;
+
+        let stats = reconcile_once(&controller, store.as_ref(), R, now_ns).await;
+
+        assert_eq!(
+            stats.stale_keys_skipped, 1,
+            "the mtime-only skip fires on the store clock's stamp alone"
+        );
+        assert_eq!(
+            stats.siblings_observed, 0,
+            "the fresh body is never read, so it is never counted live"
+        );
+        assert_eq!(
+            controller.effective_max_active_series(&tenant),
+            Some(CountLimit::Bounded(100)),
+            "the skipped sibling's 40 series never entered fleet_used, so the \
+             local threshold is not tightened for it -- the under-count this \
+             test exists to pin"
         );
     }
 

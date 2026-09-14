@@ -119,6 +119,56 @@ impl Clock for WallClock {
     }
 }
 
+/// One heartbeat/reap/live-set cycle (ADR-0065 decision 1, issue #1679),
+/// run every `H` by the heartbeat task the maintenance loop spawns. Factored
+/// out of that task so a test can drive it with an injected `now` instead of
+/// the real wall clock the production spawn always supplies -- the thing
+/// under test (`reap_dead_workers`'s mtime comparison) needs a deterministic
+/// `now` against a deterministic store clock, not real elapsed time.
+///
+/// Writes this process's own heartbeat, reaps heartbeat keys past the reap
+/// horizon (bounding the `sys/maintain/workers/` LIST itself), then
+/// recomputes and publishes the live set over `live_tx` and into `ownership`'s
+/// gauge. Each step is independently fail-open: a failure in one is logged
+/// and does not skip the next.
+async fn heartbeat_tick(
+    store: &dyn ObjectStoreBackend,
+    worker: &WorkerSet,
+    ownership: &MaintenanceOwnershipMetrics,
+    live_tx: &tokio::sync::watch::Sender<Vec<Uuid>>,
+    now: i64,
+) {
+    if let Err(err) = worker.write_heartbeat(store, now).await {
+        tracing::warn!(
+            error = %err,
+            "maintenance: worker heartbeat write failed; self-corrects next interval"
+        );
+    }
+    // Reap on the same cadence `H` as the heartbeat write: idempotent and, in
+    // steady state, zero deletes, since a key only crosses the reap horizon
+    // after its owning process has been gone a full extra liveness window.
+    if let Err(err) = worker.reap_dead_workers(store, now).await {
+        tracing::warn!(
+            error = %err,
+            "maintenance: reaping dead worker heartbeats failed; retried next tick"
+        );
+    }
+    match worker.live_set(store, now).await {
+        Ok(computed) => {
+            ownership.set_workers_live(computed.len() as u64);
+            // Publish the latest live set for the discovery loop. `send`
+            // fails only once the receiver has dropped, i.e. the loop is
+            // shutting down; there is nothing to publish to then.
+            let _ = live_tx.send(computed);
+        }
+        Err(err) => tracing::warn!(
+            error = %err,
+            "maintenance: worker live-set read failed; keeping the last-known \
+             live set (fail-open, ADR-0065 decision 1)"
+        ),
+    }
+}
+
 /// The data signals this server ingests, and therefore maintains, today.
 /// Metrics (RSEG), logs (RLOG), and spans all flow through the same
 /// signal-generic compaction/retention/sweep code (ADR-0032), carrying ADR-0019
@@ -843,27 +893,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                 tokio::select! {
                     _ = heartbeat.tick() => {
                         let now = clock.now_ns();
-                        if let Err(err) = worker.write_heartbeat(store.as_ref(), now).await {
-                            tracing::warn!(
-                                error = %err,
-                                "maintenance: worker heartbeat write failed; self-corrects next interval"
-                            );
-                        }
-                        match worker.live_set(store.as_ref(), now).await {
-                            Ok(computed) => {
-                                ownership.set_workers_live(computed.len() as u64);
-                                // Publish the latest live set for the discovery
-                                // loop. `send` fails only once the receiver has
-                                // dropped, i.e. the loop is shutting down; there
-                                // is nothing to publish to then.
-                                let _ = live_tx.send(computed);
-                            }
-                            Err(err) => tracing::warn!(
-                                error = %err,
-                                "maintenance: worker live-set read failed; keeping the last-known \
-                                 live set (fail-open, ADR-0065 decision 1)"
-                            ),
-                        }
+                        heartbeat_tick(store.as_ref(), worker.as_ref(), ownership.as_ref(), &live_tx, now).await;
                     }
                     _ = &mut heartbeat_shutdown_rx => return,
                 }
@@ -5946,6 +5976,67 @@ mod tests {
             heartbeat_writes.load(Ordering::SeqCst),
             writes_at_stop,
             "the heartbeat task must stop when the loop ends -- no writes after shutdown, no leak"
+        );
+    }
+
+    /// The production caller this ticket wires up (issue #1679): before this
+    /// change, `WorkerSet::reap_dead_workers` had two unit tests in
+    /// `ravel-fleet` but no call site anywhere in the running service, so
+    /// `sys/maintain/workers/` accumulated one key per maintain process that
+    /// ever ran regardless. This drives `heartbeat_tick` -- the exact
+    /// production sequence the heartbeat task now runs every `H` -- with an
+    /// injected `now` against a `MemoryStore` whose fake clock is set
+    /// explicitly, so the mtime comparison under test is deterministic rather
+    /// than resting on real elapsed time.
+    ///
+    /// Two dead siblings are seeded 10 * H before `now` (past the 6 * H reap
+    /// horizon at the default liveness factor of 3); one tick must delete both
+    /// and leave exactly this process's own key behind.
+    #[tokio::test]
+    async fn heartbeat_tick_reaps_dead_worker_heartbeats() {
+        const H: Duration = Duration::from_secs(1);
+        const H_NS: i64 = 1_000_000_000;
+        const H_MS: u64 = 1_000;
+        const NOW_MS: u64 = 1_700_000_000_000;
+        const NOW_NS: i64 = 1_700_000_000_000 * 1_000_000;
+
+        let store = MemoryStore::new();
+        let me = WorkerSet::new(NOW_NS, H, 3, 4);
+        let dead_a = WorkerSet::new(NOW_NS, H, 3, 4);
+        let dead_b = WorkerSet::new(NOW_NS, H, 3, 4);
+
+        // Seed the two dead heartbeats stamped 10 * H before `now` (the
+        // store's fake clock, which is what the LIST result reports as the
+        // modification time), then move the store's clock to `now` for the
+        // tick itself.
+        store.set_clock_ms(NOW_MS - 10 * H_MS);
+        dead_a
+            .write_heartbeat(&store, NOW_NS - 10 * H_NS)
+            .await
+            .expect("seed dead_a heartbeat");
+        dead_b
+            .write_heartbeat(&store, NOW_NS - 10 * H_NS)
+            .await
+            .expect("seed dead_b heartbeat");
+        store.set_clock_ms(NOW_MS);
+
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let (live_tx, _live_rx) = tokio::sync::watch::channel(me.solo_live_set());
+
+        heartbeat_tick(&store, &me, &ownership, &live_tx, NOW_NS).await;
+
+        let mut keys: Vec<String> = list_all(&store, "sys/maintain/workers/")
+            .await
+            .expect("list workers")
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![ravel_maintain::worker_set::heartbeat_key(&me.process_id())],
+            "the tick must reap both dead siblings and leave exactly this \
+             process's own key"
         );
     }
 
