@@ -330,6 +330,7 @@ impl WorkerSliceClient for CoordinatorSliceReader {
         _location: &str,
         ticket: &FlightTicket,
         _limit: Option<usize>,
+        context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let snapshot = ticket.snapshot();
         let segments = snapshot.segments.clone();
@@ -341,7 +342,12 @@ impl WorkerSliceClient for CoordinatorSliceReader {
             self.phase_accounting.clone(),
         );
         let plan = provider.worker_fragment(segments.len().max(1), &segments)?;
-        execute_stream(plan, Arc::new(TaskContext::default()))
+        // The partition's own context, not a default one. `RsegScanExec`
+        // registers its `MemoryReservation` against `context.memory_pool()`,
+        // and a bare `TaskContext` carries an unbounded pool, so a default here
+        // would make this the one read path whose decoded batches are neither
+        // counted against nor limited by the tenant's query budget.
+        execute_stream(plan, Arc::clone(context))
     }
 }
 
@@ -412,11 +418,20 @@ pub struct WorkerSlice {
 /// coordinator re-applies the exact limit above the dedup.
 pub trait WorkerSliceClient: Send + Sync + fmt::Debug {
     /// Open the worker `DoGet` stream for `ticket` at `location`.
+    /// `context` is the partition's own `TaskContext`, threaded from
+    /// [`DistributedScanExec::execute`]. A remote client ignores it: the
+    /// worker accounts for its own decode. The coordinator-local reader must
+    /// NOT, because it decodes on this process and its batches have to land in
+    /// the same memory pool the rest of the query uses. Passing
+    /// `TaskContext::default()` there gives an unbounded pool and takes the
+    /// fallback read outside the tenant's budget, in exactly the degraded
+    /// window this trait's fallback exists to serve.
     fn fetch_slice(
         &self,
         location: &str,
         ticket: &FlightTicket,
         limit: Option<usize>,
+        context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream>;
 }
 
@@ -482,6 +497,8 @@ impl WorkerSliceClient for FlightWorkerSliceClient {
         location: &str,
         ticket: &FlightTicket,
         _limit: Option<usize>,
+        // The worker decodes on its own process and accounts there.
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         // Encode the slice ticket exactly as the in-process path does. A
         // `slice_count > 1` ticket routes to the worker's scan-only fragment
@@ -706,7 +723,7 @@ impl ExecutionPlan for DistributedScanExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let endpoint = self
             .endpoints
@@ -744,7 +761,9 @@ impl ExecutionPlan for DistributedScanExec {
             } = endpoint;
 
             // Step 1: the assigned worker.
-            let mut cause = match probe_slice(client.as_ref(), &primary, &ticket, limit).await {
+            let mut cause = match probe_slice(client.as_ref(), &primary, &ticket, limit, &context)
+                .await
+            {
                 Ok(stream) => return Ok(fold_wire_bytes(stream, accounting, max_bytes_scanned)),
                 Err(err) => err,
             };
@@ -760,7 +779,7 @@ impl ExecutionPlan for DistributedScanExec {
                     error = %cause,
                     "distributed slice fetch failed; re-dispatching to another worker"
                 );
-                match probe_slice(client.as_ref(), &next, &ticket, limit).await {
+                match probe_slice(client.as_ref(), &next, &ticket, limit, &context).await {
                     Ok(stream) => {
                         return Ok(fold_wire_bytes(stream, accounting, max_bytes_scanned));
                     }
@@ -781,7 +800,14 @@ impl ExecutionPlan for DistributedScanExec {
                     error = %cause,
                     "distributed slice fetch failed on every worker; reading it on the coordinator"
                 );
-                match probe_slice(local.as_ref(), COORDINATOR_LOCAL_LOCATION, &ticket, limit).await
+                match probe_slice(
+                    local.as_ref(),
+                    COORDINATOR_LOCAL_LOCATION,
+                    &ticket,
+                    limit,
+                    &context,
+                )
+                .await
                 {
                     Ok(stream) => return Ok(stream),
                     Err(err) => cause = err,
@@ -821,8 +847,9 @@ async fn probe_slice(
     location: &str,
     ticket: &FlightTicket,
     limit: Option<usize>,
+    context: &Arc<TaskContext>,
 ) -> DFResult<SliceStream> {
-    let mut stream = client.fetch_slice(location, ticket, limit)?;
+    let mut stream = client.fetch_slice(location, ticket, limit, context)?;
     let first = match stream.next().await {
         Some(Ok(batch)) => Some(batch),
         Some(Err(err)) => return Err(err),
