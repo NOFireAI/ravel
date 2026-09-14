@@ -1530,7 +1530,14 @@ pub(crate) async fn run_tick_with_clock(
                         signal,
                         report.orphan_breaker_tripped,
                         report.orphans_withheld,
-                        report.orphans_deleted + report.orphans_withheld,
+                        // ADR-0058 decision 1: everything still present in
+                        // the live set. A refused candidate is present too,
+                        // and it is refused in exactly the store-fault case
+                        // this gauge exists to surface, so dropping it read
+                        // zero at the moment the signal mattered.
+                        report.orphans_deleted
+                            + report.orphans_withheld
+                            + report.orphans_quarantine_refused,
                     );
                 }
                 Err(err) => {
