@@ -285,7 +285,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.formal_area == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 30m per area, not the serial job's 45m for all six. maintenance is the
+    # long pole at about 8.6m warm; the headroom is for a cold JVM on a slow
+    # runner. Deliberately not tight: a timeout-minutes breach reports as
+    # `cancelled`, and publish-images.yml's release gate fails closed on a
+    # cancelled ci run for the tagged SHA.
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -311,6 +316,20 @@ jobs:
         env:
           RAVEL_TLA_WORKERS: auto
         run: scripts/check-tla.sh ci -a ${{ matrix.area }}
+      # One marker per area that finished. The aggregate `result` of a matrix
+      # is success when every leg that RAN succeeded, so it cannot by itself
+      # distinguish six green legs from five green legs and one that never
+      # produced a result. `tla` counts these instead.
+      - name: Record that this area ran
+        run: |
+          mkdir -p tla-marker
+          echo "ok" > "tla-marker/${{ matrix.area }}"
+      - name: Upload the area marker
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tla-ok-${{ matrix.area }}
+          path: tla-marker/
+          retention-days: 1
       - name: Upload TLC logs on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -365,6 +384,27 @@ jobs:
             exit 1
           fi
           echo "areas covered: $actual"
+      - name: Collect the area markers
+        if: needs.changes.outputs.formal_area == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: tla-ok-*
+          path: tla-markers
+          merge-multiple: true
+      - name: Assert every area reported a result
+        if: needs.changes.outputs.formal_area == 'true'
+        env:
+          EXPECTED_COUNT: "6"
+        run: |
+          # A leg that never ran leaves no marker while the matrix's aggregate
+          # result can still read success. Count the markers.
+          got=$(find tla-markers -type f 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$got" != "$EXPECTED_COUNT" ]; then
+            echo "::error::expected $EXPECTED_COUNT area markers, found $got"
+            find tla-markers -type f 2>/dev/null || true
+            exit 1
+          fi
+          echo "all $got area markers present"
       - name: Decide the formal lane
         env:
           FORMAL: ${{ needs.changes.outputs.formal_area }}

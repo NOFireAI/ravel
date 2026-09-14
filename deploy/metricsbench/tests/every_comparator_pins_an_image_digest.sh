@@ -78,7 +78,7 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # and `rustup show`, are a local `./...` action and a plain `run:` step; neither
 # is an external `uses:` this scan counts, and the job has no setup-sccache step
 # at all).
-WORKFLOW_EXPECTED_ACTION_COUNT=94
+WORKFLOW_EXPECTED_ACTION_COUNT=97
 
 # A pinned image reference ends in `@sha256:` followed by exactly 64 hex
 # digits. Matching the bare substring `@sha256:` is not enough: `repo:tag@sha256:`
