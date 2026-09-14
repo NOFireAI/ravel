@@ -1075,6 +1075,13 @@ pub struct LogsScanExec {
     /// `LoadedColumnStats::segments` has no exact statistics either, checked
     /// per column at the point of use rather than here.
     column_stats: Option<Arc<LoadedColumnStats>>,
+    /// Whether this scan publishes its per-segment scan timeline
+    /// (`SqlConfig::segment_timing`, issue #913). `false` by default,
+    /// installed with [`Self::with_segment_timing`]; gates
+    /// [`LogScanStream::mark_segment`] to a no-op (no label allocation, no
+    /// metric registration) so a production query pays nothing for a
+    /// timeline only the bench reporter reads.
+    segment_timing: bool,
     /// The resolved full `logs` schema this scan projects, i.e.
     /// `logs_schema_with_declared(&declared)`. Kept so [`Self::reproject`] can
     /// build a narrower sibling scan over the same table without re-deriving
@@ -1445,7 +1452,10 @@ impl LogsScanExec {
             Arc::clone(&self.declared),
             row_refs,
         )
-        .map(|scan| scan.with_column_stats(self.column_stats.clone()))
+        .map(|scan| {
+            scan.with_column_stats(self.column_stats.clone())
+                .with_segment_timing(self.segment_timing)
+        })
     }
 
     /// Attach this plan's loaded column statistics (ADR-0850), resolved once
@@ -1459,6 +1469,16 @@ impl LogsScanExec {
         column_stats: Option<Arc<LoadedColumnStats>>,
     ) -> Self {
         self.column_stats = column_stats;
+        self
+    }
+
+    /// Turn on this scan's per-segment scan timeline (`SqlConfig::
+    /// segment_timing`, issue #913). A builder method for the same reason
+    /// [`Self::with_column_stats`] is one: every existing call site of
+    /// [`Self::new`] stays source-compatible, and `false` (the default)
+    /// reproduces the pre-gate scan exactly.
+    pub(crate) fn with_segment_timing(mut self, segment_timing: bool) -> Self {
+        self.segment_timing = segment_timing;
         self
     }
 
@@ -1559,6 +1579,7 @@ impl LogsScanExec {
             projected_fraction,
             declared,
             column_stats: None,
+            segment_timing: false,
             full_schema: full,
             schema,
             row_refs,
@@ -2492,6 +2513,7 @@ impl ExecutionPlan for LogsScanExec {
             columnar_eligible: self.columnar_eligible,
             blocks,
             metrics: self.metrics.clone(),
+            segment_timing: self.segment_timing,
             origin: self.created_at,
             stream_started: Instant::now(),
             open_started: None,
@@ -3320,6 +3342,11 @@ struct LogScanStream {
     /// published as labelled metrics (`segment=<ordinal>`) alongside the
     /// per-partition totals in [`Self::blocks`].
     metrics: ExecutionPlanMetricsSet,
+    /// Whether [`Self::mark_segment`] does anything (`SqlConfig::
+    /// segment_timing`, issue #913). `false` by default: no label
+    /// allocation, no metric registration, so `accumulate_scan_timing` finds
+    /// no per-segment rows.
+    segment_timing: bool,
     /// The exec's creation instant; every `*_offset` metric is measured from it.
     origin: Instant,
     /// When this partition's stream was built; `planning_wait_elapsed` and
@@ -3336,6 +3363,9 @@ impl LogScanStream {
     /// current offset from the exec's origin, labelled with the segment's
     /// snapshot ordinal so a reader can line the partitions up on one clock.
     fn mark_segment(&self, name: &'static str) {
+        if !self.segment_timing {
+            return;
+        }
         MetricBuilder::new(&self.metrics)
             .with_new_label("segment", self.current_seg_ordinal.to_string())
             .subset_time(name, self.partition)

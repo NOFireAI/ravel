@@ -323,6 +323,11 @@ pub fn build_sql_state(
         // set, so a deployment can arm spill without a code change; unset leaves
         // it `None` and the memory budget refuses as before.
         spill: None,
+        // Issue #913: the per-segment scan timeline is a bench-reporter-only
+        // knob, with no flag, for the same reason as the lines above. Off by
+        // default so a production logs query never pays its per-segment
+        // metric registrations.
+        segment_timing: SqlConfig::default().segment_timing,
     }
     .with_spill_from_env()?;
     let max_deadline = config.engine.deadline;

@@ -309,6 +309,19 @@ pub struct SqlConfig {
     /// still `None`, so an explicit setting is never overridden by the
     /// environment.
     pub spill: Option<SpillConfig>,
+    /// Whether a logs scan publishes its per-segment scan timeline
+    /// (`seg_open_start_offset`/`seg_open_ready_offset`/`seg_done_offset`,
+    /// folded into `SqlStats.scan_timing.segments`). Default `false`.
+    ///
+    /// The timeline is O(segments scanned): a new labelled metric per
+    /// segment per partition, at three points each, on top of the O(1) sums
+    /// and counts (`open_elapsed`, `decode_build_elapsed`, `segments_opened`,
+    /// the min/max pairs) that stay unconditional regardless of this flag. A
+    /// production logs query over thousands of segments has no reader for the
+    /// per-segment rows, so this is off by default; `ravel-bench`'s
+    /// `sql_latency` reporter is the one caller that turns it on. Set once at
+    /// server startup, like every other field here.
+    pub segment_timing: bool,
 }
 
 impl Default for SqlConfig {
@@ -324,6 +337,7 @@ impl Default for SqlConfig {
             // no-spill deployment profile) and it is what makes enabling spill
             // an operator decision rather than a version upgrade.
             spill: None,
+            segment_timing: false,
         }
     }
 }

@@ -1642,6 +1642,11 @@ fn cold_executor(
                 ..EngineConfig::default()
             },
             parallel_final_aggregation,
+            // The bench reporter is the one reader of the per-segment scan
+            // timeline (issue #913): production leaves `SqlConfig::
+            // segment_timing` off, but this executor's whole job is to report
+            // it.
+            segment_timing: true,
             ..SqlConfig::default()
         },
         tenant_max_bytes.max(1),
