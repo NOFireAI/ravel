@@ -8,17 +8,28 @@
 //! query-worker set the PromQL distributed lane's [`crate::distrib`] router
 //! reads (written by the heartbeat loop under `sys/query/workers/`), filtered to
 //! the coordinator's protocol version and with the coordinator itself removed,
-//! and returns each remaining live worker's endpoint as a Flight location.
+//! and returns each remaining live worker's Flight SQL endpoint as a Flight
+//! location.
 //!
-//! # Why the fragment endpoint is the Flight location
+//! # Why the SQL lane dials `flight_sql_endpoint`, not `fragment_endpoint`
 //!
-//! A worker's [`QueryWorkerRecord::fragment_endpoint`] is the `host:port` of its
-//! cluster-internal gRPC listener. That one listener hosts BOTH the queryfrag
-//! `SeriesFetch` service (the PromQL distributed lane) AND the Flight SQL service
-//! (see the gRPC server builder in `lib.rs`, where both are added to the same
-//! `tonic::transport::Server`). So the registry's fragment endpoint is exactly
-//! where a worker's Flight `DoGet` also lives; the SQL lane needs no separate
-//! endpoint field.
+//! The two distributed lanes reach a worker over two different listeners, so the
+//! [`QueryWorkerRecord`] carries two addresses:
+//!
+//! - [`QueryWorkerRecord::fragment_endpoint`] is the queryfrag `SeriesFetch`
+//!   surface the PromQL lane dials. Under the ADR-0071 amendment (dedicated
+//!   fragment listener) it is the dedicated TLS listener, which serves the
+//!   `Pinned` `SeriesFetch` surface only and terminates TLS in-process.
+//! - [`QueryWorkerRecord::flight_sql_endpoint`] is the public gRPC listener,
+//!   which mounts Flight SQL (and OTLP) and is reached plaintext. This is where a
+//!   worker's Flight `DoGet` lives, so it is the location the SQL lane must dial.
+//!
+//! Before the amendment both surfaces shared one listener, so the SQL lane could
+//! reuse `fragment_endpoint`. With `--fragment-listener` set that stopped being
+//! true: `fragment_endpoint` names a TLS-only port that serves no Flight service,
+//! and dialing it plaintext for a Flight `DoGet` failed twice over (wrong scheme,
+//! and no service behind the port). The SQL lane therefore reads the separate
+//! `flight_sql_endpoint`.
 //!
 //! # Install seam
 //!
@@ -69,12 +80,14 @@ impl FleetWorkerEndpoints {
         }
     }
 
-    /// The Flight location for a worker record: its cluster-internal gRPC
-    /// listener, where the Flight SQL service is mounted alongside the queryfrag
-    /// surface. The `http://` scheme matches the plaintext channel the PromQL
-    /// coordinator dials the same listener over.
+    /// The Flight location for a worker record: its public gRPC listener
+    /// ([`QueryWorkerRecord::flight_sql_endpoint`]), where the Flight SQL `DoGet`
+    /// surface is mounted. Plaintext `http://`: the public gRPC listener does not
+    /// terminate TLS (only the dedicated fragment listener does, and it serves no
+    /// Flight service). NOT `fragment_endpoint`, which under `--fragment-listener`
+    /// is the TLS-only `SeriesFetch` port.
     fn location(record: &QueryWorkerRecord) -> String {
-        format!("http://{}", record.fragment_endpoint)
+        format!("http://{}", record.flight_sql_endpoint)
     }
 }
 
@@ -90,6 +103,14 @@ impl WorkerEndpoints for FleetWorkerEndpoints {
             // router drops it at routing time: dispatching a slice to a worker
             // that speaks a different protocol would fail the fetch.
             .filter(|record| record.protocol_version == PROTOCOL_VERSION)
+            // A record that advertises no Flight SQL endpoint is not a
+            // dispatchable SQL worker. This is a pre-amendment record (the field
+            // is `#[serde(default)]`, so an old writer's object decodes with an
+            // empty string): its Flight SQL lives on a public gRPC address this
+            // record does not carry, so dropping it here runs the query on the
+            // remaining workers, or fully local, rather than dialing "http://"
+            // and failing the slice.
+            .filter(|record| !record.flight_sql_endpoint.is_empty())
             // The coordinator serves its own slices through the local path
             // (ravel_sql::distributed::CoordinatorSliceReader, the last step of
             // the fan-out's failure sequence), so dispatching one to itself over
@@ -138,10 +159,16 @@ pub fn distributed_flight_config(
 mod tests {
     use super::*;
 
+    /// A record whose Flight SQL endpoint is `endpoint` and whose
+    /// `fragment_endpoint` is a DIFFERENT address, so a test that expects the SQL
+    /// location fails if `location` ever reads `fragment_endpoint` again (the
+    /// #1296 defect). The fragment endpoint is spelled as a TLS-only port to
+    /// mirror the `--fragment-listener` layout that produced the bug.
     fn record(process_id: &str, endpoint: &str, protocol_version: u32) -> QueryWorkerRecord {
         QueryWorkerRecord {
             process_id: process_id.to_string(),
-            fragment_endpoint: endpoint.to_string(),
+            fragment_endpoint: format!("{endpoint}-fragment-tls"),
+            flight_sql_endpoint: endpoint.to_string(),
             protocol_version,
             started_unix_ns: 0,
         }
@@ -233,6 +260,54 @@ mod tests {
             early.endpoints(),
             vec!["http://10.0.0.1:9000".to_string()],
             "an unpopulated self-id cell excludes nothing"
+        );
+    }
+
+    /// Regression for #1296: the SQL location is the worker's Flight SQL
+    /// endpoint (public gRPC), never its `fragment_endpoint` (the dedicated TLS
+    /// `SeriesFetch` listener under `--fragment-listener`, which serves no Flight
+    /// service). A record whose two endpoints differ pins which field is read.
+    #[test]
+    fn location_is_the_flight_sql_endpoint_not_the_fragment_endpoint() {
+        let current = PROTOCOL_VERSION;
+        let live: LiveWorkers = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
+            process_id: "a".to_string(),
+            // A dedicated TLS fragment listener address: TLS-only, no Flight.
+            fragment_endpoint: "10.0.0.1:9443".to_string(),
+            // The public gRPC listener where Flight SQL DoGet actually lives.
+            flight_sql_endpoint: "10.0.0.1:9000".to_string(),
+            protocol_version: current,
+            started_unix_ns: 0,
+        }])));
+        let endpoints = FleetWorkerEndpoints::new(live, no_self());
+        assert_eq!(
+            endpoints.endpoints(),
+            vec!["http://10.0.0.1:9000".to_string()],
+            "the SQL lane must dial the Flight SQL endpoint, not the fragment listener"
+        );
+    }
+
+    /// A worker that advertises no Flight SQL endpoint (a pre-amendment record,
+    /// `flight_sql_endpoint` defaulted empty) is dropped from the SQL roster
+    /// rather than dialed as `http://`.
+    #[test]
+    fn worker_without_flight_sql_endpoint_is_dropped() {
+        let current = PROTOCOL_VERSION;
+        let live: LiveWorkers = Arc::new(RwLock::new(Arc::new(vec![
+            QueryWorkerRecord {
+                process_id: "old".to_string(),
+                fragment_endpoint: "10.0.0.9:9443".to_string(),
+                flight_sql_endpoint: String::new(),
+                protocol_version: current,
+                started_unix_ns: 0,
+            },
+            record("new", "10.0.0.2:9000", current),
+        ])));
+        let endpoints = FleetWorkerEndpoints::new(live, no_self());
+        assert_eq!(
+            endpoints.endpoints(),
+            vec!["http://10.0.0.2:9000".to_string()],
+            "only the worker advertising a Flight SQL endpoint is dispatchable"
         );
     }
 

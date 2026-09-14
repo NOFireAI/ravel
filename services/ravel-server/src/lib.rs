@@ -2928,14 +2928,20 @@ pub async fn start(
     let query_worker_heartbeat: Option<QueryWorkerHeartbeat> =
         match (distributed.as_ref(), grpc_addr) {
             (Some(_), Some(addr)) => {
-                // Advertise the dedicated TLS fragment listener as the endpoint
-                // remote coordinators dial (ADR-0071 amendment decision 1 and section
-                // 3: `fragment_endpoint` now names the dedicated TLS listener). When
-                // no dedicated listener is configured, fall back to the public gRPC
-                // address, the pre-amendment behavior.
+                // Two endpoints, one per distributed lane (ADR-0071 amendment,
+                // decision 1). The PromQL lane's `SeriesFetch` moves to the
+                // dedicated TLS fragment listener when one is configured;
+                // otherwise it stays on the public gRPC address (pre-amendment).
+                // The SQL lane's Flight SQL `DoGet` always lives on the public
+                // gRPC listener (`addr`), which is never the TLS-only fragment
+                // listener, so it is advertised separately: dialing the fragment
+                // endpoint for a Flight `DoGet` reaches a port with no Flight
+                // service (issue #1296).
                 let fragment_endpoint = fragment_addr.unwrap_or(addr);
+                let flight_sql_endpoint = addr;
                 let workers = Arc::new(ravel_fleet::query_workers::QueryWorkers::with_defaults(
                     fragment_endpoint.to_string(),
+                    flight_sql_endpoint.to_string(),
                     ravel_query::distrib::codec::PROTOCOL_VERSION,
                 ));
                 // Ignore a set() race: `start` sets this exactly once, so the

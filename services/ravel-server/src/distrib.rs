@@ -2116,6 +2116,7 @@ mod tests {
             let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: "192.0.2.1:9".to_string(),
+                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: version,
                 started_unix_ns: 0,
             }])));
@@ -2188,6 +2189,7 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
+                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2196,6 +2198,7 @@ mod tests {
                 // Reserved-for-docs TEST-NET address that never accepts a
                 // connection, so any slice mapped here fails at transport.
                 fragment_endpoint: "192.0.2.1:9".to_string(),
+                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2306,12 +2309,14 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
+                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: "192.0.2.1:9".to_string(),
+                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2345,6 +2350,7 @@ mod tests {
         *live.write() = Arc::new(vec![QueryWorkerRecord {
             process_id: self_id.to_string(),
             fragment_endpoint: "127.0.0.1:1".to_string(),
+            flight_sql_endpoint: "127.0.0.1:1".to_string(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         }]);
@@ -2404,6 +2410,7 @@ mod tests {
         let self_record = QueryWorkerRecord {
             process_id: self_id.to_string(),
             fragment_endpoint: "127.0.0.1:1".to_string(),
+            flight_sql_endpoint: "127.0.0.1:1".to_string(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         };
@@ -2412,6 +2419,7 @@ mod tests {
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
+                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2503,6 +2511,7 @@ mod tests {
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
+                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 1_000,
             },
@@ -2554,12 +2563,14 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
+                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
+                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2655,6 +2666,7 @@ mod tests {
         let self_record = QueryWorkerRecord {
             process_id: self_id.to_string(),
             fragment_endpoint: "127.0.0.1:1".to_string(),
+            flight_sql_endpoint: "127.0.0.1:1".to_string(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         };
@@ -2663,6 +2675,7 @@ mod tests {
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
+                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2713,7 +2726,11 @@ mod tests {
     #[tokio::test]
     async fn worker_registration_appears_then_ages_out() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let workers = QueryWorkers::with_defaults("127.0.0.1:7000", codec::PROTOCOL_VERSION);
+        let workers = QueryWorkers::with_defaults(
+            "127.0.0.1:7000",
+            "127.0.0.1:7100",
+            codec::PROTOCOL_VERSION,
+        );
         let interval_ns =
             i64::try_from(workers.heartbeat_interval().as_nanos()).expect("interval fits i64");
 
@@ -2734,7 +2751,11 @@ mod tests {
         // Far past the staleness window (3x the interval by default): the record
         // is no longer live. `self` is always included by `live_set`, so read
         // from a different identity to observe the aged-out record's absence.
-        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION);
+        let observer = QueryWorkers::with_defaults(
+            "127.0.0.1:7001",
+            "127.0.0.1:7101",
+            codec::PROTOCOL_VERSION,
+        );
         let stale_now = 1_000 + interval_ns * 10;
         let live = observer
             .live_set(store.as_ref(), stale_now)
@@ -2773,12 +2794,14 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
+                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: "192.0.2.1:9".to_string(),
+                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
