@@ -8,6 +8,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`POST /api/v1/sql` now refuses a request body over 64 KiB, down from
+  1 MiB, and refuses any statement over 1,000 structural tokens** (issue
+  #1680). Both bounds return 400 on the HTTP surface, `InvalidArgument` on
+  Flight SQL, and a `validation` error on MCP. The token bound is a pre-parse
+  scan: a deep expression tree, which a flat operator chain can build without
+  nesting anywhere, previously reached the planner and aborted the process on
+  stack overflow, taking every tenant on the node with it. A statement that
+  now returns 400 was previously executed, so a generated or machine-built
+  statement near either bound is the case to check on upgrade. The token
+  count is not a character count: a literal, an identifier and a keyword each
+  cost one whatever their length, so quoting does not change the verdict.
+  `docs/query-engine.md` states how the bound is calibrated and
+  `docs/reference/http-api.md` documents the body cap.
 - **Retention no longer deletes a metric object whose format version this
   build's reader does not admit** (issue #530). The horizon-gated physical
   sweep probes each object's trailer first and distinguishes an unadmitted
