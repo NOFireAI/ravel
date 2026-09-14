@@ -208,7 +208,7 @@ pub enum ValidationError {
     )]
     ExcludedWindow { name: String },
 
-    /// The statement text carries more structural characters than
+    /// The statement text carries more structural tokens than
     /// [`MAX_STATEMENT_COMPLEXITY`](crate::complexity_guard::MAX_STATEMENT_COMPLEXITY),
     /// so it is refused before it is parsed (crate::complexity_guard, issue
     /// #1680). The message carries the two counts and nothing else of the
@@ -230,12 +230,14 @@ pub enum ValidationError {
 /// sees because same-precedence infix operators are consumed in a loop. Each
 /// covers a case the other does not, so neither is dropped because the other
 /// passed.
-const PARSER_RECURSION_LIMIT: usize = 50;
+pub(crate) const PARSER_RECURSION_LIMIT: usize = 50;
 
 /// Parse `sql` with the pinned recursion limit above.
 ///
-/// Every parse in this module goes through here so the limit cannot be set on
-/// one call site and inherited from the dependency's default on another.
+/// Every parse in this module goes through here, and the two production
+/// parses outside it (`crate::redact` and `crate::page_plan`) build their
+/// parser with the same constant, so the limit cannot be set on one call site
+/// and inherited from the dependency's default on another.
 fn parse_statements(sql: &str) -> Result<std::collections::VecDeque<DFStatement>, ValidationError> {
     DFParserBuilder::new(sql)
         .with_recursion_limit(PARSER_RECURSION_LIMIT)

@@ -155,7 +155,7 @@ fn every_clickbench_corpus_statement_is_accepted() {
 
 /// The parser's own recursion limit is the second bound, and it is pinned
 /// here because the complexity gate cannot stand in for it: 200 nested
-/// parentheses cost 400 structural characters, well under the bound, and the
+/// parentheses cost 400 structural tokens, well under the bound, and the
 /// parser must refuse them on its own. A statement nested just under the limit
 /// still parses, so this pins a limit rather than a blanket refusal.
 #[test]

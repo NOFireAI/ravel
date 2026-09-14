@@ -53,7 +53,18 @@
 //! - `'...'` string literals, closed by the next `'` (doubling a quote to
 //!   escape it reads as close-then-reopen, which excludes exactly the same
 //!   text). `GenericDialect::supports_string_literal_backslash_escape()` is
-//!   false, so a backslash escapes nothing here either.
+//!   false, so a backslash escapes nothing here either. That holds for a BARE
+//!   `'...'` only. Three prefixes move the end of the literal somewhere the
+//!   next `'` is not: `E'...'`/`e'...'` (`supports_string_escape_constant` is
+//!   true, so `\'` is an escaped quote), `X'...'`/`x'...'` (the hex arm passes
+//!   `backslash_escape = true` for every dialect), and
+//!   `q'...'`/`Q'...'`/`nq'...'` (`supports_quote_delimited_string` is true,
+//!   and the Oracle form ends at its matching delimiter followed by `'`, so
+//!   its body can hold a quote). A `'` after one of those prefix characters
+//!   therefore opens no exclusion region here: it costs its unit and its body
+//!   is counted as ordinary tokens. Measured before that fix, `SELECT E'\''`
+//!   followed by 1,100 `+1` terms scored 4 units and overflowed the stack
+//!   inside `SqlToRel::statement_to_plan`.
 //! - `"..."` and `` `...` `` delimited identifiers, which
 //!   `GenericDialect::is_delimited_identifier_start` accepts and which are
 //!   one token each.
@@ -62,9 +73,16 @@
 //!   `GenericDialect` is not one. Skipping them is not an optimization: a
 //!   scan that did not know about them would read the `'` inside
 //!   `$$ ' $$ 1+1+1...` as opening a string and skip the operator chain that
-//!   follows, which is exactly the unsound direction.
+//!   follows, which is exactly the unsound direction. Only a `$` that does
+//!   NOT follow an identifier character opens one, because
+//!   `GenericDialect::is_identifier_part` includes `$`: the tokenizer absorbs
+//!   `a$$` into one `Word` and opens nothing. Reading it as an opener sent the
+//!   scan looking for a closing `$$` an attacker simply omits, and `SELECT
+//!   a$$` followed by 4,000 `+1` terms scored 3 units.
 //! - `--` line comments, and `/* ... */` block comments, nested, because
-//!   `GenericDialect::supports_nested_comments()` is true.
+//!   `GenericDialect::supports_nested_comments()` is true. A `/*` whose `/`
+//!   follows another `/` opens neither, because `//` is one `DuckIntDiv`
+//!   token for this dialect and the `*` after it is `Mul`.
 //!
 //! One exclusion that is UNSOUND, and is therefore not made: `/*!...*/`. `GenericDialect::supports_multiline_comment_hints()` is true
 //! (sqlparser `dialect/generic.rs`), and the tokenizer re-tokenizes a block
@@ -93,6 +111,13 @@
 //! Every token costs one unit, whatever its length: a literal through its
 //! opening delimiter, an identifier or number through its first character.
 //!
+//! With one deliberate exception, in the strict direction. A multi-character
+//! operator is charged per character, so `||`, `<=`, `<>`, `!=` and `::` each
+//! cost two units where the tokenizer yields one token. That is part of why
+//! the two-units-per-level floor below holds for infix chains, and
+//! over-charging an operator can only refuse a statement the bound would
+//! otherwise admit, never the reverse.
+//!
 //! "Token" means what the tokenizer yields, not what looks like one word.
 //! `GenericDialect::supports_numeric_prefix()` is false, so `1AND` is
 //! `Number("1")` then `Word("AND")`, and the scan stops a digit run at the
@@ -111,16 +136,20 @@
 //! `std::thread::Builder::new().stack_size(2 << 20)` and growing each
 //! construct until the process aborted. Counts below are units as this module
 //! counts them, not raw bytes. They were measured under the earlier
-//! character-based rule, and every construct in the table is built from
-//! single-character operands and operators, so each figure is the same under
-//! the token rule; a table entry using multi-character operands would count
-//! lower today:
+//! character-based rule. The first two rows carry over unchanged: the binary
+//! chain is single-character throughout, and the concat row survives because
+//! `||` is two characters and one token while the scan charges operator
+//! characters individually, so it still costs the same. The boolean row does
+//! not carry over: its `AND` is three characters and one token, so its
+//! per-level cost fell from 6 to 4 and its four measured columns are scaled
+//! by 4/6 below. The level counts they were derived from are unchanged; only
+//! the unit figures move.
 //!
 //! | construct                             | units/level | `validate` survives | `validate` aborts | planner survives | planner aborts |
 //! |---------------------------------------|:-----------:|:-------------------:|:-----------------:|:----------------:|:--------------:|
 //! | `SELECT 1+1+1+...` (binary chain)     | 2           | 50,007              | 60,007            | 1,807            | 1,907          |
 //! | `SELECT 'a'\|\|'a'\|\|...` (concat)   | 3           | 75,007              | 90,007            | 2,707            | 3,307          |
-//! | `... WHERE 1=1 AND 1=1 AND ...`       | 6           | 120,026             | 240,026           | 6,626            | above 6,626    |
+//! | `... WHERE 1=1 AND 1=1 AND ...`       | 4           | 80,017              | 160,017           | 4,417            | above 4,417    |
 //! | `SELECT ((((1))))` (paren nesting)    | 2           | rejected by the parser recursion limit at depth 50 | | | |
 //! | `SELECT * FROM (SELECT * FROM (...))` | 13          | rejected by the parser recursion limit at depth 50 | | | |
 //!
@@ -133,11 +162,18 @@
 //!
 //! The margin is stated in levels rather than units, because that is
 //! what the stack spends: no construct costs fewer than two units per
-//! tree level (a claim that has been falsified once, by the numeric-prefix
-//! case above, and is load-bearing enough to be worth re-checking against the
-//! tokenizer whenever the run rule changes) (a binary operator and its right operand; parenthesis nesting
-//! also costs two and is capped by the parser's recursion limit long before
-//! this one bites), so a statement at [`MAX_STATEMENT_COMPLEXITY`] cannot
+//! tree level (a binary operator and its right operand). That claim has been
+//! falsified once, by the numeric-prefix case above, and is load-bearing
+//! enough to be worth re-checking against the tokenizer whenever the run rule
+//! changes. Two constructs sit below the floor and are excluded for the same
+//! reason parenthesis nesting is: a prefix unary chain (`SELECT NOT NOT NOT
+//! ... TRUE`, `SELECT - - - ... 1`) adds one `UnaryOp` level per token, so
+//! 1,000 units would buy 998 levels, but both descend through
+//! `parse_subexpr` and the pinned recursion limit of 50 refuses them first
+//! (measured: `recursion limit exceeded` for the minus chain, `Expected: end
+//! of statement, found: NOT` for the `NOT` chain). Parenthesis nesting costs
+//! two and is capped the same way, long before this guard bites. So a
+//! statement at [`MAX_STATEMENT_COMPLEXITY`] cannot
 //! reach more than 500 levels against the ~950 measured to abort. Worst case,
 //! an admitted statement can use a little over half the 2 MiB budget, leaving
 //! the rest for the frames below it (the axum/tower/hyper or tonic stack, on
@@ -341,7 +377,16 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                 // resumes `Normal` sooner and counts more text as top-level
                 // structure. Running past it counts every remaining character.
                 // Neither can admit a statement the tokenizer sees as deeper.
-                if rest.starts_with("/*!") {
+                // A `/*` whose `/` follows another `/` opens no comment for
+                // this dialect: `//` is a single `DuckIntDiv` token
+                // (`dialect_of!(self is DuckDbDialect | GenericDialect)`), so
+                // the `*` after it is `Mul` and the region that follows is
+                // ordinary structure. Entering a comment here would skip it.
+                // Declining to enter costs an over-count of a real comment
+                // that happens to sit after a division, which is the safe
+                // direction.
+                let after_slash = preceding_char(sql, at) == Some('/');
+                if !after_slash && rest.starts_with("/*!") {
                     count += 3;
                     if count > stop_above {
                         return count;
@@ -350,7 +395,7 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                     mode = Mode::Hint(1);
                     continue;
                 }
-                if rest.starts_with("/*") {
+                if !after_slash && rest.starts_with("/*") {
                     mode = Mode::BlockComment(1);
                     skip = 1;
                     continue;
@@ -376,11 +421,53 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                     return count;
                 }
 
+                // A single-quoted region ends at the next `'` only for a bare
+                // `'...'`. Three prefixes change where the tokenizer ends it,
+                // and all three are live on `GenericDialect`:
+                //
+                // - `E'...'` / `e'...'`: `supports_string_escape_constant` is
+                //   true, so `\'` is an escaped quote rather than a terminator.
+                // - `X'...'` / `x'...'`: the hex-literal arm passes
+                //   `backslash_escape = true` for every dialect.
+                // - `q'...'` / `Q'...'` (and the `nq`/`NQ` spelling):
+                //   `supports_quote_delimited_string` is true, and the Oracle
+                //   form ends at its matching delimiter followed by `'`, so its
+                //   body can contain a quote.
+                //
+                // Each shifts the scan's quote parity against the tokenizer's,
+                // which puts the rest of the statement inside a literal the
+                // scan thinks it is outside of, or the reverse. `E'\''` +
+                // 1,100 `+1` terms scored 4 units and overflowed the stack in
+                // `SqlToRel::statement_to_plan`.
+                //
+                // So a `'` that follows one of those prefix characters opens no
+                // literal here: it costs its unit and the body is counted as
+                // ordinary tokens. That over-counts a real escape or hex
+                // literal, and over-counting never admits a statement the
+                // tokenizer sees as deeper.
+                if c == '\''
+                    && matches!(
+                        preceding_char(sql, at),
+                        Some('E' | 'e' | 'X' | 'x' | 'q' | 'Q')
+                    )
+                {
+                    continue;
+                }
                 if c == '\'' || c == '"' || c == '`' {
                     mode = Mode::Quoted(c);
                     continue;
                 }
+                // `$` is an identifier part for this dialect, so a `$` that
+                // follows one is absorbed into the preceding `Word` and opens
+                // no dollar-quoted string. The run rule below consumes it for
+                // that reason; this guard is the second half, for a `$` the
+                // run rule cannot reach (the character before it is an
+                // identifier part but not the start of a run this iteration
+                // consumed). Opening `Mode::Dollar` on one of those swallows
+                // the rest of the statement up to a terminator an attacker
+                // simply omits: `SELECT a$$` + 4,000 `+1` terms scored 3.
                 if c == '$'
+                    && !preceding_char(sql, at).is_some_and(is_identifier_part)
                     && let Some(end) = dollar_delimiter(rest)
                 {
                     skip = end.chars().count() - 1;
@@ -412,7 +499,7 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                         rest.find(|ch: char| !ch.is_ascii_digit())
                             .unwrap_or(rest.len())
                     } else {
-                        rest.find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                        rest.find(|ch: char| !is_identifier_part(ch))
                             .unwrap_or(rest.len())
                     };
                     skip = rest[..run].chars().count() - 1;
@@ -422,6 +509,27 @@ fn scan(sql: &str, stop_above: usize) -> usize {
     }
 
     count
+}
+
+/// The character immediately before byte offset `at`, or `None` at the start
+/// of the statement.
+///
+/// Three rules in `scan` depend on what precedes the character being read,
+/// because the tokenizer's do: a `'` after `E`/`X`/`q` is not a plain string
+/// opener, a `$` after an identifier character is part of the identifier, and
+/// a `/*` after a `/` is not a comment.
+fn preceding_char(sql: &str, at: usize) -> Option<char> {
+    sql[..at].chars().next_back()
+}
+
+/// `GenericDialect::is_identifier_part`, which decides where a `Word` ends.
+///
+/// The scan's run rule has to stop exactly where this does. Stopping earlier
+/// charges one unit for what the tokenizer reads as one token and then reads
+/// the remainder as new structure, which is how `$` used to open a
+/// dollar-quoted string in the middle of an identifier.
+fn is_identifier_part(ch: char) -> bool {
+    ch.is_alphabetic() || ch.is_ascii_digit() || ch == '@' || ch == '$' || ch == '#' || ch == '_'
 }
 
 /// The closing delimiter of the dollar-quoted string opening at the start of
@@ -548,6 +656,112 @@ mod tests {
         let sql = format!("SELECT $tag$ ' $tag${chain}");
         let err = check(&sql).expect_err("the chain after the dollar string is structure");
         assert_eq!(err.count, MAX_STATEMENT_COMPLEXITY + 1);
+    }
+
+    /// A `$` that follows an identifier character opens no dollar-quoted
+    /// string, because `GenericDialect::is_identifier_part` includes `$` and
+    /// the tokenizer absorbs it into the preceding `Word`. A scan that opened
+    /// one there would run to a closing delimiter the statement never
+    /// contains, skipping everything after it.
+    ///
+    /// Measured before the fix: `SELECT a$$` + 4,000 `+1` terms scored 3 units
+    /// and planned as a column reference over a 4,000-level `BinaryOp` spine.
+    /// Every `<identifier char>$$` and `<identifier char>$tag$` spelling is
+    /// the same door.
+    ///
+    /// Flip to watch it fail: drop the `!preceding_char(..).is_some_and(
+    /// is_identifier_part)` term from the `$` arm in `scan` AND restore the
+    /// run rule to `is_alphanumeric() || '_'`. Either alone is caught by the
+    /// other, which is why both are asserted here.
+    #[test]
+    fn a_dollar_inside_an_identifier_cannot_hide_an_operator_chain() {
+        let chain = "+1".repeat(MAX_STATEMENT_COMPLEXITY);
+        for opener in ["a$$", "a$t$", "a1$$", "_x$tag$"] {
+            let sql = format!("SELECT {opener}{chain}");
+            let count = check(&sql)
+                .expect_err("the chain is structure, not a hidden literal")
+                .count;
+            assert!(
+                count > MAX_STATEMENT_COMPLEXITY,
+                "{opener}: the chain is structure, got {count} units"
+            );
+        }
+
+        // The control: a real dollar quote, whitespace-preceded, still opens
+        // and still hides its own body. Losing that would mean the guard had
+        // stopped modelling the tokenizer in the other direction.
+        let sql = format!("SELECT $$ {chain} $$");
+        check(&sql).expect("a genuine dollar-quoted body is one token");
+    }
+
+    /// A `'` that follows `E`, `X` or `q` is not a plain string opener for
+    /// this dialect, and each prefix ends the literal somewhere the next `'`
+    /// is not: `supports_string_escape_constant` and the hex arm both make
+    /// `\'` an escaped quote, and `supports_quote_delimited_string` lets the
+    /// Oracle form carry a quote in its body. A scan using the plain rule
+    /// takes the opposite quote parity to the tokenizer from there on.
+    ///
+    /// Measured before the fix, each of these at 4,000 terms scored 4 or 5
+    /// units and was accepted; `E'\''` with 1,100 terms overflowed the stack
+    /// inside `SqlToRel::statement_to_plan`.
+    ///
+    /// Flip to watch it fail: drop the prefix arm before `Mode::Quoted` in
+    /// `scan`.
+    #[test]
+    fn a_prefixed_string_literal_cannot_hide_an_operator_chain() {
+        let chain = "+1".repeat(MAX_STATEMENT_COMPLEXITY);
+        for opener in ["E'\\''", "e'\\''", "X'\\''", "x'\\''", "q'[' ]'", "Q'[' ]'"] {
+            let sql = format!("SELECT {opener}{chain}");
+            let count = check(&sql)
+                .expect_err("the chain after the prefixed literal is structure")
+                .count;
+            assert!(
+                count > MAX_STATEMENT_COMPLEXITY,
+                "{opener}: the chain after it is structure, got {count} units"
+            );
+        }
+
+        // The control: a bare literal is still one token and still hides its
+        // body, which is what keeps a large IN list of strings affordable.
+        let sql = format!("SELECT '{}'", "+1".repeat(MAX_STATEMENT_COMPLEXITY));
+        check(&sql).expect("a bare string literal is one token");
+    }
+
+    /// `//` is one `DuckIntDiv` token for this dialect, so the `*` after it is
+    /// `Mul` and `//*` opens no block comment. A scan that entered one would
+    /// skip to a `*/` the tokenizer never looks for.
+    ///
+    /// No deep payload exists for this today: every spelling tried is a parse
+    /// error (`Expected: an expression, found: *`). It is closed anyway
+    /// because it is the same defect as the two above, and because a future
+    /// sqlparser release that makes `x // * y` parse would turn it into one.
+    ///
+    /// Flip to watch it fail: drop the `!after_slash` terms in `scan`.
+    #[test]
+    fn a_double_slash_does_not_open_a_block_comment() {
+        // Six tokens to the tokenizer: DuckIntDiv, Mul, Gt, Mul, Mul, Div.
+        // The old scan read this as one unit plus an opened comment.
+        assert!(
+            scan("//*>**/", usize::MAX) > 1,
+            "the region after `//` is structure, got {}",
+            scan("//*>**/", usize::MAX)
+        );
+
+        let chain = "+1".repeat(MAX_STATEMENT_COMPLEXITY);
+        let sql = format!("SELECT 1//*{chain}");
+        let count = check(&sql)
+            .expect_err("the chain after `//*` is structure")
+            .count;
+        assert!(
+            count > MAX_STATEMENT_COMPLEXITY,
+            "the chain after `//*` is structure, got {count} units"
+        );
+
+        // The control: a real block comment after a single `/` is still a
+        // comment, so ordinary `a / b /* note */` keeps costing nothing for
+        // its note.
+        let sql = format!("SELECT 1 / 2 /* {chain} */");
+        check(&sql).expect("a block comment after a single slash is still a comment");
     }
 
     /// A `/*!...*/` hint comment cannot hide an operator chain. This dialect
@@ -760,7 +974,7 @@ mod tests {
     }
 
     /// Whitespace is free, so a statement formatted across many lines is not
-    /// penalised for its formatting: the same seven units
+    /// penalised for its formatting: the same two units (`SELECT` and `1`)
     /// pass however much whitespace surrounds them, and adding whitespace to
     /// a statement already at the bound does not push it over.
     #[test]
