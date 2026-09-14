@@ -281,7 +281,11 @@ case "$*" in
   *"/pulls/"*"/reviews"*)   cat "${FIXTURES}/reviews.json" ;;
   *"/issues/"*"/comments"*) cat "${FIXTURES}/issue-comments.json" ;;
   *"/pulls/"*"/comments"*)  cat "${FIXTURES}/review-comments.json" ;;
-  *"/rules/branches/"*)     echo "gh rules" >>"${FIXTURES}/calls.log"; cat "${FIXTURES}/rules.json" ;;
+  *"/rules/branches/"*)
+    for a in "$@"; do case "$a" in *"/rules/branches/"*) echo "$a" >>"${FIXTURES}/rules-path.log" ;; esac; done
+    echo "gh rules" >>"${FIXTURES}/calls.log"
+    [[ "$(cat "${FIXTURES}/rules.json")" == "GH_FAILS" ]] && exit 1
+    cat "${FIXTURES}/rules.json" ;;
   *) echo "unexpected gh call: $*" >&2; exit 90 ;;
 esac
 SHIM
@@ -374,6 +378,7 @@ e2e() {
       "${rollup}" "${SHA}" >"${fx}/pr-view.json"
   fi
   : >"${fx}/calls.log"
+  : >"${fx}/rules-path.log"
   printf '%s\n' "${E2E_REVIEWS:-$(printf '[{"user":{"login":"%s"},"state":"%s","commit_id":"%s","body":%s}]' \
     "${BOT}" "${E2E_REVIEW_STATE:-COMMENTED}" "${SHA}" "${review_body}")}" >"${fx}/reviews.json"
   printf '%s\n' "${E2E_ISSUE_COMMENTS:-${DONE_TASK_COMMENT}}" >"${fx}/issue-comments.json"
@@ -701,9 +706,18 @@ export E2E_GIT_STALE=1
 queued_out="$(E2E_RULES="${QUEUE_RULES}" e2e "${CLEAN_BODY_JSON}")"
 unset E2E_GIT_STALE
 
-check_eq "#1758 queue present: a stale base does not refuse" \
+# Greps for `rebase` ANYWHERE in the block, not for one exact sentence. The
+# first version of this looked for "rebase and let CI re-run before merging"
+# while the guard's own closing line says "rebase onto origin/main and let CI
+# re-run before merging" -- four words apart, so it counted 0 and passed while
+# the block told the operator to rebase.
+# Any line MENTIONING rebase that is not the merge command itself (whose
+# --rebase flag is the merge method, not advice). Broad on purpose: the first
+# version matched one exact sentence four words off the guard's own wording, so
+# it counted 0 and passed while the block told the operator to rebase.
+check_eq "#1758 queue present: no line advises a rebase" \
   "0" \
-  "$(printf '%s\n' "${queued_out}" | grep -c 'rebase and let CI re-run before merging')"
+  "$(printf '%s\n' "${queued_out}" | grep -i 'rebase' | grep -v 'gh pr merge' | wc -l | tr -d ' ')"
 check_eq "#1758 queue present: the merge command is offered, pinned to the head" \
   "  -> gh pr merge 908 --rebase --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${queued_out}" | grep '^  -> gh pr merge')"
@@ -717,9 +731,14 @@ check_eq "#1758 queue present: the reader is still pointed at an unrecognised ba
   "$(printf '%s\n' "${queued_out}" | grep -c 'do not recognise')"
 # The printed command must NOT re-run the guard, which would refuse on exactly
 # the behind-ness the queue handles. That was the bug.
-check_eq "#1758 queue present: the printed command does not re-run the guard" \
+# Anchored on CONTENT, not on the line start. The first version grepped
+# `^  -> gh pr merge` and then counted `assert-fresh-merge-base` within it;
+# restoring the guard prefix changes that line to `  -> scripts/guards/...`,
+# which no longer matches the anchor, so the inner grep counted 0 on empty
+# input and the case passed under the exact revert it names.
+check_eq "#1758 queue present: the guard is not re-run anywhere in the output" \
   "0" \
-  "$(printf '%s\n' "${queued_out}" | grep '^  -> gh pr merge' | grep -c 'assert-fresh-merge-base')"
+  "$(printf '%s\n' "${queued_out}" | grep -c 'assert-fresh-merge-base')"
 
 # Fails closed. A queue is only believed when the rules were actually read; a
 # guard that could not run at all still blocks even with a queue, because
@@ -745,6 +764,47 @@ check_eq "#1758 a closed PR is answered without touching git or the rules API" \
 check_eq "#1758 a closed PR still gets its own verdict" \
   "  -> PR is MERGED, not open; nothing to merge" \
   "$(printf '%s\n' "${closed_out}" | sed -n 2p)"
+
+# "Could not ask" is not "there is no queue". Both block, which is the safe
+# direction, but only one of them is a diagnosis the operator can act on: a
+# failed rules lookup must not hand back the pre-#1758 advice looking exactly
+# like the ordinary no-queue path. Neither failure path was pinned before.
+export E2E_GIT_STALE=1
+rules_api_down_out="$(E2E_RULES="GH_FAILS" e2e "${CLEAN_BODY_JSON}")"
+rules_unparseable_out="$(E2E_RULES="not json at all" e2e "${CLEAN_BODY_JSON}")"
+unset E2E_GIT_STALE
+for pair in "rules_api_down:${rules_api_down_out}" "rules_unparseable:${rules_unparseable_out}"; do
+  name="${pair%%:*}"; out="${pair#*:}"
+  check_eq "#1758 ${name}: the stale base still blocks" \
+    "1" \
+    "$(printf '%s\n' "${out}" | grep -c 'merge base is behind origin/main')"
+  check_eq "#1758 ${name}: and says the queue check did not answer" \
+    "1" \
+    "$(printf '%s\n' "${out}" | grep -c 'could not read the base branch.s rules')"
+  check_eq "#1758 ${name}: no merge command is offered" \
+    "0" \
+    "$(printf '%s\n' "${out}" | grep -c 'gh pr merge')"
+done
+
+# base_ref: the point of reading baseRefName is asking about the PR's OWN base,
+# which no case exercised because the fixture never carried the field and the
+# shim matched any path. Assert the branch actually asked about.
+main_base_json='{"state":"OPEN","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}],"headRefOid":"'"${SHA}"'","baseRefName":"main"}'
+slash_base_json='{"state":"OPEN","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}],"headRefOid":"'"${SHA}"'","baseRefName":"release/1.2"}'
+export E2E_GIT_STALE=1
+E2E_PR_VIEW="${main_base_json}" E2E_RULES="${QUEUE_RULES}" e2e "${CLEAN_BODY_JSON}" >/dev/null
+main_path="$(cat "${E2E_DIR}/fx/rules-path.log")"
+E2E_PR_VIEW="${slash_base_json}" E2E_RULES="${QUEUE_RULES}" e2e "${CLEAN_BODY_JSON}" >/dev/null
+slash_path="$(cat "${E2E_DIR}/fx/rules-path.log")"
+unset E2E_GIT_STALE
+check_eq "#1758 base_ref: asks about the PR's own base branch" \
+  "repos/NOFireAI/ravel/rules/branches/main" \
+  "${main_path}"
+# A branch name with a slash must be encoded, or the request addresses a
+# different path entirely and 404s, which would read as "no queue".
+check_eq "#1758 base_ref: a slash in the branch name is encoded" \
+  "repos/NOFireAI/ravel/rules/branches/release%2F1.2" \
+  "${slash_path}"
 # The stand-in git puts an escape sequence and a carriage return in the first
 # unseen subject. Both must be gone by the time the text is printed: a subject
 # is attacker-controlled and this output is what the operator reads before
