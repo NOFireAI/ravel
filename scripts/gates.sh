@@ -168,6 +168,13 @@ echo "==> scripts/guards/check-test-hygiene.sh"
 echo "==> scripts/check-injected-clock-helpers.sh"
 "$(dirname "$0")/check-injected-clock-helpers.sh"
 
+# Format-lifecycle docs drifted from the shipped reader once already (issue
+# #531). This ties each bulk-format doc's declared supported-version marker to
+# its crate's SUPPORTED_VERSIONS. A source scan, no build, and it runs its own
+# mismatch self-check first so it cannot go vacuous.
+echo "==> scripts/check_format_version_docs.py"
+python3 "$(dirname "$0")/check_format_version_docs.py"
+
 # The flag-doc overclaim guard defined above, in the ordinary gate run: a source
 # scan, no build, so it fails before the expensive lanes.
 echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"

@@ -7,6 +7,11 @@ reader accepts: ADR-0892 deleted the version-3 reader, and version 2 (which
 added the footer's compaction-identity fields) and version 1 (the format-only
 initial release) were retired the same way before it.
 
+<!-- reader-supported-versions: ravel_logseg = 4 -->
+<!-- Checked against ravel_logseg::footer::SUPPORTED_VERSIONS by
+     scripts/check_format_version_docs.py; keep it in step with the current
+     trailer version above when the reader window changes. -->
+
 Version 4 changed the BLOCKS layout, deleted the per-block header, and
 redefined the SKIP_IDX level-0 block crc, so it was a versioned change rather
 than the additive kind ADR-0029's carve-out excepts -- whatever PAGE_DIR's own

@@ -91,7 +91,12 @@ body text, but it cannot browse the lines themselves. Reading log lines is
 SQL's job. If you need write acknowledgement in single-digit milliseconds, strict
 mode pays an object-store round trip and buffered mode gives up the crash guarantee
 above. Ravel is pre-1.0: the persistent formats are versioned contracts, and the
-surfaces around them still move.
+surfaces around them still move. A format bump is currently a non-rollbackable,
+forward-only data-migration event: the reader admits one on-object version at a
+time, so once data is written at a new version, a build that predates the bump
+cannot read it. Treat a format upgrade as one-way until a released version
+declares the format stable. See the segment, log, and span format specs for the
+exact posture.
 
 ## What works
 
