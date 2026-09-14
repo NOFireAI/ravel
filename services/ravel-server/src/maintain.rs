@@ -864,6 +864,24 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                                  live set (fail-open, ADR-0065 decision 1)"
                             ),
                         }
+                        // Reap here rather than on its own cadence: this tick
+                        // already lists the same prefix for `live_set`, so the
+                        // delete costs no extra LIST. Without it the mtime skip
+                        // above bounds the GET cost and nothing bounds the LIST,
+                        // which is the second of #1679's two bounds. A failure
+                        // is not fatal: the keys are still skipped by mtime and
+                        // the next tick tries again.
+                        match worker.reap_dead_workers(store.as_ref(), now).await {
+                            Ok(0) => {}
+                            Ok(reaped) => tracing::info!(
+                                reaped,
+                                "maintenance: reaped dead worker heartbeat keys"
+                            ),
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                "maintenance: worker heartbeat reap failed; retried next interval"
+                            ),
+                        }
                     }
                     _ = &mut heartbeat_shutdown_rx => return,
                 }
