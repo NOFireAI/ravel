@@ -2276,6 +2276,24 @@ async fn dataset_info(
 
 /// Run the generated lane: build a wide-schema logs dataset in process, install
 /// the corpus's declared-column union, and measure every statement.
+/// The `*_effective` provenance for one ADR-1195 knob.
+///
+/// `in_process` is false on the Flight lane, where the override never left this
+/// process and the server's own config governed the quantity: unknown here, so
+/// `None` rather than a guess.
+///
+/// The fallback clamps, because `cold_executor` stores `fetch_concurrency` as
+/// `.max(1)` and `EngineConfig` resolves against that clamped value. Reporting
+/// the raw figure makes `--fetch-concurrency 0` print `effective = 0` beside a
+/// `fetch_concurrency` field of 1, describing a run that did not happen.
+fn knob_effective(
+    in_process: bool,
+    requested: Option<usize>,
+    fetch_concurrency: usize,
+) -> Option<usize> {
+    in_process.then(|| requested.unwrap_or(fetch_concurrency).max(1))
+}
+
 pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Error> {
     // Unique tenant per run so repeated runs against one shared bucket never
     // read each other's objects (mirrors the other bench cores).
@@ -2357,13 +2375,17 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             // Generate is always in process: the requested override (if any),
             // else `fetch_concurrency`, reaches `EngineConfig` directly, so it
             // is also the effective value.
-            sql_partition_count_effective: Some(
-                cfg.sql_partition_count.unwrap_or(cfg.fetch_concurrency),
+            sql_partition_count_effective: knob_effective(
+                true,
+                cfg.sql_partition_count,
+                cfg.fetch_concurrency,
             ),
             store_get_concurrency_requested: cfg.store_get_concurrency,
             // Same reasoning as `sql_partition_count_effective` above.
-            store_get_concurrency_effective: Some(
-                cfg.store_get_concurrency.unwrap_or(cfg.fetch_concurrency),
+            store_get_concurrency_effective: knob_effective(
+                true,
+                cfg.store_get_concurrency,
+                cfg.fetch_concurrency,
             ),
             logs_request_cost_bytes_requested: cfg
                 .logs_request_cost_bytes
@@ -2551,16 +2573,18 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             // above, so on the Flight lane this override never left the
             // process and the server's own config governed `target_partitions`
             // instead, unknown to this process.
-            sql_partition_count_effective: match &cfg.flight {
-                Some(_) => None,
-                None => Some(cfg.sql_partition_count.unwrap_or(cfg.fetch_concurrency)),
-            },
+            sql_partition_count_effective: knob_effective(
+                cfg.flight.is_none(),
+                cfg.sql_partition_count,
+                cfg.fetch_concurrency,
+            ),
             store_get_concurrency_requested: cfg.store_get_concurrency,
             // Same reasoning as `sql_partition_count_effective` above.
-            store_get_concurrency_effective: match &cfg.flight {
-                Some(_) => None,
-                None => Some(cfg.store_get_concurrency.unwrap_or(cfg.fetch_concurrency)),
-            },
+            store_get_concurrency_effective: knob_effective(
+                cfg.flight.is_none(),
+                cfg.store_get_concurrency,
+                cfg.fetch_concurrency,
+            ),
             logs_request_cost_bytes_requested: cfg
                 .logs_request_cost_bytes
                 .unwrap_or(DEFAULT_LOG_REQUEST_COST_BYTES),
@@ -5883,6 +5907,44 @@ mod tests {
             "a tenant with a real compaction over its bucket must report \
              post-compaction, derived from the resolved snapshot's L1 segments, \
              not echoed from an operator flag"
+        );
+    }
+
+    /// The Flight lane cannot observe what the remote server resolved, so its
+    /// `*_effective` provenance must be absent rather than this process's own
+    /// fallback. The PR advertising that behaviour is what makes it a claim,
+    /// and a claim needs an assertion.
+    ///
+    /// The clamp arm is the second claim: `cold_executor` stores
+    /// `fetch_concurrency` as `.max(1)`, so a report saying `effective = 0`
+    /// beside a `fetch_concurrency` of 1 would describe a run that did not
+    /// happen. Dropping `.max(1)` from `knob_effective` fails the last case.
+    #[test]
+    fn knob_effective_is_absent_off_process_and_clamped_on_it() {
+        assert_eq!(
+            knob_effective(false, Some(5), 8),
+            None,
+            "the Flight lane never learns what the server resolved"
+        );
+        assert_eq!(
+            knob_effective(false, None, 8),
+            None,
+            "absent off-process even when this process has a fallback to offer"
+        );
+        assert_eq!(
+            knob_effective(true, Some(5), 8),
+            Some(5),
+            "an explicit override resolves independently of fetch_concurrency"
+        );
+        assert_eq!(
+            knob_effective(true, None, 6),
+            Some(6),
+            "an omitted override falls back to fetch_concurrency"
+        );
+        assert_eq!(
+            knob_effective(true, None, 0),
+            Some(1),
+            "the fallback clamps the way cold_executor and EngineConfig do"
         );
     }
 
