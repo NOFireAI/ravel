@@ -618,6 +618,7 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
     let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
         process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
         fragment_endpoint: a_grpc.to_string(),
+        flight_sql_endpoint: a_grpc.to_string(),
         protocol_version: codec::PROTOCOL_VERSION,
         started_unix_ns: 0,
     }])));
@@ -1227,18 +1228,21 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
         QueryWorkerRecord {
             process_id: a_id.to_string(),
             fragment_endpoint: a_endpoint.clone(),
+            flight_sql_endpoint: a_endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
         QueryWorkerRecord {
             process_id: b_id.to_string(),
             fragment_endpoint: b_endpoint.clone(),
+            flight_sql_endpoint: b_endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
         QueryWorkerRecord {
             process_id: c_id.to_string(),
             fragment_endpoint: c_endpoint.clone(),
+            flight_sql_endpoint: c_endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
@@ -1403,6 +1407,7 @@ async fn version_mismatch_falls_back_to_local() {
         process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
         // Reserved TEST-NET address that never accepts a connection.
         fragment_endpoint: "192.0.2.1:9".to_string(),
+        flight_sql_endpoint: "192.0.2.1:9".to_string(),
         protocol_version: codec::PROTOCOL_VERSION + 1,
         started_unix_ns: 0,
     }])));
@@ -1523,12 +1528,14 @@ async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
     let live = Arc::new(RwLock::new(Arc::new(vec![
         QueryWorkerRecord {
             process_id: a_id.to_string(),
+            flight_sql_endpoint: a_endpoint.clone(),
             fragment_endpoint: a_endpoint,
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
         QueryWorkerRecord {
             process_id: b_id.to_string(),
+            flight_sql_endpoint: b_endpoint.clone(),
             fragment_endpoint: b_endpoint,
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
@@ -1695,6 +1702,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
     let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
         process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
         fragment_endpoint: y_grpc.to_string(),
+        flight_sql_endpoint: y_grpc.to_string(),
         protocol_version: codec::PROTOCOL_VERSION,
         started_unix_ns: 0,
     }])));
@@ -1840,12 +1848,14 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
         QueryWorkerRecord {
             process_id: a_id.to_string(),
             fragment_endpoint: a_endpoint.clone(),
+            flight_sql_endpoint: a_endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
         QueryWorkerRecord {
             process_id: b_id.to_string(),
             fragment_endpoint: b_endpoint.clone(),
+            flight_sql_endpoint: b_endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },

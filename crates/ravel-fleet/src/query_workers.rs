@@ -72,8 +72,22 @@ fn process_id_of(key: &str) -> Option<Uuid> {
 ///
 /// - `process_id`: the writing process's UUID as a string, matching the
 ///   `<process_id>` in the object key.
-/// - `fragment_endpoint`: where this worker serves the `queryfrag` fetch
-///   surface (host:port); how a coordinator reaches it to dispatch a slice.
+/// - `fragment_endpoint`: where this worker serves the `queryfrag` `SeriesFetch`
+///   surface (host:port); how the PromQL distributed lane reaches it to dispatch
+///   a slice. Under the ADR-0071 amendment (dedicated fragment listener) this is
+///   the dedicated TLS listener address, reached over TLS; without one it is the
+///   public gRPC listener address, reached plaintext.
+/// - `flight_sql_endpoint`: where this worker serves the Flight SQL `DoGet`
+///   surface (host:port); how the SQL distributed lane reaches it to fetch a
+///   slice. This is the public gRPC listener, which mounts Flight SQL alongside
+///   OTLP and is dialed plaintext. It is a SEPARATE field from
+///   `fragment_endpoint` because the two surfaces no longer share one listener:
+///   after the amendment the dedicated fragment listener serves the `SeriesFetch`
+///   `Pinned` surface only (TLS), and Flight SQL stays on the public gRPC
+///   listener, so the SQL lane must dial the public address rather than the
+///   fragment one (see `services/ravel-server/src/sql_distrib.rs`). Added
+///   additively: `#[serde(default)]` decodes a pre-amendment record that never
+///   carried the field to an empty string, which the SQL roster drops.
 /// - `protocol_version`: the `queryfrag` protocol version this worker speaks,
 ///   for the ADR-0071 version-skew fallback.
 /// - `started_unix_ns`: the liveness timestamp (see the [module docs](self)),
@@ -82,6 +96,8 @@ fn process_id_of(key: &str) -> Option<Uuid> {
 pub struct QueryWorkerRecord {
     pub process_id: String,
     pub fragment_endpoint: String,
+    #[serde(default)]
+    pub flight_sql_endpoint: String,
     pub protocol_version: u32,
     pub started_unix_ns: i64,
 }
@@ -107,6 +123,7 @@ impl QueryWorkerRecord {
 pub struct QueryWorkers {
     process_id: Uuid,
     fragment_endpoint: String,
+    flight_sql_endpoint: String,
     protocol_version: u32,
     heartbeat_interval: Duration,
     liveness_factor: u32,
@@ -115,8 +132,13 @@ pub struct QueryWorkers {
 impl QueryWorkers {
     /// A query worker with an explicit timing configuration. `liveness_factor`
     /// is clamped to at least 1, matching [`crate::worker_set::WorkerSet::new`].
+    ///
+    /// `fragment_endpoint` is the `queryfrag` `SeriesFetch` address the PromQL
+    /// lane dials; `flight_sql_endpoint` is the public gRPC address the SQL lane
+    /// dials for Flight SQL `DoGet` (see [`QueryWorkerRecord`]).
     pub fn new(
         fragment_endpoint: impl Into<String>,
+        flight_sql_endpoint: impl Into<String>,
         protocol_version: u32,
         heartbeat_interval: Duration,
         liveness_factor: u32,
@@ -124,6 +146,7 @@ impl QueryWorkers {
         QueryWorkers {
             process_id: Uuid::new_v4(),
             fragment_endpoint: fragment_endpoint.into(),
+            flight_sql_endpoint: flight_sql_endpoint.into(),
             protocol_version,
             heartbeat_interval,
             liveness_factor: liveness_factor.max(1),
@@ -132,9 +155,14 @@ impl QueryWorkers {
 
     /// A query worker with the ADR-0065 heartbeat defaults (`H = 60s`, `3 * H`
     /// liveness window) reused for the query role.
-    pub fn with_defaults(fragment_endpoint: impl Into<String>, protocol_version: u32) -> Self {
+    pub fn with_defaults(
+        fragment_endpoint: impl Into<String>,
+        flight_sql_endpoint: impl Into<String>,
+        protocol_version: u32,
+    ) -> Self {
         Self::new(
             fragment_endpoint,
+            flight_sql_endpoint,
             protocol_version,
             DEFAULT_HEARTBEAT_INTERVAL,
             DEFAULT_LIVENESS_FACTOR,
@@ -147,9 +175,16 @@ impl QueryWorkers {
         self.process_id
     }
 
-    /// The `queryfrag` endpoint this worker advertises.
+    /// The `queryfrag` `SeriesFetch` endpoint this worker advertises (PromQL
+    /// distributed lane).
     pub fn fragment_endpoint(&self) -> &str {
         &self.fragment_endpoint
+    }
+
+    /// The Flight SQL `DoGet` endpoint this worker advertises (SQL distributed
+    /// lane): its public gRPC listener.
+    pub fn flight_sql_endpoint(&self) -> &str {
+        &self.flight_sql_endpoint
     }
 
     /// The `queryfrag` protocol version this worker speaks.
@@ -175,6 +210,7 @@ impl QueryWorkers {
         QueryWorkerRecord {
             process_id: self.process_id.to_string(),
             fragment_endpoint: self.fragment_endpoint.clone(),
+            flight_sql_endpoint: self.flight_sql_endpoint.clone(),
             protocol_version: self.protocol_version,
             started_unix_ns: now_ns,
         }
@@ -297,7 +333,13 @@ mod tests {
     const H_NS: i64 = 60 * 1_000_000_000;
 
     fn worker() -> QueryWorkers {
-        QueryWorkers::new("10.0.0.1:9443", 1, H, DEFAULT_LIVENESS_FACTOR)
+        QueryWorkers::new(
+            "10.0.0.1:9443",
+            "10.0.0.1:9000",
+            1,
+            H,
+            DEFAULT_LIVENESS_FACTOR,
+        )
     }
 
     /// A record round-trips through its JSON encoding unchanged.
@@ -306,12 +348,30 @@ mod tests {
         let record = QueryWorkerRecord {
             process_id: Uuid::new_v4().to_string(),
             fragment_endpoint: "worker-7.internal:9443".to_string(),
+            flight_sql_endpoint: "worker-7.internal:9000".to_string(),
             protocol_version: 1,
             started_unix_ns: -12_345,
         };
         let bytes = record.encode().expect("encode");
         let decoded = QueryWorkerRecord::decode(&bytes).expect("decode");
         assert_eq!(record, decoded);
+    }
+
+    /// A pre-amendment heartbeat object never carried `flight_sql_endpoint`. It
+    /// must still decode (the field is `#[serde(default)]`), yielding an empty
+    /// endpoint that the SQL roster drops, so a rolling deploy never fails a
+    /// decode on an old sibling's record.
+    #[test]
+    fn record_without_flight_sql_endpoint_decodes_to_empty() {
+        let json = br#"{"process_id":"p","fragment_endpoint":"10.0.0.1:9443","protocol_version":1,"started_unix_ns":7}"#;
+        let decoded = QueryWorkerRecord::decode(json).expect("legacy record decodes");
+        assert_eq!(
+            decoded.flight_sql_endpoint, "",
+            "missing field defaults empty"
+        );
+        assert_eq!(decoded.fragment_endpoint, "10.0.0.1:9443");
+        assert_eq!(decoded.protocol_version, 1);
+        assert_eq!(decoded.started_unix_ns, 7);
     }
 
     /// Heartbeats round-trip through a store: two workers each write their own
@@ -383,6 +443,7 @@ mod tests {
         let forged = QueryWorkerRecord {
             process_id: body_id.to_string(),
             fragment_endpoint: "10.9.9.9:9443".to_string(),
+            flight_sql_endpoint: "10.9.9.9:9000".to_string(),
             protocol_version: 1,
             started_unix_ns: now,
         };

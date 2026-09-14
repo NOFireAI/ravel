@@ -213,12 +213,23 @@ node writes one object it alone ever writes:
 sys/query/workers/<process_id>
 ```
 
-The record is a small JSON control-plane payload carrying the process id, the
-`fragment_endpoint` (`host:port` of its cluster-internal gRPC listener), the
-`queryfrag` protocol version it speaks, and a liveness timestamp re-stamped on
-every beat. The write is an unconditional overwrite: one writer per key, no
-compare-and-swap, no contention. This is the same pattern `maintain` mode
-processes already use for their own heartbeats.
+The record is a small JSON control-plane payload carrying the process id, two
+endpoints, the `queryfrag` protocol version it speaks, and a liveness timestamp
+re-stamped on every beat. The two endpoints are the two surfaces the two
+distributed lanes dial:
+
+- `fragment_endpoint`: the `queryfrag` `SeriesFetch` surface the PromQL lane
+  dials. With a dedicated fragment listener it is that listener's TLS address;
+  without one it is the public gRPC listener.
+- `flight_sql_endpoint`: the Flight SQL `DoGet` surface the SQL lane dials. This
+  is always the public gRPC listener, which mounts Flight SQL, reached
+  plaintext. It is separate from `fragment_endpoint` because the dedicated
+  fragment listener serves only `SeriesFetch` and no Flight service, so a SQL
+  slice fetch must dial the public gRPC address rather than the fragment one.
+
+The write is an unconditional overwrite: one writer per key, no compare-and-swap,
+no contention. This is the same pattern `maintain` mode processes already use for
+their own heartbeats.
 
 On the same cadence (`H` = 60 s by default) every node lists the prefix and
 refreshes its view. The **live set** is itself plus every sibling whose stamp
