@@ -859,9 +859,10 @@ fn print_scan_timing(report: &SqlLatencyReport) {
 
 /// The cold run's logs-scan fast-path opens, split by the read shape the router
 /// chose (issue #904), printed next to the request accounting the main table
-/// already shows so a reader can pair the two: `backend_bills_requests` (in the
-/// report's request accounting) says whether the backend charges for requests,
-/// and this split says which read shape produced them.
+/// already shows so a reader can pair the two: `backend_bills_requests`
+/// (`ReportRunConfig::backend_bills_requests`, `report.rs:102`) says whether
+/// the backend charges for requests, and this split says which read shape
+/// produced them.
 ///
 /// The unit is a SEGMENT OPEN, not a request and not a statement: one statement
 /// spanning several segments contributes one open per segment and can take both
