@@ -98,6 +98,21 @@ write_gh_stub() {
 # gh pr view <n> --json <fields> --jq <expr>   |   gh pr list ...
 if [[ "\$1" == "api" ]]; then
   n="\$(printf '%s' "\$2" | sed 's#.*/pulls/##; s#/files\$##')"
+  # Model the RESPONSE SHAPE, not just the output. This endpoint keys a path as
+  # \`filename\`; \`gh pr view --json files\` keys it as \`path\`. An earlier stub
+  # printed paths whatever --jq asked for, so the guard asking for the wrong one
+  # of those two returned empty against real gh and passed every case here.
+  # Refuse any other expression instead of answering it.
+  jqx=""
+  prev=""
+  for a in "\$@"; do
+    if [[ "\${prev}" == "--jq" ]]; then jqx="\$a"; fi
+    prev="\$a"
+  done
+  if [[ "\${jqx}" != ".[].filename" ]]; then
+    echo "stub: refusing --jq '\${jqx}': the pulls/N/files endpoint keys paths as .filename" >&2
+    exit 1
+  fi
   case "\${n}" in
     101) printf 'shared.txt\n' ;;
     102) printf '${files_b}\n' ;;
