@@ -301,7 +301,11 @@ base_stale_blocks() {
   # re-run before merging", which is exactly the advice this path exists to
   # stop giving. Keep the behind count and the unseen commits, which are the
   # landing-loop revert detector, and drop that one line.
-  base_behind_note="$(printf '%s\n' "${guard_out}" | grep -v 'rebase onto')"
+  # Anchored: the advisory is the only line starting `guard: rebase`, while a
+  # commit line is `guard:   <hash> <subject>`. An unanchored match would drop
+  # any commit whose SUBJECT says `rebase onto`, hiding exactly the commit an
+  # operator most needs to see while the header still counts it.
+  base_behind_note="$(printf '%s\n' "${guard_out}" | grep -v '^guard: rebase onto')"
   return 1
 }
 

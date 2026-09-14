@@ -344,7 +344,7 @@ case "$1" in
     else printf '%s\n' "${tip}"; fi
     ;;
   rev-list) printf '3\n' ;;
-  log) printf 'ccccccc1 innocent\033[31mSPOOFED\033[0m\rsubject\ncccccc2 tab:\there\ncccccc3 third\n' ;;
+  log) printf 'ccccccc1 innocent\033[31mSPOOFED\033[0m\rsubject\ncccccc2 tab:\there\ncccccc3 fix: rebase onto the new base helper\n' ;;
   *) echo "unexpected git call: $*" >&2; exit 91 ;;
 esac
 SHIM
@@ -711,13 +711,32 @@ unset E2E_GIT_STALE
 # while the guard's own closing line says "rebase onto origin/main and let CI
 # re-run before merging" -- four words apart, so it counted 0 and passed while
 # the block told the operator to rebase.
-# Any line MENTIONING rebase that is not the merge command itself (whose
-# --rebase flag is the merge method, not advice). Broad on purpose: the first
-# version matched one exact sentence four words off the guard's own wording, so
-# it counted 0 and passed while the block told the operator to rebase.
-check_eq "#1758 queue present: no line advises a rebase" \
+# Two separate properties, because one grep cannot tell the script's own advice
+# from a commit's subject. The fixture's third unseen commit is deliberately
+# subjected "fix: rebase onto the new base helper".
+#
+# (a) None of the script's OWN verdict lines (`  -> `) advises a rebase. The
+#     merge command is excluded: its --rebase is the merge method, not advice.
+#     The first version of this grepped one exact sentence four words off the
+#     guard's wording, counted 0, and passed while the block advised a rebase.
+check_eq "#1758 queue present: no verdict line advises a rebase" \
   "0" \
-  "$(printf '%s\n' "${queued_out}" | grep -i 'rebase' | grep -v 'gh pr merge' | wc -l | tr -d ' ')"
+  "$(printf '%s\n' "${queued_out}" | grep '^  -> ' | grep -v 'gh pr merge' | grep -ci 'rebase')"
+# (b) The guard's own trailing advisory is gone, tested by SHAPE rather than by
+#     wording: the last line of the embedded note must be an unseen-commit line,
+#     not prose. Re-embedding the guard output puts its advisory there instead.
+check_eq "#1758 queue present: the note ends on a commit, not on advice" \
+  "1" \
+  "$(printf '%s\n' "${queued_out}" | grep '^     ' | tail -1 | grep -cE '^ +[0-9a-f]{7,} ')"
+
+# The filter that removes the guard's advisory must not remove a COMMIT whose
+# subject happens to say the same thing. cccccc3's subject is
+# "fix: rebase onto the new base helper" precisely so an unanchored filter
+# would drop it -- hiding the commit an operator most needs to scrutinise
+# while the header above still counts it.
+check_eq "#1758 queue present: every unseen commit survives the advisory filter" \
+  "3" \
+  "$(printf '%s\n' "${queued_out}" | grep -cE 'ccccccc1|cccccc2|cccccc3')"
 check_eq "#1758 queue present: the merge command is offered, pinned to the head" \
   "  -> gh pr merge 908 --rebase --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${queued_out}" | grep '^  -> gh pr merge')"
