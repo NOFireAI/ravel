@@ -263,6 +263,13 @@ jobs:
       # sets FLEET_DISK_REAP=0 itself so it cannot reap a runner workspace.
       - name: Disk-headroom guard cases
         run: bash scripts/guards/check-disk-headroom.test.sh
+      # Its IDENTICAL branch is the whole point of the guard and cannot be
+      # exercised against live data: the one real duplicate pair it was
+      # written for was closed within the hour of being found. These cases
+      # build the collision synthetically, so the branch is covered by
+      # something rather than by nothing.
+      - name: Duplicate-work guard cases
+        run: bash scripts/guards/check-duplicate-work.test.sh
       - name: Python script unit tests
         run: make test-python
 

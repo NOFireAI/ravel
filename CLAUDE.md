@@ -427,6 +427,32 @@ there before changing a rule.
   SHA read earlier in the session goes stale the moment another PR merges,
   and dispatching it silently rebuilds on a superseded tree.
   `ALLOW_STALE_REF=1` to dispatch an intentionally older ref.
+- `scripts/guards/check-duplicate-work.sh <pr-number>`: reports open PRs
+  whose work overlaps this one, BEFORE you start on it. Exit 0 = nothing
+  overlaps, 1 = something does, 2 = could not tell. `IDENTICAL` means two
+  PRs make the same change, matched by `git patch-id --stable` over each
+  diff, so it catches a duplicate whatever its title, branch or author says;
+  `OVERLAP` means a shared file, which is normal and only tells you whose
+  toes you are near. It reports rather than refuses: which PR should close,
+  or in what order two should land, depends on facts a script cannot see.
+  Several Claude sessions work this repo through one shared `gh` account, so
+  a PR's author never says which session owns it and idle time says nothing
+  about whether that session is alive. Both assumptions failed on
+  2026-09-14: #1786 and #1788 bumped rustls for the same advisory twenty
+  minutes apart under titles too different to match by eye, and sat in the
+  merge queue together, where the second would have rebased to an empty diff;
+  and five fix rounds went out against PRs whose session was awake and
+  already fixing the same findings, on heads that moved minutes later, so
+  landing one would have reverted the other session's work while looking
+  like an ordinary landing. Run this before the first action on any PR that
+  is not demonstrably yours, and re-resolve the head immediately before a
+  `fleet_dispatch` against it: findings extracted against a head that has
+  since moved are already stale. Claim a PR by commenting on it BEFORE
+  reading its findings, not after dispatching a round; a claim posted at the
+  end of the pipeline documents an intention events have already overtaken.
+  Cases in `scripts/guards/check-duplicate-work.test.sh`; the IDENTICAL path
+  is tested synthetically because its only real instance was closed within
+  the hour.
 - `scripts/guards/assert-fresh-merge-base.sh <pr-number>`: exits non-zero
   when a PR's merge base is behind `origin/main`, printing how far and what
   it has not seen. **Since 2026-09-13 a merge queue on `protect-main` is what
