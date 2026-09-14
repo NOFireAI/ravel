@@ -181,12 +181,11 @@ pub fn warn_plaintext_federation(clusters: &[config::RemoteClusterConfig]) {
     }
 }
 
-/// The reason a resolver configuration can resolve more than one local tenant,
-/// or `None` when at most one tenant can ever resolve. A dynamic resolver
-/// derives the tenant from a request header or a token claim, so any tenant can
-/// resolve under it; a static bearer map is bounded by its distinct values.
-fn multi_tenant_resolver_reason(
-    tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
+/// The reason a resolver derives the tenant from a request header or a token
+/// claim, or `None` when the static bearer map is the whole tenant set. Under
+/// any of these, a tenant that appears in no `--tenant-token` can still resolve,
+/// so the token map bounds neither how many tenants there are nor which.
+fn dynamic_resolver_reason(
     dev_insecure_tenant_header: bool,
     auth: &config::AuthResolverSettings,
 ) -> Option<String> {
@@ -213,6 +212,21 @@ fn multi_tenant_resolver_reason(
              tenant can resolve"
                 .to_string(),
         );
+    }
+    None
+}
+
+/// The reason a resolver configuration can resolve more than one local tenant,
+/// or `None` when at most one tenant can ever resolve. Any dynamic resolver
+/// qualifies on its own; otherwise a static bearer map is bounded by its
+/// distinct values.
+fn multi_tenant_resolver_reason(
+    tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
+    dev_insecure_tenant_header: bool,
+    auth: &config::AuthResolverSettings,
+) -> Option<String> {
+    if let Some(reason) = dynamic_resolver_reason(dev_insecure_tenant_header, auth) {
+        return Some(reason);
     }
     let distinct: std::collections::HashSet<&ravel_types::TenantId> =
         tenant_tokens.values().collect();
@@ -253,9 +267,9 @@ pub fn ensure_federation_tenant_mapping(
     if remote_clusters.is_empty() {
         return Ok(());
     }
-    let multi_tenant =
-        multi_tenant_resolver_reason(tenant_tokens, dev_insecure_tenant_header, auth);
-    if let Some(reason) = &multi_tenant {
+    if let Some(reason) =
+        multi_tenant_resolver_reason(tenant_tokens, dev_insecure_tenant_header, auth)
+    {
         let unkeyed: Vec<&str> = remote_clusters
             .iter()
             .filter(|rc| rc.tenant.is_none())
@@ -280,12 +294,16 @@ pub fn ensure_federation_tenant_mapping(
             );
         }
     }
-    // The static bearer map is the whole tenant set only when nothing else can
-    // resolve a tenant, and an empty map configures no tenants at all rather
-    // than asserting there are none. Outside those two cases a `tenant` value
-    // that is absent here may still resolve at request time, so there is
-    // nothing to check.
-    if multi_tenant.is_none() && !tenant_tokens.is_empty() {
+    // The static bearer map is the whole tenant set only when no resolver
+    // derives a tenant from a request, and an empty map configures no tenants at
+    // all rather than asserting there are none. Outside those two cases a
+    // `tenant` value that is absent here may still resolve at request time, so
+    // there is nothing to check. Note this is NOT gated on the coordinator being
+    // single-tenant: two static tenants are two tenants and still a fully known
+    // set, which is exactly the multi-tenant deployment the mapping is for.
+    if dynamic_resolver_reason(dev_insecure_tenant_header, auth).is_none()
+        && !tenant_tokens.is_empty()
+    {
         let known: std::collections::HashSet<&ravel_types::TenantId> =
             tenant_tokens.values().collect();
         for rc in remote_clusters {
