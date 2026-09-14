@@ -525,6 +525,8 @@ async fn main() -> anyhow::Result<()> {
         cache_max_bytes: performance.cache_max_bytes,
         catalog_cache_max_bytes: performance.catalog_cache_max_bytes,
         process_memory_budget_bytes: performance.memory_remainder_bytes,
+        process_memory_budget_is_fallback: performance.sources.memory_budget_bytes
+            == ravel_server::config::PERF_SOURCE_FALLBACK,
         cache_dir: cli.cache_dir.clone(),
         catalog_resolve_concurrency: cli.catalog_resolve_concurrency,
         ingest_concurrency_limit: cli

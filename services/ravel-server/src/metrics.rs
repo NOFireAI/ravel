@@ -1749,11 +1749,27 @@ fn render_ingest_buffer_budget_family(
 /// `ravel_memory_budget_bytes` is `u64::MAX` when the process was built with
 /// no derived budget (matching `ravel_memory::MemoryBudget::unlimited`'s own
 /// convention), not `0`: a `0` ceiling would misread as "everything refused."
+/// The raw `MemoryBudget::limit()` on that path is actually `u64::MAX` minus
+/// the two hard cache carves (a near-miss a `== u64::MAX` dashboard check
+/// would never match), so [`exposed_memory_budget_limit`] clamps it before
+/// it reaches this family.
 ///
 /// `ravel_memory_reserved_bytes{component="fetch"}` is always `0`: decision 2
 /// (fetch-layer reservation against this budget) has not landed upstream, so
 /// `reserved` below is entirely the SQL side's usage. See
 /// [`Label::MemoryComponent`]'s doc comment.
+/// Clamps the exposed `ravel_memory_budget_bytes` reading to `u64::MAX` when
+/// `is_fallback` is set (the budget was sized on an unmeasured host,
+/// `config::PERF_SOURCE_FALLBACK`). On that path `raw_limit` is
+/// `ravel_memory::MemoryBudget::limit()`'s actual value: `u64::MAX` minus
+/// the two hard cache carves (`DEFAULT_CACHE_MAX_BYTES` each), not `u64::MAX`
+/// itself, which would leave the "unlimited" doc claim on
+/// `ravel_memory_budget_bytes` unmet and a `== u64::MAX` dashboard check
+/// permanently unmatched.
+fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
+    if is_fallback { u64::MAX } else { raw_limit }
+}
+
 fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudgetSnapshot) {
     write_header(
         out,
@@ -1796,7 +1812,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_handoff_overlap_bytes",
-        "Bytes double-counted right now because a tenant's memory handed off between components overlaps in the ADR-1170 process budget's accounting window.",
+        "Bytes double-counted because a tenant's memory handed off between components overlaps in the ADR-1170 process budget's accounting window; inactive (always 0) until fetch handoff accounting lands.",
         "gauge",
     );
     write_sample(
@@ -4526,6 +4542,12 @@ pub struct MetricsState {
     /// `ServerConfig::process_memory_budget_bytes`, unconditionally of the
     /// `sql` feature, so the gauge family renders in every build.
     pub process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+    /// `ServerConfig::process_memory_budget_is_fallback`: whether the budget
+    /// above was sized with the host's memory unknown, so the scrape handler
+    /// clamps the exposed `ravel_memory_budget_bytes` gauge to `u64::MAX`
+    /// rather than the raw near-miss remainder. See
+    /// [`exposed_memory_budget_limit`].
+    pub process_memory_budget_is_fallback: bool,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -4736,7 +4758,10 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
     // The ADR-1170 process memory budget readings (atomic loads), like every
     // other family, rather than baking a snapshot in at construction.
     let memory_budget_snapshot = MemoryBudgetSnapshot {
-        limit: state.process_memory_budget.limit(),
+        limit: exposed_memory_budget_limit(
+            state.process_memory_budget.limit(),
+            state.process_memory_budget_is_fallback,
+        ),
         reserved: state.process_memory_budget.reserved(),
         handoff_overlap: state.process_memory_budget.handoff_overlap(),
     };
@@ -4816,6 +4841,29 @@ mod tests {
             get,
             ..StoreMetricsSnapshot::default()
         }
+    }
+
+    /// Pins the exact near-miss value `ravel_memory::MemoryBudget::limit()`
+    /// reads on a fallback (unmeasured-host) build: `u64::MAX` minus the two
+    /// hard cache carves, each `crate::config::DEFAULT_CACHE_MAX_BYTES`. This
+    /// is the value the fallback gauge clamp must catch; asserting the exact
+    /// number, not `> 0` or "large", so a change to `DEFAULT_CACHE_MAX_BYTES`
+    /// or to the clamp logic surfaces here rather than only in production.
+    #[test]
+    fn memory_budget_gauge_clamps_fallback_near_miss_to_u64_max() {
+        let raw_near_miss = u64::MAX - 2 * crate::config::DEFAULT_CACHE_MAX_BYTES;
+        assert_eq!(raw_near_miss, 18_446_744_073_172_680_703);
+        assert_eq!(
+            exposed_memory_budget_limit(raw_near_miss, true),
+            u64::MAX
+        );
+    }
+
+    /// The non-fallback path exposes the raw limit unchanged: a derived
+    /// budget's ceiling is meaningful and must not be clamped away.
+    #[test]
+    fn memory_budget_gauge_exposes_raw_limit_when_not_fallback() {
+        assert_eq!(exposed_memory_budget_limit(21_045_339_751, false), 21_045_339_751);
     }
 
     /// The acceptance test for the exposition renderer. Proves both halves: a populated
