@@ -174,6 +174,7 @@ async fn drain(
         PhaseAccounting::new(),
         logs_schema_with_declared(&[]),
         Arc::new(Vec::new()),
+        None,
     )
     .expect("build scan");
     let mut stream = scan

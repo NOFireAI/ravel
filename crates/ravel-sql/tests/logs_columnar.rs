@@ -382,6 +382,7 @@ async fn run_scan(
         PhaseAccounting::new(),
         full_schema,
         Arc::new(declared),
+        None,
     )
     .expect("build scan");
 
@@ -470,6 +471,7 @@ async fn run_scan_tp(
         PhaseAccounting::new(),
         full_schema,
         Arc::new(declared),
+        None,
     )
     .expect("build scan");
 
@@ -1453,6 +1455,7 @@ async fn an_uncached_fetcher_caps_partitions_at_the_segment_count() {
             PhaseAccounting::new(),
             Arc::clone(&full_schema),
             Arc::new(declared.clone()),
+            None,
         )
         .expect("build scan")
     };
@@ -1519,6 +1522,7 @@ async fn logs_scan_declares_no_output_ordering() {
         PhaseAccounting::new(),
         logs_schema_with_declared(&[]),
         Arc::new(Vec::new()),
+        None,
     )
     .expect("build scan");
     assert!(

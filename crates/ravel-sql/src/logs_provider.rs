@@ -145,7 +145,7 @@ impl LogsTableProvider {
     /// is returned.
     #[cfg(feature = "flight-sql")]
     pub fn worker_fragment(&self, target_partitions: usize) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let scan = self.build_scan(target_partitions, &LogsPushdown::default(), None)?;
+        let scan = self.build_scan(target_partitions, &LogsPushdown::default(), None, None)?;
         sort_slice_fragment(scan, &self.schema, LOGS_ORDER_COLS)
     }
 
@@ -203,7 +203,7 @@ impl LogsTableProvider {
     /// no projection (every column). Exposed (like the metrics provider's
     /// `plan`) so tests can execute the scan without a SQL front-end.
     pub fn plan(&self, target_partitions: usize) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.build_scan(target_partitions, &LogsPushdown::default(), None)
+        self.build_scan(target_partitions, &LogsPushdown::default(), None, None)
     }
 
     /// Build the scan for a set of filters, extracting the pushdown from them.
@@ -216,6 +216,7 @@ impl LogsTableProvider {
         self.build_scan(
             target_partitions,
             &extract_logs(filters, self.declared.as_ref()),
+            None,
             None,
         )
     }
@@ -233,6 +234,7 @@ impl LogsTableProvider {
         target_partitions: usize,
         pushdown: &LogsPushdown,
         projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let segments = self.pruned_segments(pushdown);
         let scan = LogsScanExec::new(
@@ -249,6 +251,7 @@ impl LogsTableProvider {
             self.phase_accounting.clone(),
             Arc::clone(&self.schema),
             Arc::clone(&self.declared),
+            limit,
         )?
         .with_column_stats(self.column_stats.clone());
         Ok(Arc::new(scan))
@@ -387,7 +390,31 @@ impl TableProvider for LogsTableProvider {
         // adds the columns its own pushed content predicates and pending erasure
         // predicates need (`logs_scan::resolve_columns`); those are not visible
         // in the projection at all.
-        self.build_scan(target_partitions, &pushdown, projection)
+        //
+        // `_limit` is DataFusion's own fetch-stop hint (issue #362): its
+        // `PushDownLimit` rule never populates it past a `Sort` or `Aggregate`
+        // between this scan and the enclosing `Limit`, so its mere presence
+        // already proves no ORDER BY and no aggregation sit above this leaf.
+        // The one condition DataFusion's contract leaves to the provider is
+        // filters: per `TableProvider::scan`'s own doc, a `LIMIT` may be
+        // pushed down only when every pushed filter is `Exact` (no residual
+        // survives to re-check row-by-row above the scan), so that is
+        // re-verified here with the same `filter_is_exact` helper
+        // `supports_filters_pushdown` uses, rather than trusted on the
+        // optimizer's say-so alone. Preferring `None` on any doubt is
+        // deliberate: over-fetching a partition's owned segments is safe,
+        // stopping one row short is not.
+        let limit = match _limit {
+            Some(limit)
+                if filters
+                    .iter()
+                    .all(|f| filter_is_exact(f, self.declared.as_ref())) =>
+            {
+                Some(limit)
+            }
+            _ => None,
+        };
+        self.build_scan(target_partitions, &pushdown, projection, limit)
     }
 }
 
@@ -1982,6 +2009,260 @@ mod tests {
                 TableProviderFilterPushDown::Inexact,
                 TableProviderFilterPushDown::Exact,
             ]
+        );
+    }
+
+    /// `n_segments` objects of `rows_per_segment` records each, with ts
+    /// interleaved across segments (segment `i`'s rows are `i, i+n, i+2n,
+    /// ...`) so segment `i`'s smallest ts is `i` itself: a global `ORDER BY
+    /// ts`'s true top-k spans the first k *segments*, not just the first one
+    /// written, which is what makes
+    /// [`logs_limit_with_order_by_reads_every_segment_and_stays_correct`] a
+    /// genuine cross-segment check rather than a single-segment one.
+    /// Segment `i`'s first record (ts == i) carries `request.id = "keep"`;
+    /// every other record carries `request.id = "skip"`, so exactly one
+    /// matching row lives per segment -- the corpus
+    /// [`logs_limit_with_residual_filter_reads_every_segment_and_stays_correct`]
+    /// needs.
+    async fn many_segments_interleaved(
+        store: &MemoryStore,
+        n_segments: i64,
+        rows_per_segment: i64,
+    ) -> Vec<SegmentRef> {
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let mut segments = Vec::new();
+        for i in 0..n_segments {
+            let records: Vec<LogRecord> = (0..rows_per_segment)
+                .map(|k| {
+                    let ts = i + n_segments * k;
+                    let tag = if k == 0 { "keep" } else { "skip" };
+                    record(
+                        &worker,
+                        &[("request.id".to_string(), s(tag))],
+                        ts,
+                        &format!("body {ts}"),
+                    )
+                })
+                .collect();
+            let seg = write_object(store, &format!("logs/seg{i:03}.rlog"), &records).await;
+            segments.push(seg);
+        }
+        segments
+    }
+
+    /// Build a provider over `segments` whose real object-store GETs are
+    /// counted through a dedicated [`QueryAccounting`] handle
+    /// (`PhaseAccounting::pooled_over`), the same request-counting idiom
+    /// `scan_budgets.rs` uses to bound S3 requests: `LogSegmentFetcher`
+    /// records one [`ravel_types::accounting::AccountedOp::Get`] per real
+    /// `store.get`, so `acc.snapshot().total_s3_requests()` after a query is
+    /// the query's exact GET count, not a proxy for it.
+    fn counted_provider(
+        store: Arc<dyn ObjectStoreBackend>,
+        segments: Vec<SegmentRef>,
+    ) -> (LogsTableProvider, QueryAccounting) {
+        let acc = QueryAccounting::new();
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments,
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            PhaseAccounting::pooled_over(&acc),
+        );
+        (provider, acc)
+    }
+
+    /// Issue #362, end-to-end sanity check: `SELECT ... LIMIT n` with no
+    /// `ORDER BY` and no filter above the scan returns the right row count
+    /// and touches only 8 of the 20 segments (one per partition; round-robin
+    /// assignment gives every partition an owned segment, and that first
+    /// segment alone already clears `LIMIT 10`).
+    ///
+    /// This bound does NOT by itself discriminate this crate's fix from the
+    /// pre-fix code: DataFusion's physical `LimitPushdown` rule inserts a
+    /// `LocalLimitExec` directly above ANY leaf whose `ExecutionPlan::fetch()`
+    /// returns `None` (`LogsScanExec` never implements it), and that
+    /// `LocalLimitExec` independently stops polling its child once it has 10
+    /// rows -- which, for this corpus (every segment yields a real batch
+    /// immediately), reaches the same 8-of-20 bound with `LogsScanExec::limit`
+    /// forced to `None`. Verified directly: hardcoding `None` at this crate's
+    /// `scan()` call site and rerunning this test still gives 8, not 20.
+    /// [`logs_scan_exec_limit_stops_opening_segments_directly`] below is the
+    /// test that isolates and discriminates this crate's own mechanism.
+    #[tokio::test]
+    async fn logs_limit_stops_after_one_segment_per_partition() {
+        let store = MemoryStore::new();
+        let segments = many_segments_interleaved(&store, 20, 20).await;
+        let (provider, acc) = counted_provider(Arc::new(store), segments);
+        let ctx = logs_session(provider).expect("build session");
+
+        let plan = ctx
+            .sql("SELECT ts FROM logs LIMIT 10")
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("collect");
+        let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+        assert_eq!(
+            row_count, 10,
+            "GlobalLimitExec must still enforce the true limit across partitions"
+        );
+        assert_eq!(
+            acc.snapshot().total_s3_requests(),
+            8,
+            "one partition-owned segment each must satisfy all 8 partitions' \
+             own 10-row target, so exactly 8 of the 20 segments may be opened"
+        );
+    }
+
+    /// Issue #362, the actual discriminator: drives [`LogsScanExec`] directly
+    /// through [`LogsTableProvider::build_scan`], bypassing `ctx.sql()` and
+    /// therefore DataFusion's own physical optimizer, so nothing but this
+    /// crate's own `limit`/`rows_emitted` bookkeeping in `logs_scan.rs` can
+    /// stop a partition early. Same 20-segments/20-rows-each corpus,
+    /// `target_partitions = 8`, `LIMIT 10`: with the hint (`Some(10)`) every
+    /// partition must stop after its first owned segment (8 GETs); with no
+    /// hint (`None`, the pre-fix behavior) every partition must drain all of
+    /// its owned segments (20 GETs, one per segment). This is the exact line
+    /// flip a reviewer can make to watch the fix's own test fail: change
+    /// `Some(10)` below to `None` and the second assertion goes from 8 to 20.
+    #[tokio::test]
+    async fn logs_scan_exec_limit_stops_opening_segments_directly() {
+        let store = MemoryStore::new();
+        let segments = many_segments_interleaved(&store, 20, 20).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+        async fn run(
+            store: Arc<dyn ObjectStoreBackend>,
+            segments: Vec<SegmentRef>,
+            limit: Option<usize>,
+        ) -> u64 {
+            let (provider, acc) = counted_provider(store, segments);
+            let plan = provider
+                .build_scan(8, &LogsPushdown::default(), None, limit)
+                .expect("build scan");
+            use datafusion::physical_plan::ExecutionPlanProperties;
+            for partition in 0..plan.output_partitioning().partition_count() {
+                let mut stream = plan
+                    .execute(
+                        partition,
+                        Arc::new(datafusion::execution::TaskContext::default()),
+                    )
+                    .expect("execute partition");
+                while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                    batch.expect("batch");
+                }
+            }
+            acc.snapshot().total_s3_requests()
+        }
+
+        let with_limit = run(Arc::clone(&store), segments.clone(), Some(10)).await;
+        let without_limit = run(store, segments, None).await;
+
+        assert_eq!(
+            with_limit, 8,
+            "the fetch-stop hint must leave exactly one owned segment open \
+             per partition"
+        );
+        assert_eq!(
+            without_limit, 20,
+            "with no hint every partition must drain every owned segment: \
+             this is the pre-fix behavior, and the value this test would \
+             regress to if `LogsScanExec`'s own stop-check were removed"
+        );
+    }
+
+    /// Soundness boundary, condition (a): an `ORDER BY` above the scan must
+    /// leave the fetch-stop disengaged. DataFusion's own `PushDownLimit` rule
+    /// never populates a `TableScan`'s `_limit` past a `Sort`
+    /// (`LogsTableProvider::scan` never even sees a hint to refuse), so this
+    /// is an end-to-end regression test of that structural guarantee holding
+    /// for this table, not just of this crate's own code: every segment must
+    /// still be read, and the true top-10 (which spans the first 10 of the
+    /// 20 *segments*, by construction) must come back exactly.
+    #[tokio::test]
+    async fn logs_limit_with_order_by_reads_every_segment_and_stays_correct() {
+        let store = MemoryStore::new();
+        let segments = many_segments_interleaved(&store, 20, 20).await;
+        let (provider, acc) = counted_provider(Arc::new(store), segments);
+        let ctx = logs_session(provider).expect("build session");
+
+        let (got, _) = run_counted(&ctx, "SELECT ts, body FROM logs ORDER BY ts LIMIT 10").await;
+
+        let expected: BTreeSet<(i64, String)> =
+            (0..10).map(|ts| (ts, format!("body {ts}"))).collect();
+        assert_eq!(
+            got, expected,
+            "an ORDER BY above the scan must never under-fetch: the true \
+             top-10 spans segments 0 through 9, not just segment 0"
+        );
+        // `data_objects_touched` (distinct segment objects fetched), not
+        // `total_s3_requests`: a plain `ts, body` projection happens to cost
+        // one GET per segment, but that 1:1 ratio is not the invariant this
+        // test protects. Distinct objects touched is the exact,
+        // path-independent measure of "no segment was skipped".
+        assert_eq!(
+            acc.snapshot().data_objects_touched,
+            20,
+            "a Sort above the scan must leave every one of the 20 segments \
+             opened; a stop here would be silent under-fetch"
+        );
+    }
+
+    /// Soundness boundary, condition (b): a residual (`Inexact`) filter above
+    /// the scan must also leave the fetch-stop disengaged.
+    /// `attrs['request.id'] = 'keep'` routes to the prune-only channel
+    /// ([`crate::logs_pushdown::filter_is_exact`] answers `false` for it), so
+    /// DataFusion keeps a `FilterExec` above this leaf and
+    /// `LogsTableProvider::scan`'s own `filter_is_exact` re-check independently
+    /// refuses to set a limit hint. Exactly one row per segment matches
+    /// (`request.id = "keep"` on the ts == segment-index record only), so
+    /// `LIMIT 20` exactly equals the true match count: an incorrect stop would
+    /// open only a handful of segments (each already satisfying a
+    /// mis-applied 20-row *pre-filter* threshold from its first segment,
+    /// mirroring [`logs_limit_stops_after_one_segment_per_partition`]) and
+    /// come back short, which is exactly what this test would catch.
+    #[tokio::test]
+    async fn logs_limit_with_residual_filter_reads_every_segment_and_stays_correct() {
+        let store = MemoryStore::new();
+        let segments = many_segments_interleaved(&store, 20, 20).await;
+        let (provider, acc) = counted_provider(Arc::new(store), segments);
+        let ctx = logs_session(provider).expect("build session");
+
+        let (got, _) = run_counted(
+            &ctx,
+            "SELECT ts, body FROM logs WHERE attrs['request.id'] = 'keep' LIMIT 20",
+        )
+        .await;
+
+        let expected: BTreeSet<(i64, String)> =
+            (0..20).map(|ts| (ts, format!("body {ts}"))).collect();
+        assert_eq!(
+            got, expected,
+            "a residual filter above the scan must never under-fetch: all \
+             20 per-segment 'keep' rows must come back"
+        );
+        // `data_objects_touched`, not `total_s3_requests`: an `attrs` map
+        // lookup makes this query columnar-ineligible, so each segment
+        // costs more than one GET (footer plus block reads) even on the
+        // unmodified baseline. That per-object multiplicity is unrelated to
+        // the fetch-stop; the invariant this test protects is that every
+        // one of the 20 distinct segment objects was opened, none skipped.
+        assert_eq!(
+            acc.snapshot().data_objects_touched,
+            20,
+            "an Inexact filter must leave every one of the 20 segments \
+             opened; a stop here would be silent under-fetch"
         );
     }
 }

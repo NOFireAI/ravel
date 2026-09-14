@@ -1104,6 +1104,17 @@ pub struct LogsScanExec {
     /// opens each segment exactly once. Threaded into the stream and
     /// [`owned_work`]; the same predicate gates `declared_partitions` above.
     stripe_blocks: bool,
+    /// A per-partition fetch-stop hint (issue #362): once a partition has
+    /// emitted this many rows, it stops opening further owned segments. Only
+    /// ever `Some` when the provider proved, at `scan()` time, that no
+    /// ORDER BY, residual filter, or aggregation sits above this leaf --
+    /// DataFusion's own limit pushdown already refuses to populate a
+    /// `TableScan`'s `_limit` past a `Sort` or `Aggregate`, and
+    /// `LogsTableProvider::scan` separately re-checks every filter is
+    /// `Exact` before setting this. `None` -- the default, and every path but
+    /// the direct local scan -- reads exactly as many segments as before
+    /// (over-fetch is safe; under-fetch is not, so refusal is the fallback).
+    limit: Option<usize>,
     properties: Arc<PlanProperties>,
     /// This query's phase-split accounting handle (ADR-0044, issue #796),
     /// threaded into every per-partition fetch so log fetches are recorded
@@ -1330,6 +1341,7 @@ impl LogsScanExec {
         phase_accounting: PhaseAccounting,
         full_schema: SchemaRef,
         declared: Arc<Vec<DeclaredColumn>>,
+        limit: Option<usize>,
     ) -> DFResult<Self> {
         let projection: Option<Vec<usize>> = projection.cloned();
         Self::build(
@@ -1347,6 +1359,7 @@ impl LogsScanExec {
             full_schema,
             declared,
             false,
+            limit,
         )
     }
 
@@ -1379,6 +1392,10 @@ impl LogsScanExec {
             Arc::clone(&self.full_schema),
             Arc::clone(&self.declared),
             row_refs,
+            // Phase 2 re-reads exactly the row refs phase 1's TopK kept, below
+            // an existing Sort + Limit; a fetch-stop here would race that
+            // read, so this sibling never carries one.
+            None,
         )
         .map(|scan| scan.with_column_stats(self.column_stats.clone()))
     }
@@ -1413,6 +1430,7 @@ impl LogsScanExec {
         full_schema: SchemaRef,
         declared: Arc<Vec<DeclaredColumn>>,
         row_refs: bool,
+        limit: Option<usize>,
     ) -> DFResult<Self> {
         // Blocks, not segments, are what get striped (ADR-0102), but the
         // per-segment block counts are not known until a prune runs, which is
@@ -1499,6 +1517,7 @@ impl LogsScanExec {
             row_refs,
             columnar_eligible,
             stripe_blocks,
+            limit,
             properties,
             phase_accounting,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -2442,6 +2461,8 @@ impl ExecutionPlan for LogsScanExec {
             current_footer: None,
             current_whole_object: None,
             seg_columnar_blocks: 0,
+            limit: self.limit,
+            rows_emitted: 0,
             state,
         }))
     }
@@ -3234,6 +3255,16 @@ struct LogScanStream {
     /// segment over `current_indices` and skips this many positions so none is
     /// emitted twice. Reset when a new segment starts draining.
     seg_columnar_blocks: usize,
+    /// This partition's fetch-stop hint (issue #362), copied from
+    /// [`LogsScanExec::limit`]. Checked against `rows_emitted` only at a
+    /// segment boundary (`LogScanState::NextSegment`, before opening the
+    /// next owned segment), never mid-segment: a segment already opened is
+    /// let to drain, which is the over-fetch this optimization tolerates.
+    limit: Option<usize>,
+    /// Rows this partition has emitted so far, across every segment. Compared
+    /// against `limit` at each segment boundary; never reset for the life of
+    /// the stream.
+    rows_emitted: usize,
     state: LogScanState,
 }
 
@@ -3288,6 +3319,7 @@ impl LogScanStream {
         self.reservation.try_grow(bytes)?;
         self.emitted = bytes;
         self.blocks.rowpath_batches.add(1);
+        self.rows_emitted += batch.num_rows();
         Ok(batch)
     }
 
@@ -3315,6 +3347,7 @@ impl LogScanStream {
         self.held = self.held.saturating_sub(bytes);
         self.emitted = bytes;
         self.blocks.columnar_batches.add(1);
+        self.rows_emitted += batch.num_rows();
         Ok(batch)
     }
 
@@ -3448,68 +3481,82 @@ impl Stream for LogScanStream {
                     Poll::Ready(Err(e)) => return this.fail(e),
                     Poll::Pending => return Poll::Pending,
                 },
-                LogScanState::NextSegment => match this.work.pop_front() {
-                    Some(OwnedSeg {
-                        seg,
-                        ordinal,
-                        indices,
-                        footer,
-                        whole_object,
-                    }) => {
-                        this.current_seg = Some(seg.clone());
-                        this.current_seg_ordinal = ordinal;
-                        this.current_indices = indices.clone();
-                        this.current_footer = footer.clone();
-                        // Moved, not cloned: this stream consumes the carried
-                        // whole object exactly once, by whichever open below
-                        // `take()`s it first. A later `ReopenRows` reopen
-                        // must see `None` and pay for its own fetch (real GET
-                        // or read-cache hit), or `tenant_bytes_with_footer`
-                        // charges `add_bytes_reused` twice for one buffer
-                        // (issue #835 follow-up).
-                        this.current_whole_object = whole_object;
-                        this.seg_columnar_blocks = 0;
-                        this.block_cursor = 0;
-                        // Whole-segment fast path reads the object in one GET
-                        // (#693 part 3), or by column chunk when the projection
-                        // is narrow enough to pay for the extra round trips
-                        // (#862); the striped path opens only this partition's
-                        // subset, reusing the plan footer if any.
-                        this.state = if this.fast_whole_segment {
-                            let by_chunk = this.ctx.open_by_column_chunk(&seg);
-                            this.blocks.record_fast_path_route(by_chunk);
-                            this.ctx.record_open_shape(by_chunk);
-                            // The fast path's owning-partition recorder for
-                            // ADR-0996 decision 3; see
-                            // `PartitionCtx::record_data_object_touched` for why
-                            // this site is once per segment per query and why
-                            // the planned route's recorder cannot also fire.
-                            this.ctx.record_data_object_touched();
-                            LogScanState::Opening(open_segment_fast(
-                                Arc::clone(&this.ctx),
-                                seg,
-                                by_chunk,
-                            ))
-                        } else {
-                            // `take()`, not the moved-in value directly: this
-                            // IS the one consumption of the carried whole
-                            // object (see the comment above where it moved
-                            // into `current_whole_object`). Taking it here
-                            // leaves `None` behind for any later reopen.
-                            let whole_object = this.current_whole_object.take();
-                            LogScanState::Opening(open_segment_subset(
-                                Arc::clone(&this.ctx),
-                                seg,
-                                indices,
-                                footer,
-                                whole_object,
-                            ))
-                        };
-                    }
-                    None => {
+                LogScanState::NextSegment => {
+                    // Fetch-stop hint (issue #362): a partition that has
+                    // already emitted `limit` rows of its own stops opening
+                    // further owned segments. Checked here, before popping the
+                    // next one, so the stop never issues the GET that segment
+                    // would have cost; a segment already opened is left to
+                    // drain in full (over-fetch, never under-fetch).
+                    if let Some(limit) = this.limit
+                        && this.rows_emitted >= limit
+                    {
                         this.state = LogScanState::Done;
+                        continue;
                     }
-                },
+                    match this.work.pop_front() {
+                        Some(OwnedSeg {
+                            seg,
+                            ordinal,
+                            indices,
+                            footer,
+                            whole_object,
+                        }) => {
+                            this.current_seg = Some(seg.clone());
+                            this.current_seg_ordinal = ordinal;
+                            this.current_indices = indices.clone();
+                            this.current_footer = footer.clone();
+                            // Moved, not cloned: this stream consumes the carried
+                            // whole object exactly once, by whichever open below
+                            // `take()`s it first. A later `ReopenRows` reopen
+                            // must see `None` and pay for its own fetch (real GET
+                            // or read-cache hit), or `tenant_bytes_with_footer`
+                            // charges `add_bytes_reused` twice for one buffer
+                            // (issue #835 follow-up).
+                            this.current_whole_object = whole_object;
+                            this.seg_columnar_blocks = 0;
+                            this.block_cursor = 0;
+                            // Whole-segment fast path reads the object in one GET
+                            // (#693 part 3), or by column chunk when the projection
+                            // is narrow enough to pay for the extra round trips
+                            // (#862); the striped path opens only this partition's
+                            // subset, reusing the plan footer if any.
+                            this.state = if this.fast_whole_segment {
+                                let by_chunk = this.ctx.open_by_column_chunk(&seg);
+                                this.blocks.record_fast_path_route(by_chunk);
+                                this.ctx.record_open_shape(by_chunk);
+                                // The fast path's owning-partition recorder for
+                                // ADR-0996 decision 3; see
+                                // `PartitionCtx::record_data_object_touched` for why
+                                // this site is once per segment per query and why
+                                // the planned route's recorder cannot also fire.
+                                this.ctx.record_data_object_touched();
+                                LogScanState::Opening(open_segment_fast(
+                                    Arc::clone(&this.ctx),
+                                    seg,
+                                    by_chunk,
+                                ))
+                            } else {
+                                // `take()`, not the moved-in value directly: this
+                                // IS the one consumption of the carried whole
+                                // object (see the comment above where it moved
+                                // into `current_whole_object`). Taking it here
+                                // leaves `None` behind for any later reopen.
+                                let whole_object = this.current_whole_object.take();
+                                LogScanState::Opening(open_segment_subset(
+                                    Arc::clone(&this.ctx),
+                                    seg,
+                                    indices,
+                                    footer,
+                                    whole_object,
+                                ))
+                            };
+                        }
+                        None => {
+                            this.state = LogScanState::Done;
+                        }
+                    }
+                }
                 LogScanState::Opening(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(Some(scan))) => {
                         this.state = if this.columnar_eligible {
@@ -4821,6 +4868,7 @@ mod cstat_reconcile_tests {
             PhaseAccounting::new(),
             schema,
             Arc::new(declared),
+            None,
         )
         .expect("scan")
         .with_column_stats(Some(stats))
