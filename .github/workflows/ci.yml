@@ -239,6 +239,12 @@ jobs:
       # scoping property; the guard refuses to run without it. If this step
       # fails on the runner for that reason, that is worth knowing, because
       # CLAUDE.md tells sessions to arm the guard and it would be inert.
+      # The TLA+ harness's own resource-resolution and timeout logic. It drives
+      # shell functions only, with no JVM and no TLC jar, so it belongs beside
+      # the other bash-only guard suites and runs once here rather than once
+      # per area in the tla-models matrix.
+      - name: check-tla.sh self-test
+        run: bash scripts/check-tla.test.sh
       - name: Disk-watchdog guard cases
         run: bash scripts/guards/disk-watchdog.test.sh
       # Same reason as the two above: a guard suite that runs in no job is
@@ -295,8 +301,6 @@ jobs:
           # The job executes scripts/check-tla.sh from the PR itself; do not
           # leave the checkout token in .git/config for it to read.
           persist-credentials: false
-      - name: check-tla.sh self-test
-        run: bash scripts/check-tla.test.sh
       - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
         with:
           distribution: temurin
@@ -347,6 +351,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Matches the tla-models checkout: nothing here needs the token, so
+          # do not leave it in .git/config for the download step.
+          persist-credentials: false
       - name: Assert the matrix covers every area under formal/tla
         if: needs.changes.outputs.formal_area == 'true'
         env:
@@ -359,7 +367,7 @@ jobs:
           # an empty repository, and fails rather than asserting against
           # nothing.
           actual=$(for d in formal/tla/*/; do
-            if [ -e "${d}smoke.cfg" ] || ls "${d}"MC*.smoke.cfg >/dev/null 2>&1; then
+            if [ -f "${d}smoke.cfg" ] || ls "${d}"MC*.smoke.cfg >/dev/null 2>&1; then
               basename "$d"
             fi
           done | sort | tr '\n' ' ' | sed 's/ $//')
