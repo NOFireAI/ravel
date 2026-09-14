@@ -1548,17 +1548,17 @@ pub struct Cli {
     pub max_parallel_slices: usize,
 
     /// A remote cluster this coordinator federates a query out to (ADR-0071
-    /// cross-cluster federation). Repeatable: one flag per remote. Refuses
-    /// startup when the coordinator can resolve more than one local tenant,
-    /// because federation holds one remote credential per process and cannot
-    /// express a per-tenant remote credential; single-tenant federation is the
-    /// only supported configuration.
+    /// cross-cluster federation). Repeatable: one flag per remote. Its
+    /// credential belongs to one local tenant, named by the `tenant` key; a
+    /// spec that names none is refused on a coordinator that can resolve more
+    /// than one local tenant.
     ///
     /// The value is a comma-separated `key=value` spec. Required keys: `name`
     /// (the cluster's stable label, surfaced in the `warnings` field when it is
     /// skipped), `endpoint` (`host:port` of the remote's fragment `SeriesFetch`
     /// surface), and `credential-file` (a file holding the bearer token this
-    /// coordinator presents to the remote). Optional keys: `tls`
+    /// coordinator presents to the remote). Optional keys: `tenant` (the one
+    /// local tenant whose queries fan out to this remote), `tls`
     /// (`true`/`false`, default `true`), `tls-ca-file` (a CA bundle for the
     /// remote's server certificate, meaningful only with TLS on),
     /// `skip-unavailable` (`true`/`false`, default `false`), and `soft-timeout`
@@ -1579,16 +1579,27 @@ pub struct Cli {
     /// this configured principal. Remotes are operator configuration only and
     /// never appear in query text.
     ///
-    /// Because that one credential is process-wide, federation is single-tenant:
-    /// a coordinator that can resolve more than one local tenant (two or more
-    /// `--tenant-token` tenants, or any of `--dev-insecure-tenant-header`,
-    /// `--oidc-issuer`, or `--mtls-enabled`) refuses to start with a remote
-    /// cluster configured, rather than fanning every local tenant's selectors
-    /// and discovery out under the same credential and returning another
-    /// tenant's series.
+    /// Because that credential authorizes one tenant's data on the remote, it
+    /// belongs to one LOCAL tenant: `tenant` names it, and a query from any
+    /// other local tenant never dials this remote, presenting no credential and
+    /// receiving no remote series. A local tenant no remote names is answered
+    /// from local data alone. Two local tenants sharing a remote endpoint is two
+    /// `--remote-cluster` specs, each with its own `name` and `credential-file`;
+    /// there is no syntax for naming several local tenants on one spec, because
+    /// that puts them back behind one credential.
+    ///
+    /// Omitting `tenant` leaves the remote reachable by every local tenant,
+    /// which is correct only where one can ever resolve. A coordinator that can
+    /// resolve more than one (two or more `--tenant-token` tenants, or any of
+    /// `--dev-insecure-tenant-header`, `--oidc-issuer`, or `--mtls-enabled`)
+    /// refuses to start with such a spec, rather than fanning every local
+    /// tenant's selectors and discovery out under the same credential and
+    /// returning another tenant's series. A `tenant` that no `--tenant-token`
+    /// configures is also refused where the tenant set is fully known: it can
+    /// never fire.
     ///
     /// Example:
-    /// `--remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,skip-unavailable=true`
+    /// `--remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tenant=acme,skip-unavailable=true`
     #[arg(long = "remote-cluster", value_name = "SPEC")]
     pub remote_clusters: Vec<String>,
 

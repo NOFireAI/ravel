@@ -986,4 +986,100 @@ mod tests {
             other => panic!("expected QueryError::Federation, got {other:?}"),
         }
     }
+
+    /// A fetcher that fails the test if it is ever dialed. The mapping filters
+    /// before dispatch, so an unmapped tenant must never reach one.
+    struct NeverDialedFetcher;
+
+    #[async_trait]
+    impl SliceFetcher for NeverDialedFetcher {
+        async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            panic!("a remote mapped to another local tenant must never be dialed");
+        }
+    }
+
+    const MAPPED: TenantHash = TenantHash([7u8; 16]);
+    const UNMAPPED: TenantHash = TenantHash([9u8; 16]);
+
+    fn mapped_remote() -> Federation {
+        Federation::new(vec![RemoteCluster {
+            name: "eu-west".to_string(),
+            fetcher: Arc::new(NeverDialedFetcher),
+            tenant: Some(MAPPED),
+            skip_unavailable: false,
+            soft_timeout: Duration::from_secs(5),
+        }])
+    }
+
+    /// A tenant the remote is not mapped to gets an empty outcome and never
+    /// dials: the filter runs before dispatch, so no credential is presented and
+    /// no request is issued. `NeverDialedFetcher` panics if that is wrong, so
+    /// this cannot pass by the fetch merely returning nothing.
+    #[tokio::test]
+    async fn an_unmapped_tenant_dials_no_remote() {
+        let outcome = mapped_remote()
+            .fetch(
+                UNMAPPED,
+                Signal::Metrics,
+                Vec::new(),
+                Vec::new(),
+                0,
+                1_000,
+                Vec::new(),
+                QueryAccounting::new(),
+                EngineConfig::default(),
+            )
+            .await
+            .expect("an unmapped tenant is answered locally, not failed");
+
+        assert!(outcome.series.is_empty(), "no remote series");
+        assert!(
+            !outcome.partial,
+            "a remote this tenant holds no credential for is outside its query, not missing \
+             from it"
+        );
+        assert!(outcome.warnings.is_empty(), "and nothing to warn about");
+        assert!(outcome.skipped.is_empty(), "nothing was skipped");
+    }
+
+    /// `remotes_for`/`has_remotes_for` select by exact local tenant, and an
+    /// unkeyed remote is reachable by every tenant. The two are one predicate, so
+    /// a caller asking "does this tenant federate" and `fetch` agree.
+    #[test]
+    fn remote_selection_is_by_local_tenant() {
+        let fed = Federation::new(vec![
+            RemoteCluster {
+                name: "keyed".to_string(),
+                fetcher: Arc::new(NeverDialedFetcher),
+                tenant: Some(MAPPED),
+                skip_unavailable: false,
+                soft_timeout: Duration::from_secs(5),
+            },
+            RemoteCluster {
+                name: "unkeyed".to_string(),
+                fetcher: Arc::new(NeverDialedFetcher),
+                tenant: None,
+                skip_unavailable: false,
+                soft_timeout: Duration::from_secs(5),
+            },
+        ]);
+
+        let for_mapped: Vec<&str> = fed.remotes_for(MAPPED).map(|r| r.name.as_str()).collect();
+        assert_eq!(for_mapped, vec!["keyed", "unkeyed"]);
+        let for_unmapped: Vec<&str> = fed.remotes_for(UNMAPPED).map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            for_unmapped,
+            vec!["unkeyed"],
+            "a keyed remote belongs to its tenant alone"
+        );
+        assert!(fed.has_remotes_for(MAPPED));
+        assert!(fed.has_remotes_for(UNMAPPED));
+
+        let keyed_only = mapped_remote();
+        assert!(keyed_only.has_remotes_for(MAPPED));
+        assert!(
+            !keyed_only.has_remotes_for(UNMAPPED),
+            "a tenant no remote names federates nothing"
+        );
+    }
 }
