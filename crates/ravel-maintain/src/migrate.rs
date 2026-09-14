@@ -1331,6 +1331,156 @@ mod tests {
         assert_eq!((l0_below, l1_below), (0, 0));
     }
 
+    /// The L1 part keys the migration published for one `(shard, hour)` bucket,
+    /// read out of its compaction record, so the test can open the rewrite's own
+    /// output through the production RSEG reader rather than a copy of it.
+    async fn migrated_part_keys(
+        store: &dyn ObjectStoreBackend,
+        shard: u32,
+        hour: u32,
+    ) -> Vec<String> {
+        let bucket = Bucket::new(tenant_hash(), Signal::Metrics, shard, hour);
+        let listing = list_bucket(store, &bucket).await.expect("list bucket");
+        let mut parts = Vec::new();
+        for key in &listing.compaction_record_keys {
+            let got = store
+                .get(key, GetRange::Full)
+                .await
+                .expect("get compaction record");
+            let rec =
+                record::decode_compaction(got.data.as_ref()).expect("decode compaction record");
+            for part in &rec.parts {
+                parts
+                    .push(keys::reconstruct_l1_part_key(&rec, part).expect("reconstruct part key"));
+            }
+        }
+        parts
+    }
+
+    /// The two #530 fix-shape bullets that had not landed (issue #1775): one
+    /// migration exercised end to end, and the ordering guarantee that a format
+    /// floor rises only once *every* bucket has converted. Three sealed buckets
+    /// across two shards are recorded one below the target over real v7 bytes
+    /// (the synthetic-N-1 record shape the other migrate tests use, since no real
+    /// N-1 RSEG *object* version has shipped -- ADR-0092 decision 7 keeps the
+    /// reader window single-version, so "below target" is a commit-record fact
+    /// over a genuine current-version object, not an older trailer). Driven one
+    /// bucket at a time with a one-record budget: the floor stays unraised on
+    /// every partial invocation and is raised to the target only on the
+    /// invocation whose walk drains, i.e. strictly after the last bucket
+    /// converted. Every migrated bucket's published L1 output is then opened
+    /// through the production RSEG reader and admitted at the target version.
+    #[tokio::test]
+    async fn floor_rises_only_after_every_bucket_converts_and_outputs_read_at_the_target() {
+        let store = MemoryStore::new();
+        provision(&store, 2).await;
+        let target = VERSION_V7 as u32;
+        let buckets = [(0u32, 100u32), (0, 101), (1, 100)];
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        seed_at(&store, 0, 101, 2, "beta", target - 1).await;
+        seed_at(&store, 1, 100, 3, "gamma", target - 1).await;
+
+        let clock = FixedClock::new(sealed_now_ns_for(101));
+        let config = CompactorConfig::default();
+        let budget = MigrateBudget::records(1);
+
+        let mut invocations = 0usize;
+        let mut buckets_migrated = 0usize;
+        let mut partial_invocations = 0usize;
+        loop {
+            let report = migrate_family(
+                &store,
+                &clock,
+                &config,
+                tenant_hash(),
+                Signal::Metrics,
+                FAMILY,
+                target,
+                2,
+                budget,
+                "test",
+            )
+            .await
+            .expect("migrate invocation");
+            invocations += 1;
+            buckets_migrated += report.buckets_migrated;
+
+            let floor = current_floor_from_store(&store, &tenant_hash(), Signal::Metrics, FAMILY)
+                .await
+                .expect("read floor");
+            if report.walk_complete {
+                assert_eq!(
+                    floor,
+                    Some(target),
+                    "the drained walk raised the floor to the target"
+                );
+                assert_eq!(
+                    report.verification,
+                    Some(Verification::FloorRaised {
+                        floor_version: target
+                    }),
+                );
+                break;
+            }
+            // A walk that has not drained still has a bucket below the target, so
+            // the floor must not have risen: it rises only after the last one.
+            partial_invocations += 1;
+            assert_eq!(
+                floor, None,
+                "the floor stayed unraised while a bucket sat below the target"
+            );
+            assert!(invocations < 10, "resume loop failed to converge");
+        }
+
+        assert!(
+            partial_invocations >= 1,
+            "a one-record budget over three buckets must interrupt before draining"
+        );
+        assert_eq!(
+            buckets_migrated, 3,
+            "every seeded bucket converted exactly once"
+        );
+
+        // Record axis: nothing is left below the target for the family.
+        let (l0_below, l1_below) =
+            count_below_target(&store, &tenant_hash(), Signal::Metrics, 2, target)
+                .await
+                .expect("re-audit");
+        assert_eq!((l0_below, l1_below), (0, 0));
+
+        // Reader axis: every migrated bucket's own published output opens through
+        // the production RSEG reader and is admitted at the target version.
+        let mut outputs_read = 0usize;
+        for (shard, hour) in buckets {
+            let part_keys = migrated_part_keys(&store, shard, hour).await;
+            assert!(
+                !part_keys.is_empty(),
+                "bucket ({shard},{hour}) published an L1 part"
+            );
+            for key in part_keys {
+                let got = store
+                    .get(&key, GetRange::Full)
+                    .await
+                    .expect("get migrated L1 part");
+                let loc = ravel_segment::open_from_full(
+                    got.data.as_ref(),
+                    ravel_segment::ReaderLimits::default(),
+                )
+                .expect("migration output is a readable RSEG segment");
+                assert_eq!(
+                    u32::from(loc.version),
+                    target,
+                    "the migrated object is admitted at the target version"
+                );
+                outputs_read += 1;
+            }
+        }
+        assert!(
+            outputs_read >= 3,
+            "each converted bucket contributed at least one readable output"
+        );
+    }
+
     /// What an [`InjectingStore`] writes when it fires, i.e. what "lands"
     /// during the window between the walk finishing and the re-audit reading.
     #[derive(Debug, Clone, Copy)]
