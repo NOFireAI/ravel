@@ -3,21 +3,17 @@
 //!
 //! # What it costs to not do this
 //!
-//! Asking a question through `attrs['attr_3']` and through a declared column
-//! `"attr_3"` over the same data moves identical bytes over the wire under the
-//! stock whole-object read policy, yet the map form costs 50x-220x the CPU: on
-//! an in-process store, 40 objects, 200,000 rows, 33 record attributes, the
-//! equality statement was 1070.7 ms versus 4.8 ms cold and decoded 84,691
-//! versus 3,531 stored page bytes. Three things cost that, and all three are
-//! about materializing the whole map when the query reads one key: the reader
-//! selects every FIELD_DIR column's pages, [`crate::logs_scan`] rebuilds a
-//! `Vec<(String, AttrValue)>` per row, and it materializes a `Map(Utf8, Utf8)`
-//! column that `get_field` then reads one key out of.
+//! Three things cost the map form, all of them about materializing the whole
+//! map when the query reads one key: the reader selects every FIELD_DIR
+//! column's pages, [`crate::logs_scan`] rebuilds a `Vec<(String, AttrValue)>`
+//! per row, and it materializes a `Map(Utf8, Utf8)` column that `get_field`
+//! then reads one key out of.
 //!
 //! This is a CPU saving, not an I/O one. The stock fetch policy reads whole
 //! objects, so narrowing the *decode* selection changes no wire byte and no GET
 //! (the fetch layer is out of scope, #1769); only the pages decoded and the
-//! per-row work fall.
+//! per-row work fall. See ADR-0087's 2026-09-14 amendment for the measurement
+//! that motivated this.
 //!
 //! # The rewrite
 //!
@@ -363,6 +359,15 @@ fn rebuild_node(
             group.groups().to_vec(),
             group.has_grouping_set(),
         );
+        // `agg.input_schema()` is stale after the rewrite: its `attrs` slot is
+        // still `Map` where the rebuilt child now emits `Utf8`. Safe because
+        // the output schema comes from `input.schema()` (the real child) rather
+        // than this argument, and the only runtime reads of the stored copy sit
+        // in `init_empty_grouping_sets`, which returns early unless
+        // `has_grouping_set()` -- and `classify_and_collect` bails on grouping
+        // sets, so this plan never reaches them. A DataFusion change that read
+        // the stored schema on the non-grouping-set path would break that, so
+        // pass the child's schema instead if this stops holding.
         let rebuilt = AggregateExec::try_new(
             *agg.mode(),
             group_by,
