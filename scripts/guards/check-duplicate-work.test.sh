@@ -94,8 +94,11 @@ write_gh_stub() {
   mkdir -p "${bin}"
   cat > "${bin}/gh" <<STUB
 #!/usr/bin/env bash
-# gh api repos/<o>/<r>/pulls/<n>/files --paginate --jq .[].path
+# gh api repos/<o>/<r>/pulls/<n>/files --paginate --jq .[].filename
 # gh pr view <n> --json <fields> --jq <expr>   |   gh pr list ...
+# No \`files\` branch under \`pr view\`: the guard reads file lists from the REST
+# endpoint above, and a stub that still answered the old call would let a
+# regression back to it pass green, which is how the .path bug shipped.
 if [[ "\$1" == "api" ]]; then
   n="\$(printf '%s' "\$2" | sed 's#.*/pulls/##; s#/files\$##')"
   # Model the RESPONSE SHAPE, not just the output. This endpoint keys a path as
@@ -127,12 +130,10 @@ if [[ "\$1" == "pr" && "\$2" == "list" ]]; then
 fi
 if [[ "\$1" == "pr" && "\$2" == "view" ]]; then
   n="\$3"
-  for a in "\$@"; do case "\$a" in headRefName) want=branch;; files) want=files;; title) want=title;; esac; done
+  for a in "\$@"; do case "\$a" in headRefName) want=branch;; title) want=title;; esac; done
   case "\${want}:\${n}" in
     branch:101) echo pr-a ;;
     branch:102) echo pr-b ;;
-    files:101)  printf 'shared.txt\n' ;;
-    files:102)  printf '${files_b}\n' ;;
     title:101)  echo 'fix(deps): bump the thing' ;;
     title:102)  echo 'chore(deps): take the thing' ;;
     *) exit 1 ;;
