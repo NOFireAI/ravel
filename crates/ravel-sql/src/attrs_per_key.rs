@@ -37,7 +37,8 @@
 //!
 //! `attrs['k']` and a declared column `"k"` diverge by design when a record
 //! holds a non-`Str` value under a `Str` declaration: the map renders `7`, the
-//! declared column reads NULL (ADR-0090 decision 6). The per-key column
+//! declared column reads NULL (ADR-0090 decision 7, no cast, ever). The
+//! per-key column
 //! reproduces the MAP rendering -- record-wins over resource/scope, every
 //! variant rendered as text, NULL only for a genuinely absent key -- so a query
 //! returns the same rows it did before. Aliasing the declared column instead

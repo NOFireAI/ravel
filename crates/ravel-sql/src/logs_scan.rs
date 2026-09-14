@@ -220,9 +220,8 @@
 //! `attrs['k']` subscripts is rewritten by
 //! [`crate::attrs_per_key::AttrsPerKeyProjection`] into synthetic per-key
 //! columns (issue #1768), which resolve to just those keys' FIELD_DIR columns
-//! plus `attrs_raw` like a declared column does; ADR-0087 decision 3 recorded
-//! per-key projection as out of scope and needs an amendment note now that
-//! #1768 implements it.
+//! plus `attrs_raw` like a declared column does (ADR-0087, amended
+//! 2026-09-14).
 //!
 //! # Row refs, for TopK late materialization (ADR-0774)
 //!
@@ -1525,7 +1524,10 @@ impl LogsScanExec {
             attr_keys,
             false,
         )
-        .map(|scan| scan.with_column_stats(self.column_stats.clone()))
+        .map(|scan| {
+            scan.with_column_stats(self.column_stats.clone())
+                .with_segment_timing(self.segment_timing)
+        })
     }
 
     /// Attach this plan's loaded column statistics (ADR-0850), resolved once
