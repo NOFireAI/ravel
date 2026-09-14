@@ -660,6 +660,8 @@ fn task_ctx_with_query_bytes(max_query_bytes: usize) -> Arc<TaskContext> {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
+        // Issue #913: the per-segment timeline off, as on the shipped default.
+        segment_timing: false,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());

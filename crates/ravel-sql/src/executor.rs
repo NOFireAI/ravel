@@ -1550,7 +1550,8 @@ impl SqlExecutor {
                         phase_accounting.clone(),
                     )
                     .with_declared_columns(extras.declared)
-                    .with_column_stats(column_stats),
+                    .with_column_stats(column_stats)
+                    .with_segment_timing(config.segment_timing),
                 ))
             }
             // The spans, alerts, and audit providers are not yet threaded onto
@@ -2211,7 +2212,8 @@ impl SqlExecutor {
                     self.log_fetcher.clone(),
                     PhaseAccounting::new(),
                 )
-                .with_declared_columns(declared.to_vec()),
+                .with_declared_columns(declared.to_vec())
+                .with_segment_timing(self.config.segment_timing),
             )),
             TargetSignal::Spans => SessionTable::Spans(Arc::new(SpansTableProvider::new(
                 empty_snapshot(),

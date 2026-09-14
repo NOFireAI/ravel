@@ -72,6 +72,8 @@ async fn a_join_that_overruns_the_query_ceiling_aborts_and_frees_the_tenant_budg
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
+        // Issue #913: the per-segment timeline off, as on the shipped default.
+        segment_timing: false,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
