@@ -75,6 +75,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{collect, displayable, execute_stream};
@@ -336,6 +337,7 @@ impl WorkerSliceClient for InProcessWorker {
         _location: &str,
         ticket: &FlightTicket,
         limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         self.limits_seen.lock().expect("lock").push(limit);
         // Rebuild the slice's snapshot from the ticket and run the worker
@@ -429,6 +431,7 @@ impl WorkerSliceClient for WireWorker {
         _location: &str,
         ticket: &FlightTicket,
         _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         // Encode the slice ticket exactly as the coordinator would, then redeem
         // it against the real service. `slice_count > 1` routes it to the
@@ -1422,11 +1425,12 @@ impl WorkerSliceClient for RefusedPortWorkers {
         location: &str,
         ticket: &FlightTicket,
         limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         if self.dead.contains(location) {
-            self.flight.fetch_slice(location, ticket, limit)
+            self.flight.fetch_slice(location, ticket, limit, _context)
         } else {
-            self.healthy.fetch_slice(location, ticket, limit)
+            self.healthy.fetch_slice(location, ticket, limit, _context)
         }
     }
 }
@@ -1452,10 +1456,11 @@ impl WorkerSliceClient for RefusingClient {
         location: &str,
         ticket: &FlightTicket,
         limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         match &self.healthy {
             Some(worker) if !self.dead.contains(location) => {
-                worker.fetch_slice(location, ticket, limit)
+                worker.fetch_slice(location, ticket, limit, _context)
             }
             _ => Err(DataFusionError::Internal(self.message.to_string())),
         }
@@ -1479,6 +1484,23 @@ async fn collect_with_fallback(
     client: Arc<dyn WorkerSliceClient>,
     fallback: SliceFallback,
 ) -> DFResult<Vec<RecordBatch>> {
+    collect_with_fallback_in(
+        endpoints,
+        client,
+        fallback,
+        Arc::new(TaskContext::default()),
+    )
+    .await
+}
+
+/// The same, under a caller-supplied `TaskContext`, so a test can pin which
+/// memory pool the coordinator-local read reserves against.
+async fn collect_with_fallback_in(
+    endpoints: Vec<WorkerSlice>,
+    client: Arc<dyn WorkerSliceClient>,
+    fallback: SliceFallback,
+    context: Arc<TaskContext>,
+) -> DFResult<Vec<RecordBatch>> {
     let plan = distributed_samples_plan(
         endpoints,
         client,
@@ -1488,7 +1510,7 @@ async fn collect_with_fallback(
         ByteLimit::Unlimited,
         fallback,
     )?;
-    collect(plan, Arc::new(TaskContext::default())).await
+    collect(plan, context).await
 }
 
 /// The whole-set result of the plain local scan: the independent reference for
@@ -1623,6 +1645,142 @@ async fn every_worker_dead_reads_on_the_coordinator() {
     // what distinguishes this case from the one above: a pooled "a fallback
     // happened" figure would read the same for both.
     assert_counters(&counters, 2, 2, 0);
+}
+
+/// A `MemoryPool` that records the name of every consumer registered against
+/// it. `RsegScanExec` registers `RsegScanExec[<partition>]`, so seeing that
+/// name is proof the scan reserved against THIS pool rather than another one.
+#[derive(Debug, Default)]
+struct RecordingPool {
+    inner: datafusion::execution::memory_pool::UnboundedMemoryPool,
+    consumers: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingPool {
+    fn saw_scan(&self) -> bool {
+        self.consumers
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|name| name.starts_with("RsegScanExec"))
+    }
+}
+
+impl std::fmt::Display for RecordingPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RecordingPool")
+    }
+}
+
+impl datafusion::execution::memory_pool::MemoryPool for RecordingPool {
+    fn memory_limit(&self) -> datafusion::execution::memory_pool::MemoryLimit {
+        self.inner.memory_limit()
+    }
+
+    fn register(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+        self.consumers
+            .lock()
+            .expect("lock")
+            .push(consumer.name().to_string());
+        self.inner.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+
+    fn grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) {
+        self.inner.grow(reservation, additional);
+    }
+
+    fn shrink(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        shrink: usize,
+    ) {
+        self.inner.shrink(reservation, shrink);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) -> DFResult<()> {
+        self.inner.try_grow(reservation, additional)
+    }
+
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+
+    fn name(&self) -> &str {
+        "RecordingPool"
+    }
+}
+
+/// The coordinator-local read reserves against the query's own memory pool,
+/// not a default one. `RsegScanExec` registers its `MemoryReservation` against
+/// `context.memory_pool()`, and a bare `TaskContext` carries an unbounded pool,
+/// so a local read under a default context is the one path whose decoded
+/// batches escape the tenant's budget. That window is exactly when every worker
+/// is dead and the coordinator reads every slice itself.
+///
+/// A pool that records its consumers proves the threading directly: the scan
+/// names itself `RsegScanExec[<partition>]`, so the assertion is that THIS
+/// pool saw that consumer. A bounded pool would not do: a small limit fails
+/// the whole plan whichever pool the scan used, which is a test that passes
+/// for the wrong reason.
+///
+/// Flip to watch it fail: in `CoordinatorSliceReader::fetch_slice`, pass
+/// `Arc::new(TaskContext::default())` to `execute_stream` instead of the
+/// threaded `context`. The scan then registers against that default pool and
+/// this one never sees it.
+#[tokio::test]
+async fn the_coordinator_local_read_reserves_against_the_query_pool() {
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher = SegmentFetcher::new(Arc::clone(&backend));
+
+    let locations = vec![dead_location(), dead_location()];
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RefusedPortWorkers {
+        healthy: InProcessWorker::new(fetcher.clone()),
+        flight: FlightWorkerSliceClient::new(
+            ravel_sql::derive_ticket_key(b"fallback-cases"),
+            MetadataMap::new(),
+            Duration::from_secs(1),
+        ),
+        dead: locations.iter().cloned().collect(),
+    });
+    let fallback = SliceFallback::with_local(local_reader(&fetcher));
+
+    let pool = Arc::new(RecordingPool::default());
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(
+            Arc::clone(&pool) as Arc<dyn datafusion::execution::memory_pool::MemoryPool>
+        )
+        .build_arc()
+        .expect("runtime builds");
+    let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+    let got = collect_with_fallback_in(
+        endpoints_at(&snapshot, &locations),
+        client,
+        fallback,
+        context,
+    )
+    .await
+    .expect("the coordinator reads the slices itself");
+    assert!(!got.is_empty(), "the fallback still returns the whole set");
+
+    assert!(
+        pool.saw_scan(),
+        "the coordinator-local scan must reserve against the query's pool;          consumers seen: {:?}",
+        pool.consumers.lock().expect("lock"),
+    );
 }
 
 #[tokio::test]
@@ -1881,6 +2039,7 @@ impl WorkerSliceClient for RlogWorker {
         _location: &str,
         ticket: &FlightTicket,
         _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let snapshot = ticket.snapshot();
         let target_partitions = snapshot.segments.len().max(1);
@@ -2538,6 +2697,7 @@ impl WorkerSliceClient for SpanWorker {
         _location: &str,
         ticket: &FlightTicket,
         _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let snapshot = ticket.snapshot();
         let target_partitions = snapshot.segments.len().max(1);
