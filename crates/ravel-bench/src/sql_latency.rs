@@ -1636,6 +1636,12 @@ struct ColdExecutor {
     /// counters above: nothing downstream hands it back, and it is the only
     /// place a test can prove `--store-get-concurrency` reached the limiter
     /// rather than stopping at the config the report stamps.
+    ///
+    /// Written on every build and read only by those tests, so the lib target
+    /// sees a field nobody reads and `-D warnings` rejects it. Scoped to the
+    /// builds where that is actually true, rather than a blanket allow, so a
+    /// field that goes dead in test builds too still reports.
+    #[cfg_attr(not(test), allow(dead_code))]
     get_limiter_permits: usize,
 }
 
