@@ -237,10 +237,15 @@ fn each_dynamic_resolver_refuses_an_unmapped_remote_cluster() {
 }
 
 /// A mapping naming a tenant no `--tenant-token` configures can never fire: the
-/// remote would sit there answering nobody. Checked only where the tenant set is
+/// remote would sit there answering nobody. Checked wherever the tenant set is
 /// fully known (static bearer tokens, no resolver that derives a tenant from a
 /// request), so a typo fails startup instead of presenting as an empty result
 /// months later.
+///
+/// Both tenant counts are driven, because the check keys on "no dynamic
+/// resolver", NOT on the coordinator being single-tenant: the multi-tenant
+/// static deployment is the one the mapping exists for, and gating the check on
+/// single-tenant would exempt exactly it.
 #[test]
 fn refusing_a_mapping_to_an_unconfigured_tenant() {
     let two_tenants = tokens(&[("token-a", "acme"), ("token-b", "beta")]);
@@ -259,6 +264,19 @@ fn refusing_a_mapping_to_an_unconfigured_tenant() {
     assert!(
         msg.contains("acme, beta"),
         "error must list the configured tenants so the typo is visible, got: {msg:?}"
+    );
+
+    let one_tenant = tokens(&[("token-a", "acme")]);
+    let single_err = ravel_server::ensure_federation_tenant_mapping(
+        &[remote("east", Some("acme-typo"))],
+        &one_tenant,
+        false,
+        &AuthResolverSettings::default(),
+    )
+    .expect_err("the same typo must refuse on a single-tenant coordinator too");
+    assert!(
+        format!("{single_err:#}").contains("acme-typo"),
+        "got: {single_err:#}"
     );
 }
 
