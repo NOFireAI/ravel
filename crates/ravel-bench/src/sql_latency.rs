@@ -222,6 +222,32 @@ pub struct Provenance {
     /// full-scan statement is latency-bound and moves nearly linearly with it.
     #[serde(default = "default_fetch_concurrency")]
     pub fetch_concurrency: usize,
+    /// Explicit `--sql-partition-count` this run ASKED for (ADR-1195):
+    /// DataFusion's `target_partitions`, unbundled from `fetch_concurrency`.
+    /// `None` when the flag was unset, in which case the resolution falls back
+    /// to `fetch_concurrency` -- see [`Self::sql_partition_count_effective`].
+    #[serde(default)]
+    pub sql_partition_count_requested: Option<usize>,
+    /// The partition count that actually governed execution
+    /// (`EngineConfig::sql_partition_count()`): the requested value if set,
+    /// else `fetch_concurrency`. `None` when this process cannot know it, same
+    /// split and same reason as [`Self::logs_request_cost_bytes_effective`]:
+    /// the Flight lane does not send this setting to the server.
+    #[serde(default)]
+    pub sql_partition_count_effective: Option<usize>,
+    /// Explicit `--store-get-concurrency` this run ASKED for (ADR-1195): the
+    /// process-wide in-flight object-store GET cap, unbundled from
+    /// `fetch_concurrency`. `None` when the flag was unset, in which case the
+    /// resolution falls back to `fetch_concurrency` -- see
+    /// [`Self::store_get_concurrency_effective`].
+    #[serde(default)]
+    pub store_get_concurrency_requested: Option<usize>,
+    /// The GET concurrency that actually governed execution
+    /// (`EngineConfig::store_get_concurrency()`): the requested value if set,
+    /// else `fetch_concurrency`. `None` on the Flight lane, same reason as
+    /// [`Self::sql_partition_count_effective`].
+    #[serde(default)]
+    pub store_get_concurrency_effective: Option<usize>,
     /// The logs per-request byte budget this run ASKED for
     /// (`--logs-request-cost-bytes`, ADR-0904). A report written before this
     /// field existed deserializes to
@@ -1189,6 +1215,17 @@ pub struct GenerateConfig {
     /// (ADR-0088's single coupled knob, `ravel-server --fetch-concurrency`).
     /// Defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`].
     pub fetch_concurrency: usize,
+    /// Explicit `--sql-partition-count` override (ADR-1195): DataFusion's
+    /// `target_partitions`, unbundled from `fetch_concurrency`. `None` falls
+    /// back to `fetch_concurrency`, leaving today's behaviour byte-for-byte
+    /// unchanged. Reaches [`EngineConfig::sql_partition_count`].
+    pub sql_partition_count: Option<usize>,
+    /// Explicit `--store-get-concurrency` override (ADR-1195): the
+    /// process-wide in-flight object-store GET cap, unbundled from
+    /// `fetch_concurrency`. `None` falls back to `fetch_concurrency`, leaving
+    /// today's behaviour byte-for-byte unchanged. Reaches
+    /// [`EngineConfig::store_get_concurrency`].
+    pub store_get_concurrency: Option<usize>,
     /// Append one JSON line per finished statement ([`EntryEvent`]) to this
     /// file as the run goes, flushed per line, so a run killed hours in still
     /// leaves every number it had measured. `None` writes nothing.
@@ -1324,6 +1361,17 @@ pub struct TenantConfigInput {
     /// (ADR-0088's single coupled knob, `ravel-server --fetch-concurrency`).
     /// Defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`].
     pub fetch_concurrency: usize,
+    /// Explicit `--sql-partition-count` override (ADR-1195): DataFusion's
+    /// `target_partitions`, unbundled from `fetch_concurrency`. `None` falls
+    /// back to `fetch_concurrency`, leaving today's behaviour byte-for-byte
+    /// unchanged. Reaches [`EngineConfig::sql_partition_count`].
+    pub sql_partition_count: Option<usize>,
+    /// Explicit `--store-get-concurrency` override (ADR-1195): the
+    /// process-wide in-flight object-store GET cap, unbundled from
+    /// `fetch_concurrency`. `None` falls back to `fetch_concurrency`, leaving
+    /// today's behaviour byte-for-byte unchanged. Reaches
+    /// [`EngineConfig::store_get_concurrency`].
+    pub store_get_concurrency: Option<usize>,
     /// Append one JSON line per finished statement ([`EntryEvent`]) to this
     /// file as the run goes, flushed per line, so a run killed hours in still
     /// leaves every number it had measured. `None` writes nothing.
@@ -1498,6 +1546,13 @@ pub struct ExecutorSettings {
     pub shard_count: u32,
     /// Scan partitions and in-flight segment fetches (`--fetch-concurrency`).
     pub fetch_concurrency: usize,
+    /// Explicit `--sql-partition-count` override (ADR-1195). `None` falls
+    /// back to `fetch_concurrency`. Reaches [`EngineConfig::sql_partition_count`].
+    pub sql_partition_count: Option<usize>,
+    /// Explicit `--store-get-concurrency` override (ADR-1195). `None` falls
+    /// back to `fetch_concurrency`. Reaches
+    /// [`EngineConfig::store_get_concurrency`].
+    pub store_get_concurrency: Option<usize>,
     /// Per-tenant ceiling across a tenant's concurrent queries
     /// (`--sql-tenant-max-bytes`), a SECOND limit under `max_query_bytes`.
     pub tenant_max_bytes: usize,
@@ -1549,6 +1604,8 @@ impl Default for ExecutorSettings {
             max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
             shard_count: 1,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            sql_partition_count: None,
+            store_get_concurrency: None,
             tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
             parallel_final_aggregation: true,
             max_segments: DEFAULT_MAX_SEGMENTS,
@@ -1586,6 +1643,8 @@ fn cold_executor(
         max_query_bytes,
         shard_count,
         fetch_concurrency,
+        sql_partition_count,
+        store_get_concurrency,
         tenant_max_bytes,
         parallel_final_aggregation,
         max_segments,
@@ -1634,6 +1693,8 @@ fn cold_executor(
             max_query_bytes,
             engine: EngineConfig {
                 fetch_concurrency: fetch_concurrency.max(1),
+                sql_partition_count,
+                store_get_concurrency,
                 max_segments,
                 logs_request_cost_bytes,
                 logs_block_range_threshold,
@@ -2252,6 +2313,8 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         max_query_bytes: cfg.max_query_bytes,
         shard_count,
         fetch_concurrency: cfg.fetch_concurrency,
+        sql_partition_count: cfg.sql_partition_count,
+        store_get_concurrency: cfg.store_get_concurrency,
         tenant_max_bytes: cfg.tenant_max_bytes,
         parallel_final_aggregation: cfg.parallel_final_aggregation,
         max_segments: cfg.max_segments,
@@ -2290,6 +2353,18 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
+            sql_partition_count_requested: cfg.sql_partition_count,
+            // Generate is always in process: the requested override (if any),
+            // else `fetch_concurrency`, reaches `EngineConfig` directly, so it
+            // is also the effective value.
+            sql_partition_count_effective: Some(
+                cfg.sql_partition_count.unwrap_or(cfg.fetch_concurrency),
+            ),
+            store_get_concurrency_requested: cfg.store_get_concurrency,
+            // Same reasoning as `sql_partition_count_effective` above.
+            store_get_concurrency_effective: Some(
+                cfg.store_get_concurrency.unwrap_or(cfg.fetch_concurrency),
+            ),
             logs_request_cost_bytes_requested: cfg
                 .logs_request_cost_bytes
                 .unwrap_or(DEFAULT_LOG_REQUEST_COST_BYTES),
@@ -2355,6 +2430,8 @@ fn tenant_executor_settings(
         max_query_bytes: cfg.max_query_bytes,
         shard_count,
         fetch_concurrency: cfg.fetch_concurrency,
+        sql_partition_count: cfg.sql_partition_count,
+        store_get_concurrency: cfg.store_get_concurrency,
         tenant_max_bytes: cfg.tenant_max_bytes,
         parallel_final_aggregation: cfg.parallel_final_aggregation,
         max_segments: cfg.max_segments,
@@ -2469,6 +2546,21 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
+            sql_partition_count_requested: cfg.sql_partition_count,
+            // `settings` is passed only on the in-process arm of the match
+            // above, so on the Flight lane this override never left the
+            // process and the server's own config governed `target_partitions`
+            // instead, unknown to this process.
+            sql_partition_count_effective: match &cfg.flight {
+                Some(_) => None,
+                None => Some(cfg.sql_partition_count.unwrap_or(cfg.fetch_concurrency)),
+            },
+            store_get_concurrency_requested: cfg.store_get_concurrency,
+            // Same reasoning as `sql_partition_count_effective` above.
+            store_get_concurrency_effective: match &cfg.flight {
+                Some(_) => None,
+                None => Some(cfg.store_get_concurrency.unwrap_or(cfg.fetch_concurrency)),
+            },
             logs_request_cost_bytes_requested: cfg
                 .logs_request_cost_bytes
                 .unwrap_or(DEFAULT_LOG_REQUEST_COST_BYTES),
@@ -3003,6 +3095,8 @@ mod tests {
             deadline: Duration::from_secs(30),
             continue_on_error: false,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            sql_partition_count: None,
+            store_get_concurrency: None,
             progress_jsonl: None,
             tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
             parallel_final_aggregation: false,
@@ -5888,6 +5982,8 @@ mod tests {
             deadline: Duration::from_secs(30),
             continue_on_error: false,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            sql_partition_count: None,
+            store_get_concurrency: None,
             progress_jsonl: None,
             tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
             parallel_final_aggregation: false,
@@ -5980,6 +6076,177 @@ mod tests {
             "the injected stall must not land in the decode interval: decode \
              {} ns against a {DELAY:?} stall",
             timing.decode_build_elapsed_max_ns
+        );
+    }
+
+    /// `--sql-partition-count` and `--store-get-concurrency` (ADR-1195) must
+    /// land on their own `EngineConfig` fields, not stop at a parsed
+    /// `ExecutorSettings` field. Values distinct from `fetch_concurrency`
+    /// prove each knob is threaded independently; the omitted-flag arm
+    /// guards against a silent-drop regression passing on a coincidental
+    /// default. Dropping `sql_partition_count,` or `store_get_concurrency,`
+    /// from the `EngineConfig` literal in `cold_executor` fails this test.
+    #[test]
+    fn cold_executor_threads_sql_partition_count_and_store_get_concurrency_overrides() {
+        let store = empty_store();
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                fetch_concurrency: 3,
+                sql_partition_count: Some(5),
+                store_get_concurrency: Some(7),
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor")
+        .executor;
+        assert_eq!(executor.config().engine.sql_partition_count(), 5);
+        assert_eq!(executor.config().engine.store_get_concurrency(), 7);
+        assert_eq!(
+            executor.config().engine.fetch_concurrency,
+            3,
+            "fetch_concurrency itself is untouched by the two new overrides"
+        );
+
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                fetch_concurrency: 3,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor")
+        .executor;
+        assert_eq!(
+            executor.config().engine.sql_partition_count(),
+            3,
+            "an omitted override falls back to fetch_concurrency"
+        );
+        assert_eq!(
+            executor.config().engine.store_get_concurrency(),
+            3,
+            "an omitted override falls back to fetch_concurrency"
+        );
+    }
+
+    /// `--sql-partition-count 5` resolves to exactly 5, independent of
+    /// `fetch_concurrency`, and the report's provenance carries both the
+    /// requested and resolved value for each knob (ADR-1195). Pins exact
+    /// numbers, not just non-zero-ness.
+    #[tokio::test]
+    async fn explicit_sql_partition_count_resolves_independent_of_fetch_concurrency() {
+        let gen_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let cfg = GenerateConfig {
+            store: gen_store,
+            store_backend: "memory".to_string(),
+            region: "n/a".to_string(),
+            endpoint: "n/a".to_string(),
+            entries: Vec::new(),
+            runs: 1,
+            records: 4,
+            records_per_object: 4,
+            extra_attrs: 0,
+            max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+            cache_bytes: 0,
+            deadline: Duration::from_secs(30),
+            continue_on_error: false,
+            fetch_concurrency: 8,
+            sql_partition_count: Some(5),
+            store_get_concurrency: None,
+            progress_jsonl: None,
+            tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
+            parallel_final_aggregation: false,
+            max_segments: DEFAULT_MAX_SEGMENTS,
+            explain_dir: None,
+            warm_catalog: false,
+            logs_suffix_len: None,
+            logs_request_cost_bytes: None,
+            logs_fetch_policy: LogsFetchPolicy::ByteMinimal,
+            logs_block_range_threshold: None,
+            store_cost_profile: StoreCostProfile::reference(),
+        };
+        let report = run_generated(&cfg).await.expect("generated lane runs");
+        let p = &report.provenance;
+        assert_eq!(
+            p.fetch_concurrency, 8,
+            "fetch_concurrency stays at its own configured value"
+        );
+        assert_eq!(p.sql_partition_count_requested, Some(5));
+        assert_eq!(
+            p.sql_partition_count_effective,
+            Some(5),
+            "an explicit override resolves to itself, not to fetch_concurrency"
+        );
+        assert_eq!(p.store_get_concurrency_requested, None);
+        assert_eq!(
+            p.store_get_concurrency_effective,
+            Some(8),
+            "the unset knob still falls back to fetch_concurrency"
+        );
+
+        let json = serde_json::to_value(p).expect("Provenance serializes");
+        assert_eq!(json["fetch_concurrency"], 8);
+        assert_eq!(json["sql_partition_count_requested"], 5);
+        assert_eq!(json["sql_partition_count_effective"], 5);
+        assert_eq!(
+            json["store_get_concurrency_requested"],
+            serde_json::Value::Null
+        );
+        assert_eq!(json["store_get_concurrency_effective"], 8);
+    }
+
+    /// With both `--sql-partition-count` and `--store-get-concurrency`
+    /// absent, the resolved values equal `fetch_concurrency` exactly: the
+    /// default path this task must leave byte-for-byte unchanged.
+    #[tokio::test]
+    async fn absent_sql_partition_count_and_store_get_concurrency_fall_back_to_fetch_concurrency() {
+        let gen_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let cfg = GenerateConfig {
+            store: gen_store,
+            store_backend: "memory".to_string(),
+            region: "n/a".to_string(),
+            endpoint: "n/a".to_string(),
+            entries: Vec::new(),
+            runs: 1,
+            records: 4,
+            records_per_object: 4,
+            extra_attrs: 0,
+            max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+            cache_bytes: 0,
+            deadline: Duration::from_secs(30),
+            continue_on_error: false,
+            fetch_concurrency: 6,
+            sql_partition_count: None,
+            store_get_concurrency: None,
+            progress_jsonl: None,
+            tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
+            parallel_final_aggregation: false,
+            max_segments: DEFAULT_MAX_SEGMENTS,
+            explain_dir: None,
+            warm_catalog: false,
+            logs_suffix_len: None,
+            logs_request_cost_bytes: None,
+            logs_fetch_policy: LogsFetchPolicy::ByteMinimal,
+            logs_block_range_threshold: None,
+            store_cost_profile: StoreCostProfile::reference(),
+        };
+        let report = run_generated(&cfg).await.expect("generated lane runs");
+        let p = &report.provenance;
+        assert_eq!(p.sql_partition_count_requested, None);
+        assert_eq!(
+            p.sql_partition_count_effective,
+            Some(6),
+            "an omitted override falls back to fetch_concurrency"
+        );
+        assert_eq!(p.store_get_concurrency_requested, None);
+        assert_eq!(
+            p.store_get_concurrency_effective,
+            Some(6),
+            "an omitted override falls back to fetch_concurrency"
         );
     }
 }

@@ -96,6 +96,8 @@ async fn l0_object_count_equals_distinct_data_object_keys() {
         deadline: Duration::from_secs(30),
         continue_on_error: false,
         fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+        sql_partition_count: None,
+        store_get_concurrency: None,
         progress_jsonl: None,
         tenant_max_bytes: ravel_bench::sql_latency::DEFAULT_TENANT_MAX_BYTES,
         parallel_final_aggregation: false,
