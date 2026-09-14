@@ -793,11 +793,11 @@ fn print_human_table(report: &SqlLatencyReport) {
 
 /// The cold run's logs-scan wall-clock split (`SqlStats::scan_timing`) beside
 /// the process CPU time the run consumed. Every `ms` column except `cold`,
-/// `first_batch` and `plan_init` is a SUM over the scan's partitions, whose
-/// intervals overlap in wall time, so those sums are comparable with each
-/// other and with `cpu_ms`, never with `cold`. `open_max` is the single
-/// partition that waited longest on segment opens, which is the only open
-/// figure that can sit on the critical path.
+/// `first_batch`, `plan_init` and `open_max` is a SUM over the scan's
+/// partitions, whose intervals overlap in wall time, so those sums are
+/// comparable with each other and with `cpu_ms`, never with `cold`. `open_max`
+/// is not a sum: it is the single partition that waited longest on segment
+/// opens, which is the only open figure that can sit on the critical path.
 fn print_scan_timing(report: &SqlLatencyReport) {
     let rows: Vec<(&str, f64, &RunAccounting)> = report
         .entries
@@ -858,11 +858,11 @@ fn print_scan_timing(report: &SqlLatencyReport) {
 }
 
 /// The cold run's logs-scan fast-path opens, split by the read shape the router
-/// chose (issue #904), printed next to the request accounting the main table
-/// already shows so a reader can pair the two: `backend_bills_requests`
-/// (`ReportRunConfig::backend_bills_requests`, `report.rs:102`) says whether
-/// the backend charges for requests, and this split says which read shape
-/// produced them.
+/// chose (issue #904), printed next to the request count the main table already
+/// shows so a reader can see which read shape produced those requests. Whether
+/// the backend charges per request is not stamped anywhere in this report:
+/// `harness::backend_bills_requests` answers it for a `StoreKind`, but this
+/// binary does not call it and `SqlLatencyReport` carries no such field.
 ///
 /// The unit is a SEGMENT OPEN, not a request and not a statement: one statement
 /// spanning several segments contributes one open per segment and can take both

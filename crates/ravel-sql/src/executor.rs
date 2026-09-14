@@ -88,6 +88,7 @@ use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, UnboundedMemor
 use datafusion::logical_expr::{
     Aggregate, Distinct, Expr, ExprSchemable, Filter, LogicalPlan, lit,
 };
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
@@ -359,7 +360,11 @@ pub struct SegmentTiming {
     pub done_ns: u64,
 }
 
-/// Fold every `LogsScanExec` timing metric under `plan` into `timing`.
+/// Fold one node's `LogsScanExec` timing metrics into `timing`.
+///
+/// Called from [`accumulate_block_counts`] with the `MetricsSet` that walk
+/// already holds, so the tree is traversed once and each node's metrics are
+/// cloned once.
 ///
 /// Elapsed sums and counts hold for any plan. Everything derived from an
 /// offset holds only while the plan has ONE `LogsScanExec`: each exec times
@@ -368,8 +373,8 @@ pub struct SegmentTiming {
 /// `stream_elapsed_max_ns` mix origins, and two execs can contribute rows for
 /// the same `(partition, segment)` pair. Making those comparable means giving
 /// the execs one query-level origin rather than merging harder here.
-fn accumulate_scan_timing(plan: &Arc<dyn ExecutionPlan>, timing: &mut ScanTiming) {
-    if let Some(metrics) = plan.metrics() {
+fn accumulate_scan_timing(metrics: &MetricsSet, timing: &mut ScanTiming) {
+    {
         let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
         timing.open_elapsed_ns += sum("open_elapsed");
         timing.open_pending_polls += sum("open_pending_polls");
@@ -437,9 +442,6 @@ fn accumulate_scan_timing(plan: &Arc<dyn ExecutionPlan>, timing: &mut ScanTiming
         rows.sort_by_key(|r| (r.open_start_ns, r.partition, r.segment));
         timing.segments.extend(rows);
     }
-    for child in plan.children() {
-        accumulate_scan_timing(child, timing);
-    }
 }
 
 /// The `LogsScanExec` block counters, summed over a plan tree, and the scan's
@@ -459,11 +461,16 @@ struct BlockCounts {
 /// nothing. Reads the counters the scan already maintains rather than counting
 /// blocks a second time.
 fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCounts) {
+    // One walk, one `metrics()` call per node: that call clones the node's
+    // whole `MetricsSet` out of its mutex, and with the per-segment timeline on
+    // the set holds three labelled metrics per segment per partition. Folding
+    // the timing here rather than in a second traversal halves both.
     if let Some(metrics) = plan.metrics() {
         let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
         counts.total += sum("blocks_total");
         counts.scanned += sum("blocks_scanned");
         counts.pruned_by_postings += sum("blocks_pruned_by_postings");
+        accumulate_scan_timing(&metrics, &mut counts.timing);
     }
     for child in plan.children() {
         accumulate_block_counts(child, counts);
@@ -2680,7 +2687,6 @@ impl PinnedStream {
     fn block_counts(&self) -> BlockCounts {
         let mut counts = BlockCounts::default();
         accumulate_block_counts(&self.plan, &mut counts);
-        accumulate_scan_timing(&self.plan, &mut counts.timing);
         counts
     }
 
