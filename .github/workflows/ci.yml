@@ -254,22 +254,42 @@ jobs:
   # per-PR budget and runs in tla-nightly.yml instead. The `ci` subcommand runs
   # smoke, the negative controls, and traceability under a single run id, and
   # its own exit code is the gate.
-  tla:
+  # TLA+ fast lane (ADR-1113), fanned out one job per model area. The areas
+  # under formal/tla are independent inputs to check-tla.sh, which already
+  # takes `-a AREA`, so running them concurrently explores exactly the state
+  # space the single job explored: same configs, same budgets, same negative
+  # controls and traceability checks, only on six runners instead of one.
+  # This is a scheduling change, not a verification-policy change.
+  #
+  # Measured on job 101914957416: the serial job spent 250s in
+  # maintenance/MCCompactionClaims and 195s in maintenance/MCMaintenanceOwnership
+  # against 3s for lifecycle/MCLifecycleGC, so the serial 16.3m p50 is set by
+  # one area while five short ones wait behind it.
+  #
+  # The matrix is enumerated rather than discovered because a required check
+  # must not be able to shrink silently: `tla` below asserts this list still
+  # equals the directories under formal/tla, so adding an area without adding
+  # it here fails instead of quietly going unchecked.
+  tla-models:
     needs: changes
     if: needs.changes.outputs.formal_area == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     permissions:
       contents: read
+    strategy:
+      # Report every area's real result. fail-fast would cancel siblings and
+      # report them as `cancelled`, which the aggregator cannot tell from an
+      # infrastructure loss.
+      fail-fast: false
+      matrix:
+        area: [catalog, commit, common, lifecycle, maintenance, resharding]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The job executes scripts/check-tla.sh from the PR itself; do not
           # leave the checkout token in .git/config for it to read.
           persist-credentials: false
-      # Self-test the harness's own resource-resolution and timeout logic
-      # before running any model. It drives shell functions only, needs no
-      # JVM and no TLC jar, so it runs here rather than in a compiling lane.
       - name: check-tla.sh self-test
         run: bash scripts/check-tla.test.sh
       - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
@@ -277,22 +297,89 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: Fast lane (smoke, negatives, traceability)
-        # State CI's resource choice rather than inheriting the script's
-        # laptop-safe default of 2 workers: at workers=2 the
-        # maintenance/MCCompactionClaims smoke config timed out at the 300s
-        # budget on this runner class, where -workers auto finished in ~246s.
-        # `auto` is the previous behaviour on GitHub runners, where claiming
-        # every core is fine.
         env:
           RAVEL_TLA_WORKERS: auto
-        run: scripts/check-tla.sh ci
+        run: scripts/check-tla.sh ci -a ${{ matrix.area }}
       - name: Upload TLC logs on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: tla-logs
+          name: tla-logs-${{ matrix.area }}
           path: .cache/tla/logs
           if-no-files-found: ignore
+
+  # The required check. It keeps the name `tla` so main's protect-main ruleset
+  # needs no edit, and it is the only thing that decides whether the formal
+  # lane passed.
+  #
+  # `if: always()` because a required check must report in every case the
+  # matrix can end in. That makes every non-success outcome this job's problem
+  # to classify, so it enumerates them rather than testing for failure: a
+  # cancelled matrix, a matrix that never ran because an upstream job failed,
+  # and a skipped matrix on a change that IS formal all have to be red. Only
+  # two states are green: every area succeeded, or formal_area was false and
+  # the lane legitimately did not apply.
+  tla:
+    needs: [changes, tla-models]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Assert the matrix covers every area under formal/tla
+        if: needs.changes.outputs.formal_area == 'true'
+        env:
+          # Must equal the matrix list above, in sorted order.
+          EXPECTED: catalog commit common lifecycle maintenance resharding
+        run: |
+          # Same area test scripts/check-tla.sh uses: a directory under
+          # formal/tla is an area when it holds a bare smoke.cfg or any
+          # per-module MC*.smoke.cfg. An empty result is a broken scan, not
+          # an empty repository, and fails rather than asserting against
+          # nothing.
+          actual=$(for d in formal/tla/*/; do
+            if [ -e "${d}smoke.cfg" ] || ls "${d}"MC*.smoke.cfg >/dev/null 2>&1; then
+              basename "$d"
+            fi
+          done | sort | tr '\n' ' ' | sed 's/ $//')
+          if [ -z "$actual" ]; then
+            echo "::error::found no model areas under formal/tla; the scan itself is broken"
+            exit 1
+          fi
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::formal/tla areas ($actual) do not match the tla-models matrix ($EXPECTED)"
+            echo "::error::add the new area to the matrix in .github/workflows/ci.yml"
+            exit 1
+          fi
+          echo "areas covered: $actual"
+      - name: Decide the formal lane
+        env:
+          FORMAL: ${{ needs.changes.outputs.formal_area }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          MODELS_RESULT: ${{ needs.tla-models.result }}
+        run: |
+          echo "formal_area=$FORMAL changes=$CHANGES_RESULT tla-models=$MODELS_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::the changes job did not succeed ($CHANGES_RESULT); the formal lane cannot be judged"
+            exit 1
+          fi
+          if [ "$FORMAL" != "true" ]; then
+            # Not a formal change. The matrix is expected to have skipped; any
+            # other result means the gating itself is wrong.
+            if [ "$MODELS_RESULT" != "skipped" ]; then
+              echo "::error::formal_area is false but tla-models reported $MODELS_RESULT"
+              exit 1
+            fi
+            echo "formal_area is false; no model areas apply"
+            exit 0
+          fi
+          if [ "$MODELS_RESULT" != "success" ]; then
+            echo "::error::tla-models reported $MODELS_RESULT; the formal lane is not green"
+            exit 1
+          fi
+          echo "every model area passed"
 
   # Lint the workflow files themselves (ADR-0086 decision 7). actionlint is
   # cheap and uses no cargo toolchain, so like doc-scripts it runs on every
