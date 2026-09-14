@@ -87,6 +87,7 @@ fn server_config(mcp: McpConfig) -> ServerConfig {
         cache_max_bytes: 256 * 1024 * 1024,
         catalog_cache_max_bytes: 256 * 1024 * 1024,
         process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_is_fallback: false,
         cache_dir: None,
         catalog_resolve_concurrency: None,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,

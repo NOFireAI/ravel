@@ -826,9 +826,10 @@ unconditionally in every mode: `ravel_memory_budget_bytes` (the resolved
 ceiling; `u64::MAX` means unlimited, which is what a host where memory could
 not be read but no explicit caps were set resolves to), `ravel_memory_reserved_bytes{component="sql"|"fetch"}`
 (bytes currently reserved against the budget, split by which side reserved
-them), and `ravel_memory_handoff_overlap_bytes` (bytes double-counted right
-now because a tenant's memory handed off between components overlaps in the
-budget's accounting window). `component="fetch"` always reads `0` today:
+them), and `ravel_memory_handoff_overlap_bytes` (bytes double-counted because
+a tenant's memory handed off between components overlaps in the budget's
+accounting window; inactive (always `0`) until fetch handoff accounting
+lands). `component="fetch"` always reads `0` today:
 the fetch layer does not yet reserve against this budget (only the SQL
 executor's per-tenant accountants do), so the gauge is an honest gap rather
 than a bug. It exists now so a dashboard built against it does not need to

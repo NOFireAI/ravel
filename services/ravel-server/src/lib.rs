@@ -482,6 +482,13 @@ pub struct ServerConfig {
     /// the exposed gauges read the SAME counter rather than two
     /// independently drifting instances.
     pub process_memory_budget_bytes: u64,
+    /// Whether [`Self::process_memory_budget_bytes`] was sized from
+    /// [`config::PERF_SOURCE_FALLBACK`] (host memory unknown), rather than
+    /// derived from a measured host. On that path the raw remainder is
+    /// `u64::MAX` minus the two hard cache carves, not `u64::MAX` itself; the
+    /// `/metrics` `ravel_memory_budget_bytes` gauge clamps to `u64::MAX` when
+    /// this is `true` so a dashboard's `== u64::MAX` unlimited check matches.
+    pub process_memory_budget_is_fallback: bool,
     /// `--cache-dir`: the ADR-0046 local-disk cache tier's directory (#97),
     /// `None` when the flag is unset. `main` sets it from `Cli::cache_dir`.
     /// When `Some` and `disable_cache` is off, [`query::build_catalog`] attaches
@@ -2095,6 +2102,7 @@ pub async fn start(
         // same reason.
         audit_pipeline: None,
         process_memory_budget: process_memory_budget.clone(),
+        process_memory_budget_is_fallback: config.process_memory_budget_is_fallback,
     };
 
     // Held past the HTTP wiring so the Flight SQL service can register

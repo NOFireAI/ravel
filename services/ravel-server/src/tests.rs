@@ -216,6 +216,7 @@ fn harness(
         catalog_cache_max_bytes: 0,
         audit_pipeline: None,
         process_memory_budget,
+        process_memory_budget_is_fallback: false,
     });
 
     Harness {
