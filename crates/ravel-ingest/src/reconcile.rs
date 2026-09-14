@@ -91,8 +91,24 @@
 //!   already past the same `2 * R` window is skipped without a GET
 //!   ([`mtime_stale`]). The body's `snapshot_unix_ns` is stamped no later than
 //!   the write that set the modification time, so a key the LIST shows as past
-//!   the window can only hold a body that is at least as old: skipping it never
-//!   drops a sibling the decoded body would have counted as fresh.
+//!   the window can only hold a body that is at least as old, and skipping it
+//!   drops no sibling the decoded body would have counted as fresh.
+//!
+//!   That ordering holds within one clock. `snapshot_unix_ns` comes from the
+//!   writer and the modification time from the object store, so a writer whose
+//!   clock runs ahead of the store's can produce a body that reads fresh
+//!   behind a modification time that reads stale. The skip is deliberately NOT
+//!   widened for that: it uses the same bare `2 * R` that [`is_stale`] uses, so
+//!   it skips exactly the keys `is_stale` would then discard. Widening it would
+//!   only pay a GET to reach the same answer, and the skew exposure is the one
+//!   [`is_stale`] already carries rather than a new one. A live sibling
+//!   refreshes its own modification time every `R`, so reaching this case needs
+//!   skew large enough to break `is_stale` too, and it self-corrects on the
+//!   next interval.
+//!
+//!   The reap below widens where this does not, and the asymmetry is the
+//!   point: a skipped GET costs one interval of under-counting that the next
+//!   interval fixes, and a delete is not recoverable.
 //! - A key past the *reap horizon* ([`reap_horizon_ns`], `2 * R` widened by the
 //!   same factor again) is deleted, which bounds the LIST itself. The extra
 //!   width is the clock-skew margin: the modification time comes from the
