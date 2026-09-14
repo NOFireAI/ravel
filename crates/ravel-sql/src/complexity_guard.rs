@@ -176,7 +176,7 @@ use std::fmt;
 /// AST-walk depth, for every construct rather than just the ones tested.
 pub const MAX_STATEMENT_COMPLEXITY: usize = 1_000;
 
-/// A statement's structural character count exceeded
+/// A statement's token count outside literals and comments exceeded
 /// [`MAX_STATEMENT_COMPLEXITY`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatementTooComplex {
@@ -233,7 +233,8 @@ pub fn check(sql: &str) -> Result<(), StatementTooComplex> {
     Ok(())
 }
 
-/// `sql`'s structural character count, by the same rules [`check`] applies.
+/// `sql`'s token count outside literals and comments, by the same rules
+/// [`check`] applies.
 ///
 /// [`check`] stops as soon as it knows the answer, so it reports a count only
 /// on rejection; this scans the whole text. It exists for callers that need
