@@ -1,0 +1,9 @@
+# actionlint configuration.
+#
+# Declares the self-hosted runner labels this repo uses so actionlint does not
+# flag them as unknown. `ravel-reference` is the ADR-0070 tier B reference
+# runner that bench-compare.yml targets; the baseline under bench/baselines/ is
+# recorded there and criterion timings are only comparable against it.
+self-hosted-runner:
+  labels:
+    - ravel-reference
