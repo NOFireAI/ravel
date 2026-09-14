@@ -53,6 +53,26 @@ merge_base_guard() {
   return "${guard_rc}"
 }
 
+# Is a merge queue enforced on the pull request's base branch?
+#
+# A queue rebases each entry onto current main and runs full CI on the combined
+# result before landing, so ordinary base movement is not a reason to send the
+# author back for a rebase and another CI cycle (CLAUDE.md, issue #1758). One
+# call: /rules/branches/<branch> returns the rules in effect for that branch,
+# merge_queue among them, without walking every ruleset.
+#
+# Fails CLOSED. A call that errors, or returns something jq cannot read, is
+# "could not ask", which is not "there is a queue": it returns non-zero, the
+# stale base keeps blocking, and the cost is a rebase rather than a merge onto
+# an unverified base.
+merge_queue_active() {
+  local branch="${1:-main}" body count
+  body="$(gh api "repos/${repo}/rules/branches/${branch}" 2>/dev/null)" || return 1
+  count="$(printf '%s' "${body}" \
+    | jq '[.[] | select(.type == "merge_queue")] | length' 2>/dev/null)" || return 1
+  [[ "${count}" =~ ^[1-9][0-9]*$ ]]
+}
+
 pr="${1:?usage: pr-review-status.sh <pr-number> [--confirm-addressed]}"
 repo="NOFireAI/ravel"
 confirm_addressed=0
@@ -64,10 +84,14 @@ elif [[ -n "${2:-}" ]]; then
 fi
 
 pr_json="$(gh pr view "${pr}" --repo "${repo}" \
-  --json state,mergeStateStatus,statusCheckRollup,headRefOid)"
+  --json state,mergeStateStatus,statusCheckRollup,headRefOid,baseRefName)"
 state="$(echo "${pr_json}" | jq -r '.state')"
 merge_state="$(echo "${pr_json}" | jq -r '.mergeStateStatus')"
 head_sha="$(echo "${pr_json}" | jq -r '.headRefOid')"
+# Empty when the field is absent; the repository's default branch is the right
+# fallback, and keeps a fixture that predates this field working.
+base_ref="$(echo "${pr_json}" | jq -r '.baseRefName // empty')"
+[[ -n "${base_ref}" ]] || base_ref="main"
 
 # `statusCheckRollup` can mix two shapes: a `CheckRun` (GitHub Actions and
 # most modern integrations -- `status`/`conclusion`, name in `.name`) and a
@@ -233,6 +257,30 @@ if [[ "${outside_diff}" != "0" ]]; then
 fi
 echo "${summary}"
 
+# Decide, before the verdict chain, whether a base behind origin/main blocks.
+# It should not when a merge queue is enforced on the base branch: the queue
+# rebases the entry onto current main and runs full CI on the combined result
+# before landing, so a hand rebase buys nothing and costs a CI cycle (#1758).
+#
+# The behind-ness is still reported. That is the half of the old refusal worth
+# keeping: the unseen commits are printed so a base the author does not
+# recognise stays visible, which is the landing-loop revert detector CLAUDE.md
+# names. Only the refusal is dropped, not the information.
+#
+# A guard exit other than 1 means the check did not run, not that the base is
+# fresh, so it blocks regardless of any queue.
+base_blocks=0
+base_behind_note=""
+queue_merges=0
+if ! merge_base_guard; then
+  if [[ "${guard_rc}" == "1" ]] && merge_queue_active "${base_ref}"; then
+    queue_merges=1
+    base_behind_note="${guard_out}"
+  else
+    base_blocks=1
+  fi
+fi
+
 if [[ "${state}" != "OPEN" ]]; then
   echo "  -> PR is ${state}, not open; nothing to merge"
 elif [[ "${merge_state}" == "DIRTY" || "${merge_state}" == "DRAFT" || "${merge_state}" == "BEHIND" ]]; then
@@ -304,7 +352,7 @@ elif [[ "${outside_diff}" != "0" && "${confirm_addressed}" != "1" ]]; then
 # own push CI catches the first of those after the merge has landed, which is
 # detection rather than prevention, and it never catches a landing loop that
 # silently reverts a concurrent change. Costs one fetch.
-elif ! merge_base_guard; then
+elif [[ "${base_blocks}" == "1" ]]; then
   if [[ "${guard_rc}" == "1" ]]; then
     echo "  -> merge base is behind origin/main; rebase and let CI re-run before merging"
   else
@@ -333,5 +381,17 @@ else
   # printed command would fail before merging anything. Nothing is lost; the
   # repository sets `delete_branch_on_merge`, which removes the head branch
   # when the merge lands.
-  echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} && gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
+  if [[ "${queue_merges}" == "1" ]]; then
+    # Reported, not refused. The queue rebases this entry onto current main and
+    # runs full CI on the result, so the behind-ness below is context for
+    # spotting a base you do not recognise, not a reason to rebase by hand.
+    echo "  -> base is behind origin/main; the merge queue rebases and re-runs CI before landing, so this is information, not a blocker:"
+    echo "${base_behind_note//guard: /     }"
+    echo "  -> if any commit above is one you do not recognise, stop and check for a landing loop before merging"
+    # No assert-fresh-merge-base prefix: it would refuse on exactly the
+    # behind-ness the queue exists to handle, which is issue #1758.
+    echo "  -> gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
+  else
+    echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} && gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
+  fi
 fi
