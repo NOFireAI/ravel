@@ -213,10 +213,16 @@
 //! produce. The projected columns, plus every field a pushed content predicate
 //! names, plus every attribute key a pending erasure predicate names, are
 //! resolved into a [`ColumnSelection`] that the reader uses to decode only
-//! those columns' pages ([`resolve_columns`]). Any reference to the SQL `attrs`
-//! map column resolves to every dynamic column plus `attrs_raw`, because the
-//! map's contract is that every key is present; per-key `attrs['k']`
-//! projection is out of scope (ADR-0087 decision 3).
+//! those columns' pages ([`resolve_columns`]). A reference to the whole SQL
+//! `attrs` map column (a bare `attrs` projection, `SELECT *`) resolves to every
+//! dynamic column plus `attrs_raw`, because the map's contract is that every key
+//! is present. A projection that reaches the map only through literal-key
+//! `attrs['k']` subscripts is rewritten by
+//! [`crate::attrs_per_key::AttrsPerKeyProjection`] into synthetic per-key
+//! columns (issue #1768), which resolve to just those keys' FIELD_DIR columns
+//! plus `attrs_raw` like a declared column does; ADR-0087 decision 3 recorded
+//! per-key projection as out of scope and needs an amendment note now that
+//! #1768 implements it.
 //!
 //! # Row refs, for TopK late materialization (ADR-0774)
 //!
