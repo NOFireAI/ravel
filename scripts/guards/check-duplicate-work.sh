@@ -159,6 +159,17 @@ for other in ${others}; do
 
     other_files="$(files_of "${other}" || true)"
     [ -n "${other_files}" ] || continue
+    # An empty other_id means the diff could not be COMPUTED, not that it did
+    # not match: a fork PR's head is not under refs/heads on this remote, and a
+    # merged PR's branch may be gone. Staying quiet would downgrade a true
+    # duplicate from the blocker signal to the advisory one with nothing to say
+    # why, which is the same could-not-ask/asked-and-got-nothing collapse the
+    # mine_id path above refuses to make.
+    if [ -z "${other_id}" ]; then
+        echo "check-duplicate-work: NOTE: could not resolve #${other}'s diff (a fork" >&2
+        echo "    PR's head, or a deleted branch), so it was compared on file paths" >&2
+        echo "    only. A true duplicate would read as OVERLAP here, not IDENTICAL." >&2
+    fi
     # Temp files rather than process substitution: this runs under /bin/sh,
     # where `<(...)` is a syntax error rather than a portability nicety.
     printf '%s\n' "${mine_files}" > "${tmp_mine}"

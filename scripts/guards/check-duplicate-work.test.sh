@@ -179,6 +179,27 @@ check_contains "disjoint: says so"             "overlaps no other open pull requ
 check_absent   "disjoint: no shell error noise" "Illegal number"     "${out}"
 check_absent   "disjoint: no integer error"     "integer expression" "${out}"
 
+# --- other side's diff unfetchable (fork PR, deleted branch) -> say so ---
+# The IDENTICAL branch needs the other PR's head under refs/heads on this
+# remote. A fork PR's head is not, and a deleted branch is gone, so patch_id_of
+# returns empty. That is "could not compute", not "did not match": staying
+# quiet would downgrade a real duplicate to the advisory OVERLAP signal with
+# nothing saying why. Build exactly that case by deleting pr-b from the remote
+# while the gh stub still reports its files.
+root="$(mktemp -d)"
+build_repo "${root}/repo" same
+write_gh_stub "${root}/bin" shared.txt
+git -C "${root}/repo" branch -D pr-b --quiet
+set +e
+out="$( cd "${root}/repo" && PATH="${root}/bin:${PATH}" sh "${SCRIPT}" 101 origin 2>&1 )"
+rc=$?
+set -e
+rm -rf "${root}"
+check_contains "unfetchable other: says it could not resolve" "could not resolve #102's diff" "${out}"
+check_contains "unfetchable other: still reports the overlap" "OVERLAP: #101 and #102" "${out}"
+check_absent   "unfetchable other: claims no IDENTICAL"       "IDENTICAL: #101" "${out}"
+check_eq       "unfetchable other: still exits 1"             "1" "${rc}"
+
 # --- a missing pull request is 'could not tell' (2), never 'clean' (0) ---
 root="$(mktemp -d)"
 build_repo "${root}/repo" diff
