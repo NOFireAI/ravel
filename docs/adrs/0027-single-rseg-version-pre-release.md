@@ -10,6 +10,12 @@ Status: Accepted (superseded at first public release by ADR-0066)
 > retirement of the old reader, and the RSEG decode-and-re-encode migration
 > primitive (ADR-0066 decision 5) replaces the wipe-or-re-ingest disposition
 > this ADR's decision 6 accepted. This historical content is left intact.
+>
+> The meaning of "first public release" for this policy is disambiguated by
+> ADR-0531 (proposed): it denotes a not-yet-reached format-lifecycle activation
+> milestone, distinct from the software's first public release at 0.9.0, so this
+> ADR's pre-release regime remains in force at HEAD. The supersession above takes
+> effect only when that milestone is declared.
 
 This ADR changes the format lifecycle policy, not any byte of the v5
 layout, building on the RSEG v5 implementation (ADR-0026).

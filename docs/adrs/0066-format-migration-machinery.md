@@ -67,6 +67,8 @@ ADR-0027's single-version policy is superseded at (and only at) first public rel
 
 Until first release, ADR-0027 stands unchanged; this ADR's machinery lands exercised by tests and dry-runs rather than by carrying real dual versions in anger.
 
+"First public release" here is disambiguated by ADR-0531 (proposed): it denotes a not-yet-reached format-lifecycle activation milestone, distinct from the software's first public release at 0.9.0. Under that reading this decision's N/N-1 window is staged but not yet in force at HEAD, which is why the reader window is still single-version and the 0.10.0 (RSEG v6) and 0.11.0 (RLOG v3) deletions acted correctly under ADR-0027's pre-release regime.
+
 ### 2. Fail-closed-on-newer, everywhere, typed
 
 Every decoder of a persistent format must, on a version newer than it knows, return a typed error distinct from corruption, and no caller may treat that error as absence, corruption, or a miss. (Sole deliberate exception: the local disk cache, where old-version-equals-miss is correct semantics, `crates/ravel-cache/src/disk.rs:143-148`.) Concretely:

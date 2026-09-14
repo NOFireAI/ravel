@@ -224,6 +224,14 @@ jobs:
         run: python3 scripts/check_docs.py
       - name: Check workspace version drift (ADR-0086 D8)
         run: scripts/check-workspace-versions.sh
+      # Format docs vs the reader's SUPPORTED_VERSIONS (issue #531). The checker
+      # runs its own mismatch self-check first, so a broken checker fails here
+      # rather than reporting a false clean; run UNPIPED for the same exit-code
+      # reason as the documentation gate above.
+      - name: Format-version doc consistency self-check (issue #531)
+        run: python3 scripts/check_format_version_docs.py --selftest
+      - name: Format-version doc consistency (issue #531)
+        run: python3 scripts/check_format_version_docs.py
       - name: Test-hygiene guard cases
         run: bash scripts/guards/check-test-hygiene.test.sh
       - name: Test-hygiene guard (issue #778)

@@ -6,6 +6,13 @@ Migration class: A (bulk data objects), ADR-0066 decision 4. Convergence is
 by retention, by rewrite-on-touch, and by the `maintain migrate` job. The
 pre-release regime of ADR-0027 applies: exactly one supported version, and
 v6 read and write support is deleted in the same change that introduces v7.
+ADR-0531 (proposed) confirms this was correct: "first public release" for the
+format-lifecycle policy is a not-yet-reached activation milestone distinct from
+the software's 0.9.0 release, so the pre-release regime was in force when v7
+shipped. Decision 7 below still names `SupportedVersions::single` /
+`n_and_prev`; those constructors were replaced by the `SegmentVersion::WINDOW`
+single-source model in the issue #530 change, a rename that does not alter this
+decision.
 
 **Amended 2026-08-20 (epic #309 outcome).** Every number this ADR projected
 has been superseded by measurement on the shipped tree: the fragmented shape
