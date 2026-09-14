@@ -834,6 +834,7 @@ fn dead_federation(name: &str, endpoint: &str) -> ravel_query::distrib::Federati
         name: name.to_string(),
         endpoint: endpoint.to_string(),
         credential: GATE_OPERATOR_CRED.to_string(),
+        tenant: None,
         tls: false,
         tls_ca_file: None,
         skip_unavailable: true,
@@ -844,6 +845,7 @@ fn dead_federation(name: &str, endpoint: &str) -> ravel_query::distrib::Federati
     Federation::new(vec![RemoteCluster {
         name: name.to_string(),
         fetcher: Arc::new(fetcher),
+        tenant: None,
         skip_unavailable: true,
         soft_timeout: Duration::from_secs(3),
     }])

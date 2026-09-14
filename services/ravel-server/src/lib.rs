@@ -225,15 +225,26 @@ fn multi_tenant_resolver_reason(
     None
 }
 
-/// Refuse `--remote-cluster` on a coordinator that can resolve more than one
-/// local tenant. ADR-0071 federation holds one remote credential per process
-/// and has no per-tenant remote credential, so on a multi-tenant coordinator
-/// every local tenant's federated metric selectors and discovery calls fan out
-/// under the same credential and receive another tenant's series. Single-tenant
-/// federation is the only configuration this can serve safely. Call this at
-/// startup once the resolver inputs and remote clusters are parsed, before any
-/// listener binds; it is a no-op when no remote cluster is configured.
-pub fn ensure_federation_single_tenant(
+/// Refuse a `--remote-cluster` that names no local tenant on a coordinator that
+/// can resolve more than one.
+///
+/// A remote cluster's credential authorizes one tenant's data on that remote, so
+/// it belongs to one local tenant, named by the spec's `tenant` key. A spec
+/// without that key serves every local tenant: correct where only one can
+/// resolve, and on a multi-tenant coordinator exactly the exposure the key
+/// exists to remove, since every local tenant's federated metric selectors and
+/// discovery calls would then fan out under that one credential and receive
+/// another tenant's series.
+///
+/// Also refuses a mapping that can never fire: when the tenant set is fully
+/// known (static bearer tokens only, no resolver that derives a tenant from a
+/// request), a `tenant` naming a tenant outside it is a typo whose only symptom
+/// would be a remote that silently answers nobody.
+///
+/// Call this at startup once the resolver inputs and remote clusters are parsed,
+/// before any listener binds; it is a no-op when no remote cluster is
+/// configured.
+pub fn ensure_federation_tenant_mapping(
     remote_clusters: &[config::RemoteClusterConfig],
     tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
     dev_insecure_tenant_header: bool,
@@ -242,17 +253,58 @@ pub fn ensure_federation_single_tenant(
     if remote_clusters.is_empty() {
         return Ok(());
     }
-    if let Some(reason) =
-        multi_tenant_resolver_reason(tenant_tokens, dev_insecure_tenant_header, auth)
-    {
-        anyhow::bail!(
-            "--remote-cluster is configured on a coordinator that can resolve more than one local \
-             tenant ({reason}). ADR-0071 federation holds one remote credential per process and \
-             cannot express a per-tenant remote credential, so every local tenant's federated \
-             metric selectors and discovery calls would fan out under that single credential and \
-             receive another tenant's series. Single-tenant federation is the only supported \
-             configuration: run one local tenant, or remove --remote-cluster."
-        );
+    let multi_tenant =
+        multi_tenant_resolver_reason(tenant_tokens, dev_insecure_tenant_header, auth);
+    if let Some(reason) = &multi_tenant {
+        let unkeyed: Vec<&str> = remote_clusters
+            .iter()
+            .filter(|rc| rc.tenant.is_none())
+            .map(|rc| rc.name.as_str())
+            .collect();
+        if !unkeyed.is_empty() {
+            anyhow::bail!(
+                "--remote-cluster {} names no local tenant on a coordinator that can resolve more \
+                 than one local tenant ({reason}). A remote cluster holds one remote credential \
+                 and cannot express one credential per local tenant, so every local tenant's \
+                 federated metric selectors and discovery calls would fan out under that single \
+                 credential and receive another tenant's series. Add tenant=<local tenant> to \
+                 each of those specs, naming the one local tenant whose queries may use that \
+                 remote's credential (write one --remote-cluster per local tenant that needs the \
+                 same remote, each with its own name and credential-file), or run one local \
+                 tenant, or remove --remote-cluster.",
+                unkeyed
+                    .iter()
+                    .map(|n| format!("'{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    // The static bearer map is the whole tenant set only when nothing else can
+    // resolve a tenant, and an empty map configures no tenants at all rather
+    // than asserting there are none. Outside those two cases a `tenant` value
+    // that is absent here may still resolve at request time, so there is
+    // nothing to check.
+    if multi_tenant.is_none() && !tenant_tokens.is_empty() {
+        let known: std::collections::HashSet<&ravel_types::TenantId> =
+            tenant_tokens.values().collect();
+        for rc in remote_clusters {
+            if let Some(tenant) = &rc.tenant
+                && !known.contains(tenant)
+            {
+                let mut names: Vec<&str> = known.iter().map(|t| t.as_str()).collect();
+                names.sort_unstable();
+                anyhow::bail!(
+                    "--remote-cluster '{}' maps to local tenant '{}', which no --tenant-token \
+                     configures (configured: {}). No request can ever resolve to that tenant, so \
+                     this remote would answer no query at all. Fix the tenant name, or configure \
+                     a --tenant-token for it.",
+                    rc.name,
+                    tenant.as_str(),
+                    names.join(", ")
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -538,6 +590,12 @@ pub struct ServerConfig {
     /// sends its matchers and window to each remote under the operator credential
     /// configured here, never the calling client's. Independent of `distrib`
     /// above: federation is coordinator-side and needs no local fragment surface.
+    ///
+    /// Each remote is reached only by the local tenant its
+    /// [`RemoteClusterConfig::tenant`](crate::config::RemoteClusterConfig::tenant)
+    /// names, so a coordinator serving several local tenants keeps one remote
+    /// credential per local tenant instead of sharing one across all of them. A
+    /// local tenant no remote names runs a fully local query.
     pub remote_clusters: Vec<crate::config::RemoteClusterConfig>,
     /// The resolved query-audit pipeline config (ADR-0062 decision 2b), from
     /// `--audit-mode`/`--audit-max-batch`/`--audit-max-age`. In a query-serving
@@ -2201,6 +2259,13 @@ pub async fn start(
                 remotes.push(ravel_query::distrib::RemoteCluster {
                     name: rc.name.clone(),
                     fetcher: Arc::new(fetcher),
+                    // Hashed here rather than at parse time so the derivation
+                    // runs under the scheme `install_tenant_hash_scheme`
+                    // resolved from the bucket's `sys/tenancy` marker, the same
+                    // scheme the tenant resolver hashes an incoming request's
+                    // tenant under. Comparing two hashes from one scheme is what
+                    // makes the mapping match at query time.
+                    tenant: rc.tenant.as_ref().map(ravel_types::TenantId::hash),
                     skip_unavailable: rc.skip_unavailable,
                     soft_timeout: rc.soft_timeout,
                 });

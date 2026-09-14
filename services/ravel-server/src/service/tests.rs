@@ -403,6 +403,7 @@ async fn dead_federation() -> ravel_query::distrib::Federation {
         name: "west".to_string(),
         endpoint,
         credential: "operator-west-credential".to_string(),
+        tenant: None,
         tls: false,
         tls_ca_file: None,
         skip_unavailable: true,
@@ -413,6 +414,7 @@ async fn dead_federation() -> ravel_query::distrib::Federation {
     Federation::new(vec![RemoteCluster {
         name: "west".to_string(),
         fetcher: Arc::new(fetcher),
+        tenant: None,
         skip_unavailable: true,
         soft_timeout: Duration::from_secs(3),
     }])

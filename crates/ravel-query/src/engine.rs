@@ -1234,8 +1234,16 @@ impl QueryEngine {
             .await
             .map_err(|err| self.map_log_series_error(err))?;
 
+            // Keyed on the remotes THIS tenant reaches, not on the presence of a
+            // federation context: a local tenant with no mapped remote runs a
+            // fully local query, so telling it a log selector was not federated
+            // describes a fan-out that was never going to happen.
             let mut warnings = Vec::new();
-            if self.federation.is_some() {
+            if self
+                .federation
+                .as_ref()
+                .is_some_and(|f| f.has_remotes_for(tenant_hash))
+            {
                 warnings.push(log_not_federated_warning(metric.name()));
             }
 
@@ -1276,9 +1284,14 @@ impl QueryEngine {
     /// because discovery enumerates series, not samples.
     ///
     /// Routes through the SAME [`crate::distrib::Federation`] coordinator the
-    /// query path uses -- there is no second federation path. Each remote
-    /// resolves under ITS OWN tenant auth (the operator credential baked into the
-    /// fetcher, never a wire `tenant_hash` and never a client credential),
+    /// query path uses -- there is no second federation path. `tenant_hash`
+    /// therefore selects the remotes this local tenant may use
+    /// ([`crate::distrib::RemoteCluster::tenant`]), so discovery cannot enumerate
+    /// a remote tenant's label namespace for a local tenant holding no
+    /// credential for it; a local tenant no remote names enumerates local series
+    /// only. Each selected remote then resolves under ITS OWN tenant auth (the
+    /// operator credential baked into the fetcher, never a wire `tenant_hash`
+    /// and never a client credential),
     /// enforces its own admission/limits/erasure, and returns decoded series that
     /// this method unions into the local pool. `skip_unavailable`, the
     /// deduplicated skipped-cluster warnings, and the partial-coverage marker all
@@ -1679,8 +1692,14 @@ impl QueryEngine {
         // ADR-1103 decision 5: a federated query answers a log selector
         // locally only, never fanning it to a remote cluster; the client is
         // told so via the same `warnings` channel `federate_scalar` already
-        // populates for a skipped remote.
-        if self.federation.is_some() {
+        // populates for a skipped remote. Keyed on the remotes THIS tenant
+        // reaches: for a tenant with no mapped remote the whole query is local
+        // and there is no fan-out to have excluded the log selector from.
+        if self
+            .federation
+            .as_ref()
+            .is_some_and(|f| f.has_remotes_for(tenant_hash))
+        {
             for name in fed_metric_names {
                 stats.warnings.push(log_not_federated_warning(name));
             }
@@ -2640,11 +2659,14 @@ impl QueryEngine {
             return Ok((runs, hist_runs, stats, warnings, partial));
         };
         for (matchers, start_ns, end_ns) in plan_matchers_windows {
-            // Empty erasure and empty min-commit-tokens cross the boundary: the
-            // remote resolves its own snapshot and enforces its own erasure,
-            // and commit tokens are cluster-local (also structurally prevents
-            // leaking this cluster's tokens). The operator credential is baked
-            // into the fetcher, so no client credential is threaded here.
+            // `tenant_hash` selects which remotes this local tenant may use
+            // before any is dialed, so a tenant with no mapped remote fans out
+            // to nothing and receives nothing. Empty erasure and empty
+            // min-commit-tokens cross the boundary: the remote resolves its own
+            // snapshot and enforces its own erasure, and commit tokens are
+            // cluster-local (also structurally prevents leaking this cluster's
+            // tokens). The operator credential is baked into the fetcher, so no
+            // client credential is threaded here.
             // Owned args (accounting is an `Arc` clone that folds into the same
             // handle) keep the fan-out future higher-ranked `Send`. Remote
             // spend is charged to `scan` (issue #796 finding: opaque remote
@@ -8881,6 +8903,7 @@ mod coverage_wrapper_tests {
         let federation = Federation::new(vec![RemoteCluster {
             name: REMOTE.to_string(),
             fetcher,
+            tenant: None,
             skip_unavailable: true,
             soft_timeout: Duration::from_secs(5),
         }]);

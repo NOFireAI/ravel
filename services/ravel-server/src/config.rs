@@ -2798,6 +2798,23 @@ pub struct RemoteClusterConfig {
     /// `credential-file`. This is the ONLY principal the remote sees for a
     /// federated fetch: the calling client's credential is never forwarded.
     pub credential: String,
+    /// The single local tenant whose queries fan out to this remote, from the
+    /// `tenant` key. `credential` above is one principal, so it authorizes one
+    /// remote tenant's data; this names the local tenant that data belongs to.
+    /// A query from any other local tenant never dials this remote.
+    ///
+    /// `None` means the spec carried no `tenant` key: the remote serves every
+    /// local tenant. That is only expressible on a coordinator that can resolve
+    /// at most one local tenant, which
+    /// [`crate::ensure_federation_tenant_mapping`] enforces at startup; it is
+    /// what every pre-`tenant` federation deployment already is.
+    ///
+    /// To serve two local tenants from one remote endpoint, write one
+    /// `--remote-cluster` per local tenant, each with its own `name` and its own
+    /// `credential-file`. There is deliberately no syntax for naming several
+    /// local tenants on one spec: that would put two local tenants back behind
+    /// one credential, which is the exposure the `tenant` key exists to remove.
+    pub tenant: Option<TenantId>,
     /// Whether to dial the remote over TLS. Defaults to `true` when the spec
     /// carries no `tls` key: plaintext federation is an explicit, logged choice,
     /// never the fallback (ADR-0071 amendment, federation TLS by default).
@@ -2822,6 +2839,7 @@ impl std::fmt::Debug for RemoteClusterConfig {
             .field("name", &self.name)
             .field("endpoint", &self.endpoint)
             .field("credential", &"<redacted>")
+            .field("tenant", &self.tenant)
             .field("tls", &self.tls)
             .field("tls_ca_file", &self.tls_ca_file)
             .field("skip_unavailable", &self.skip_unavailable)
@@ -3602,12 +3620,19 @@ impl Cli {
     /// [`RemoteClusterConfig`] (ADR-0071 cross-cluster federation).
     ///
     /// Each spec is a comma-separated `key=value` list. `name`, `endpoint`, and
-    /// `credential-file` are required; `tls`, `tls-ca-file`, `skip-unavailable`,
-    /// and `soft-timeout` are optional. The credential file is read and trimmed
-    /// here (failing startup on an unreadable or empty file), so the operator
-    /// principal is validated at the same point every other credential file is.
-    /// Cluster names must be unique: a duplicate name would make the `warnings`
-    /// field ambiguous about which remote was skipped.
+    /// `credential-file` are required; `tenant`, `tls`, `tls-ca-file`,
+    /// `skip-unavailable`, and `soft-timeout` are optional. The credential file
+    /// is read and trimmed here (failing startup on an unreadable or empty
+    /// file), so the operator principal is validated at the same point every
+    /// other credential file is. Cluster names must be unique: a duplicate name
+    /// would make the `warnings` field ambiguous about which remote was skipped.
+    ///
+    /// `tenant` names the ONE local tenant whose queries fan out to this remote
+    /// (see [`RemoteClusterConfig::tenant`]). Two local tenants sharing a remote
+    /// endpoint is two specs, not one spec naming two tenants. A spec with no
+    /// `tenant` key serves every local tenant and is accepted only on a
+    /// coordinator resolving at most one, which
+    /// [`crate::ensure_federation_tenant_mapping`] checks at startup.
     ///
     /// `tls` defaults to `true`. A spec that carries `tls-ca-file` and no `tls`
     /// key therefore means "TLS on, with this CA trusted" and is accepted; only
@@ -3621,6 +3646,7 @@ impl Cli {
             let mut name = None;
             let mut endpoint = None;
             let mut credential_file = None;
+            let mut tenant: Option<TenantId> = None;
             // TLS on unless the spec explicitly turns it off: the credential,
             // the query, and the result stream all cross this hop, so plaintext
             // is an opt-in the operator states and startup logs, never a silent
@@ -3645,6 +3671,16 @@ impl Cli {
                     "name" => name = Some(value.to_string()),
                     "endpoint" => endpoint = Some(value.to_string()),
                     "credential-file" => credential_file = Some(PathBuf::from(value)),
+                    "tenant" => {
+                        if value.is_empty() {
+                            anyhow::bail!(
+                                "invalid --remote-cluster '{spec}': tenant is empty; name the \
+                                 local tenant whose queries fan out to this remote, or omit the \
+                                 key entirely on a single-tenant coordinator"
+                            );
+                        }
+                        tenant = Some(TenantId::new(value));
+                    }
                     "tls" => tls = parse_bool_field(spec, "tls", value)?,
                     "tls-ca-file" => tls_ca_file = Some(PathBuf::from(value)),
                     "skip-unavailable" => {
@@ -3665,7 +3701,7 @@ impl Cli {
                     }
                     other => anyhow::bail!(
                         "invalid --remote-cluster '{spec}': unknown key '{other}' (expected name, \
-                         endpoint, credential-file, tls, tls-ca-file, skip-unavailable, \
+                         endpoint, credential-file, tenant, tls, tls-ca-file, skip-unavailable, \
                          soft-timeout)"
                     ),
                 }
@@ -3716,6 +3752,7 @@ impl Cli {
                 name,
                 endpoint,
                 credential,
+                tenant,
                 tls,
                 tls_ca_file,
                 skip_unavailable,
@@ -5381,6 +5418,7 @@ mod tests {
             name: "beta".to_string(),
             endpoint: "beta.internal:9443".to_string(),
             credential: "super-secret-operator-token".to_string(),
+            tenant: None,
             tls: true,
             tls_ca_file: None,
             skip_unavailable: true,
@@ -5626,6 +5664,116 @@ mod tests {
             err.to_string()
                 .contains("tls-ca-file was set but tls is off"),
             "expected the inert-CA error, got: {err}"
+        );
+    }
+
+    /// The `tenant` key names the one local tenant whose queries fan out to a
+    /// remote, and its absence is a distinct state (`None`, an unkeyed remote
+    /// serving every local tenant) rather than a default value, because startup
+    /// treats the two differently.
+    #[test]
+    fn remote_cluster_tenant_key_is_parsed_and_optional() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let mapped = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={},tenant=acme",
+            token.path().display()
+        );
+        let unmapped = format!(
+            "name=us,endpoint=us.internal:9443,credential-file={}",
+            token.path().display()
+        );
+
+        let clusters = cli(&["--remote-cluster", &mapped, "--remote-cluster", &unmapped])
+            .parse_remote_clusters()
+            .expect("a tenant-keyed spec and an unkeyed spec both parse");
+
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(
+            clusters[0].tenant.as_ref().map(TenantId::as_str),
+            Some("acme"),
+            "tenant=acme must resolve to that local tenant, got {:?}",
+            clusters[0]
+        );
+        assert_eq!(
+            clusters[1].tenant, None,
+            "a spec with no tenant key must stay unkeyed, got {:?}",
+            clusters[1]
+        );
+    }
+
+    /// Two local tenants sharing one remote endpoint is two specs, each with its
+    /// own name and its own credential file. There is deliberately no syntax for
+    /// naming several local tenants on one spec, so this is the shape the guide
+    /// documents and it must parse.
+    #[test]
+    fn two_local_tenants_share_a_remote_endpoint_as_two_specs() {
+        let acme_cred = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(acme_cred.path(), "acme-operator-token\n").expect("write credential");
+        let beta_cred = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(beta_cred.path(), "beta-operator-token\n").expect("write credential");
+        let acme = format!(
+            "name=eu-acme,endpoint=eu.internal:9443,credential-file={},tenant=acme",
+            acme_cred.path().display()
+        );
+        let beta = format!(
+            "name=eu-beta,endpoint=eu.internal:9443,credential-file={},tenant=beta",
+            beta_cred.path().display()
+        );
+
+        let clusters = cli(&["--remote-cluster", &acme, "--remote-cluster", &beta])
+            .parse_remote_clusters()
+            .expect("two specs to one endpoint under distinct names parse");
+
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0].endpoint, clusters[1].endpoint);
+        assert_ne!(
+            clusters[0].credential, clusters[1].credential,
+            "each local tenant must carry its own remote credential; sharing one is the \
+             exposure the tenant key exists to remove"
+        );
+    }
+
+    /// `tenant=` with no value is a truncated spec, not "unkeyed": accepting it
+    /// would turn a typo into a remote every local tenant reaches.
+    #[test]
+    fn remote_cluster_empty_tenant_value_is_refused() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let spec = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={},tenant=",
+            token.path().display()
+        );
+
+        let err = cli(&["--remote-cluster", &spec])
+            .parse_remote_clusters()
+            .expect_err("an empty tenant value must refuse startup");
+        assert!(
+            err.to_string().contains("tenant is empty"),
+            "expected the empty-tenant error, got: {err}"
+        );
+    }
+
+    /// The unknown-key error lists the keys a spec may carry, so it has to list
+    /// `tenant` now that one exists. An operator reading the old list writes a
+    /// spec without the key and gets the startup refusal instead.
+    #[test]
+    fn remote_cluster_unknown_key_error_lists_tenant() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let spec = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={},tenat=acme",
+            token.path().display()
+        );
+
+        let err = cli(&["--remote-cluster", &spec])
+            .parse_remote_clusters()
+            .expect_err("an unknown key must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown key 'tenat'"), "got: {msg}");
+        assert!(
+            msg.contains("credential-file, tenant, tls"),
+            "the expected-key list must name tenant, got: {msg}"
         );
     }
 
