@@ -281,6 +281,7 @@ case "$*" in
   *"/pulls/"*"/reviews"*)   cat "${FIXTURES}/reviews.json" ;;
   *"/issues/"*"/comments"*) cat "${FIXTURES}/issue-comments.json" ;;
   *"/pulls/"*"/comments"*)  cat "${FIXTURES}/review-comments.json" ;;
+  *"/rules/branches/"*)     cat "${FIXTURES}/rules.json" ;;
   *) echo "unexpected gh call: $*" >&2; exit 90 ;;
 esac
 SHIM
@@ -370,6 +371,14 @@ e2e() {
     "${BOT}" "${E2E_REVIEW_STATE:-COMMENTED}" "${SHA}" "${review_body}")}" >"${fx}/reviews.json"
   printf '%s\n' "${E2E_ISSUE_COMMENTS:-${DONE_TASK_COMMENT}}" >"${fx}/issue-comments.json"
   printf '%s\n' "${E2E_REVIEW_COMMENTS:-[]}" >"${fx}/review-comments.json"
+  # Branch rules in effect. Default: protection WITHOUT a merge queue, so the
+  # stale-base refusal is the default behaviour every existing case expects.
+  #
+  # The default lives in a variable, not inline in the ${...:-} default: a
+  # literal `}` inside the expansion closes it early, which silently produced
+  # invalid JSON with the tail appended as literal text.
+  local default_rules='[{"type":"pull_request"},{"type":"required_status_checks"}]'
+  printf '%s\n' "${E2E_RULES:-$default_rules}" >"${fx}/rules.json"
   FIXTURES="${fx}" PATH="${E2E_DIR}/bin:${PATH}" \
     bash "${E2E_SCRIPT:-$(dirname "$0")/pr-review-status.sh}" 908 "$@"
 }
@@ -673,6 +682,47 @@ check_eq "stale merge base: blocks a verdict that is otherwise clean" \
 check_eq "stale merge base: no merge command offered" \
   "0" \
   "$(printf '%s\n' "${stale_base_out}" | grep -c 'gh pr merge')"
+
+# Issue #1758. The two halves of the same question: a base behind origin/main
+# is a refusal only when nothing else will re-validate it. With a merge queue
+# on the base branch the queue rebases the entry onto current main and runs
+# full CI on the result, so the behind-ness is information and the merge
+# command must still print. Without one, the refusal above stands.
+QUEUE_RULES='[{"type":"pull_request"},{"type":"required_status_checks"},{"type":"merge_queue","parameters":{"merge_method":"REBASE"}}]'
+
+export E2E_GIT_STALE=1
+queued_out="$(E2E_RULES="${QUEUE_RULES}" e2e "${CLEAN_BODY_JSON}")"
+unset E2E_GIT_STALE
+
+check_eq "#1758 queue present: a stale base does not refuse" \
+  "0" \
+  "$(printf '%s\n' "${queued_out}" | grep -c 'rebase and let CI re-run before merging')"
+check_eq "#1758 queue present: the merge command is offered, pinned to the head" \
+  "  -> gh pr merge 908 --rebase --match-head-commit ${SHA}" \
+  "$(printf '%s\n' "${queued_out}" | grep '^  -> gh pr merge')"
+# The landing-loop revert detector CLAUDE.md names survives: the unseen commits
+# are still printed, and the reader is still told to look at them.
+check_eq "#1758 queue present: the unseen commits are still reported" \
+  "1" \
+  "$(printf '%s\n' "${queued_out}" | grep -c 'information, not a blocker')"
+check_eq "#1758 queue present: the reader is still pointed at an unrecognised base" \
+  "1" \
+  "$(printf '%s\n' "${queued_out}" | grep -c 'do not recognise')"
+# The printed command must NOT re-run the guard, which would refuse on exactly
+# the behind-ness the queue handles. That was the bug.
+check_eq "#1758 queue present: the printed command does not re-run the guard" \
+  "0" \
+  "$(printf '%s\n' "${queued_out}" | grep '^  -> gh pr merge' | grep -c 'assert-fresh-merge-base')"
+
+# Fails closed. A queue is only believed when the rules were actually read; a
+# guard that could not run at all still blocks even with a queue, because
+# "could not check" is not "fresh".
+export E2E_GIT_STALE=1 E2E_GIT_FAIL_AT=rev-list
+queue_unreadable_guard_out="$(E2E_RULES="${QUEUE_RULES}" e2e "${CLEAN_BODY_JSON}")"
+unset E2E_GIT_STALE E2E_GIT_FAIL_AT
+check_eq "#1758 queue present but the guard could not run: still blocks" \
+  "1" \
+  "$(printf '%s\n' "${queue_unreadable_guard_out}" | grep -c 'could not check merge-base freshness')"
 # The stand-in git puts an escape sequence and a carriage return in the first
 # unseen subject. Both must be gone by the time the text is printed: a subject
 # is attacker-controlled and this output is what the operator reads before
