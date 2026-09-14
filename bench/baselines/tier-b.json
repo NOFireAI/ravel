@@ -1,0 +1,104 @@
+{
+  "_meta": {
+    "label": "EXECUTOR BOX (x86_64, 8 cores, shared fleet host) - NOT the ADR-0070 reference runner; re-record on the reference runner before this baseline means anything. Quick sampling (sample-size 10).",
+    "note": "median_ns/mean_ns are criterion point estimates in nanoseconds. See scripts/bench-compare.py and ADR-0070 decision 3."
+  },
+  "benchmarks": {
+    "bytes_slice_vs_copy/bytes_slice_refcounted": {
+      "median_ns": 5.133298000233002,
+      "mean_ns": 5.158867817282535
+    },
+    "bytes_slice_vs_copy/copy_from_slice": {
+      "median_ns": 18.4921577400892,
+      "mean_ns": 19.85125504489185
+    },
+    "logseg_encode/20000_records_1_stream": {
+      "median_ns": 75997057.55000001,
+      "mean_ns": 76154782.56535715
+    },
+    "logseg_encode/20000_records_many_streams": {
+      "median_ns": 67330375.375,
+      "mean_ns": 67419245.03587301
+    },
+    "logseg_encode/2000_records_1_stream": {
+      "median_ns": 7380504.142857143,
+      "mean_ns": 7388943.421740362
+    },
+    "logseg_encode/2000_records_many_streams": {
+      "median_ns": 6417643.333333334,
+      "mean_ns": 6405986.493675595
+    },
+    "logseg_scan/selective_hasword_needle": {
+      "median_ns": 94460628.81746031,
+      "mean_ns": 95874398.48765872
+    },
+    "logseg_scan/unfiltered_full_scan": {
+      "median_ns": 145948943.5,
+      "mean_ns": 146952487.9
+    },
+    "merge_kway_vs_materialized/kway_merge": {
+      "median_ns": 1861617.6643518517,
+      "mean_ns": 1891912.629428407
+    },
+    "merge_kway_vs_materialized/materialized_window": {
+      "median_ns": 3447257.080645161,
+      "mean_ns": 3461287.057002751
+    },
+    "otap_decode/decode_batch": {
+      "median_ns": 485889.81529051985,
+      "mean_ns": 489296.04033930396
+    },
+    "segment_encode/10000_series_v5": {
+      "median_ns": 135146529.5,
+      "mean_ns": 135889329.63333333
+    },
+    "segment_encode/100_series_v5": {
+      "median_ns": 53482759.87142857,
+      "mean_ns": 53283900.58206349
+    },
+    "segment_encode/2000_series_v5": {
+      "median_ns": 72801402.83333334,
+      "mean_ns": 74218603.28023809
+    },
+    "segment_encode_axis_sweep/s2_l15_v5": {
+      "median_ns": 1612895582.5,
+      "mean_ns": 1691376689.3
+    },
+    "segment_encode_axis_sweep/s2_l5_v5": {
+      "median_ns": 770966123.0,
+      "mean_ns": 783664847.2
+    },
+    "segment_encode_axis_sweep/s500_l15_v5": {
+      "median_ns": 58482202.38888889,
+      "mean_ns": 59388796.812896825
+    },
+    "segment_encode_axis_sweep/s500_l5_v5": {
+      "median_ns": 56676606.625,
+      "mean_ns": 56773887.725317456
+    },
+    "segment_encode_axis_sweep/s60_l15_v5": {
+      "median_ns": 87567555.5,
+      "mean_ns": 90537853.16392857
+    },
+    "segment_encode_axis_sweep/s60_l5_v5": {
+      "median_ns": 78261561.75,
+      "mean_ns": 78410701.65460317
+    },
+    "segment_encode_histogram/10000_series_histogram": {
+      "median_ns": 39514679.375,
+      "mean_ns": 39832100.79230159
+    },
+    "segment_encode_histogram/100_series_histogram": {
+      "median_ns": 227338.7960636516,
+      "mean_ns": 229778.83518505222
+    },
+    "series_id_hash/few_big_labels": {
+      "median_ns": 15213107.583333334,
+      "mean_ns": 17148270.227678575
+    },
+    "series_id_hash/many_small_labels": {
+      "median_ns": 5966190.875,
+      "mean_ns": 6193709.609583333
+    }
+  }
+}

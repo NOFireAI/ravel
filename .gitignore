@@ -1,5 +1,11 @@
 /target
-/bench/
+# Bench output stays ignored (reports, criterion dirs), but the committed
+# ADR-0070 tier B baseline under bench/baselines/ is tracked. Re-including a
+# path requires not excluding its parent directory itself, so exclude the
+# contents of bench/ (bench/*) rather than the directory, then re-include the
+# baselines subtree. See issue #533.
+/bench/*
+!/bench/baselines/
 **/*.rs.bk
 *.profraw
 .DS_Store
