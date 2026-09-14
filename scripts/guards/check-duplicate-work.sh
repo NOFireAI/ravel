@@ -94,7 +94,12 @@ patch_id_of() {
 # either side. Same silent-cap class the scan note above exists for, and a
 # field-addition PR reaches 100 files easily.
 files_of() {
-    _files="$(gh api "repos/${repo}/pulls/$1/files" --paginate --jq '.[].path' 2>/dev/null | sort)"
+    # `.filename`, NOT `.path`: this endpoint and `gh pr view --json files` name
+    # the same thing differently. Switching to REST for its pagination while
+    # keeping the old field name yields empty for every pull request, which
+    # turns every comparison into "could not list files" and disables OVERLAP
+    # entirely.
+    _files="$(gh api "repos/${repo}/pulls/$1/files" --paginate --jq '.[].filename' 2>/dev/null | sort)"
     if [ -n "${_files}" ]; then
         _count="$(printf '%s\n' "${_files}" | wc -l | tr -d '[:space:]')"
         # The endpoint itself stops at 3000 files and --paginate cannot follow
