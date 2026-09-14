@@ -38,7 +38,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 HTTP_ADDR="${CHAOS_HTTP_ADDR:-127.0.0.1:14318}"
 GRPC_ADDR="${CHAOS_GRPC_ADDR:-127.0.0.1:14317}"
 BASE_URL="http://${HTTP_ADDR}"
-SERIES="chaos_requests_total"
+# The series the fixture actually emits: gen_otlp_fixture (services/ravel-server
+# /examples/gen_otlp_fixture.rs) writes one gauge named `demo_requests_total`.
+# A query for any other name is unsatisfiable and makes the durability oracle
+# green-by-vacuity, which is the failure mode this whole lane exists to close.
+SERIES="demo_requests_total"
 # Number of strict-ack exports to drive before the kill. Each returns a
 # commit token recorded as an acked-before-kill write.
 EXPORT_COUNT="${CHAOS_EXPORT_COUNT:-20}"
@@ -126,19 +130,19 @@ FLUSH_BASELINE="$(metric_value "$BASE_URL" "$CHAOS_FLUSH_METRIC")" || FLUSH_BASE
 [[ "${FLUSH_BASELINE%.*}" =~ ^[0-9]+$ ]] || FLUSH_BASELINE=0
 
 log "driving ${EXPORT_COUNT} strict-ack exports"
+# Commit tokens are opaque base64 strings, not integers (see
+# oracle_strict_ack_implies_durable in lib.sh): collect them verbatim and never
+# compare or increment them numerically. Each is an acked-before-kill write the
+# oracle re-queries after restart.
 ACKED_TOKENS=()
-HIGHEST_TOKEN=0
 for _ in $(seq 1 "$EXPORT_COUNT"); do
   token="$(drive_one_export "$HTTP_ADDR" "$FIXTURE_PATH")" || {
     log "export failed before kill; aborting scenario setup"
     exit 1
   }
   ACKED_TOKENS+=("$token")
-  if [[ "${token%.*}" =~ ^[0-9]+$ ]] && [[ "${token%.*}" -gt "$HIGHEST_TOKEN" ]]; then
-    HIGHEST_TOKEN="${token%.*}"
-  fi
 done
-log "highest strict-ack commit token before kill: ${HIGHEST_TOKEN}"
+log "recorded ${#ACKED_TOKENS[@]} strict-ack commit token(s) before kill"
 
 log "waiting for a flush to start (mid-flush trigger: ${CHAOS_FLUSH_METRIC})"
 if wait_for_flush_started "$BASE_URL" "${FLUSH_BASELINE%.*}" 60; then
@@ -155,7 +159,7 @@ chaos_wait_for "server to accept connections after restart" 60 server_reachable
 
 # ---- Oracle (each pinned assertion independently) ----
 oracle_strict_ack_implies_durable \
-  "$HTTP_ADDR" "$SERIES" "$HIGHEST_TOKEN" "${ACKED_TOKENS[@]}" || true
+  "$HTTP_ADDR" "$SERIES" "${ACKED_TOKENS[@]}" || true
 oracle_custody_and_catalog_verify_clean "$CHAOS_TENANT_NAME" 4 || true
 
 # Scenario 1 is not release-blocking by ADR-0077 section 4 (that clause is

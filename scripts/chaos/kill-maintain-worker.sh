@@ -50,6 +50,15 @@ WORKER_B_HTTP="${CHAOS_WORKER_B_HTTP:-127.0.0.1:14338}"
 WORKER_B_GRPC="${CHAOS_WORKER_B_GRPC:-127.0.0.1:14337}"
 WORKER_B_URL="http://${WORKER_B_HTTP}"
 
+# An ingest server drives the load that creates compactable buckets before the
+# maintain workers start. Its own address, distinct from either worker's.
+INGEST_HTTP="${CHAOS_INGEST_HTTP:-127.0.0.1:14318}"
+INGEST_GRPC="${CHAOS_INGEST_GRPC:-127.0.0.1:14317}"
+
+# Number of strict-ack exports to drive into the ingest server so the bucket
+# carries real, compactable data for the maintain workers to own and compact.
+EXPORT_COUNT="${CHAOS_EXPORT_COUNT:-20}"
+
 # Total ownable units across the world under test; the survivor must own all
 # of them after takeover. Sized by the load the setup drives (tenants x
 # signals x shards). Overridable so the orchestrator can match its fixture.
@@ -97,19 +106,21 @@ fi
 
 WORKER_A_PID=""
 WORKER_B_PID=""
+INGEST_PID=""
 WORKER_A_LOG="$(mktemp)"
 WORKER_B_LOG="$(mktemp)"
+INGEST_LOG="$(mktemp)"
 FIXTURE_PATH="$(mktemp --suffix=.pb)"
 
 cleanup() {
   local pid
-  for pid in "$WORKER_A_PID" "$WORKER_B_PID"; do
+  for pid in "$WORKER_A_PID" "$WORKER_B_PID" "$INGEST_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
     fi
   done
-  rm -f "$WORKER_A_LOG" "$WORKER_B_LOG" "$FIXTURE_PATH"
+  rm -f "$WORKER_A_LOG" "$WORKER_B_LOG" "$INGEST_LOG" "$FIXTURE_PATH"
   minio_down
 }
 trap cleanup EXIT
@@ -135,16 +146,51 @@ worker_reachable() {
   curl --silent --fail --max-time 2 "http://$1/metrics" >/dev/null 2>&1
 }
 
+# Start an ingest-role server (default mode) in the background, capturing its
+# PID so the trap can reap it. This is the server the load below is POSTed to.
+start_ingest_bg() {
+  local argv=()
+  mapfile -d '' -t argv < <(ravel_server_cmd \
+    --store s3 \
+    --listen-http "$INGEST_HTTP" \
+    --listen-grpc "$INGEST_GRPC" \
+    --tenant-token "${CHAOS_TENANT_TOKEN}=${CHAOS_TENANT_NAME}")
+  "${argv[@]}" >"$INGEST_LOG" 2>&1 &
+  INGEST_PID=$!
+}
+
+ingest_reachable() {
+  curl --silent --fail --max-time 2 \
+    -H "Authorization: Bearer ${CHAOS_TENANT_TOKEN}" \
+    "http://${INGEST_HTTP}/api/v1/query?query=up" >/dev/null 2>&1
+}
+
 log "bringing up MinIO and qualifying the store"
 minio_up
 
-log "generating OTLP fixture and driving load to create compactable buckets"
+log "generating OTLP fixture"
 cargo run --quiet -p ravel-server --example gen_otlp_fixture > "$FIXTURE_PATH"
-# A real run drives enough load through an ingest server to produce multiple
-# sealed hours per unit so a compaction has real work. That ingest server is
-# started/torn down by the orchestrator's load fixture; here we assume the
-# bucket already carries compactable data (the orchestrator's setup step) and
-# focus on the two maintain workers, which is what this scenario tests.
+
+# Actually drive the generated load: start an ingest server and POST the
+# fixture through it so the bucket carries real, compactable data. A prior
+# version generated the fixture and never sent it, then commented that it
+# "assumes the bucket already carries compactable data" -- so the maintain
+# workers below owned nothing, no compaction ever ran, and every oracle was
+# vacuous. The maintain workers read the sealed inputs this load produces.
+log "starting ingest server (${INGEST_HTTP}) and driving ${EXPORT_COUNT} exports"
+start_ingest_bg
+chaos_wait_for "ingest server to accept connections" 60 ingest_reachable
+SENT=0
+for _ in $(seq 1 "$EXPORT_COUNT"); do
+  if drive_one_export "$INGEST_HTTP" "$FIXTURE_PATH" >/dev/null; then
+    SENT=$(( SENT + 1 ))
+  fi
+done
+if [[ "$SENT" -eq 0 ]]; then
+  log "no exports were accepted; the maintain workers would own nothing"
+  exit 1
+fi
+log "sent ${SENT}/${EXPORT_COUNT} strict-ack exports into the ingest server"
 
 log "starting two maintain workers (A=${WORKER_A_HTTP}, B=${WORKER_B_HTTP})"
 start_worker "$WORKER_A_HTTP" "$WORKER_A_GRPC" "$WORKER_A_LOG" WORKER_A_PID
