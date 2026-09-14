@@ -257,10 +257,11 @@ if [[ "${outside_diff}" != "0" ]]; then
 fi
 echo "${summary}"
 
-# Decide, before the verdict chain, whether a base behind origin/main blocks.
-# It should not when a merge queue is enforced on the base branch: the queue
-# rebases the entry onto current main and runs full CI on the combined result
-# before landing, so a hand rebase buys nothing and costs a CI cycle (#1758).
+# Does a base behind origin/main block the merge?
+#
+# Not when a merge queue is enforced on the base branch: the queue rebases the
+# entry onto current main and runs full CI on the combined result before
+# landing, so a hand rebase buys nothing and costs a CI cycle (issue #1758).
 #
 # The behind-ness is still reported. That is the half of the old refusal worth
 # keeping: the unseen commits are printed so a base the author does not
@@ -269,17 +270,21 @@ echo "${summary}"
 #
 # A guard exit other than 1 means the check did not run, not that the base is
 # fresh, so it blocks regardless of any queue.
-base_blocks=0
+#
+# Called from the verdict chain rather than computed ahead of it, so a closed,
+# DIRTY or DRAFT pull request -- which an earlier branch answers -- still costs
+# no fetch and no API call, exactly as before this function existed.
 base_behind_note=""
 queue_merges=0
-if ! merge_base_guard; then
+base_stale_blocks() {
+  merge_base_guard && return 1
   if [[ "${guard_rc}" == "1" ]] && merge_queue_active "${base_ref}"; then
     queue_merges=1
     base_behind_note="${guard_out}"
-  else
-    base_blocks=1
+    return 1
   fi
-fi
+  return 0
+}
 
 if [[ "${state}" != "OPEN" ]]; then
   echo "  -> PR is ${state}, not open; nothing to merge"
@@ -352,7 +357,7 @@ elif [[ "${outside_diff}" != "0" && "${confirm_addressed}" != "1" ]]; then
 # own push CI catches the first of those after the merge has landed, which is
 # detection rather than prevention, and it never catches a landing loop that
 # silently reverts a concurrent change. Costs one fetch.
-elif [[ "${base_blocks}" == "1" ]]; then
+elif base_stale_blocks; then
   if [[ "${guard_rc}" == "1" ]]; then
     echo "  -> merge base is behind origin/main; rebase and let CI re-run before merging"
   else
