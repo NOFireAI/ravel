@@ -394,6 +394,11 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -420,6 +425,11 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test
         run: cargo nextest run --locked --workspace --cargo-profile ci
       # nextest does not run doctests; keep them covered separately.
@@ -462,6 +472,11 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: SQL endpoint tests
         run: cargo nextest run --locked -p ravel-server --features sql
       - name: Differential correctness gate
@@ -503,6 +518,11 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Flight SQL tests
         run: cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql
 
@@ -563,6 +583,11 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check ravel-bench --features parquet-baseline
         run: cargo check --locked -p ravel-bench --features parquet-baseline
       - name: Check ravel-bench --features flight-egress
@@ -670,6 +695,11 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy ravel-server --features otap
         run: cargo clippy --locked -p ravel-server --features otap --all-targets -- -D warnings
         # `--lib`, not the whole test set: `tests/cli_reference.rs` asserts
@@ -739,6 +769,11 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Fuzz RSEG codecs (varint, gorilla, delta-varint)
         run: cargo nextest run --locked -p ravel-segment --lib fuzz_mutation
       - name: Fuzz RSEG footer/section reader
@@ -795,6 +830,11 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Start MinIO
         run: |
           # Docker Hub's anonymous pull allowance is per-IP and shared across
@@ -962,6 +1002,11 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Start MinIO
         run: |
           # quay.io rationale: see object-store-contract's "Start MinIO" step.
@@ -1048,6 +1093,11 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Fetch pinned Prometheus binary
         id: fetch-prometheus
         run: echo "bin_path=$(scripts/fetch-prometheus.sh)" >> "$GITHUB_OUTPUT"
@@ -1142,6 +1192,11 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Exactly what the root Dockerfile's builder stage compiles for these
       # images, including ravel-cli: scripts/kind-up.sh's store-qualification
       # Job (ADR-0050 section 6, EC7/#623) runs it from inside the assembled
@@ -1475,6 +1530,11 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
@@ -1576,6 +1636,11 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.filter.outputs.run == 'true'
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR or
+          # queue ref is readable by nothing else, dies with the ref, and
+          # evicts the main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Both binaries: Dockerfile.prebuilt's `server` target COPYs ravel-server
       # AND ravel-cli, so a context missing the CLI fails the docker build.
       - name: Build ravel-server (sql,flight-sql,otap) and ravel-cli on the host
