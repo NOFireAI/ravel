@@ -96,17 +96,6 @@ pub struct Transaction {
     _private: (),
 }
 
-/// Per-fold cap on how many requested re-fold hours
-/// ([`RefoldRequest`]) one fold re-lists, so a caller that reports a large
-/// blocked set cannot turn one fold into an unbounded LIST fan-out. Matches
-/// [`crate::DEFAULT_FRONTIER_RECONCILE_MAX_HOURS`] (168 = seven days of hourly
-/// buckets) for the same reason: far above the steady-state set (the hours that
-/// received a late record since the last sweep), so the cap only ever bounds a
-/// recovery case. The remainder is not lost, and needs no deferral bookkeeping
-/// in the snapshot: the requester re-derives its blocked set every pass and a
-/// still-blocked hour is requested again on the next one.
-const REFOLD_REQUEST_MAX_HOURS: usize = 168;
-
 /// The ingest hours a caller wants this fold to re-list and reconcile, on top
 /// of the fold's own fixed reconcile window and retention-frontier band
 /// (ADR-0063 section 4). The receiving end of issue #526's re-fold half.
@@ -1024,7 +1013,7 @@ impl Catalog {
     /// The requested hours are reconciled through exactly the same per-bucket
     /// path as the other two passes, so a re-fold can only ever make the
     /// snapshot agree with the commit layout. The pass is bounded by
-    /// [`REFOLD_REQUEST_MAX_HOURS`], skips hours the other two passes already
+    /// `frontier_reconcile_max_hours`, skips hours the other two passes already
     /// list, and skips hours the snapshot does not name (a re-fold of an hour
     /// no part covers would be pure cost). It also inherits ADR-0063 section
     /// 4's carve-outs: a first fold and a rebuild do no reconcile work at all,
@@ -1461,10 +1450,21 @@ impl Catalog {
                 //   hour cannot be blocking a delete on HEAD reachability, so
                 //   listing it is pure cost.
                 //
-                // Whatever survives is capped at `REFOLD_REQUEST_MAX_HOURS`,
-                // oldest-first. The remainder is not tracked in the snapshot:
-                // the requester re-derives its blocked set each pass, so a
-                // still-blocked hour comes back on the next request.
+                // Whatever survives is capped oldest-first, so one caller
+                // reporting a large blocked set cannot turn a fold into an
+                // unbounded LIST fan-out.
+                //
+                // The cap is `frontier_reconcile_max_hours`, read from the
+                // runtime config rather than from its default, which is what
+                // makes "the two sparse passes share one cap" true for an
+                // operator who lowers it and not only for one who leaves it
+                // alone. The bound suits both for the same reason: it sits far
+                // above the steady-state set, so it only ever bounds a recovery
+                // case.
+                //
+                // The remainder is not tracked in the snapshot: the requester
+                // re-derives its blocked set each pass, so a still-blocked hour
+                // comes back on the next request.
                 if !refold_request.is_empty() {
                     let named_hours: HashSet<u32> =
                         entries.iter().map(|e| e.ingest_hour_bucket).collect();
@@ -1480,7 +1480,8 @@ impl Catalog {
                                 && named_hours.contains(hour)
                         })
                         .collect();
-                    let take = candidates.len().min(REFOLD_REQUEST_MAX_HOURS);
+                    let cap = self.config().frontier_reconcile_max_hours as usize;
+                    let take = candidates.len().min(cap);
                     if take < candidates.len() {
                         tracing::warn!(
                             tenant = %tenant.to_hex(),
@@ -6608,10 +6609,12 @@ mod tests {
     /// Same setup as `reconcile_ignores_late_record_outside_window`, whose
     /// unrequested fold leaves hour 5 naming the superseded L0.
     ///
-    /// To watch this FAIL against the pre-fix behaviour, narrow the targeted
-    /// pass's slice in `fold_inner` to `let refold_hours = &candidates[..take];`:
-    /// the pass then lists nothing, hour 5 keeps naming `seg_x`, and the exact
-    /// key-set assertion below fails.
+    /// To watch this FAIL against the pre-fix behaviour, empty the targeted
+    /// pass's slice in `fold_inner`: `let refold_hours = &candidates[..0];`.
+    /// The pass then lists nothing, hour 5 keeps naming `seg_x`, and the exact
+    /// key-set assertion below fails. (`&candidates[..take]` is the shipped
+    /// line itself, so quoting that changes nothing and the test still
+    /// passes.)
     #[tokio::test]
     async fn refold_request_applies_out_of_window_compaction() {
         let store = Arc::new(MemoryStore::new());
@@ -6671,7 +6674,7 @@ mod tests {
     /// rewrite outside the window is never picked up by any later fold at all.
     ///
     /// Flip the same line as `refold_request_applies_out_of_window_compaction`
-    /// (`let refold_hours = &candidates[..take];`) to watch it fail: the snapshot
+    /// (`let refold_hours = &candidates[..0];`) to watch it fail: the snapshot
     /// keeps naming the pre-erasure L0.
     #[tokio::test]
     async fn refold_request_applies_out_of_window_rewrite() {

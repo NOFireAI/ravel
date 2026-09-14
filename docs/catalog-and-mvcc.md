@@ -949,8 +949,9 @@ those hours, after the fixed window and the frontier band:
   already listed by the frontier band this fold, and named by at least one
   snapshot entry. An hour no entry names cannot be blocking a delete on HEAD
   reachability, so listing it would be pure cost.
-- **Bounded per fold.** What survives those filters is capped at 168 hours,
-  oldest-first, matching `frontier_reconcile_max_hours`. The remainder needs
+- **Bounded per fold.** What survives those filters is capped oldest-first at
+  `frontier_reconcile_max_hours`, the same runtime value the frontier band
+  reads (default 168), so lowering that bound lowers both. The remainder needs
   no deferral bookkeeping in the snapshot: the requester re-derives its
   blocked set on each pass, so a still-blocked hour is requested again.
 - **Same diff-and-apply, same CAS.** Requested buckets go through the
