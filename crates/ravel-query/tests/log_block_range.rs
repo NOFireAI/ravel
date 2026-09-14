@@ -437,6 +437,10 @@ async fn ranged_reads_reuse_one_pooled_assembly_buffer() {
             allocated: 1,
             reused: 2,
             zeroed_bytes: object_size,
+            // Each `assembled` is dropped before the next iteration, so one
+            // buffer is out at a time and nothing is live at the end.
+            live_bytes: 0,
+            peak_live_bytes: object_size,
         }
     );
 }

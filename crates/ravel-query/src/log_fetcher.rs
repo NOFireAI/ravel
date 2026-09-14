@@ -3169,9 +3169,15 @@ const MAX_IDLE_ASSEMBLY_BUFFERS: usize = DEFAULT_LOG_MAX_CONCURRENT_GETS;
 /// this, and a single buffer longer than the whole budget is never retained.
 const MAX_IDLE_ASSEMBLY_BYTES: usize = 128 * 1024 * 1024;
 
-/// Reuse counters for one [`BlockRangeFetcher`]'s assembly-buffer pool
-/// ([`BlockRangeFetcher::assembly_buffer_stats`], issue #894). Cumulative over
-/// the fetcher's life and shared by all its clones; nothing resets them.
+/// Assembly-buffer pool figures for one [`BlockRangeFetcher`]
+/// ([`BlockRangeFetcher::assembly_buffer_stats`], issues #894 and #1771),
+/// shared by all its clones.
+///
+/// Two kinds, which do not read the same way. [`Self::allocated`],
+/// [`Self::reused`] and [`Self::zeroed_bytes`] are counters, cumulative over
+/// the fetcher's life, and nothing resets them. [`Self::live_bytes`] is a
+/// gauge that rises and falls as buffers are checked out and returned, and
+/// [`Self::peak_live_bytes`] is its high-water mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AssemblyBufferStats {
     /// Ranged reads that found no idle buffer and allocated one.
@@ -3184,10 +3190,17 @@ pub struct AssemblyBufferStats {
     /// long as its object adds nothing, which is the whole point of the pool.
     pub zeroed_bytes: u64,
     /// Bytes currently checked OUT of the pool, the live set. The retention
-    /// bounds cap what sits idle here, not what scans hold: under
-    /// `byte-minimal` a query holds one object-sized buffer per in-flight
-    /// ranged read, and nothing else reports that. Zero under the stock
-    /// `cost-based` policy, whose whole-object reads never touch this pool.
+    /// bounds cap what sits idle here, not what scans hold: a query holds one
+    /// object-sized buffer per in-flight ranged read, and nothing else reports
+    /// that.
+    ///
+    /// Zero wherever the resolved request cost saturates the routing
+    /// threshold, so that every object is read whole and never touches this
+    /// pool. That includes `cost-based` at the reference
+    /// `s3-intra-region-2026` profile, which prices transfer and retrieval at
+    /// zero; the same policy on an egress-billed deployment resolves a finite
+    /// rate, routes objects above the threshold through the ranged path, and
+    /// charges this gauge.
     pub live_bytes: u64,
     /// High-water mark of [`Self::live_bytes`] over this pool's life.
     pub peak_live_bytes: u64,
@@ -3666,10 +3679,12 @@ impl BlockRangeFetcher {
         self.wire_bytes.clone()
     }
 
-    /// This fetcher's assembly-buffer reuse counters (issue #894): how many
-    /// ranged reads had to allocate an object-sized buffer, how many were served
-    /// by a pooled one, and how many bytes the pool has ever zeroed. Cumulative
-    /// and shared by every clone.
+    /// This fetcher's assembly-buffer pool figures (issues #894 and #1771):
+    /// the cumulative counters -- how many ranged reads had to allocate an
+    /// object-sized buffer, how many were served by a pooled one, how many
+    /// bytes the pool has ever zeroed -- plus the live set currently checked
+    /// out and its high-water mark. Shared by every clone; the counters are
+    /// cumulative, the live figure is a gauge.
     #[must_use]
     pub fn assembly_buffer_stats(&self) -> AssemblyBufferStats {
         self.assembly_pool.stats()
