@@ -543,20 +543,27 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    # 30m (provisional): the ravel-bench probes are separate, mutually
-    # non-sharing compile configurations (arrow, parquet, object_store,
-    # datafusion, arrow-flight all appear across them). This split job's own
-    # bench-only duration has NOT been measured: the previously-cited
-    # "14m40s-17m59s before the otap lane was added" (main runs
-    # c94c581f/3f9f71df/361a4432) is wrong as a baseline -- 6951146b added the
-    # otap lane, and `git merge-base --is-ancestor 6951146b <sha>` is true for
-    # all three, so those samples are combined-job runs WITH otap already in
-    # them, not a pre-otap, bench-only figure. No bench-only duration can be
-    # derived from them by subtraction. 30m is a placeholder carried over from
-    # the flight-sql job's budget for a comparably shaped multi-config,
-    # non-sharing compile; tighten or loosen it once a run of this split job
-    # supplies its own measured duration.
-    timeout-minutes: 30
+    # 45m, measured (issue #1793). The ravel-bench probes are separate,
+    # mutually non-sharing compile configurations (arrow, parquet,
+    # object_store, datafusion, arrow-flight all appear across them), so this
+    # job pays a full build per lane and a cache miss is expensive:
+    #
+    #   warm cache  15m43s  (main run 34839481011)
+    #   cold cache  28m35s  (main run 34882054056, "No cache found")
+    #               30m15s  (PR #1783, same, over the old 30m and reported as
+    #                        `cancelled` rather than as a timeout)
+    #
+    # The old 30m covered the warm case only, so every cache eviction was a
+    # coin flip on a required check. 45m covers the measured cold run with
+    # margin. The spread is cache state, not growth: between the two runs
+    # above every compile step scaled by roughly the same factor.
+    #
+    # Two steps carry over half of a cold run (Test sql-latency 7m41s, Test
+    # sql-latency,profiling,flight-lane 7m07s). Splitting them into their own
+    # job would let both halves fit, and would also need the new job added to
+    # the required-checks set or it drops out of the merge gate; #1793 holds
+    # that.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/free-disk-space
