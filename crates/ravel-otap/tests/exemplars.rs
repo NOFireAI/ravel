@@ -1272,6 +1272,69 @@ fn exp_histogram_exemplars_are_counted_as_dropped() {
     assert_eq!(dropped_counts(&result.output.rejected), vec![2]);
 }
 
+/// A whole-request rejection counts exponential-histogram exemplar rows too.
+///
+/// The test above covers the admitted path, where
+/// `push_exp_histogram_exemplar_drops` counts them. This covers the other
+/// one: `dropped_exemplar_rows`, which a whole-request rejection reads from
+/// the payloads' row counts before anything is decoded. Both paths have to
+/// count the same three tables or an OTAP-fronted deployment under-reports
+/// on one payload type against an OTLP-fronted one (ADR-0047 decision 2).
+///
+/// Flip to watch it fail: drop the
+/// `.chain(payloads_of(batch, ArrowPayloadType::ExpHistogramDpExemplars)...)`
+/// line from `dropped_exemplar_rows`. The count falls to 1, the number
+/// exemplar alone.
+#[test]
+fn a_whole_request_rejection_counts_exp_histogram_exemplar_rows() {
+    let mut cap = ExemplarCap::default();
+    let decoded = DecodedBatch {
+        batch_id: 0,
+        payloads: vec![
+            (ArrowPayloadType::UnivariateMetrics, number_root_batch()),
+            (ArrowPayloadType::NumberDataPoints, number_dp_batch()),
+            (
+                ArrowPayloadType::NumberDpExemplars,
+                exemplar_batch_with_parents(vec![0]),
+            ),
+            (
+                ArrowPayloadType::ExpHistogramDpExemplars,
+                exemplar_batch_with_parents(vec![0, 1]),
+            ),
+        ],
+    };
+    // One data point against a zero budget, so the wire-count bound trips
+    // before any explosion or exemplar decode is considered.
+    let limits = IngestLimits {
+        max_data_points_per_request: 0,
+        ..IngestLimits::default()
+    };
+
+    let result =
+        normalize_decoded_with_exemplars(&tenant(), &decoded, &limits, INGEST_TS_NS, &mut cap);
+
+    assert!(
+        result.output.points.is_empty(),
+        "the whole request is rejected: {:?}",
+        result.output.rejected
+    );
+    assert!(
+        result
+            .output
+            .rejected
+            .iter()
+            .any(|r| matches!(r, Rejection::TooManyDataPoints { count: 1, max: 0 })),
+        "the wire-count bound is what tripped: {:?}",
+        result.output.rejected
+    );
+    assert_eq!(
+        dropped_counts(&result.output.rejected),
+        vec![3],
+        "one number exemplar plus two exp-histogram exemplars: {:?}",
+        result.output.rejected
+    );
+}
+
 proptest! {
     /// Arbitrary gauge exemplar input never panics, and every exemplar row is
     /// accounted for exactly once: carried, or counted by the drop counter.

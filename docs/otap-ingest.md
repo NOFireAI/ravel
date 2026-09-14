@@ -168,6 +168,17 @@ with that point and are not counted separately, which is what `ravel-otlp`
 does: counting them would give the same logical input a rejection class the
 OTLP path does not produce, and ADR-0011 requires the two to agree.
 
+A whole-request rejection is the other case, and there the count is
+reported. When a request trips the wire-count bound or the exploded-point
+bound, every exemplar it carried is lost with it, so both early returns
+count them and report a `HistogramExemplarsDropped`. The count comes from
+the three exemplar payloads' row counts rather than from a decode, so it
+costs nothing and the rejection still happens before any exemplar is
+grouped to a parent. `ravel-otlp` counts at both of its own early returns
+for the same reason (ADR-0047 decision 2: the dropped-data counter must not
+read zero while data is lost), and an OTAP-fronted deployment that left
+them out would diverge from an OTLP-fronted one on the same overload input.
+
 `EXP_HISTOGRAM_DP_EXEMPLARS` rows are counted as dropped, never carried.
 The reason is structural, not a missing decode: `EXP_HISTOGRAM_DATA_POINTS`
 is rejected as an unsupported metric type on this path (ADR-0017 is a

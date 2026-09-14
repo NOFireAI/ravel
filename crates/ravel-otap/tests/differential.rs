@@ -1062,12 +1062,11 @@ fn assert_histogram_paths_agree_with_limits(
     // (`*_with_exemplars`), not the wrapper outputs. All three wrappers discard
     // the exemplars the cap admits (nothing stores them yet) and count that
     // discard into `HistogramExemplarsDropped`. Wrapper bookkeeping is not an
-    // admission decision;
-    // the ADR-0011 parity that matters is that the two paths make the SAME cap
-    // decisions, which is what the `_with_exemplars` outputs expose. Comparing
-    // here is future-proof: it stays correct whether or not either wrapper
-    // counts its discards, and it still asserts the cap-level
-    // `HistogramExemplarsDropped` counts agree byte for byte.
+    // admission decision; the ADR-0011 parity that matters is that the two
+    // paths make the SAME cap decisions, which is what the `_with_exemplars`
+    // outputs expose. Comparing here is future-proof: it stays correct whether
+    // or not either wrapper counts its discards, and it still asserts the
+    // cap-level `HistogramExemplarsDropped` counts agree byte for byte.
     let otlp_full = normalize_metrics_with_exemplars(
         &tenant,
         build_otlp_histogram_request(workload),
