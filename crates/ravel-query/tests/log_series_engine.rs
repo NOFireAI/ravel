@@ -974,6 +974,7 @@ async fn log_only_query_warns_instead_of_federating() {
     let federation = Arc::new(Federation::new(vec![RemoteCluster {
         name: "remote-1".to_string(),
         fetcher: Arc::new(PanicsIfFetched),
+        tenant: None,
         skip_unavailable: false,
         soft_timeout: Duration::from_secs(1),
     }]));

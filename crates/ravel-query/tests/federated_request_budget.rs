@@ -85,6 +85,7 @@ fn engine_with_remote(
             requests: remote_requests,
             bytes: remote_bytes,
         }),
+        tenant: None,
         skip_unavailable: false,
         soft_timeout: Duration::from_secs(5),
     }]);

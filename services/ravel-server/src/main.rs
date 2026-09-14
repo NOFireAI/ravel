@@ -249,16 +249,15 @@ async fn main() -> anyhow::Result<()> {
     // `tls` off is a deliberate operator choice; log it by name once here,
     // where the resolved remote-cluster config first exists. Parsed before
     // `build_auth_resolver` consumes `tenant_tokens` and `auth`, so the
-    // single-tenant refusal can read every resolver input.
+    // tenant-mapping check can read every resolver input.
     let remote_clusters = cli
         .parse_remote_clusters()
         .context("failed to resolve --remote-cluster settings")?;
-    // ADR-0071 federation holds one remote credential per process and cannot
-    // express a per-tenant remote credential. Refuse `--remote-cluster` on a
-    // coordinator that can resolve more than one local tenant, before any
-    // listener binds, rather than silently fanning every tenant's queries out
-    // under the same credential.
-    ravel_server::ensure_federation_single_tenant(
+    // A remote cluster's credential belongs to one local tenant. Refuse a spec
+    // that names none on a coordinator that can resolve more than one, before
+    // any listener binds, rather than silently fanning every tenant's queries
+    // out under the same credential.
+    ravel_server::ensure_federation_tenant_mapping(
         &remote_clusters,
         &tenant_tokens,
         cli.dev_insecure_tenant_header,

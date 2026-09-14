@@ -185,6 +185,7 @@ mod tests {
         Federation::new(vec![RemoteCluster {
             name: "eu-west".to_string(),
             fetcher: Arc::new(NeverCalledFetcher),
+            tenant: None,
             skip_unavailable: false,
             soft_timeout: Duration::from_secs(1),
         }])
