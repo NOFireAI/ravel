@@ -549,9 +549,11 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --all --check
@@ -580,9 +582,11 @@ jobs:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test
         run: cargo nextest run --locked --workspace --cargo-profile ci
@@ -632,9 +636,11 @@ jobs:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: SQL endpoint tests
         run: cargo nextest run --locked -p ravel-server --features sql
@@ -678,9 +684,11 @@ jobs:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Flight SQL tests
         run: cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql
@@ -750,9 +758,11 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check ravel-bench --features parquet-baseline
         run: cargo check --locked -p ravel-bench --features parquet-baseline
@@ -862,9 +872,11 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy ravel-server --features otap
         run: cargo clippy --locked -p ravel-server --features otap --all-targets -- -D warnings
@@ -936,9 +948,11 @@ jobs:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Fuzz RSEG codecs (varint, gorilla, delta-varint)
         run: cargo nextest run --locked -p ravel-segment --lib fuzz_mutation
@@ -997,9 +1011,11 @@ jobs:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Start MinIO
         run: |
@@ -1169,9 +1185,11 @@ jobs:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Start MinIO
         run: |
@@ -1260,9 +1278,11 @@ jobs:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Fetch pinned Prometheus binary
         id: fetch-prometheus
@@ -1357,12 +1377,15 @@ jobs:
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
+      # No save-if here, unlike every other rust-cache step in this file. This
+      # job's gate includes github.event_name == 'pull_request', so it runs
+      # only on labelled PRs and never on a push to main: save-if would always
+      # be false AND no main-scoped entry under its key could ever be written,
+      # leaving the step pure overhead and every labelled run a cold release
+      # build against a 55m cap. Its PR-scoped saves are kept so a second push
+      # to a labelled PR still restores the first push's entry; the lane is
+      # label-gated and rare, so its share of the write amplification is small.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Exactly what the root Dockerfile's builder stage compiles for these
       # images, including ravel-cli: scripts/kind-up.sh's store-qualification
       # Job (ADR-0050 section 6, EC7/#623) runs it from inside the assembled
@@ -1697,9 +1720,11 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
@@ -1803,9 +1828,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.filter.outputs.run == 'true'
         with:
-          # Restore everywhere, save only on main: a cache written on a PR or
-          # queue ref is readable by nothing else, dies with the ref, and
-          # evicts the main-scoped entries every run restores from (#1643).
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Both binaries: Dockerfile.prebuilt's `server` target COPYs ravel-server
       # AND ravel-cli, so a context missing the CLI fails the docker build.
