@@ -422,9 +422,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Test
         run: cargo nextest run --locked --workspace --cargo-profile ci
-      # nextest does not run doctests; keep them covered separately.
+      # nextest does not run doctests; keep them covered separately. Same
+      # `ci` profile as the step above (ADR-0053 D4, and what scripts/gates.sh
+      # has always run): on the default profile this is a second target
+      # subtree and so a second build of the workspace inside one job.
+      # profile.ci inherits dev, so debug_assertions and overflow checks are
+      # unchanged and only debug info is dropped.
       - name: Doctests
-        run: cargo test --locked --doc --workspace
+        run: cargo test --locked --doc --profile ci --workspace
 
   # The SQL surface. Two things the `check` job cannot
   # cover:
