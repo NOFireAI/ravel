@@ -111,14 +111,22 @@ next non-tripping pass, including one that stopped tripping through dilution.
 
 | Symptom | Likely cause | How to confirm | Corrective action |
 |---|---|---|---|
-| Data that was written is invisible to queries, and the orphan breaker tripped or `ravel_maintain_orphans_present` is nonzero. | Commit records for a shard were removed outside Ravel: an accidental delete, a lifecycle rule on the wrong prefix, a mistyped prefix delete. | `ravel-cli maintain sweep --tenant <t> --signal <s> --shard <n> --dry-run` lists the record-less data objects as orphan candidates. `ravel-cli catalog list --tenant <t> --shards <n>` shows what the catalog still resolves. | Follow the four steps below, in order. Step 1 is not optional. |
+| Data that was written is invisible to queries, and the orphan breaker tripped or `ravel_maintain_orphans_present` is nonzero. | Commit records for a shard were removed outside Ravel: an accidental delete, a lifecycle rule on the wrong prefix, a mistyped prefix delete. | `ravel-cli maintain sweep --tenant <t> --signal <s> --shard <n> --dry-run` lists the record-less data objects as orphan candidates. `ravel-cli catalog list --tenant <t> --shards <n>` shows what the catalog still resolves. | Follow the five steps below, in order. Step 1 is not optional. |
 
-The data objects those records named are invisible to readers and, once past the
-orphan grace horizon, will be physically deleted by the sweeper. The recovery is
-`ravel-cli commit reconstruct`, which rebuilds each record-less L0 data object's
-commit record from the object's own footer. **Stop maintenance first**, or the
-sweeper's orphan rule deletes the very objects you are trying to reattach while
-you reattach them.
+The data objects those records named are invisible to readers. Once past the
+orphan grace horizon the sweeper moves them out of the live keyspace to a
+`quarantine/` prefix rather than deleting them, and a second reaper deletes the
+quarantine copy once it is older than `quarantine_horizon_ns` (default 7 days).
+So there are two clocks to beat, not one: after the grace horizon the object is
+no longer where `commit reconstruct` looks for it, and after the quarantine
+horizon it is gone for good.
+
+The recovery is `ravel-cli commit reconstruct`, which rebuilds each record-less
+L0 data object's commit record from the object's own footer. It reads the live
+L0 prefix only, so anything already quarantined has to be copied back first
+(step 2 below). **Stop maintenance first**, or the sweeper's orphan rule
+quarantines the very objects you are trying to reattach while you reattach
+them.
 
 1. **Stop maintenance for the tenant.** Stop the `--mode maintain` process
    entirely. This is the one method that reliably protects a tenant under repair
@@ -128,7 +136,26 @@ you reattach them.
    tenants will not keep the sweeper off it. Do not rely on the orphan breaker
    to hold the shard open either: see the entry above.
 
-2. **Reconstruct the missing records**, one shard at a time:
+2. **Restore anything already quarantined.** List the tenant's quarantine
+   prefix and compare it against what the sweep reported as orphan candidates:
+
+   ```sh
+   aws s3 ls --recursive s3://<bucket>/quarantine/t/<tenant_hash>/
+   ```
+
+   Each entry is `quarantine/<original key>/q<quarantined_at_ns>`. Recover the
+   live key by stripping the `quarantine/` prefix and the trailing `/q<ns>`
+   segment, then copy the object back to it. The original key is preserved
+   verbatim in between, so the transform is textual and needs no lookup. Copy,
+   do not move, until step 4 has passed: the quarantine copy is the only other
+   copy that exists.
+
+   There is no `ravel-cli` command for this yet, so it is an object-store
+   operation against whatever tooling the bucket takes. Objects whose
+   quarantine timestamp is older than `quarantine_horizon_ns` are already gone
+   and are not recoverable from here.
+
+3. **Reconstruct the missing records**, one shard at a time:
 
    ```sh
    ravel-cli commit reconstruct --tenant <name> --signal <metrics|logs> --shard <n>
@@ -140,7 +167,7 @@ you reattach them.
    reconstructed, already-present and failed, and exits nonzero if any candidate
    failed. Repeat per shard across the affected range.
 
-3. **Verify custody and catalog state** before resuming maintenance:
+4. **Verify custody and catalog state** before resuming maintenance:
 
    ```sh
    ravel-cli maintain verify-custody --tenant <name>
@@ -153,8 +180,10 @@ you reattach them.
    names, defaulting to metrics, so run it once per signal the tenant writes.
    Both must exit zero before you trust the repair.
 
-4. **Resume maintenance.** Restart the `--mode maintain` process. The sweeper now
+5. **Resume maintenance.** Restart the `--mode maintain` process. The sweeper now
    sees the reconstructed records and treats their data objects as referenced.
+   Once it does, delete the quarantine copies you restored from in step 2; the
+   reaper leaves them until their own horizon otherwise.
 
 Two fields are rebuilt as honest approximations rather than exact copies: the
 record's creation time, taken from the data object's own last-modified time

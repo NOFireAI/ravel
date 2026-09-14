@@ -34,12 +34,24 @@ admission/query/<process_id>.snapshot                                   fleet-gl
 sys/maintain/workers/<process_id>                                       maintain-worker liveness heartbeat (root-level, per-process, Overwrite; ADR-0065 §1)
 sys/maintain/memo/<process_id>                                          maintain-worker durable memo snapshot for warm start/handoff (root-level, per-process, Overwrite; ADR-0065 §3)
 sys/maintain/claims/compaction/<work_id_hex>                            advisory compaction claim (root-level, per-work-unit, CreateIfAbsent then CAS, additive; ADR-1029 §1)
+quarantine/<original key>/q<quarantined_at_ns>                          orphan-GC quarantine copy (root-level, immutable, reaped after the second horizon; ADR-0058 §6)
 ```
 
 The compaction/retention key shapes (ADR-0018, ADR-0019) and the
 selective-erasure key shapes
 (`rw.` rewrite records and the `del/` request/completion prefix, ADR-0064) are
 additive: existing keys and their meaning are untouched.
+
+`quarantine/<original key>/q<quarantined_at_ns>` (ADR-0058 §6) is a third
+root-level prefix beside `t/` and `sys/`, so anything that enumerates the
+bucket by prefix has to account for it: a lifecycle rule, an IAM prefix
+policy, and the scope of a DR restore. Orphan GC copies a record-less data
+object here instead of deleting it, and reaps the copy after a second
+horizon. The whole original key is preserved verbatim between the prefix and
+the trailing `/q<ns>` segment, so stripping both recovers the live key a
+restore writes back to. Expiring this prefix out of band defeats the recovery
+window it exists for, and omitting it from a restore scope loses the only
+remaining copy of anything quarantined.
 
 `admission/query/<process_id>.snapshot` (ADR-0061 §2) is the fleet-global
 query concurrency ceiling's keyspace. Each query-serving process writes its

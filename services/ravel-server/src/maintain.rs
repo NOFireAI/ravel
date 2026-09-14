@@ -1230,13 +1230,6 @@ fn note_owned_units(
     }
 }
 
-/// [`run_tick`] with the clock injected instead of hardwired to [`WallClock`].
-/// The running service always passes [`WallClock`]; tests pass a
-/// [`ravel_maintain::FixedClock`] so a tick that must observe time *passing*
-/// -- the ADR-0064 `.dreq` sweep waits out `protection_horizon` after the
-/// `.done` write -- can advance it deterministically instead of sleeping or
-/// shrinking the horizon to zero (CLAUDE.md testing patterns: time is
-/// injected).
 /// Every orphan candidate the pass left present in the live set (ADR-0058
 /// decision 1), which is what the `orphans_present` gauge reports.
 ///
@@ -1252,6 +1245,13 @@ fn orphans_present_total(report: &ravel_maintain::SweepReport) -> usize {
     report.orphans_deleted + report.orphans_withheld + report.orphans_quarantine_refused
 }
 
+/// [`run_tick`] with the clock injected instead of hardwired to [`WallClock`].
+/// The running service always passes [`WallClock`]; tests pass a
+/// [`ravel_maintain::FixedClock`] so a tick that must observe time *passing*
+/// -- the ADR-0064 `.dreq` sweep waits out `protection_horizon` after the
+/// `.done` write -- can advance it deterministically instead of sleeping or
+/// shrinking the horizon to zero (CLAUDE.md testing patterns: time is
+/// injected).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tick_with_clock(
     clock: &dyn Clock,
@@ -5118,11 +5118,6 @@ mod tests {
         assert_eq!(safety.legal_hold_refresh_failures(), 0);
     }
 
-    /// ADR-0058 decision 1: `orphans_present` is a last-observed-value gauge
-    /// that catches small-scale record loss the breaker never trips on. It
-    /// carries the pass's total orphan-candidate count regardless of what
-    /// happened to those candidates, and drops to whatever the latest pass
-    /// found -- it is never sticky and never monotonic.
     /// The `orphans_present` fold counts a refused quarantine. A candidate
     /// whose copy failed is left live, so it is still present, and the copy
     /// fails in exactly the store-fault case the gauge exists to surface.
@@ -5171,6 +5166,11 @@ mod tests {
         assert_eq!(orphans_present_total(&tripped), 55);
     }
 
+    /// ADR-0058 decision 1: `orphans_present` is a last-observed-value gauge
+    /// that catches small-scale record loss the breaker never trips on. It
+    /// carries the pass's total orphan-candidate count regardless of what
+    /// happened to those candidates, and drops to whatever the latest pass
+    /// found -- it is never sticky and never monotonic.
     #[test]
     fn orphans_present_gauge_tracks_latest_pass_and_is_not_sticky() {
         let safety = MaintenanceSafetyMetrics::default();

@@ -289,7 +289,16 @@ pub async fn sweep_shard_with_holds(
     // The quarantine reaper is the second horizon on rule 1's output. It runs
     // every pass so it is reachable from the same maintain tick as the sweep,
     // and whole-shard because quarantine keys are not hour-bucketed.
-    let quarantine = sweep_quarantine(store, clock, config, lease, tenant, signal, shard).await?;
+    //
+    // It is skipped on a pass whose mass-orphan breaker tripped: a trip means
+    // a record loss large enough to page is live now, and reaping during one
+    // destroys the copies taken before the loss grew. A `force_orphan_gc`
+    // override is not a trip, so an operator who has decided still reclaims.
+    let quarantine = if orphan_breaker_tripped {
+        QuarantineSweepOutcome::default()
+    } else {
+        sweep_quarantine(store, clock, config, lease, tenant, signal, shard).await?
+    };
     Ok((
         SweepReport {
             orphans_deleted,
@@ -405,8 +414,14 @@ pub async fn sweep_shard_zoned_with_holds(
     };
     // The quarantine reaper runs on every pass, including the zone-scoped one,
     // so a per-tick sweep reaps expired quarantine too; it is whole-shard
-    // because quarantine keys are not hour-bucketed (like rule 1 itself).
-    let quarantine = sweep_quarantine(store, clock, config, lease, tenant, signal, shard).await?;
+    // because quarantine keys are not hour-bucketed (like rule 1 itself). It
+    // is skipped on a tripped-breaker pass for the reason given in
+    // `sweep_all`.
+    let quarantine = if orphan_breaker_tripped {
+        QuarantineSweepOutcome::default()
+    } else {
+        sweep_quarantine(store, clock, config, lease, tenant, signal, shard).await?
+    };
     Ok((
         SweepReport {
             orphans_deleted,
@@ -744,6 +759,21 @@ fn parse_quarantine_timestamp(quarantine_key: &str) -> Option<i64> {
         .and_then(|digits| digits.parse::<i64>().ok())
 }
 
+/// The live key a quarantine key was copied from: strip the `quarantine/`
+/// prefix and the trailing `/q<ns>` segment.
+///
+/// The reaper asks the lease check about this as well as about the quarantine
+/// key itself. A legal-hold scope is validated to start with `t/<tenant_hex>/`
+/// and `LegalHoldCheck::is_protected` is a prefix match, so a hold can never
+/// match a `quarantine/...` key. Without this, a hold placed after an object
+/// was quarantined would not stop the reap.
+fn original_key_from_quarantine(quarantine_key: &str) -> Option<&str> {
+    let without_prefix = quarantine_key.strip_prefix(QUARANTINE_PREFIX)?;
+    let (original, stamp) = without_prefix.rsplit_once('/')?;
+    stamp.strip_prefix('q')?;
+    Some(original)
+}
+
 /// What one quarantine-reaper pass did (ADR-0058 amendment).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QuarantineSweepOutcome {
@@ -751,7 +781,8 @@ pub struct QuarantineSweepOutcome {
     /// horizon.
     pub reaped: usize,
     /// Objects left in quarantine this pass, still inside the second horizon
-    /// (or with an unparseable timestamp, or lease-protected).
+    /// (or with an unparseable timestamp, or held: a hold on the recovered
+    /// original key binds to its quarantine copy).
     pub retained: usize,
 }
 
@@ -793,7 +824,9 @@ pub async fn sweep_quarantine(
             retained += 1;
             continue;
         }
-        if lease.is_protected(&meta.key) {
+        let held = lease.is_protected(&meta.key)
+            || original_key_from_quarantine(&meta.key).is_some_and(|k| lease.is_protected(k));
+        if held {
             retained += 1;
             continue;
         }
@@ -3517,6 +3550,142 @@ mod tests {
             .expect("reap");
         assert_eq!(reaped.reaped, 0, "a malformed key is never reaped");
         assert_eq!(reaped.retained, 1);
+    }
+
+    /// A legal hold placed after an object was quarantined still stops the
+    /// reap. Hold scopes are validated to start with `t/<tenant_hex>/` and
+    /// `is_protected` is a prefix match, so the hold is asked about the
+    /// recovered original key, not only about the `quarantine/...` key it
+    /// could never match.
+    ///
+    /// Flip to watch it fail: drop the `original_key_from_quarantine` arm of
+    /// the reaper's `held` check and the first assertion reaps 1.
+    #[tokio::test]
+    async fn a_hold_on_the_original_key_stops_the_quarantine_reap() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 12;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+
+        put_orphan(&store, &tenant, signal, shard, 0).await;
+        let t1 = config.orphan_age_gate_ns() + 1;
+        let clock = FixedClock::new(t1);
+        sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("quarantine the single candidate");
+
+        // Past the second horizon, so only the hold can save it.
+        clock.set(t1 + config.quarantine_horizon_ns + 1);
+
+        // The hold names the live keyspace, which is the only shape a real
+        // hold scope can take.
+        let hold = HoldPrefix(l0_data_prefix(&tenant, signal, shard).unwrap());
+        assert!(
+            !hold.is_protected(
+                &keys_under(
+                    &store,
+                    &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+                )
+                .await
+                .into_iter()
+                .next()
+                .expect("one quarantined object")
+            ),
+            "the hold cannot match the quarantine key itself; that is the point"
+        );
+
+        let out = sweep_quarantine(&store, &clock, &config, &hold, &tenant, signal, shard)
+            .await
+            .expect("reap under a hold");
+        assert_eq!(out.reaped, 0, "a held original protects its copy");
+        assert_eq!(out.retained, 1);
+
+        // Same object, same clock, hold released: it is reaped.
+        let out = sweep_quarantine(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("reap without a hold");
+        assert_eq!(out.reaped, 1, "nothing else was keeping it");
+    }
+
+    /// A pass whose mass-orphan breaker trips reaps nothing, even quarantine
+    /// that is past its own horizon. The two horizons are not independent:
+    /// reaping while the breaker signals a live record loss destroys the copies
+    /// taken before that loss grew, which is this mechanism's own failure mode
+    /// one horizon later.
+    ///
+    /// Both directions are asserted in one test so the gate cannot be dropped
+    /// silently. Flip to watch it fail: delete the `orphan_breaker_tripped`
+    /// arm in `sweep_shard_with_holds` and the first assertion reaps 1.
+    #[tokio::test]
+    async fn a_tripped_breaker_holds_the_quarantine_reaper() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 11;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+
+        // One object quarantined at t1, well below the breaker's thresholds.
+        put_orphan(&store, &tenant, signal, shard, 0).await;
+        let t1 = config.orphan_age_gate_ns() + 1;
+        let clock = FixedClock::new(t1);
+        let out = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("one candidate does not trip the breaker");
+        assert_eq!(out.deleted, 1);
+
+        // A whole horizon later that copy is reapable. The loss has also grown:
+        // 60 record-less objects now trip the breaker on this pass.
+        let t2 = t1 + config.quarantine_horizon_ns + 1;
+        clock.set(t2);
+        for seq in 1..61u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+
+        let report = sweep_shard(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("a tripped breaker is reported, not an error, at this layer");
+        assert!(report.orphan_breaker_tripped, "60 of 60 trips the breaker");
+        assert_eq!(
+            report.quarantine_reaped, 0,
+            "the reaper is held while the breaker signals a live loss"
+        );
+        let still_quarantined = keys_under(
+            &store,
+            &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            still_quarantined.len(),
+            1,
+            "the expired copy survives a tripped-breaker pass"
+        );
+
+        // Same store, same clock, same expired copy: once the mass loss is
+        // resolved the breaker no longer trips and the reaper collects it.
+        for seq in 1..61u64 {
+            store
+                .delete(&orphan_data_key(&tenant, signal, shard, seq))
+                .await
+                .expect("clear the mass loss");
+        }
+        let report = sweep_shard(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("sweep with the breaker no longer tripping");
+        assert!(!report.orphan_breaker_tripped);
+        assert_eq!(
+            report.quarantine_reaped, 1,
+            "the same expired copy is reaped once the breaker is quiet"
+        );
+        assert!(
+            keys_under(
+                &store,
+                &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+            )
+            .await
+            .is_empty(),
+            "nothing left in quarantine"
+        );
     }
 
     fn idem_receipt(written_count: u64) -> IdempotencyReceipt {
