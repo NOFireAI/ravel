@@ -150,6 +150,10 @@ check_contains "overlap: reports OVERLAP"      "OVERLAP: #101 and #102"   "${out
 # that on its first run.
 check_absent   "overlap: no IDENTICAL finding" "IDENTICAL: #101"          "${out}"
 check_contains "overlap: names the file"       "shared.txt"               "${out}"
+# Pin the exact count, not that some number appeared: the fixture shares
+# exactly one file, and a count computed from a mis-parsed value would still
+# have rendered something here.
+check_contains "overlap: counts exactly one"   "share 1 file(s)"          "${out}"
 
 # --- different change, no shared file -> clean, exit 0 ---
 set +e
@@ -158,6 +162,12 @@ set -e
 out="$(run_case diff only-b.txt || true)"
 check_eq       "disjoint: exits 0"             "0" "${rc}"
 check_contains "disjoint: says so"             "overlaps no other open pull request" "${out}"
+# Both checks above passed against a guard that printed
+# "[: Illegal number: 0\n0" to stderr once per non-overlapping PR: the exit
+# code and the message were right, and only the noise was wrong, so nothing
+# here noticed. run_case folds stderr into the output, so assert it is clean.
+check_absent   "disjoint: no shell error noise" "Illegal number"     "${out}"
+check_absent   "disjoint: no integer error"     "integer expression" "${out}"
 
 # --- a missing pull request is 'could not tell' (2), never 'clean' (0) ---
 root="$(mktemp -d)"
