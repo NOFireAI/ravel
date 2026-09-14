@@ -330,11 +330,9 @@ fn normalize_impl(
 /// Remote Write twin, so the dropped-data counter does not read zero while
 /// exemplars are lost (ADR-0047 decision 2). Remote Write can count here
 /// because its exemplars are already decoded into the resolved request; OTLP
-/// can because they ride inline on the decoded request. OTAP deliberately
-/// does not count here: its exemplar payloads are not decoded at the
-/// point-count check, a genuine structural difference, so the OTAP/OTLP
-/// differential gate compares this path at the exemplar-carrying layer rather
-/// than at the wrapper.
+/// can because they ride inline on the decoded request. OTAP counts here too,
+/// from its exemplar payloads' row counts rather than a decode, and the
+/// OTAP/OTLP differential gate compares the two at this wrapper.
 fn whole_request_rejection(
     req: &ExportMetricsServiceRequest,
     reason: Rejection,
