@@ -413,6 +413,11 @@ else
   # repository sets `delete_branch_on_merge`, which removes the head branch
   # when the merge lands.
   if [[ "${queue_merges}" == "1" ]]; then
+    # Reachable, despite the BEHIND branch far above: on a merge-queue
+    # repository GitHub reports mergeStateStatus CLEAN for a pull request that
+    # is behind in git, so that branch never sees this case and the merge-base
+    # guard is the only detector. Observed 2026-09-14: #1796 and #1798 both
+    # read CLEAN while the guard reported them 18 commits behind.
     # Reported, not refused. The queue rebases this entry onto current main and
     # runs full CI on the result, so the behind-ness below is context for
     # spotting a base you do not recognise, not a reason to rebase by hand.
