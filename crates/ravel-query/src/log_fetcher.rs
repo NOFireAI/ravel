@@ -3183,6 +3183,14 @@ pub struct AssemblyBufferStats {
     /// plus each later growth. A read served by a buffer already at least as
     /// long as its object adds nothing, which is the whole point of the pool.
     pub zeroed_bytes: u64,
+    /// Bytes currently checked OUT of the pool, the live set. The retention
+    /// bounds cap what sits idle here, not what scans hold: under
+    /// `byte-minimal` a query holds one object-sized buffer per in-flight
+    /// ranged read, and nothing else reports that. Zero under the stock
+    /// `cost-based` policy, whose whole-object reads never touch this pool.
+    pub live_bytes: u64,
+    /// High-water mark of [`Self::live_bytes`] over this pool's life.
+    pub peak_live_bytes: u64,
 }
 
 /// Object-sized assembly buffers, reused across the ranged reads one
@@ -3212,6 +3220,8 @@ struct AssemblyBufferPool {
     allocated: AtomicU64,
     reused: AtomicU64,
     zeroed_bytes: AtomicU64,
+    live_bytes: AtomicU64,
+    peak_live_bytes: AtomicU64,
 }
 
 impl Default for AssemblyBufferPool {
@@ -3223,6 +3233,8 @@ impl Default for AssemblyBufferPool {
             allocated: AtomicU64::new(0),
             reused: AtomicU64::new(0),
             zeroed_bytes: AtomicU64::new(0),
+            live_bytes: AtomicU64::new(0),
+            peak_live_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -3262,6 +3274,26 @@ impl AssemblyBufferPool {
                 .fetch_add((len - buf.len()) as u64, Ordering::Relaxed);
             buf.resize(len, 0);
         }
+        // Charged on the resident length rather than the requested one: a
+        // reused buffer keeps the length of the largest object it has served,
+        // and those bytes are held whether or not this read addresses them.
+        let charged = buf.len() as u64;
+        let live = self.live_bytes.fetch_add(charged, Ordering::Relaxed) + charged;
+        // Raise the high-water mark, retrying only while another thread's
+        // observed peak is lower than ours; a concurrent higher peak wins and
+        // ends the loop.
+        let mut seen = self.peak_live_bytes.load(Ordering::Relaxed);
+        while seen < live {
+            match self.peak_live_bytes.compare_exchange_weak(
+                seen,
+                live,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => seen = actual,
+            }
+        }
         AssemblyBuffer {
             buf,
             len,
@@ -3273,6 +3305,11 @@ impl AssemblyBufferPool {
         if buf.capacity() == 0 {
             return;
         }
+        // Released on the same basis it was charged, before the retention
+        // bounds decide whether to keep it: a buffer dropped instead of pooled
+        // still left the live set.
+        self.live_bytes
+            .fetch_sub(buf.len() as u64, Ordering::Relaxed);
         if let Ok(mut idle) = self.idle.lock()
             && idle.bufs.len() < self.max_idle_bufs
             && idle.bytes + buf.len() <= self.max_idle_bytes
@@ -3287,6 +3324,8 @@ impl AssemblyBufferPool {
             allocated: self.allocated.load(Ordering::Relaxed),
             reused: self.reused.load(Ordering::Relaxed),
             zeroed_bytes: self.zeroed_bytes.load(Ordering::Relaxed),
+            live_bytes: self.live_bytes.load(Ordering::Relaxed),
+            peak_live_bytes: self.peak_live_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -9546,6 +9585,76 @@ mod assembly_buffer_tests {
         Arc::new(AssemblyBufferPool::default())
     }
 
+    /// The retention bounds cap idle buffers; nothing reported what scans hold.
+    /// Under `byte-minimal` that live set is one object-sized buffer per
+    /// in-flight ranged read, so it is the figure a memory question actually
+    /// needs (#1771).
+    ///
+    /// Pins magnitudes, not non-emptiness: the gauge must equal the SUM of the
+    /// checked-out sizes, fall back as each is returned, and reach exactly zero
+    /// when they all are. Charging on release instead of acquire, or forgetting
+    /// the release path, leaves a monotonically rising gauge that a
+    /// `live_bytes > 0` assertion would still pass.
+    #[test]
+    fn live_bytes_tracks_the_checked_out_set_and_returns_to_zero() {
+        let pool = pool();
+        let a = pool.acquire(1_000);
+        assert_eq!(pool.stats().live_bytes, 1_000, "one buffer out");
+        let b = pool.acquire(2_500);
+        assert_eq!(
+            pool.stats().live_bytes,
+            3_500,
+            "the sum of both, not the last"
+        );
+        let c = pool.acquire(500);
+        assert_eq!(pool.stats().live_bytes, 4_000);
+        assert_eq!(
+            pool.stats().peak_live_bytes,
+            4_000,
+            "the high-water mark is the peak simultaneous set"
+        );
+
+        drop(b);
+        assert_eq!(
+            pool.stats().live_bytes,
+            1_500,
+            "returning the middle buffer drops exactly its own bytes"
+        );
+        drop(a);
+        drop(c);
+        assert_eq!(
+            pool.stats().live_bytes,
+            0,
+            "every buffer returned leaves nothing live"
+        );
+        assert_eq!(
+            pool.stats().peak_live_bytes,
+            4_000,
+            "the peak survives the buffers that produced it"
+        );
+    }
+
+    /// A reused buffer keeps the length of the largest object it has served, so
+    /// the live charge is its resident length rather than the requested one.
+    /// Stated as a test because the two differ only after a reuse, which is
+    /// exactly when a reader would assume they agree.
+    #[test]
+    fn a_reused_buffer_charges_its_resident_length() {
+        let pool = pool();
+        let big = pool.acquire(4_000);
+        drop(big);
+        assert_eq!(pool.stats().live_bytes, 0);
+
+        let small = pool.acquire(100);
+        assert_eq!(
+            pool.stats().live_bytes,
+            4_000,
+            "the pooled buffer is still 4,000 bytes resident, whatever this read asked for"
+        );
+        drop(small);
+        assert_eq!(pool.stats().live_bytes, 0, "and all of it comes back");
+    }
+
     /// The exact allocation figures the fix is about: three same-sized reads
     /// through one pool allocate ONE buffer and zero its bytes ONCE, with the
     /// other two served by reuse. Before the fix each `ObjectAssembler::new`
@@ -9564,6 +9673,9 @@ mod assembly_buffer_tests {
                 allocated: 1,
                 reused: 2,
                 zeroed_bytes: 4096,
+                // Sequential: each buffer is dropped before the next is taken.
+                live_bytes: 0,
+                peak_live_bytes: 4096,
             }
         );
     }
@@ -9583,6 +9695,10 @@ mod assembly_buffer_tests {
                 allocated: 1,
                 reused: 2,
                 zeroed_bytes: 6144,
+                // The 1 KiB read reuses the grown 6 KiB buffer, so the peak is
+                // that resident length rather than the largest object asked for.
+                live_bytes: 0,
+                peak_live_bytes: 6144,
             }
         );
     }
@@ -9678,6 +9794,10 @@ mod assembly_buffer_tests {
                 allocated: 2,
                 reused: 0,
                 zeroed_bytes: 128,
+                // Both buffers are out at once here, which is the case the
+                // gauge exists for: the idle bounds say nothing about it.
+                live_bytes: 128,
+                peak_live_bytes: 128,
             },
             "a live Bytes keeps its buffer out of the pool"
         );
