@@ -6164,6 +6164,52 @@ mod tests {
     /// default. Dropping `sql_partition_count,` or `store_get_concurrency,`
     /// from the `EngineConfig` literal in `cold_executor` fails this test.
     #[test]
+    fn cold_executor_threads_sql_partition_count_and_store_get_concurrency_overrides() {
+        let store = empty_store();
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                fetch_concurrency: 3,
+                sql_partition_count: Some(5),
+                store_get_concurrency: Some(7),
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor")
+        .executor;
+        assert_eq!(executor.config().engine.sql_partition_count(), 5);
+        assert_eq!(executor.config().engine.store_get_concurrency(), 7);
+        assert_eq!(
+            executor.config().engine.fetch_concurrency,
+            3,
+            "fetch_concurrency itself is untouched by the two new overrides"
+        );
+
+        let executor = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                fetch_concurrency: 3,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor")
+        .executor;
+        assert_eq!(
+            executor.config().engine.sql_partition_count(),
+            3,
+            "an omitted override falls back to fetch_concurrency"
+        );
+        assert_eq!(
+            executor.config().engine.store_get_concurrency(),
+            3,
+            "an omitted override falls back to fetch_concurrency"
+        );
+    }
+
     /// `--store-get-concurrency` has to reach the fetcher's `GetLimiter`, not
     /// just the `EngineConfig` the report stamps. It did not: `cold_executor`
     /// sized the limiter from `fetch_concurrency` alone, so the flag was inert
@@ -6209,52 +6255,6 @@ mod tests {
         assert_eq!(
             fallback.get_limiter_permits, 8,
             "with the knob unset the limiter falls back to fetch_concurrency, unchanged"
-        );
-    }
-
-    fn cold_executor_threads_sql_partition_count_and_store_get_concurrency_overrides() {
-        let store = empty_store();
-        let executor = cold_executor(
-            &store,
-            &[],
-            None,
-            ExecutorSettings {
-                fetch_concurrency: 3,
-                sql_partition_count: Some(5),
-                store_get_concurrency: Some(7),
-                ..ExecutorSettings::default()
-            },
-        )
-        .expect("build executor")
-        .executor;
-        assert_eq!(executor.config().engine.sql_partition_count(), 5);
-        assert_eq!(executor.config().engine.store_get_concurrency(), 7);
-        assert_eq!(
-            executor.config().engine.fetch_concurrency,
-            3,
-            "fetch_concurrency itself is untouched by the two new overrides"
-        );
-
-        let executor = cold_executor(
-            &store,
-            &[],
-            None,
-            ExecutorSettings {
-                fetch_concurrency: 3,
-                ..ExecutorSettings::default()
-            },
-        )
-        .expect("build executor")
-        .executor;
-        assert_eq!(
-            executor.config().engine.sql_partition_count(),
-            3,
-            "an omitted override falls back to fetch_concurrency"
-        );
-        assert_eq!(
-            executor.config().engine.store_get_concurrency(),
-            3,
-            "an omitted override falls back to fetch_concurrency"
         );
     }
 
