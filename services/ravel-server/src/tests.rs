@@ -394,6 +394,26 @@ async fn query_result_is_byte_identical_with_and_without_accounting() {
 /// the real HTTP handler and the real `SqlExecutor::new`/
 /// `with_process_memory_budget` wiring `crate::start` uses, not just the
 /// ravel-sql unit tests that drive `TenantDelegatingPool` directly.
+///
+/// Prove-the-test for the rollback half: add an early `return;` to
+/// `TenantMemoryAccountant::release_process_at_most`
+/// (crates/ravel-sql/src/memory.rs), so a refused query's charge stays on the
+/// shared counter. `budget.reserved()` then reads 64,000 against the expected
+/// 0. The `SELECT 1` assertion below does NOT catch that: a query that
+/// reserves nothing issues no `try_grow`, so it answers 200 against a counter
+/// left fully saturated just as it does against one rolled back to 0. It is
+/// here for the second half of the claim (the executor and the tenant mutex
+/// are still usable), and the counter assertion is here for the first.
+///
+/// The budget is 256 KiB rather than a token 1 KiB for the same reason. This
+/// statement needs 460,200 bytes to complete and takes them in increments no
+/// larger than the 64,000-byte table itself, so a 256 KiB ceiling is crossed
+/// only after several reservations have really been charged. Against a 1 KiB
+/// or 16 KiB ceiling the FIRST `try_grow` is refused, which reserves nothing
+/// by `MemoryBudget::try_reserve`'s all-or-nothing rule, and the counter never
+/// leaves 0 for a rollback to return it to: the assertion then holds whether
+/// or not the rollback exists (measured: `reserved()` reads 0 under both
+/// ceilings with the rollback disabled).
 #[tokio::test]
 async fn a_query_over_the_process_budget_is_refused_and_the_process_keeps_serving() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -402,24 +422,29 @@ async fn a_query_over_the_process_budget_is_refused_and_the_process_keeps_servin
         .map(|i| (i as i64 * 1_000_000, i as f64))
         .collect();
     publish_segment(store.as_ref(), &tenant, &samples).await;
-    let h = harness(
-        Arc::clone(&store),
-        HashSet::new(),
-        Arc::new(ravel_memory::MemoryBudget::new(1024)),
-    );
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(256 * 1024));
+    let h = harness(Arc::clone(&store), HashSet::new(), Arc::clone(&budget));
 
-    // A real sort over 4,000 rows outgrows a 1 KiB process budget: refused
+    // A real sort over 4,000 rows outgrows a 256 KiB process budget: refused
     // typed, not a panic and not a hang.
     let (status, body) = post_sql(&h.sql, "SELECT ts, value FROM samples ORDER BY ts").await;
     assert_eq!(
         status,
         StatusCode::UNPROCESSABLE_ENTITY,
-        "a sort over 4,000 rows must outgrow a 1 KiB process budget: {body}"
+        "a sort over 4,000 rows must outgrow a 256 KiB process budget: {body}"
     );
 
-    // The refused charge rolled back off the shared process counter: a query
-    // cheap enough to need no real reservation still succeeds under the same
-    // tiny budget, proving the refusal did not wedge the executor.
+    // The refused query's charge rolled back off the SHARED process counter.
+    // This is what makes the cross-tenant cascade survivable: the counter is
+    // process-wide, so a charge left behind by one tenant's abort refuses
+    // every other tenant's next reservation for as long as it sits there.
+    assert_eq!(
+        budget.reserved(),
+        0,
+        "the refused query must leave no charge on the shared process counter"
+    );
+
+    // And the executor itself is still usable through the same tenant mutex.
     let (status, body) = post_sql(&h.sql, "SELECT 1").await;
     assert_eq!(
         status,

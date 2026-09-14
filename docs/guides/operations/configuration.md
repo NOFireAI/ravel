@@ -1057,12 +1057,20 @@ for concurrent SQL queries even though the two are configured by separate
 flags. This budget, its two carves, and the remainder are computed once at
 startup from the host profile observed at that moment; nothing about it
 changes while the process runs, and a container whose cgroup limit changes
-later is not noticed until the next restart. The current state is visible
-live at `/metrics`: `ravel_memory_budget_bytes` (the resolved ceiling,
-`u64::MAX` meaning unlimited), `ravel_memory_reserved_bytes` split by a
+later is not noticed until the next restart. Startup refuses outright when
+the two cache ceilings leave no strictly positive remainder, naming both
+figures; `--disable-cache` is exempt, because a process that builds neither
+cache claims nothing against the budget and the remainder is all of it. The current state is visible
+live at `/metrics`: `ravel_memory_budget_bytes` (the ceiling of that shared
+accountant, which is the startup log's `memory_remainder_bytes`, the budget
+MINUS the two cache ceilings, not the pre-carve `memory_budget_bytes` figure
+logged beside it; `u64::MAX` means unlimited, which is what any host with
+unreadable memory reports regardless of the caps set on it),
+`ravel_memory_reserved_bytes` split by a
 `component` label (`sql` or `fetch`; `fetch` reads `0` today because no
 fetcher this process builds reserves against this budget, an honest gap
-rather than a bug), and `ravel_memory_handoff_overlap_bytes` (the bytes a
+rather than a bug, and `sql` is correspondingly the whole reserved total
+rather than one component's share of it), and `ravel_memory_handoff_overlap_bytes` (the bytes a
 handoff between components would double-count in the budget's accounting
 window; inactive, always `0`, until fetch handoff accounting reaches this
 budget).
