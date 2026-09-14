@@ -1631,6 +1631,12 @@ struct ColdExecutor {
     /// same reason as `probe_misses`: `SqlOutcome` carries only a pooled
     /// `QueryAccountingSnapshot`, which has no per-phase byte field.
     wire_bytes: PhaseWireByteCounter,
+    /// GET permits the log fetcher was built with, read off the fetcher before
+    /// it moves into the executor. Cloned out for the same reason as the two
+    /// counters above: nothing downstream hands it back, and it is the only
+    /// place a test can prove `--store-get-concurrency` reached the limiter
+    /// rather than stopping at the config the report stamps.
+    get_limiter_permits: usize,
 }
 
 fn cold_executor(
@@ -1664,12 +1670,19 @@ fn cold_executor(
     // fetcher's permit pool stays at its compiled-in 16 and a scan planned at
     // more partitions than that queues on it, so the bench would measure a
     // ceiling the flag cannot move.
+    //
+    // Sized by `store_get_concurrency`, falling back to `fetch_concurrency`,
+    // which is how `EngineConfig::store_get_concurrency()` resolves it
+    // (ADR-1195). Sizing it by `fetch_concurrency` alone left
+    // `--store-get-concurrency` inert in this lane while the report still
+    // stamped an `effective` value for it, so a sweep of the flag measured one
+    // configuration repeatedly and looked stamped while doing it.
     // The request cost has to be handed to the fetcher here, exactly as
     // `ravel-server` hands it over: the quantity lives on the block-range
     // fetcher this builder owns, so a fetcher built without it keeps the
     // compiled-in default and the resolved rate governs nothing (issue #1139).
     let mut log_fetcher = LogSegmentFetcher::new(Arc::clone(store))
-        .with_max_concurrent_gets(fetch_concurrency.max(1))
+        .with_max_concurrent_gets(store_get_concurrency.unwrap_or(fetch_concurrency).max(1))
         .with_block_range_threshold(logs_block_range_threshold)
         .with_request_cost_bytes(logs_request_cost_bytes);
     if let Some(n) = logs_suffix_len {
@@ -1684,6 +1697,7 @@ fn cold_executor(
     // ordering the reader has to verify.
     let probe_misses = log_fetcher.probe_miss_counter();
     let wire_bytes = log_fetcher.phase_wire_byte_counter();
+    let get_limiter_permits = log_fetcher.get_limiter_permits();
     let executor = SqlExecutor::new(
         catalog,
         SegmentFetcher::new(Arc::clone(store)),
@@ -1716,6 +1730,7 @@ fn cold_executor(
         executor,
         probe_misses,
         wire_bytes,
+        get_limiter_permits,
     })
 }
 
@@ -6149,6 +6164,54 @@ mod tests {
     /// default. Dropping `sql_partition_count,` or `store_get_concurrency,`
     /// from the `EngineConfig` literal in `cold_executor` fails this test.
     #[test]
+    /// `--store-get-concurrency` has to reach the fetcher's `GetLimiter`, not
+    /// just the `EngineConfig` the report stamps. It did not: `cold_executor`
+    /// sized the limiter from `fetch_concurrency` alone, so the flag was inert
+    /// in this lane while the report still printed an `effective` value for it.
+    /// A sweep of the flag then measured one configuration repeatedly and
+    /// looked stamped while doing it, which is worse than an unstamped run.
+    ///
+    /// Asserted at the point of reliance -- the permits the fetcher was built
+    /// with -- because every weaker assertion (the settings field, the
+    /// `EngineConfig` value, the provenance) was already true while the bug was
+    /// live. Restoring `.with_max_concurrent_gets(fetch_concurrency.max(1))`
+    /// fails this with 8 against 64.
+    #[test]
+    fn store_get_concurrency_reaches_the_fetchers_limiter() {
+        let store = empty_store();
+        let built = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                fetch_concurrency: 8,
+                store_get_concurrency: Some(64),
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build cold executor");
+        assert_eq!(
+            built.get_limiter_permits, 64,
+            "the limiter must be sized by --store-get-concurrency, not by fetch_concurrency"
+        );
+
+        let fallback = cold_executor(
+            &store,
+            &[],
+            None,
+            ExecutorSettings {
+                fetch_concurrency: 8,
+                store_get_concurrency: None,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build cold executor");
+        assert_eq!(
+            fallback.get_limiter_permits, 8,
+            "with the knob unset the limiter falls back to fetch_concurrency, unchanged"
+        );
+    }
+
     fn cold_executor_threads_sql_partition_count_and_store_get_concurrency_overrides() {
         let store = empty_store();
         let executor = cold_executor(
