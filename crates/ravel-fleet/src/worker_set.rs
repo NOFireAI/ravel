@@ -545,7 +545,8 @@ mod tests {
 
     const H: Duration = Duration::from_secs(60);
     const H_NS: i64 = 60 * 1_000_000_000;
-    /// `3 * H` in milliseconds: the default liveness window.
+    /// `H` in milliseconds. The default liveness window is `3 * H_MS`
+    /// (`DEFAULT_LIVENESS_FACTOR` is 3), which is how the tests spell it.
     const H_MS: u64 = 60 * 1_000;
 
     fn worker(now_ns: i64) -> WorkerSet {
