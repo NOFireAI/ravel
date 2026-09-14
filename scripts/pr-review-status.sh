@@ -67,10 +67,16 @@ merge_base_guard() {
 # an unverified base.
 merge_queue_active() {
   local branch="${1:-main}" body count
-  body="$(gh api "repos/${repo}/rules/branches/${branch}" 2>/dev/null)" || return 1
+  # A branch name can contain `/` (release/1.2); the API wants that segment
+  # encoded, and an unencoded one 404s, which would read as "no queue".
+  branch="${branch//\//%2F}"
+  # --paginate: the endpoint pages at 30 rules, and a merge_queue rule landing
+  # on page 2 would otherwise read as absent.
+  body="$(gh api --paginate "repos/${repo}/rules/branches/${branch}" 2>/dev/null)" || return 2
   count="$(printf '%s' "${body}" \
-    | jq '[.[] | select(.type == "merge_queue")] | length' 2>/dev/null)" || return 1
-  [[ "${count}" =~ ^[1-9][0-9]*$ ]]
+    | jq -s '[.[][] | select(.type == "merge_queue")] | length' 2>/dev/null)" || return 2
+  [[ "${count}" =~ ^[1-9][0-9]*$ ]] || return 1
+  return 0
 }
 
 pr="${1:?usage: pr-review-status.sh <pr-number> [--confirm-addressed]}"
@@ -276,14 +282,27 @@ echo "${summary}"
 # no fetch and no API call, exactly as before this function existed.
 base_behind_note=""
 queue_merges=0
+queue_lookup_failed=0
 base_stale_blocks() {
   merge_base_guard && return 1
-  if [[ "${guard_rc}" == "1" ]] && merge_queue_active "${base_ref}"; then
-    queue_merges=1
-    base_behind_note="${guard_out}"
-    return 1
+  [[ "${guard_rc}" == "1" ]] || return 0
+  local qrc=0
+  merge_queue_active "${base_ref}" || qrc=$?
+  if [[ "${qrc}" == "2" ]]; then
+    # Could not ask is not an answer. Block, but say why, so the operator is
+    # not handed the pre-#1758 advice with no hint it came from a failed
+    # lookup and cannot tell it from the ordinary no-queue path.
+    queue_lookup_failed=1
+    return 0
   fi
-  return 0
+  [[ "${qrc}" == "0" ]] || return 0
+  queue_merges=1
+  # The guard's own closing line is "rebase onto <remote>/<branch> and let CI
+  # re-run before merging", which is exactly the advice this path exists to
+  # stop giving. Keep the behind count and the unseen commits, which are the
+  # landing-loop revert detector, and drop that one line.
+  base_behind_note="$(printf '%s\n' "${guard_out}" | grep -v 'rebase onto')"
+  return 1
 }
 
 if [[ "${state}" != "OPEN" ]]; then
@@ -364,6 +383,9 @@ elif base_stale_blocks; then
     echo "  -> could not check merge-base freshness (guard exit ${guard_rc}); check by hand before merging"
   fi
   echo "${guard_out//guard: /     }"
+  if [[ "${queue_lookup_failed}" == "1" ]]; then
+    echo "  -> NOTE: could not read the base branch's rules, so this refusal does not know whether a merge queue would have re-validated it"
+  fi
 elif [[ "${merge_state}" != "CLEAN" && "${merge_state}" != "UNSTABLE" ]]; then
   echo "  -> every check and review looks clean, but mergeState is ${merge_state} (not CLEAN/UNSTABLE); verify by hand before merging"
 else
@@ -390,7 +412,7 @@ else
     # Reported, not refused. The queue rebases this entry onto current main and
     # runs full CI on the result, so the behind-ness below is context for
     # spotting a base you do not recognise, not a reason to rebase by hand.
-    echo "  -> base is behind origin/main; the merge queue rebases and re-runs CI before landing, so this is information, not a blocker:"
+    echo "  -> base is behind origin/main; the merge queue re-validates the entry against current main before landing, so this is information, not a blocker:"
     echo "${base_behind_note//guard: /     }"
     echo "  -> if any commit above is one you do not recognise, stop and check for a landing loop before merging"
     # No assert-fresh-merge-base prefix: it would refuse on exactly the
