@@ -11,19 +11,20 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly fourteen label keys: `tenant_hash`, `signal`, `mode`, `op`,
+//! renders exactly fifteen label keys: `tenant_hash`, `signal`, `mode`, `op`,
 //! `error_kind`, `workload_class`, `level`, `reason`, `cache`, `tier`,
-//! `kind`, `allocator`, `stat`, and `component` (ADR-0044
+//! `kind`, `outcome`, `allocator`, `stat`, and `component` (ADR-0044
 //! section 4; `reason` added by ADR-0051 section 6 for the admission-rejection
 //! family and reused by ADR-0059 section 2 for the scrub seal-divergence family,
 //! `cache` to split the read-cache family into the
 //! fetcher and catalog byte caches, `tier` added by #97 to split each of those
 //! into its RAM and local-disk tiers when a disk tier is configured, `kind`
 //! added by ADR-0065 decision 4 to split the maintenance merge-memory gauge into
-//! its transient and total high-water marks, `allocator`/`stat` added by
-//! #1170 for the process allocator gauges, and `component` added by ADR-1170
-//! decision 4 to split the process memory budget's reserved-bytes gauge by
-//! which side reserved it). The fourteen keys come from fifteen
+//! its transient and total high-water marks, `outcome` added by #532 to split
+//! the alert-tick family by how one evaluation tick ended, `allocator`/`stat`
+//! added by #1170 for the process allocator gauges, and `component` added by
+//! ADR-1170 decision 4 to split the process memory budget's reserved-bytes
+//! gauge by which side reserved it). The fifteen keys come from sixteen
 //! `Label` variants: `RejectReason` and `ScrubReason` both render `reason`.
 //! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
@@ -267,6 +268,17 @@ pub enum Label {
     /// landed upstream, so nothing yet charges the budget on the fetcher's
     /// behalf. This is an honest gap, not a bug -- the gauge exists now so a
     /// dashboard need not change shape once decision 2 lands.
+    ///
+    /// The split is not yet a real split, and landing decision 2 is more than
+    /// flipping the hardcoded `Fetch` constant to a reader. `Sql` renders
+    /// `MemoryBudget::reserved()`, the WHOLE process budget's reserved total,
+    /// which is only equal to SQL's share because SQL is the sole reserver
+    /// today. Wire a fetcher to the same instance and `component="sql"`
+    /// silently becomes the process total while `component="fetch"` reports
+    /// its own share, so the two double-count and a dashboard summing them
+    /// reads high. Decision 2 has to give the budget per-component
+    /// accounting (or give each component its own counter) before either
+    /// sample can be read as a share.
     MemoryComponent(MemoryComponent),
 }
 
@@ -1758,9 +1770,18 @@ fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
 /// so this family renders in every build even where nothing yet reserves
 /// against the budget.
 ///
-/// `ravel_memory_budget_bytes` is `u64::MAX` when the process was built with
-/// no derived budget (matching `ravel_memory::MemoryBudget::unlimited`'s own
-/// convention), not `0`: a `0` ceiling would misread as "everything refused."
+/// `ravel_memory_budget_bytes` is the POST-carve remainder, not the pre-carve
+/// `memory_budget_bytes` the startup log names: `main.rs` sizes
+/// `ServerConfig::process_memory_budget_bytes` from
+/// `ResolvedPerformanceDefaults::memory_remainder_bytes`, and this gauge
+/// renders that one instance's `limit()`. That is the right quantity for a
+/// budget accountant gauge (it is what reservations are refused against), but
+/// both names appear in the startup log with a multi-GB gap between them, so
+/// the HELP string below says which one this is.
+///
+/// It is `u64::MAX` when the process was built with no derived budget
+/// (matching `ravel_memory::MemoryBudget::unlimited`'s own convention), not
+/// `0`: a `0` ceiling would misread as "everything refused."
 /// [`exposed_memory_budget_limit`] clamps that path before it reaches this
 /// family.
 ///
@@ -1775,7 +1796,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_budget_bytes",
-        "The ADR-1170 process-wide memory budget ceiling (ServerConfig::process_memory_budget_bytes); u64::MAX means unlimited.",
+        "Ceiling of the ADR-1170 shared SQL/fetch memory budget: the startup log's memory_remainder_bytes, which is memory_budget_bytes minus memory_hard_caps_bytes (the two resolved cache ceilings), NOT the pre-carve memory_budget_bytes that log line names; u64::MAX means unlimited.",
         "gauge",
     );
     write_sample(
@@ -1788,7 +1809,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_reserved_bytes",
-        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"fetch\" reads 0 until decision 2 (fetch-layer reservation) lands upstream.",
+        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"sql\" is the budget's whole reserved total, equal to SQL's share only because SQL is its sole reserver today; component=\"fetch\" reads 0 until decision 2 (fetch-layer reservation) lands upstream.",
         "gauge",
     );
     write_sample(

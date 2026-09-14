@@ -811,6 +811,16 @@ message: lower `--cache-max-bytes`, or, when the budget itself derived to
 value of that flag can satisfy the check), give the process more memory or
 raise its cgroup memory limit.
 
+`--disable-cache` is outside that check entirely. It builds neither cache, so
+neither resolved ceiling holds any memory: the hard-caps figure is `0`
+regardless of `--cache-max-bytes`, the remainder is the whole budget, and
+startup never refuses. That is what keeps the flag usable as the remedy the
+caching guide names it as, and it is the one path that can start with a
+remainder of `0`: a container whose effective memory is at or below the 2 GiB
+overhead reserve derives a `0` budget, which no flag can raise. Startup logs a
+WARN there rather than refusing, because such a process still ingests; every
+query that reserves memory is refused for as long as it runs that way.
+
 This derivation runs once, at process startup, from the host profile
 observed at that moment. There is no runtime budget re-derivation: the
 ceiling never grows to match a host whose memory changed, and a reservation
@@ -836,18 +846,32 @@ counter, one infallible `grow` path), not a separate defect; see ADR-1170's
 consequence.
 
 The `/metrics` endpoint exposes the budget's current state as three gauges,
-unconditionally in every mode: `ravel_memory_budget_bytes` (the resolved
-ceiling; `u64::MAX` means unlimited, which is what a host where memory could
-not be read but no explicit caps were set resolves to), `ravel_memory_reserved_bytes{component="sql"|"fetch"}`
+unconditionally in every mode: `ravel_memory_budget_bytes`,
+`ravel_memory_reserved_bytes{component="sql"|"fetch"}`
 (bytes currently reserved against the budget, split by which side reserved
 them), and `ravel_memory_handoff_overlap_bytes` (the bytes a handoff between
 components would double-count in the budget's accounting window; inactive,
 always `0`, until fetch handoff accounting reaches this budget).
-`component="fetch"` always reads `0` today for the same reason: only the SQL
+
+`ravel_memory_budget_bytes` is the ceiling of the shared accountant, which is
+the POST-carve remainder: the startup log's `memory_remainder_bytes`, not the
+`memory_budget_bytes` it is named after. Both figures appear in that log, and
+on the 30 GiB reference host they differ by 9.0 GB, so a dashboard comparing
+the gauge against the pre-carve line will find bytes it cannot account for.
+The gauge reads `u64::MAX` (unlimited) on the fallback path, which is any host
+where memory could not be read, whatever `--cache-max-bytes` was set to: that
+clamp keys off the budget's source alone, so an explicit cap on an unmeasured
+host still renders unlimited here while the real ceiling behind it is
+`u64::MAX` minus the two caps.
+
+`component="fetch"` always reads `0` today: only the SQL
 executor's per-tenant accountants reserve against this budget. The fetchers
 do have their own reservation and handoff accounting, but the server wires
 none of them to this instance, so neither gauge can move until that wiring
-lands. Both are an honest gap rather than a bug: they exist now so a
+lands. `component="sql"` is correspondingly the budget's whole reserved
+total rather than a component's share of it; the two coincide only while SQL
+is the sole reserver, and the split becomes real, rather than a relabelling,
+when decision 2 lands. Both are an honest gap rather than a bug: they exist now so a
 dashboard built against them does not need to change shape once the fetch
 layer starts reserving here.
 
