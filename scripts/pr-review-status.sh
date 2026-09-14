@@ -421,6 +421,17 @@ else
     echo "  -> if any commit above is one you do not recognise, stop and check for a landing loop before merging"
     # No assert-fresh-merge-base prefix: it would refuse on exactly the
     # behind-ness the queue exists to handle, which is issue #1758.
+    #
+    # --rebase is kept even though the queue sets the merge strategy itself.
+    # Measured against this repository's live protect-main queue on
+    # 2026-09-14: this exact command was run for #1796, #1797 and #1798, each
+    # exited 0 printing the informational "! The merge strategy for main is
+    # set by the merge queue", and all three merged. gh can reject a method on
+    # some queue configurations, so this is a property of this repository, not
+    # a general one -- which is why it is recorded here with its evidence
+    # rather than re-derived. Keeping the flag also means the printed command
+    # stays correct if the queue is ever removed, where the strategy would
+    # otherwise fall back to whatever the repository default happens to be.
     echo "  -> gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
   else
     echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} && gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
