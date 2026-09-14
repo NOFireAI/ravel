@@ -1061,10 +1061,8 @@ fn assert_histogram_paths_agree_with_limits(
     // Compare the rejection classes at the shared admission layer
     // (`*_with_exemplars`), not the wrapper outputs. All three wrappers discard
     // the exemplars the cap admits (nothing stores them yet) and count that
-    // discard into `HistogramExemplarsDropped`. They still disagree at the
-    // too-many-points return, where OTLP and Remote Write count the request's
-    // exemplars and OTAP cannot, having decoded none. That wrapper bookkeeping
-    // is not an admission decision;
+    // discard into `HistogramExemplarsDropped`. Wrapper bookkeeping is not an
+    // admission decision;
     // the ADR-0011 parity that matters is that the two paths make the SAME cap
     // decisions, which is what the `_with_exemplars` outputs expose. Comparing
     // here is future-proof: it stays correct whether or not either wrapper
