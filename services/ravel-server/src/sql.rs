@@ -488,8 +488,17 @@ mod tests {
     #[test]
     fn the_body_cap_admits_a_statement_at_the_complexity_bound() {
         assert_eq!(MAX_BODY_BYTES, 64 << 10);
-        let statement = "a".repeat(ravel_sql::MAX_STATEMENT_COMPLEXITY);
+        // Space-separated: a run of `a` is ONE token under the token rule, so
+        // `"a".repeat(N)` builds a 1-unit statement, not an N-unit one. Each
+        // `a ` is its own token, which is what makes this the widest statement
+        // the gate admits.
+        let statement = "a ".repeat(ravel_sql::MAX_STATEMENT_COMPLEXITY);
         let body = format!(r#"{{"query":"{statement}"}}"#);
+        assert_eq!(
+            ravel_sql::complexity_guard::structural_count(&statement),
+            ravel_sql::MAX_STATEMENT_COMPLEXITY,
+            "the probe must actually sit at the bound for this case to pin anything"
+        );
         assert!(
             body.len() < MAX_BODY_BYTES,
             "a statement at the complexity bound must fit the body cap: {} vs {MAX_BODY_BYTES}",

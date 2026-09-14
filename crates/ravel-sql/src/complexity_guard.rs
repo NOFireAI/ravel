@@ -93,6 +93,17 @@
 //! Every token costs one unit, whatever its length: a literal through its
 //! opening delimiter, an identifier or number through its first character.
 //!
+//! "Token" means what the tokenizer yields, not what looks like one word.
+//! `GenericDialect::supports_numeric_prefix()` is false, so `1AND` is
+//! `Number("1")` then `Word("AND")`, and the scan stops a digit run at the
+//! first non-digit to match. Consuming it as one alphanumeric run charged one
+//! unit for two tokens, and because each `AND` adds a tree level that made a
+//! boolean chain cost one unit per level against the two every other construct
+//! costs: `SELECT 1` + `AND 1` x998 scored exactly 1,000 units and built a
+//! 998-level spine. A run that starts with a letter or `_` still consumes
+//! alphanumerics, because `a1` really is one identifier, which is what keeps
+//! the bound independent of quoting.
+//!
 //! # Calibrating [`MAX_STATEMENT_COMPLEXITY`]
 //!
 //! Measured on a 2 MiB stack (the tokio worker default the server runs on),
@@ -122,7 +133,9 @@
 //!
 //! The margin is stated in levels rather than units, because that is
 //! what the stack spends: no construct costs fewer than two units per
-//! tree level (a binary operator and its right operand; parenthesis nesting
+//! tree level (a claim that has been falsified once, by the numeric-prefix
+//! case above, and is load-bearing enough to be worth re-checking against the
+//! tokenizer whenever the run rule changes) (a binary operator and its right operand; parenthesis nesting
 //! also costs two and is capped by the parser's recursion limit long before
 //! this one bites), so a statement at [`MAX_STATEMENT_COMPLEXITY`] cannot
 //! reach more than 500 levels against the ~950 measured to abort. Worst case,
@@ -157,7 +170,7 @@
 
 use std::fmt;
 
-/// Maximum count of non-whitespace characters outside literals and comments a
+/// Maximum count of tokens outside literals and comments a
 /// SQL statement's text may contain. See the module documentation for how
 /// this was measured and why it bounds parse depth, AST depth, and every
 /// AST-walk depth, for every construct rather than just the ones tested.
@@ -374,13 +387,33 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                     continue;
                 }
                 if c.is_alphanumeric() || c == '_' {
-                    // Consume the rest of the identifier/keyword/number run.
-                    // A `.` inside a number (`1.5`, `1e-3`) is deliberately
-                    // NOT consumed: it costs its own unit, which only makes
-                    // the count stricter, never more permissive.
-                    let run = rest
-                        .find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
-                        .unwrap_or(rest.len());
+                    // Consume the rest of the run, stopping where the tokenizer
+                    // would.
+                    //
+                    // A run that STARTS with a digit stops at the first
+                    // non-digit, because `GenericDialect::supports_numeric_prefix`
+                    // is false: `1AND` is `Number("1")` then `Word("AND")`, two
+                    // tokens. Consuming it as one alphanumeric run charged one
+                    // unit for two tokens, and since each `AND` adds a tree
+                    // level that made a boolean chain cost one unit per level
+                    // instead of two. Measured on the version that did:
+                    // `SELECT 1` + `AND 1` x998 scored exactly 1,000 units and
+                    // built a 998-level spine, against 499 for the same budget
+                    // spent on `+1`. That is the whole calibration margin.
+                    //
+                    // A run that starts with a letter or `_` keeps consuming
+                    // alphanumerics, because `a1` really is one identifier.
+                    //
+                    // A `.` inside a number (`1.5`, `1e-3`) is deliberately NOT
+                    // consumed: it costs its own unit, which only makes the
+                    // count stricter, never more permissive.
+                    let run = if c.is_ascii_digit() {
+                        rest.find(|ch: char| !ch.is_ascii_digit())
+                            .unwrap_or(rest.len())
+                    } else {
+                        rest.find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                            .unwrap_or(rest.len())
+                    };
                     skip = rest[..run].chars().count() - 1;
                 }
             }
@@ -566,6 +599,50 @@ mod tests {
                 err.count
             );
         }
+    }
+
+    /// A digit run touching a following keyword costs two units, not one,
+    /// because the tokenizer splits it into two tokens.
+    ///
+    /// `GenericDialect::supports_numeric_prefix()` is false, so `1AND` is
+    /// `Number("1")` then `Word("AND")`. An earlier form of the run rule
+    /// consumed it as one alphanumeric run and charged one unit, and since each
+    /// `AND` adds a tree level that made a boolean chain cost one unit per level
+    /// against the two every other construct costs. Measured on that form:
+    /// `SELECT 1` + `AND 1` x998 scored exactly 1,000 units and built a
+    /// 998-level spine, where the same budget spent on `+1` reaches 499. The
+    /// calibration argument this guard rests on is that no construct costs
+    /// fewer than two units per level, so that one construct falsified it and
+    /// put an admitted statement within about 5% of the measured abort.
+    ///
+    /// Flip to watch it fail: drop the `c.is_ascii_digit()` branch from the run
+    /// consumption in `scan`, leaving the single alphanumeric arm. The `AND`
+    /// chain below then scores 1,000 and is accepted.
+    #[test]
+    fn a_digit_touching_a_keyword_costs_two_units() {
+        // 998 levels' worth of `AND`, which the one-unit rule admitted.
+        let sql = format!("SELECT 1{}", "AND 1".repeat(998));
+        let err = check(&sql).expect_err("a boolean chain must cost two units per level");
+        assert!(
+            err.count > MAX_STATEMENT_COMPLEXITY,
+            "the AND chain must be refused, counted {}",
+            err.count
+        );
+
+        // The two chains now cost the same per level, which is the property
+        // the calibration rests on.
+        assert_eq!(
+            structural_count("SELECT 1AND 1AND 1"),
+            structural_count("SELECT 1+1+1"),
+            "a boolean chain and an arithmetic chain of equal depth cost equally"
+        );
+
+        // And an identifier run is still one unit, so the quoting independence
+        // the token rule exists for is intact.
+        assert_eq!(
+            structural_count("SELECT ResolutionWidth FROM t"),
+            structural_count("SELECT a1 FROM t"),
+        );
     }
 
     /// One token costs one unit whatever its length, so the bound does not
