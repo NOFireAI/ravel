@@ -1,0 +1,81 @@
+name: bench-compare
+
+# ADR-0070 tier B: a criterion smoke compare of the pure-CPU bench set against
+# the committed baseline under bench/baselines/, posting a PR comment.
+#
+# Two things about this lane, both from ADR-0070 decision 3:
+#
+#  - It runs ONLY on the self-hosted reference runner where the baseline was
+#    recorded (label `ravel-reference`). A criterion timing number is only
+#    comparable to a baseline taken on the same hardware; on a GitHub-hosted
+#    runner the comparison would be noise. When the runner is offline the job is
+#    skipped, not failed.
+#  - It is ADVISORY by default: `bench-tier-b.sh compare` without `--enforce`
+#    exits 0 regardless of the result, so this lane never blocks a merge. It
+#    posts a comment and stops there.
+#
+# The machinery to BLOCK exists and is reachable: a manual dispatch with
+# `enforce=true` runs the compare with `--enforce`, which fails the job on a
+# regression past the threshold. Per ADR-0070 that enforcing mode is gated on a
+# probation window (see the ADR amendment for issue #533) and must not be wired
+# onto the pull_request trigger without an owner's decision. This file
+# deliberately keeps the automatic path advisory.
+#
+# CARGO_TERM_COLOR is intentionally NOT set to always here (unlike the other
+# bench lanes): the compare reads criterion JSON, and a colored terminal would
+# only risk leaking ANSI codes into logs. The compare never greps stdout.
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      enforce:
+        description: "Fail the job on a regression past the threshold (probation only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-compare-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench-compare:
+    # Self-hosted reference runner only (ADR-0070 decision 3). Skipped, not
+    # failed, when no such runner is online.
+    runs-on: [self-hosted, ravel-reference]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Run the tier B compare (advisory unless dispatched with enforce)
+        id: compare
+        env:
+          # Only a manual dispatch can enforce; the pull_request path is always
+          # advisory. github.event.inputs.enforce is empty on non-dispatch runs.
+          ENFORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.enforce == true }}
+        run: |
+          if [ "$ENFORCE" = "true" ]; then
+            scripts/bench-tier-b.sh compare bench/baselines/tier-b.json --enforce
+          else
+            scripts/bench-tier-b.sh compare bench/baselines/tier-b.json
+          fi
+      - name: Post the comparison as a PR comment
+        # Only on pull_request events, and even if an enforcing run failed, so
+        # the numbers are always visible.
+        if: ${{ always() && github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -f .gate-logs/bench-compare.md ]; then
+            gh pr comment "$PR_NUMBER" --body-file .gate-logs/bench-compare.md
+          else
+            echo "::warning::no bench-compare.md produced; the compare step did not run to completion"
+          fi

@@ -152,3 +152,41 @@ decision).
   workflow leg iterates on live Actions runs.
 - The benchmark discipline holds: every number states its
   environment; loopback panels stay labeled as loopback.
+
+## Proposed amendment (issue #533): make tier B advisory-that-can-block
+
+Status: Proposed. Needs an owner's decision; not adopted by the change that
+adds this text.
+
+Issue #533 asks for a tier B that is "advisory-that-can-block, not silently
+informational". That is a different decision from decision 3 above, which
+records tier B as advisory only: "posting a PR comment, never failing the
+build". This section records the tension rather than resolving it silently.
+
+The machinery landed for #533 makes both behaviours reachable from one tool.
+`scripts/bench-compare.py compare` (driven by `scripts/bench-tier-b.sh`) is
+advisory by default and exits non-zero only with `--enforce`. The
+`bench-compare.yml` workflow wires the pull_request trigger to the advisory
+path, matching decision 3 as it stands, and exposes the enforcing path only on
+a manual dispatch. Nothing on the automatic PR path can block a merge today.
+
+What decision 3 already requires before enforcing, unchanged by this proposal:
+
+- Enforcement turns on only after a probation window shows an acceptable
+  false-positive rate. On shared and self-hosted runners under co-resident
+  load, a raw +15% single-run threshold will fire on noise; the probation
+  window is what measures how often.
+- Even then, a regression blocks only when it is beyond 15% and sustained
+  across two consecutive runs of the same PR head. The current
+  `bench-compare.py` compares a single run to the baseline; the two-consecutive
+  -runs-of-the-same-head condition is not yet implemented and is a prerequisite
+  for wiring `--enforce` onto pull_request.
+
+Recommendation: keep the automatic path advisory until the probation data
+exists, then promote by (a) implementing the two-consecutive-runs condition in
+the compare tool, (b) recording a real baseline on the reference runner, and
+(c) switching the pull_request step to `--enforce`. The threshold, the named
+bench set, and the reference-runner-only constraint stay as decision 3 sets
+them. This is a policy change on a required-check surface and needs an owner's
+call, not a fleet executor's; it is filed here so the decision is made with the
+probation condition in view rather than by default.
