@@ -1490,6 +1490,69 @@ fn an_over_exploded_request_counts_its_dropped_exemplars_on_both_surfaces() {
     assert_histogram_paths_agree_with_limits(&workload, &limits);
 }
 
+/// The wire-count rejection counts its dropped exemplars too, not only the
+/// exploded one.
+///
+/// Both OTAP early returns now carry the count, and only the exploded path was
+/// pinned. This sizes the request so the WIRE count trips first: 101 points
+/// against a limit of 100, each carrying one exemplar, so the rejection is
+/// `TooManyDataPoints` rather than `TooManyExplodedPoints` and the exemplars
+/// are still counted.
+///
+/// Flip to watch it fail: pass `0` instead of `dropped_exemplar_rows(batch)`
+/// at the `TooManyDataPoints` return. The rejection then carries only the
+/// count variant and the exemplar assertion below fails.
+#[test]
+fn an_over_wire_count_request_counts_its_dropped_exemplars() {
+    let limits = IngestLimits {
+        max_data_points_per_request: 100,
+        ..IngestLimits::default()
+    };
+    // 101 single-bound points: over the wire count before any explosion is
+    // considered, each carrying one exemplar.
+    let workload = vec![WorkloadHistogramMetric {
+        name: "latency".to_string(),
+        temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+        points: (0..101)
+            .map(|_| {
+                let mut p = wide_histogram_workload_point(1);
+                p.exemplar_count = 1;
+                p
+            })
+            .collect(),
+    }];
+
+    let otap_out = otap_histogram_normalize(&workload, &limits);
+    assert!(otap_out.points.is_empty(), "the whole request is rejected");
+    assert!(
+        otap_out.rejected.iter().any(|r| matches!(
+            r,
+            Rejection::TooManyDataPoints {
+                count: 101,
+                max: 100
+            }
+        )),
+        "the wire count must trip before the exploded one: {:?}",
+        otap_out.rejected
+    );
+
+    let dropped: usize = otap_out
+        .rejected
+        .iter()
+        .filter_map(|r| match r {
+            Rejection::HistogramExemplarsDropped { count } => Some(*count),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        dropped, 101,
+        "the wire-count return drops 101 exemplars and must count them: {:?}",
+        otap_out.rejected
+    );
+
+    assert_histogram_paths_agree_with_limits(&workload, &limits);
+}
+
 #[test]
 fn summary_non_finite_quantile_agrees() {
     let point = WorkloadSummaryPoint {

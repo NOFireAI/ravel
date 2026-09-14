@@ -1022,13 +1022,11 @@ fn count_exploded_points(
 /// this shape, the same way `ravel_otlp::whole_request_rejection` is shared by
 /// both of its own early returns.
 ///
-/// Unlike OTLP and Remote Write, OTAP does not count dropped exemplars here:
-/// no exemplar payload is decoded at either OTAP early return (the count check
-/// runs before any payload past the row count is read, and the exploded check
-/// reads only flattened point lengths), so there is nothing to count. That
-/// difference is structural, not an oversight, and the differential gate
-/// compares rejection classes at the shared admission layer rather than at
-/// this return for exactly that reason.
+/// `dropped_exemplars` is what the rejection discards, counted from the
+/// columnar payloads' row counts rather than from a decode, so both returns
+/// report it exactly as OTLP's do (ADR-0047 decision 2: a dropped-data counter
+/// must not read zero while data is lost). Counting without decoding is what
+/// lets the exploded check stay above `group_exemplars_by_parent_id`.
 ///
 /// A whole-request rejection stored no point, so it describes no metric family:
 /// the metadata vector is empty, exactly as OTLP's own early returns.
@@ -1069,10 +1067,19 @@ fn whole_request_rejection(
 /// read zero while data is lost), and an OTAP-fronted deployment that
 /// under-reported them would diverge from an OTLP-fronted one on the same
 /// overload input.
+///
+/// All three exemplar payloads count, exponential histograms included. Those
+/// data points are rejected as an unsupported type on the admitted path, but
+/// `count_total_points` still counts them, so a request of them can trip the
+/// wire-count bound and OTLP reports their exemplars as dropped when it does.
+/// `push_exp_histogram_exemplar_drops` counts the same rows on the admitted
+/// path, so leaving them out here would under-report on one payload type only,
+/// which is the same hazard one layer along.
 fn dropped_exemplar_rows(batch: &DecodedBatch) -> usize {
     payloads_of(batch, ArrowPayloadType::HistogramDpExemplars)
         .iter()
         .chain(payloads_of(batch, ArrowPayloadType::NumberDpExemplars).iter())
+        .chain(payloads_of(batch, ArrowPayloadType::ExpHistogramDpExemplars).iter())
         .map(|b| b.num_rows())
         .sum()
 }
