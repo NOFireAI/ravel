@@ -349,6 +349,12 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+    env:
+      # The area set, once for this whole job. It must equal the tla-models
+      # matrix above; the marker step below is what asserts that, by comparing
+      # the marker names (each written by the matrix entry that produced it)
+      # against this value.
+      EXPECTED: catalog commit common lifecycle maintenance resharding
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -357,9 +363,6 @@ jobs:
           persist-credentials: false
       - name: Assert the matrix covers every area under formal/tla
         if: needs.changes.outputs.formal_area == 'true'
-        env:
-          # Must equal the matrix list above, in sorted order.
-          EXPECTED: catalog commit common lifecycle maintenance resharding
         run: |
           # Same area test scripts/check-tla.sh uses: a directory under
           # formal/tla is an area when it holds a bare smoke.cfg or any
@@ -390,18 +393,23 @@ jobs:
           merge-multiple: true
       - name: Assert every area reported a result
         if: needs.changes.outputs.formal_area == 'true'
-        env:
-          EXPECTED_COUNT: "6"
         run: |
           # A leg that never ran leaves no marker while the matrix's aggregate
-          # result can still read success. Count the markers.
-          got=$(find tla-markers -type f 2>/dev/null | wc -l | tr -d ' ')
-          if [ "$got" != "$EXPECTED_COUNT" ]; then
-            echo "::error::expected $EXPECTED_COUNT area markers, found $got"
-            find tla-markers -type f 2>/dev/null || true
+          # result can still read success, so the markers are what decide this.
+          #
+          # Compare their NAMES, not their count. Each marker is named by the
+          # matrix entry that wrote it, so name equality also asserts the thing
+          # nothing else does: that the matrix list equals EXPECTED. With the
+          # step above pinning EXPECTED to the directories on disk, the chain
+          # closes as matrix == EXPECTED == formal/tla, and there is no third
+          # copy of the area set to drift.
+          got=$(find tla-markers -type f -exec basename {} \; 2>/dev/null \
+            | sort | tr '\n' ' ' | sed 's/ $//')
+          if [ "$got" != "$EXPECTED" ]; then
+            echo "::error::area markers present ($got) do not match the expected areas ($EXPECTED)"
             exit 1
           fi
-          echo "all $got area markers present"
+          echo "every expected area reported: $got"
       - name: Decide the formal lane
         env:
           FORMAL: ${{ needs.changes.outputs.formal_area }}
