@@ -166,9 +166,16 @@ pub struct SweepReport {
     /// the `quarantine/` prefix rather than deleted outright, so this counts
     /// objects quarantined this pass, equal to [`Self::orphans_quarantined`];
     /// the name is retained because the operator-facing meaning ("orphan
-    /// candidates GC removed from the live L0 set") is unchanged, and
-    /// `orphans_deleted + orphans_withheld` is still the pass's total
-    /// orphan-candidate count with exactly one term nonzero.
+    /// candidates GC removed from the live L0 set") is unchanged.
+    ///
+    /// This is NOT the pass's whole orphan-candidate count. A candidate whose
+    /// copy failed is left live and counted only in
+    /// [`Self::orphans_quarantine_refused`], so the present total is
+    /// `orphans_deleted + orphans_withheld + orphans_quarantine_refused`. That
+    /// third term is what the ADR-0058 decision-1 `orphans_present` gauge in
+    /// `ravel-server` adds: a refused candidate is still present, and it is
+    /// refused precisely in the store-fault case where the gauge matters most,
+    /// so leaving it out would drop the signal exactly when it fires.
     pub orphans_deleted: usize,
     /// Rule 1: record-less `l0/` data objects moved to `quarantine/` this pass
     /// (ADR-0058 amendment). Equal to [`Self::orphans_deleted`]; a distinctly
@@ -633,10 +640,18 @@ enum QuarantineMove {
 }
 
 /// Copy one object's bytes to its quarantine key (`quarantine/<original
-/// key>/q<ns>`). The overwrite [`PutOptions`] make a re-quarantine of the same
-/// object idempotent. NotFound on the source is reported as
+/// key>/q<ns>`). NotFound on the source is reported as
 /// [`QuarantineMove::SourceGone`] rather than an error: the object vanished
 /// between the listing and the copy, which is not a fault.
+///
+/// The overwrite [`PutOptions`] make a retry idempotent WITHIN one pass only.
+/// The destination key embeds that pass's `quarantined_at_ns`, so a crash
+/// between the copy and the live-key delete leaves the object live, and the
+/// next pass quarantines it again under a different `/q<ns>`: a second copy,
+/// not an overwrite of the first. The duplicate is self-cleaning, since the
+/// reaper collects both on their own horizons, and the live object is never
+/// deleted without a copy of it existing. Do not read the overwrite as
+/// cross-pass idempotence.
 async fn quarantine_object(
     store: &dyn ObjectStoreBackend,
     src: &str,
@@ -3403,6 +3418,23 @@ mod tests {
             .await
             .is_empty(),
             "no partial quarantine copy survived the failed put",
+        );
+
+        // The ADR-0058 decision-1 `orphans_present` gauge sums the sweep's
+        // deleted and withheld counts, and now its refused count too. A
+        // refused candidate is still present, and it is refused exactly in
+        // the store-fault case the gauge exists for, so the pre-fix sum read
+        // zero at the moment the signal mattered. `withheld` lives on the
+        // whole-sweep report rather than this per-rule outcome, so the two
+        // terms available here are the ones asserted.
+        assert_eq!(
+            outcome.deleted, 0,
+            "the pre-fix sum contributed nothing for these three candidates",
+        );
+        assert_eq!(
+            outcome.deleted + outcome.refused,
+            3,
+            "all three are still present and must reach the gauge",
         );
     }
 

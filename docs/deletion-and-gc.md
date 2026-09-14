@@ -268,7 +268,12 @@ prefix and a separate reaper deletes it only after a second horizon:
   none. A candidate whose copy fails is left live and counted as refused
   (`ravel_maintain_orphans_quarantine_refused`), and the live delete never
   runs for it; the candidate is retried on the next pass. The `put` is an
-  overwrite, so re-quarantining the same object after a crash is idempotent.
+  overwrite, which makes a retry idempotent within one pass. It is not
+  idempotent across passes: the destination key embeds that pass's timestamp,
+  so a crash between the copy and the live delete leaves the object live and
+  the next pass writes a second copy under a different `/q<ns>`. That
+  duplicate is self-cleaning, because the reaper collects each copy on its own
+  horizon, and the live object is never deleted while no copy of it exists.
 - **The quarantine key carries its own timestamp.** The trailing `/q<ns>`
   segment records when the object was quarantined, taken from the injected
   clock. The reaper reads the second horizon from that segment, not from the
