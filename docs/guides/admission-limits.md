@@ -275,7 +275,7 @@ find. Because the flag couples the two bounds, the raise still respects the
 `max_flush_lifetime` retention-floor discipline
 ([catalog-and-mvcc.md](../catalog-and-mvcc.md), "Config discipline"): a
 `--max-ingest-lag` above the configured retention window fails startup at the
-ADR-0019 retention-floor check. The normative statement of the late-data rule
+retention-floor check. The normative statement of the late-data rule
 lives in
 [consistency-model.md](../consistency-model.md#late-and-skewed-data).
 
