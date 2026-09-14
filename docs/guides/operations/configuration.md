@@ -1063,8 +1063,9 @@ live at `/metrics`: `ravel_memory_budget_bytes` (the resolved ceiling,
 `component` label (`sql` or `fetch`; `fetch` reads `0` today because nothing
 yet reserves against the budget on the fetch layer's behalf, an honest gap
 rather than a bug), and `ravel_memory_handoff_overlap_bytes` (bytes
-double-counted right now because a tenant's memory handed off between
-components overlaps in the budget's accounting window).
+double-counted because a tenant's memory handed off between components
+overlaps in the budget's accounting window; inactive (always `0`) until
+fetch handoff accounting lands).
 `--cache-max-bytes` changes less than it used to about how many times a logs
 statement moves a given object's bytes: a query's plan-phase whole-object
 read (the `has_word`/text and other skip-index-undecidable fallback) is now
