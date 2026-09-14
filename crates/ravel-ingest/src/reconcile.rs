@@ -408,8 +408,14 @@ pub struct ReconcileCycleStats {
     /// whose GET was skipped because the LIST already showed them past the
     /// staleness window.
     pub stale_keys_skipped: u64,
-    /// `ravel_admission_reconciliation_keys_reaped_total` (counter): keys past
-    /// the reap horizon this cycle deleted.
+    /// Keys past the reap horizon this cycle deleted.
+    ///
+    /// Per-cycle, like the two fields above: `record_reconcile_cycle` replaces
+    /// `last_cycle` wholesale, so this reads "reaped this cycle", never a
+    /// running total. An exporter rendering it as
+    /// `ravel_admission_reconciliation_keys_reaped_total` must accumulate it
+    /// itself; publishing this value under a `_total` name yields a counter
+    /// that drops to zero on the first cycle that reaps nothing.
     pub keys_reaped: u64,
 }
 
