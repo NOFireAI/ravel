@@ -786,14 +786,13 @@ impl From<&ScanTiming> for ScanTimingReport {
     }
 }
 
-/// Process CPU time (user plus system, all threads) in nanoseconds, from
 /// Kernel tick rate assumed when converting `/proc/self/stat` times, in Hz.
 ///
 /// Not read from the kernel: `sysconf(_SC_CLK_TCK)` needs a `libc` dependency
-/// this crate does not have. Verified as 100 on both executor classes this
-/// bench runs on (`getconf CLK_TCK`). A host reporting anything else scales
-/// `cpu_ms` by `USER_HZ / 100` with no error, so check it before reading a
-/// `cpu_ms` figure from an unfamiliar machine.
+/// this crate does not have. Checked as 100 on the amd64 measurement host
+/// (`getconf CLK_TCK`); the arm64 class has not been checked. A host reporting
+/// anything else scales `cpu_ms` by `USER_HZ / 100` with no error, so check it
+/// before reading a `cpu_ms` figure from an unfamiliar machine.
 const ASSUMED_CLK_TCK_HZ: u64 = 100;
 
 /// `/proc/self/stat` fields 14 and 15, converted at [`ASSUMED_CLK_TCK_HZ`].

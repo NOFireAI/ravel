@@ -2518,6 +2518,7 @@ impl ExecutionPlan for LogsScanExec {
             stream_started: Instant::now(),
             open_started: None,
             first_batch_seen: false,
+            done_seen: false,
             partition,
             target_partitions: self.target_partitions,
             stripe_blocks: self.stripe_blocks,
@@ -3356,6 +3357,11 @@ struct LogScanStream {
     open_started: Option<Instant>,
     /// Whether `first_batch_elapsed` has been recorded.
     first_batch_seen: bool,
+    /// Whether `stream_elapsed` has been recorded. `LogScanState::Done` keeps
+    /// returning `Poll::Ready(None)`, and the metric holds an offset from the
+    /// origin rather than an interval, so a second poll after completion would
+    /// overwrite a correct figure with a larger one that still looks monotone.
+    done_seen: bool,
 }
 
 impl LogScanStream {
@@ -3539,7 +3545,10 @@ impl Stream for LogScanStream {
                 this.first_batch_seen = true;
                 this.blocks.first_batch_elapsed.add_elapsed(this.origin);
             }
-            Poll::Ready(None) => this.blocks.stream_elapsed.add_elapsed(this.origin),
+            Poll::Ready(None) if !this.done_seen => {
+                this.done_seen = true;
+                this.blocks.stream_elapsed.add_elapsed(this.origin);
+            }
             Poll::Ready(_) => {}
         }
         polled
