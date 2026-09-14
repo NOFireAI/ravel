@@ -94,7 +94,17 @@ write_gh_stub() {
   mkdir -p "${bin}"
   cat > "${bin}/gh" <<STUB
 #!/usr/bin/env bash
+# gh api repos/<o>/<r>/pulls/<n>/files --paginate --jq .[].path
 # gh pr view <n> --json <fields> --jq <expr>   |   gh pr list ...
+if [[ "\$1" == "api" ]]; then
+  n="\$(printf '%s' "\$2" | sed 's#.*/pulls/##; s#/files\$##')"
+  case "\${n}" in
+    101) printf 'shared.txt\n' ;;
+    102) printf '${files_b}\n' ;;
+    *) exit 1 ;;
+  esac
+  exit 0
+fi
 if [[ "\$1" == "pr" && "\$2" == "list" ]]; then
   echo 101
   echo 102
