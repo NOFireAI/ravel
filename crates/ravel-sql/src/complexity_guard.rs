@@ -60,11 +60,26 @@
 //!   `backslash_escape = true` for every dialect), and
 //!   `q'...'`/`Q'...'`/`nq'...'` (`supports_quote_delimited_string` is true,
 //!   and the Oracle form ends at its matching delimiter followed by `'`, so
-//!   its body can hold a quote). A `'` after one of those prefix characters
-//!   therefore opens no exclusion region here: it costs its unit and its body
-//!   is counted as ordinary tokens. Measured before that fix, `SELECT E'\''`
-//!   followed by 1,100 `+1` terms scored 4 units and overflowed the stack
-//!   inside `SqlToRel::statement_to_plan`.
+//!   its body can hold a quote). The scan models the first two and refuses a
+//!   statement containing the third, and the prefix only counts when it
+//!   starts a token, so `DATE'2024-01-01'` is an ordinary literal. Measured
+//!   before that fix, `SELECT E''` followed by 4,000 `+1` terms scored 4
+//!   units against 8,002 tokens.
+//!
+//!   Four other string-literal prefixes are live for this dialect and need no
+//!   special handling, which is worth stating because the reason is a set of
+//!   dialect facts rather than anything visible in the scan: `B'...'`/`b'...'`
+//!   byte strings, `R'...'`/`r'...'` raw strings and `N'...'`/`n'...'`
+//!   national strings all close at the next undoubled `'`, because
+//!   `supports_string_literal_backslash_escape()` and
+//!   `supports_triple_quoted_string()` are both false here, which is exactly
+//!   what `Mode::Quoted` already does. `U&'...'` unicode strings
+//!   (`supports_unicode_string_literal()` is true) diverge only through their
+//!   `\`-hex escape, which either ends the literal earlier than this scan
+//!   does, a safe over-count, or makes the tokenizer error. If any of those
+//!   dialect flags changes, or sqlparser adds a prefix, each becomes the same
+//!   parity bug the three above were: recheck this list against the tokenizer
+//!   before trusting it.
 //! - `"..."` and `` `...` `` delimited identifiers, which
 //!   `GenericDialect::is_delimited_identifier_start` accepts and which are
 //!   one token each.
