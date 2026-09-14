@@ -189,6 +189,24 @@ struct Args {
     /// earlier run used; recorded in the report's provenance.
     #[arg(long, default_value_t = ravel_query::DEFAULT_FETCH_CONCURRENCY)]
     fetch_concurrency: usize,
+    /// Explicit override for DataFusion's `target_partitions` (ADR-1195),
+    /// unbundled from `fetch_concurrency`: the same knob as `ravel-server
+    /// --sql-partition-count`. Unset falls back to `--fetch-concurrency`,
+    /// leaving today's behaviour byte-for-byte unchanged; set, it lets a
+    /// measurement vary the scan's partition count at a fixed GET
+    /// concurrency. Recorded in the report's provenance alongside the
+    /// requested value.
+    #[arg(long = "sql-partition-count", value_name = "N")]
+    sql_partition_count: Option<usize>,
+    /// Explicit override for the process-wide in-flight object-store GET cap
+    /// (ADR-1195), unbundled from `fetch_concurrency`: the same knob as
+    /// `ravel-server --store-get-concurrency`. Unset falls back to
+    /// `--fetch-concurrency`, leaving today's behaviour byte-for-byte
+    /// unchanged; set, it lets a measurement vary the GET concurrency at a
+    /// fixed partition count. Recorded in the report's provenance alongside
+    /// the requested value.
+    #[arg(long = "store-get-concurrency", value_name = "N")]
+    store_get_concurrency: Option<usize>,
     /// The logs fetch policy (ADR-0996 decision 2), the same knob and the same
     /// value names as `ravel-server --logs-fetch-policy`, resolved here through
     /// the same `ravel_query::resolve_logs_fetch` the server calls at startup.
@@ -476,6 +494,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
+                sql_partition_count: args.sql_partition_count,
+                store_get_concurrency: args.store_get_concurrency,
                 logs_request_cost_bytes: args.logs_request_cost_bytes,
                 logs_fetch_policy: args.logs_fetch_policy.policy(),
                 logs_block_range_threshold: args.logs_block_range_threshold,
@@ -519,6 +539,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
+                sql_partition_count: args.sql_partition_count,
+                store_get_concurrency: args.store_get_concurrency,
                 logs_request_cost_bytes: args.logs_request_cost_bytes,
                 logs_fetch_policy: args.logs_fetch_policy.policy(),
                 logs_block_range_threshold: args.logs_block_range_threshold,
@@ -616,6 +638,28 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
         p.deadline_secs
     ));
     out.push_str(&format!("  fetch conc : {}\n", p.fetch_concurrency));
+    out.push_str(&format!(
+        "  sql part   : requested={}  effective={}\n",
+        match p.sql_partition_count_requested {
+            Some(v) => v.to_string(),
+            None => "unset".to_string(),
+        },
+        match p.sql_partition_count_effective {
+            Some(v) => v.to_string(),
+            None => unresolved_effective_label(&p.source).to_string(),
+        }
+    ));
+    out.push_str(&format!(
+        "  get conc   : requested={}  effective={}\n",
+        match p.store_get_concurrency_requested {
+            Some(v) => v.to_string(),
+            None => "unset".to_string(),
+        },
+        match p.store_get_concurrency_effective {
+            Some(v) => v.to_string(),
+            None => unresolved_effective_label(&p.source).to_string(),
+        }
+    ));
     out.push_str(&format!(
         "  req cost   : requested={} bytes  effective={}\n",
         p.logs_request_cost_bytes_requested,
@@ -1048,6 +1092,10 @@ mod tests {
             cache_bytes: 0,
             deadline_secs: 30,
             fetch_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            sql_partition_count_requested: None,
+            sql_partition_count_effective: Some(ravel_query::DEFAULT_FETCH_CONCURRENCY),
+            store_get_concurrency_requested: None,
+            store_get_concurrency_effective: Some(ravel_query::DEFAULT_FETCH_CONCURRENCY),
             logs_request_cost_bytes_requested: cost,
             logs_request_cost_bytes_effective: Some(cost),
             logs_fetch_policy: ravel_query::LogsFetchPolicy::ByteMinimal
