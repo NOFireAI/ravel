@@ -51,7 +51,17 @@ fi
 repo="NOFireAI/ravel"
 
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "${tmp_dir}"' EXIT INT TERM
+# The per-PR fetches below write refs/remotes/<remote>/_dupchk_<n>. Drop them on
+# the way out: --force keeps any one PR number fresh, but a run over the whole
+# backlog leaves one ref per PR behind in the real checkout's namespace.
+cleanup() {
+    rm -rf "${tmp_dir}"
+    git for-each-ref --format='%(refname)' "refs/remotes/${remote}/_dupchk_*" 2>/dev/null |
+        while read -r _stale; do
+            git update-ref -d "${_stale}" 2>/dev/null || true
+        done
+}
+trap cleanup EXIT INT TERM
 tmp_mine="${tmp_dir}/mine"
 tmp_other="${tmp_dir}/other"
 tmp_shared="${tmp_dir}/shared"
@@ -93,10 +103,21 @@ if [ -z "${mine_files}" ]; then
     exit 2
 fi
 
-others="$(gh pr list --repo "${repo}" --state open --limit 100 --json number --jq '.[].number' 2>/dev/null)" || {
+scan_limit=300
+others="$(gh pr list --repo "${repo}" --state open --limit "${scan_limit}" --json number --jq '.[].number' 2>/dev/null)" || {
     echo "check-duplicate-work: could not list open pull requests" >&2
     exit 2
 }
+# Say so when the scan is capped rather than reporting a clean result that only
+# means "no duplicate among the first N": a silent cap turns "I did not find
+# one" into "there is not one", which is the claim this guard must never make.
+scanned="$(printf '%s\n' "${others}" | wc -l | tr -d '[:space:]')"
+[ -n "${scanned}" ] || scanned=0
+if [ "${scanned}" -ge "${scan_limit}" ]; then
+    echo "check-duplicate-work: NOTE: compared only the first ${scan_limit} open" >&2
+    echo "    pull requests; more are open and were NOT compared, so a clean" >&2
+    echo "    result here does not rule out a duplicate past that cap." >&2
+fi
 
 found=0
 for other in ${others}; do
@@ -119,7 +140,11 @@ for other in ${others}; do
     printf '%s\n' "${mine_files}" > "${tmp_mine}"
     printf '%s\n' "${other_files}" > "${tmp_other}"
     comm -12 "${tmp_mine}" "${tmp_other}" > "${tmp_shared}" 2>/dev/null || true
-    shared="$(grep -c . "${tmp_shared}" 2>/dev/null || echo 0)"
+    # `grep -c` prints 0 AND exits 1 when it matches nothing, so the obvious
+    # `$(grep -c . f || echo 0)` yields "0\n0" and the -gt below dies with
+    # "Illegal number" on every PR that shares no file. wc emits one number.
+    shared="$(wc -l < "${tmp_shared}" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "${shared}" ] || shared=0
     if [ "${shared}" -gt 0 ]; then
         echo "OVERLAP: #${pr} and #${other} share ${shared} file(s)"
         head -5 "${tmp_shared}" | sed 's/^/        /'
