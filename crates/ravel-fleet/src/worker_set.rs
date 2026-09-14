@@ -60,7 +60,9 @@
 //!   ([`reap_horizon_ns`]: the liveness window widened by
 //!   [`REAP_WINDOW_FACTOR`]), which bounds the LIST itself. The extra width is
 //!   the clock-skew margin between the object store's clock (which sets the
-//!   modification time) and the reader's. Reaping is idempotent and costs a
+//!   modification time) and the reader's. Called from the maintain tier's
+//!   heartbeat tick, which lists this prefix for `live_set` on the same
+//!   cadence, so the reap adds no LIST of its own. Reaping is idempotent and costs a
 //!   live-but-skewed worker at most one heartbeat interval of invisibility,
 //!   since it rewrites its key every `H`.
 //!
