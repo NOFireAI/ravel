@@ -143,6 +143,8 @@ runs="$(ask gh run list --repo "${repo}" --branch "${head_branch}" --limit 50 \
 
 signature_lines=""
 coarse=0
+unread=0
+unread_reason=""
 run_ids=()
 esc=$'\033'
 if [[ -n "${runs}" ]]; then
@@ -158,7 +160,20 @@ if [[ -n "${runs}" ]]; then
     # The test identifiers inside the failed log. Job and step names alone
     # match for any failure in the same job, which would call two unrelated
     # defects the same signature.
-    log="$(gh run view "${run_id}" --repo "${repo}" --log-failed 2>/dev/null || true)"
+    # Keep stderr. An empty log has at least three causes -- the run has no
+    # parseable failure text, the fetch failed, or the run is not finished
+    # ("logs will be available when it is complete") -- and only the first is
+    # a statement about the failure. Discarding stderr merges them into one
+    # wrong claim, which is the same collapse this script refuses everywhere
+    # else.
+    log_err="$(mktemp)"
+    log="$(gh run view "${run_id}" --repo "${repo}" --log-failed 2>"${log_err}" || true)"
+    if [[ -z "${log}" ]]; then
+      unread=1
+      unread_reason="$(tr -d '\r' <"${log_err}" | head -2 | tr '\n' ' ')"
+      unread_reason="${unread_reason:-no output and no error}"
+    fi
+    rm -f "${log_err}"
     if [[ -n "${log}" ]]; then
       # Colour codes first. `CARGO_TERM_COLOR: always` in ci.yml puts an SGR
       # sequence right before the token, and the sequence ENDS in a letter
@@ -209,7 +224,11 @@ attempts=$(jq -r --arg pr "${pr}" --arg sha "${head_sha}" \
 
 echo "RED   PR #${pr} on ${head_sha:0:12}: ${failing} failing check(s), signature ${signature}, attempt $((attempts + 1))"
 printf '%s' "${signature_lines}" | sed 's/^/      /'
-if ((coarse == 1)); then
+if ((unread == 1)); then
+  echo "      UNREAD: the failed log could not be read (${unread_reason})."
+  echo "      This signature is job-level only, and the reason is the reader, not the failure. Read it before"
+  echo "      acting on a repeat: a run still in progress reports exactly like a run with nothing to report."
+elif ((coarse == 1)); then
   echo "      COARSE: the failed log carried no test identifier, so this signature is job-level only."
   echo "      Two different failures in that step cannot be told apart and will read as the same one."
 fi
