@@ -305,8 +305,8 @@ a malformed spec, an unknown key, a `tls` or `skip-unavailable` value that is
 not `true` or `false`, a duplicate cluster name, `tls=false` next to a
 `tls-ca-file`, a zero soft timeout, an empty `tenant` value, or an unreadable or
 empty credential file all fail the process before it binds a listener. A remote
-cluster that names no local tenant on a coordinator that can resolve more than
-one also fails startup here; see [One remote credential per local
+cluster that names no local tenant on a coordinator that runs queries for more
+than one also fails startup here; see [One remote credential per local
 tenant](#one-remote-credential-per-local-tenant).
 
 ### What crosses the boundary, and what does not

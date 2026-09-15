@@ -1714,9 +1714,12 @@ with its own credential.
 
 An entry with `tenant: None` is unkeyed and reachable by every local tenant.
 That is the shape of a deployment written before the mapping existed, and it is
-safe only where one local tenant can ever resolve, so `ravel-server` refuses one
-at startup whenever its resolver can resolve more than one. The operator guide
-states which resolver configurations that covers:
+safe only where the coordinator runs queries for one local tenant, so
+`ravel-server` refuses one at startup whenever it runs queries for more than
+one. That covers a second `--tenant-token` tenant, a dynamic resolver, and an
+`--alert-rules-file` naming a tenant no token does, because the alert evaluator
+queries the same federated engine. The operator guide states which
+configurations that covers:
 docs/guides/distributed-query.md.
 
 ### Partial coverage is always surfaced, never silent

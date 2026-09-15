@@ -1044,6 +1044,54 @@ async fn log_only_query_does_not_warn_for_a_tenant_with_no_mapped_remote() {
     );
 }
 
+/// The discovery twin of the case above. `instant_with_stats` reaches one of
+/// the two log-selector warning sites; `resolve_series_with_stats`, which backs
+/// `/api/v1/series`, `/api/v1/labels` and `/api/v1/label/<name>/values`, reaches
+/// the other. ADR-1295 decision 2 is a claim about both, and reverting either
+/// one alone has to fail something.
+#[tokio::test]
+async fn log_discovery_does_not_warn_for_a_tenant_with_no_mapped_remote() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+    fixture(&store, th).await;
+    let (engine, _tid) = build_engine(store, EngineConfig::default());
+    let federation = Arc::new(Federation::new(vec![RemoteCluster {
+        name: "remote-1".to_string(),
+        fetcher: Arc::new(PanicsIfFetched),
+        tenant: Some(tenant("tenant-b").hash()),
+        skip_unavailable: false,
+        soft_timeout: Duration::from_secs(1),
+    }]));
+    let engine = engine.with_federation(federation);
+
+    let (series, stats) = engine
+        .resolve_series_with_stats(
+            th,
+            &[LabelMatcher::equal("__name__", "ravel_log_lines")],
+            TimeRange {
+                start_ns: BASE - NS,
+                end_ns: BASE + 20 * NS,
+            },
+            &[],
+            NOW_NS,
+            DEADLINE,
+        )
+        .await
+        .expect("discovery succeeds without ever calling the remote fetcher");
+    assert!(
+        !series.is_empty(),
+        "the local log series must still be discovered, or the warning assertion below is \
+         vacuous"
+    );
+    assert!(
+        stats.warnings.is_empty(),
+        "a tenant with no mapped remote federates nothing, so discovery excluded the log \
+         selector from no fan-out; got: {:?}",
+        stats.warnings
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Pending erasure applies to log series through the engine, exactly as it
 // does for metrics (tests/erasure_e2e.rs's pattern, `Signal::Logs` swapped
