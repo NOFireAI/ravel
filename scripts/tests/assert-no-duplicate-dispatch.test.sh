@@ -165,6 +165,33 @@ for word in "hotfix" "bugfix" "suffix:" "prefix" "postfix" "affixes" "disclosed"
   check_eq "'${word} #42' is not a closing keyword (0)" "0" "${rc}"
 done
 
+# Case is not part of the keyword: GitHub closes on `FIXES #42` the same as
+# `Fixes: #42`. Matching only a capitalised first letter let an all-caps body
+# read as clean, so a resolved ticket allowed a second dispatch -- the
+# false-clean direction this guard's header calls the only costly answer, and
+# the opposite of the boundary bugs above.
+# Mutation: drop the `; "i"` flag from the addressing predicate.
+for kw in "FIXES #42" "CLOSES #42" "RESOLVES #42" "fixes #42" "Fixed #42"; do
+  d="$(new_case "case_$(printf '%s' "${kw}" | tr -cd '[:alnum:]')")"
+  printf '[{"number":26,"title":"work","state":"OPEN","body":"%s","headRefName":"c","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' "${kw}" >"${d}/prs.json"
+  out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
+  check_eq "'${kw}' refuses whatever its case (65)" "65" "${rc}"
+done
+
+# A colon absorbs the space. GitHub closes on `Fixes:#42`, and requiring
+# whitespace unconditionally missed it.
+# Mutation: put `[:]?[[:space:]]+` back as the separator.
+d="$(new_case colon_nospace)"
+printf '[{"number":27,"title":"work","state":"OPEN","body":"Fixes:#42","headRefName":"c","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' >"${d}/prs.json"
+out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
+check_eq "'Fixes:#42' refuses (65)" "65" "${rc}"
+
+# Something must still separate the keyword from the ref.
+d="$(new_case no_sep_digits)"
+printf '[{"number":28,"title":"work","state":"OPEN","body":"Fixes42 #42","headRefName":"c","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' >"${d}/prs.json"
+out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
+check_eq "'Fixes42 #42' is not a closing keyword (0)" "0" "${rc}"
+
 # GitHub's set has no -ing forms, so neither does this. `fixing #42` closes
 # nothing on merge and must not refuse a dispatch.
 # Mutation: put `ing` back in the alternation.

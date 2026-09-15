@@ -121,21 +121,38 @@ candidates="$(jq -r --argjson cutoff "${cutoff_epoch}" '
 # No -ing forms. GitHub closes on close/closes/closed, fix/fixes/fixed,
 # resolve/resolves/resolved and nothing else; `fixing #42` does not close #42,
 # so it must not refuse here either.
-closing_kw='(^|[^0-9A-Za-z])([Cc]los(e|es|ed)|[Ff]ix(es|ed)?|[Rr]esolv(e|es|ed))'
+# Case is not part of the keyword. GitHub closes on `FIXES #42` and `fixes
+# #42` alike, so matching only a capitalised first letter left an all-caps
+# body reading as clean and allowed a second dispatch of a resolved ticket --
+# the false-clean direction this file's header calls the only costly answer.
+# The `; "i"` on each test below carries that; the pattern itself stays
+# lower-case.
+closing_kw='(^|[^0-9a-z])(clos(e|es|ed)|fix(es|ed)?|resolv(e|es|ed))'
+# A colon absorbs the space: GitHub closes on `Fixes:#42` as well as
+# `Fixes: #42` and `Fixes #42`. Requiring whitespace unconditionally missed
+# the first. Something must still separate keyword from ref, so `Fixes42`
+# does not match.
+#
+# `fixes#42`, with no separator at all, is NOT covered and is left that way
+# deliberately: whether GitHub closes on it was not verified here, and
+# guessing in the refusing direction blocks real work on a spelling nobody
+# in this repository writes. If it turns out to close, `[[:space:]]*` on the
+# second alternative covers it.
+kw_sep='(:[[:space:]]*|[[:space:]]+)'
 addressing="$(jq -r --arg needle "#${issue}" --arg kw "${closing_kw}" \
-  --argjson cutoff "${cutoff_epoch}" '
+  --arg sep "${kw_sep}" --argjson cutoff "${cutoff_epoch}" '
   [ .[] | select(
       .state == "OPEN"
       or ((.mergedAt // .closedAt // "") != ""
           and ((.mergedAt // .closedAt) | fromdateiso8601) >= $cutoff)
     )
     | select(((.body // "") + " " + (.title // ""))
-        | test($kw + "[:]?[[:space:]]+" + $needle + "([^0-9]|$)"))
+        | test($kw + $sep + $needle + "([^0-9]|$)"; "i"))
   ] | .[] | "\(.number)\t\(.state)\t\(.title)"' <<<"${prs_json}")"
 
 # Cited but not closed. Worth knowing, never a refusal.
 mentioning="$(jq -r --arg needle "#${issue}" --arg kw "${closing_kw}" \
-  --argjson cutoff "${cutoff_epoch}" '
+  --arg sep "${kw_sep}" --argjson cutoff "${cutoff_epoch}" '
   [ .[] | select(
       .state == "OPEN"
       or ((.mergedAt // .closedAt // "") != ""
@@ -144,7 +161,7 @@ mentioning="$(jq -r --arg needle "#${issue}" --arg kw "${closing_kw}" \
     | select(((.body // "") + " " + (.title // ""))
         | test("(^|[^0-9A-Za-z])" + $needle + "([^0-9]|$)"))
     | select((((.body // "") + " " + (.title // ""))
-        | test($kw + "[:]?[[:space:]]+" + $needle + "([^0-9]|$)")) | not)
+        | test($kw + $sep + $needle + "([^0-9]|$)"; "i")) | not)
   ] | .[] | "\(.number)\t\(.state)\t\(.title)"' <<<"${prs_json}")"
 
 if [[ -n "${addressing}" ]]; then
