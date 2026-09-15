@@ -340,21 +340,43 @@ pub struct CycleOutcome {
     /// Total records observed by the post-compaction conservation probe
     /// (equal, per invariant (b), to the pre-compaction count).
     pub records_conserved: usize,
-    /// Sum, across every tenant/shard faulted sweep pass this cycle
-    /// (the `sweep_shard_recover` calls through `sweep_store`), of
-    /// [`SweepReport::superseded_records_deleted`]. Lets a test prove the
-    /// sweep's delete-phase fault (see [`FaultSchedule::sweep_plan`]) landed
-    /// on a real delete, not merely that its `FaultStore` counter moved.
+    /// Cumulative sum, across every tenant/shard sweep pass this cycle (every
+    /// `sweep_shard_recover` call through `sweep_store`, faulted and not), of
+    /// [`SweepReport::superseded_records_deleted`]. Because the sweep-phase
+    /// delete fault is retryable and the re-run re-gathers and deletes the same
+    /// groups in full, this equals the total for the same seed and config run
+    /// with the delete rule absent; a suppressed delete would show up here as a
+    /// shortfall. To read the faulted pass in isolation, use
+    /// [`Self::faulted_pass_superseded_records_deleted`].
     ///
     /// [`FaultSchedule::sweep_plan`]: crate::fault_plan::FaultSchedule::sweep_plan
     pub sweep_superseded_records_deleted: usize,
     /// Same as [`Self::sweep_superseded_records_deleted`], for
     /// [`SweepReport::superseded_data_deleted`] -- the superseded L0 data
-    /// objects, which is what the sweep-phase delete fault is keyed on.
+    /// objects.
     pub sweep_superseded_data_deleted: usize,
     /// Same as [`Self::sweep_superseded_records_deleted`], for
     /// [`SweepReport::unreferenced_parts_deleted`].
     pub sweep_unreferenced_parts_deleted: usize,
+    /// The `(tenant, shard)` of the single sweep pass the delete-phase fault
+    /// fired on this cycle, or `None` if no delete fault fired (faults
+    /// disabled, or no cleared group existed to delete). The fault is
+    /// `Occurrence::Nth(1)` on the one `sweep_store`, so at most one pass is
+    /// ever faulted per cycle.
+    pub faulted_sweep_pass: Option<(String, u32)>,
+    /// The faulted pass's own [`SweepReport::superseded_records_deleted`] --
+    /// the records rule 2 deleted on the pass the delete fault hit, after the
+    /// bounded re-run absorbed it. Zero when [`Self::faulted_sweep_pass`] is
+    /// `None`. This is the per-pass figure that proves the recovery re-ran rule
+    /// 2 rather than converging through orphan GC: it is positive exactly when
+    /// the re-gather found the input commit records still present.
+    pub faulted_pass_superseded_records_deleted: usize,
+    /// The faulted pass's own [`SweepReport::superseded_data_deleted`]. Zero
+    /// when [`Self::faulted_sweep_pass`] is `None`.
+    pub faulted_pass_superseded_data_deleted: usize,
+    /// The faulted pass's own [`SweepReport::unreferenced_parts_deleted`]. Zero
+    /// when [`Self::faulted_sweep_pass`] is `None`.
+    pub faulted_pass_unreferenced_parts_deleted: usize,
     /// Snapshot of the [`FaultStore`] counters after the cycle: how many times
     /// each `(Op, FaultKind)` fired. Empty when `inject_faults` is false.
     pub fault_counters: HashMap<(Op, FaultKind), u64>,
@@ -583,6 +605,15 @@ async fn sweep_shard_recover(
             Err(source) => return Err(CycleError::Sweep { seed, source }),
         }
     }
+}
+
+/// How many times the sweep-phase delete fault has fired on `store` so far,
+/// summed over both retryable flavors the schedule may pick (`Transient` and
+/// `Throttled`). Read before and after each pass so the one pass the delete
+/// fault landed on can be recorded with its own [`SweepReport`].
+fn sweep_delete_faults_fired<S: ObjectStoreBackend>(store: &FaultStore<S>) -> u64 {
+    store.fault_count(Op::Delete, FaultKind::Transient)
+        + store.fault_count(Op::Delete, FaultKind::Throttled)
 }
 
 /// Clock the driver hands to `IngestRouter`: `now_ns` is a plain atomic
@@ -979,6 +1010,10 @@ async fn run_cycle_async(
     let mut sweep_superseded_records_deleted = 0usize;
     let mut sweep_superseded_data_deleted = 0usize;
     let mut sweep_unreferenced_parts_deleted = 0usize;
+    let mut faulted_sweep_pass: Option<(String, u32)> = None;
+    let mut faulted_pass_superseded_records_deleted = 0usize;
+    let mut faulted_pass_superseded_data_deleted = 0usize;
+    let mut faulted_pass_unreferenced_parts_deleted = 0usize;
 
     for tenant_wl in &workload.tenants {
         series_generated += tenant_wl.series.len();
@@ -1236,10 +1271,19 @@ async fn run_cycle_async(
             .saturating_add(NS_PER_HOUR);
         let sweep_clock = FixedClock::new(sweep_now_ns);
         // Action pass through the sweep-phase FaultStore with the bounded
-        // idempotent re-run: the pagination fault
-        // fires on the first paginated listing and the re-run recovers, or an
-        // exhausted fault surfaces as a typed `CycleError::Sweep`.
+        // idempotent re-run. The sweep plan carries two retryable rules, each
+        // `Nth(1)` on the one `sweep_store`: a pagination fault on the first
+        // paginated listing, and a delete fault on the first commit-record
+        // delete of rule 2's phase C. The re-run recovers each, or an exhausted
+        // fault surfaces as a typed `CycleError::Sweep`.
+        //
+        // The delete counter is read across each pass so the single pass the
+        // delete fault fired on is recorded with its own report: a fault that
+        // recovered through rule 2 leaves that pass's superseded counts
+        // positive, which is what distinguishes it from a recovery that
+        // converged through orphan GC instead.
         for shard in 0..config.shard_count {
+            let deletes_before = sweep_delete_faults_fired(sweep_fault_store.as_ref());
             let report = sweep_shard_recover(
                 sweep_store.as_ref(),
                 &sweep_clock,
@@ -1249,6 +1293,13 @@ async fn run_cycle_async(
                 seed,
             )
             .await?;
+            let deletes_after = sweep_delete_faults_fired(sweep_fault_store.as_ref());
+            if deletes_after > deletes_before && faulted_sweep_pass.is_none() {
+                faulted_sweep_pass = Some((tenant_wl.tenant.as_str().to_string(), shard));
+                faulted_pass_superseded_records_deleted = report.superseded_records_deleted;
+                faulted_pass_superseded_data_deleted = report.superseded_data_deleted;
+                faulted_pass_unreferenced_parts_deleted = report.unreferenced_parts_deleted;
+            }
             sweep_superseded_records_deleted += report.superseded_records_deleted;
             sweep_superseded_data_deleted += report.superseded_data_deleted;
             sweep_unreferenced_parts_deleted += report.unreferenced_parts_deleted;
@@ -1385,6 +1436,10 @@ async fn run_cycle_async(
         sweep_superseded_records_deleted,
         sweep_superseded_data_deleted,
         sweep_unreferenced_parts_deleted,
+        faulted_sweep_pass,
+        faulted_pass_superseded_records_deleted,
+        faulted_pass_superseded_data_deleted,
+        faulted_pass_unreferenced_parts_deleted,
         fault_counters,
         expected_faults,
         gates_armed,
