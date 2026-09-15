@@ -73,6 +73,38 @@ const MASKING_ECHO = /&&\s*echo\b/;
 // no output that looks like a failure.
 const RESERVED_ASSIGN = /(^|[;&|(]|\bdo\b|\bthen\b|\blocal\b|\bexport\b)\s*(status|path|argv|PWD)=/;
 
+// --- destructive git rules ----------------------------------------------
+//
+// These three discard work that no later command can recover: a reset onto
+// a remote ref drops local commits, filter-branch rewrites every id, and a
+// force-push to main or to a reviewed branch deletes published history.
+// .githooks/pre-push catches the push at the git level (it detects the
+// history drop structurally, since the hook never sees the flag), but it
+// runs too late for a reset and never for filter-branch, and a hook is only
+// installed where someone ran the installer. This is the copy that binds
+// every session in this repository.
+//
+// The escape hatch must be read from the command TEXT. Shell state does not
+// persist between tool calls, so `export ALLOW_DESTRUCTIVE=1` in an earlier
+// call is gone; the only spelling that works is the inline assignment, and
+// that is exactly what HARMLESS_PREFIX strips. So this is tested against the
+// raw statement, before any prefix is removed -- stripping first would
+// delete the escape hatch and then refuse the command for lacking it.
+const ALLOW_DESTRUCTIVE =
+  /(^|[\s;&|(])ALLOW_DESTRUCTIVE=(1|true|yes)(\s|$)/;
+const GIT_HEAD = /^git(\s+-[A-Za-z-]+(\s+\S+)?)*\s/;
+const RESET_REMOTE =
+  /\breset\b[^|;&]*\s--(hard|soft|merge|keep)\b[^|;&]*\s(origin\/|upstream\/|refs\/remotes\/|@\{u(pstream)?\}|FETCH_HEAD)/;
+const RESET_REMOTE_FLAG_LAST =
+  /\breset\b[^|;&]*\s(origin\/|upstream\/|refs\/remotes\/|@\{u(pstream)?\}|FETCH_HEAD)\S*\s+--(hard|soft|merge|keep)\b/;
+const FILTER_BRANCH = /\bfilter-branch\b/;
+const FORCE_PUSH = /\bpush\b[^|;&]*(\s(-f|--force|--force-with-lease(=\S*)?)\b|\s\+refs\/)/;
+// Only the spellings that name main. A force-push to any other branch is
+// left to the pre-push hook, which can ask whether that branch has an open
+// pull request; this guard cannot, because it must stay offline and fast.
+const PUSH_TARGETS_MAIN =
+  /(\s(origin|upstream)\s+(\+?main|HEAD:main|\S+:main|\+?refs\/heads\/main)\b|\s\+?refs\/heads\/main\b|\smain\s*$|\s\S+:main\b)/;
+
 // Command substitutions are checked as commands in their own right. Extending
 // the harmless-prefix list instead only ever covers the spellings someone
 // thought to enumerate: `out=$(gate | tail -1)` was covered and the same line
@@ -309,6 +341,78 @@ function startsWithGate(fragment) {
   );
 }
 
+// The git subcommand, or "". Matched on the ARGUMENT position rather than
+// anywhere in the line: `git commit -m "document git push --force origin
+// main"` contains every token of a force-push and is a commit.
+function gitSubcommand(fragment) {
+  const stripped = blankSubstitutions(fragment)
+    .replace(HARMLESS_PREFIX, "")
+    .trim();
+  if (!GIT_HEAD.test(stripped + " ")) return "";
+  const tokens = stripped.split(/\s+/).slice(1);
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "-C" || t === "-c" || t === "--git-dir" || t === "--work-tree") {
+      i++;
+      continue;
+    }
+    if (t.startsWith("-")) continue;
+    return t;
+  }
+  return "";
+}
+
+// Judged on the raw statement: see the comment on ALLOW_DESTRUCTIVE.
+function destructiveAllowed(rawStatement) {
+  return (
+    ALLOW_DESTRUCTIVE.test(rawStatement) ||
+    process.env.ALLOW_DESTRUCTIVE === "1"
+  );
+}
+
+function checkDestructiveGit(rawStatement) {
+  const stmt = rawStatement.trim();
+  const sub = gitSubcommand(stmt);
+  if (sub !== "reset" && sub !== "push" && sub !== "filter-branch") return;
+  const allowed = destructiveAllowed(stmt);
+
+  const loss =
+    "Print what it would discard first: " +
+    "`scripts/guards/show-destructive-loss.sh <target-ref> [--from <ref>] [--hard]`. " +
+    "Then re-run the command with ALLOW_DESTRUCTIVE=1 in front of it if the loss is what you want.";
+
+  if (RESET_REMOTE.test(stmt) || RESET_REMOTE_FLAG_LAST.test(stmt)) {
+    if (allowed) return;
+    deny(
+      "`git reset --hard/--soft` onto a remote ref drops every local commit " +
+        "that is not on that ref, and --hard also erases uncommitted work " +
+        "with no reflog entry to recover it. " +
+        loss,
+    );
+  }
+
+  if (FILTER_BRANCH.test(stmt)) {
+    if (allowed) return;
+    deny(
+      "`git filter-branch` rewrites every commit id on the branch, which " +
+        "orphans anything built on the old ids (open pull requests, fleet " +
+        "task refs, other sessions' worktrees). " +
+        loss,
+    );
+  }
+
+  if (FORCE_PUSH.test(stmt) && PUSH_TARGETS_MAIN.test(stmt)) {
+    if (allowed) return;
+    deny(
+      "A force-push to main deletes published history for everyone, and " +
+        "main is protected: land through a pull request instead. " +
+        "(.githooks/pre-push covers the same push at the git level, plus " +
+        "any branch with an open pull request.) " +
+        loss,
+    );
+  }
+}
+
 // The command itself plus every command substitution nested inside it. The
 // depth cap is a backstop against pathological input, not a real limit: two
 // levels covers anything a session writes by hand.
@@ -361,6 +465,8 @@ function checkBash(rawCommand) {
           "loop. Use a different name (rc, target_path, args).",
       );
     }
+
+    checkDestructiveGit(stmt);
   }
 }
 

@@ -293,6 +293,40 @@ check deny  "cargo --offline clippy to head"    "$(bash_payload 'cargo --offline
 check deny  "cargo +toolchain test piped"       "$(bash_payload 'cargo +nightly test -p ravel-sql | tail -5')"
 check allow "cargo --locked test alone"         "$(bash_payload 'cargo --locked test -p ravel-sql')"
 
+# --- destructive git ----------------------------------------------------
+# These discard work nothing can recover. The pre-push hook covers the push
+# at the git level, but it never sees a reset or a filter-branch, and it is
+# only installed where someone ran the installer.
+check deny  "reset --hard onto origin/main"     "$(bash_payload 'git reset --hard origin/main')"
+check deny  "reset --soft onto origin/main"     "$(bash_payload 'git reset --soft origin/main')"
+check deny  "reset --hard onto @{upstream}"     "$(bash_payload 'git reset --hard @{upstream}')"
+check deny  "reset --hard onto FETCH_HEAD"      "$(bash_payload 'git reset --hard FETCH_HEAD')"
+check deny  "reset with the flag written last"  "$(bash_payload 'git reset origin/main --hard')"
+check deny  "filter-branch"                     "$(bash_payload 'git filter-branch --tree-filter "rm -f secret" HEAD')"
+check deny  "push --force to main"              "$(bash_payload 'git push --force origin main')"
+check deny  "push -f to main"                   "$(bash_payload 'git push -f origin main')"
+check deny  "push --force-with-lease to main"   "$(bash_payload 'git push --force-with-lease origin main')"
+check deny  "push +refs/heads/main"             "$(bash_payload 'git push origin +refs/heads/main')"
+check deny  "push HEAD:main forced"             "$(bash_payload 'git push --force origin HEAD:main')"
+
+# Ordinary work is not blocked.
+check allow "reset --hard to a local sha"       "$(bash_payload 'git reset --hard HEAD~1')"
+check allow "reset --soft HEAD~1"               "$(bash_payload 'git reset --soft HEAD~1')"
+check allow "plain push to main"                "$(bash_payload 'git push origin main')"
+check allow "force-push to a feature branch"    "$(bash_payload 'git push --force origin feat/x')"
+check allow "the words in a grep pattern"       "$(bash_payload 'grep -rn "git reset --hard origin/main" docs/')"
+check allow "the words in a commit message"     "$(bash_payload 'git commit -m "document git push --force origin main"')"
+
+# The escape hatch has to be read from the command TEXT: shell state does not
+# survive between tool calls, so an inline assignment is the only spelling
+# that can work, and it is exactly what the harmless-prefix list strips.
+check allow "ALLOW_DESTRUCTIVE=1 before a reset" \
+  "$(bash_payload 'ALLOW_DESTRUCTIVE=1 git reset --hard origin/main')"
+check allow "ALLOW_DESTRUCTIVE=1 before a force-push" \
+  "$(bash_payload 'ALLOW_DESTRUCTIVE=1 git push --force origin main')"
+check deny  "a different env prefix does not launder it" \
+  "$(bash_payload 'CARGO_INCREMENTAL=0 git reset --hard origin/main')"
+
 # --- malformed input must never block -----------------------------------
 check allow "empty stdin"                      ""
 check allow "not json"                         "wat"
