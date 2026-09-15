@@ -109,8 +109,19 @@ candidates="$(jq -r --argjson cutoff "${cutoff_epoch}" '
 # habit has stopped being a guard.
 #
 # The keyword list is GitHub's own closing set, so what refuses here is what
-# GitHub would actually close on merge.
-closing_kw='([Cc]los(e[sd]?|ing)|[Ff]ix(e[sd]|ing)?|[Rr]esolv(e[sd]?|ing))'
+# GitHub would actually close on merge. Two details carry that parity, and the
+# first version of this got both wrong:
+#
+# A boundary on BOTH sides. With only a trailing one, any word ENDING in a
+# keyword matched: `hotfix #42`, `bugfix #42`, `suffix: #42`, `prefix #42`,
+# `affixes #42` and `disclosed #42` all refused a genuine first dispatch of
+# #42, which is the same false-positive class this function was written to
+# remove and which GitHub itself does not have (`hotfix #42` closes nothing).
+#
+# No -ing forms. GitHub closes on close/closes/closed, fix/fixes/fixed,
+# resolve/resolves/resolved and nothing else; `fixing #42` does not close #42,
+# so it must not refuse here either.
+closing_kw='(^|[^0-9A-Za-z])([Cc]los(e|es|ed)|[Ff]ix(es|ed)?|[Rr]esolv(e|es|ed))'
 addressing="$(jq -r --arg needle "#${issue}" --arg kw "${closing_kw}" \
   --argjson cutoff "${cutoff_epoch}" '
   [ .[] | select(
