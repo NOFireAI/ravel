@@ -201,8 +201,8 @@ class KnobDriftTest(_CriterionCase):
         enf = _run("compare", "--baseline", base, "--current", cur,
                    "--threshold", "15", "--enforce")
         self.assertEqual(enf.returncode, 1, enf.stdout)
-        self.assertIn("NOT RECORDED on the baseline and current file", enf.stdout)
-        self.assertIn("not recorded on the baseline and current file", enf.stdout)
+        self.assertIn("NOT RECORDED on the baseline and current files", enf.stdout)
+        self.assertIn("not recorded on the baseline and current files", enf.stdout)
 
     def test_malformed_knob_is_refused(self):
         root = self._make_criterion("m", {"g/a": (100.0, 100.0)})

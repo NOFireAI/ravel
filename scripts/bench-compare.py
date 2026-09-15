@@ -124,11 +124,11 @@ def _knob_drift(base_doc, cur_doc):
     base = base_doc.get("_meta", {}).get("knobs")
     cur = cur_doc.get("_meta", {}).get("knobs")
     if not base or not cur:
-        side = "baseline" if not base else "current"
+        side = "baseline file" if not base else "current file"
         if not base and not cur:
-            side = "baseline and current"
+            side = "baseline and current files"
         return f"unknown:{side}", [
-            f"- sampling knobs: NOT RECORDED on the {side} file, so this "
+            f"- sampling knobs: NOT RECORDED on the {side}, so this "
             "comparison cannot be checked for sampling drift. An enforcing run "
             "refuses this pair: re-record the baseline through "
             "`bench-tier-b.sh record`, which stamps them."
@@ -232,7 +232,7 @@ def compare(args):
         lines.append("**The sampling knobs differ, so the two runs are not comparable.**")
     elif knob_state.startswith("unknown"):
         side = knob_state.split(":", 1)[1]
-        lines.append(f"**The sampling knobs are not recorded on the {side} file, so the two "
+        lines.append(f"**The sampling knobs are not recorded on the {side}, so the two "
                      "runs cannot be shown to be comparable.**")
     else:
         lines.append(f"**No regression past +{threshold:g}%.**")
