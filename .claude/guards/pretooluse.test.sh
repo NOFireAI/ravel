@@ -283,6 +283,16 @@ else
 fi
 rm -rf "$tmproot"
 
+# --- cargo's own flags sit before the subcommand ------------------------
+# `cargo --locked test | tail -1` ran the gate and read the pipe's status,
+# and the guard allowed it: the pattern was anchored on `cargo` followed
+# immediately by the subcommand, which none of cargo's global flags leave
+# intact.
+check deny  "cargo --locked test piped to tail" "$(bash_payload 'cargo --locked test | tail -1')"
+check deny  "cargo --offline clippy to head"    "$(bash_payload 'cargo --offline clippy --workspace | head -3')"
+check deny  "cargo +toolchain test piped"       "$(bash_payload 'cargo +nightly test -p ravel-sql | tail -5')"
+check allow "cargo --locked test alone"         "$(bash_payload 'cargo --locked test -p ravel-sql')"
+
 # --- malformed input must never block -----------------------------------
 check allow "empty stdin"                      ""
 check allow "not json"                         "wat"
