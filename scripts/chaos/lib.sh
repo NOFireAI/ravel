@@ -453,9 +453,12 @@ metric_value() {
   local body
   body="$(curl --silent --fail --max-time 5 "${base_url}/metrics")" || return 1
   # $body is data, not a gate; awk sums the family's samples by label-aware name.
+  # The value is $(NF), not $2: a label value holding a space splits the label
+  # set across fields, and $2 would then be part of the label set rather than
+  # the sample. No metric this lane reads carries such a label today.
   awk -v n="$name" '
-    $1 == n            { sum += $2; hit = 1; next }
-    index($1, n "{") == 1 { sum += $2; hit = 1 }
+    $1 == n            { sum += $(NF); hit = 1; next }
+    index($1, n "{") == 1 { sum += $(NF); hit = 1 }
     END { if (hit) print sum; else print "" }' \
     <<<"$body"
 }
