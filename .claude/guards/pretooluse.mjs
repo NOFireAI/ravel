@@ -93,17 +93,32 @@ const RESERVED_ASSIGN = /(^|[;&|(]|\bdo\b|\bthen\b|\blocal\b|\bexport\b)\s*(stat
 const ALLOW_DESTRUCTIVE =
   /(^|[\s;&|(])ALLOW_DESTRUCTIVE=(1|true|yes)(\s|$)/;
 const GIT_HEAD = /^git(\s+-[A-Za-z-]+(\s+\S+)?)*\s/;
-const RESET_REMOTE =
-  /\breset\b[^|;&]*\s--(hard|soft|merge|keep)\b[^|;&]*\s(origin\/|upstream\/|refs\/remotes\/|@\{u(pstream)?\}|FETCH_HEAD)/;
-const RESET_REMOTE_FLAG_LAST =
-  /\breset\b[^|;&]*\s(origin\/|upstream\/|refs\/remotes\/|@\{u(pstream)?\}|FETCH_HEAD)\S*\s+--(hard|soft|merge|keep)\b/;
+// The quote before the ref is not decoration: `git reset --hard 'origin/main'`
+// discards exactly as much as the unquoted spelling, and a pattern demanding
+// whitespace immediately before `origin/` allows it. A guard that a habit of
+// quoting turns off is not a guard.
+const REMOTE_REF = `['"]?(origin\\/|upstream\\/|refs\\/remotes\\/|@\\{u(pstream)?\\}|FETCH_HEAD)`;
+const RESET_REMOTE = new RegExp(
+  `\\breset\\b[^|;&]*\\s--(hard|soft|merge|keep)\\b[^|;&]*\\s${REMOTE_REF}`,
+);
+const RESET_REMOTE_FLAG_LAST = new RegExp(
+  `\\breset\\b[^|;&]*\\s${REMOTE_REF}\\S*\\s+--(hard|soft|merge|keep)\\b`,
+);
 const FILTER_BRANCH = /\bfilter-branch\b/;
-const FORCE_PUSH = /\bpush\b[^|;&]*(\s(-f|--force|--force-with-lease(=\S*)?)\b|\s\+refs\/)/;
+// Any leading-`+` refspec, not only the fully-qualified one. `git push origin
+// +main` is the common spelling and it rewrites published history exactly like
+// `+refs/heads/main`; requiring `refs/` here made PUSH_TARGETS_MAIN's own
+// `+main` and `HEAD:main` alternatives unreachable for this path.
+const FORCE_PUSH = /\bpush\b[^|;&]*(\s(-f|--force|--force-with-lease(=\S*)?)\b|\s\+\S)/;
 // Only the spellings that name main. A force-push to any other branch is
 // left to the pre-push hook, which can ask whether that branch has an open
 // pull request; this guard cannot, because it must stay offline and fast.
+//
+// The target must END at main. A bare `\b` after it also matched
+// `main-experiment`, `main/foo` and `main.2`, which refused ordinary work on
+// branches that merely start with the word.
 const PUSH_TARGETS_MAIN =
-  /(\s(origin|upstream)\s+(\+?main|HEAD:main|\S+:main|\+?refs\/heads\/main)\b|\s\+?refs\/heads\/main\b|\smain\s*$|\s\S+:main\b)/;
+  /(\s['"]?\+?(refs\/heads\/)?main['"]?(\s|$)|\s['"]?\+?\S+:(refs\/heads\/)?main['"]?(\s|$))/;
 
 // Command substitutions are checked as commands in their own right. Extending
 // the harmless-prefix list instead only ever covers the spellings someone
