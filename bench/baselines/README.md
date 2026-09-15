@@ -53,3 +53,11 @@ side and ignores an extra on the other, and the arm leaves the comparison
 without failing anything. A re-record must use the same `BENCH_SAMPLE_SIZE`,
 `BENCH_WARMUP`, `BENCH_MEASURE`, and `RAVEL_BENCH_MAX_SERIES` the
 `bench-compare` workflow pins, or the workflow's pins must move with it.
+
+`bench-tier-b.sh record` stamps them, so a baseline recorded through it is
+checkable. `tier-b.json` as committed predates the stamping and carries no
+`_meta.knobs`: the compare reports `NOT RECORDED` for it and an enforcing run
+refuses the pair. That is deliberate. The knobs it was recorded at are not
+fully recoverable from the file, and writing values nobody observed is the
+drift this check exists to catch. Re-recording on the reference runner, which
+this baseline needs anyway, fixes it.
