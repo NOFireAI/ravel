@@ -35,7 +35,16 @@
 //!    before: no build can read it, holding it protects nothing. This narrows
 //!    ADR-0066 decision 4's "retention ages old-version objects out" to objects
 //!    this build can actually read; see that ADR's 2026-09-13 amendment.
-//! 4. **Physical sweep** runs once `now >= retired_at_ns + protection_horizon`,
+//! 4. **Legal-hold gate** (ADR-0042 decision 2) runs next, and is
+//!    all-or-nothing over the bucket: every key the pass would delete is
+//!    offered to the [`LeaseCheck`], and if any one of them is protected the
+//!    pass deletes nothing, leaves the tombstone in place, counts the hold, and
+//!    reports `SweptPartial`. Retention's deletes are one retirement, not a set
+//!    of independent deletes: the commit records and the tombstone are what
+//!    make the bucket's data objects discoverable and sweepable, so deleting
+//!    the unheld part of a held bucket loses the held bytes by a slower route
+//!    (issue #1697).
+//! 5. **Physical sweep** runs once `now >= retired_at_ns + protection_horizon`,
 //!    deleting in the fixed order L0 commit records, compaction records,
 //!    rewrite records, L0 data objects, L1 parts, then the tombstone last, and
 //!    only after a verifying LIST shows the bucket's commit prefix holds only
@@ -102,6 +111,33 @@ pub fn held_out_of_window_objects_total() -> u64 {
     HELD_OUT_OF_WINDOW_OBJECTS.load(Ordering::Relaxed)
 }
 
+/// Counter seam for `ravel_maintain_retention_held_by_lease_buckets_total`
+/// (ADR-0042 decision 2): tombstoned buckets the physical sweep declined to
+/// touch this pass because a [`LeaseCheck`] protects at least one key the pass
+/// would have deleted. Legal hold ([`crate::legal_hold::LegalHoldCheck`]) is
+/// the production implementation of that seam, so in practice this counts
+/// buckets parked by a hold.
+///
+/// Process-wide and monotonic, incremented once per bucket per pass that
+/// declined it. It counts buckets rather than keys because the gate is
+/// all-or-nothing: one protected key parks the whole bucket, and the number of
+/// keys under it says nothing about how many retirements are stalled.
+///
+/// Unlike [`HELD_OUT_OF_WINDOW_OBJECTS`] a nonzero rate here is not by itself a
+/// fault: a hold is deliberate, and this stays nonzero for as long as the hold
+/// stands. It exists so the stall is visible at all, because a bucket parked in
+/// [`RetentionOutcome::SweptPartial`] is a bucket kept past its retention
+/// window, and an operator has to be able to see which holds are doing that and
+/// for how long. The total goes flat again once the hold is cleared and the
+/// next pass retires the bucket.
+static HELD_BY_LEASE_BUCKETS: AtomicU64 = AtomicU64::new(0);
+
+/// Read [`HELD_BY_LEASE_BUCKETS`]. Zero when no hold covers a bucket whose
+/// physical sweep is otherwise due.
+pub fn held_by_lease_buckets_total() -> u64 {
+    HELD_BY_LEASE_BUCKETS.load(Ordering::Relaxed)
+}
+
 /// The outcome of one retention pass over a bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetentionOutcome {
@@ -114,12 +150,16 @@ pub enum RetentionOutcome {
     /// Expired: a tombstone is present (written this pass or already there)
     /// and the protection horizon has not elapsed, so no bytes were deleted.
     Tombstoned,
-    /// Tombstone present and horizon elapsed, but the bucket was not emptied:
-    /// either a verifying LIST still found residue (a delete lost to a lease or
-    /// a concurrent write), or the sweep declined to delete anything because at
-    /// least one data object's format version is outside this build's reader
-    /// window (ADR-0066, see [`held_out_of_window_objects_total`]). Either way
-    /// the tombstone was left in place for the next pass to finish.
+    /// Tombstone present and horizon elapsed, but the bucket was not emptied,
+    /// for one of three reasons: a verifying LIST still found residue (a delete
+    /// lost to a concurrent write); the sweep declined to delete anything
+    /// because at least one data object's format version is outside this
+    /// build's reader window (ADR-0066, see
+    /// [`held_out_of_window_objects_total`]); or the sweep declined to delete
+    /// anything because a [`LeaseCheck`], in production a legal hold, protects
+    /// at least one key the pass would have deleted (ADR-0042 decision 2, see
+    /// [`held_by_lease_buckets_total`]). In all three the tombstone was left in
+    /// place for the next pass to finish.
     SweptPartial,
     /// Tombstone present, horizon elapsed, bucket verified empty, tombstone
     /// deleted last: the bucket is fully retired.
@@ -506,6 +546,41 @@ async fn physical_sweep(
         .map(|meta| meta.key)
         .collect();
 
+    // Legal-hold gate (ADR-0042 decision 2), all-or-nothing over the bucket and
+    // ahead of every delete. `delete_all` below skips a protected key one key at
+    // a time, which is the right rule for a sweep whose deletes are independent
+    // of each other. Retention's are not: the commit records name the L0 data
+    // objects, the tombstone is what keeps the bucket excluded from snapshots,
+    // and the three are one retirement. Deleting the unheld part of a held
+    // bucket leaves the held bytes with no record naming them and no tombstone
+    // covering them, which loses the data a hold exists to preserve by a slower
+    // route and is unrecoverable once done. So the pass asks about every key it
+    // would delete and deletes nothing if any one of them is protected.
+    //
+    // Declining is the conservative direction in both failure modes: a hold
+    // wrongly reported here costs a stalled retirement that the next pass
+    // completes once the hold clears, while a hold wrongly missed destroys held
+    // data. The bucket keeps its tombstone, so it stays excluded from snapshots
+    // and the retirement resumes rather than restarting.
+    //
+    // This runs before the version probe below so a held bucket costs no suffix
+    // GETs: the answer needs no I/O, and both gates return the same outcome.
+    let protected =
+        protected_sweep_keys(lease, listing, &l0_data_keys, &l1_part_keys, tombstone_key);
+    if let Some(first) = protected.first() {
+        HELD_BY_LEASE_BUCKETS.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            tenant = %bucket.tenant_hash.to_hex(),
+            signal = ?bucket.signal,
+            shard = bucket.shard,
+            ingest_hour_bucket = bucket.ingest_hour_bucket,
+            protected_keys = protected.len(),
+            first_protected_key = first,
+            "retention sweep held a tombstoned bucket: a lease or legal hold protects keys this pass would delete"
+        );
+        return Ok(RetentionOutcome::SweptPartial);
+    }
+
     // Version hold (ADR-0066 decisions 1 and 2): before deleting anything,
     // refuse if any data object about to be deleted carries a format version
     // outside this build's reader window. Such an object is readable by the
@@ -614,9 +689,61 @@ async fn out_of_window_version(store: &dyn ObjectStoreBackend, key: &str) -> Res
     }
 }
 
+/// Every key one physical sweep pass would delete, in delete order, tombstone
+/// last.
+///
+/// The all-or-nothing gate and the deletes below have to enumerate the same
+/// set: a key the sweep deletes but never offers to the [`LeaseCheck`] is a
+/// hold that did not hold, and that is exactly the shape of the bug this gate
+/// closes. The gate reads this iterator; the deletes below are still written
+/// out per class, so a new key class goes in both places, and
+/// `the_delete_set_is_every_class_in_delete_order` pins that they match.
+fn sweep_delete_keys<'a>(
+    listing: &'a BucketListing,
+    l0_data_keys: &'a [String],
+    l1_part_keys: &'a [String],
+    tombstone_key: &'a str,
+) -> impl Iterator<Item = &'a str> {
+    listing
+        .commit_keys
+        .iter()
+        .chain(listing.compaction_record_keys.iter())
+        .chain(listing.rewrite_record_keys.iter())
+        .chain(l0_data_keys.iter())
+        .chain(l1_part_keys.iter())
+        .map(String::as_str)
+        .chain(std::iter::once(tombstone_key))
+}
+
+/// The keys of a pending physical sweep that the [`LeaseCheck`] protects, in
+/// delete order. Empty means the sweep may proceed.
+///
+/// Every key is offered rather than stopping at the first protected one. The
+/// check is a pure in-memory prefix match (no I/O), the count is what the
+/// operator warning reports, and stopping early would leave the key classes
+/// behind the first hit unasked, so a hold covering only those would be decided
+/// by the ordering of the classes rather than by its own scope.
+fn protected_sweep_keys<'a>(
+    lease: &dyn LeaseCheck,
+    listing: &'a BucketListing,
+    l0_data_keys: &'a [String],
+    l1_part_keys: &'a [String],
+    tombstone_key: &'a str,
+) -> Vec<&'a str> {
+    sweep_delete_keys(listing, l0_data_keys, l1_part_keys, tombstone_key)
+        .filter(|key| lease.is_protected(key))
+        .collect()
+}
+
 /// Delete each key idempotently, skipping any the [`LeaseCheck`] protects
 /// (a protected key becomes residue that the verifying LIST will catch, so the
 /// tombstone stays for a later pass).
+///
+/// In the retention sweep this per-key skip is now unreachable: the
+/// all-or-nothing gate in [`physical_sweep`] has already refused the pass if
+/// any of these keys is protected. It stays as the last line of defence, so a
+/// future caller that reaches the deletes by another route still cannot delete
+/// a held key.
 async fn delete_all(
     store: &dyn ObjectStoreBackend,
     lease: &dyn LeaseCheck,
@@ -738,6 +865,85 @@ mod tests {
 
     fn tenant() -> TenantHash {
         TenantHash([0u8; 16])
+    }
+
+    /// A [`LeaseCheck`] protecting exactly one key, recording every key it was
+    /// asked about.
+    struct HoldOneKey {
+        held: String,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LeaseCheck for HoldOneKey {
+        fn is_protected(&self, key: &str) -> bool {
+            self.asked.lock().expect("asked lock").push(key.to_string());
+            key == self.held
+        }
+    }
+
+    fn listing_of_every_class() -> BucketListing {
+        BucketListing {
+            commit_keys: vec!["commit-a".to_string(), "commit-b".to_string()],
+            compaction_record_keys: vec!["compaction".to_string()],
+            rewrite_record_keys: vec!["rewrite".to_string()],
+            tombstone_key: Some("tombstone".to_string()),
+        }
+    }
+
+    /// The gate's delete set is every class the sweep deletes, in delete order,
+    /// tombstone last. The rewrite-record class is the one no integration
+    /// fixture here produces, and it is also the class whose omission from the
+    /// deletes once stalled every erased bucket forever (issue #1321), so it is
+    /// pinned by name.
+    #[test]
+    fn the_delete_set_is_every_class_in_delete_order() {
+        let listing = listing_of_every_class();
+        let l0 = vec!["l0-data".to_string()];
+        let l1 = vec!["l1-part".to_string()];
+        let keys: Vec<&str> = sweep_delete_keys(&listing, &l0, &l1, "tombstone").collect();
+        assert_eq!(
+            keys,
+            vec![
+                "commit-a",
+                "commit-b",
+                "compaction",
+                "rewrite",
+                "l0-data",
+                "l1-part",
+                "tombstone",
+            ]
+        );
+    }
+
+    /// Every key is offered to the check, not just enough to reach a verdict:
+    /// a hold on the last class in delete order is found, and the classes after
+    /// the first protected key are still asked about.
+    #[test]
+    fn the_gate_offers_every_key_and_finds_a_hold_on_any_class() {
+        let listing = listing_of_every_class();
+        let l0 = vec!["l0-data".to_string()];
+        let l1 = vec!["l1-part".to_string()];
+        for held in [
+            "commit-a",
+            "commit-b",
+            "compaction",
+            "rewrite",
+            "l0-data",
+            "l1-part",
+            "tombstone",
+        ] {
+            let lease = HoldOneKey {
+                held: held.to_string(),
+                asked: std::sync::Mutex::new(Vec::new()),
+            };
+            let protected = protected_sweep_keys(&lease, &listing, &l0, &l1, "tombstone");
+            assert_eq!(protected, vec![held], "a hold on {held} must be found");
+            assert_eq!(
+                lease.asked.lock().expect("asked lock").len(),
+                7,
+                "every key is offered even once {held} has already matched"
+            );
+        }
     }
 
     /// The retention read of a compaction record refuses a future
