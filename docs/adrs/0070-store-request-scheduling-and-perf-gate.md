@@ -145,8 +145,9 @@ decision).
 - Every store construction site changes once (handle selection); new
   callers must choose a class, which is the point.
 - The reference runner becomes CI infrastructure (self-hosted runner
-  labels on the existing dual-role box); Tier B is skipped, not failed,
-  when the runner is offline.
+  labels on the existing dual-role box); Tier B never fails the build.
+  (Correction: an offline runner leaves the job queued until one appears or
+  GitHub times the queue out, not skipped. See the amendment below.)
 - The panel is local-only work (MinIO + toxiproxy on a workstation, per
   the depth-panel methodology); code legs are fleet-dispatchable, the
   workflow leg iterates on live Actions runs.

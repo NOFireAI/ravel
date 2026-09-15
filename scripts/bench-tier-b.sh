@@ -64,6 +64,19 @@ BENCHES=(
   "ravel-otap:decode"
 )
 
+# The knobs that change what is measured, stamped into both the baseline and
+# every compare run. RAVEL_BENCH_MAX_SERIES is part of the segment_encode bench
+# id, so a compare recorded at a different value renames that arm and it drops
+# out of the comparison; bench-compare.py refuses that pair rather than
+# reporting on the arms that happen to still line up.
+knob_args() {
+  printf '%s ' \
+    "--knob" "BENCH_SAMPLE_SIZE=$BENCH_SAMPLE_SIZE" \
+    "--knob" "BENCH_WARMUP=$BENCH_WARMUP" \
+    "--knob" "BENCH_MEASURE=$BENCH_MEASURE" \
+    "--knob" "RAVEL_BENCH_MAX_SERIES=$RAVEL_BENCH_MAX_SERIES"
+}
+
 run_set() {
   if [ -z "${KEEP_CRITERION:-}" ]; then
     rm -rf "$CRITERION_DIR"
@@ -87,7 +100,8 @@ case "$cmd" in
     label="${3:?usage: bench-tier-b.sh record <out.json> <label>}"
     run_set
     python3 "$ROOT/scripts/bench-compare.py" collect \
-      --criterion-dir "$CRITERION_DIR" --out "$out" --label "$label"
+      --criterion-dir "$CRITERION_DIR" --out "$out" --label "$label" \
+      $(knob_args)
     echo "bench-tier-b: recorded baseline at $out" >&2
     ;;
   compare)
@@ -101,7 +115,8 @@ case "$cmd" in
     run_set
     python3 "$ROOT/scripts/bench-compare.py" collect \
       --criterion-dir "$CRITERION_DIR" --out "$current" \
-      --label "current run ($(uname -m), $(nproc) cores)"
+      --label "current run ($(uname -m), $(nproc) cores)" \
+      $(knob_args)
     # .gate-logs/ is gitignored and created by gates.sh, so a fresh CI
     # checkout does not have it. bench-compare.py opens --out-md for write
     # with no fallback, and this script runs under set -euo pipefail.
