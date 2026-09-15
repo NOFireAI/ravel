@@ -12,6 +12,15 @@ initial release) were retired the same way before it.
      scripts/check_format_version_docs.py; keep it in step with the current
      trailer version above when the reader window changes. -->
 
+**Upgrade and rollback posture at HEAD.** A trailer-version bump is a
+non-rollbackable, forward-only data-migration event: the reader admits exactly
+one version, so once any object at the new version exists, a build that predates
+the bump cannot read it. The irreversible step is the first write at the new
+version; before it, a rollback to the earlier build is safe. The N/N-1 window
+described below is staged for a future format-lifecycle activation milestone,
+distinct from the software's first public release at 0.9.0 and not yet reached
+(ADR-0531), not a posture any released build has had.
+
 Version 4 changed the BLOCKS layout, deleted the per-block header, and
 redefined the SKIP_IDX level-0 block crc, so it was a versioned change rather
 than the additive kind ADR-0029's carve-out excepts -- whatever PAGE_DIR's own
@@ -28,7 +37,9 @@ v3.
 bulk data-object format. The supported-version window is single-sourced as
 `ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer, reader gate,
 `audit-versions`, `migrate`, and the compactor's output-version constant all
-read it. Until first public release the window holds exactly one version
+read it. Until the format-lifecycle activation milestone (ADR-0531, distinct
+from the software's 0.9.0 first public release and not yet reached) the window
+holds exactly one version
 (ADR-0027 decision 7, ADR-0892): each bump deletes the previous version's
 reader in the same change, and a pre-1.0.0 development store holding older
 objects is wiped or re-ingested. The N/N-1 window ADR-0066 describes, rolled

@@ -131,7 +131,8 @@ in force at HEAD (Reading B, point 2 above):
 ## Consequences
 
 - The operator-facing format docs (docs/segment-format.md,
-  docs/span-segment-format.md, README.md) state the HEAD posture plainly: the
+  docs/log-segment-format.md, docs/span-segment-format.md, README.md) state the
+  HEAD posture plainly: the
   reader admits exactly one version, a format bump is a non-rollbackable
   data-migration event, and the N/N-1 window is staged but not yet in force.
   These edits are factual at HEAD and hold under either reading of "first public
@@ -143,7 +144,7 @@ in force at HEAD (Reading B, point 2 above):
   are not rewritten here; that waits on owner confirmation of point 1.
 
 - A documentation/code consistency check
-  (scripts/check-format-version-docs.py, wired into scripts/gates.sh and CI)
+  (scripts/check_format_version_docs.py, wired into scripts/gates.sh and CI)
   ties the version claims in the format docs to each crate's
   `SUPPORTED_VERSIONS`, so the docs and the reader's admitted set cannot silently
   diverge again. The check fails closed: if it cannot find a version claim to
