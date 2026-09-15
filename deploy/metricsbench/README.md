@@ -74,11 +74,12 @@ deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
 ```
 
 Originally scoped to this directory's compose file alone (issue #934), the
-script now also checks the two repo-wide supply-chain pins issue #1310 added:
-every `FROM`/`ARG` base image in the root `Dockerfile` and `Dockerfile.prebuilt`,
-and every `uses:` action reference under `.github/workflows/` and
-`.github/actions/`. All three categories run in one invocation and each is
-checked against its own expected count:
+script now also checks the two repo-wide supply-chain pins issue #1310 added,
+plus the quickstart compose file issue #1720 added: every `FROM`/`ARG` base
+image in the root `Dockerfile` and `Dockerfile.prebuilt`, every `uses:` action
+reference under `.github/workflows/` and `.github/actions/`, and every
+`image:` reference in `deploy/docker-compose/ravel.yml`. All four categories
+run in one invocation and each is checked against its own expected count:
 
 - **Compose images** (this directory): every image reference carries an
   `@sha256:` digest, every ADR-0927-required comparator is present, and the
@@ -90,8 +91,14 @@ checked against its own expected count:
 - **Workflow actions**: every `uses:` reference in every workflow and
   composite action carries a 40-hex commit SHA pin, and the number of
   references equals the expected count.
+- **Quickstart compose images** (`deploy/docker-compose/ravel.yml`): every
+  `image:` reference except the two `${RAVEL_IMAGE:-...}` references (Ravel's
+  own released image, excluded by exact match) carries an `@sha256:` digest,
+  and both the total image-line count and the pin-required count equal their
+  expected totals. Scoped to that one file: `deploy/k8s` carries locally built
+  placeholders with no registry manifest to pin.
 
-Exit 0 means all three categories passed. Any unpinned reference, any missing
+Exit 0 means all four categories passed. Any unpinned reference, any missing
 required comparator, or a reference count that drifts from any category's
 expected number fails the check with a non-zero exit. The script prints what
 it checked and how many references it found in each category.
@@ -150,6 +157,22 @@ curl -sI -H "Authorization: Bearer <TOKEN>" \
 
 The tag is kept in each `image:` reference alongside the digest for human
 readability; the digest is what pins the run.
+
+### Pins shared with deploy/docker-compose/ravel.yml (issue #1720)
+
+The quickstart compose file (`deploy/docker-compose/ravel.yml`) is scanned by
+the same script as its fourth category (see above), so its pins are recorded
+here too. The MinIO pair is the exact same tag and digest this directory
+already uses above; the other two are quickstart-only.
+
+| Image | Tag | Digest |
+|---|---|---|
+| `quay.io/minio/minio` | `RELEASE.2025-04-08T15-41-24Z` | `sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b` |
+| `quay.io/minio/mc` | `RELEASE.2025-04-08T15-39-49Z` | `sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952` |
+| `ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib` | `0.160.0` | `sha256:799dc6cf12c96192af37b5bdba804da8c10b3bc563b43cb90c3f3c58d9572ad6` |
+| `grafana/grafana` | `13.2.2` | `sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0` |
+
+See `deploy/README.md` for why these four registries were chosen.
 
 ## Note on the acceptance check name
 
