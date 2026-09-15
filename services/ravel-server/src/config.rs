@@ -1109,7 +1109,7 @@ pub struct Cli {
     /// per prefix) holds the shard's only permit, and co-resident tenants'
     /// flushes queue behind it until the stall clears. A queued flush's
     /// `max_flush_lifetime` budget is measured from when it acquires the permit,
-    /// not from flush-open (issue #1739), so the wait itself does not abandon
+    /// not from flush-open, so the wait itself does not abandon
     /// it: a buffered write's rows stay invisible to queries until the stall
     /// clears, then commit, rather than being dropped. A co-resident strict
     /// write instead takes `WriteError::AckTimeout` once the request's ack
