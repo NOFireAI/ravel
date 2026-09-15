@@ -104,6 +104,44 @@ fn each_compaction_fault_kind_recovers() {
             outcome.fault_counters
         );
 
+        // The delete fault fired during the sweep (either flavor), on the
+        // sweep's superseded L0 data deletes. `Occurrence::Nth(1)` fires
+        // exactly once, so the sum is exactly 1, not just positive.
+        let delete = outcome
+            .fault_counters
+            .get(&(Op::Delete, FaultKind::Transient))
+            .copied()
+            .unwrap_or(0)
+            + outcome
+                .fault_counters
+                .get(&(Op::Delete, FaultKind::Throttled))
+                .copied()
+                .unwrap_or(0);
+        assert_eq!(
+            delete, 1,
+            "seed {seed}: delete fault on the sweep's superseded L0 deletes fired {delete} times, \
+             want exactly 1 (counters: {:?})",
+            outcome.fault_counters
+        );
+        // The fault landing on a real delete, not on nothing: `compacting_config`
+        // fixes the workload shape (tenant/series/sample counts) independently
+        // of the seed, so the faulted sweep pass's own report is exactly the
+        // same superseded-record/data count on every seed in this range, and
+        // touches no unreferenced `/l1` part (this workload's compaction
+        // leaves none to collect).
+        assert_eq!(
+            outcome.sweep_superseded_records_deleted, 18,
+            "seed {seed}: faulted sweep pass superseded-records-deleted changed"
+        );
+        assert_eq!(
+            outcome.sweep_superseded_data_deleted, 18,
+            "seed {seed}: faulted sweep pass superseded-data-deleted changed"
+        );
+        assert_eq!(
+            outcome.sweep_unreferenced_parts_deleted, 0,
+            "seed {seed}: faulted sweep pass unexpectedly deleted an unreferenced part"
+        );
+
         // Every fault the schedule declared (ingest and compaction/sweep) fired.
         for (op, kind) in &outcome.expected_faults {
             let fired = outcome
