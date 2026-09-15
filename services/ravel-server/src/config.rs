@@ -1550,8 +1550,8 @@ pub struct Cli {
     /// A remote cluster this coordinator federates a query out to (ADR-0071
     /// cross-cluster federation). Repeatable: one flag per remote. Its
     /// credential belongs to one local tenant, named by the `tenant` key; a
-    /// spec that names none is refused on a coordinator that can resolve more
-    /// than one local tenant.
+    /// spec that names none is refused on a coordinator that runs queries for
+    /// more than one local tenant.
     ///
     /// The value is a comma-separated `key=value` spec. Required keys: `name`
     /// (the cluster's stable label, surfaced in the `warnings` field when it is
@@ -3693,6 +3693,24 @@ impl Cli {
                                  key entirely on a single-tenant coordinator"
                             );
                         }
+                        // Refuse a repeat rather than take the last one. A spec
+                        // is one remote credential, so naming two local tenants
+                        // on it puts them back behind one credential, which is
+                        // the disclosure the key exists to prevent. Last-wins
+                        // would leave the earlier tenant with no remote at all
+                        // and send the later one out under a credential meant
+                        // for the earlier, and every startup check would pass.
+                        if let Some(first) = &tenant {
+                            anyhow::bail!(
+                                "invalid --remote-cluster '{spec}': tenant is set twice, to '{}' \
+                                 and '{}'. One spec carries one remote credential and maps it to \
+                                 one local tenant. Write one --remote-cluster per local tenant \
+                                 that needs this remote, each with its own name and \
+                                 credential-file.",
+                                first.as_str(),
+                                value
+                            );
+                        }
                         tenant = Some(TenantId::new(value));
                     }
                     "tls" => tls = parse_bool_field(spec, "tls", value)?,
@@ -5765,6 +5783,35 @@ mod tests {
         assert!(
             err.to_string().contains("tenant is empty"),
             "expected the empty-tenant error, got: {err}"
+        );
+    }
+
+    /// A repeated `tenant` key is the one wrong spelling of "both tenants on
+    /// this remote" that would otherwise be accepted. Every other spelling is
+    /// already refused or lands on an unknown tenant the startup check catches;
+    /// last-wins would instead leave the first tenant with no remote and send
+    /// the second out under a credential meant for the first.
+    #[test]
+    fn remote_cluster_repeated_tenant_key_is_refused() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let spec = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={},tenant=acme,tenant=beta",
+            token.path().display()
+        );
+
+        let err = cli(&["--remote-cluster", &spec])
+            .parse_remote_clusters()
+            .expect_err("a repeated tenant key must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tenant is set twice"),
+            "expected the repeated-tenant error, got: {err}"
+        );
+        assert!(
+            msg.contains("acme") && msg.contains("beta"),
+            "the error must name both tenants so the operator can see which was dropped, got: \
+             {err}"
         );
     }
 
