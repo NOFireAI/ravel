@@ -358,6 +358,63 @@ async fn buffered_flush_queued_behind_a_stall_reaches_the_store_past_lifetime() 
     );
 }
 
+/// The pre-acquire guard (issue #1739 part 2) abandons a flush whose flush-open
+/// deadline already elapsed before its task takes a permit, and counts it under
+/// the new queue-deadline reason, distinct from a store failure (part 4). A
+/// `max_flush_lifetime` of zero makes the deadline expire at flush-open, so the
+/// guard fires deterministically on the injected clock, before any store call.
+#[tokio::test]
+async fn expired_flush_is_abandoned_in_the_queue_without_a_permit() {
+    let start_ns = 1_700_000_000_000_000_000;
+    let clock = TestClock::new(start_ns);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+    let config = IngestConfig {
+        shard_count: 1,
+        // The flush-open deadline is raw_ns + max_flush_lifetime; zero makes it
+        // equal to the flush-open reading, so the flush is already past deadline
+        // when its task first polls, and the pre-acquire guard fires.
+        max_flush_lifetime: Duration::ZERO,
+        flush_tick: Duration::from_millis(50),
+        max_inflight_flushes: 1,
+        ..IngestConfig::default()
+    };
+    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+
+    let t = tenant("acme");
+    router
+        .write(
+            t.clone(),
+            vec![make_point(&t, "m", &[("h", "1")], start_ns, 1.0)],
+            WriteMode::Buffered,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a buffered write acks at enqueue");
+
+    // Flush now: the flush opens already past its deadline, so its task takes the
+    // guard's abandon path before acquiring a permit or issuing a store call.
+    router.flush_all().await;
+
+    let snap = router.metrics().snapshot();
+    assert_eq!(
+        snap.abandoned_queue_deadline, 1,
+        "the expired flush is counted under the queue-deadline reason"
+    );
+    assert_eq!(
+        snap.abandoned_retry_exhausted, 0,
+        "no store call ran, so the store-failure reason must not move"
+    );
+
+    // No permit was taken and no object written: the guard ran before the
+    // acquire and before `run_flush`.
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert!(
+        objects.is_empty(),
+        "an expired flush must take no permit and write no object: {objects:?}"
+    );
+}
+
 fn log_in_flight(router: &LogIngestRouter, shard: u32) -> u64 {
     router
         .metrics()
