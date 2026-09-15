@@ -195,6 +195,20 @@ class KnobDriftTest(_CriterionCase):
         self.assertIn("not recorded on the baseline file", enf.stdout)
         self.assertNotIn("both sides", enf.stdout)
 
+    def test_unrecorded_on_the_current_side_names_the_current_file(self):
+        # The third side-selection branch. It never fires against the committed
+        # baseline, which is exactly why a refactor of the side selection could
+        # break it with nothing noticing.
+        base = self._collect("base", {"g/a": (100.0, 100.0)}, "base",
+                             knobs=["RAVEL_BENCH_MAX_SERIES=2000"])
+        cur = self._collect("cur", {"g/a": (100.0, 100.0)}, "cur", knobs=[])
+        enf = _run("compare", "--baseline", base, "--current", cur,
+                   "--threshold", "15", "--enforce")
+        self.assertEqual(enf.returncode, 1, enf.stdout)
+        self.assertIn("NOT RECORDED on the current file", enf.stdout)
+        self.assertIn("not recorded on the current file", enf.stdout)
+        self.assertNotIn("baseline file", enf.stdout)
+
     def test_unrecorded_on_both_sides_names_both(self):
         base = self._collect("base", {"g/a": (100.0, 100.0)}, "base", knobs=[])
         cur = self._collect("cur", {"g/a": (100.0, 100.0)}, "cur", knobs=[])
