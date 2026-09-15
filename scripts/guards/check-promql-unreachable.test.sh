@@ -75,7 +75,12 @@ fn reduce(op: TokenId) -> f64 {
 RS
 check "passes when the marker line itself carries a reason after --" "${d}" 0 "every unreachable! is documented"
 
-# --- a marked one, reason wraps onto a following comment line, passes ------
+# --- the reason must START on the marker line, not on a continuation -------
+#
+# A marker line that ends at the "--" is an empty reason. Letting the next
+# comment line supply it means any unrelated prose under the marker
+# suppresses the finding, which is how the rule was quietly weaker than both
+# this script's header and CLAUDE.md claimed.
 
 d="$(new_repo marked_wrapped)"
 cat >"${d}/crates/ravel-promql/src/aggregate.rs" <<'RS'
@@ -88,7 +93,49 @@ fn reduce(op: TokenId) -> f64 {
     }
 }
 RS
-check "passes when the reason continues on the next comment line" "${d}" 0 "every unreachable! is documented"
+check "a reason starting only on a continuation line does not suppress" "${d}" 1 "aggregate.rs:6: bare-unreachable:"
+
+# --- a reason that starts on the marker line and wraps still passes --------
+
+d="$(new_repo marked_wrapping_reason)"
+cat >"${d}/crates/ravel-promql/src/aggregate.rs" <<'RS'
+fn reduce(op: TokenId) -> f64 {
+    match op {
+        T_SUM => 1.0,
+        // unreachable-allow: eval_aggregate's dispatch -- op is already
+        // narrowed to T_SUM before this helper runs, by the arm above that
+        // rejects every other token with Error::Unsupported.
+        _ => unreachable!("no such aggregator"),
+    }
+}
+RS
+check "passes when the reason starts on the marker line and wraps" "${d}" 0 "every unreachable! is documented"
+
+# --- the trailing-marker form (marker on the unreachable! line) passes ------
+
+d="$(new_repo marker_trailing)"
+cat >"${d}/crates/ravel-promql/src/aggregate.rs" <<'RS'
+fn reduce(op: TokenId) -> f64 {
+    match op {
+        T_SUM => 1.0,
+        _ => unreachable!("no such aggregator"), // unreachable-allow: eval_aggregate's dispatch -- narrowed to T_SUM above.
+    }
+}
+RS
+check "passes with the marker trailing the unreachable! line itself" "${d}" 0 "every unreachable! is documented"
+
+# --- a trailing marker with an empty reason still fails ---------------------
+
+d="$(new_repo marker_trailing_no_reason)"
+cat >"${d}/crates/ravel-promql/src/aggregate.rs" <<'RS'
+fn reduce(op: TokenId) -> f64 {
+    match op {
+        T_SUM => 1.0,
+        _ => unreachable!("no such aggregator"), // unreachable-allow: eval_aggregate's dispatch --
+    }
+}
+RS
+check "a trailing marker with nothing after -- does not suppress" "${d}" 1 "aggregate.rs:4: bare-unreachable:"
 
 # --- an empty marker reason fails --------------------------------------------
 

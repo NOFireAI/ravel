@@ -1555,9 +1555,10 @@ fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
         | Expr::Binary(_)
         | Expr::Aggregate(_)
         | Expr::Subquery(_) => {
-            // unreachable-allow: eval_expr's own top-level match -- every one
-            // of these variants is handled there before this fallback is
-            // ever reached.
+            // unreachable-allow: the callers' own matches -- this helper has
+            // exactly two, eval_expr and resolve_range_core, and each handles
+            // every variant listed here in an arm above its fallback, so none
+            // of them can arrive.
             unreachable!("caller must handle every supported construct before falling back")
         }
     }

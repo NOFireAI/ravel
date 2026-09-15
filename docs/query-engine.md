@@ -2478,18 +2478,31 @@ the clean rejection is what the guarantee requires.
 The same state-2 guarantee applies below the scored surface too, at the
 evaluator's own internal dispatch arms. `ravel-promql` used to defend several
 of these with `unreachable!()`, on the assumption that promql-parser's AST
-could never carry a shape those arms didn't expect. Issue #1701 found that
-several of them were in fact reachable from a parsed tenant query -- an
-unknown aggregator token, an aggregate whose inner expression evaluates to a
-non-vector, a missing or wrongly-typed `limitk`/`count_values` parameter, a
-binary operator whose operands are neither both scalar nor both vector, and a
-`ManyToMany` vector match on a non-set operator -- and converted each to a
-typed `Error::Unsupported` naming the operator or type, rather than aborting
-the process. The arms that remain `unreachable!()` are the ones an exhaustive
-prior match already narrows out of reach before they run (for example,
-`apply_arith`'s fallback, reachable only through `eval_binary`'s own
-arithmetic/comparison dispatch), and each carries a one-line comment naming
-the arm that rejects first. `scripts/guards/check-promql-unreachable.sh`
+could never carry a shape those arms didn't expect. Issue #1701 found nine of
+them -- an unknown aggregator token, an aggregate whose inner expression
+evaluates to a non-vector, a missing or wrongly-typed
+`limitk`/`count_values` parameter, a binary operator whose operands are
+neither both scalar nor both vector, a `ManyToMany` vector match on a non-set
+operator, and a matrix-typed function argument that is not a matrix node --
+whose only protection was promql-parser's own `check_ast`. Under
+promql-parser 0.10 no parsed query actually reaches them, so the defect is
+not a live panic: it is that the guarantee lives in a third-party crate on a
+caret version range, where a minor upgrade can relax a check without any
+signal here. Each was converted to a typed `Error::Unsupported` naming the
+operator or type, so Ravel's own evaluator refuses the shape rather than
+inheriting the refusal.
+
+The arms that remain `unreachable!()` are the ones an exhaustive prior match
+inside `ravel-promql` already narrows out of reach before they run. For
+example, `apply_arith`'s fallback is narrowed by `eval_binary`'s
+operator-class check, which refuses any token that is neither arithmetic nor
+a comparison, and refuses a set operator (`and`/`or`/`unless`) on a
+Scalar/Scalar or Scalar/Vector operand pair, before `eval_scalar_scalar` or
+`eval_scalar_vector` runs. That check is Ravel's, not the parser's:
+`eval_binary` dispatches on operand types, never on operator class, so
+without it a set operator on scalar operands reached `apply_arith` and
+aborted the process. Each remaining arm carries a one-line comment naming the
+arm that rejects first. `scripts/guards/check-promql-unreachable.sh`
 keeps this from regressing: every `unreachable!()` under
 `crates/ravel-promql/src` must carry that comment, so a new defensive arm
 added without one fails the gate instead of becoming the next reachable
