@@ -88,13 +88,25 @@ answer, with nothing left for a cross-source belt to reconcile.
 
 Pushdown is attempted only when BOTH hold for the query:
 
-**(a) No federation.** If the query has a non-`None` `Federation`
-context (any remote configured), pushdown is unconditionally ineligible.
-A local partial cannot be complete for a series that may also have
-remote runs, and this ADR does not attempt to combine a worker's local
-partial with a remote's raw samples through the belt — that composition
-is real future work, out of scope here. This closes mechanism 2 above by
-exclusion, not by design; it is the cheap, correct answer for a v1.
+**(a) No federation.** If the query reaches any remote, pushdown is
+unconditionally ineligible. A local partial cannot be complete for a
+series that may also have remote runs, and this ADR does not attempt to
+combine a worker's local partial with a remote's raw samples through the
+belt — that composition is real future work, out of scope here. This
+closes mechanism 2 above by exclusion, not by design; it is the cheap,
+correct answer for a v1.
+
+The set a query reaches is the remotes mapped to its own local tenant,
+plus any unkeyed remote (ADR-1295): a `--remote-cluster` credential
+belongs to one local tenant, and `Federation::fetch` selects on that key
+before dispatch. So the test is "any remote THIS tenant reaches", not
+"any remote this process holds". `QueryEngine::prefetch` filters the
+federation reference by `Federation::has_remotes_for` before the gate
+reads it. Under a single-tenant coordinator, which was the only shape
+that could configure `--remote-cluster` before ADR-1295, the two are the
+same set. They differ on a multi-tenant coordinator, where a tenant with
+no mapped remote fans out to nothing and would otherwise be excluded
+from pushdown on another tenant's remote.
 
 **(b) No reshard-generation split, checked against the segments the
 query actually resolved, not against the query's own event-time window.**
@@ -138,8 +150,8 @@ materialized segment list plus one lookup into already-fetched
 provisioning state, not a new store read.
 
 **Why this makes per-worker pushdown exact once both (a) and (b) hold:**
-with no federation, every sample for the query comes from the local
-cluster's own segments. With every resolved segment inside one stable
+with no remote the query reaches, every sample for the query comes from
+the local cluster's own segments. With every resolved segment inside one stable
 generation, `shard_for` is provably constant for the tenant throughout
 the query's actual scan set, so every series the query touches is
 provably held by exactly one worker: no series is split, so no
