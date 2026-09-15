@@ -324,6 +324,23 @@ minio_up() {
     -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
     quay.io/minio/mc:latest mb -p "local/${RAVEL_S3_BUCKET}" >/dev/null 2>&1 || true
 
+  # Start every scenario on an empty store. The compose file bind-mounts
+  # ../../minio-data, so `docker compose down` leaves the objects on the host
+  # and the next scenario, or a re-run of this one, inherits them. That is not
+  # only untidy: `discover_tenants` lists every tenant under `t/` and ignores
+  # --tenant-token, and `ravel_maintain_units_owned` is one store-wide gauge,
+  # so a leftover tenant inflates the universe the takeover oracles count
+  # against while their expected value stays at one scenario's worth. Those
+  # oracles compare with >=, so the inflation makes them pass without a
+  # takeover. Emptying the bucket is the fix that holds for both, and it is
+  # done through mc rather than rm because the container writes the host
+  # directory as root. RAVEL_S3_BUCKET defaults to a chaos-only bucket.
+  log "emptying bucket ${RAVEL_S3_BUCKET} so this scenario starts clean"
+  docker run --rm --network host \
+    -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
+    quay.io/minio/mc:latest rm --recursive --force "local/${RAVEL_S3_BUCKET}" \
+    >/dev/null 2>&1 || true
+
   # ADR-0050 EC7: a non-Memory store refuses to serve until `sys/qualification`
   # exists, and there is no bootstrap-and-continue path. Qualify before any
   # server start.
@@ -331,6 +348,32 @@ minio_up() {
   local rc=0
   run_capture ravel_cli --store s3 store qualify || rc=$?
   return "$rc"
+}
+
+# Count the tenants the maintain tier would discover, and record a pinned
+# oracle failure when it is not exactly one.
+#
+# The takeover oracles compare a store-wide gauge against one scenario's
+# worth of units with >=, so they discriminate a real takeover only while the
+# store holds this scenario's tenant alone. `minio_up` empties the bucket to
+# make that true; this asserts it rather than assuming it, because the
+# violated-precondition case is a PASS, not an error, and would go unnoticed.
+assert_single_tenant_universe() {
+  local listing count
+  listing="$(docker run --rm --network host \
+    -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
+    quay.io/minio/mc:latest ls "local/${RAVEL_S3_BUCKET}/t/" 2>/dev/null)" || {
+    oracle_bad "single_tenant_universe" "could not list t/ in ${RAVEL_S3_BUCKET}"
+    return 1
+  }
+  count="$(printf '%s\n' "$listing" | grep -c '/$' || true)"
+  if [[ "$count" -ne 1 ]]; then
+    oracle_bad "single_tenant_universe" \
+      "expected exactly 1 tenant prefix under t/, found ${count}"
+    return 1
+  fi
+  oracle_ok "single_tenant_universe"
+  return 0
 }
 
 # Tear MinIO down only if this library started it.
