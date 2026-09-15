@@ -44,6 +44,10 @@ CLUSTER_NAME="${RAVEL_KIND_CLUSTER:-ravel-dev}"
 # floating tag would silently change the control-plane version under a
 # reproduction. This is the image kind v0.32.0 ships with, and the digest is
 # the multi-arch index digest, so it resolves on both amd64 and arm64 hosts.
+# v1.32.2 also happens to sit exactly at the operator's own minimum
+# Kubernetes floor (MIN_KUBERNETES_MINOR_VERSION, issue #1714): never pin
+# this below 1.32, or the dev cluster cannot run the rendered preStop
+# SleepAction and the operator raises KubernetesVersionUnsupported on it.
 NODE_IMAGE="${RAVEL_KIND_NODE_IMAGE:-kindest/node:v1.32.2@sha256:142f543559cc55d64e1ab9341df08e5ced84bd2e893736da8f51320f26f5950b}"
 SERVER_IMAGE="${RAVEL_SERVER_IMAGE:-ravel-server:kind-dev}"
 OPERATOR_IMAGE="${RAVEL_OPERATOR_IMAGE:-ravel-operator:kind-dev}"

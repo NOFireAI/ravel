@@ -111,6 +111,11 @@ pub const GRPC_PORT: i32 = 4317;
 /// load-balancer drain under load.
 pub const PRE_STOP_DRAIN_DELAY_SECONDS: i64 = 10;
 
+/// Minimum Kubernetes minor version (1.x) the operator supports, because the
+/// `preStop` `SleepAction` above ([`pre_stop_lifecycle`]) only became GA in
+/// 1.32.
+pub const MIN_KUBERNETES_MINOR_VERSION: u32 = 32;
+
 /// `terminationGracePeriodSeconds` on every ravel-server pod.
 ///
 /// Kubernetes runs `preStop` inside the grace period and only sends SIGTERM
@@ -6340,7 +6345,10 @@ mod tests {
     /// for the router Role): the table below pins the exact verbs line for every
     /// rule in rbac.yaml, so any verb change to any rule (a reintroduced dead
     /// verb, a dropped read, a widened grant) fails the gate, not only the
-    /// batch/jobs rule.
+    /// batch/jobs rule. A rule's first element is the `apiGroups:` line
+    /// immediately above its identifying line, or `None` for a non-resource
+    /// rule (`nonResourceURLs:`), which carries the `- ` dash itself and has
+    /// no `apiGroups:` line at all.
     #[test]
     fn rbac_grants_only_the_verbs_the_reconcile_loop_calls() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -6358,68 +6366,75 @@ mod tests {
             "server-side apply is a PATCH, not a PUT: no rule may grant the update verb"
         );
 
-        // Every rule's apiGroups/resources/verbs lines, in rbac.yaml's fixed
-        // ordering: the `resources:` line uniquely identifies each rule, with its
-        // `apiGroups:` line immediately before and its `verbs:` line immediately
-        // after.
-        let rules: &[(&str, &str, &str)] = &[
+        // Every rule's apiGroups/resources (or nonResourceURLs)/verbs lines, in
+        // rbac.yaml's fixed ordering: the identifying line uniquely identifies
+        // each rule, with its `apiGroups:` line immediately before (resource
+        // rules only) and its `verbs:` line immediately after.
+        let rules: &[(Option<&str>, &str, &str)] = &[
             (
-                "- apiGroups: [\"apps\"]",
+                Some("- apiGroups: [\"apps\"]"),
                 "resources: [\"deployments\"]",
                 "verbs: [\"create\", \"patch\", \"get\", \"list\", \"watch\", \"delete\"]",
             ),
             (
-                "- apiGroups: [\"\"]",
+                Some("- apiGroups: [\"\"]"),
                 "resources: [\"services\"]",
                 "verbs: [\"create\", \"patch\", \"get\", \"list\", \"watch\", \"delete\"]",
             ),
             (
-                "- apiGroups: [\"networking.k8s.io\"]",
+                Some("- apiGroups: [\"networking.k8s.io\"]"),
                 "resources: [\"ingresses\"]",
                 "verbs: [\"create\", \"patch\", \"list\", \"watch\", \"delete\"]",
             ),
             (
-                "- apiGroups: [\"gateway.networking.k8s.io\"]",
+                Some("- apiGroups: [\"gateway.networking.k8s.io\"]"),
                 "resources: [\"httproutes\", \"grpcroutes\"]",
                 "verbs: [\"create\", \"patch\", \"delete\"]",
             ),
             (
-                "- apiGroups: [\"\"]",
+                Some("- apiGroups: [\"\"]"),
                 "resources: [\"serviceaccounts\"]",
                 "verbs: [\"create\", \"patch\", \"delete\"]",
             ),
             (
-                "- apiGroups: [\"rbac.authorization.k8s.io\"]",
+                Some("- apiGroups: [\"rbac.authorization.k8s.io\"]"),
                 "resources: [\"roles\", \"rolebindings\"]",
                 "verbs: [\"create\", \"patch\", \"delete\"]",
             ),
             (
-                "- apiGroups: [\"discovery.k8s.io\"]",
+                Some("- apiGroups: [\"discovery.k8s.io\"]"),
                 "resources: [\"endpointslices\"]",
                 "verbs: [\"get\", \"list\", \"watch\"]",
             ),
             (
-                "- apiGroups: [\"ravel.nofire.ai\"]",
+                Some("- apiGroups: [\"ravel.nofire.ai\"]"),
                 "resources: [\"ravelclusters\"]",
                 "verbs: [\"list\", \"watch\"]",
             ),
             (
-                "- apiGroups: [\"ravel.nofire.ai\"]",
+                Some("- apiGroups: [\"ravel.nofire.ai\"]"),
                 "resources: [\"ravelclusters/status\"]",
                 "verbs: [\"patch\"]",
             ),
             (
-                "- apiGroups: [\"policy\"]",
+                Some("- apiGroups: [\"policy\"]"),
                 "resources: [\"poddisruptionbudgets\"]",
                 "verbs: [\"create\", \"patch\", \"delete\"]",
             ),
             (
-                "- apiGroups: [\"batch\"]",
+                Some("- apiGroups: [\"batch\"]"),
                 "resources: [\"jobs\"]",
                 "verbs: [\"create\", \"patch\", \"get\", \"delete\"]",
             ),
             (
-                "- apiGroups: [\"\"]",
+                // /version detection (issue #1714): a non-resource rule, so it
+                // carries its own `- ` dash and has no apiGroups line above it.
+                None,
+                "- nonResourceURLs: [\"/version\"]",
+                "verbs: [\"get\"]",
+            ),
+            (
+                Some("- apiGroups: [\"\"]"),
                 "resources: [\"secrets\"]",
                 "verbs: [\"get\"]",
             ),
@@ -6428,7 +6443,7 @@ mod tests {
         let lines: Vec<&str> = manifest.lines().map(str::trim).collect();
 
         // Exhaustiveness: the table must pin every rule in the manifest. Count the
-        // `verbs:` lines and require the table length to match, so a thirteenth
+        // `verbs:` lines and require the table length to match, so a fourteenth
         // rule cannot be added without a matching table row.
         let verbs_lines = lines.iter().filter(|l| l.starts_with("verbs:")).count();
         assert_eq!(
@@ -6440,28 +6455,30 @@ mod tests {
         );
 
         for rule in rules {
-            let (apigroups_line, resources_line, expected_verbs) = *rule;
-            // The resources line identifies the rule; assert it occurs exactly
-            // once so a duplicated resources line with wider verbs cannot hide
-            // behind the first match.
-            let occurrences = lines.iter().filter(|l| **l == resources_line).count();
+            let (apigroups_line, identifying_line, expected_verbs) = *rule;
+            // The identifying line identifies the rule; assert it occurs exactly
+            // once so a duplicated line with wider verbs cannot hide behind the
+            // first match.
+            let occurrences = lines.iter().filter(|l| **l == identifying_line).count();
             assert_eq!(
                 occurrences, 1,
-                "the {resources_line} rule must appear exactly once"
+                "the {identifying_line} rule must appear exactly once"
             );
             let idx = lines
                 .iter()
-                .position(|l| *l == resources_line)
-                .unwrap_or_else(|| panic!("rbac.yaml defines a rule for {resources_line}"));
-            assert_eq!(
-                idx.checked_sub(1).and_then(|i| lines.get(i)).copied(),
-                Some(apigroups_line),
-                "the {resources_line} rule must be under {apigroups_line}"
-            );
+                .position(|l| *l == identifying_line)
+                .unwrap_or_else(|| panic!("rbac.yaml defines a rule for {identifying_line}"));
+            if let Some(apigroups_line) = apigroups_line {
+                assert_eq!(
+                    idx.checked_sub(1).and_then(|i| lines.get(i)).copied(),
+                    Some(apigroups_line),
+                    "the {identifying_line} rule must be under {apigroups_line}"
+                );
+            }
             assert_eq!(
                 lines.get(idx + 1).copied(),
                 Some(expected_verbs),
-                "the {resources_line} rule must grant exactly {expected_verbs}"
+                "the {identifying_line} rule must grant exactly {expected_verbs}"
             );
         }
     }
