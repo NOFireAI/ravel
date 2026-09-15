@@ -360,6 +360,10 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
         stats: FetchStats {
             raw_f64_pages: summary.raw_f64_pages,
             raw_f64_bytes: summary.raw_f64_bytes,
+            // A metrics slice returns its histogram-kind series as their own
+            // frames (`histogram` above) rather than dropping them, so nothing
+            // was skipped for a caller to be warned about.
+            histogram_series_skipped: 0,
         },
         series_returned: summary.series_returned,
         samples_returned: summary.samples_returned,
@@ -423,6 +427,8 @@ pub fn decode_log_slice_frames(
         stats: FetchStats {
             raw_f64_pages: summary.raw_f64_pages,
             raw_f64_bytes: summary.raw_f64_bytes,
+            // The log signal has no histogram-kind series to skip.
+            histogram_series_skipped: 0,
         },
         records_returned: summary.series_returned,
         status: code,
@@ -485,6 +491,8 @@ pub fn decode_span_slice_frames(
         stats: FetchStats {
             raw_f64_pages: summary.raw_f64_pages,
             raw_f64_bytes: summary.raw_f64_bytes,
+            // The span signal has no histogram-kind series to skip.
+            histogram_series_skipped: 0,
         },
         spans_returned: summary.series_returned,
         status: code,
