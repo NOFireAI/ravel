@@ -119,9 +119,16 @@ for exit_code in 0 3; do
   call_count="$(wc -l <"${call_log}" | tr -d ' ')"
   check_eq "with-gates stub invoked exactly once (stub exit ${exit_code})" "1" "${call_count}"
 
-  worktree_dir="${worktree_parent}/verify-$(cd "${repo}" && git rev-parse --short HEAD)"
+  # Prefix, not an exact path: the worktree name carries a per-invocation
+  # suffix so two runs of one ref cannot collide, and pinning the old exact
+  # shape here would force that suffix back off.
+  worktree_prefix="${worktree_parent}/verify-$(cd "${repo}" && git rev-parse --short HEAD)-"
   logged_cwd="$(sed -n 's/^cwd=\(.*\) args=.*/\1/p' "${call_log}")"
-  check_eq "with-gates stub ran inside the worktree (stub exit ${exit_code})" "${worktree_dir}" "${logged_cwd}"
+  case "${logged_cwd}" in
+    "${worktree_prefix}"*) inside="yes" ;;
+    *) inside="no (${logged_cwd})" ;;
+  esac
+  check_eq "with-gates stub ran inside the worktree (stub exit ${exit_code})" "yes" "${inside}"
 
   # Unscoped, or the real gates.sh writes no receipt: it only stamps one when
   # its crate-argument list is empty, so a scoped invocation here would leave
@@ -134,8 +141,9 @@ for exit_code in 0 3; do
     check_true "with-gates prints a receipt path on success" "$([[ -n "${printed_receipt}" ]] && echo 1 || echo 0)"
   fi
 
-  # Worktree must always be removed, pass or fail.
-  remaining="$(git -C "${repo}" worktree list --porcelain | grep -c "^worktree ${worktree_dir}$" || true)"
+  # Worktree must always be removed, pass or fail. Counted by prefix, so any
+  # worktree this run created is caught whatever per-invocation suffix it got.
+  remaining="$(git -C "${repo}" worktree list --porcelain | grep -c "^worktree ${worktree_prefix}" || true)"
   check_eq "with-gates cleans up the worktree (stub exit ${exit_code})" "0" "${remaining}"
 done
 
@@ -187,9 +195,13 @@ check_eq "VERIFY_WITH_GATES=1 exit code propagated" "0" "${got_exit}"
 call_count="$(wc -l <"${call_log}" | tr -d ' ')"
 check_eq "VERIFY_WITH_GATES=1 invokes the gate exactly once" "1" "${call_count}"
 
-worktree_dir="${worktree_parent}/verify-$(cd "${repo}" && git rev-parse --short HEAD)"
+worktree_prefix="${worktree_parent}/verify-$(cd "${repo}" && git rev-parse --short HEAD)-"
 logged_cwd="$(sed -n 's/^cwd=\(.*\) args=.*/\1/p' "${call_log}")"
-check_eq "VERIFY_WITH_GATES=1 runs the gate inside the worktree" "${worktree_dir}" "${logged_cwd}"
+case "${logged_cwd}" in
+  "${worktree_prefix}"*) inside="yes" ;;
+  *) inside="no (${logged_cwd})" ;;
+esac
+check_eq "VERIFY_WITH_GATES=1 runs the gate inside the worktree" "yes" "${inside}"
 
 logged_args="$(sed -n 's/^cwd=.* args=\(.*\)/\1/p' "${call_log}")"
 check_eq "VERIFY_WITH_GATES=1 invokes the gate unscoped" "0" "${logged_args}"
@@ -227,6 +239,66 @@ want_calls="$(printf '%s\n' \
   'test --locked --doc --workspace')"
 got_calls="$(cat "${call_log}")"
 check_eq "default mode invokes the five cargo commands in order" "${want_calls}" "${got_calls}"
+
+# === (d) one run must not delete another run's worktree. ==================
+#
+# `verify-${short_sha}` collided whenever two runs verified the same ref,
+# which is the normal case: a result branch is verified, comes back with a
+# finding, and is verified again while the first run is still building. The
+# second run's `git worktree add` failed with "already exists" and its EXIT
+# trap -- installed before creation and unconditional -- removed the FIRST
+# run's worktree, taking an in-flight cold build with it. It surfaced as a
+# corrupted gate rather than as a collision.
+#
+# Mutation: drop the per-invocation suffix from worktree_dir, or set
+# created_worktree before `git worktree add` instead of after; either fails
+# the first case below.
+repo="${tmproot}/repo-d"
+worktree_parent="${tmproot}/wt-d"
+new_repo "${repo}"
+short="$(cd "${repo}" && git rev-parse --short HEAD)"
+
+# A worktree standing in for another run that is mid-build, at the exact path
+# the old naming scheme would have chosen.
+victim="${worktree_parent}/verify-${short}"
+mkdir -p "${worktree_parent}"
+git -C "${repo}" worktree add --detach -q "${victim}" HEAD
+printf 'in flight\n' >"${victim}/.in-flight"
+
+stub_gates="${tmproot}/stub-gates-d.sh"
+make_stub_gates "${stub_gates}"
+call_log="${tmproot}/call-log-d"
+: >"${call_log}"
+(cd "${repo}" && CALL_LOG="${call_log}" STUB_GATES_EXIT="0" \
+  GATES_SH="${stub_gates}" "${VERIFY_SCRIPT}" --with-gates HEAD "${worktree_parent}" >/dev/null 2>&1) || true
+
+check_true "a second run leaves the first run's worktree alone" \
+  "$([[ -f "${victim}/.in-flight" ]] && echo 1 || echo 0)"
+check_true "and git still tracks it" \
+  "$(git -C "${repo}" worktree list --porcelain | grep -qc "^worktree ${victim}$" && echo 1 || echo 0)"
+
+# It also cleans up after ITSELF: only the victim is left behind.
+own="$(git -C "${repo}" worktree list --porcelain \
+  | sed -n "s|^worktree ${worktree_parent}/|&|p" | grep -vc "verify-${short}$" || true)"
+check_eq "and removes only the worktree it created" "0" "${own}"
+
+# === (e) a failed `worktree add` removes nothing. =========================
+#
+# The narrow case: creation fails, so this run owns no directory, so its
+# cleanup must be a no-op. Forced by pointing the run at a parent directory
+# whose target path already exists as a plain file.
+repo="${tmproot}/repo-e"
+worktree_parent="${tmproot}/wt-e"
+new_repo "${repo}"
+mkdir -p "${worktree_parent}"
+# Pre-create a bystander worktree; nothing this run does may touch it.
+bystander="${worktree_parent}/bystander"
+git -C "${repo}" worktree add --detach -q "${bystander}" HEAD
+printf 'keep me\n' >"${bystander}/.keep"
+
+(cd "${repo}" && "${VERIFY_SCRIPT}" "does-not-resolve-as-a-ref" "${worktree_parent}" >/dev/null 2>&1) || true
+check_true "an unresolvable ref leaves a bystander worktree intact" \
+  "$([[ -f "${bystander}/.keep" ]] && echo 1 || echo 0)"
 
 echo
 echo "passed: ${pass}  failed: ${fail}"
