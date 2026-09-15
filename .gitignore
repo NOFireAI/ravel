@@ -27,6 +27,11 @@ graft/
 # Local, per-checkout state for .claude/guards/epic-status-nudge.mjs.
 .claude/.epic-status-nudge-state.json
 
+# scripts/epic-orchestrator.sh's per-epic index. The epic issue body is the
+# durable ledger; this is a local cache of it plus the CI signatures seen on
+# a head, so it is per-machine and never committed.
+.claude/epic-state/
+
 # The disk watchdog drops this in the scope directory when it fires; the
 # harness commit-on-death sweeps an unignored file into a wip commit.
 .disk-watchdog-fired

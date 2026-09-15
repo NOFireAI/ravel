@@ -252,6 +252,17 @@ landed: <merge-sha> <merge-sha2>; main=<sha>; closed #103 #106
 
 ## Resume after a dropped session
 
+0. `scripts/epic-orchestrator.sh reconcile <epic>` first. It rewrites
+   `.claude/epic-state/<epic>.json` from live GitHub state and exits 65 on
+   any drift that must be fixed before the next dispatch, including a task
+   the local index knows about that never reached the issue body. A task
+   with a start ref and no result ref comes back UNRESOLVED, not running:
+   only `fleet_status` separates RUNNING from LOST, and calling it running
+   is how a dead task's ticket sits unfixed for the rest of the session.
+   `resume-get <epic>` says whether an interruption is parked and how long
+   the backoff has to run; a rate limit, a 5xx or a session limit is parked
+   with `resume-set --reason`, which exits 69 with the delay to pass to
+   ScheduleWakeup, or 75 when the error is fatal or the budget is spent.
 1. Read the epic issue ledger; find the last wave block and its status.
 2. Any task_id without a terminal ledger line: `fleet_status` it, verify
    its result ref with `git ls-remote`, resume that stage's procedure.
