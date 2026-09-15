@@ -99,30 +99,11 @@ head_sha="$(echo "${pr_json}" | jq -r '.headRefOid')"
 base_ref="$(echo "${pr_json}" | jq -r '.baseRefName // empty')"
 [[ -n "${base_ref}" ]] || base_ref="main"
 
-# `statusCheckRollup` can mix two shapes: a `CheckRun` (GitHub Actions and
-# most modern integrations -- `status`/`conclusion`, name in `.name`) and a
-# legacy `StatusContext` (the older commit-status API some third-party
-# integrations still use -- `state` only, name in `.context`). Classify each
-# entry once, by shape, into one bucket, so neither shape nor an unrecognized
-# value inside a recognized shape can silently vanish from every count.
-normalized="$(echo "${pr_json}" | jq '
-  [.statusCheckRollup[]? | {
-    name: (.name // .context // "unknown"),
-    class: (
-      if has("state") then
-        (if .state=="SUCCESS" then "success"
-         elif (.state=="PENDING" or .state=="EXPECTED") then "pending"
-         elif (.state=="FAILURE" or .state=="ERROR") then "failing"
-         else "other" end)
-      elif has("status") then
-        (if .status!="COMPLETED" then "pending"
-         elif .conclusion=="SKIPPED" then "skipped"
-         elif (.conclusion=="SUCCESS" or .conclusion=="NEUTRAL") then "success"
-         elif (.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT") then "failing"
-         else "other" end)
-      else "other" end
-    )
-  }]')"
+# One classifier, shared with scripts/guards/assert-green-head.sh: two
+# scripts that can disagree about whether a pull request is green are worse
+# than one. The shapes it has to tell apart, and why a skipped check is its
+# own bucket, are documented in the filter itself.
+normalized="$(echo "${pr_json}" | jq -f "${script_dir}/lib/check-rollup-classify.jq")"
 pending=$(echo "${normalized}" | jq '[.[] | select(.class=="pending")] | length')
 success=$(echo "${normalized}" | jq '[.[] | select(.class=="success")] | length')
 failing=$(echo "${normalized}" | jq '[.[] | select(.class=="failing")] | length')
