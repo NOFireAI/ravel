@@ -8,9 +8,10 @@
 #
 #   * strict-ack-implies-durable: every write acked under strict ack before
 #     the kill is durable and queryable after restart;
-#   * no partial flush is visible (no commit token beyond the last strict ack
-#     becomes queryable);
-#   * custody-and-catalog verification clean.
+#   * custody-and-catalog verification clean, which is also what discharges
+#     partial-flush visibility here: no live record references an unacked or
+#     partial object. Commit tokens are opaque base64, so there is no "one
+#     past the last ack" token to probe for; see the note in lib.sh.
 #
 # This is the exit criterion's "kill -9 mid-flush against MinIO with no
 # strict-ack violation" row (ADR-0077 section 4).
