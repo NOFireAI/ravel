@@ -195,6 +195,35 @@ check_contains "disjoint: says so"             "overlaps no other open pull requ
 check_absent   "disjoint: no shell error noise" "Illegal number"     "${out}"
 check_absent   "disjoint: no integer error"     "integer expression" "${out}"
 
+# --- a peer's file list unreadable -> say so, and do NOT report a clean bill ---
+# `files_of` returns nothing on a transient 5xx exactly as it does on a genuinely
+# empty diff, and the loop used to `continue` on that with no note. The run then
+# printed "overlaps no other open pull request", which is a claim about every
+# open pull request made after comparing fewer than all of them. Stub #102's
+# files call as failing while everything else about it works.
+root="$(mktemp -d)"
+build_repo "${root}/repo" diff
+write_gh_stub "${root}/bin" shared.txt
+python3 - "${root}/bin/gh" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = """    102) printf '"""
+assert s.count(old) == 1, "stub files branch for 102 not found"
+s = s.replace(old, """    102) exit 1 ;;
+    999) printf '""", 1)
+open(p, 'w').write(s)
+PYEOF
+set +e
+out="$( cd "${root}/repo" && PATH="${root}/bin:${PATH}" sh "${SCRIPT}" 101 origin 2>&1 )"
+rc=$?
+set -e
+rm -rf "${root}"
+check_contains "unreadable peer: names it"          "could not read #102's file list" "${out}"
+check_contains "unreadable peer: qualifies clean"   "could NOT be read and were skipped" "${out}"
+check_absent   "unreadable peer: no clean bill"     "overlaps no other open pull request" "${out}"
+check_eq       "unreadable peer: exits 2 not 0"     "2" "${rc}"
+
 # --- other side's diff unfetchable (fork PR, deleted branch) -> say so ---
 # The IDENTICAL branch needs the other PR's head under refs/heads on this
 # remote. A fork PR's head is not, and a deleted branch is gone, so patch_id_of
