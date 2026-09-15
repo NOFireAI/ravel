@@ -10,7 +10,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **The physical retention sweep is now all-or-nothing under a legal
   hold** (issue #1697). A hold on any key the pass would delete (a commit,
-  compaction or rewrite record, an L0 data object, an L1 part, or the
+  compaction or rewrite record, an L0 data object, an L1 object, or the
   tombstone) makes the pass delete nothing and return `SweptPartial`; before,
   the pass skipped only the held keys and deleted the commit records and
   tombstone that named the held bytes. A bucket parked this way counts on the

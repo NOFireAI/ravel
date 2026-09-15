@@ -437,8 +437,8 @@ The count is `ravel_maintain::retention::held_by_lease_buckets_total`, the
 process-wide seam for
 `ravel_maintain_retention_held_by_lease_buckets_total`, one per bucket per
 declining pass. Like the version-hold counter beside it
-(`held_out_of_window_objects_total`, ADR-0066) it is a seam today and not yet on
-the scrape endpoint. A held bucket is a bucket kept past its retention window,
+(`held_out_of_window_objects_total`) it is a seam today and not yet on the
+scrape endpoint. A held bucket is a bucket kept past its retention window,
 so this rises for as long as the hold stands, which is expected; it goes flat
 again once the hold is cleared and the next pass retires the bucket. A total
 that keeps rising after every hold is cleared means some scope is still
