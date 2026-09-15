@@ -216,60 +216,108 @@ fn dynamic_resolver_reason(
     None
 }
 
-/// The reason a resolver configuration can resolve more than one local tenant,
-/// or `None` when at most one tenant can ever resolve. Any dynamic resolver
-/// qualifies on its own; otherwise a static bearer map is bounded by its
-/// distinct values.
+/// Every local tenant this coordinator runs queries for, as hashes.
+///
+/// Two sources, not one. The distinct `--tenant-token` values are the tenants a
+/// REQUEST can authenticate as. `--alert-rules-file` names more: `alerting::
+/// spawn` starts one evaluator per tenant in the rules document, against the
+/// same `QueryEngine` the federation context is installed on, and those queries
+/// originate from no request. So a tenant named only there federates exactly
+/// like a token-mapped one, and the token map alone is not the tenant set.
+///
+/// Hashes rather than [`ravel_types::TenantId`]s because that is what
+/// `Federation::remotes_for` compares: `alerting::parse_rules` keys its map by
+/// `TenantId::new(&spec.tenant).hash()` and `ravel_server::start` keys each
+/// remote by `rc.tenant.hash()`, the same derivation under the same installed
+/// scheme, so comparing hashes here asks the question the dispatch actually
+/// answers.
+fn local_tenant_hashes(
+    tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
+    alert_rule_tenants: &[ravel_types::TenantHash],
+) -> std::collections::HashSet<ravel_types::TenantHash> {
+    tenant_tokens
+        .values()
+        .map(|t| t.hash())
+        .chain(alert_rule_tenants.iter().copied())
+        .collect()
+}
+
+/// The reason this coordinator runs queries for more than one local tenant, or
+/// `None` when at most one tenant can ever be queried for. Any dynamic resolver
+/// qualifies on its own; otherwise the set is bounded by
+/// [`local_tenant_hashes`].
 fn multi_tenant_resolver_reason(
     tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
+    alert_rule_tenants: &[ravel_types::TenantHash],
     dev_insecure_tenant_header: bool,
     auth: &config::AuthResolverSettings,
 ) -> Option<String> {
     if let Some(reason) = dynamic_resolver_reason(dev_insecure_tenant_header, auth) {
         return Some(reason);
     }
-    let distinct: std::collections::HashSet<&ravel_types::TenantId> =
-        tenant_tokens.values().collect();
-    if distinct.len() > 1 {
-        return Some(format!(
-            "{} distinct --tenant-token tenants are configured",
-            distinct.len()
-        ));
+    let from_tokens: std::collections::HashSet<ravel_types::TenantHash> =
+        tenant_tokens.values().map(|t| t.hash()).collect();
+    let all = local_tenant_hashes(tenant_tokens, alert_rule_tenants);
+    if all.len() > 1 {
+        let alert_only = all.len() - from_tokens.len();
+        return Some(if alert_only == 0 {
+            format!(
+                "{} distinct --tenant-token tenants are configured",
+                from_tokens.len()
+            )
+        } else {
+            format!(
+                "{} distinct local tenants are configured: {} from --tenant-token and \
+                 {alert_only} named only in --alert-rules-file",
+                all.len(),
+                from_tokens.len()
+            )
+        });
     }
     None
 }
 
 /// Refuse a `--remote-cluster` that names no local tenant on a coordinator that
-/// can resolve more than one.
+/// runs queries for more than one.
 ///
 /// A remote cluster's credential authorizes one tenant's data on that remote, so
 /// it belongs to one local tenant, named by the spec's `tenant` key. A spec
-/// without that key serves every local tenant: correct where only one can
-/// resolve, and on a multi-tenant coordinator exactly the exposure the key
+/// without that key serves every local tenant: correct where only one can be
+/// queried for, and on a multi-tenant coordinator exactly the exposure the key
 /// exists to remove, since every local tenant's federated metric selectors and
 /// discovery calls would then fan out under that one credential and receive
 /// another tenant's series.
 ///
 /// Also refuses a mapping that can never fire: when the tenant set is fully
-/// known (static bearer tokens only, no resolver that derives a tenant from a
+/// known (static configuration only, no resolver that derives a tenant from a
 /// request), a `tenant` naming a tenant outside it is a typo whose only symptom
 /// would be a remote that silently answers nobody.
 ///
-/// Call this at startup once the resolver inputs and remote clusters are parsed,
-/// before any listener binds; it is a no-op when no remote cluster is
-/// configured.
+/// `alert_rule_tenants` is the tenant set of `--alert-rules-file`
+/// (`alerting::parse_rules`'s map keys). It counts on both sides: the alert
+/// evaluators query the same engine, under no request, so a tenant named only
+/// there is a second local tenant for the unkeyed-spec refusal AND a valid
+/// target for a `tenant` key. See [`local_tenant_hashes`].
+///
+/// Call this at startup once the resolver inputs, alert rules, and remote
+/// clusters are parsed, before any listener binds; it is a no-op when no remote
+/// cluster is configured.
 pub fn ensure_federation_tenant_mapping(
     remote_clusters: &[config::RemoteClusterConfig],
     tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
+    alert_rule_tenants: &[ravel_types::TenantHash],
     dev_insecure_tenant_header: bool,
     auth: &config::AuthResolverSettings,
 ) -> anyhow::Result<()> {
     if remote_clusters.is_empty() {
         return Ok(());
     }
-    if let Some(reason) =
-        multi_tenant_resolver_reason(tenant_tokens, dev_insecure_tenant_header, auth)
-    {
+    if let Some(reason) = multi_tenant_resolver_reason(
+        tenant_tokens,
+        alert_rule_tenants,
+        dev_insecure_tenant_header,
+        auth,
+    ) {
         let unkeyed: Vec<&str> = remote_clusters
             .iter()
             .filter(|rc| rc.tenant.is_none())
@@ -277,8 +325,8 @@ pub fn ensure_federation_tenant_mapping(
             .collect();
         if !unkeyed.is_empty() {
             anyhow::bail!(
-                "--remote-cluster {} names no local tenant on a coordinator that can resolve more \
-                 than one local tenant ({reason}). A remote cluster holds one remote credential \
+                "--remote-cluster {} names no local tenant on a coordinator that runs queries for \
+                 more than one local tenant ({reason}). A remote cluster holds one remote credential \
                  and cannot express one credential per local tenant, so every local tenant's \
                  federated metric selectors and discovery calls would fan out under that single \
                  credential and receive another tenant's series. Add tenant=<local tenant> to \
@@ -294,32 +342,39 @@ pub fn ensure_federation_tenant_mapping(
             );
         }
     }
-    // The static bearer map is the whole tenant set only when no resolver
-    // derives a tenant from a request, and an empty map configures no tenants at
+    // The static configuration is the whole tenant set only when no resolver
+    // derives a tenant from a request, and an empty set configures no tenants at
     // all rather than asserting there are none. Outside those two cases a
     // `tenant` value that is absent here may still resolve at request time, so
     // there is nothing to check. Note this is NOT gated on the coordinator being
     // single-tenant: two static tenants are two tenants and still a fully known
     // set, which is exactly the multi-tenant deployment the mapping is for.
-    if dynamic_resolver_reason(dev_insecure_tenant_header, auth).is_none()
-        && !tenant_tokens.is_empty()
-    {
-        let known: std::collections::HashSet<&ravel_types::TenantId> =
-            tenant_tokens.values().collect();
+    let known = local_tenant_hashes(tenant_tokens, alert_rule_tenants);
+    if dynamic_resolver_reason(dev_insecure_tenant_header, auth).is_none() && !known.is_empty() {
         for rc in remote_clusters {
             if let Some(tenant) = &rc.tenant
-                && !known.contains(tenant)
+                && !known.contains(&tenant.hash())
             {
-                let mut names: Vec<&str> = known.iter().map(|t| t.as_str()).collect();
+                // Only the token map carries tenant NAMES; the alert-rules map
+                // is keyed by hash, so it can be counted here but not listed.
+                let mut names: Vec<&str> = tenant_tokens.values().map(|t| t.as_str()).collect();
                 names.sort_unstable();
+                names.dedup();
                 anyhow::bail!(
                     "--remote-cluster '{}' maps to local tenant '{}', which no --tenant-token \
-                     configures (configured: {}). No request can ever resolve to that tenant, so \
-                     this remote would answer no query at all. Fix the tenant name, or configure \
-                     a --tenant-token for it.",
+                     configures and no --alert-rules-file rule names (--tenant-token tenants: {}; \
+                     --alert-rules-file adds {} more, matched by hash). Nothing on this \
+                     coordinator can ever run a query for that tenant, so this remote would answer \
+                     nothing at all. Fix the tenant name, configure a --tenant-token for it, or \
+                     give it an alert rule.",
                     rc.name,
                     tenant.as_str(),
-                    names.join(", ")
+                    if names.is_empty() {
+                        "none".to_string()
+                    } else {
+                        names.join(", ")
+                    },
+                    alert_rule_tenants.len()
                 );
             }
         }
