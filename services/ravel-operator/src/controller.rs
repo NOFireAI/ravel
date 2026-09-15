@@ -3039,10 +3039,17 @@ mod tests {
     /// recovers `31`, and that recovered value is still below the floor.
     #[test]
     fn apiserver_below_the_kubernetes_floor_sets_the_unsupported_condition() {
+        // The floor is pinned as a literal here so the table's derived
+        // expectations cannot drift with the constant: raising it to 33 would
+        // otherwise turn the "32" row into an expected condition and pass.
+        assert_eq!(MIN_KUBERNETES_MINOR_VERSION, 32);
         let cases: &[(&str, &str, Option<u32>)] = &[
             ("31", "v1.31.6", Some(31)),
             ("32", "v1.32.0", Some(32)),
             ("32+", "v1.32.2-gke.1234", Some(32)),
+            // No usable git_version: only the leading-digits parse of "32+"
+            // can produce 32, so a bare integer parse fails this row.
+            ("32+", "unknown", Some(32)),
             ("33", "v1.33.1", Some(33)),
             ("unknown", "unknown", None),
             ("", "v1.31.6", Some(31)),
