@@ -192,14 +192,6 @@ impl Federation {
         Federation { remotes }
     }
 
-    /// The configured remotes (for diagnostics and tests). This is every
-    /// remote the process holds, across all local tenants; a query never fans
-    /// out to all of them. Use [`Self::remotes_for`] for what one tenant
-    /// actually reaches.
-    pub fn remotes(&self) -> &[RemoteCluster] {
-        &self.remotes
-    }
-
     /// The remotes `tenant_hash` fans out to: those mapped to exactly this
     /// local tenant, plus any unkeyed remote (see [`RemoteCluster::tenant`]).
     /// This is the single place the local-tenant-to-remote-credential mapping is
