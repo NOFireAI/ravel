@@ -15,6 +15,18 @@ Python 3 standard library only, matching scripts/check_docs.py: CI's doc-scripts
 job installs no toolchain beyond the interpreter, so the reader's set is parsed
 from source text rather than by building and running the crate.
 
+Two limits on what this proves, both deliberate:
+
+  - It ties the MARKER to the source, not the prose. A doc whose marker reads
+    `= 7` while its surrounding paragraphs still describe a two-version window
+    passes. The marker comments ask a human to keep the number in the paragraph
+    in step; nothing enforces that.
+  - MAPPINGS below is hand-maintained. The `compared == 0` guard catches an
+    emptied list, not a missing row, so a fourth bulk-format crate added later
+    carries no marker requirement until someone adds it here. Coverage is
+    complete today: `SupportedVersions` constructors exist only in
+    ravel-segment, ravel-logseg and ravel-rspan.
+
 Fail-closed by construction:
   - The checker's own comparison logic is exercised against synthetic inputs
     (including a deliberate mismatch that MUST be flagged) before the repo is

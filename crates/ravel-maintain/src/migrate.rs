@@ -1422,12 +1422,14 @@ mod tests {
                 );
                 break;
             }
-            // A walk that has not drained still has a bucket below the target, so
-            // the floor must not have risen: it rises only after the last one.
+            // The floor rises only on the invocation whose walk drains. On the
+            // last partial pass every bucket has already converted and none is
+            // below the target, so the reason the floor is still unraised is
+            // the undrained walk, not a straggler.
             partial_invocations += 1;
             assert_eq!(
                 floor, None,
-                "the floor stayed unraised while a bucket sat below the target"
+                "the floor rises only once the walk drains, never on a partial invocation"
             );
             assert!(invocations < 10, "resume loop failed to converge");
         }
@@ -1467,6 +1469,11 @@ mod tests {
                     ravel_segment::ReaderLimits::default(),
                 )
                 .expect("migration output is a readable RSEG segment");
+                // Entailed by the expect above while WINDOW holds one version:
+                // open_from_full refuses anything outside it. Kept for the day
+                // the window widens, when it starts pinning that the migration
+                // published at the target rather than at some other admitted
+                // version.
                 assert_eq!(
                     u32::from(loc.version),
                     target,

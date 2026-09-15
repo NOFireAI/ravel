@@ -17,6 +17,14 @@ Refs: issue #892. Applies ADR-0027 decision 7 and ADR-0066 decision 1 (the
 single-version regime that holds until first public release); removes the
 version gate added by #887; removes the defect class behind #891.
 
+> The meaning of "first public release" throughout this ADR is disambiguated by
+> ADR-0531 (proposed): it denotes a not-yet-reached format-lifecycle activation
+> milestone, distinct from the software's first public release at 0.9.0. Under
+> that reading, the question this ADR raises under "Rejected alternatives", of
+> whether the N/N-1 window should begin before first release, is still open and
+> the window is still staged. The two-version reader this ADR removes was an
+> unretired predecessor, not that window opening early.
+
 ## Context
 
 Before this change, RLOG's reader accepted two format versions.
