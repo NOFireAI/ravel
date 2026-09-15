@@ -49,6 +49,39 @@ pub(crate) fn eval_binary(
         });
     }
     let op = b.op.id();
+    // Operator class first, before any dispatch on operand types. Everything
+    // downstream splits the operator space two ways (`is_comparison` picks
+    // `apply_cmp`, everything else falls to `apply_arith`; `is_set_operator`
+    // picks the set path only on a Vector/Vector pair), so a token in neither
+    // the arithmetic nor the comparison set would arrive at `apply_arith`'s
+    // fallback. Ravel narrows it here rather than resting on promql-parser's
+    // own `check_ast`, which sits on a caret version range.
+    if !is_set_operator(op) && !is_arithmetic(op) && !is_comparison(op) {
+        return Err(Error::Unsupported {
+            construct: format!("binary operator {}", b.op),
+        });
+    }
+    // A set operator is only defined over two instant vectors. The scalar
+    // shapes below would otherwise route through `eval_scalar_scalar` or
+    // `eval_scalar_vector`, both of which treat a non-comparison operator as
+    // arithmetic and reach `apply_arith`'s fallback.
+    if is_set_operator(op)
+        && matches!(
+            (&lhs, &rhs),
+            (Value::Scalar(_), Value::Scalar(_))
+                | (Value::Scalar(_), Value::Vector(_))
+                | (Value::Vector(_), Value::Scalar(_))
+        )
+    {
+        return Err(Error::Unsupported {
+            construct: format!(
+                "set operator {} over {} and {} operands",
+                b.op,
+                lhs.type_name(),
+                rhs.type_name()
+            ),
+        });
+    }
 
     match (lhs, rhs) {
         (Value::Scalar(l), Value::Scalar(r)) => Ok(Value::Scalar(eval_scalar_scalar(op, l, r))),
@@ -77,6 +110,13 @@ fn is_comparison(op: TokenId) -> bool {
 
 fn is_set_operator(op: TokenId) -> bool {
     matches!(op, T_LAND | T_LOR | T_LUNLESS)
+}
+
+/// The seven tokens [`apply_arith`] implements. `eval_binary` uses this to
+/// refuse anything outside the three operator classes up front, so
+/// `apply_arith`'s fallback arm has no caller that can reach it.
+fn is_arithmetic(op: TokenId) -> bool {
+    matches!(op, T_ADD | T_SUB | T_MUL | T_DIV | T_MOD | T_POW | T_ATAN2)
 }
 
 /// Whether any element of `v` is a native-histogram sample.
@@ -116,9 +156,12 @@ fn apply_arith(op: TokenId, l: f64, r: f64) -> f64 {
         // Prometheus computes `math.Atan2(lhs, rhs)`; Rust's `l.atan2(r)` is
         // `atan2(self, other)` with the same (y, x) argument order.
         T_ATAN2 => l.atan2(r),
-        // unreachable-allow: eval_scalar_scalar/combine_value's is_comparison(op)
-        // check -- every comparison token is already routed to apply_cmp before
-        // either caller reaches this match.
+        // unreachable-allow: eval_binary's operator-class check -- it rejects
+        // any token that is neither arithmetic nor a comparison, and rejects a
+        // set operator on the Scalar/Scalar and Scalar/Vector shapes, before
+        // eval_scalar_scalar or eval_scalar_vector runs; is_comparison then
+        // routes every remaining comparison token to apply_cmp, leaving only
+        // the seven arithmetic tokens for this match.
         _ => unreachable!("apply_arith called with non-arithmetic operator {op}"),
     }
 }
@@ -134,9 +177,9 @@ fn apply_cmp(op: TokenId, l: f64, r: f64) -> bool {
         T_LSS => l < r,
         T_GTE => l >= r,
         T_LTE => l <= r,
-        // unreachable-allow: eval_scalar_scalar/combine_value's is_comparison(op)
-        // check -- apply_cmp is only ever called from the branch where that
-        // check already returned true.
+        // unreachable-allow: is_comparison(op) -- apply_cmp has exactly two
+        // callers, eval_scalar_scalar and combine_value, and each calls it
+        // only from the branch where that check already returned true.
         _ => unreachable!("apply_cmp called with non-comparison operator {op}"),
     }
 }
@@ -236,9 +279,9 @@ fn eval_vector_vector(
             T_LAND => set_and(lhs, rhs, matching),
             T_LOR => set_or(lhs, rhs, matching),
             T_LUNLESS => set_unless(lhs, rhs, matching),
-            // unreachable-allow: is_set_operator's own three-token match --
-            // the `if is_set_operator(op)` guard above already guarantees op
-            // is one of exactly these three before this match runs.
+            // unreachable-allow: is_set_operator(op) -- the guard on the
+            // enclosing `if` already narrowed op to exactly these three
+            // tokens before this match runs.
             _ => unreachable!("is_set_operator matched an unhandled token"),
         });
     }
@@ -648,6 +691,97 @@ mod tests {
             construct.contains("string"),
             "rejection should name the operand types, got {construct:?}"
         );
+    }
+
+    /// Issue #1701 fix round: a set operator on two scalars reaches
+    /// `eval_scalar_scalar`, which treats every non-comparison token as
+    /// arithmetic and hands it to `apply_arith`'s `unreachable!` fallback.
+    /// promql-parser's `check_ast` is what keeps `1 and 2` from parsing, and
+    /// it sits on a caret version range, so `eval_binary` now refuses the
+    /// shape itself. Built from a synthetic `BinaryExpr` because the parser
+    /// will not produce one today.
+    #[test]
+    fn set_operator_on_two_scalars_rejects_without_panicking() {
+        use promql_parser::parser::token::{T_LAND, TokenType};
+        use promql_parser::parser::{BinaryExpr, parse};
+
+        let b = BinaryExpr {
+            op: TokenType::new(T_LAND),
+            lhs: Box::new(parse("1").expect("parses")),
+            rhs: Box::new(parse("2").expect("parses")),
+            modifier: None,
+        };
+        let ctx = crate::eval::QueryWindow::for_test();
+        let err = super::eval_binary(&Evaluator::new(), &source(), &b, 0, &ctx)
+            .expect_err("must reject, not panic");
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert_eq!(
+            construct,
+            "set operator and over scalar and scalar operands"
+        );
+    }
+
+    /// Issue #1701 fix round: the Scalar/Vector half of the same defect.
+    /// `eval_scalar_vector` routes a non-comparison token to `combine_value`,
+    /// which hands it to `apply_arith`'s fallback the same way.
+    #[test]
+    fn set_operator_on_scalar_and_vector_rejects_without_panicking() {
+        use promql_parser::parser::token::{T_LOR, TokenType};
+        use promql_parser::parser::{BinaryExpr, parse};
+
+        let b = BinaryExpr {
+            op: TokenType::new(T_LOR),
+            lhs: Box::new(parse("1").expect("parses")),
+            rhs: Box::new(parse("a").expect("parses")),
+            modifier: None,
+        };
+        let ctx = crate::eval::QueryWindow::for_test();
+        let err = super::eval_binary(&Evaluator::new(), &source(), &b, 0, &ctx)
+            .expect_err("must reject, not panic");
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert_eq!(
+            construct,
+            "set operator or over scalar and instant vector operands"
+        );
+
+        // and the other operand order.
+        let b = BinaryExpr {
+            op: TokenType::new(T_LOR),
+            lhs: Box::new(parse("a").expect("parses")),
+            rhs: Box::new(parse("1").expect("parses")),
+            modifier: None,
+        };
+        let err = super::eval_binary(&Evaluator::new(), &source(), &b, 0, &ctx)
+            .expect_err("must reject, not panic");
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert_eq!(
+            construct,
+            "set operator or over instant vector and scalar operands"
+        );
+    }
+
+    /// The same three queries as query TEXT, through the public evaluator.
+    /// promql-parser 0.10 rejects them at parse time; this pins that an
+    /// upgrade which starts accepting them still cannot reintroduce the panic
+    /// path, because `eval_binary`'s own check refuses the shape. Either a
+    /// parse error or an `Error::Unsupported` is a pass; a panic is not.
+    #[test]
+    fn set_operator_on_scalars_as_query_text_never_panics() {
+        for query in ["1 and 2", "1 or 2", "1 unless 2"] {
+            let err = Evaluator::new()
+                .eval_instant(&source(), query, 0)
+                .expect_err("must reject, not panic");
+            assert!(
+                matches!(err, Error::Parse(_) | Error::Unsupported { .. }),
+                "{query:?} should be a parse error or an Unsupported rejection, got {err:?}"
+            );
+        }
     }
 
     /// Issue #1701: `eval_vector_vector`'s `ManyToMany` arm used to

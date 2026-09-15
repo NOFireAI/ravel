@@ -345,9 +345,11 @@ fn reduce_group_samples(
                 reduce_group(op, &values),
             ))
         }
-        // unreachable-allow: eval_aggregate's unknown-aggregator-token arm --
-        // op only reaches here already narrowed to the plain-aggregate set by
-        // that dispatch, which now rejects anything else with Error::Unsupported.
+        // unreachable-allow: eval_aggregate's dispatch -- reduce_group_samples
+        // has one caller, eval_plain_aggregate, reached only from that
+        // dispatch's T_SUM | T_AVG | T_MIN | T_MAX | T_COUNT | T_GROUP |
+        // T_STDDEV | T_STDVAR arm; its unknown-aggregator-token arm rejects
+        // everything else with Error::Unsupported before either one runs.
         _ => unreachable!("reduce_group_samples called with non-plain aggregator {op}"),
     }
 }
@@ -360,9 +362,9 @@ fn aggregation_name(op: TokenId) -> &'static str {
         T_MAX => "max",
         T_STDDEV => "stddev",
         T_STDVAR => "stdvar",
-        // unreachable-allow: reduce_group_samples's T_MIN | T_MAX | T_STDDEV |
-        // T_STDVAR arm -- only that arm calls this helper, so op is already
-        // narrowed to the four float-only aggregators before it gets here.
+        // unreachable-allow: reduce_group_samples's float-only arm -- its
+        // T_MIN | T_MAX | T_STDDEV | T_STDVAR arm is this helper's only
+        // caller, so op is already narrowed to those four before it runs.
         _ => unreachable!("aggregation_name called with a non-dropping aggregator {op}"),
     }
 }
@@ -377,9 +379,11 @@ fn reduce_group(op: TokenId, values: &[f64]) -> f64 {
         T_GROUP => 1.0,
         T_STDDEV => group_welford(values).sqrt(),
         T_STDVAR => group_welford(values),
-        // unreachable-allow: eval_aggregate's unknown-aggregator-token arm --
-        // op only reaches here already narrowed to a reducing aggregator by
-        // that dispatch, which now rejects anything else with Error::Unsupported.
+        // unreachable-allow: reduce_group_samples's float-only arm -- its
+        // T_MIN | T_MAX | T_STDDEV | T_STDVAR arm is this helper's only
+        // caller, so op is already narrowed to those four before it runs
+        // (eval_aggregate's dispatch narrows to the plain-aggregate set one
+        // level further up, but that arm is the immediate narrowing).
         _ => unreachable!("reduce_group called with non-reducing aggregator {op}"),
     }
 }
@@ -929,9 +933,16 @@ mod tests {
         let Error::Unsupported { construct } = err else {
             panic!("expected Error::Unsupported, got {err:?}");
         };
+        // Same discrimination as `count_values_param_non_string`, the other
+        // way round: the param is a `StringLiteral`, so "typed string" is the
+        // part that depends on `type_name()`.
         assert!(
-            construct.contains("string"),
-            "rejection should name the wrong param type, got {construct:?}"
+            construct.contains("typed string"),
+            "rejection should name the actual param type, got {construct:?}"
+        );
+        assert!(
+            construct.contains("expected scalar"),
+            "rejection should name the expected param type, got {construct:?}"
         );
     }
 
@@ -989,9 +1000,17 @@ mod tests {
         let Error::Unsupported { construct } = err else {
             panic!("expected Error::Unsupported, got {err:?}");
         };
+        // The param is a `NumberLiteral`, so it evaluates to `Value::Scalar`
+        // and the message must name that. Asserting on "string" alone would
+        // be satisfied by the fixed "expected string" tail whatever
+        // `type_name()` actually returned.
         assert!(
-            construct.contains("string"),
-            "rejection should name the wrong param type, got {construct:?}"
+            construct.contains("typed scalar"),
+            "rejection should name the actual param type, got {construct:?}"
+        );
+        assert!(
+            construct.contains("expected string"),
+            "rejection should name the expected param type, got {construct:?}"
         );
     }
 
