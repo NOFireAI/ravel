@@ -223,7 +223,9 @@ cmd_record() {
     done | jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): .[1]}) | add // {}'
   )"
 
-  local v_issue v_ticket v_task v_pr v_sha v_status v_signature
+  local v_issue v_ticket v_task v_pr v_sha v_status v_signature v_run_key v_verdict
+  v_run_key="$(kv_get run_key "${pairs[@]:-}")"
+  v_verdict="$(kv_get verdict "${pairs[@]:-}")"
   v_issue="$(kv_get issue "${pairs[@]:-}")"
   v_ticket="$(kv_get ticket "${pairs[@]:-}")"
   v_task="$(kv_get task "${pairs[@]:-}")"
@@ -280,9 +282,22 @@ cmd_record() {
       ;;
     ci-attempt)
       [[ -n "${v_pr}" && -n "${v_sha}" ]] || die "ci-attempt needs pr=<number> sha=<sha>" 64
+      # Keyed by the CI RESULT observed, not by the call. Two invocations of
+      # the merge gate against one settled red run are one observation; only a
+      # new run, or a new attempt of the same run, is a second. Without the
+      # key, polling the gate escalates its own repeat reads as "the same
+      # failure twice".
+      [[ -n "${v_run_key}" ]] || die "ci-attempt needs run_key=<runs observed>" 64
       with_lock "${file}" mutate "${file}" \
-        '.ci[$pr] = ((.ci[$pr] // {}) | .[$sha] = (((.[$sha] // {attempts: 0, signatures: []})) | .attempts += 1 | .signatures += [$sig])) | .updated = $now' \
-        --arg pr "${v_pr}" --arg sha "${v_sha}" --arg sig "${v_signature}"
+        '.ci[$pr] = ((.ci[$pr] // {}) | .[$sha] = (
+           ((.[$sha] // {attempts: 0, signatures: [], observations: {}})
+            | if (.observations | has($key)) then .
+              else .attempts += 1
+                   | .signatures += [$sig]
+                   | .observations[$key] = {signature: $sig, verdict: $verdict, at: $now}
+              end))) | .updated = $now' \
+        --arg pr "${v_pr}" --arg sha "${v_sha}" --arg sig "${v_signature}" \
+        --arg key "${v_run_key}" --arg verdict "${v_verdict}"
       ;;
     *)
       die "record: unknown kind '${kind}'" 64
