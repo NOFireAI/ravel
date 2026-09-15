@@ -42,12 +42,6 @@
 //! prefix for issue #1679 apply here unchanged, over the same shared
 //! predicates:
 //!
-//! The reap needs `s3:DeleteObject` on this prefix, which the shipped query
-//! role does not have: `deploy/iam/query.json` grants no delete at all. Under
-//! that template every delete here is denied and logged, the GET-skip still
-//! applies, and the prefix stays as large as it was. See the tracking issue on
-//! the IAM templates before relying on the bound.
-//!
 //! - [`live_set`] skips the GET for a key the LIST result already shows as
 //!   older than the liveness window (`worker_set::mtime_stale`). A record's
 //!   `started_unix_ns` is stamped no later than the write that set the
@@ -65,6 +59,12 @@
 //!   listing. Reaping is idempotent and costs a live-but-skewed worker at most
 //!   one heartbeat interval of invisibility, since it rewrites its key every
 //!   `H`.
+//!
+//! The reap needs `s3:DeleteObject` on this prefix, which the shipped query
+//! role does not have: `deploy/iam/query.json` grants no delete at all. Under
+//! that template every delete here is denied and logged, the GET-skip still
+//! applies, and the prefix stays as large as it was. See the tracking issue on
+//! the IAM templates before relying on the bound.
 //!
 //! A backend reporting no usable modification time (`<= 0`) gets neither
 //! treatment: its keys are read as before and never reaped. The same holds for
