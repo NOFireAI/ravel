@@ -44,8 +44,9 @@ concurrency:
 
 jobs:
   bench-compare:
-    # Self-hosted reference runner only (ADR-0070 decision 3). Skipped, not
-    # failed, when no such runner is online.
+    # Self-hosted reference runner only (ADR-0070 decision 3). With no such
+    # runner online the job stays queued until one appears or GitHub times the
+    # queue out; it is not skipped.
     runs-on: [self-hosted, ravel-reference]
     timeout-minutes: 45
     permissions:
@@ -61,6 +62,17 @@ jobs:
           # Only a manual dispatch can enforce; the pull_request path is always
           # advisory. github.event.inputs.enforce is empty on non-dispatch runs.
           ENFORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.enforce == true }}
+          # Pinned, not left to the script defaults. RAVEL_BENCH_MAX_SERIES is
+          # part of the segment_encode bench id, so a compare run at a different
+          # cardinality than the baseline was recorded at produces a bench id
+          # that matches nothing: the arm reads as MISSING on one side and as an
+          # ignored extra on the other, and drops out of the comparison without
+          # failing anything. These must equal the values in the baseline's
+          # _meta.knobs.
+          BENCH_SAMPLE_SIZE: "10"
+          BENCH_WARMUP: "1"
+          BENCH_MEASURE: "3"
+          RAVEL_BENCH_MAX_SERIES: "2000"
         run: |
           if [ "$ENFORCE" = "true" ]; then
             scripts/bench-tier-b.sh compare bench/baselines/tier-b.json --enforce

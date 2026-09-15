@@ -76,14 +76,18 @@ def collect(args):
         benchmarks[bench_id] = {"median_ns": median, "mean_ns": mean}
     if not benchmarks:
         _die(f"no estimates.json found under {root}; did the benches run?")
+    meta = {
+        "label": args.label,
+        "note": (
+            "median_ns/mean_ns are criterion point estimates in nanoseconds. "
+            "See scripts/bench-compare.py and ADR-0070 decision 3."
+        ),
+    }
+    knobs = _parse_knobs(args.knob)
+    if knobs:
+        meta["knobs"] = knobs
     out = {
-        "_meta": {
-            "label": args.label,
-            "note": (
-                "median_ns/mean_ns are criterion point estimates in nanoseconds. "
-                "See scripts/bench-compare.py and ADR-0070 decision 3."
-            ),
-        },
+        "_meta": meta,
         "benchmarks": dict(sorted(benchmarks.items())),
     }
     text = json.dumps(out, indent=2) + "\n"
@@ -93,6 +97,54 @@ def collect(args):
         with open(args.out, "w", encoding="utf-8") as fh:
             fh.write(text)
         print(f"bench-compare: wrote {len(benchmarks)} benchmarks to {args.out}", file=sys.stderr)
+
+
+def _parse_knobs(pairs):
+    """Turn repeated KEY=VALUE arguments into a dict, refusing a malformed one."""
+    knobs = {}
+    for pair in pairs or []:
+        key, sep, value = pair.partition("=")
+        if not sep or not key:
+            _die(f"--knob expects KEY=VALUE, got {pair!r}")
+        knobs[key] = value
+    return knobs
+
+
+def _knob_drift(base_doc, cur_doc):
+    """Report how the two runs' sampling knobs relate.
+
+    Returns (state, lines) where state is "match", "differ", or "unknown".
+    A knob such as RAVEL_BENCH_MAX_SERIES is part of the bench id, so a
+    mismatch renames an arm: it reads as missing on one side and as an ignored
+    extra on the other, and leaves the comparison without failing anything.
+    "unknown" is a distinct answer from "match": a file recorded before the
+    knobs were stamped cannot be checked, and saying so is not the same as
+    saying they agree.
+    """
+    base = base_doc.get("_meta", {}).get("knobs")
+    cur = cur_doc.get("_meta", {}).get("knobs")
+    if not base or not cur:
+        side = "baseline" if not base else "current"
+        if not base and not cur:
+            side = "baseline and current"
+        return "unknown", [
+            f"- sampling knobs: NOT RECORDED on the {side} file, so this "
+            "comparison cannot be checked for sampling drift"
+        ]
+    if base == cur:
+        return "match", []
+    differing = sorted(set(base) | set(cur))
+    lines = [
+        "- sampling knobs: MISMATCH between the baseline and this run. A knob "
+        "that appears in a bench id renames its arm, so the arm drops out of "
+        "the comparison instead of being compared."
+    ]
+    for key in differing:
+        b = base.get(key, "(absent)")
+        c = cur.get(key, "(absent)")
+        if b != c:
+            lines.append(f"  - `{key}`: baseline `{b}`, current `{c}`")
+    return "differ", lines
 
 
 def _pct(base, cur):
@@ -150,6 +202,8 @@ def compare(args):
     lines.append(f"- baseline: `{base_label}`")
     lines.append(f"- current: `{cur_label}`")
     lines.append(f"- threshold: +/-{threshold:g}% on median")
+    knob_state, knob_lines = _knob_drift(base_doc, cur_doc)
+    lines.extend(knob_lines)
     lines.append("")
     lines.append("| benchmark | baseline | current | change | status |")
     lines.append("|---|---:|---:|---:|---|")
@@ -172,6 +226,8 @@ def compare(args):
         lines.append(f"**{len(regressions)} regression(s) past +{threshold:g}%, worst {worst:+.1f}%.**")
     elif missing:
         lines.append(f"**{len(missing)} baseline benchmark(s) missing from the run.**")
+    elif knob_state == "differ":
+        lines.append("**The sampling knobs differ, so the two runs are not comparable.**")
     else:
         lines.append(f"**No regression past +{threshold:g}%.**")
     lines.append("")
@@ -186,7 +242,7 @@ def compare(args):
             fh.write(report)
     sys.stdout.write(report)
 
-    fail = bool(regressions) or bool(missing)
+    fail = bool(regressions) or bool(missing) or knob_state == "differ"
     if args.enforce and fail:
         sys.exit(1)
     sys.exit(0)
@@ -200,6 +256,12 @@ def main():
     c.add_argument("--criterion-dir", required=True)
     c.add_argument("--out", required=True, help="output path, or - for stdout")
     c.add_argument("--label", required=True, help="provenance label baked into the file")
+    c.add_argument(
+        "--knob",
+        action="append",
+        metavar="KEY=VALUE",
+        help="sampling knob stamped into _meta.knobs; repeatable",
+    )
     c.set_defaults(func=collect)
 
     d = sub.add_parser("compare", help="diff a current collect against a baseline")

@@ -47,7 +47,9 @@ class PctTest(unittest.TestCase):
         self.assertEqual(bench_compare._pct(0, 5), float("inf"))
 
 
-class EndToEndTest(unittest.TestCase):
+class _CriterionCase(unittest.TestCase):
+    """Shared fixture: a synthetic criterion tree and a collect helper."""
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
 
@@ -57,13 +59,19 @@ class EndToEndTest(unittest.TestCase):
             _estimates(os.path.join(root, bench_id, "new"), median, mean)
         return root
 
-    def _collect(self, name, values, label):
+    def _collect(self, name, values, label, knobs=None):
         root = self._make_criterion(name, values)
         out = os.path.join(self.tmp, f"{name}.json")
-        res = _run("collect", "--criterion-dir", root, "--out", out, "--label", label)
+        extra = []
+        for pair in knobs or []:
+            extra += ["--knob", pair]
+        res = _run("collect", "--criterion-dir", root, "--out", out,
+                   "--label", label, *extra)
         self.assertEqual(res.returncode, 0, res.stderr)
         return out
 
+
+class EndToEndTest(_CriterionCase):
     def test_collect_ignores_base_dir(self):
         # A saved base/ copy must not be picked up; only new/ counts.
         root = os.path.join(self.tmp, "c")
@@ -111,6 +119,67 @@ class EndToEndTest(unittest.TestCase):
         # Advisory still exits 0 even with the gap.
         adv = _run("compare", "--baseline", base, "--current", cur, "--threshold", "15")
         self.assertEqual(adv.returncode, 0, adv.stdout)
+
+
+class KnobDriftTest(_CriterionCase):
+    """A knob that appears in a bench id renames its arm, so a mismatched pair
+    drops the arm from the comparison instead of comparing it. The compare must
+    say so, and must not call a pair comparable when it cannot tell."""
+
+    def test_knobs_are_stamped_and_matching_knobs_report_nothing(self):
+        base = self._collect("base", {"g/a_2000": (100.0, 100.0)}, "base",
+                             knobs=["RAVEL_BENCH_MAX_SERIES=2000", "BENCH_WARMUP=1"])
+        with open(base, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(
+            doc["_meta"]["knobs"],
+            {"RAVEL_BENCH_MAX_SERIES": "2000", "BENCH_WARMUP": "1"},
+        )
+        cur = self._collect("cur", {"g/a_2000": (101.0, 101.0)}, "cur",
+                            knobs=["RAVEL_BENCH_MAX_SERIES=2000", "BENCH_WARMUP=1"])
+        res = _run("compare", "--baseline", base, "--current", cur,
+                   "--threshold", "15", "--enforce")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertNotIn("sampling knobs", res.stdout)
+
+    def test_mismatched_knobs_are_named_and_fail_closed_under_enforce(self):
+        # The arms line up by name here, so nothing else in the report objects:
+        # without the knob check this pair reads as a clean pass.
+        base = self._collect("base", {"g/a": (100.0, 100.0)}, "base",
+                             knobs=["RAVEL_BENCH_MAX_SERIES=2000"])
+        cur = self._collect("cur", {"g/a": (100.0, 100.0)}, "cur",
+                            knobs=["RAVEL_BENCH_MAX_SERIES=100000"])
+        enf = _run("compare", "--baseline", base, "--current", cur,
+                   "--threshold", "15", "--enforce")
+        self.assertEqual(enf.returncode, 1, enf.stdout)
+        self.assertIn("MISMATCH", enf.stdout)
+        self.assertIn("RAVEL_BENCH_MAX_SERIES", enf.stdout)
+        self.assertIn("baseline `2000`", enf.stdout)
+        self.assertIn("current `100000`", enf.stdout)
+        # Advisory says the same thing and still exits 0, per ADR-0070 D3.
+        adv = _run("compare", "--baseline", base, "--current", cur, "--threshold", "15")
+        self.assertEqual(adv.returncode, 0, adv.stdout)
+        self.assertIn("MISMATCH", adv.stdout)
+
+    def test_unrecorded_knobs_report_unknown_not_agreement(self):
+        base = self._collect("base", {"g/a": (100.0, 100.0)}, "base")
+        cur = self._collect("cur", {"g/a": (100.0, 100.0)}, "cur",
+                            knobs=["RAVEL_BENCH_MAX_SERIES=2000"])
+        res = _run("compare", "--baseline", base, "--current", cur,
+                   "--threshold", "15", "--enforce")
+        # Cannot check is not the same as checked and agreed: it says so, and
+        # it does not fail a run whose baseline predates the stamping.
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("NOT RECORDED on the baseline file", res.stdout)
+        self.assertNotIn("MISMATCH", res.stdout)
+
+    def test_malformed_knob_is_refused(self):
+        root = self._make_criterion("m", {"g/a": (100.0, 100.0)})
+        out = os.path.join(self.tmp, "m.json")
+        res = _run("collect", "--criterion-dir", root, "--out", out,
+                   "--label", "m", "--knob", "no-equals-sign")
+        self.assertEqual(res.returncode, 2, res.stdout)
+        self.assertIn("KEY=VALUE", res.stderr)
 
 
 if __name__ == "__main__":

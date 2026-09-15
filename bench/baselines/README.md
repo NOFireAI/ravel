@@ -45,3 +45,11 @@ baseline taken on the same hardware under the same load. ADR-0070 states that
 tier B runs, and the baseline is recorded, on the self-hosted reference runner.
 A baseline recorded anywhere else is a demonstration of the machinery, not a
 usable baseline, and its label must say so.
+
+The sampling knobs are load-bearing in the same way. `RAVEL_BENCH_MAX_SERIES`
+is part of the `segment_encode` bench id, so a re-record at a different
+cardinality renames that arm. The compare then reports it as MISSING on one
+side and ignores an extra on the other, and the arm leaves the comparison
+without failing anything. A re-record must use the same `BENCH_SAMPLE_SIZE`,
+`BENCH_WARMUP`, `BENCH_MEASURE`, and `RAVEL_BENCH_MAX_SERIES` the
+`bench-compare` workflow pins, or the workflow's pins must move with it.
