@@ -75,6 +75,12 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This job holds pull-requests: write for the comment it posts, and
+          # `gh pr comment` reads GH_TOKEN from the environment rather than
+          # .git/config. The bench build runs dependency build scripts, so the
+          # token must not be readable on disk while they run.
+          persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Run the tier B compare (advisory unless dispatched with enforce)

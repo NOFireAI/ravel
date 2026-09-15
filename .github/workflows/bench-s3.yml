@@ -38,6 +38,11 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing after this checkout runs git against the remote, so the
+          # workflow token has no reason to sit in .git/config where a
+          # dependency build script could read it.
+          persist-credentials: false
       # Credential guard: the org-level secret is mapped into an env var and
       # checked for non-emptiness. On a fork or an unconfigured org the secret
       # is empty, `have_creds` is false, and every real step below is skipped,

@@ -584,6 +584,19 @@ than passing for "no pull request open".
   anchor, which is the case where the scan would otherwise pass everything.
   Wired into `gates.sh` and CI's doc-scripts job; cases in
   `scripts/guards/check-guarded-sql-parse.test.sh`.
+- `scripts/guards/check-workflow-permissions.sh [dir ...]`: exits non-zero
+  when a workflow under `.github/workflows/` declares no top-level
+  `permissions:` block, or when that block itself grants a write scope. The
+  repository default workflow permission is write, so a workflow without a
+  floor compiles the workspace with a read-write `GITHUB_TOKEN` in the
+  environment of every dependency build script cargo runs. A job that
+  genuinely needs more declares it on itself; `# workflow-permissions-allow:
+  top-level-write -- <reason>` above the key is the escape hatch for the
+  write rule only, and there is none for a missing block. A scan that finds
+  no workflow file exits 64 rather than reporting clean, so a moved
+  directory cannot turn the guard into a no-op. Wired into `gates.sh` and
+  ci.yml's `doc-scripts` job, cases first. Cases in
+  `scripts/guards/check-workflow-permissions.test.sh`.
 - `scripts/check-injected-clock-helpers.sh [file]`: exits non-zero when an
   injected-clock test helper contains `thread::sleep`, `tokio::time::sleep`,
   a bare or aliased `sleep()` call, `tokio::time::timeout`, `Instant::`,

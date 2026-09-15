@@ -9,6 +9,24 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Workflow-level permissions floor (issue #1717), the fuzz-nightly.yml and
+# supply-chain-nightly.yml pattern applied to the lane that runs on every push
+# and every pull request. The repository default workflow permission is write,
+# so a job without a permissions block of its own compiles the workspace with a
+# read-write GITHUB_TOKEN in the environment of every dependency build script
+# cargo runs. `contents: read` is what actions/checkout and the cargo lanes
+# need and nothing more. Jobs needing anything else declare it themselves:
+# `coverage` adds id-token: write for the Codecov OIDC upload. Nothing in this
+# workflow writes an issue, a comment, a package or a release.
+#
+# Every checkout below carries `persist-credentials: false` for the same
+# reason from the other side: no job here runs git against the remote after
+# checking out (the merge-base filters in `changes`, `docker-build` and
+# `quickstart` read only what fetch-depth: 0 already fetched), so the token
+# must not sit in .git/config where that build-script code could read it.
+permissions:
+  contents: read
+
 # Cancel a superseded run for the same ref so a force-push to an open PR does
 # not leave the old run burning coverage/k8s minutes to completion (ADR-0053
 # D3). Keyed on the workflow plus the ref for PR and merge-queue refs, where
@@ -55,6 +73,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: check
         run: |
           # Emit all six outputs from a single point so no code path forgets
@@ -213,6 +232,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Supply-chain pin check (issue #1310)
         run: deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
       - name: Check derived-doc drift (docs/query-engine.md)
@@ -236,6 +257,14 @@ jobs:
         run: bash scripts/guards/check-test-hygiene.test.sh
       - name: Test-hygiene guard (issue #778)
         run: scripts/guards/check-test-hygiene.sh
+      # No local gate compiles .github/, so a workflow added without a
+      # top-level permissions floor is invisible until it runs on main with
+      # the repository default, which is write. Cases first, same reason as
+      # the hygiene guard above.
+      - name: Workflow-permissions guard cases (issue #1717)
+        run: bash scripts/guards/check-workflow-permissions.test.sh
+      - name: Workflow-permissions guard (issue #1717)
+        run: scripts/guards/check-workflow-permissions.sh
       - name: Injected-clock helper guard cases (issue #1260)
         run: bash scripts/tests/check-injected-clock-helpers.test.sh
       - name: Injected-clock helper guard (issue #1260)
@@ -521,6 +550,8 @@ jobs:
       SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install pinned shellcheck and actionlint
         run: |
           bin_dir="${RUNNER_TEMP}/lint-bin"
@@ -590,6 +621,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -618,6 +651,8 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
@@ -672,6 +707,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
@@ -720,6 +757,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
@@ -798,6 +837,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
@@ -912,6 +953,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
@@ -952,6 +995,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install cargo-deny
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
@@ -985,6 +1030,8 @@ jobs:
       PROPTEST_CASES: 4096
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install nextest
@@ -1047,6 +1094,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
@@ -1221,6 +1270,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
@@ -1315,6 +1366,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install nextest
@@ -1417,6 +1470,8 @@ jobs:
       RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       # First, before anything pulls: two Ravel images and a release target
       # directory together need real headroom.
       - uses: ./.github/actions/free-disk-space
@@ -1502,6 +1557,8 @@ jobs:
       RAVEL_KIND_CLUSTER: ravel-ci
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       # Still disk-hungry: a kind node image, two Ravel images, and floci all
       # land on this runner even though the release build moved to k8s-build.
       - uses: ./.github/actions/free-disk-space
@@ -1690,6 +1747,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: dockerfile-changed
         run: |
           # merge_group events carry merge_group.base_sha, not event.before;
@@ -1760,6 +1818,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
@@ -1837,6 +1897,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       # Inline merge-base path filter (decision 7). Runs on a README-only change
       # but skips the expensive build/bring-up when nothing this job covers
       # changed, the same shape docker-build uses for its Dockerfile guard.

@@ -32,6 +32,17 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Workflow-level permissions floor (issue #1717). Every job here checks out the
+# tree and then runs cargo, which runs a dependency build script for each
+# crate in the graph with this token in the environment. `contents: read` is
+# all any of them needs; none files an issue, pushes a package or writes a
+# release. Every checkout carries `persist-credentials: false` for the same
+# reason from the other side: no job here runs git against the remote after
+# checking out, so the token must not sit in .git/config where that
+# build-script code could read it.
+permissions:
+  contents: read
+
 jobs:
   # Mirrors ci.yml's k8s-build. See that job's own comments for the full
   # rationale (ADR-0034 decision 7, ADR-0053 D5); this copy omits
@@ -47,6 +58,8 @@ jobs:
       RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
@@ -94,6 +107,8 @@ jobs:
       RAVEL_KIND_CLUSTER: ravel-ci
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Download the assembled images
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -181,6 +196,8 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show

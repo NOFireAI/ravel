@@ -47,6 +47,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing after this checkout runs git against the remote, so the
+          # workflow token has no reason to sit in .git/config where a
+          # dependency build script could read it.
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show

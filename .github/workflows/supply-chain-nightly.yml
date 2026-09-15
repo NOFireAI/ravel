@@ -62,6 +62,12 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Serves the same rule as this job's `contents: read` from the other
+          # side: cargo-deny is installed by a third-party action and reads the
+          # whole dependency graph, so the token must be neither powerful nor
+          # readable on disk while it runs.
+          persist-credentials: false
       - name: Install cargo-deny
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
