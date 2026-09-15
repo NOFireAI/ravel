@@ -6481,6 +6481,29 @@ mod tests {
                 "the {identifying_line} rule must grant exactly {expected_verbs}"
             );
         }
+
+        // The `/version` rule (issue #1714) carries no `apiGroups:` line to pin
+        // it under, since it is a non-resource rule; anchor it between the two
+        // ClusterRole headers instead, so it cannot silently drift into
+        // `ravel-operator-secrets` (which must stay `secrets get` only).
+        fn cluster_role_header_index(lines: &[&str], name: &str) -> usize {
+            let target = format!("name: {name}");
+            lines
+                .windows(3)
+                .position(|w| w[0] == "kind: ClusterRole" && w[2] == target)
+                .unwrap_or_else(|| panic!("rbac.yaml defines a ClusterRole named {name}"))
+        }
+        let operator_role_idx = cluster_role_header_index(&lines, "ravel-operator");
+        let secrets_role_idx = cluster_role_header_index(&lines, "ravel-operator-secrets");
+        let version_idx = lines
+            .iter()
+            .position(|l| *l == "- nonResourceURLs: [\"/version\"]")
+            .expect("rbac.yaml defines the /version rule");
+        assert!(
+            operator_role_idx < version_idx && version_idx < secrets_role_idx,
+            "the /version grant must live in the ravel-operator ClusterRole, \
+             before the ravel-operator-secrets ClusterRole"
+        );
     }
 
     /// A job condition of the given type/status, the shape
