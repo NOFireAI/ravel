@@ -1177,13 +1177,31 @@ async fn the_first_block_with_attrs_raw_falls_back_only_for_that_block_and_resum
     );
 }
 
-/// Issue #1769: a segment where EVERY block carries an `attrs_raw` overflow
-/// page must still return every row exactly once. Each block triggers its own
-/// fallback (`columnar_batches == 0` throughout, since there is never a clean
-/// block to resume into), and each fallback re-opens the segment from
-/// scratch: `reopens == 3` pins the accepted cost of this design (a reopen
-/// per offending block, redecoding the growing already-emitted prefix each
-/// time) rather than silently letting it drift.
+/// Issue #1769 (bounded, follow-up to the initial per-block narrowing): a
+/// segment where EVERY block carries an `attrs_raw` overflow page must still
+/// return every row exactly once, AND must not pay one reopen per block.
+///
+/// `max_dynamic_columns` is a PER-OBJECT budget
+/// (`crates/ravel-logseg/src/writer.rs`, `block.rs`), so once a tenant's key
+/// count exceeds it, the overflow recurs across most of that object's
+/// blocks: the every-block-spills shape this fixture pins is the common
+/// high-cardinality-attribute case, not a corner. Retrying columnar once per
+/// offending block (redecoding the growing already-emitted prefix each time)
+/// is therefore O(N^2) in the block count for exactly the tenants already
+/// slowest on this path, so it is bounded instead:
+/// `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS` (`crates/ravel-sql/src/logs_scan.rs`)
+/// tolerates one fallback with a columnar retry (the sparse case covered by
+/// `the_first_block_with_attrs_raw_falls_back_only_for_that_block_and_resumes_columnar_after`
+/// above), but a second fallback in a row with no clean columnar block
+/// between them commits the rest of this partition's block list to the row
+/// path in one reopen instead of reopening again per remaining block.
+///
+/// Five blocks all overflow here (more than the 3 the fixture used before
+/// this bound existed), specifically so the reopen count pins a property of
+/// the code rather than of a fixture sized to match it: `reopens == 2`
+/// regardless of block count once the bound has kicked in, not `reopens ==
+/// block_count - 1`. `columnar_batches == 0` throughout, since there is
+/// never a clean block to resume into.
 #[tokio::test]
 async fn every_block_with_attrs_raw_still_returns_every_row_exactly_once() {
     let declared = vec![DeclaredColumn::new("tags", DeclaredType::Str)];
@@ -1204,9 +1222,9 @@ async fn every_block_with_attrs_raw_still_returns_every_row_exactly_once() {
             ("tags".to_string(), AttrValue::Str(format!("spilled-{ts}"))),
         ],
     };
-    // Three blocks of two records each, every one carrying the `attrs_raw`
+    // Five blocks of two records each, every one carrying the `attrs_raw`
     // page.
-    let records: Vec<_> = (0..6).map(i64::from).map(mk).collect();
+    let records: Vec<_> = (0..10).map(i64::from).map(mk).collect();
     let cfg = RlogConfig {
         block_target_records: 2,
         max_dynamic_columns: 1,
@@ -1235,19 +1253,22 @@ async fn every_block_with_attrs_raw_still_returns_every_row_exactly_once() {
         run.columnar_batches, run.rowpath_batches
     );
     assert_eq!(
-        run.rowpath_batches, 3,
-        "each of the three blocks falls back individually; columnar={}, \
-         rowpath={}",
+        run.rowpath_batches, 5,
+        "every one of the five blocks is still emitted through the row \
+         path; columnar={}, rowpath={}",
         run.columnar_batches, run.rowpath_batches
     );
     assert_eq!(
-        run.reopens, 3,
-        "each block's fallback re-opens the segment once (the accepted \
-         per-block reopen cost of narrowing the fallback); reopens={}",
+        run.reopens, 2,
+        "bounded to MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS + 1 = 2 reopens \
+         regardless of block count: the first fallback (block 0) still \
+         retries columnar once, the second fallback (block 1, with no clean \
+         columnar block in between) commits the remaining three blocks to \
+         the row path with no further reopen; reopens={}",
         run.reopens
     );
 
-    let want: Vec<_> = (0..6)
+    let want: Vec<_> = (0..10)
         .map(|ts| vec![Cell::Ts(ts), Cell::OptStr(Some(format!("spilled-{ts}")))])
         .collect();
     let got = rows(&run.batches, &projection, &declared);
@@ -1518,37 +1539,48 @@ async fn block_striping_is_row_identical_to_single_partition() {
     //
     // Issue #1769 narrowed the fallback to the offending block only, resuming
     // columnar afterward instead of falling the rest of the partition's own
-    // block list to rows. That makes each reopen's re-decode cost a function
-    // of how many blocks THIS PARTITION has already emitted before the block
-    // it is reopening for -- a per-partition running count, reset to 0 at
-    // NextSegment and local to that partition's own `current_indices` list
-    // (ADR-0102's partitions never interleave). With this fixture's spill
-    // roughly every third record, a coarser partitioning packs more blocks
-    // (and so more already-emitted blocks ahead of each later spill) into
-    // every partition's own list, and repeated per-block reopens make that
-    // cost grow with the SQUARE of a partition's own block count, not
-    // linearly: splitting the same blocks across more, smaller partitions
-    // can only shrink or match that per-partition sum, never grow it. This is
-    // the reverse of the pre-#1769 direction (a single reopen per partition
-    // that then committed the rest of that partition's own list to rows,
-    // where finer striping could only add independent one-time reopens).
-    // Pinned exactly, not just by direction, per this fixture's actual block
-    // layout and spill pattern.
+    // block list to rows. Unbounded, that made each reopen's re-decode cost a
+    // function of how many blocks THIS PARTITION had already emitted before
+    // the block it was reopening for, and with this fixture's spill roughly
+    // every third record (dense, not sparse, per the per-object
+    // `max_dynamic_columns` budget), a coarser partitioning packed more
+    // already-emitted blocks ahead of each later spill, making the cost grow
+    // with the SQUARE of a partition's own block count.
+    //
+    // `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS` (`crates/ravel-sql/src/logs_scan.rs`)
+    // removes that growth: a segment escalates to committing the rest of a
+    // partition's own block list to the row path after its second consecutive
+    // fallback, so each (partition, segment) pair this fixture's near-every-
+    // block spill touches pays at most 2 reopens with a small, bounded
+    // re-decode prefix (the position of that second fallback, not the whole
+    // list) -- independent of how many blocks that partition owns in the
+    // segment. What now scales with partition count is the number of DISTINCT
+    // (partition, segment) pairs paying that small bounded overhead: striping
+    // a segment's blocks across more partitions means more partitions
+    // independently open it and each pays its own bounded 1-2 reopens, so
+    // FINER striping can now ADD reopen overhead rather than shrink it -- the
+    // same direction the pre-#1769 whole-segment fallback had (this bound's
+    // per-partition tail-commit is functionally close to that behavior once
+    // escalation fires), and the reverse of the unbounded per-block
+    // narrowing's square-of-block-count blowup this replaces. Pinned exactly,
+    // not just by direction, per this fixture's actual block layout and spill
+    // pattern.
     assert_eq!(
-        baseline.blocks_scanned, 29,
-        "single-partition baseline's own reopen chain over all four \
-         segments' blocks"
+        baseline.blocks_scanned, 19,
+        "single-partition baseline touches each of the four segments once, \
+         each paying at most the bounded 2-reopen chain"
     );
     assert_eq!(
         under.blocks_scanned, 20,
-        "12-way striping splits the same blocks into many smaller \
-         partitions, each with a shorter reopen chain"
+        "12-way striping touches each segment from more partitions, each \
+         independently paying its own small bounded reopen chain, so the sum \
+         is slightly higher than the single-partition baseline"
     );
     assert!(
-        under.blocks_scanned <= baseline.blocks_scanned,
-        "finer striping can only shrink or match fallback-driven re-decode \
-         work under the narrowed, per-block fallback (issue #1769), never \
-         add to it: under={} baseline={}",
+        under.blocks_scanned >= baseline.blocks_scanned,
+        "bounded per-(partition, segment) reopen overhead can only add up \
+         across more partition-segment pairs, never shrink below the \
+         single-partition baseline: under={} baseline={}",
         under.blocks_scanned,
         baseline.blocks_scanned
     );

@@ -2664,6 +2664,7 @@ impl ExecutionPlan for LogsScanExec {
             current_seg: None,
             current_seg_ordinal: 0,
             block_cursor: 0,
+            consecutive_fallbacks: 0,
             pending_range: None,
             current_indices: Vec::new(),
             current_footer: None,
@@ -3248,6 +3249,18 @@ fn open_segment_fast(ctx: Arc<PartitionCtx>, seg: SegmentRef, by_column_chunk: b
     }
 }
 
+/// Consecutive `attrs_raw`-overflow fallbacks (see
+/// [`LogScanStream::consecutive_fallbacks`]) tolerated within one segment
+/// before the rest of this partition's block list is committed to the row
+/// path in one reopen, rather than reopening again to retry columnar. `1`:
+/// the first fallback still gets a columnar retry (the sparse case, where a
+/// single overflowing block among clean ones is common and worth resuming
+/// columnar for), but a second fallback immediately after it -- with no
+/// clean columnar block in between -- escalates. This bounds a segment to at
+/// most `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS + 1` reopens regardless of how
+/// many of its blocks overflow.
+const MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS: usize = 1;
+
 enum LogScanState {
     /// Awaiting the shared per-segment block plan (ADR-0102). Once it resolves,
     /// this partition's owned `(segment, block-index-list)` work is computed and
@@ -3266,12 +3279,14 @@ enum LogScanState {
     Columnar(Box<LogSegmentScan>),
     /// Draining one segment's surviving blocks through the row path
     /// ([`LogSegmentScan::next_block`]), rebuilding a [`LogRecord`] per row: the
-    /// unchanged pre-ADR-0099 path, taken only by a scan that is statically
-    /// ineligible for the columnar fast path (never entered by the `attrs_raw`
-    /// fallback, which uses [`LogScanState::RowFallbackBlock`] instead so it can
-    /// hand the scan back to `Columnar` afterward). Never carries a `skip`:
-    /// only a fallback reopen needs one, and that reopen becomes
-    /// `RowFallbackBlock` instead.
+    /// unchanged pre-ADR-0099 path, taken by a scan that is statically
+    /// ineligible for the columnar fast path, OR handed the
+    /// still-open scan by [`LogScanState::RowFallbackBlock`] once a segment
+    /// has hit [`MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS`] consecutive `attrs_raw`
+    /// fallbacks, committing the rest of this partition's block list to the
+    /// row path in one reopen instead of retrying columnar block by block.
+    /// Never carries a `skip`: a fallback reopen needs one only while it is
+    /// still resuming columnar, which is `RowFallbackBlock`'s job.
     Rows(Box<LogSegmentScan>),
     /// Re-opening the current segment to restart it on the row path after a
     /// block turned out to carry an `attrs_raw` overflow page. The re-opened
@@ -3292,9 +3307,13 @@ enum LogScanState {
     /// page -- through the row path (issue #1769). That block done, the same
     /// still-open scan is handed back to [`LogScanState::Columnar`] so the
     /// blocks after it keep decoding columnar instead of falling the rest of
-    /// the segment to rows. A block-index list this partition owns is never
-    /// touched by another partition's fallback (ADR-0102), so this reopen
-    /// cannot race one.
+    /// the segment to rows -- unless this is this segment's
+    /// [`MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS`]-th consecutive fallback with no
+    /// clean columnar block in between, in which case it is handed to
+    /// [`LogScanState::Rows`] instead, committing the rest of
+    /// the block list to the row path with no further reopen. A block-index
+    /// list this partition owns is never touched by another partition's
+    /// fallback (ADR-0102), so this reopen cannot race one.
     RowFallbackBlock {
         scan: Box<LogSegmentScan>,
         skip: usize,
@@ -3458,6 +3477,22 @@ struct LogScanStream {
     /// [`LogScanState::ReopenRows`] re-derives from. Reset when a new segment
     /// starts.
     block_cursor: usize,
+    /// Count of `attrs_raw`-overflow fallbacks (issue #1769) since the last
+    /// clean columnar block in the current segment, reset to 0 at
+    /// `NextSegment` and by [`Step::Held`]. `max_dynamic_columns`
+    /// (`crates/ravel-logseg/src/writer.rs`, `block.rs`) is a PER-OBJECT
+    /// budget, so once a tenant's declared-plus-dynamic key count for a
+    /// segment exceeds it, the overflow keys recur across most of that
+    /// object's blocks: two fallbacks in a row is evidence the object's
+    /// budget is exhausted for its remaining blocks, not that this one block
+    /// was unlucky. [`MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS`] is the count of
+    /// consecutive fallbacks tolerated before the rest of this partition's
+    /// block list for the segment is committed to the row path in one
+    /// reopen instead of retrying columnar block by block,
+    /// which is what bounds the segment's total reopens to a constant
+    /// (`MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS + 1`) instead of one per
+    /// overflowing block.
+    consecutive_fallbacks: usize,
     /// The address the row-path batch builder stamps from while draining the
     /// held block. `None` when this scan emits no row refs.
     pending_range: Option<RowRefRange>,
@@ -3786,6 +3821,7 @@ impl LogScanStream {
                         // (issue #835 follow-up).
                         this.current_whole_object = whole_object;
                         this.block_cursor = 0;
+                        this.consecutive_fallbacks = 0;
                         this.blocks.segments_opened.add(1);
                         this.open_started = Some(Instant::now());
                         this.mark_segment("seg_open_start_offset");
@@ -4024,6 +4060,7 @@ impl LogScanStream {
                                 )
                             };
                             this.blocks.reopens.add(1);
+                            this.consecutive_fallbacks += 1;
                             this.open_started = Some(Instant::now());
                             this.state = LogScanState::ReopenRows {
                                 fut,
@@ -4034,6 +4071,10 @@ impl LogScanStream {
                             batches,
                             block_bytes,
                         } => {
+                            // A clean columnar block: the streak of consecutive
+                            // fallbacks that would otherwise escalate to a
+                            // full row-path commit is broken.
+                            this.consecutive_fallbacks = 0;
                             // Count every consumed clean block, empty or not, so
                             // a later `attrs_raw` fallback's `ReopenRows` skips
                             // exactly the blocks the cursor advanced past. The
@@ -4128,13 +4169,33 @@ impl LogScanStream {
                             // fallback (issue #1769): hand the still-open scan
                             // back to the columnar cursor for the blocks after
                             // it instead of falling the rest of the segment to
-                            // rows.
+                            // rows -- UNLESS this segment has now hit
+                            // `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS` fallbacks in
+                            // a row with no clean columnar block between them
+                            // (issue #1769 follow-up): the per-object `attrs_raw` budget
+                            // that caused this block to overflow almost
+                            // certainly causes the rest of this partition's
+                            // block list to as well, so retrying columnar
+                            // block by block would pay one reopen per
+                            // remaining block for no columnar benefit. Commit
+                            // the still-open scan straight to `Rows` instead:
+                            // it already sits right after the block just
+                            // emitted, so the remaining blocks drain through
+                            // the row path with no further reopen, bounding
+                            // this segment's total reopens to
+                            // `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS + 1`.
                             let scan = match std::mem::replace(&mut this.state, LogScanState::Done)
                             {
                                 LogScanState::RowFallbackBlock { scan, .. } => scan,
                                 _ => unreachable!("state just matched as RowFallbackBlock"),
                             };
-                            this.state = LogScanState::Columnar(scan);
+                            this.state = if this.consecutive_fallbacks
+                                > MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS
+                            {
+                                LogScanState::Rows(scan)
+                            } else {
+                                LogScanState::Columnar(scan)
+                            };
                         }
                         // Cannot happen: the columnar cursor that triggered this
                         // fallback had already decoded this exact block, so a
