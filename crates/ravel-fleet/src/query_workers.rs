@@ -741,7 +741,7 @@ mod tests {
                 ScriptedFault::Transient("a 4th query-workers-prefix GET".into()),
             )
             .with_key_contains(QUERY_WORKERS_PREFIX)
-            .with_occurrence(Occurrence::Nth(4)),
+            .with_occurrence(Occurrence::Nth(3)),
         );
         let store = FaultStore::new(MemoryStore::new(), plan);
         store.inner().set_clock_ms(now_ms);

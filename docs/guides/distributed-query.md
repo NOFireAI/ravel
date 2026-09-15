@@ -245,7 +245,7 @@ returns. A key whose modification time is already older than the liveness
 window is not fetched at all: its stamp can only be older still, so the read
 cost of a coordinator tracks the live fleet rather than every node that ever
 ran. A key older than twice that window is deleted, from the same listing, so
-the delete costs no extra request. The doubled width is the clock-skew margin
+the delete needs no listing of its own. The doubled width is the clock-skew margin
 between the object store's clock and the reader's; a live node reaped by a
 skewed clock reappears on its next beat, at most one interval later. A store
 that reports no modification time, or one in the future, gets neither rule:
