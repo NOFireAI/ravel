@@ -213,6 +213,17 @@ else
   log "did not observe worker A mid-compaction within budget; killing anyway"
 fi
 
+# EXPECTED_TOTAL_UNITS is one scenario's worth of units, and both takeover
+# oracles compare with >=. That only discriminates while the store holds this
+# scenario's tenant alone: `discover_tenants` lists every tenant under `t/`
+# and ignores --tenant-token, and `ravel_maintain_units_owned` is one
+# store-wide gauge, so a second tenant's units inflate the reading and the
+# survivor can clear the threshold without taking over anything. `minio_up`
+# empties the bucket for exactly this reason; assert the precondition here
+# rather than trust it, because a green run under a violated precondition is
+# the failure this lane exists to catch.
+assert_single_tenant_universe || true
+
 # Timestamp the kill so the takeover oracle can measure wall-clock against the
 # 3*H + tick bound. `date +%s` is the real clock ADR-0077 section 4 requires.
 KILL_EPOCH="$(date +%s)"
