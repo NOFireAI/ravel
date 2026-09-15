@@ -744,7 +744,7 @@ mod tests {
         let plan = FaultPlan::empty().with_rule(
             Rule::new(
                 Op::Get,
-                ScriptedFault::Transient("a 4th query-workers-prefix GET".into()),
+                ScriptedFault::Transient("a 3rd query-workers-prefix GET".into()),
             )
             .with_key_contains(QUERY_WORKERS_PREFIX)
             .with_occurrence(Occurrence::Nth(3)),
@@ -774,7 +774,8 @@ mod tests {
         assert_eq!(
             store.fault_count(Op::Get, FaultKind::Transient),
             0,
-            "a 4th GET under the query-workers prefix never happened: at most 3"
+            "a 3rd GET under the query-workers prefix never happened: at most 2, one \
+             per live sibling, with self skipped and the stale keys costing none"
         );
         let live = read.expect("live set");
         let ids: Vec<&str> = live.iter().map(|r| r.process_id.as_str()).collect();
