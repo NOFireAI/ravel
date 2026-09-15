@@ -5,8 +5,9 @@
 //! each literal value replaced by a deterministic keyed token while column
 //! names, table names, operators, keywords, and structure stay readable.
 //!
-//! [`redact`] parses `query` with the same `DFParser::parse_sql` front end the
-//! read-only gate ([`crate::validate`]) uses, walks the parsed statement with
+//! [`redact`] parses `query` through [`crate::complexity_guard::parse_guarded`],
+//! the same guarded parse the read-only gate ([`crate::validate`]) uses, walks
+//! the parsed statement with
 //! sqlparser's `VisitorMut` (the `visitor` feature is already enabled on
 //! `sqlparser` via `datafusion-sql`, and this crate already uses its immutable
 //! `Visitor` in `validate`), replaces every literal `Value` with a token, and
@@ -60,7 +61,7 @@
 //! not handle is worse than one that fails: the caller must never store text
 //! this function did not actually redact.
 
-use datafusion::sql::parser::{DFParserBuilder, Statement as DFStatement};
+use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
     Expr, LimitClause, OrderByKind, Query, Statement, Value, ValueWithSpan, VisitMut, VisitorMut,
 };
@@ -104,22 +105,19 @@ pub enum RedactError {
 /// is never partially redacted, because returning the redacted prefix of a
 /// batch whose remainder went unredacted would still leak.
 pub fn redact(query: &str, token_key: &[u8; 32]) -> Result<String, RedactError> {
-    // This is the second entry point that parses caller text, and it is NOT
-    // behind `validate`: `sql_execute` audits the raw statement before it
-    // returns the executor's result, so text that `validate` just rejected as
-    // too complex still arrives here. Both walks below recurse per tree level
-    // (`VisitMut::visit`, then `Display`), and the parser's own recursion limit
-    // does not bound a flat operator chain, so the guard has to run here too.
-    // `ravel-promql`'s redact carries the same call for the same reason.
-    crate::complexity_guard::check(query).map_err(|_| RedactError::Parse)?;
-    // Same pinned recursion limit `crate::validate` uses. The inherited
-    // default happens to match today; pinning it here means a change to that
-    // default cannot make one of the crate's parses deeper than another.
-    let mut statements = DFParserBuilder::new(query)
-        .with_recursion_limit(crate::validate::PARSER_RECURSION_LIMIT)
-        .build()
-        .and_then(|mut parser| parser.parse_statements())
-        .map_err(|_| RedactError::Parse)?;
+    // This entry point is NOT behind `validate`: `sql_execute` audits the raw
+    // statement before it returns the executor's result, so text that
+    // `validate` just rejected as too complex still arrives here. Both walks
+    // below recurse per tree level (`VisitMut::visit`, then `Display`), and the
+    // parser's own recursion limit does not bound a flat operator chain, so the
+    // complexity guard has to run here too. It does, because it is part of the
+    // parse: `parse_guarded` is the crate's only parse of caller text.
+    //
+    // Its error is discarded rather than reported: the parser arm quotes the
+    // offending token, which can be a caller literal, and this module exists to
+    // keep exactly that out of stored text (F3, see `RedactError::Parse`).
+    let mut statements =
+        crate::complexity_guard::parse_guarded(query).map_err(|_| RedactError::Parse)?;
 
     let mut redactor = LiteralRedactor {
         key: token_key,
@@ -300,12 +298,17 @@ fn redactable_content(value: &Value) -> Option<String> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    // guarded-parse-allow: test code parses this module's own output and its
+    // own fixed probes, never caller text, and asserts on what the raw front
+    // end does. The complexity guard is what production must not skip.
     use datafusion::sql::parser::DFParser;
 
     const KEY_A: [u8; 32] = [1u8; 32];
     const KEY_B: [u8; 32] = [2u8; 32];
 
     fn reparse(sql: &str) {
+        // guarded-parse-allow: the subject is the redacted output, which must
+        // re-parse; guarding it would test the guard instead.
         DFParser::parse_sql(sql).expect("redacted output re-parses as valid SQL");
     }
 
@@ -555,6 +558,9 @@ mod tests {
         // this documents the leak the redactor closes. A trailing unexpected string
         // literal makes sqlparser echo it (`... found: 'topsecret' ...`).
         let probe = "SELECT * FROM t WHERE a = 'ok' 'topsecret'";
+        // guarded-parse-allow: the assertion is about the raw parser message
+        // quoting a literal, which is the leak this module closes, so the raw
+        // front end is the subject rather than an oversight.
         let raw = DFParser::parse_sql(probe)
             .expect_err("malformed input")
             .to_string();
@@ -592,9 +598,10 @@ mod tests {
     /// bound is enforced at all on this entry point, and a test that overflows
     /// the stack to prove it would abort the whole test binary.
     ///
-    /// Flip to watch it fail: delete the `complexity_guard::check` call at the
-    /// top of `redact`. The over-bound statement then parses and is redacted,
-    /// and the `expect_err` below panics.
+    /// Flip to watch it fail: replace the `complexity_guard::parse_guarded`
+    /// call at the top of `redact` with a bare parser build. The over-bound
+    /// statement then parses and is redacted, and the `expect_err` below
+    /// panics.
     #[test]
     fn an_over_complex_statement_is_refused_before_it_is_parsed() {
         let chain = "+1".repeat(crate::complexity_guard::MAX_STATEMENT_COMPLEXITY);

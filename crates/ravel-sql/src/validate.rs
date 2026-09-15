@@ -9,13 +9,15 @@
 //! extension form), and a multi-statement body -- is rejected with a typed
 //! error the endpoint maps to HTTP 400.
 //!
-//! Parsing here uses `datafusion::sql::parser::DFParser`, not bare
-//! sqlparser: DFParser is the same front end `SessionContext::sql` uses, so
-//! a statement that parses into a DataFusion extension variant
-//! (`CreateExternalTable`, `CopyTo`, `Explain`, `Reset`) is seen here in the
-//! same shape the planner would see it. A gate built on bare sqlparser would
-//! either fail to parse those or classify them differently from the planner,
-//! which is exactly the kind of gap the invariant exists to close.
+//! Parsing goes through [`complexity_guard::parse_guarded`], the crate's only
+//! parse of caller text, which runs the structural-complexity guard and then
+//! DataFusion's own `DFParser` front end rather than bare sqlparser: it is the
+//! front end `SessionContext::sql` uses, so a statement that parses into a
+//! DataFusion extension variant (`CreateExternalTable`, `CopyTo`, `Explain`,
+//! `Reset`) is seen here in the same shape the planner would see it. A gate
+//! built on bare sqlparser would either fail to parse those or classify them
+//! differently from the planner, which is exactly the kind of gap the
+//! invariant exists to close.
 //!
 //! A `Query` is not automatically read-only in sqlparser's grammar: its body
 //! is a `SetExpr`, which has `Insert`/`Update`/`Delete`/`Merge` variants
@@ -66,7 +68,7 @@
 //! replacement is structurally total.
 
 use crate::complexity_guard;
-use datafusion::sql::parser::{DFParserBuilder, Statement as DFStatement};
+use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, SetExpr, Statement,
     TableFactor, Visit, Visitor,
@@ -218,32 +220,17 @@ pub enum ValidationError {
     TooComplex(#[from] complexity_guard::StatementTooComplex),
 }
 
-/// Recursion limit set on the [`DFParserBuilder`] below, pinned here rather
-/// than inherited from `datafusion-sql`'s own default (50 in 54.1.0), which is
-/// a value an upgrade may change without notice.
-///
-/// This is a second bound, independent of
-/// [`complexity_guard`](crate::complexity_guard), and it is not redundant with
-/// it: this one caps the parser's own descent through nested constructs
-/// (parentheses, subqueries) cheaply and early, while the guard caps the total
-/// tree size a flat construct can build, which the parser's counter never
-/// sees because same-precedence infix operators are consumed in a loop. Each
-/// covers a case the other does not, so neither is dropped because the other
-/// passed.
-pub(crate) const PARSER_RECURSION_LIMIT: usize = 50;
-
-/// Parse `sql` with the pinned recursion limit above.
-///
-/// Every parse in this module goes through here, and the two production
-/// parses outside it (`crate::redact` and `crate::page_plan`) build their
-/// parser with the same constant, so the limit cannot be set on one call site
-/// and inherited from the dependency's default on another.
-fn parse_statements(sql: &str) -> Result<std::collections::VecDeque<DFStatement>, ValidationError> {
-    DFParserBuilder::new(sql)
-        .with_recursion_limit(PARSER_RECURSION_LIMIT)
-        .build()
-        .and_then(|mut parser| parser.parse_statements())
-        .map_err(|e| ValidationError::Parse(strip_prefix(&e.to_string())))
+impl From<complexity_guard::GuardedParseError> for ValidationError {
+    fn from(error: complexity_guard::GuardedParseError) -> Self {
+        match error {
+            complexity_guard::GuardedParseError::TooComplex(too_complex) => {
+                ValidationError::TooComplex(too_complex)
+            }
+            complexity_guard::GuardedParseError::Parse(message) => {
+                ValidationError::Parse(strip_prefix(&message))
+            }
+        }
+    }
 }
 
 /// Parse `sql` and accept it only if it is exactly one read-only
@@ -254,14 +241,11 @@ fn parse_statements(sql: &str) -> Result<std::collections::VecDeque<DFStatement>
 /// tree it produces (the two below, `crate::page_plan`'s rewrites, DataFusion's
 /// SQL-to-`LogicalPlan` conversion, and the tree's own `Drop`) recurses once
 /// per tree level, and a stack overflow on a 2 MiB tokio worker stack aborts
-/// the process rather than raising a catchable panic (issue #1680). Because
-/// this is the single funnel every SQL surface reaches -- the HTTP handler,
-/// `get_flight_info_statement`, `do_get_statement`, and the page plan -- one
-/// call here covers all four.
+/// the process rather than raising a catchable panic (issue #1680). That
+/// ordering is not this function's to remember: it is what
+/// [`complexity_guard::parse_guarded`] is, so every parse in the crate has it.
 pub fn validate(sql: &str) -> Result<(), ValidationError> {
-    complexity_guard::check(sql)?;
-
-    let statements = parse_statements(sql)?;
+    let statements = complexity_guard::parse_guarded(sql)?;
 
     if statements.len() > 1 {
         return Err(ValidationError::MultipleStatements {
@@ -332,11 +316,10 @@ pub fn validate(sql: &str) -> Result<(), ValidationError> {
 pub(crate) fn referenced_base_tables(sql: &str) -> Result<BTreeSet<String>, ValidationError> {
     // This parses and walks a tree of its own, so it carries the same guard
     // [`validate`] does rather than relying on every caller having run
-    // `validate` on the same text first. The scan stops one character past
-    // the bound, so a statement that already passed `validate` pays a bounded
+    // `validate` on the same text first. The scan stops one token past the
+    // bound, so a statement that already passed `validate` pays a bounded
     // rescan and nothing else.
-    complexity_guard::check(sql)?;
-    let statements = parse_statements(sql)?;
+    let statements = complexity_guard::parse_guarded(sql)?;
     let mut tables = BTreeSet::new();
     let mut ctes = BTreeSet::new();
     for statement in &statements {

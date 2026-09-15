@@ -226,8 +226,29 @@
 //! argument. Every element costs the same two units, one for the value token
 //! and one for the comma, whether the value is quoted or bare, so the list
 //! that fits the bound is the same list either way.
+//!
+//! # The guard cannot be skipped by a new entry point
+//!
+//! [`parse_guarded`] is the crate's only parse of caller text: it runs
+//! [`check`] and then builds the parser, so a caller cannot reach the parser
+//! without the guard in front of it. `crate::validate`, `crate::redact`, and
+//! `crate::page_plan` all go through it. Before that, each parse site carried
+//! its own [`check`] call by convention, and the convention failed the first
+//! time it was tested: the audit path (`crate::redact`) went through a whole
+//! review round without the call, and `crate::page_plan` had none at all,
+//! resting on the claim that `crate::validate` had already accepted the same
+//! text (issue #1760).
+//!
+//! `scripts/guards/check-guarded-sql-parse.sh` keeps it that way: it refuses
+//! any mention of a SQL parser front end under `crates/ravel-sql/src/` outside
+//! [`parse_guarded`], so a fourth entry point that builds its own parser fails
+//! the gate rather than a reader's attention. Test code that needs a raw parse
+//! carries a `guarded-parse-allow:` marker with its reason.
 
+use std::collections::VecDeque;
 use std::fmt;
+
+use datafusion::sql::parser::Statement as DFStatement;
 
 /// Maximum count of tokens outside literals and comments a
 /// SQL statement's text may contain. See the module documentation for how
@@ -277,6 +298,52 @@ impl fmt::Display for StatementTooComplex {
 }
 
 impl std::error::Error for StatementTooComplex {}
+
+/// Recursion limit set on the parser [`parse_guarded`] builds, pinned here
+/// rather than inherited from `datafusion-sql`'s own default (50 in 54.1.0),
+/// which is a value an upgrade may change without notice.
+///
+/// This is a second bound, independent of [`check`], and it is not redundant
+/// with it: this one caps the parser's own descent through nested constructs
+/// (parentheses, subqueries) cheaply and early, while [`check`] caps the total
+/// tree size a flat construct can build, which the parser's counter never sees
+/// because same-precedence infix operators are consumed in a loop. Each covers
+/// a case the other does not, so neither is dropped because the other passed.
+///
+/// One parse site means one place the limit is set, so it can no longer be
+/// pinned on one call site and inherited from the dependency's default on
+/// another.
+const PARSER_RECURSION_LIMIT: usize = 50;
+
+/// A [`parse_guarded`] failure: the text was refused by [`check`], or the
+/// parser rejected it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum GuardedParseError {
+    /// [`check`] refused the text before it was parsed.
+    #[error("{0}")]
+    TooComplex(#[from] StatementTooComplex),
+
+    /// The parser rejected the text. The message is the parser's own, so it
+    /// can quote a caller literal: a caller that stores or logs it must
+    /// replace it with a fixed label first, the way `crate::redact` does.
+    #[error("{0}")]
+    Parse(String),
+}
+
+/// Run [`check`] over `sql` and then parse it, with the pinned recursion limit
+/// above.
+///
+/// This is the crate's only parse of caller text. See the module documentation
+/// for why the guard is part of the parse rather than a call every parse site
+/// is expected to remember, and for the check that keeps it that way.
+pub(crate) fn parse_guarded(sql: &str) -> Result<VecDeque<DFStatement>, GuardedParseError> {
+    check(sql)?;
+    datafusion::sql::parser::DFParserBuilder::new(sql)
+        .with_recursion_limit(PARSER_RECURSION_LIMIT)
+        .build()
+        .and_then(|mut parser| parser.parse_statements())
+        .map_err(|e| GuardedParseError::Parse(e.to_string()))
+}
 
 /// How the scan is currently reading the text.
 enum Mode {
@@ -740,6 +807,48 @@ mod tests {
     #[test]
     fn an_ordinary_statement_passes() {
         check("SELECT ts, value FROM samples WHERE ts > 0 ORDER BY ts LIMIT 10").expect("ordinary");
+    }
+
+    /// The guarded parse refuses an over-bound statement instead of parsing it,
+    /// which is what makes the check unskippable rather than a call every parse
+    /// site is expected to make (issue #1760).
+    ///
+    /// The chain runs at [`MAX_STATEMENT_COMPLEXITY`] + 1 rather than at the
+    /// half-million of the abort payload above: a test that overflowed the
+    /// stack to prove the point would abort the whole test binary.
+    ///
+    /// Flip to watch it fail: drop the `check(sql)?` line from
+    /// [`parse_guarded`]. The statement then parses and the `expect_err` below
+    /// panics.
+    #[test]
+    fn the_guarded_parse_refuses_before_it_parses() {
+        let sql = format!("SELECT 1{}", "+1".repeat(MAX_STATEMENT_COMPLEXITY));
+        assert!(
+            structural_count(&sql) > MAX_STATEMENT_COMPLEXITY,
+            "the probe must exceed the bound to be testing anything"
+        );
+
+        let err = parse_guarded(&sql).expect_err("an over-bound statement is refused");
+        assert!(
+            matches!(err, GuardedParseError::TooComplex(_)),
+            "expected TooComplex, got {err}"
+        );
+    }
+
+    /// The other two outcomes, so the guarded parse is not satisfied by
+    /// refusing everything and its two error arms stay distinguishable: a
+    /// statement inside the bound parses, and a malformed one reports a parse
+    /// failure rather than a complexity one.
+    #[test]
+    fn the_guarded_parse_parses_and_reports_a_parse_failure_as_one() {
+        let statements = parse_guarded("SELECT ts FROM samples").expect("parses");
+        assert_eq!(statements.len(), 1);
+
+        let err = parse_guarded("SELECT 1 +").expect_err("malformed");
+        assert!(
+            matches!(err, GuardedParseError::Parse(_)),
+            "expected Parse, got {err}"
+        );
     }
 
     /// The abort payload from issue #1680: `SELECT 1` followed by `+1`

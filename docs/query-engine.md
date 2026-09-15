@@ -2684,6 +2684,17 @@ Three numbers, one decision:
   statement at the complexity bound fits in it many times over, with room for
   whitespace, string literals, and `min_commit_token` values.
 
+The check is not a call each parse site is expected to remember. It is part of
+the parse: `ravel_sql::complexity_guard::parse_guarded` runs the check and then
+builds the parser with the pinned recursion limit, and it is the only parse of
+caller text in the crate. `validate`, the audit redactor, and the page plan all
+go through it. The convention form of the rule failed the first time it was
+tested, on both of the sites that were not `validate`, so
+`scripts/guards/check-guarded-sql-parse.sh` refuses any other mention of a
+parser front end under `crates/ravel-sql/src/` and runs in `scripts/gates.sh`
+and in CI. Test code that needs a raw parse carries a `guarded-parse-allow:`
+marker with its reason.
+
 ## SQL over logs (the `logs` table, ADR-0033)
 
 `POST /api/v1/sql` serves five tables from one endpoint, of which this section
