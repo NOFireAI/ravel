@@ -659,6 +659,17 @@ stat range cannot overlap a queried range holds no matching row. Under version
 the block holding the record a range query wanted; that is the defect version 3
 fixes, and it is why a v2 object cannot be read as a v3 one.
 
+An f64 range test carries one further condition: a reader must decline to
+prune any block whose stat has `has_nan` set, unconditionally, rather than
+testing the query arm against that stat's `[min, max]` as usual. `min`/`max`
+bound only the non-NaN resolved values (see above), but under the `total_cmp`
+order this format's f64 stats and range predicates share, a `+NaN` value
+sorts above every finite value and a `-NaN` value sorts below every finite
+value, so a NaN row in the block can satisfy a half-open arm the finite
+bounds alone would rule out. `has_nan` does not record which sign was
+present, so a reader cannot narrow the decline to just the arm shape that
+sign would satisfy; it must decline pruning on the whole stat instead.
+
 ### null_count at both levels (trailer version 3, normative)
 
 A stat's `null_count` counts rows that resolve nothing the stat's `[min, max]`
