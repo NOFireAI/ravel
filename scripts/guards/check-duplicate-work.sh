@@ -149,6 +149,7 @@ if [ "${scanned}" -ge "${scan_limit}" ]; then
 fi
 
 found=0
+unread=0
 for other in ${others}; do
     [ "${other}" = "${pr}" ] && continue
 
@@ -163,7 +164,16 @@ for other in ${others}; do
     fi
 
     other_files="$(files_of "${other}" || true)"
-    [ -n "${other_files}" ] || continue
+    # A pull request whose file list could not be read is one this run did NOT
+    # compare, so skipping it quietly would let the clean message below claim a
+    # comparison that never happened. Count it and say so; the endpoint returns
+    # nothing on a transient 5xx as readily as on a genuinely empty diff.
+    if [ -z "${other_files}" ]; then
+        unread=$((unread + 1))
+        echo "check-duplicate-work: NOTE: could not read #${other}'s file list, so" >&2
+        echo "    it was NOT compared. Any clean result below excludes it." >&2
+        continue
+    fi
     # An empty other_id means the diff could not be COMPUTED, not that it did
     # not match: a fork PR's head is not under refs/heads on this remote, and a
     # merged PR's branch may be gone. Staying quiet would downgrade a true
@@ -194,6 +204,15 @@ for other in ${others}; do
 done
 
 if [ "${found}" -eq 0 ]; then
+    if [ "${unread}" -gt 0 ]; then
+        # Qualify rather than claim. "Overlaps nothing" is a statement about
+        # every open pull request; what this run actually established is a
+        # statement about the ones it could read.
+        echo "check-duplicate-work: #${pr} overlaps none of the open pull requests"
+        echo "    this run could read; ${unread} could NOT be read and were skipped"
+        echo "    (see the NOTEs above). This is not a clean bill for those."
+        exit 2
+    fi
     echo "check-duplicate-work: #${pr} overlaps no other open pull request"
     exit 0
 fi
