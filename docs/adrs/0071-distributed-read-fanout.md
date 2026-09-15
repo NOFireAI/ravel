@@ -6,6 +6,11 @@ Amended by ADR-0096: per-sample dedup provenance columns on `Run` and
 `HistogramRun`, typed histogram records, and a `PROTOCOL_VERSION` bump to
 carry both over the distributed and federated fan-out paths.
 
+Amended by ADR-1295: each `--remote-cluster` credential is keyed by the one
+local tenant it belongs to and `Federation::fetch` selects remotes by the
+caller's tenant before dispatch, so the one-credential-per-process model
+described below is one credential per local tenant.
+
 ## Context
 
 Ravel's compute is stateless and disposable over an S3 source of truth. A
