@@ -109,10 +109,48 @@ check_contains "and names it" "#8" "${out}"
 # --- a merged pull request inside the window ---------------------------
 d="$(new_case addressed_merged)"
 merged="$(iso_days_ago 3)"
-printf '[{"number":9,"title":"done already","state":"MERGED","body":"Refs: #42","headRefName":"z","updatedAt":"%s","mergedAt":"%s","closedAt":"%s"}]\n' \
+printf '[{"number":9,"title":"done already","state":"MERGED","body":"Fixes: #42","headRefName":"z","updatedAt":"%s","mergedAt":"%s","closedAt":"%s"}]\n' \
   "${merged}" "${merged}" "${merged}" >"${d}/prs.json"
 out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
-check_eq "a recently merged PR that names the issue: skip (65)" "65" "${rc}"
+check_eq "a recently merged PR that closes the issue: skip (65)" "65" "${rc}"
+
+# --- cited is not closed -----------------------------------------------
+#
+# This repository's convention makes the difference load-bearing: `Fixes: #N`
+# resolves the issue, `Refs: #N` says related and explicitly does not. Treating
+# a citation as "already addressed" refuses the first genuine dispatch and
+# pushes the operator to DISPATCH_SKIP_DUPLICATE_CHECK=1, which trains the
+# reflex that flag exists to avoid.
+#
+# Measured against live data before the fix: issue #1790 is cited with `Refs:`
+# by two pull requests and closed by neither, and the guard refused it.
+# Mutation: match a bare `#<n>` again and this case fails.
+d="$(new_case refs_only)"
+printf '[{"number":20,"title":"unrelated work","state":"OPEN","body":"Refs: #42","headRefName":"r","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' >"${d}/prs.json"
+out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
+check_eq "a PR citing the issue with Refs: does not block (0)" "0" "${rc}"
+check_contains "but is reported" "do not close it" "${out}"
+check_contains "and names the PR" "#20" "${out}"
+
+# A bare mention in prose is the same: information, not a refusal.
+d="$(new_case bare_mention)"
+printf '[{"number":21,"title":"see also","state":"OPEN","body":"related to #42 but separate","headRefName":"m","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' >"${d}/prs.json"
+out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
+check_eq "a bare mention does not block (0)" "0" "${rc}"
+
+# Every GitHub closing keyword refuses, with and without the colon.
+for kw in "Fixes: #42" "Fixed #42" "Closes #42" "Closed: #42" "Resolves: #42" "resolve #42" "fix #42"; do
+  d="$(new_case "kw_$(printf '%s' "${kw}" | tr -cd '[:alnum:]')")"
+  printf '[{"number":22,"title":"work","state":"OPEN","body":"%s","headRefName":"k","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' "${kw}" >"${d}/prs.json"
+  out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
+  check_eq "'${kw}' refuses (65)" "65" "${rc}"
+done
+
+# The boundary still holds on the closing-keyword path.
+d="$(new_case kw_boundary)"
+printf '[{"number":23,"title":"other","state":"OPEN","body":"Fixes: #421","headRefName":"b","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' >"${d}/prs.json"
+out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
+check_eq "Fixes: #421 does not close #42 (0)" "0" "${rc}"
 
 # An old closed pull request is history, not a reason to skip work now.
 # Mutation: drop the cutoff and every stale PR blocks forever.
