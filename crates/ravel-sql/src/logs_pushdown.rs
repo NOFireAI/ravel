@@ -120,10 +120,15 @@
 //!
 //! F64 is out of scope (no `DeclaredType::F64` exists yet). The dispatch is one
 //! `match` on [`DeclaredType`], so F64 is a one-arm addition once its plumbing
-//! lands -- but that arm MUST honor [`Predicate::NumRange`]'s float contract
-//! (widen a zero-including range across both `0.0`/`-0.0` bit patterns, never
-//! build a bound from a NaN literal); the I64/Bool code here does not, because
-//! neither case is reachable for an integer or boolean literal.
+//! lands -- but that arm MUST honor [`Predicate::NumRange`]'s float contract:
+//! widen a zero-including range across both `0.0`/`-0.0` bit patterns, never
+//! build a bound from a NaN literal, and leave a NaN-polluted block to the
+//! reader rather than trying to prune around it here -- the extractor has no
+//! per-block `has_nan` to consult, only the predicate, so it is
+//! `ravel_logseg::skip_index::stat_disjoint` that must decline to prune a
+//! block whose f64 stat carries `has_nan`, unconditionally, before it ever
+//! applies this arm's bounds. The I64/Bool code here honors none of this,
+//! because neither case is reachable for an integer or boolean literal.
 
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator};
