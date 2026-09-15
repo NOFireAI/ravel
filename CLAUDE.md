@@ -584,6 +584,18 @@ than passing for "no pull request open".
   anchor, which is the case where the scan would otherwise pass everything.
   Wired into `gates.sh` and CI's doc-scripts job; cases in
   `scripts/guards/check-guarded-sql-parse.test.sh`.
+- `scripts/guards/check-promql-unreachable.sh [path ...]`: exits non-zero when
+  an `unreachable!` under `crates/ravel-promql/src/` carries no
+  `// unreachable-allow: <arm> -- <reason>` marker, on its own line or in the
+  contiguous comment block above it, with a non-empty reason. A parsed tenant
+  query used to be able to reach some of these arms and abort the process
+  instead of getting a typed rejection; issue #1701 converted every reachable
+  one to `Error::Unsupported` and left only the arms an exhaustive prior match
+  already narrows out of reach, each marked with the arm that now rejects
+  first. Exit 1 is an unmarked or empty-reason finding, 2 is zero
+  `unreachable!` occurrences found or a missing source directory, so a rename
+  or move cannot silently turn this into a no-op. Wired into `gates.sh` and
+  CI's doc-scripts job; cases in `scripts/guards/check-promql-unreachable.test.sh`.
 - `scripts/guards/check-workflow-permissions.sh [dir ...]`: exits non-zero
   when a workflow under `.github/workflows/` declares no top-level
   `permissions:` block, or when that block itself grants a write scope. The

@@ -105,10 +105,15 @@ pub(crate) fn eval_aggregate(
 ) -> Result<Value, Error> {
     let operand = match evaluator.eval_expr(source, &agg.expr, eval_ts_ns, ctx)? {
         Value::Vector(v) => v,
-        other => unreachable!(
-            "promql-parser guarantees an aggregate's inner expr is Vector-typed, got {}",
-            other.type_name()
-        ),
+        other => {
+            return Err(Error::Unsupported {
+                construct: format!(
+                    "aggregation operator {} over a {} expression",
+                    agg.op,
+                    other.type_name()
+                ),
+            });
+        }
     };
     let mut input = operand;
     input.sort_by(|a, b| label_set_cmp(&a.labels, &b.labels));
@@ -158,9 +163,9 @@ pub(crate) fn eval_aggregate(
                 construct: format!("aggregation operator {}", agg.op),
             })
         }
-        _ => {
-            unreachable!("promql-parser only produces the known aggregator tokens, got {op}")
-        }
+        _ => Err(Error::Unsupported {
+            construct: format!("aggregation operator {}", agg.op),
+        }),
     }
 }
 
@@ -227,14 +232,21 @@ fn eval_scalar_param(
 ) -> Result<f64, Error> {
     let param = match &agg.param {
         Some(p) => p,
-        None => unreachable!("promql-parser guarantees a scalar param for this aggregator"),
+        None => {
+            return Err(Error::Unsupported {
+                construct: format!("aggregation operator {} missing its parameter", agg.op),
+            });
+        }
     };
     match evaluator.eval_expr(source, param, eval_ts_ns, ctx)? {
         Value::Scalar(x) => Ok(x),
-        other => unreachable!(
-            "promql-parser guarantees a Scalar-typed param for this aggregator, got {}",
-            other.type_name()
-        ),
+        other => Err(Error::Unsupported {
+            construct: format!(
+                "aggregation operator {} parameter typed {}, expected scalar",
+                agg.op,
+                other.type_name()
+            ),
+        }),
     }
 }
 
@@ -333,6 +345,9 @@ fn reduce_group_samples(
                 reduce_group(op, &values),
             ))
         }
+        // unreachable-allow: eval_aggregate's unknown-aggregator-token arm --
+        // op only reaches here already narrowed to the plain-aggregate set by
+        // that dispatch, which now rejects anything else with Error::Unsupported.
         _ => unreachable!("reduce_group_samples called with non-plain aggregator {op}"),
     }
 }
@@ -345,6 +360,9 @@ fn aggregation_name(op: TokenId) -> &'static str {
         T_MAX => "max",
         T_STDDEV => "stddev",
         T_STDVAR => "stdvar",
+        // unreachable-allow: reduce_group_samples's T_MIN | T_MAX | T_STDDEV |
+        // T_STDVAR arm -- only that arm calls this helper, so op is already
+        // narrowed to the four float-only aggregators before it gets here.
         _ => unreachable!("aggregation_name called with a non-dropping aggregator {op}"),
     }
 }
@@ -359,6 +377,9 @@ fn reduce_group(op: TokenId, values: &[f64]) -> f64 {
         T_GROUP => 1.0,
         T_STDDEV => group_welford(values).sqrt(),
         T_STDVAR => group_welford(values),
+        // unreachable-allow: eval_aggregate's unknown-aggregator-token arm --
+        // op only reaches here already narrowed to a reducing aggregator by
+        // that dispatch, which now rejects anything else with Error::Unsupported.
         _ => unreachable!("reduce_group called with non-reducing aggregator {op}"),
     }
 }
@@ -498,14 +519,22 @@ fn eval_count_values(
 ) -> Result<Value, Error> {
     let param = match &agg.param {
         Some(p) => p,
-        None => unreachable!("promql-parser guarantees a string param for count_values"),
+        None => {
+            return Err(Error::Unsupported {
+                construct: "aggregation operator count_values missing its parameter".to_string(),
+            });
+        }
     };
     let label_name = match evaluator.eval_expr(source, param, eval_ts_ns, ctx)? {
         Value::String(s) => s,
-        other => unreachable!(
-            "promql-parser guarantees a String-typed param for count_values, got {}",
-            other.type_name()
-        ),
+        other => {
+            return Err(Error::Unsupported {
+                construct: format!(
+                    "aggregation operator count_values parameter typed {}, expected string",
+                    other.type_name()
+                ),
+            });
+        }
     };
     if !is_valid_label_name(&label_name) {
         return Err(Error::InvalidLabelName { label: label_name });
@@ -788,6 +817,182 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    /// Issue #1701: `eval_aggregate`'s dispatch match ends in a catch-all that
+    /// used to `unreachable!`, on the assumption that promql-parser only ever
+    /// produces a known aggregator token. A synthetic `AggregateExpr` (which
+    /// no real query text can produce, since the parser rejects unknown
+    /// aggregator names before this evaluator ever sees them) exercises that
+    /// assumption directly: it must reject, not panic, in case a future
+    /// promql-parser version adds a token this dispatch does not yet know.
+    #[test]
+    fn unknown_aggregator_token_rejects_without_panicking() {
+        use crate::eval::Error;
+        use promql_parser::parser::token::{T_ADD, TokenType};
+        use promql_parser::parser::{AggregateExpr, parse};
+
+        let agg = AggregateExpr {
+            op: TokenType::new(T_ADD),
+            expr: Box::new(parse("m").expect("parses")),
+            param: None,
+            modifier: None,
+        };
+        let ctx = crate::eval::QueryWindow::for_test();
+        let err = super::eval_aggregate(&Evaluator::new(), &source(), &agg, 0, &ctx)
+            .expect_err("must reject, not panic");
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert!(
+            construct.contains("aggregation operator"),
+            "rejection should name the aggregation operator, got {construct:?}"
+        );
+    }
+
+    /// Issue #1701: `eval_aggregate` used to `unreachable!` when its inner
+    /// expression evaluated to a non-Vector value, trusting promql-parser's
+    /// own type check. A synthetic `AggregateExpr` wrapping a Scalar-typed
+    /// inner expression (no real query text produces this: the parser
+    /// rejects a non-Vector aggregate operand before this evaluator sees it)
+    /// exercises the defensive fallback directly.
+    #[test]
+    fn aggregate_over_non_vector_inner_expr_rejects_without_panicking() {
+        use crate::eval::Error;
+        use promql_parser::parser::token::{T_SUM, TokenType};
+        use promql_parser::parser::{AggregateExpr, parse};
+
+        let agg = AggregateExpr {
+            op: TokenType::new(T_SUM),
+            expr: Box::new(parse("1").expect("parses")),
+            param: None,
+            modifier: None,
+        };
+        let ctx = crate::eval::QueryWindow::for_test();
+        let err = super::eval_aggregate(&Evaluator::new(), &source(), &agg, 0, &ctx)
+            .expect_err("must reject, not panic");
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert!(
+            construct.contains("scalar"),
+            "rejection should name the non-Vector operand type, got {construct:?}"
+        );
+    }
+
+    /// Issue #1701: `eval_scalar_param` used to `unreachable!` on a missing
+    /// or non-Scalar aggregator parameter, trusting promql-parser's own type
+    /// check. A synthetic `AggregateExpr` with no param at all (no real
+    /// `topk`/`bottomk`/`quantile` query text produces this: the parser
+    /// requires the parameter) exercises the missing-param fallback.
+    #[test]
+    fn scalar_param_missing_rejects_without_panicking() {
+        use crate::eval::Error;
+        use promql_parser::parser::token::{T_TOPK, TokenType};
+        use promql_parser::parser::{AggregateExpr, parse};
+
+        let agg = AggregateExpr {
+            op: TokenType::new(T_TOPK),
+            expr: Box::new(parse("m").expect("parses")),
+            param: None,
+            modifier: None,
+        };
+        let ctx = crate::eval::QueryWindow::for_test();
+        let err = super::eval_scalar_param(&Evaluator::new(), &source(), &agg, 0, &ctx)
+            .expect_err("must reject, not panic");
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert!(
+            construct.contains("topk"),
+            "rejection should name the aggregation operator, got {construct:?}"
+        );
+    }
+
+    /// Issue #1701: same as above, for a present but non-Scalar parameter
+    /// (a String-typed param no real `topk` query text can produce).
+    #[test]
+    fn scalar_param_non_scalar_rejects_without_panicking() {
+        use crate::eval::Error;
+        use promql_parser::parser::token::{T_TOPK, TokenType};
+        use promql_parser::parser::{AggregateExpr, parse};
+
+        let agg = AggregateExpr {
+            op: TokenType::new(T_TOPK),
+            expr: Box::new(parse("m").expect("parses")),
+            param: Some(Box::new(parse(r#""x""#).expect("parses"))),
+            modifier: None,
+        };
+        let ctx = crate::eval::QueryWindow::for_test();
+        let err = super::eval_scalar_param(&Evaluator::new(), &source(), &agg, 0, &ctx)
+            .expect_err("must reject, not panic");
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert!(
+            construct.contains("string"),
+            "rejection should name the wrong param type, got {construct:?}"
+        );
+    }
+
+    /// Issue #1701: `eval_count_values` used to `unreachable!` on a missing
+    /// `count_values` parameter, trusting promql-parser's own type check. No
+    /// real `count_values` query text produces this: the parser requires the
+    /// parameter.
+    #[test]
+    fn count_values_param_missing_rejects_without_panicking() {
+        use crate::eval::Error;
+        use promql_parser::parser::token::{T_COUNT_VALUES, TokenType};
+        use promql_parser::parser::{AggregateExpr, parse};
+
+        let agg = AggregateExpr {
+            op: TokenType::new(T_COUNT_VALUES),
+            expr: Box::new(parse("m").expect("parses")),
+            param: None,
+            modifier: None,
+        };
+        let input = Evaluator::new()
+            .instant(&source(), "m", 0)
+            .expect("must evaluate");
+        let ctx = crate::eval::QueryWindow::for_test();
+        let err = super::eval_count_values(&Evaluator::new(), &source(), &agg, input, 0, &ctx)
+            .expect_err("must reject, not panic");
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert!(
+            construct.contains("count_values"),
+            "rejection should name count_values, got {construct:?}"
+        );
+    }
+
+    /// Issue #1701: same as above, for a present but non-String parameter (a
+    /// Scalar-typed param no real `count_values` query text can produce).
+    #[test]
+    fn count_values_param_non_string_rejects_without_panicking() {
+        use crate::eval::Error;
+        use promql_parser::parser::token::{T_COUNT_VALUES, TokenType};
+        use promql_parser::parser::{AggregateExpr, parse};
+
+        let agg = AggregateExpr {
+            op: TokenType::new(T_COUNT_VALUES),
+            expr: Box::new(parse("m").expect("parses")),
+            param: Some(Box::new(parse("1").expect("parses"))),
+            modifier: None,
+        };
+        let input = Evaluator::new()
+            .instant(&source(), "m", 0)
+            .expect("must evaluate");
+        let ctx = crate::eval::QueryWindow::for_test();
+        let err = super::eval_count_values(&Evaluator::new(), &source(), &agg, input, 0, &ctx)
+            .expect_err("must reject, not panic");
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert!(
+            construct.contains("string"),
+            "rejection should name the wrong param type, got {construct:?}"
+        );
     }
 
     /// promql-parser 0.10 parses `limitk`/`limit_ratio`, so both reach the

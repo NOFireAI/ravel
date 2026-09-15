@@ -2475,6 +2475,26 @@ surface. `ravel-promql`'s aggregation dispatch rejects both with a typed
 surface (they are not part of the stable language), and are not implemented;
 the clean rejection is what the guarantee requires.
 
+The same state-2 guarantee applies below the scored surface too, at the
+evaluator's own internal dispatch arms. `ravel-promql` used to defend several
+of these with `unreachable!()`, on the assumption that promql-parser's AST
+could never carry a shape those arms didn't expect. Issue #1701 found that
+several of them were in fact reachable from a parsed tenant query -- an
+unknown aggregator token, an aggregate whose inner expression evaluates to a
+non-vector, a missing or wrongly-typed `limitk`/`count_values` parameter, a
+binary operator whose operands are neither both scalar nor both vector, and a
+`ManyToMany` vector match on a non-set operator -- and converted each to a
+typed `Error::Unsupported` naming the operator or type, rather than aborting
+the process. The arms that remain `unreachable!()` are the ones an exhaustive
+prior match already narrows out of reach before they run (for example,
+`apply_arith`'s fallback, reachable only through `eval_binary`'s own
+arithmetic/comparison dispatch), and each carries a one-line comment naming
+the arm that rejects first. `scripts/guards/check-promql-unreachable.sh`
+keeps this from regressing: every `unreachable!()` under
+`crates/ravel-promql/src` must carry that comment, so a new defensive arm
+added without one fails the gate instead of becoming the next reachable
+panic.
+
 The table below is generated from a run, not hand-maintained: the state
 column is recomputed from which corpus entries actually exercise each
 construct and whether they actually passed, so a regression appears as a diff
