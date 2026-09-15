@@ -25,8 +25,8 @@ use std::time::Duration;
 use common::{StallingStore, TestClock, make_point, tenant};
 use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, WriteMode};
 use ravel_logseg::stream_attrs_bytes;
-use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{ObjectStoreBackend, list_all};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_otlp::traces_normalize::NormalizedSpan;
 use ravel_rspan::StatusCode;
@@ -211,6 +211,151 @@ async fn stalled_flush_does_not_stop_a_coresident_tenants_age_trigger() {
     // Let A's PUT proceed and drain both tenants so the actor shuts down clean.
     stalling.release();
     router.flush_all().await;
+}
+
+/// A buffered flush that queues behind a stalled prefix must not burn its
+/// abandonment lifetime while it waits for the shard permit (issue #1739).
+///
+/// Tenant A's data PUT stalls, holding the shard's one permit. Tenant B writes
+/// in buffered mode, so its rows are acknowledged at enqueue; its age-triggered
+/// flush then queues on the permit A holds. The injected clock advances past
+/// `max_flush_lifetime` while B is still queued, which also crosses A's own
+/// flush-open deadline, so A's stalled PUT is abandoned and releases the
+/// permit. B then acquires it -- but with the deadline pinned at flush-open, B's
+/// own lifetime has already elapsed in the queue, so B is abandoned before it
+/// attempts a PUT and its already-acked rows are dropped with no crash. The fix
+/// re-derives the deadline from the moment the permit is granted, so B gets its
+/// full lifetime for its own store calls and its rows reach the store.
+#[tokio::test]
+async fn buffered_flush_queued_behind_a_stall_reaches_the_store_past_lifetime() {
+    let start_ns = 1_700_000_000_000_000_000;
+    let clock = TestClock::new(start_ns);
+
+    let tenant_a = tenant("throttled-prefix-tenant");
+    let tenant_b = tenant("healthy-tenant");
+    // A's data object key is `t/<a_hash_hex>/metrics/l0/...`; stalling on this
+    // substring stalls A's PUT and nothing of B's. B's own objects live under
+    // `t/<b_hash_hex>/`, the prefix the durability assertion reads.
+    let a_hash_hex = tenant_a.hash().to_hex();
+    let b_hash_hex = tenant_b.hash().to_hex();
+
+    let stalling = Arc::new(StallingStore::new(MemoryStore::new(), a_hash_hex, 1));
+    let store: Arc<dyn ObjectStoreBackend> = stalling.clone();
+
+    let max_flush_delay = Duration::from_secs(2);
+    // B is buffered (no strict waiter) and tiny, so its buffer takes the idle
+    // age threshold, not `max_flush_delay`; the test advances past this to open
+    // B's flush.
+    let max_flush_delay_idle = Duration::from_secs(40);
+    let max_flush_lifetime = Duration::from_secs(3600);
+    let config = IngestConfig {
+        shard_count: 1,
+        // Small enough that A's wide batch size-triggers at once, large enough
+        // that B's single point stays buffered until its age trigger fires.
+        target_bytes: 4096,
+        max_flush_delay,
+        max_flush_delay_idle,
+        max_flush_lifetime,
+        flush_tick: Duration::from_millis(50),
+        max_inflight_flushes: 1,
+        ..IngestConfig::default()
+    };
+    let router = Arc::new(IngestRouter::new(
+        config,
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+    ));
+
+    // Tenant A: a wide strict write that crosses target_bytes, so it opens a
+    // size flush whose data PUT stalls on A's prefix, holding the one permit.
+    let a_points: Vec<_> = (0..400u32)
+        .map(|i| {
+            make_point(
+                &tenant_a,
+                "m",
+                &[("series", &i.to_string())],
+                start_ns,
+                i as f64,
+            )
+        })
+        .collect();
+    let router_a = Arc::clone(&router);
+    let tenant_a_moved = tenant_a.clone();
+    let _a = tokio::spawn(async move {
+        let _ = router_a
+            .write(
+                tenant_a_moved,
+                a_points,
+                WriteMode::Strict,
+                Duration::from_secs(60),
+            )
+            .await;
+    });
+    stalling.wait_until_stalled().await;
+    assert_eq!(
+        in_flight(&router, 0),
+        1,
+        "A's flush task is spawned and holds the one permit"
+    );
+
+    // Tenant B: a single buffered point. Buffered mode acks at enqueue, so these
+    // rows are already acknowledged; an abandoned flush drops them with no crash.
+    router
+        .write(
+            tenant_b.clone(),
+            vec![make_point(&tenant_b, "m", &[("h", "1")], start_ns, 1.0)],
+            WriteMode::Buffered,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a buffered write acks at enqueue");
+    let seen = poll_until(|| processed(&router, 0), 2).await;
+    assert_eq!(
+        seen, 2,
+        "the actor must keep draining and buffer B while A's flush is stalled"
+    );
+
+    // Advance past the idle age threshold: B's age trigger opens B's flush,
+    // which then queues on the one permit A holds. B's flush-open deadline is
+    // pinned here.
+    clock.advance_ns(max_flush_delay_idle.as_nanos() as i64 + 1);
+    let observed = poll_until(|| in_flight(&router, 0), 2).await;
+    assert_eq!(
+        observed, 2,
+        "B's age trigger must spawn its flush task while A holds the permit"
+    );
+
+    // Advance past max_flush_lifetime while B is still queued. A's flush-open
+    // deadline (pinned at start) is now past too, so A's stalled PUT is
+    // abandoned and releases the permit for B.
+    clock.advance_ns(max_flush_lifetime.as_nanos() as i64 + 1);
+
+    // Release the (already abandoned) stall and drain: `flush_all` joins every
+    // in-flight flush task, so both A's and B's flushes reach a terminal
+    // outcome before it returns.
+    stalling.release();
+    router.flush_all().await;
+
+    // The stall fired exactly once, on A's data PUT: the queue behind it was a
+    // real fault, not an unexercised one.
+    assert_eq!(
+        stalling.stall_hits(),
+        1,
+        "exactly one PUT stalled, and it was on tenant A's prefix"
+    );
+
+    // B's acked buffered rows must be durable. This fails on unmodified code:
+    // B's flush burned its lifetime in the queue and was abandoned before its
+    // PUT, so nothing lands under B's prefix.
+    let b_objects = list_all(store.as_ref(), &format!("t/{b_hash_hex}/"))
+        .await
+        .expect("list B's objects");
+    assert!(
+        !b_objects.is_empty(),
+        "B's acked buffered rows must reach the store, not be dropped when its \
+         queued flush outran a lifetime it spent waiting for the permit: {b_objects:?}"
+    );
 }
 
 fn log_in_flight(router: &LogIngestRouter, shard: u32) -> u64 {

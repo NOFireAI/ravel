@@ -389,6 +389,24 @@ impl SpanFlushCtx {
         }
     }
 
+    /// Abandons a flush whose flush-open deadline already elapsed while it was
+    /// queued for a permit, before it took one or attempted any store call
+    /// (issue #1739). Its waiters are acked with a retryable `Abandoned` error
+    /// and its byte charges are dropped, refunding the ADR-0069 budget.
+    fn abandon_in_queue(&self, pinned: SpanPinnedFlush) {
+        let SpanPinnedFlush {
+            waiters, charges, ..
+        } = pinned;
+        self.metrics.record_abandoned_retry_exhausted();
+        self.ack_waiters(
+            waiters,
+            Err(SpanWriteError::Abandoned(
+                "flush lifetime elapsed while queued for a shard flush permit".into(),
+            )),
+        );
+        drop(charges);
+    }
+
     /// Races `fut` against the remaining budget to `deadline_ns` on the injected
     /// `Clock`, returning `None` if the deadline is already past or elapses
     /// while `fut` is still in flight. Built on `tokio::select!` racing
@@ -1028,9 +1046,15 @@ impl SpanShardActor {
             }
         };
         self.metrics.record_flush(trigger);
-        // ADR-1307 finding 4: the abandonment deadline measures real-time
-        // budget, so it derives from the raw clock reading, not the (possibly
-        // floor-raised) stamp.
+        // The deadline pinned here is the flush-open deadline. It bounds how
+        // long the flush may sit queued for a permit: the spawned task checks it
+        // before acquiring and abandons a flush already past it without taking a
+        // permit (issue #1739 part 2). The budget for the flush's own store
+        // calls is re-derived from the moment the permit is granted (part 1), so
+        // a flush that waited behind a stalled prefix does not spend its lifetime
+        // in the queue and drop already-acked rows with no PUT.
+        // ADR-1307 finding 4: it derives from the raw clock reading, not the
+        // (possibly floor-raised) stamp.
         let deadline_ns = raw_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
 
         let identity = ObjectIdentity {
@@ -1088,6 +1112,23 @@ impl SpanShardActor {
         let ctx = Arc::clone(&self.ctx);
         self.flushes.spawn(async move {
             let _guard = guard;
+            let mut pinned = pinned;
+            // Issue #1739 part 2: a flush whose flush-open deadline already
+            // elapsed while it sat in the spawn queue must not take a permit only
+            // to fail the deadline check inside `run_flush` and waste the slot.
+            // Check the pinned flush-open deadline here, before the acquire; if
+            // it has passed, abandon in the queue with no permit taken. In normal
+            // operation the deadline is a full `max_flush_lifetime` ahead of
+            // flush-open, so this fires only when this task is scheduled
+            // pathologically late.
+            if ctx
+                .bound_to_deadline(pinned.deadline_ns, std::future::ready(()))
+                .await
+                .is_none()
+            {
+                ctx.abandon_in_queue(pinned);
+                return;
+            }
             // Wait for a flush permit here, off the actor. At the bound this task
             // parks; the actor does not.
             let permit = match semaphore.acquire_owned().await {
@@ -1097,6 +1138,18 @@ impl SpanShardActor {
                 ),
             };
             let _permit = permit;
+            // Issue #1739 part 1: re-derive the abandonment deadline from the
+            // moment the permit is granted, not from flush-open. A flush that
+            // queued behind a stalled prefix must get its full
+            // `max_flush_lifetime` for its own store calls; pinning at flush-open
+            // spent that budget in the queue and dropped already-acked buffered
+            // rows with no PUT. The re-derived value only ever moves the deadline
+            // later (grant is at or after open), so it never shortens a flush's
+            // store budget.
+            pinned.deadline_ns = ctx
+                .clock
+                .now_ns()
+                .saturating_add(ctx.config.max_flush_lifetime.as_nanos() as i64);
             ctx.run_flush(pinned).await;
         });
     }
