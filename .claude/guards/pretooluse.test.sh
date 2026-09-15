@@ -327,6 +327,28 @@ check allow "ALLOW_DESTRUCTIVE=1 before a force-push" \
 check deny  "a different env prefix does not launder it" \
   "$(bash_payload 'CARGO_INCREMENTAL=0 git reset --hard origin/main')"
 
+# Review findings on this PR, each verified against the hook before the fix.
+# All three are regex-boundary holes of the same shape: a pattern that is
+# right about plain text and wrong about one ordinary variation of it.
+#
+# A quote between the space and the ref. `git reset --hard 'origin/main'`
+# discards exactly what the unquoted spelling does.
+check deny  "reset --hard 'origin/main' single-quoted" "$(bash_payload "git reset --hard 'origin/main'")"
+check deny  "reset --hard \"origin/main\" double-quoted" "$(bash_payload 'git reset --hard "origin/main"')"
+check deny  "reset --soft, quoted remote ref"          "$(bash_payload 'git reset --soft "origin/main"')"
+# The abbreviated plus-refspec. Requiring `+refs/` matched only the long form
+# and made PUSH_TARGETS_MAIN's own `+main`/`HEAD:main` alternatives dead.
+check deny  "push origin +main"                        "$(bash_payload 'git push origin +main')"
+check deny  "push origin +HEAD:main"                   "$(bash_payload 'git push origin +HEAD:main')"
+check deny  "push origin +main:main"                   "$(bash_payload 'git push origin +main:main')"
+# A branch whose name merely STARTS with main is not main. `main\b` refused
+# these, which is fail-closed but wrong, and the override would have been
+# used to work around the guard rather than to accept a loss.
+check allow "force-push to main-experiment"            "$(bash_payload 'git push --force-with-lease origin main-experiment')"
+check allow "force-push to main/foo"                   "$(bash_payload 'git push --force origin main/foo')"
+check allow "force-push to maintenance"                "$(bash_payload 'git push --force origin maintenance')"
+check allow "force-push to mainline"                   "$(bash_payload 'git push --force origin mainline')"
+
 # --- malformed input must never block -----------------------------------
 check allow "empty stdin"                      ""
 check allow "not json"                         "wat"
