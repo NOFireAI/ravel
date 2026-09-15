@@ -2,15 +2,19 @@
 # check-duplicate-work.sh <pr-number> [remote]
 # Report open pull requests whose work overlaps <pr-number>'s, before you start
 # on it. Exit 0 when nothing overlaps; exit 1 when something does; exit 2 when
-# the check cannot stand behind a clean answer. Exit 2 covers two different
-# situations and a caller should treat both the same way:
+# the check cannot stand behind a clean answer. Exit 2 covers every way the
+# comparison can be incomplete, and a caller should treat them alike:
 #
 #   - the check could not run at all (bad argument, no such pull request, gh or
-#     git failed), or
-#   - it ran and compared most pull requests but could not read at least one,
-#     so "nothing overlaps" would be a claim about pull requests it never saw.
+#     git failed),
+#   - it ran but could not read at least one pull request's file list, or
+#   - it ran but there are more open pull requests than the scan limit, so some
+#     were never reached.
 #
-# Only exit 0 means "compared everything open and found nothing".
+# In each case "nothing overlaps" would be a claim about pull requests this run
+# never compared. Only exit 0 means "compared everything open and found
+# nothing"; exit 1 can also carry an incomplete-comparison note, because an
+# overlap being found says nothing about the ones that went unread.
 #
 # Several Claude sessions work this repository at once through one shared `gh`
 # account, so a pull request's author never says which session owns it, and a
@@ -134,7 +138,7 @@ if [ -z "${mine_files}" ]; then
     exit 2
 fi
 
-scan_limit=300
+scan_limit=${DUPCHK_SCAN_LIMIT:-300}
 others="$(gh pr list --repo "${repo}" --state open --limit "${scan_limit}" --json number --jq '.[].number' 2>/dev/null)" || {
     echo "check-duplicate-work: could not list open pull requests" >&2
     exit 2
@@ -149,7 +153,9 @@ else
     scanned="$(printf '%s\n' "${others}" | wc -l | tr -d '[:space:]')"
     [ -n "${scanned}" ] || scanned=0
 fi
+capped=0
 if [ "${scanned}" -ge "${scan_limit}" ]; then
+    capped=1
     echo "check-duplicate-work: NOTE: compared only the first ${scan_limit} open" >&2
     echo "    pull requests; more are open and were NOT compared, so a clean" >&2
     echo "    result here does not rule out a duplicate past that cap." >&2
@@ -210,14 +216,23 @@ for other in ${others}; do
     fi
 done
 
+# Two different reasons the comparison can be incomplete, and they mean the same
+# thing to a caller: this run did not look at every open pull request, so it
+# cannot make a statement about all of them. Kept in one place so a third reason
+# added later has somewhere obvious to go -- the first two were each fixed one
+# branch at a time, which is how the second survived the fix for the first.
+incomplete=0
+[ "${unread}" -gt 0 ] && incomplete=1
+[ "${capped}" -eq 1 ] && incomplete=1
+
 if [ "${found}" -eq 0 ]; then
-    if [ "${unread}" -gt 0 ]; then
+    if [ "${incomplete}" -eq 1 ]; then
         # Qualify rather than claim. "Overlaps nothing" is a statement about
-        # every open pull request; what this run actually established is a
-        # statement about the ones it could read.
+        # every open pull request; what this run established is a statement
+        # about the ones it actually compared.
         echo "check-duplicate-work: #${pr} overlaps none of the open pull requests"
-        echo "    this run could read; ${unread} could NOT be read and were skipped"
-        echo "    (see the NOTEs above). This is not a clean bill for those."
+        echo "    this run compared, but the comparison was INCOMPLETE (see the"
+        echo "    NOTEs above). This is not a clean bill."
         exit 2
     fi
     echo "check-duplicate-work: #${pr} overlaps no other open pull request"
@@ -228,4 +243,13 @@ echo ""
 echo "Overlap is not a blocker: the merge queue rebases and re-tests whichever"
 echo "lands second. IDENTICAL is a blocker, and a large overlap is worth a word"
 echo "with the other session before either merges."
+if [ "${incomplete}" -eq 1 ]; then
+    # Say it here too. A caller that reads exit 1 as "overlap found, comparison
+    # complete" would otherwise learn nothing about the pull requests this run
+    # never reached, and the stderr NOTEs are easy to lose beside a finding.
+    echo ""
+    echo "NOTE: this comparison was INCOMPLETE -- some open pull requests were"
+    echo "not read or not reached. There may be further overlap, or a duplicate,"
+    echo "among those."
+fi
 exit 1
