@@ -237,7 +237,23 @@ connection, a pushed-but-broken main).
   fresh-ref guard, and posts a marker comment; `record`/`failed` close it
   out after the `fleet_dispatch` call. A start push lost to a 5xx then
   leaves a record instead of a ghost task, and a retry cannot
-  double-dispatch. Use it around every dispatch.
+  double-dispatch. Use it around every dispatch. An unreadable intent
+  history exits 69: UNKNOWN is not the same as no dangling intent, and the
+  moment GitHub is unreliable is the moment a dispatch is most likely to be
+  a retry of one that already started.
+- `scripts/epic-orchestrator.sh <command> <epic>`: the per-epic state index
+  behind a resumable orchestration, at `.claude/epic-state/<epic>.json` in
+  the PRIMARY checkout (a wave's worktree is deleted at the end of its
+  wave). `record <kind>` writes each transition; `task-dispatched` also
+  appends the ledger line to the epic issue BODY and reads it back, because
+  `epic-status.sh` parses the body and nothing else. `reconcile` rewrites
+  the index from live GitHub state and blocks the next dispatch (65) on any
+  drift, reporting a task with a start ref and no result ref as UNRESOLVED
+  rather than guessing between RUNNING and LOST. `resume-set --reason` parks
+  a recoverable interruption with the next backoff delay (900, 1800, 3600;
+  below 900 the PreToolUse guard refuses the wakeup) and exits 69, or exits
+  75 on a fatal error or an exhausted budget. `classify` and `backoff` are
+  the same decisions on their own, for a caller that only needs one.
 - `scripts/ci-sweep-cancelled.sh [-y]`: finds cancelled ci runs on open PR
   head SHAs and reruns them (dry run by default). A cancelled required
   check blocks auto-merge the same as a red one, and nothing retries it.
@@ -335,20 +351,64 @@ between your working tree and every change anyone else makes to it, and it
 ships your paths to fleet executors. Both settings files are read and
 merged, local last, so nothing is lost by splitting them.
 
-Four of these no longer depend on being remembered.
+Several of these no longer depend on being remembered.
 `.claude/guards/pretooluse.mjs` runs as a PreToolUse hook and refuses the
 tool call outright: a gate or guard piped into `tail`/`head`/`grep`/`rg`/
 `sed` or followed by `&& echo`, in the command itself or inside any
 command substitution (`out="$(guard | tail -1)"` and its backtick
 spelling run the same gate and read the same pipe's status), an
 assignment to zsh's reserved `status`/`path`/
-`argv`/`PWD`, a `ScheduleWakeup` under 900 s, and an `Edit`/`Write`
-inside the primary checkout. It fails open on any internal error, and it
-exempts a dispatched fleet clone (which is itself the isolated
-workspace). `RAVEL_GUARD_ALLOW_PRIMARY=1` is the escape hatch for the
-last rule. Its cases live in `.claude/guards/pretooluse.test.sh`; add one
-there before changing a rule.
+`argv`/`PWD`, a `ScheduleWakeup` under 900 s, an `Edit`/`Write`
+inside the primary checkout, and three destructive git operations:
+`reset --hard/--soft` onto a remote ref, `filter-branch`, and a
+force-push naming `main`. The gate patterns match cargo's global flags
+too (`cargo --locked test | tail -1` was allowed until they did). It
+fails open on any internal error, and it exempts a dispatched fleet clone
+(which is itself the isolated workspace).
+`RAVEL_GUARD_ALLOW_PRIMARY=1` is the escape hatch for the worktree rule;
+`ALLOW_DESTRUCTIVE=1`, written inline at the front of the command (shell
+state does not survive between tool calls), is the one for the git rules.
+Its cases live in `.claude/guards/pretooluse.test.sh` and run in CI's
+doc-scripts job; add one there before changing a rule.
 
+`.githooks/pre-push` is the same protection at the git level, and it
+covers what the hook cannot see: it refuses a push that would drop
+commits from `main` or from any branch with an open pull request, prints
+the commits and diffstat that would be lost, and takes the same
+`ALLOW_DESTRUCTIVE=1`. It never sees `--force` (git passes a pre-push
+hook four fields on stdin and no flags), so it tests ancestry instead,
+which also catches `--force-with-lease` and a `+refs/` refspec. Install
+it once per checkout with `scripts/guards/install-git-hooks.sh`
+(`--check` reports whether it is installed); `core.hooksPath` is
+per-repository config shared by every linked worktree, so one run covers
+them all. A pull-request lookup that cannot be answered refuses rather
+than passing for "no pull request open".
+
+- `scripts/guards/assert-no-duplicate-dispatch.sh --issue <n> [--paths a,b]`:
+  refuse to dispatch work someone is already doing. Exits 65 when an open or
+  recently-merged pull request already references the issue (skip and log,
+  never open a second one), 66 when an OPEN pull request is already touching
+  a predicted file, and 69 when the question could not be asked. It reads
+  each candidate's files from the paginated endpoint, because
+  `gh pr list --json files` caps at 100 and would report a wide pull request
+  as touching nothing. It is the pre-dispatch half of the problem;
+  `check-duplicate-work.sh` compares patch-ids between pull requests that
+  already exist, which a task with no diff yet cannot use.
+- `scripts/guards/assert-green-head.sh <pr> [--rerun]`: the merge gate. Green
+  means green on the pull request's current head: the head SHA is re-read
+  after the query and a move aborts the verdict, and an empty rollup is
+  reported as no-verdict rather than as zero failures. On red it records a
+  failure signature (failing job, failing step, test identifiers from the
+  failed log) against that SHA in the orchestrator state, reruns once, and
+  compares: the same signature twice exits 1 (a real failure, escalate), two
+  different signatures exit 4 (a flake, budget spent). A cancelled or
+  timed-out check exits 6 and goes to `ci-sweep-cancelled.sh`, which owns the
+  timeout-versus-supersede distinction.
+- `scripts/guards/show-destructive-loss.sh <target-ref> [--from <ref>]
+  [--hard]`: prints the commits a reset would orphan, their combined
+  diffstat, and (with `--hard`) the uncommitted work that would go with no
+  reflog entry. Run it before setting `ALLOW_DESTRUCTIVE=1`; that is what the
+  flag is meant to be read beside.
 - `scripts/guards/assert-worktree.sh`: exits non-zero if the cwd is the
   PRIMARY checkout rather than a linked worktree. Run it before the first
   edit/commit of any isolated unit of work. A concurrent session can hold
