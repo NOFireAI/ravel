@@ -1107,10 +1107,15 @@ pub struct Cli {
     /// isolation control as much as a throughput one. At the default of 1, a
     /// tenant whose S3 key prefix is being throttled (`503 SlowDown`, applied
     /// per prefix) holds the shard's only permit, and co-resident tenants'
-    /// flushes queue behind it until the stall clears or `max_flush_lifetime`
-    /// abandons it; their writes are still accepted, but their data stays
-    /// invisible to queries meanwhile. Raising it gives those tenants a
-    /// permit to flush on, at the cost of more concurrent PUTs and more
+    /// flushes queue behind it until the stall clears. A queued flush's
+    /// `max_flush_lifetime` budget is measured from when it acquires the permit,
+    /// not from flush-open (issue #1739), so the wait itself does not abandon
+    /// it: a buffered write's rows stay invisible to queries until the stall
+    /// clears, then commit, rather than being dropped. A co-resident strict
+    /// write instead takes `WriteError::AckTimeout` once the request's ack
+    /// deadline elapses while its flush is still queued for the permit, even
+    /// though its own prefix stayed healthy. Raising the bound gives those
+    /// tenants a permit to flush on, at the cost of more concurrent PUTs and more
     /// encode memory in flight. Queued flushes hold their buffers and their
     /// ADR-0069 byte charges, so the byte budget, not this bound, is what
     /// sheds when a shard backs up. Matches

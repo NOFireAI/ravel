@@ -23,8 +23,9 @@
 //!   the data-object PUT, or the commit-record PUT. A flush that is later
 //!   abandoned is therefore counted in both `flushes_by_*` **and** one of the
 //!   `abandoned_*` counters. Flushes that actually reached a durable commit
-//!   are the three trigger counters summed, minus `abandoned_retry_exhausted`
-//!   and `abandoned_input_rejected`; the bare trigger sum overcounts.
+//!   are the three trigger counters summed, minus `abandoned_retry_exhausted`,
+//!   `abandoned_input_rejected`, and `abandoned_queue_deadline`; the bare
+//!   trigger sum overcounts.
 //! - **Success-time.** `acks_ok`/`acks_err` are recorded when a flush's strict
 //!   waiters are acked, i.e. at the flush's terminal outcome. They count
 //!   strict-mode waiters only: a buffered-mode flush, or an age/size flush with
@@ -109,11 +110,21 @@ pub struct IngestMetrics {
     /// paths. Excludes each path's first attempt.
     put_retries: AtomicU64,
     /// Flushes abandoned because a PUT exhausted its retry budget or
-    /// `max_flush_lifetime` elapsed first (`WriteError::Abandoned`). A
-    /// durability signal: the input was fine, the object store did not accept
-    /// it in time. Nothing was acknowledged and the whole write stays
-    /// retryable.
+    /// `max_flush_lifetime` elapsed while the flush's own store calls were in
+    /// flight (`WriteError::Abandoned`). A durability signal about the object
+    /// store: the flush held a permit and its PUTs did not land in time.
+    /// Nothing was acknowledged and the whole write stays retryable. Split from
+    /// `abandoned_queue_deadline`, which never reached a store call at all.
     abandoned_retry_exhausted: AtomicU64,
+    /// Flushes abandoned because their flush-open deadline elapsed while they
+    /// were still queued for a `max_inflight_flushes` permit, before taking one
+    /// or attempting any store call (`WriteError::Abandoned`, issue #1739). A
+    /// contention signal, not an object-store one: distinct from
+    /// `abandoned_retry_exhausted` so a deadline reached in the queue is not
+    /// read as the store failing to accept a PUT. With the deadline re-derived
+    /// from permit grant this fires only when a flush's task is scheduled after
+    /// its flush-open deadline already passed.
+    abandoned_queue_deadline: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the segment build, data-key derivation, or commit-record
     /// build failed (`WriteError::SegmentBuild`). A client signal: identical
@@ -569,6 +580,10 @@ pub struct IngestMetricsSnapshot {
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
+    /// Flushes abandoned by their flush-open deadline while queued for a permit,
+    /// before any store call (issue #1739). Distinct from
+    /// `abandoned_retry_exhausted` (a store failure).
+    pub abandoned_queue_deadline: u64,
     pub abandoned_input_rejected: u64,
     pub buffered_bytes_total: u64,
     pub buffered_points_total: u64,
@@ -769,10 +784,19 @@ impl IngestMetrics {
         self.put_retries.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A flush abandoned by retry-budget or lifetime exhaustion
-    /// (`WriteError::Abandoned`): a durability signal, retryable.
+    /// A flush abandoned by retry-budget or lifetime exhaustion while its own
+    /// store calls were in flight (`WriteError::Abandoned`): a durability
+    /// signal, retryable.
     pub(crate) fn record_abandoned_retry_exhausted(&self) {
         self.abandoned_retry_exhausted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A flush abandoned because its flush-open deadline elapsed while it was
+    /// queued for a permit, before any store call (`WriteError::Abandoned`,
+    /// issue #1739): a contention signal, retryable.
+    pub(crate) fn record_abandoned_queue_deadline(&self) {
+        self.abandoned_queue_deadline
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -905,6 +929,7 @@ impl IngestMetrics {
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
+            abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
             abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
             buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),
             buffered_points_total: self.buffered_points_total.load(Ordering::Relaxed),
@@ -1276,16 +1301,20 @@ mod tests {
     #[test]
     fn abandoned_causes_are_counted_separately() {
         let metrics = IngestMetrics::default();
-        // Two durability abandonments (retry/lifetime exhaustion) and one
-        // input rejection (segment build failed). The split lets an operator
-        // tell a store problem from a bad-input problem by counter alone, which a single
-        // `abandoned_flushes` counter could not.
+        // Two store-side abandonments (retry/lifetime exhaustion), one input
+        // rejection (segment build failed), and one queue-deadline abandonment
+        // (issue #1739: the flush-open deadline elapsed while queued, before any
+        // store call). The three-way split lets an operator tell a store
+        // problem from a bad-input problem from permit contention by counter
+        // alone, which a single `abandoned_flushes` counter could not.
         metrics.record_abandoned_retry_exhausted();
         metrics.record_abandoned_retry_exhausted();
         metrics.record_abandoned_input_rejected();
+        metrics.record_abandoned_queue_deadline();
 
         let snap = metrics.snapshot();
         assert_eq!(snap.abandoned_retry_exhausted, 2);
         assert_eq!(snap.abandoned_input_rejected, 1);
+        assert_eq!(snap.abandoned_queue_deadline, 1);
     }
 }
