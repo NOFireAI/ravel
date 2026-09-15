@@ -595,13 +595,14 @@ mod tests {
     ///
     /// The chain runs at [`MAX_STATEMENT_COMPLEXITY`] + 1 rather than at the
     /// half-million of the execution-path test: the point here is that the
-    /// bound is enforced at all on this entry point, and a test that overflows
-    /// the stack to prove it would abort the whole test binary.
+    /// bound is enforced at all on this entry point.
     ///
     /// Flip to watch it fail: replace the `complexity_guard::parse_guarded`
-    /// call at the top of `redact` with a bare parser build. The over-bound
-    /// statement then parses and is redacted, and the `expect_err` below
-    /// panics.
+    /// call at the top of `redact` with a bare parser build. The parser's own
+    /// recursion limit does not bound a flat operator chain, so the over-bound
+    /// tree is built and the `VisitMut` and `Display` walks below overflow the
+    /// stack, which aborts the test binary rather than reaching a clean
+    /// `expect_err`. The test still bites; an abort is a failure.
     #[test]
     fn an_over_complex_statement_is_refused_before_it_is_parsed() {
         let chain = "+1".repeat(crate::complexity_guard::MAX_STATEMENT_COMPLEXITY);

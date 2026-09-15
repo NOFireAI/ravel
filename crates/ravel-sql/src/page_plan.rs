@@ -2168,14 +2168,16 @@ mod tests {
     /// `plan_page` does call `validate`, but `parse_query` is reachable without
     /// it, and the rewrites below walk the tree it returns once per level.
     ///
-    /// The chain runs at [`MAX_STATEMENT_COMPLEXITY`] + 1 rather than at a
-    /// depth that would actually overflow: the claim is that the bound is
-    /// enforced on this entry point at all, and a test that overflowed the
-    /// stack to prove it would abort the whole test binary.
+    /// The chain runs at [`MAX_STATEMENT_COMPLEXITY`] + 1 rather than deeper:
+    /// the claim is that the bound is enforced on this entry point at all, and
+    /// the guard is what keeps the depth away from the walks below.
     ///
     /// Flip to watch it fail: replace the `complexity_guard::parse_guarded`
-    /// call in `parse_query` with a bare parser build. The over-bound statement
-    /// then parses and the `expect_err` below panics.
+    /// call in `parse_query` with a bare parser build. The parser's own
+    /// recursion limit does not bound a flat operator chain, so the over-bound
+    /// tree is built and the clone below overflows the stack, aborting the test
+    /// binary with SIGABRT rather than reaching a clean `expect_err`. The test
+    /// still bites; an abort is a failure.
     #[test]
     fn the_page_plan_parse_refuses_an_over_complex_statement_itself() {
         let chain = "+1".repeat(crate::complexity_guard::MAX_STATEMENT_COMPLEXITY);
