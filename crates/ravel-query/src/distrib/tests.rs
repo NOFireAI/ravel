@@ -482,6 +482,128 @@ proptest! {
         let rt = Runtime::new().expect("runtime");
         rt.block_on(run_acceptance(segments, cap));
     }
+
+    /// ADR-0103 count-pushdown acceptance at a fan-out above one: the
+    /// coordinator collects each slice's worker partials in slice-completion
+    /// order (which varies run to run under `buffer_unordered`), and
+    /// `sorted_pushdown_counts` must turn them into the same per-series count
+    /// table a purely local fetch-and-count produces, in the same label-set
+    /// order the raw path sorts its merged series into.
+    ///
+    /// Each series lives in its own segment under its own shard, so the
+    /// shard-major partition places every series in exactly one slice for any
+    /// cap: the pushdown path hard-errors (`DuplicatePushdownSeries`) on a
+    /// series id that appears in two slices, so a differential over it must
+    /// keep every series slice-local.
+    #[test]
+    fn distributed_pushdown_count_equals_local(
+        per_series in prop::collection::vec(arb_samples(), 2..8),
+        cap in 2usize..=6,
+    ) {
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(run_pushdown_count_acceptance(per_series, cap));
+    }
+}
+
+/// The metric name (`__name__`) of a label set, the whole distinguishing label
+/// in the pushdown corpora.
+fn metric_name(labels: &LabelSet) -> String {
+    labels
+        .iter()
+        .find(|l| l.name == "__name__")
+        .map(|l| l.value.clone())
+        .expect("corpus labels carry __name__")
+}
+
+/// Drives one count-pushdown differential: build `per_series.len()` distinct
+/// series, one per segment and one per shard, fetch their counts both locally
+/// and through the distributed pushdown path at `cap`, and assert the built
+/// count table equals the local counts and is in label-set order.
+async fn run_pushdown_count_acceptance(per_series: Vec<Vec<(i64, u64)>>, cap: usize) {
+    let store = Arc::new(MemoryStore::new());
+    let mut segments = Vec::new();
+    for (i, samples) in per_series.iter().enumerate() {
+        let desc = SeriesDesc {
+            metric: format!("m{i}"),
+            samples: samples.clone(),
+        };
+        // One series, its own segment, its own shard, so no series id can span
+        // two slices at any cap.
+        segments.push(
+            write_segment(&store, i as u64, i as u32, 100, std::slice::from_ref(&desc)).await,
+        );
+    }
+    let snapshot = Snapshot {
+        segments: segments.clone(),
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+
+    // Local reference: the deduped per-series sample count, keyed by metric.
+    let (local_runs, _acct, _stats) = local_scalar(Arc::clone(&store), &snapshot).await;
+    let local_merged = merge_soa_runs(local_runs, usize::MAX, usize::MAX).expect("local merge");
+    let mut local_counts: Vec<(String, u64)> = local_merged
+        .iter()
+        .map(|s| (metric_name(&s.labels), s.samples.len() as u64))
+        .collect();
+    local_counts.sort();
+
+    // Distributed count pushdown over a real worker at a fan-out above one.
+    let (fetcher, server) = spawn_worker(Arc::clone(&store), segments).await;
+    let distributed = Distributed::new(
+        Arc::new(fetcher),
+        DistribThresholds {
+            min_store_bytes: 0,
+            min_segments: 0,
+            max_parallel_slices: cap,
+        },
+    );
+    let accounting = QueryAccounting::new();
+    let (_triple, partials) = distributed
+        .fetch(
+            TENANT,
+            Signal::Metrics,
+            &snapshot,
+            &[],
+            &[],
+            &accounting,
+            &EngineConfig::default(),
+            i64::MAX,
+            Some(pb::PartialAggregateRequest {
+                want_count: true,
+                want_min: false,
+                want_max: false,
+                reduce_start_ns: None,
+                reduce_end_ns: None,
+            }),
+        )
+        .await
+        .expect("distributed fetch")
+        .expect("count pushdown produced a result, not a fallback");
+    server.abort();
+
+    let table = crate::engine::sorted_pushdown_counts(partials);
+
+    // In label-set order regardless of which slice finished first: the raw path
+    // sorts its merged series by this same comparison, so the pushdown table
+    // must too.
+    let mut resorted = table.clone();
+    resorted.sort_by(|a, b| a.0.iter().cmp(b.0.iter()));
+    assert_eq!(
+        table, resorted,
+        "pushdown count table is not in label-set order"
+    );
+
+    // And it carries exactly the local per-series counts.
+    let mut got: Vec<(String, u64)> = table
+        .iter()
+        .map(|(labels, count)| (metric_name(labels), *count))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got, local_counts,
+        "distributed pushdown counts differ from the local reduction"
+    );
 }
 
 /// A hand-built corpus where metric `m0` is written under shard 0 in hour 100
