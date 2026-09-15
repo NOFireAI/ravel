@@ -23,9 +23,17 @@ Two limits on what this proves, both deliberate:
     in step; nothing enforces that.
   - MAPPINGS below is hand-maintained. The `compared == 0` guard catches an
     emptied list, not a missing row, so a fourth bulk-format crate added later
-    carries no marker requirement until someone adds it here. Coverage is
-    complete today: `SupportedVersions` constructors exist only in
-    ravel-segment, ravel-logseg and ravel-rspan.
+    carries no marker requirement until someone adds it here. To confirm the
+    list is still complete, run:
+
+        grep -rn 'pub const SUPPORTED_VERSIONS' crates/*/src/*.rs
+
+    Today that returns four hits and three rows are correct. ravel-segment,
+    ravel-logseg and ravel-rspan are the Class A bulk data-object formats and
+    each has a row. The fourth, crates/ravel-bench/src/report_schema.rs, is a
+    `u32` bench-report schema version rather than an on-object format, so it has
+    no row and needs none. A fifth hit in a crate that writes objects is a
+    missing row.
 
 Fail-closed by construction:
   - The checker's own comparison logic is exercised against synthetic inputs
