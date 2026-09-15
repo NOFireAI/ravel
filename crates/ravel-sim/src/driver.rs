@@ -40,7 +40,7 @@ use ravel_ingest::{
     Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, WriteError, WriteMode,
 };
 use ravel_maintain::{
-    Bucket, CompactionOutcome, CompactorConfig, FixedClock, MaintainError, NoLeases,
+    Bucket, CompactionOutcome, CompactorConfig, FixedClock, MaintainError, NoLeases, SweepReport,
     compact_bucket, sweep_shard,
 };
 use ravel_object_store::fault::{FaultKind, FaultStore, GateHandle, Op};
@@ -340,6 +340,21 @@ pub struct CycleOutcome {
     /// Total records observed by the post-compaction conservation probe
     /// (equal, per invariant (b), to the pre-compaction count).
     pub records_conserved: usize,
+    /// Sum, across every tenant/shard faulted sweep pass this cycle
+    /// (the `sweep_shard_recover` calls through `sweep_store`), of
+    /// [`SweepReport::superseded_records_deleted`]. Lets a test prove the
+    /// sweep's delete-phase fault (see [`FaultSchedule::sweep_plan`]) landed
+    /// on a real delete, not merely that its `FaultStore` counter moved.
+    ///
+    /// [`FaultSchedule::sweep_plan`]: crate::fault_plan::FaultSchedule::sweep_plan
+    pub sweep_superseded_records_deleted: usize,
+    /// Same as [`Self::sweep_superseded_records_deleted`], for
+    /// [`SweepReport::superseded_data_deleted`] -- the superseded L0 data
+    /// objects, which is what the sweep-phase delete fault is keyed on.
+    pub sweep_superseded_data_deleted: usize,
+    /// Same as [`Self::sweep_superseded_records_deleted`], for
+    /// [`SweepReport::unreferenced_parts_deleted`].
+    pub sweep_unreferenced_parts_deleted: usize,
     /// Snapshot of the [`FaultStore`] counters after the cycle: how many times
     /// each `(Op, FaultKind)` fired. Empty when `inject_faults` is false.
     pub fault_counters: HashMap<(Op, FaultKind), u64>,
@@ -533,9 +548,9 @@ async fn compact_bucket_recover(
 
 /// Sweep one shard, absorbing a recoverable sweep-phase fault with a bounded
 /// idempotent re-run. `sweep_shard` is documented
-/// idempotent, so re-running after a mid-pass listing fault converges. Returns
-/// the report on the recover branch, or a typed [`CycleError::Sweep`] on the
-/// typed-error branch.
+/// idempotent, so re-running after a mid-pass listing or delete fault
+/// converges. Returns the report on the recover branch, or a typed
+/// [`CycleError::Sweep`] on the typed-error branch.
 #[allow(clippy::too_many_arguments)]
 async fn sweep_shard_recover(
     store: &dyn ObjectStoreBackend,
@@ -544,7 +559,7 @@ async fn sweep_shard_recover(
     tenant_hash: &TenantHash,
     shard: u32,
     seed: u64,
-) -> Result<(), CycleError> {
+) -> Result<SweepReport, CycleError> {
     let mut attempt = 0usize;
     loop {
         attempt += 1;
@@ -559,7 +574,7 @@ async fn sweep_shard_recover(
         )
         .await
         {
-            Ok(_) => return Ok(()),
+            Ok(report) => return Ok(report),
             Err(e)
                 if attempt < COMPACTION_FAULT_RETRY_BUDGET && is_recoverable_maintain_error(&e) =>
             {
@@ -961,6 +976,9 @@ async fn run_cycle_async(
     let mut queries_run = 0usize;
     let mut buckets_compacted = 0usize;
     let mut records_conserved = 0usize;
+    let mut sweep_superseded_records_deleted = 0usize;
+    let mut sweep_superseded_data_deleted = 0usize;
+    let mut sweep_unreferenced_parts_deleted = 0usize;
 
     for tenant_wl in &workload.tenants {
         series_generated += tenant_wl.series.len();
@@ -1222,7 +1240,7 @@ async fn run_cycle_async(
         // fires on the first paginated listing and the re-run recovers, or an
         // exhausted fault surfaces as a typed `CycleError::Sweep`.
         for shard in 0..config.shard_count {
-            sweep_shard_recover(
+            let report = sweep_shard_recover(
                 sweep_store.as_ref(),
                 &sweep_clock,
                 &compactor_config,
@@ -1231,6 +1249,9 @@ async fn run_cycle_async(
                 seed,
             )
             .await?;
+            sweep_superseded_records_deleted += report.superseded_records_deleted;
+            sweep_superseded_data_deleted += report.superseded_data_deleted;
+            sweep_unreferenced_parts_deleted += report.unreferenced_parts_deleted;
         }
 
         // Invariant (c): no orphan objects or unreferenced parts left past the
@@ -1361,6 +1382,9 @@ async fn run_cycle_async(
         queries_run,
         buckets_compacted,
         records_conserved,
+        sweep_superseded_records_deleted,
+        sweep_superseded_data_deleted,
+        sweep_unreferenced_parts_deleted,
         fault_counters,
         expected_faults,
         gates_armed,
