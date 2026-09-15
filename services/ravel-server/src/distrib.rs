@@ -1502,6 +1502,12 @@ fn decode_tenant_hash(bytes: &[u8]) -> Option<TenantHash> {
 /// coordinator's live set at once rather than lingering until its stamp ages
 /// past the `3 * H` staleness window. Without this a coordinator keeps dialing
 /// a worker that has already stopped serving for up to the staleness window.
+///
+/// That delete runs on a graceful drain alone, so a process lost to a panic, a
+/// kill or a node loss leaves its key behind. The same tick therefore reaps
+/// every key past the reap horizon, taken from the listing the membership read
+/// already made (issue #1761), which bounds the prefix to the live fleet
+/// instead of to every query worker that ever ran.
 pub fn spawn_heartbeat(
     workers: Arc<QueryWorkers>,
     store: Arc<dyn ObjectStoreBackend>,
@@ -1516,8 +1522,19 @@ pub fn spawn_heartbeat(
             if let Err(err) = workers.write_heartbeat(store.as_ref(), now_ns).await {
                 tracing::warn!(error = %err, "query worker heartbeat write failed");
             }
-            match workers.live_set(store.as_ref(), now_ns).await {
-                Ok(live) => *live_workers.write() = Arc::new(live),
+            match workers.live_set_read(store.as_ref(), now_ns).await {
+                Ok(read) => {
+                    // One listing serves both: the membership view the
+                    // routing fetcher reads, and the keys past the reap
+                    // horizon. Reaping from that same read is what keeps the
+                    // prefix bounded without a second LIST, which is how the
+                    // maintain tier does it too.
+                    let reaped = workers.reap_keys(store.as_ref(), &read.reapable).await;
+                    if reaped > 0 {
+                        tracing::info!(reaped, "reaped dead query worker heartbeat keys");
+                    }
+                    *live_workers.write() = Arc::new(read.live);
+                }
                 Err(err) => {
                     tracing::warn!(error = %err, "query worker live_set read failed; keeping prior membership")
                 }
