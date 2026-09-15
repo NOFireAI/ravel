@@ -288,13 +288,16 @@ only, not on every part a sparse column touches.
 
 **NaN.** Under an `f64` key, NaN rows sort by the total order above (so they
 land in the extreme parts), but a part containing any NaN in the clustering
-column leaves its bounds absent, exactly as the null rule does. This is
-deliberately stricter than SKIP_IDX's `has_nan` treatment (where min/max
-bound the non-NaN values and a range predicate can still prune, ADR-0095):
-the catalog bound is consumed at resolve time, before per-predicate NaN
-semantics are established, and this ADR's posture is absent-on-doubt. The
-cost is pruning on NaN-polluted parts only, which total-order sorting has
-already pushed to the tail.
+column leaves its bounds absent, exactly as the null rule does. This is not a
+stricter posture than SKIP_IDX's `has_nan` treatment: SKIP_IDX also declines
+to prune a block whose stat carries `has_nan`, unconditionally (the
+reader-side rule in `docs/log-segment-format.md`, issue #1699), rather than
+pruning off its non-NaN min/max as an earlier
+version of this section assumed; the two layers reach the same non-pruning
+outcome by different means, since the catalog bound is consumed at resolve
+time, before per-predicate NaN semantics are established, and this ADR's
+posture is absent-on-doubt. The cost is pruning on NaN-polluted parts only,
+which total-order sorting has already pushed to the tail.
 
 #### Identity: pinning the clustering configuration that produced a record
 
