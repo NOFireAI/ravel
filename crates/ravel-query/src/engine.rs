@@ -2028,10 +2028,7 @@ impl QueryEngine {
                     matchers: target.matchers.clone(),
                     start_ns: target.reduce_start_ns,
                     end_ns: target.reduce_end_ns,
-                    counts: partials
-                        .into_iter()
-                        .filter_map(|p| p.count.and_then(|c| (c != 0).then_some((p.labels, c))))
-                        .collect(),
+                    counts: sorted_pushdown_counts(partials),
                 }),
                 _ => None,
             };
@@ -4399,8 +4396,142 @@ struct PrecomputedCount {
     start_ns: i64,
     /// Inclusive upper bound of the reduction window.
     end_ns: i64,
-    /// One per-series count, exactly as the workers reported it.
+    /// One per-series count, ordered by label set (see `sorted_pushdown_counts`).
     counts: Vec<(LabelSet, u64)>,
+}
+
+/// Build the pushdown count table from the collected worker partials: drop a
+/// zero-in-window count (a series with no output sample, per ADR-0103's
+/// amendment) and order the survivors by label set.
+///
+/// The order is deliberate. The raw distributed path sorts its merged series
+/// by this exact comparison before the evaluator sees them, but the collected
+/// partials arrive in slice-completion order under the fan-out's
+/// `buffer_unordered`, which varies from run to run. Sorting here gives the
+/// pushdown path the same stable, backend-order-independent encounter order as
+/// the raw path, so any consumer of `query_precomputed_count` sees one order
+/// rather than the arrival order of whichever slice finished first.
+pub(crate) fn sorted_pushdown_counts(
+    partials: Vec<crate::distrib::codec::PartialAggregate>,
+) -> Vec<(LabelSet, u64)> {
+    let mut counts: Vec<(LabelSet, u64)> = partials
+        .into_iter()
+        .filter_map(|p| p.count.and_then(|c| (c != 0).then_some((p.labels, c))))
+        .collect();
+    counts.sort_by(|a, b| a.0.iter().cmp(b.0.iter()));
+    counts
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod pushdown_count_sort_tests {
+    use ravel_types::{Label, LabelSet, SeriesId};
+
+    use super::sorted_pushdown_counts;
+    use crate::distrib::codec::PartialAggregate;
+
+    fn labels(id: u8) -> LabelSet {
+        LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: "http_requests_total".to_string(),
+            },
+            Label {
+                name: "id".to_string(),
+                value: format!("{id:02}"),
+            },
+        ])
+        .expect("valid labels")
+    }
+
+    fn partial(id: u8, count: u64) -> PartialAggregate {
+        PartialAggregate {
+            series_id: SeriesId([id; 16]),
+            labels: labels(id),
+            count: Some(count),
+            min: None,
+            max: None,
+        }
+    }
+
+    /// The collected partials arrive in slice-completion order, which varies
+    /// run to run. `sorted_pushdown_counts` must produce the same label-set
+    /// order the raw path uses, independent of that arrival order.
+    ///
+    /// Reverting the `counts.sort_by(...)` line in `sorted_pushdown_counts`
+    /// makes this fail: the two orders come back different, and the equal-count
+    /// tie means the divergence is not masked by any value difference.
+    #[test]
+    fn orders_by_label_set_independent_of_arrival_order() {
+        // Ten series, every count tied at 5, so nothing but the label set can
+        // break the order.
+        let ascending: Vec<PartialAggregate> = (0..10).map(|id| partial(id, 5)).collect();
+        let mut descending = ascending.clone();
+        descending.reverse();
+        let mut scrambled = ascending.clone();
+        scrambled.swap(0, 7);
+        scrambled.swap(2, 9);
+        scrambled.swap(3, 5);
+
+        let from_ascending = sorted_pushdown_counts(ascending);
+        let from_descending = sorted_pushdown_counts(descending);
+        let from_scrambled = sorted_pushdown_counts(scrambled);
+
+        // All three arrival orders collapse to one deterministic table.
+        assert_eq!(from_ascending, from_descending);
+        assert_eq!(from_ascending, from_scrambled);
+
+        // And that table is in ascending label-set order (the exact
+        // comparison the raw path applies to its merged series), 00..09.
+        let ids: Vec<String> = from_ascending
+            .iter()
+            .map(|(ls, _)| {
+                ls.iter()
+                    .find(|l| l.name == "id")
+                    .map(|l| l.value.clone())
+                    .expect("id label present")
+            })
+            .collect();
+        let expected: Vec<String> = (0..10).map(|id| format!("{id:02}")).collect();
+        assert_eq!(ids, expected, "count table is not in label-set order");
+    }
+
+    /// A zero-in-window count is dropped (ADR-0103 amendment: no output sample
+    /// for an empty window), and an absent count is dropped too, while the
+    /// nonzero survivors stay sorted.
+    #[test]
+    fn drops_zero_and_absent_counts_and_keeps_order() {
+        let partials = vec![
+            partial(3, 7),
+            partial(1, 0),
+            PartialAggregate {
+                series_id: SeriesId([9; 16]),
+                labels: labels(9),
+                count: None,
+                min: None,
+                max: None,
+            },
+            partial(0, 2),
+        ];
+        let counts = sorted_pushdown_counts(partials);
+        let ids: Vec<(String, u64)> = counts
+            .iter()
+            .map(|(ls, c)| {
+                (
+                    ls.iter()
+                        .find(|l| l.name == "id")
+                        .map(|l| l.value.clone())
+                        .expect("id label present"),
+                    *c,
+                )
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![("00".to_string(), 2), ("03".to_string(), 7)],
+            "zero and absent counts must drop, survivors sorted by label set"
+        );
+    }
 }
 
 struct MergedSource {
