@@ -422,7 +422,7 @@ check_eq "no findings: verdict is clean" \
   "  -> clean: CI green, review at the current head with zero findings" \
   "$(printf '%s\n' "${clean_out}" | sed -n 2p)"
 check_eq "no findings: merge command printed" \
-  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 origin main && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${clean_out}" | sed -n 3p)"
 
 # The #908 regression: same PR, same green CI, same zero inline comments, one
@@ -442,7 +442,7 @@ check_eq "outside-diff body finding: --confirm-addressed clears it" \
   "  -> clean (operator confirmed all 1 outside-diff body finding(s) addressed): CI green, review at the current head" \
   "$(printf '%s\n' "${confirmed_out}" | sed -n 2p)"
 check_eq "outside-diff body finding: --confirm-addressed prints the merge command" \
-  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 origin main && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${confirmed_out}" | sed -n 3p)"
 
 # An inline comment blocks the same way, and names the other flag path.
@@ -612,7 +612,7 @@ check_eq "prove: without the review conjunct, an unreviewed PR reads clean" \
   "  -> clean: CI green, review at the current head with zero findings" \
   "$(printf '%s\n' "${flipped_out}" | sed -n 2p)"
 check_eq "prove: without it, the merge command is even offered" \
-  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 origin main && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${flipped_out}" | sed -n 3p)"
 
 unset E2E_REVIEWS
@@ -854,6 +854,24 @@ check_eq "#1758 no queue + fresh base: the guard prefix stays" \
   "1" \
   "$(printf '%s\n' "${noqueue_fresh_out}" | grep -c 'assert-fresh-merge-base')"
 
+# Every operator-facing mention of the base branch names the PR's OWN base, not
+# a hardcoded main. Four sites had to agree: the internal guard call, the two
+# behind-notes, and the printed command. A release/1.2 PR with no queue.
+slash_noqueue_out="$(E2E_PR_VIEW="${slash_base_json}" e2e "${CLEAN_BODY_JSON}")"
+check_eq "#1758 non-main base: the printed guard command names that base" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 origin release/1.2 && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
+  "$(printf '%s\n' "${slash_noqueue_out}" | grep '^  -> scripts/guards/')"
+export E2E_GIT_STALE=1
+slash_stale_noqueue_out="$(E2E_PR_VIEW="${slash_base_json}" e2e "${CLEAN_BODY_JSON}")"
+slash_stale_queue_out="$(E2E_PR_VIEW="${slash_base_json}" E2E_RULES="${QUEUE_RULES}" e2e "${CLEAN_BODY_JSON}")"
+unset E2E_GIT_STALE
+check_eq "#1758 non-main base: the refusal names that base" \
+  "  -> merge base is behind origin/release/1.2; rebase and let CI re-run before merging" \
+  "$(printf '%s\n' "${slash_stale_noqueue_out}" | grep 'merge base is behind')"
+check_eq "#1758 non-main base: the queue note names that base, not main" \
+  "0" \
+  "$(printf '%s\n' "${slash_stale_queue_out}" | grep '^  -> base is behind' | grep -c 'origin/main')"
+
 # A failed rules lookup on the FRESH path. Blocking is right either way, but
 # the operator must be able to tell a failed lookup from an ordinary no-queue
 # repository, or they copy a guard-prefixed command believing no queue exists.
@@ -1037,7 +1055,7 @@ check_eq "all checks skipped: the verdict does not claim CI green" \
   "  -> clean: every check skipped, nothing ran, review at the current head with zero findings" \
   "$(printf '%s\n' "${all_skipped_out}" | sed -n 2p)"
 check_eq "all checks skipped: the merge command is still offered" \
-  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 origin main && gh pr merge 908 --rebase --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${all_skipped_out}" | sed -n 3p)"
 
 # The mirror: one real pass beside one skip still says CI green, so the case

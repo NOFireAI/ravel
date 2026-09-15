@@ -263,7 +263,7 @@ if [[ "${outside_diff}" != "0" ]]; then
 fi
 echo "${summary}"
 
-# Does a base behind origin/main block the merge?
+# Does a base behind its own branch block the merge?
 #
 # Not when a merge queue is enforced on the base branch: the queue rebases the
 # entry onto current main and runs full CI on the combined result before
@@ -390,7 +390,7 @@ elif [[ "${outside_diff}" != "0" && "${confirm_addressed}" != "1" ]]; then
 # silently reverts a concurrent change. Costs one fetch.
 elif base_stale_blocks; then
   if [[ "${guard_rc}" == "1" ]]; then
-    echo "  -> merge base is behind origin/main; rebase and let CI re-run before merging"
+    echo "  -> merge base is behind origin/${base_ref}; rebase and let CI re-run before merging"
   else
     echo "  -> could not check merge-base freshness (guard exit ${guard_rc}); check by hand before merging"
   fi
@@ -434,7 +434,7 @@ else
     # Reported, not refused. The queue rebases this entry onto current main and
     # runs full CI on the result, so the behind-ness below is context for
     # spotting a base you do not recognise, not a reason to rebase by hand.
-    echo "  -> base is behind origin/main; the merge queue re-validates the entry against current main before landing, so this is information, not a blocker:"
+    echo "  -> base is behind origin/${base_ref}; the merge queue re-validates the entry against current ${base_ref} before landing, so this is information, not a blocker:"
     echo "${base_behind_note//guard: /     }"
     echo "  -> if any commit above is one you do not recognise, stop and check for a landing loop before merging"
     # No assert-fresh-merge-base prefix: it would refuse on exactly the
@@ -456,6 +456,6 @@ else
       # operator must not read a failed lookup as an ordinary no-queue repo.
       echo "  -> NOTE: could not read the base branch's rules, so this command carries the freshness guard without knowing whether a merge queue would have re-validated it"
     fi
-    echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} && gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
+    echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} origin ${base_ref} && gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
   fi
 fi
