@@ -240,7 +240,14 @@ connection, a pushed-but-broken main).
   double-dispatch. Use it around every dispatch. An unreadable intent
   history exits 69: UNKNOWN is not the same as no dangling intent, and the
   moment GitHub is unreliable is the moment a dispatch is most likely to be
-  a retry of one that already started.
+  a retry of one that already started. `intent` also runs the
+  duplicate-work guard, so a ticket another pull request already addresses
+  refuses here (65/66/69) rather than depending on someone remembering to
+  check: this is the one chokepoint every dispatch passes through. Pass
+  `DISPATCH_PATHS="a,b"` with the files the task is predicted to touch so
+  an open pull request already on them refuses too, and
+  `DISPATCH_SKIP_DUPLICATE_CHECK=1` for a deliberate second dispatch (a fix
+  round, a continuation after a ceiling kill).
 - `scripts/epic-orchestrator.sh <command> <epic>`: the per-epic state index
   behind a resumable orchestration, at `.claude/epic-state/<epic>.json` in
   the PRIMARY checkout (a wave's worktree is deleted at the end of its

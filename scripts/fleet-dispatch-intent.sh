@@ -11,8 +11,13 @@
 # Usage:
 #   fleet-dispatch-intent.sh intent <epic-issue> <ticket> <ref-sha>
 #       Refuses on a dangling intent (exit 65) or on an unreadable intent
-#       history (exit 69: UNKNOWN is not clean), runs the fresh-ref guard,
-#       posts a dispatch-intent comment, prints the nonce.
+#       history (exit 69: UNKNOWN is not clean), runs the fresh-ref guard
+#       and the duplicate-work guard, posts a dispatch-intent comment,
+#       prints the nonce.
+#       Env: DISPATCH_PATHS="a,b" gives the duplicate-work guard the files
+#       the task is predicted to touch, so an open pull request already on
+#       them refuses (66) instead of two divergent rewrites of one file.
+#       DISPATCH_SKIP_DUPLICATE_CHECK=1 for a deliberate second dispatch.
 #   fleet-dispatch-intent.sh record <epic-issue> <nonce> <task-id>
 #   fleet-dispatch-intent.sh failed <epic-issue> <nonce> [reason...]
 #
@@ -94,6 +99,36 @@ case "${mode}" in
     fi
 
     "${script_dir}/guards/assert-fresh-dispatch-ref.sh" "${ref_sha}" >&2
+
+    # Is someone already doing this? Asked HERE because this is the one
+    # chokepoint every dispatch passes through; a rule that lives only in
+    # prose is a rule that holds until the first hurried session. A ticket
+    # that is not a plain issue number (a task label, a free-form string)
+    # is not something the guard can look up, so it is skipped rather than
+    # guessed at.
+    #
+    # Exit 65 (a pull request already addresses the issue) and 66 (an open
+    # pull request is already touching the predicted files) both refuse.
+    # 69 is "could not ask", which refuses too: the moment GitHub is
+    # unreadable is the moment a dispatch is most likely to be a retry of
+    # one that already started, and this script already takes that line on
+    # its own history read above.
+    #
+    # DISPATCH_SKIP_DUPLICATE_CHECK=1 proceeds anyway, for a deliberate
+    # second task on one ticket (a fix round, a continuation after a
+    # ceiling kill). Say so in the spec when you use it.
+    if [[ "${ticket}" =~ ^#?[0-9]+$ && "${DISPATCH_SKIP_DUPLICATE_CHECK:-0}" != "1" ]]; then
+      dup_rc=0
+      "${script_dir}/guards/assert-no-duplicate-dispatch.sh" \
+        --issue "${ticket#\#}" ${DISPATCH_PATHS:+--paths "${DISPATCH_PATHS}"} >&2 || dup_rc=$?
+      if [[ ${dup_rc} -ne 0 ]]; then
+        echo "fleet-dispatch-intent.sh: duplicate-work guard exited ${dup_rc}; refusing to dispatch." >&2
+        echo "  65 = a pull request already addresses #${ticket#\#}; 66 = an open pull request is on" >&2
+        echo "  those files; 69 = the question could not be asked, which is not a clean answer." >&2
+        echo "  Deliberate second dispatch on this ticket: DISPATCH_SKIP_DUPLICATE_CHECK=1." >&2
+        exit "${dup_rc}"
+      fi
+    fi
 
     nonce="$(date +%s)-$$"
     gh issue comment "${epic}" --body \
