@@ -19,7 +19,7 @@ the bump cannot read it. The irreversible step is the first write at the new
 version; before it, a rollback to the earlier build is safe. The N/N-1 window
 described below is staged for a future format-lifecycle activation milestone,
 distinct from the software's first public release at 0.9.0 and not yet reached
-(ADR-0531), not a posture any released build has had.
+(ADR-0531, proposed), not a posture any released build has had.
 
 Version 4 changed the BLOCKS layout, deleted the per-block header, and
 redefined the SKIP_IDX level-0 block crc, so it was a versioned change rather
@@ -37,8 +37,9 @@ v3.
 bulk data-object format. The supported-version window is single-sourced as
 `ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer, reader gate,
 `audit-versions`, `migrate`, and the compactor's output-version constant all
-read it. Until the format-lifecycle activation milestone (ADR-0531, distinct
-from the software's 0.9.0 first public release and not yet reached) the window
+read it. Until the format-lifecycle activation milestone (ADR-0531, proposed:
+distinct from the software's 0.9.0 first public release and not yet reached) the
+window
 holds exactly one version
 (ADR-0027 decision 7, ADR-0892): each bump deletes the previous version's
 reader in the same change, and a pre-1.0.0 development store holding older
