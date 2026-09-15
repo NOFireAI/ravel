@@ -188,6 +188,12 @@ class KnobDriftTest(_CriterionCase):
                    "--threshold", "15", "--enforce")
         self.assertEqual(enf.returncode, 1, enf.stdout)
         self.assertIn("NOT RECORDED on the baseline file", enf.stdout)
+        # The summary must name the same side the detail line names. It used to
+        # say "both sides" unconditionally, contradicting its own detail
+        # whenever only one side was missing, which is every real compare
+        # against the committed baseline.
+        self.assertIn("not recorded on the baseline file", enf.stdout)
+        self.assertNotIn("both sides", enf.stdout)
 
     def test_unrecorded_on_both_sides_names_both(self):
         base = self._collect("base", {"g/a": (100.0, 100.0)}, "base", knobs=[])
@@ -196,6 +202,7 @@ class KnobDriftTest(_CriterionCase):
                    "--threshold", "15", "--enforce")
         self.assertEqual(enf.returncode, 1, enf.stdout)
         self.assertIn("NOT RECORDED on the baseline and current file", enf.stdout)
+        self.assertIn("not recorded on the baseline and current file", enf.stdout)
 
     def test_malformed_knob_is_refused(self):
         root = self._make_criterion("m", {"g/a": (100.0, 100.0)})
