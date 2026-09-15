@@ -351,21 +351,31 @@ outside its query rather than missing from it, so no `warnings` entry and no
 adding a spec with its `tenant`.
 
 Omitting `tenant` makes a remote reachable by **every** local tenant. That is
-correct on a coordinator where only one local tenant can ever resolve, and it is
+correct on a coordinator that runs queries for only one local tenant, and it is
 what a single-tenant deployment writes. Anywhere else it is the exposure this
-key exists to remove, so **a coordinator that can resolve more than one local
-tenant refuses to start with an unmapped remote cluster**, naming every spec
-that needs a `tenant`. A coordinator can resolve more than one local tenant when
-two or more `--tenant-token` values name different tenants, or when any dynamic
-resolver is enabled: `--dev-insecure-tenant-header`, `--oidc-issuer`, or
-`--mtls-enabled`, each of which derives the tenant from a request header or a
-token claim.
+key exists to remove, so **a coordinator that runs queries for more than one
+local tenant refuses to start with an unmapped remote cluster**, naming every
+spec that needs a `tenant`. A coordinator runs queries for more than one local
+tenant when:
 
-Startup also refuses a `tenant` that no `--tenant-token` configures, where the
-tenant set is fully known (static bearer tokens, no dynamic resolver). Such a
-mapping can never fire, and its only symptom would be a remote that quietly
-answers nobody. Under a dynamic resolver the static token list is not the tenant
-set, so the check does not apply there.
+- two or more `--tenant-token` values name different tenants, or
+- `--alert-rules-file` names a tenant that the `--tenant-token` values do not,
+  since one alert evaluator runs per tenant in that file and its queries go
+  through the same engine, or
+- any dynamic resolver is enabled: `--dev-insecure-tenant-header`,
+  `--oidc-issuer`, or `--mtls-enabled`, each of which derives the tenant from a
+  request header or a token claim.
+
+Startup also refuses a `tenant` that neither `--tenant-token` nor
+`--alert-rules-file` names, where the tenant set is fully known (static
+configuration, no dynamic resolver). Such a mapping can never fire, and its only
+symptom would be a remote that quietly answers nobody. Under a dynamic resolver
+the static configuration is not the tenant set, so the check does not apply
+there.
+
+Mapping a remote to a tenant that only `--alert-rules-file` names is supported
+and is a real deployment: alert rules for a tenant whose data lives partly on a
+remote.
 
 None of this changes what the remote does with the credential it is presented:
 it resolves its own tenant from it and ignores any tenant on the wire. The

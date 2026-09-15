@@ -111,8 +111,8 @@ pub struct RemoteCluster {
     /// costs nothing here and receives nothing.
     ///
     /// `None` means the remote is unkeyed and serves every local tenant. That is
-    /// the pre-mapping shape, and it is safe only on a coordinator that can
-    /// resolve at most one local tenant; `ravel-server` refuses an unkeyed
+    /// the pre-mapping shape, and it is safe only on a coordinator that runs
+    /// queries for at most one local tenant; `ravel-server` refuses an unkeyed
     /// remote on a multi-tenant coordinator at startup
     /// (`ensure_federation_tenant_mapping`). This variant exists so a
     /// single-tenant deployment that never wrote a mapping keeps working

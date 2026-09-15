@@ -78,19 +78,41 @@ the startup refusal for the configurations that still cannot be expressed.
    written before this ADR, and it stays byte-identical for them.
    `ensure_federation_tenant_mapping` (replacing
    `ensure_federation_single_tenant`) refuses an unkeyed spec whenever the
-   resolver can resolve more than one local tenant, naming every such spec and
-   the `tenant` key as the remedy. Every configuration the old refusal covered is
-   still refused, because every one of them is unkeyed; what changes is that a
-   mapped spec now starts instead.
+   coordinator runs queries for more than one local tenant, naming every such
+   spec and the `tenant` key as the remedy. Every configuration the old refusal
+   covered is still refused, because every one of them is unkeyed; what changes
+   is that a mapped spec now starts instead.
 
 5. **A mapping that can never fire is refused too.** Where the tenant set is
-   fully known (static bearer tokens only, no resolver deriving a tenant from a
+   fully known (static configuration only, no resolver deriving a tenant from a
    request), a `tenant` naming a tenant outside it fails startup. Its only
    symptom otherwise would be a remote that quietly answers nobody, which is the
    same silent-empty failure this ADR is about, one layer over. Under a dynamic
-   resolver the static map is not the tenant set, so the check does not apply.
+   resolver the static configuration is not the tenant set, so the check does not
+   apply.
 
-6. **The remote's own resolution is unchanged.** The remote still derives its
+6. **The local tenant set is `--tenant-token` UNION `--alert-rules-file`, for
+   both refusals.** `--tenant-token` bounds which tenants a REQUEST can
+   authenticate as, which is not the same question. `alerting::spawn` starts one
+   evaluator per tenant in the rules document against the same `QueryEngine` the
+   federation context is installed on, and those queries originate from no
+   request, so a tenant named only there federates exactly like a token-mapped
+   one.
+
+   Counting tokens alone gets both halves wrong, in opposite directions. It reads
+   a coordinator with one token and an alert rule for a second tenant as
+   single-tenant, so the unkeyed spec starts and that second tenant's alert rules
+   evaluate against the remote tenant's series: the exact exposure decision 1
+   closes for the HTTP path, surviving on the alerting path. And it refuses a
+   `tenant=` naming a tenant only the rules file configures, which is the shape
+   the key is most needed for, alert rules over data that lives partly on a
+   remote. The union is compared by `TenantHash`, because
+   `alerting::parse_rules` keys its map by `TenantId::new(&spec.tenant).hash()`
+   and `start` keys each remote by `rc.tenant.hash()`: the same derivation under
+   the same installed scheme, so the comparison asks the question the dispatch
+   answers. `main` parses the rules file before the check for this reason.
+
+7. **The remote's own resolution is unchanged.** The remote still derives its
    tenant from the presented credential and overwrites the wire `tenant_hash`.
    This ADR decides which local tenant may present a given credential; the remote
    still decides what that credential is entitled to see. The two are
