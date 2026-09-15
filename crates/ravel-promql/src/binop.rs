@@ -61,11 +61,13 @@ pub(crate) fn eval_binary(
         (Value::Vector(l), Value::Vector(r)) => {
             eval_vector_vector(op, l, r, &modifier).map(Value::Vector)
         }
-        (l, r) => unreachable!(
-            "promql-parser only allows scalar/vector binary operands, got {} and {}",
-            l.type_name(),
-            r.type_name()
-        ),
+        (l, r) => Err(Error::Unsupported {
+            construct: format!(
+                "binary operator over {} and {} operands",
+                l.type_name(),
+                r.type_name()
+            ),
+        }),
     }
 }
 
@@ -114,6 +116,9 @@ fn apply_arith(op: TokenId, l: f64, r: f64) -> f64 {
         // Prometheus computes `math.Atan2(lhs, rhs)`; Rust's `l.atan2(r)` is
         // `atan2(self, other)` with the same (y, x) argument order.
         T_ATAN2 => l.atan2(r),
+        // unreachable-allow: eval_scalar_scalar/combine_value's is_comparison(op)
+        // check -- every comparison token is already routed to apply_cmp before
+        // either caller reaches this match.
         _ => unreachable!("apply_arith called with non-arithmetic operator {op}"),
     }
 }
@@ -129,6 +134,9 @@ fn apply_cmp(op: TokenId, l: f64, r: f64) -> bool {
         T_LSS => l < r,
         T_GTE => l >= r,
         T_LTE => l <= r,
+        // unreachable-allow: eval_scalar_scalar/combine_value's is_comparison(op)
+        // check -- apply_cmp is only ever called from the branch where that
+        // check already returned true.
         _ => unreachable!("apply_cmp called with non-comparison operator {op}"),
     }
 }
@@ -228,6 +236,9 @@ fn eval_vector_vector(
             T_LAND => set_and(lhs, rhs, matching),
             T_LOR => set_or(lhs, rhs, matching),
             T_LUNLESS => set_unless(lhs, rhs, matching),
+            // unreachable-allow: is_set_operator's own three-token match --
+            // the `if is_set_operator(op)` guard above already guarantees op
+            // is one of exactly these three before this match runs.
             _ => unreachable!("is_set_operator matched an unhandled token"),
         });
     }
@@ -242,9 +253,9 @@ fn eval_vector_vector(
         VectorMatchCardinality::OneToMany(extra) => {
             group_match(op, lhs, rhs, modifier, extra, false)
         }
-        VectorMatchCardinality::ManyToMany => {
-            unreachable!("promql-parser only produces ManyToMany for set operators")
-        }
+        VectorMatchCardinality::ManyToMany => Err(Error::Unsupported {
+            construct: "many-to-many vector matching for a non-set binary operator".to_string(),
+        }),
     }
 }
 
@@ -608,6 +619,61 @@ mod tests {
             Value::Scalar(x) => x,
             other => panic!("expected a scalar result for {query:?}, got {other:?}"),
         }
+    }
+
+    /// Issue #1701: `eval_binary`'s final match arm used to `unreachable!` on
+    /// an operand pair that is neither Scalar nor Vector, trusting
+    /// promql-parser's own type check. A synthetic `BinaryExpr` over two
+    /// String-typed operands (no real query text produces this: a bare
+    /// string literal is not a valid binary operand) exercises the
+    /// defensive fallback directly.
+    #[test]
+    fn binary_over_non_scalar_non_vector_operands_rejects_without_panicking() {
+        use promql_parser::parser::token::{T_ADD, TokenType};
+        use promql_parser::parser::{BinaryExpr, parse};
+
+        let b = BinaryExpr {
+            op: TokenType::new(T_ADD),
+            lhs: Box::new(parse(r#""a""#).expect("parses")),
+            rhs: Box::new(parse(r#""b""#).expect("parses")),
+            modifier: None,
+        };
+        let ctx = crate::eval::QueryWindow::for_test();
+        let err = super::eval_binary(&Evaluator::new(), &source(), &b, 0, &ctx)
+            .expect_err("must reject, not panic");
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert!(
+            construct.contains("string"),
+            "rejection should name the operand types, got {construct:?}"
+        );
+    }
+
+    /// Issue #1701: `eval_vector_vector`'s `ManyToMany` arm used to
+    /// `unreachable!`, trusting promql-parser to only ever produce
+    /// `ManyToMany` cardinality for a set operator. Calling it directly with
+    /// `ManyToMany` and a non-set operator (no real query text produces
+    /// this: the parser only assigns `ManyToMany` to `and`/`or`/`unless`)
+    /// exercises the defensive fallback.
+    #[test]
+    fn many_to_many_cardinality_on_non_set_operator_rejects_without_panicking() {
+        use promql_parser::parser::token::T_ADD;
+        use promql_parser::parser::{BinModifier, VectorMatchCardinality};
+
+        let modifier = BinModifier {
+            card: VectorMatchCardinality::ManyToMany,
+            ..BinModifier::default()
+        };
+        let err = super::eval_vector_vector(T_ADD, Vec::new(), Vec::new(), &modifier)
+            .expect_err("must reject, not panic");
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert!(
+            construct.contains("many-to-many"),
+            "rejection should name the cardinality, got {construct:?}"
+        );
     }
 
     #[test]

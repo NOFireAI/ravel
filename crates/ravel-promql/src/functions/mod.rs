@@ -976,11 +976,31 @@ pub fn matrix_arg(expr: &promql_parser::parser::Expr) -> Result<MatrixArg<'_>, E
             Expr::Paren(p) => cur = &p.expr,
             Expr::MatrixSelector(ms) => return Ok(MatrixArg::Selector(ms)),
             Expr::Subquery(sq) => return Ok(MatrixArg::Subquery(sq)),
-            _ => unreachable!(
-                "promql-parser only ever type-checks a Matrix-typed argument to one of these \
-                 forms before this evaluator sees it"
-            ),
+            other => {
+                return Err(Error::Unsupported {
+                    construct: format!("matrix-typed argument of kind {}", expr_kind_name(other)),
+                });
+            }
         }
+    }
+}
+
+/// The AST variant name of `expr`, for an error message naming an
+/// unexpected node kind (`Expr` has no public accessor for this).
+fn expr_kind_name(expr: &promql_parser::parser::Expr) -> &'static str {
+    use promql_parser::parser::Expr;
+    match expr {
+        Expr::Aggregate(_) => "aggregate expression",
+        Expr::Binary(_) => "binary expression",
+        Expr::Call(_) => "function call",
+        Expr::Extension(_) => "extension node",
+        Expr::MatrixSelector(_) => "matrix selector",
+        Expr::NumberLiteral(_) => "number literal",
+        Expr::Paren(_) => "parenthesized expression",
+        Expr::StringLiteral(_) => "string literal",
+        Expr::Subquery(_) => "subquery",
+        Expr::Unary(_) => "unary expression",
+        Expr::VectorSelector(_) => "vector selector",
     }
 }
 
@@ -1877,5 +1897,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Issue #1701: `matrix_arg`'s final match arm used to `unreachable!` on
+    /// an AST node that is none of `MatrixSelector`/`Subquery`/`Paren`,
+    /// trusting promql-parser's own type check. A number literal (no real
+    /// query text passes one as a matrix-typed function argument: the parser
+    /// rejects it before this evaluator sees it) exercises the defensive
+    /// fallback directly.
+    #[test]
+    fn matrix_arg_on_non_matrix_node_rejects_without_panicking() {
+        use crate::eval::Error;
+
+        let expr = promql_parser::parser::parse("1").expect("parses");
+        let err = match super::matrix_arg(&expr) {
+            Ok(_) => panic!("must reject, not panic"),
+            Err(e) => e,
+        };
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Error::Unsupported, got {err:?}");
+        };
+        assert!(
+            construct.contains("number literal"),
+            "rejection should name the node kind, got {construct:?}"
+        );
     }
 }
