@@ -48,25 +48,25 @@ normally. A corrupt object is swept as usual.
 
 **Version lifecycle and migration (ADR-0066, normative).** RSEG is a Class A
 bulk data-object format. Until the format-lifecycle activation milestone
-(ADR-0531, proposed: distinct from the software's 0.9.0 first public release
-and not yet reached), ADR-0027's single-supported-version rule above stands
-and a bump is forward-only. From that milestone onward the supported-version
-window becomes N/N-1: the writer always emits the current
-version N, and the reader accepts N and N-1. The window is single-sourced as
+(ADR-0531, proposed: distinct from the software's 0.9.0 first public release and
+not yet reached), ADR-0027's single-supported-version rule above stands and a
+bump is forward-only. From that milestone onward the supported-version window
+becomes N/N-1: the writer always emits the current version N, and the reader
+accepts N and N-1. The window is single-sourced as
 `ravel_segment::SUPPORTED_VERSIONS`, and the writer, reader gate,
 `audit-versions`, and the `migrate` job all read it; it holds exactly one
-version today, v7, so the two-version shape is capability the code carries for
-a future bump rather than behaviour any build has now.
-Rollout is readers-before-writers: a release
-that writes N+1 requires a fleet already reading N+1. Old-version objects
-converge to the current version three ways, in preference order: retention ages
-them out; compaction and the `maintain migrate` job rewrite them
-(`ravel-maintain` decodes an input recorded below the current output version and
-re-encodes its pages at the current version -- a real decode-and-re-encode, not
-a verbatim page copy -- conserving the sample count exactly, ADR-0066 decision
-5); and the migrate job then verifies and raises the per-(tenant, signal) format
-floor. Support for reading N-1 is deleted only once every bucket's recorded
-floor is >= N, in a separate change that cites those floors.
+version today, v7, so the two-version shape is capability the code carries for a
+future bump rather than behaviour any build has now. Rollout is
+readers-before-writers: a release that writes N+1 requires a fleet already
+reading N+1. Old-version objects converge to the current version three ways, in
+preference order: retention ages them out; compaction and the `maintain migrate`
+job rewrite them (`ravel-maintain` decodes an input recorded below the current
+output version and re-encodes its pages at the current version -- a real
+decode-and-re-encode, not a verbatim page copy -- conserving the sample count
+exactly, ADR-0066 decision 5); and the migrate job then verifies and raises the
+per-(tenant, signal) format floor. Support for reading N-1 is deleted only once
+every bucket's recorded floor is >= N, in a separate change that cites those
+floors.
 
 Parsers treat every offset, length, and count as untrusted input:
 bounds-check everything, fuzz all decoders, return typed errors and never

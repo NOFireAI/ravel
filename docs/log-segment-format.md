@@ -47,14 +47,14 @@ bulk data-object format. The supported-version window is single-sourced as
 `ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer, reader gate,
 `audit-versions`, `migrate`, and the compactor's output-version constant all
 read it. Until the format-lifecycle activation milestone (ADR-0531, proposed:
-distinct from the software's 0.9.0 first public release and not yet reached)
-the window holds exactly one version (ADR-0027 decision 7, ADR-0892): a bump
-deletes the previous version's reader, and a pre-1.0.0 development store
-holding older objects is wiped or re-ingested. RLOG v3 to v4 in 0.11.0 is the
-one bump that did not do this in the same change; ADR-0892 removed the v3
-reader in 0.12.0 instead. The N/N-1 window ADR-0066 describes, rolled
-out readers-before-writers -- a release writing N+1 requires a fleet already
-reading N+1 -- opens at, and only at, that release.
+distinct from the software's 0.9.0 first public release and not yet reached) the
+window holds exactly one version (ADR-0027 decision 7, ADR-0892): a bump deletes
+the previous version's reader, and a pre-1.0.0 development store holding older
+objects is wiped or re-ingested. RLOG v3 to v4 in 0.11.0 is the one bump that
+did not do this in the same change; ADR-0892 removed the v3 reader in 0.12.0
+instead. The N/N-1 window ADR-0066 describes, rolled out readers-before-writers
+-- a release writing N+1 requires a fleet already reading N+1 -- opens at, and
+only at, that release.
 
 RLOG compaction already decodes every input's records and re-encodes them from
 scratch, so once the window is two versions wide an old-version object is

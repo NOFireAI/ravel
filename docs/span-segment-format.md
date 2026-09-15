@@ -39,20 +39,19 @@ distinct from the software's first public release at 0.9.0 and not yet reached
 **Version lifecycle and migration (ADR-0066, normative).** The pre-release
 posture above expires at the format-lifecycle activation milestone (ADR-0531,
 proposed: distinct from the software's 0.9.0 first public release and not yet
-reached). RSPAN is a Class A bulk data-object format; from that milestone
-onward the supported-version window
-becomes N/N-1 (single-sourced as `ravel_rspan::footer::SUPPORTED_VERSIONS`,
-which holds exactly one version today; the writer, reader gate,
-`audit-versions`, `migrate`, and the compactor's output-version
-constant all read it), rolled out readers-before-writers: a release writing N+1
-requires a fleet already reading N+1, so the "no dual reader" statement above is
-the pre-release state, not a standing rule. Once an N-1 reader exists, RSPAN
-compaction already decodes every input's span records and re-encodes them from
-scratch, so an old-version object is migrated forward by the normal compaction
-and `maintain migrate` paths with no special carve-out; retention also ages old
-objects out. The migrate job verifies and raises the per-(tenant, signal) format
-floor, and N-1 read support is deleted only once every bucket's floor is >= N,
-citing those floors.
+reached). RSPAN is a Class A bulk data-object format; from that milestone onward
+the supported-version window becomes N/N-1 (single-sourced as
+`ravel_rspan::footer::SUPPORTED_VERSIONS`, which holds exactly one version
+today; the writer, reader gate, `audit-versions`, `migrate`, and the compactor's
+output-version constant all read it), rolled out readers-before-writers: a
+release writing N+1 requires a fleet already reading N+1, so the "no dual
+reader" statement above is the pre-release state, not a standing rule. Once an
+N-1 reader exists, RSPAN compaction already decodes every input's span records
+and re-encodes them from scratch, so an old-version object is migrated forward
+by the normal compaction and `maintain migrate` paths with no special carve-out;
+retention also ages old objects out. The migrate job verifies and raises the
+per-(tenant, signal) format floor, and N-1 read support is deleted only once
+every bucket's floor is >= N, citing those floors.
 
 Parsers treat every offset, length, count, and tag read from stored bytes as
 untrusted input: bounds-check everything, overflow-check every accumulation,

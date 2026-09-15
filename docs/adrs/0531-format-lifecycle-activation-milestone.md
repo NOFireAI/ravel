@@ -48,10 +48,12 @@ Read literally and together, those three say the N/N-1 window was in force from
 
 So an operator who reads the ADRs and the format docs concludes stored data
 survives upgrades, upgrades 0.9.x to 0.10.0, and finds every stored metrics
-segment failing typed `UnsupportedVersion`, after which retention's version
-hold (issue #530, ADR-0066 decision 2) declines to delete the now-unreadable
-objects but cannot make them readable again. That is the harm this
-reconciliation exists to remove.
+segment failing typed `UnsupportedVersion`. At that release the outcome was
+worse than unreadable: retention's version hold did not exist yet, so the
+horizon-gated sweep deleted those objects on their ordinary age schedule. The
+hold (issue #530, ADR-0066 decision 2) is in `## [Unreleased]` and has shipped
+in no release; at HEAD it would keep the metrics objects, unreadable but not
+lost. That is the harm this reconciliation exists to remove.
 
 The genuine question underneath is whether "first public release" in the
 lifecycle ADRs means:
@@ -133,11 +135,19 @@ in force at HEAD (Reading B, point 2 above):
 - **The irreversible step, after which rollback is not safe.** The first write
   at the new format version. Once any object at version N exists in the store, a
   build whose window tops out at N-1 cannot read it and will fail closed with
-  typed `UnsupportedVersion`. Retention's version hold (issue #530) will decline
-  to delete such an object under a build that cannot read it, so the object is
-  not lost, but it is not queryable until a build whose window includes its
-  version runs again. A format bump is therefore a **non-rollbackable
-  data-migration event** under the current regime: plan it as forward-only.
+  typed `UnsupportedVersion`. For metrics (RSEG), retention's version hold
+  (issue #530) declines to delete such an object under a build that cannot read
+  it, so the object is not lost, but it is not queryable until a build whose
+  window includes its version runs again. **That hold covers metrics only.**
+  `held_out_of_window` returns early for any other signal
+  (`crates/ravel-maintain/src/retention.rs:590`), so logs (RLOG) and spans
+  (RSPAN) keep the unconditional horizon-gated sweep until the remaining half of
+  issue #530 lands. For those two the irreversible step is a data-loss risk and
+  not only a queryability one: an object written at the new version and left
+  unreadable by a rolled-back build is deleted once its retention horizon
+  elapses. A format bump is therefore a **non-rollbackable data-migration
+  event** under the current regime: plan it as forward-only, and for logs and
+  spans treat the rollback window as bounded by the retention horizon.
 
 - **When this stance changes.** When the activation milestone (point 1) is
   declared and the reader window moves to N/N-1, a single bump becomes rollback-
