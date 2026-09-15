@@ -146,11 +146,34 @@ for kw in "Fixes: #42" "Fixed #42" "Closes #42" "Closed: #42" "Resolves: #42" "r
   check_eq "'${kw}' refuses (65)" "65" "${rc}"
 done
 
-# The boundary still holds on the closing-keyword path.
+# The boundary still holds on the closing-keyword path. TRAILING side.
 d="$(new_case kw_boundary)"
 printf '[{"number":23,"title":"other","state":"OPEN","body":"Fixes: #421","headRefName":"b","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' >"${d}/prs.json"
 out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
 check_eq "Fixes: #421 does not close #42 (0)" "0" "${rc}"
+
+# LEADING side. The case above exercises only the trailing boundary, and the
+# first version of the keyword test had none on the left: any word ENDING in a
+# keyword refused, which is the same false-positive class the closing-keyword
+# change was written to remove. GitHub closes nothing on `hotfix #42`.
+# Mutation: drop the `(^|[^0-9A-Za-z])` prefix from closing_kw; each of these
+# then refuses.
+for word in "hotfix" "bugfix" "suffix:" "prefix" "affixes" "disclosed" "unresolved"; do
+  d="$(new_case "lead_$(printf '%s' "${word}" | tr -cd '[:alnum:]')")"
+  printf '[{"number":24,"title":"work","state":"OPEN","body":"%s #42","headRefName":"l","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' "${word}" >"${d}/prs.json"
+  out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
+  check_eq "'${word} #42' is not a closing keyword (0)" "0" "${rc}"
+done
+
+# GitHub's set has no -ing forms, so neither does this. `fixing #42` closes
+# nothing on merge and must not refuse a dispatch.
+# Mutation: put `ing` back in the alternation.
+for word in "fixing" "closing" "resolving"; do
+  d="$(new_case "ing_${word}")"
+  printf '[{"number":25,"title":"work","state":"OPEN","body":"%s #42","headRefName":"g","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' "${word}" >"${d}/prs.json"
+  out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?
+  check_eq "'${word} #42' does not close it (0)" "0" "${rc}"
+done
 
 # An old closed pull request is history, not a reason to skip work now.
 # Mutation: drop the cutoff and every stale PR blocks forever.
