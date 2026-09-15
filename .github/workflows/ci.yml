@@ -285,6 +285,11 @@ jobs:
         run: bash scripts/tests/epic-orchestrator.test.sh
       - name: Duplicate-dispatch guard cases
         run: bash scripts/tests/assert-no-duplicate-dispatch.test.sh
+      # The dispatch chokepoint. Its refusals are the only thing standing
+      # between a hurried session and a second task on a ticket someone is
+      # already working; before these cases the script had no suite at all.
+      - name: Dispatch-intent cases
+        run: bash scripts/tests/fleet-dispatch-intent.test.sh
       - name: Green-before-merge guard cases
         run: bash scripts/tests/assert-green-head.test.sh
       - name: Destructive pre-push hook cases
