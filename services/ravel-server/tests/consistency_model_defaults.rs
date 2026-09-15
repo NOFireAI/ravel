@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use ravel_maintain::config::DEFAULT_MAX_QUERY_DURATION_NS;
-use ravel_server::config::{DERIVED_MAX_SEGMENTS, DERIVED_QUERY_DEADLINE};
+use ravel_server::config::{Cli, DERIVED_MAX_SEGMENTS, DERIVED_QUERY_DEADLINE};
 
 const NS_PER_HOUR: i64 = 3_600 * 1_000_000_000;
 
@@ -31,6 +31,10 @@ const CEILING_ANCHOR: &str = "`max_query_duration`, the GC protection budget it 
 /// The prose that introduces the sealed-set fan-out cap.
 const SEGMENTS_ANCHOR: &str = "`max_segments` (default ";
 
+/// The prose in `docs/query-engine.md` that introduces the derived per-query
+/// S3 request budget. A stock server's figure follows it directly.
+const REQUEST_BUDGET_ANCHOR: &str = "the derived default is ";
+
 /// `docs/consistency-model.md`, resolved from this crate's manifest directory
 /// rather than the process working directory, which differs between a
 /// crate-scoped `cargo test` and one run from the workspace root.
@@ -42,12 +46,32 @@ fn doc_path() -> PathBuf {
         .join("consistency-model.md")
 }
 
+/// `docs/query-engine.md`, resolved from this crate's manifest directory the
+/// same way [`doc_path`] resolves the consistency model.
+fn query_engine_doc_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("docs")
+        .join("query-engine.md")
+}
+
 /// The document with every run of whitespace collapsed to a single space, so a
 /// claim the 80-column wrap split across two lines still matches one anchor.
 fn normalized_doc() -> String {
-    let path = doc_path();
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    normalized(&doc_path())
+}
+
+/// The whitespace-collapsed form of `docs/query-engine.md`, matching
+/// [`normalized_doc`].
+fn normalized_query_engine_doc() -> String {
+    normalized(&query_engine_doc_path())
+}
+
+/// Read `path` and collapse every run of whitespace to a single space.
+fn normalized(path: &Path) -> String {
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -224,6 +248,67 @@ fn max_segments_figure_matches_the_derived_constant() {
     assert!(
         doc.contains(&rendered),
         "docs/consistency-model.md must render the max_segments default with \
+         comma thousands separators, as {rendered:?}"
+    );
+}
+
+/// The per-query S3 request budget `docs/query-engine.md` states as the
+/// derived default is the budget a stock server enforces through
+/// `resolve_max_s3_requests`, which derives it with `derive_max_s3_requests`
+/// from the default `--shards` and the default ingest flush cadence. The
+/// figure is computed here from that derivation, never restated, so a default
+/// or a derivation change fails this rather than leaving the doc claiming
+/// 48,200 while a stock server derives 15,800.
+#[test]
+fn request_budget_figure_matches_the_derived_default() {
+    use clap::Parser;
+
+    let doc = normalized_query_engine_doc();
+    let figures = figures_after(&doc, REQUEST_BUDGET_ANCHOR);
+    assert_eq!(
+        figures.len(),
+        1,
+        "docs/query-engine.md must state the derived S3 request budget exactly \
+         once, using the phrase {REQUEST_BUDGET_ANCHOR:?}; found {} occurrence(s)",
+        figures.len()
+    );
+
+    let cli = Cli::try_parse_from(["ravel-server"]).expect("server defaults parse");
+    assert_eq!(
+        cli.shards, 4,
+        "guards the shard default the documented figure is derived at"
+    );
+    let flush = ravel_ingest::IngestConfig::default().max_flush_delay;
+    let expected = ravel_query::derive_max_s3_requests(cli.shards, flush);
+
+    // The figure must be exactly what a stock server enforces through the real
+    // resolve path, not just what the standalone derivation returns.
+    assert_eq!(
+        cli.resolve_max_s3_requests()
+            .expect("server defaults resolve a bounded budget"),
+        ravel_query::RequestLimit::Bounded(expected),
+        "the budget the running server enforces must match derive_max_s3_requests"
+    );
+
+    let (value, _unit) = &figures[0];
+    assert_eq!(
+        *value, expected,
+        "docs/query-engine.md states a derived S3 request budget of {value} but \
+         ravel-server derives derive_max_s3_requests({}, {flush:?}) = {expected}. \
+         An operator sizes a query tier from that figure, so it must track the \
+         derivation.",
+        cli.shards
+    );
+
+    // The rendering is pinned too, so the figure keeps its comma grouping
+    // instead of drifting to an ungrouped digit run.
+    let rendered = format!(
+        "{REQUEST_BUDGET_ANCHOR}{}",
+        grouped(usize::try_from(expected).expect("the derived budget fits in usize"))
+    );
+    assert!(
+        doc.contains(&rendered),
+        "docs/query-engine.md must render the derived S3 request budget with \
          comma thousands separators, as {rendered:?}"
     );
 }
