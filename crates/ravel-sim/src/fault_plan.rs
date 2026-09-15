@@ -118,8 +118,9 @@ pub struct FaultSchedule {
     pub compact_plan: FaultPlan,
     /// The scripted plan the driver wraps only around the sweep's action
     /// pass: a retryable failure on the sweep's paginated listing, and a
-    /// retryable failure on the sweep's delete of a superseded L0 data
-    /// object.
+    /// retryable failure on the first commit-record delete of rule 2's phase
+    /// C (the first delete the sweep issues), so the re-run re-gathers the same
+    /// cleared groups and deletes them through rule 2.
     pub sweep_plan: FaultPlan,
     /// Hold/release gates the driver may arm on the store.
     pub gates: Vec<GateScript>,
@@ -295,11 +296,28 @@ fn generate_compaction_faults(
         sweep_plan.with_rule(Rule::new(Op::List, list_fault).with_occurrence(Occurrence::Nth(1)));
     expected.push((Op::List, list_kind));
 
-    // Sweep phase: a retryable failure on the delete of a superseded L0 data
-    // object. Keyed on `L0_DATA_SUBSTR` so it governs rule 2's phase-C data-key
-    // deletes and not rule 3's `/l1` part deletes or rule 1's orphan deletes
-    // (`sweep_shard_with_holds` runs superseded, then unreferenced parts, then
-    // orphan GC, so the first matching delete is a superseded data object).
+    // Sweep phase: a retryable failure on the FIRST commit-record delete of
+    // rule 2's phase C. Keyed on `COMMIT_SUBSTR` (`/c/`) and `Nth(1)` so it
+    // lands on the very first delete the sweep issues.
+    //
+    // Placement matters for what the re-run exercises. Rule 2's phase C deletes
+    // every cleared group's commit records first, then every cleared group's
+    // data objects, then the chains' own records (`sweep_superseded_impl`,
+    // crates/ravel-maintain/src/sweep.rs), and `sweep_shard_with_holds` runs
+    // superseded (rule 2) before unreferenced parts (rule 3) and orphan GC
+    // (rule 1). So the first delete of the whole pass is a superseded input
+    // commit record, and this fault fires there. A retryable `Delete` fault in
+    // `FaultStore` short-circuits before the wrapped backend runs
+    // (crates/ravel-object-store/src/fault.rs), so when it fires no object has
+    // been deleted yet: the re-gather on retry finds every input commit record
+    // still present, collects the same cleared groups, and rule 2 deletes them
+    // in full. The delete counts the faulted pass reports are therefore rule
+    // 2's real work, not the zero a fault on the first `/l0/` data delete would
+    // leave (that fires only after every commit record of the pass is already
+    // gone, so the retry's re-gather reads `NotFound` for each input, collects
+    // nothing through rule 2, and the keyspace converges through rule 1's
+    // orphan GC instead -- a different recovery path than the harness claims to
+    // exercise).
     let (delete_fault, delete_kind) = if rng.random_bool(0.5) {
         (
             ScriptedFault::Transient("sim fault schedule: transient on sweep delete".to_string()),
@@ -313,7 +331,7 @@ fn generate_compaction_faults(
     };
     sweep_plan = sweep_plan.with_rule(
         Rule::new(Op::Delete, delete_fault)
-            .with_key_contains(L0_DATA_SUBSTR)
+            .with_key_contains(COMMIT_SUBSTR)
             .with_occurrence(Occurrence::Nth(1)),
     );
     expected.push((Op::Delete, delete_kind));
@@ -434,15 +452,16 @@ mod tests {
                     )),
                 "seed {seed}: no retryable pagination rule on the sweep listing"
             );
-            // Retryable delete fault on the sweep's superseded L0 data deletes.
+            // Retryable delete fault on the sweep's first phase-C commit-record
+            // delete (keyed on `/c/`, the first delete the sweep issues).
             assert!(
                 s.sweep_plan.rules.iter().any(|r| r.op == Op::Delete
-                    && r.key_contains.as_deref() == Some(L0_DATA_SUBSTR)
+                    && r.key_contains.as_deref() == Some(COMMIT_SUBSTR)
                     && matches!(
                         r.fault,
                         ScriptedFault::Transient(_) | ScriptedFault::Throttled { .. }
                     )),
-                "seed {seed}: no retryable delete rule on the sweep's superseded L0 deletes"
+                "seed {seed}: no retryable delete rule on the sweep's first commit-record delete"
             );
             // Every compaction/sweep rule fires exactly once.
             for rule in s.compact_plan.rules.iter().chain(s.sweep_plan.rules.iter()) {
