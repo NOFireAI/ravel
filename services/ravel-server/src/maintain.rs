@@ -6058,10 +6058,12 @@ mod tests {
     async fn an_injected_clock_advance_evicts_a_stopped_worker() {
         use ravel_maintain::worker_set::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LIVENESS_FACTOR};
 
-        // Epoch-relative, far behind any real wall clock, so `live_set_read`'s
-        // LIST-metadata shortcut (`mtime_stale`, which reads the store's own
-        // modification times rather than the injected clock) never fires and
-        // the heartbeat body's stamp is what decides liveness.
+        // `MemoryStore` reports no modification time: its `clock_ms` defaults to
+        // 0 and nothing here sets it, so `live_set_read`'s LIST-metadata
+        // shortcut takes `mtime_stale`'s unknown-mtime path and the heartbeat
+        // body's stamp is what decides liveness. The value below does not gate
+        // that shortcut; it is epoch-relative only so the arithmetic below is
+        // readable.
         const NOW_NS: i64 = 1_000 * TEST_NS_PER_HOUR;
 
         let clock = ravel_maintain::FixedClock::new(NOW_NS);
