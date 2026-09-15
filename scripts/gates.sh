@@ -194,6 +194,15 @@ python3 "$(dirname "$0")/check_format_version_docs.py"
 echo "==> scripts/guards/check-guarded-sql-parse.sh"
 "$(dirname "$0")/guards/check-guarded-sql-parse.sh"
 
+# A parsed tenant query could reach an evaluator unreachable!() arm and abort
+# the process instead of rejecting the query (issue #1701). That round
+# converted every reachable arm to Error::Unsupported and left only the arms
+# an exhaustive prior match already narrows out of reach, each carrying a
+# one-line justification. This guard keeps new unreachable! arms honest: a
+# source scan, no build, same placement reasoning as the two above.
+echo "==> scripts/guards/check-promql-unreachable.sh"
+"$(dirname "$0")/guards/check-promql-unreachable.sh"
+
 # The flag-doc overclaim guard defined above, in the ordinary gate run: a source
 # scan, no build, so it fails before the expensive lanes.
 echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"

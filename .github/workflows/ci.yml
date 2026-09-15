@@ -279,6 +279,13 @@ jobs:
         run: bash scripts/guards/check-guarded-sql-parse.test.sh
       - name: Guarded-SQL-parse guard (issue #1760)
         run: bash scripts/guards/check-guarded-sql-parse.sh
+      # A parsed tenant query could reach an evaluator unreachable!() arm and
+      # abort the process instead of rejecting the query (issue #1701). Cases
+      # first, same reason as the guards above.
+      - name: PromQL-unreachable guard cases (issue #1701)
+        run: bash scripts/guards/check-promql-unreachable.test.sh
+      - name: PromQL-unreachable guard (issue #1701)
+        run: bash scripts/guards/check-promql-unreachable.sh
       # ci-sweep-cancelled.sh must not blind-rerun a job that hit its own
       # timeout-minutes (issue #1590): a rerun on a faster runner can pass and
       # hide the missing headroom. These cases stub gh, hit no network, and
