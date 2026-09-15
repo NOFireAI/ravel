@@ -60,6 +60,9 @@
 #     EndpointSlices. Without it every backend: ravelNative reconcile 403s when
 #     it tries to create the router's Role. Direct grant, not escalate/bind:
 #     least privilege.
+#   - /version (non-resource URL): get only. Read once at operator startup to
+#     detect whether the cluster is below the Kubernetes floor the rendered
+#     preStop SleepAction needs (issue #1714); never read again after that.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -125,6 +128,11 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["create", "patch", "get", "delete"]
+  # non-resource: reads the apiserver's /version once at startup to detect
+  # whether the cluster is below the Kubernetes floor the rendered preStop
+  # SleepAction needs (issue #1714, docs/guides/kubernetes.md "Status").
+  - nonResourceURLs: ["/version"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

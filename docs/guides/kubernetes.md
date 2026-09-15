@@ -169,9 +169,19 @@ Services in whatever namespace each `RavelCluster` lives in. Its ClusterRole
 grants the full lifecycle of Deployments, Services, Ingresses,
 `gateway.networking.k8s.io` HTTPRoutes/GRPCRoutes, and the ServiceAccounts,
 Roles, and RoleBindings it renders for the `ravelNative` ingest router,
-plus `RavelCluster` and its status subresource, `get` on Secrets, and
+plus `RavelCluster` and its status subresource, `get` on Secrets,
 `get`/`list`/`watch` on `endpointslices` (needed to create the router's own
-least-privilege Role). It never lists, writes, or watches Secrets.
+least-privilege Role), and `get` on the non-resource URL `/version`. It
+never lists, writes, or watches Secrets.
+
+**Minimum Kubernetes version: 1.32.** Every rendered ravel-server container
+carries a `preStop` `SleepAction`, GA only since 1.32; below that floor
+Kubernetes cannot create the Pod at all. The operator reads the cluster's
+version once at startup (via the `/version` grant above) and, on a cluster
+below the floor, raises a `KubernetesVersionUnsupported` condition on every
+`RavelCluster` rather than failing silently -- see "Status" below. It fails
+open (raises nothing) when it cannot read the version at all, so an RBAC
+gap or a `/version` blip never produces a false warning.
 
 ## `RavelCluster` reference
 
@@ -438,6 +448,12 @@ Store qualification above. If a reconcile fails (a missing Secret,
 an apply error), the operator writes a `Degraded=True` condition with the
 reason and flips `Available` to `False`. A `kubectl wait` then fails with an
 explanation instead of timing out silently.
+
+On a cluster below the Kubernetes 1.32 floor (see "Installing the operator
+yourself" above), every `RavelCluster` also carries a
+`KubernetesVersionUnsupported=True` condition naming the floor and the
+detected version, alongside `Available`/`Degraded` rather than instead of
+them.
 
 ## Probe semantics
 
