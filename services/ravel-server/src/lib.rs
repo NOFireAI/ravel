@@ -374,7 +374,13 @@ pub fn ensure_federation_tenant_mapping(
                     } else {
                         names.join(", ")
                     },
-                    alert_rule_tenants.len()
+                    known.len().saturating_sub(
+                        tenant_tokens
+                            .values()
+                            .map(|t| t.hash())
+                            .collect::<std::collections::HashSet<_>>()
+                            .len()
+                    )
                 );
             }
         }

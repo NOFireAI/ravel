@@ -442,28 +442,38 @@ result: a remote it holds no credential for is outside its query, not missing
 from it, so no warning and no `partial: true` appear.
 
 Omitting `tenant` leaves the remote reachable by every local tenant, which is
-correct only where one local tenant can ever resolve. A coordinator that can
-resolve more than one therefore **refuses to start** with such a spec, rather
+correct only where the coordinator runs queries for one. A coordinator that runs
+queries for more than one therefore **refuses to start** with such a spec, rather
 than fanning every local tenant's selectors and discovery out under the one
-credential and returning another tenant's series. A coordinator can resolve more
-than one local tenant when two or more `--tenant-token` values name different
-tenants, or when any dynamic resolver is enabled
-(`--dev-insecure-tenant-header`, `--oidc-issuer`, or `--mtls-enabled`, each of
-which derives the tenant from a request header or a token claim). The startup
-error names every spec needing a `tenant` and the resolver that makes the
+credential and returning another tenant's series. A coordinator runs queries for
+more than one local tenant when:
+
+- two or more `--tenant-token` values name different tenants;
+- an `--alert-rules-file` names a tenant no `--tenant-token` does. The alert
+  evaluator runs one query loop per tenant in that file, against the same engine
+  federation is installed on, so those queries federate even though no request
+  produced them;
+- any dynamic resolver is enabled (`--dev-insecure-tenant-header`,
+  `--oidc-issuer`, or `--mtls-enabled`, each of which derives the tenant from a
+  request header or a token claim).
+
+The startup error names every spec needing a `tenant` and what makes the
 deployment multi-tenant:
 
 ```
---remote-cluster 'eu' names no local tenant on a coordinator that can resolve
-more than one local tenant (2 distinct --tenant-token tenants are configured).
-A remote cluster holds one remote credential and cannot express one credential
-per local tenant ... Add tenant=<local tenant> to each of those specs ...
+--remote-cluster 'eu' names no local tenant on a coordinator that runs queries
+for more than one local tenant (2 distinct --tenant-token tenants are
+configured). A remote cluster holds one remote credential and cannot express one
+credential per local tenant ... Add tenant=<local tenant> to each of those specs
+...
 ```
 
-Startup also refuses a `tenant` that no `--tenant-token` configures, where the
-tenant set is fully known (static bearer tokens, no dynamic resolver): the
-mapping could never fire, and the only symptom would be a remote that quietly
-answers nobody.
+Startup also refuses a `tenant` named by neither a `--tenant-token` nor an
+`--alert-rules-file` rule, where the tenant set is fully known (static bearer
+tokens and alert rules, no dynamic resolver): the mapping could never fire, and
+the only symptom would be a remote that quietly answers nobody. A tenant that
+only alert rules name is a valid target, and mapping a remote to it is the
+supported way to give alert rules over data that lives partly on a remote.
 
 **TLS is on unless the spec says otherwise.** Neither spec above names `tls`,
 and both dial over TLS, verifying the remote against the system trust roots plus
