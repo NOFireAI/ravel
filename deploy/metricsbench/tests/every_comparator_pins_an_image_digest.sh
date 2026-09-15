@@ -28,12 +28,18 @@
 #   3. every `uses:` action reference in .github/workflows/*.yml and
 #      .github/actions/*/*.yml -- excluding a local action (`uses: ./...`),
 #      which is repo-tracked code, not a fetched external action;
-#   4. every `image:` reference in deploy/docker-compose/ravel.yml (the
-#      quickstart stack) -- excluding the two `${RAVEL_IMAGE:-...}` references
-#      by exact match, since their default is Ravel's own released image
-#      (pinned by release tag, ADR-0081), not a third-party image this check
-#      governs. Scoped to that one file: deploy/k8s carries locally built
-#      placeholders with no registry manifest to pin.
+#   4. every `image:` reference in the two quickstart compose files,
+#      deploy/docker-compose/ravel.yml and deploy/docker-compose/minio.yml
+#      (ravel.yml documents minio.yml as its MinIO-and-bucket mirror, so both
+#      must be scanned or the mirror can drift unpinned with nothing to
+#      notice) -- excluding the two `${RAVEL_IMAGE:-...}` references by exact
+#      match, since their default is Ravel's own released image (pinned by
+#      release tag, ADR-0081), not a third-party image this check governs.
+#      Scoped to these two files: deploy/k8s carries four registry images
+#      that are not yet pinned (minio.yaml lines 49 and 140, floci.yaml
+#      lines 74 and 157) plus two locally built placeholders
+#      (ravel-server, ravel-operator); pinning the k8s manifests is a
+#      separate ticket.
 #
 # Every category requires an `@sha256:<64 hex>` digest (categories 1, 2, and
 # 4) or a full 40-character commit SHA (category 3): a tag alone, a branch, or
@@ -58,6 +64,7 @@ DEPLOY_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$DEPLOY_DIR/../.." && pwd)
 COMPOSE_FILE="$DEPLOY_DIR/docker-compose.yml"
 RAVEL_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/ravel.yml"
+MINIO_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/minio.yml"
 
 # The comparators ADR-0927 requires in the portable cross-engine lane. Each must
 # appear as a service in the compose file. Prometheus and VictoriaMetrics are
@@ -92,16 +99,18 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # `./.github/actions/...` action, which this scan does not count.
 WORKFLOW_EXPECTED_ACTION_COUNT=101
 
-# Exact number of `image:` lines in the quickstart compose file
-# (deploy/docker-compose/ravel.yml): minio, createbucket (mc), qualify,
-# ravel-server, otel-collector, grafana. Update deliberately if a service is
-# added or removed.
-RAVEL_COMPOSE_EXPECTED_IMAGE_COUNT=6
+# Exact number of `image:` lines across the two quickstart compose files:
+# ravel.yml's six (minio, createbucket (mc), qualify, ravel-server,
+# otel-collector, grafana) plus minio.yml's two (minio, createbucket (mc),
+# the same mirror pair under different service wiring). Update deliberately
+# if a service is added or removed from either file.
+QUICKSTART_EXPECTED_IMAGE_COUNT=8
 
-# Of those six, the number that must carry a digest pin: every image except
-# the two `${RAVEL_IMAGE:-...}` references excluded below. Update
-# deliberately alongside RAVEL_COMPOSE_EXPECTED_IMAGE_COUNT.
-RAVEL_COMPOSE_EXPECTED_PINNED_COUNT=4
+# Of those eight, the number that must carry a digest pin: every image except
+# the two `${RAVEL_IMAGE:-...}` references excluded below (both in
+# ravel.yml; minio.yml carries none). Update deliberately alongside
+# QUICKSTART_EXPECTED_IMAGE_COUNT.
+QUICKSTART_EXPECTED_PINNED_COUNT=6
 
 # The exact text of a stripped `image:` reference (key and surrounding
 # whitespace removed, same as IMAGE_REFS above) that is Ravel's own image
@@ -125,7 +134,9 @@ fail=0
 
 DOCKERFILE_REFS_FILE=$(mktemp)
 WORKFLOW_REFS_FILE=$(mktemp)
-trap 'rm -f "$DOCKERFILE_REFS_FILE" "$WORKFLOW_REFS_FILE"' EXIT
+QUICKSTART_REFS_FILE=$(mktemp)
+QUICKSTART_REQUIRED_FILE=$(mktemp)
+trap 'rm -f "$DOCKERFILE_REFS_FILE" "$WORKFLOW_REFS_FILE" "$QUICKSTART_REFS_FILE" "$QUICKSTART_REQUIRED_FILE"' EXIT
 
 echo "Repo-wide pin check (issue #1310)"
 
@@ -314,69 +325,76 @@ else
   fi
 fi
 
-# --- 4. Quickstart compose file (deploy/docker-compose/ravel.yml) -----------
+# --- 4. Quickstart compose files (ravel.yml and minio.yml) -----------------
 
 echo
-echo "== quickstart compose image pins (deploy/docker-compose/ravel.yml, issue #1720) =="
+echo "== quickstart compose image pins (deploy/docker-compose/{ravel,minio}.yml, issue #1720) =="
 
-if [ ! -f "$RAVEL_COMPOSE_FILE" ]; then
-  echo "FAIL: quickstart compose file not found at $RAVEL_COMPOSE_FILE"
-  fail=1
-  ravel_image_count=0
-  ravel_required_count=0
-else
-  echo "  deployment file: $RAVEL_COMPOSE_FILE"
-
-  RAVEL_IMAGE_REFS=$(grep -E '^[[:space:]]*image:[[:space:]]*' "$RAVEL_COMPOSE_FILE" \
-    | sed -E 's/^[[:space:]]*image:[[:space:]]*//; s/[[:space:]]*$//')
-
-  if [ -z "$RAVEL_IMAGE_REFS" ]; then
-    echo "FAIL: no image references found in $RAVEL_COMPOSE_FILE; the check must never scan zero images"
+for f in "$RAVEL_COMPOSE_FILE" "$MINIO_COMPOSE_FILE"; do
+  if [ ! -f "$f" ]; then
+    echo "FAIL: quickstart compose file not found at $f"
     fail=1
-    ravel_image_count=0
-    ravel_required_count=0
-  else
-    ravel_image_count=$(printf '%s\n' "$RAVEL_IMAGE_REFS" | grep -c .)
-    echo "  image references found: $ravel_image_count (expected $RAVEL_COMPOSE_EXPECTED_IMAGE_COUNT)"
-    echo "  references:"
-    printf '%s\n' "$RAVEL_IMAGE_REFS" | while IFS= read -r ref; do
-      if [ "$ref" = "$RAVEL_IMAGE_VAR_REF" ]; then
-        echo "    [ravel image, exempt] $ref"
-      elif printf '%s\n' "$ref" | grep -q "$IMAGE_DIGEST_RE"; then
-        echo "    [pinned]   $ref"
-      else
-        echo "    [UNPINNED] $ref"
-      fi
-    done
+    continue
+  fi
+  echo "  deployment file: $f"
+  grep -nE '^[[:space:]]*image:[[:space:]]*' "$f" | while IFS= read -r line; do
+    lineno=$(printf '%s\n' "$line" | cut -d: -f1)
+    content=$(printf '%s\n' "$line" | cut -d: -f2-)
+    ref=$(printf '%s\n' "$content" | sed -E 's/^[[:space:]]*image:[[:space:]]*//; s/[[:space:]]*$//')
+    echo "$f:$lineno:$ref" >>"$QUICKSTART_REFS_FILE"
+  done
+done
 
-    # Exclude the two Ravel-own-image references by exact match before
-    # counting and pin-checking what remains: they are checked against
-    # RAVEL_COMPOSE_EXPECTED_PINNED_COUNT, not against the digest regex.
-    RAVEL_REQUIRED_REFS=$(printf '%s\n' "$RAVEL_IMAGE_REFS" | grep -vF -x "$RAVEL_IMAGE_VAR_REF")
+quickstart_count=$(wc -l <"$QUICKSTART_REFS_FILE" | tr -d '[:space:]')
+echo "  image references found: $quickstart_count (expected $QUICKSTART_EXPECTED_IMAGE_COUNT)"
 
-    if [ -z "$RAVEL_REQUIRED_REFS" ]; then
-      echo "FAIL: no pin-required image references found in $RAVEL_COMPOSE_FILE; the check must never scan zero images"
-      fail=1
-      ravel_required_count=0
+if [ "$quickstart_count" -eq 0 ]; then
+  echo "FAIL: no quickstart compose image references found; the check must never scan zero images"
+  fail=1
+  quickstart_required_count=0
+else
+  echo "  references:"
+  while IFS=: read -r file lineno ref; do
+    if [ "$ref" = "$RAVEL_IMAGE_VAR_REF" ]; then
+      echo "    [ravel image, exempt] $file:$lineno: $ref"
+    elif printf '%s\n' "$ref" | grep -q "$IMAGE_DIGEST_RE"; then
+      echo "    [pinned]   $file:$lineno: $ref"
     else
-      ravel_required_count=$(printf '%s\n' "$RAVEL_REQUIRED_REFS" | grep -c .)
-      ravel_unpinned=$(printf '%s\n' "$RAVEL_REQUIRED_REFS" | grep -vc "$IMAGE_DIGEST_RE")
-
-      if [ "$ravel_unpinned" -ne 0 ]; then
-        echo "FAIL: $ravel_unpinned quickstart compose image reference(s) lack an @sha256: digest"
-        fail=1
-      fi
-
-      if [ "$ravel_required_count" -ne "$RAVEL_COMPOSE_EXPECTED_PINNED_COUNT" ]; then
-        echo "FAIL: found $ravel_required_count pin-required quickstart compose image references, expected exactly $RAVEL_COMPOSE_EXPECTED_PINNED_COUNT"
-        fail=1
-      fi
+      echo "    [UNPINNED] $file:$lineno: $ref"
     fi
+  done <"$QUICKSTART_REFS_FILE"
 
-    if [ "$ravel_image_count" -ne "$RAVEL_COMPOSE_EXPECTED_IMAGE_COUNT" ]; then
-      echo "FAIL: found $ravel_image_count quickstart compose image references, expected exactly $RAVEL_COMPOSE_EXPECTED_IMAGE_COUNT"
+  # Exclude the two Ravel-own-image references by exact match on the ref
+  # field before counting and pin-checking what remains: they are checked
+  # against QUICKSTART_EXPECTED_PINNED_COUNT, not against the digest regex.
+  while IFS=: read -r file lineno ref; do
+    if [ "$ref" != "$RAVEL_IMAGE_VAR_REF" ]; then
+      echo "$file:$lineno:$ref" >>"$QUICKSTART_REQUIRED_FILE"
+    fi
+  done <"$QUICKSTART_REFS_FILE"
+
+  quickstart_required_count=$(wc -l <"$QUICKSTART_REQUIRED_FILE" | tr -d '[:space:]')
+
+  if [ "$quickstart_required_count" -eq 0 ]; then
+    echo "FAIL: no pin-required quickstart compose image references found; the check must never scan zero images"
+    fail=1
+  else
+    quickstart_unpinned=$(grep -vc "$IMAGE_DIGEST_RE" "$QUICKSTART_REQUIRED_FILE")
+
+    if [ "$quickstart_unpinned" -ne 0 ]; then
+      echo "FAIL: $quickstart_unpinned quickstart compose image reference(s) lack an @sha256: digest"
       fail=1
     fi
+
+    if [ "$quickstart_required_count" -ne "$QUICKSTART_EXPECTED_PINNED_COUNT" ]; then
+      echo "FAIL: found $quickstart_required_count pin-required quickstart compose image references, expected exactly $QUICKSTART_EXPECTED_PINNED_COUNT"
+      fail=1
+    fi
+  fi
+
+  if [ "$quickstart_count" -ne "$QUICKSTART_EXPECTED_IMAGE_COUNT" ]; then
+    echo "FAIL: found $quickstart_count quickstart compose image references, expected exactly $QUICKSTART_EXPECTED_IMAGE_COUNT"
+    fail=1
   fi
 fi
 
@@ -388,5 +406,5 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, $ravel_image_count quickstart compose images, all pinned; comparators: $REQUIRED_COMPARATORS)"
+echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, $quickstart_count quickstart compose images, all pinned; comparators: $REQUIRED_COMPARATORS)"
 exit 0
