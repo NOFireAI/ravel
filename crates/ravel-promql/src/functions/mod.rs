@@ -963,11 +963,12 @@ fn eval_matrix_arg(
     }
 }
 
-/// Extract the matrix-typed node from a function argument known (by
-/// promql-parser's own parse-time type check) to be Matrix-typed:
-/// `MatrixSelector`, `Subquery`, or `Paren` wrapping either. Any other node
-/// is unreachable, since the parser rejects the query before this evaluator
-/// ever sees it otherwise.
+/// Extract the matrix-typed node from a function argument promql-parser's own
+/// parse-time type check is expected to have constrained to Matrix:
+/// `MatrixSelector`, `Subquery`, or `Paren` wrapping either. Any other node is
+/// rejected with [`Error::Unsupported`] naming its kind rather than trusted
+/// away: that check lives in a third-party crate on a caret version range, so
+/// this evaluator does not rest a panic on it (issue #1701).
 pub fn matrix_arg(expr: &promql_parser::parser::Expr) -> Result<MatrixArg<'_>, Error> {
     use promql_parser::parser::Expr;
     let mut cur = expr;

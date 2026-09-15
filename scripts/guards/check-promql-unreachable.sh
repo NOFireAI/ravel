@@ -15,9 +15,11 @@
 #
 #   // unreachable-allow: <the arm that rejects first> -- <reason>
 #
-# The reason is required (text after the `--`, on the marker's own line or
-# continuing on the comment lines below it up to the next non-comment line).
-# A marker with no reason does not suppress. An `unreachable!` added later
+# The reason is required, and it must start on the marker's own line: the
+# line carrying `unreachable-allow:` needs a `--` with non-empty text after
+# it. The reason may of course wrap onto the comment lines below, but a
+# marker line that ends at the `--` (or has no `--` at all) does not
+# suppress, whatever follows it. An `unreachable!` added later
 # with no marker at all is exactly the case this guard exists to catch: it
 # means either the arm is reachable and should return `Error::Unsupported`
 # instead, or it is genuinely dead and needs the same one-sentence
@@ -40,7 +42,7 @@ roots=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help)
-      sed -n '2,29p' "$0"
+      sed -n '2,31p' "$0"
       exit 0
       ;;
     -*)
@@ -145,12 +147,13 @@ function mentions_unreachable(s) {
   return s ~ /(^|[^A-Za-z0-9_])unreachable!/
 }
 # The marker itself only counts from comment text, and takes the form
-# `unreachable-allow: <arm> -- <reason>`. A reason is required: either text
-# after the "--" on the same line, or (the common case, since the arm name
-# runs the line long) the marker line ends right after "--" and the reason
-# continues as plain comment text on the contiguous lines below it.
-# Returns: 0 no marker, 1 marker with a reason already on this line, 2
-# marker present but the reason (if any) is still to come on a later line.
+# `unreachable-allow: <arm> -- <reason>`. The reason must begin on the marker
+# line: non-empty text after the "--", on that same line. A following comment
+# line cannot supply it, because then a marker line that simply ended at the
+# "--" would be suppressed by whatever unrelated prose happened to sit under
+# it (the reason may still wrap onto those lines; it just cannot start there).
+# Returns: 0 no marker, 1 marker with a reason on this line, 2 marker present
+# with no "--" or with nothing after it.
 function has_marker_with_reason(s,   i, rest, dashpos, reason) {
   i = index(s, MARKER)
   if (i == 0) return 0
@@ -170,7 +173,7 @@ BEGIN {
 }
 FNR == 1 {
   sstate = 0; sesc = 0; shashes = 0; bdepth = 0
-  block_marker = 0; block_has_reason = 0
+  block_has_reason = 0
 }
 {
   code = strip_line($0)
@@ -180,7 +183,7 @@ FNR == 1 {
     total++
     m = has_marker_with_reason(cmt)
     inline_ok = (m == 1)
-    if (!inline_ok && !(block_marker && block_has_reason)) {
+    if (!inline_ok && !block_has_reason) {
       printf "%s:%d: bare-unreachable: no `%s <arm> -- <reason>` marker on" \
              " this line or in the comment block above it; either this arm" \
              " is reachable by a parsed query and must return" \
@@ -192,18 +195,8 @@ FNR == 1 {
   }
 
   if (is_comment_line) {
-    m = has_marker_with_reason(cmt)
-    if (m == 1) { block_marker = 1; block_has_reason = 1 }
-    else if (m == 2 && !block_marker) { block_marker = 1; block_has_reason = 0 }
-    else if (block_marker && !block_has_reason && cmt != "") {
-      # a later comment line in the same block supplies the reason text
-      trimmed = cmt
-      gsub(/^[ \t]*\/\/+[ \t]*/, "", trimmed)
-      gsub(/[ \t]/, "", trimmed)
-      if (length(trimmed) > 0) block_has_reason = 1
-    }
+    if (has_marker_with_reason(cmt) == 1) block_has_reason = 1
   } else {
-    block_marker = 0
     block_has_reason = 0
   }
 }
