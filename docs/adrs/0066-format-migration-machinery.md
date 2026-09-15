@@ -67,7 +67,7 @@ ADR-0027's single-version policy is superseded at (and only at) first public rel
 
 Until first release, ADR-0027 stands unchanged; this ADR's machinery lands exercised by tests and dry-runs rather than by carrying real dual versions in anger.
 
-"First public release" here is disambiguated by ADR-0531 (proposed): it denotes a not-yet-reached format-lifecycle activation milestone, distinct from the software's first public release at 0.9.0. Under that reading this decision's N/N-1 window is staged but not yet in force at HEAD, which is why the reader window is still single-version and the 0.10.0 (RSEG v6) and 0.11.0 (RLOG v3) deletions acted correctly under ADR-0027's pre-release regime.
+"First public release" here is disambiguated by ADR-0531 (proposed): it denotes a not-yet-reached format-lifecycle activation milestone, distinct from the software's first public release at 0.9.0. Under that reading this decision's N/N-1 window is staged but not yet in force at HEAD, which is why the reader window is still single-version and the 0.10.0 (RSEG v6) and 0.12.0 (RLOG v3) deletions acted correctly under ADR-0027's pre-release regime. 0.11.0, which introduced RLOG v4 while keeping the v3 reader, is a deviation from that regime rather than an early start of this decision's window; ADR-0892 closed it.
 
 ### 2. Fail-closed-on-newer, everywhere, typed
 

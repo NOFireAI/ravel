@@ -19,7 +19,16 @@ the bump cannot read it. The irreversible step is the first write at the new
 version; before it, a rollback to the earlier build is safe. The N/N-1 window
 described below is staged for a future format-lifecycle activation milestone,
 distinct from the software's first public release at 0.9.0 and not yet reached
-(ADR-0531, proposed), not a posture any released build has had.
+(ADR-0531, proposed).
+
+RLOG is the one format with a released two-version reader behind it, so read
+the paragraph above as the posture at HEAD and not as a description of every
+bump this format has had. 0.11.0 shipped a reader accepting v3 and v4 while
+writers emitted v4, and a v3 store upgrading to 0.11.0 kept its objects
+readable. ADR-0892 closed that window in 0.12.0 and characterises it as an
+unretired predecessor reader rather than an N/N-1 policy in force. The
+irreversible boundary for a v3 store was 0.11.0 to 0.12.0, not 0.10.x to
+0.11.0.
 
 Version 4 changed the BLOCKS layout, deleted the per-block header, and
 redefined the SKIP_IDX level-0 block crc, so it was a versioned change rather
@@ -38,12 +47,12 @@ bulk data-object format. The supported-version window is single-sourced as
 `ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer, reader gate,
 `audit-versions`, `migrate`, and the compactor's output-version constant all
 read it. Until the format-lifecycle activation milestone (ADR-0531, proposed:
-distinct from the software's 0.9.0 first public release and not yet reached) the
-window
-holds exactly one version
-(ADR-0027 decision 7, ADR-0892): each bump deletes the previous version's
-reader in the same change, and a pre-1.0.0 development store holding older
-objects is wiped or re-ingested. The N/N-1 window ADR-0066 describes, rolled
+distinct from the software's 0.9.0 first public release and not yet reached)
+the window holds exactly one version (ADR-0027 decision 7, ADR-0892): a bump
+deletes the previous version's reader, and a pre-1.0.0 development store
+holding older objects is wiped or re-ingested. RLOG v3 to v4 in 0.11.0 is the
+one bump that did not do this in the same change; ADR-0892 removed the v3
+reader in 0.12.0 instead. The N/N-1 window ADR-0066 describes, rolled
 out readers-before-writers -- a release writing N+1 requires a fleet already
 reading N+1 -- opens at, and only at, that release.
 

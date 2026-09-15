@@ -32,8 +32,16 @@ Read literally and together, those three say the N/N-1 window was in force from
   migration path, explicitly "under the pre-release single-version policy
   (ADR-0027)" (ADR-0092 migration-class header and decision 7; CHANGELOG 0.10.0
   entry: "There is no v6 reader and no v6-to-v7 migration path").
-- 0.11.0 deleted the RLOG v3 reader the same way, again citing ADR-0027
-  decision 7 and ADR-0066 decision 1.
+- 0.12.0 deleted the RLOG v3 reader the same way, again citing ADR-0027
+  decision 7 and ADR-0066 decision 1 (CHANGELOG 0.12.0 Removed).
+- 0.11.0 is the one deviation, and it cuts against the pre-release regime
+  rather than for it: it introduced RLOG v4 while keeping the v3 reader, so
+  that release shipped a two-version reader ("The reader accepts v3 and v4;
+  writers emit v4", CHANGELOG 0.11.0). ADR-0027 decision 7 does not permit
+  that, and no ADR authorised it at the time. ADR-0892 later closed the window
+  and treats it as an unretired predecessor reader, not as the N/N-1 policy
+  starting early: its line 56 says the window "is not yet in force" in the same
+  document that describes the v3+v4 reader.
 - At HEAD, `ravel_segment::SUPPORTED_VERSIONS` holds exactly one version (v7);
   the N/N-1 machinery exists and is exercised by tests but carries no live
   second version.
@@ -49,23 +57,33 @@ The genuine question underneath is whether "first public release" in the
 lifecycle ADRs means:
 
 - **Reading A: 0.9.0**, as the changelog states. Then the N/N-1 window has been
-  in force since 0.9.0, the 0.10.0 v6 deletion and the 0.11.0 RLOG v3 deletion
+  in force since 0.9.0, the 0.10.0 v6 deletion and the 0.12.0 RLOG v3 deletion
   were policy violations that shipped, and the project owes a retroactive
   correction and a migration path for any 0.9.x store that upgraded.
 - **Reading B: a distinct, not-yet-reached format-lifecycle activation
   milestone**, separate from the software's first public release at 0.9.0. Then
   the format lifecycle is still under ADR-0027's pre-release regime at HEAD,
   ADR-0066's window is staged (machinery present, exercised by tests and
-  dry-runs) but not yet governing, and the 0.10.0 and 0.11.0 deletions were the
-  intended pre-release behavior, not violations.
+  dry-runs) but not yet governing, and the 0.10.0 and 0.12.0 deletions were the
+  intended pre-release behavior, not violations. 0.11.0's two-version reader is
+  a deviation under either reading and is treated separately below.
 
 Only Reading B is consistent with what the binary actually did. ADR-0092
 decision 7 is explicit that v7's single-version window is "the intended
 pre-release behavior, not a gap," and that a real two-version window would be a
 deliberate future flip. Reading A would mean two shipped releases silently broke
 the policy their own changelog entries cite, and it makes every existing 0.10.0
-and 0.11.0 changelog entry contradict the policy; Reading B makes those entries
+and 0.12.0 changelog entry contradict the policy; Reading B makes those entries
 correct as written and requires editing no changelog history.
+
+0.11.0 is not evidence for either reading, and it should not be read as
+support for this recommendation. Shipping a v3+v4 reader is outside ADR-0027
+decision 7 under Reading B and outside ADR-0066's readers-before-writers
+sequencing under Reading A. It was closed in the next minor release by
+ADR-0892, which describes the window as unretired rather than as policy, so it
+does not establish that the N/N-1 window ever opened. The owner confirming
+point 2 below should know that one shipped bump deviated from the regime being
+confirmed.
 
 ## Decision (recommended, pending owner confirmation)
 
@@ -85,13 +103,15 @@ correct as written and requires editing no changelog history.
    as decision 1 already says for the pre-release period.
 
 3. This confirms, rather than reverses, ADR-0092 decision 7 and the 0.10.0 and
-   0.11.0 reader deletions: they acted correctly under the pre-release regime,
-   because the activation milestone had not (and has not) occurred.
+   0.12.0 reader deletions: they acted correctly under the pre-release regime,
+   because the activation milestone had not (and has not) occurred. It says
+   nothing about 0.11.0's two-version RLOG reader, which no reading of the
+   phrase authorises and which ADR-0892 has already closed.
 
 The owner must confirm point 1 before the reconciling edits to ADR-0027,
 ADR-0066, and ADR-0092 land. If the owner instead chooses Reading A, this ADR is
 withdrawn and a separate change records the retroactive-correction obligation
-for the shipped 0.10.0/0.11.0 deletions; the operator-facing posture edits in
+for the shipped 0.10.0/0.12.0 deletions; the operator-facing posture edits in
 the format docs (below) hold under either reading and are not gated on the
 choice.
 
@@ -138,9 +158,12 @@ in force at HEAD (Reading B, point 2 above):
   These edits are factual at HEAD and hold under either reading of "first public
   release."
 
-- ADR-0027, ADR-0066, and ADR-0092 each gain a pointer to this ADR at the
-  "first public release" reference, so a reader meeting the ambiguous phrase is
-  sent to the decision record rather than left to guess. Their core decisions
+- ADR-0027, ADR-0066, ADR-0092, and ADR-0892 each gain a pointer to this ADR at
+  the "first public release" reference, so a reader meeting the ambiguous phrase
+  is sent to the decision record rather than left to guess. ADR-0892 is not a
+  passing mention of the phrase: it is the ADR that deleted a shipped reader on
+  the strength of it, and docs/log-segment-format.md sends readers there by
+  name. Their core decisions
   are not rewritten here; that waits on owner confirmation of point 1.
 
 - A documentation/code consistency check

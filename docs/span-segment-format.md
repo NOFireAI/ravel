@@ -39,9 +39,8 @@ distinct from the software's first public release at 0.9.0 and not yet reached
 **Version lifecycle and migration (ADR-0066, normative).** The pre-release
 posture above expires at the format-lifecycle activation milestone (ADR-0531,
 proposed: distinct from the software's 0.9.0 first public release and not yet
-reached).
-RSPAN is a Class A bulk
-data-object format; from that milestone onward the supported-version window
+reached). RSPAN is a Class A bulk data-object format; from that milestone
+onward the supported-version window
 becomes N/N-1 (single-sourced as `ravel_rspan::footer::SUPPORTED_VERSIONS`,
 which holds exactly one version today; the writer, reader gate,
 `audit-versions`, `migrate`, and the compactor's output-version

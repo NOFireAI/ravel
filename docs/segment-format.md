@@ -49,10 +49,9 @@ normally. A corrupt object is swept as usual.
 **Version lifecycle and migration (ADR-0066, normative).** RSEG is a Class A
 bulk data-object format. Until the format-lifecycle activation milestone
 (ADR-0531, proposed: distinct from the software's 0.9.0 first public release
-and not yet reached), ADR-0027's single-supported-version rule above stands and
-a bump is
-forward-only. From that milestone onward the
-supported-version window becomes N/N-1: the writer always emits the current
+and not yet reached), ADR-0027's single-supported-version rule above stands
+and a bump is forward-only. From that milestone onward the supported-version
+window becomes N/N-1: the writer always emits the current
 version N, and the reader accepts N and N-1. The window is single-sourced as
 `ravel_segment::SUPPORTED_VERSIONS`, and the writer, reader gate,
 `audit-versions`, and the `migrate` job all read it; it holds exactly one
