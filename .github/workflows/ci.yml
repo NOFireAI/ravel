@@ -240,6 +240,14 @@ jobs:
         run: bash scripts/tests/check-injected-clock-helpers.test.sh
       - name: Injected-clock helper guard (issue #1260)
         run: bash scripts/check-injected-clock-helpers.sh
+      # One guarded SQL parse, and nothing else in ravel-sql may reach a parser
+      # front end (issue #1760). Its cases run first for the same reason the
+      # hygiene ones do: a guard broken into always-passing fails here rather
+      # than going quiet, and this one passes everything if its anchor moves.
+      - name: Guarded-SQL-parse guard cases (issue #1760)
+        run: bash scripts/guards/check-guarded-sql-parse.test.sh
+      - name: Guarded-SQL-parse guard (issue #1760)
+        run: bash scripts/guards/check-guarded-sql-parse.sh
       # ci-sweep-cancelled.sh must not blind-rerun a job that hit its own
       # timeout-minutes (issue #1590): a rerun on a faster runner can pass and
       # hide the missing headroom. These cases stub gh, hit no network, and

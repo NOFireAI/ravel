@@ -504,6 +504,19 @@ there before changing a rule.
   merge script runs it after its rewrite; run it yourself after any
   manual amend or script-bypassing merge. A wrong identity on protected
   `main` cannot be fixed later.
+- `scripts/guards/check-guarded-sql-parse.sh [path ...]`: exits non-zero when
+  anything under `crates/ravel-sql/src/` reaches a SQL parser front end
+  (`DFParser`, `DFParserBuilder`, sqlparser's `Parser`) outside
+  `complexity_guard::parse_guarded`, which runs the pre-parse complexity guard
+  and then parses. Every parse of caller text needs that guard, because the
+  walks over the parsed tree abort the process on a statement the parser's own
+  recursion limit does not bound, and as a convention it failed on two of the
+  three parse sites (issue #1760). Test code that parses fixture text carries
+  `// guarded-parse-allow: <reason>` on the line or in the comment block above
+  it; the reason is required. Exit 1 is a finding, 2 is a missing or moved
+  anchor, which is the case where the scan would otherwise pass everything.
+  Wired into `gates.sh` and CI's doc-scripts job; cases in
+  `scripts/guards/check-guarded-sql-parse.test.sh`.
 - `scripts/check-injected-clock-helpers.sh [file]`: exits non-zero when an
   injected-clock test helper contains `thread::sleep`, `tokio::time::sleep`,
   a bare or aliased `sleep()` call, `tokio::time::timeout`, `Instant::`,
