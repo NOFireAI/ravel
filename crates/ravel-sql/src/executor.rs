@@ -304,6 +304,16 @@ pub struct SqlStats {
     /// same DataFusion metric set as the block counters. All zero for a plan
     /// with no logs scan.
     pub scan_timing: ScanTiming,
+    /// Histogram-kind series the successful attempt's `RsegScanExec` matched
+    /// and did not return, read off its DataFusion counters the same way the
+    /// block counters above are (issue #1738). Nonzero means this result is
+    /// missing the histogram population of what the statement selected, which
+    /// is what [`SqlOutcome::warnings`] turns into a caller-visible warning.
+    ///
+    /// Counted per (segment, partition), so it is a presence signal rather than
+    /// a distinct-series count. Zero for every non-metrics statement, and for a
+    /// metrics statement over a tenant with no histogram data.
+    pub histogram_series_skipped: u64,
 }
 
 /// Wall-clock timing of a query's `LogsScanExec` partitions (see
@@ -444,22 +454,28 @@ fn accumulate_scan_timing(metrics: &MetricsSet, timing: &mut ScanTiming) {
     }
 }
 
-/// The `LogsScanExec` block counters, summed over a plan tree, and the scan's
-/// wall-clock timing read off the same metric set.
+/// The `LogsScanExec` block counters, summed over a plan tree, the scan's
+/// wall-clock timing read off the same metric set, and the metrics scan's
+/// skipped-histogram count.
 #[derive(Clone, Default)]
 struct BlockCounts {
     total: u64,
     scanned: u64,
     pruned_by_postings: u64,
     timing: ScanTiming,
+    /// Summed from the counter `RsegScanExec` publishes (crate::scan). Lives
+    /// here rather than in a second walk because one traversal already reads
+    /// every node's metric set, and that read is the expensive part.
+    histogram_series_skipped: u64,
 }
 
 /// Sum the `blocks_total` / `blocks_scanned` / `blocks_pruned_by_postings`
-/// DataFusion counters over `plan` and its descendants. Only `LogsScanExec`
-/// publishes these names (crate::logs_scan), so the sum is that scan's totals
-/// however the optimizer nested it, and a plan with no logs scan contributes
-/// nothing. Reads the counters the scan already maintains rather than counting
-/// blocks a second time.
+/// DataFusion counters over `plan` and its descendants, plus the metrics
+/// scan's `histogram_series_skipped`. Only `LogsScanExec` publishes the first
+/// three names (crate::logs_scan) and only `RsegScanExec` the last
+/// (crate::scan), so each sum is that scan's total however the optimizer
+/// nested it, and a plan carrying neither scan contributes nothing. Reads the
+/// counters the scans already maintain rather than counting a second time.
 fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCounts) {
     // One walk, one `metrics()` call per node: that call clones the node's
     // whole `MetricsSet` out of its mutex, and with the per-segment timeline on
@@ -470,6 +486,7 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
         counts.total += sum("blocks_total");
         counts.scanned += sum("blocks_scanned");
         counts.pruned_by_postings += sum("blocks_pruned_by_postings");
+        counts.histogram_series_skipped += sum(crate::scan::HISTOGRAM_SERIES_SKIPPED_METRIC);
         accumulate_scan_timing(&metrics, &mut counts.timing);
     }
     for child in plan.children() {
@@ -734,6 +751,42 @@ pub struct SqlOutcome {
     /// erasure is in force, so a later page cannot return rows an erasure
     /// accepted between pages.
     pub pending_erasure: Vec<ErasurePredicate>,
+}
+
+/// The warning a `samples` statement carries when its answer omits the
+/// tenant's native-histogram samples (issue #1738). One fixed string: the
+/// caller cannot act on a count of skipped series, only on the fact that the
+/// result is not the whole population.
+pub const HISTOGRAM_EXCLUDED_WARNING: &str = "native-histogram samples are excluded from the samples table, which has no \
+     column that can hold one; this result omits them, so counts and \
+     aggregations over samples are short by the histogram population";
+
+impl SqlOutcome {
+    /// Non-fatal diagnostics about what this result is NOT, for a transport to
+    /// render beside the rows (the PromQL surface's top-level `warnings`
+    /// array, ADR-0071 decision 2, is the shape this follows).
+    ///
+    /// The exactness posture makes approximation opt-in and visible; a
+    /// `samples` result that silently drops a tenant's histogram samples is
+    /// neither. The condition is the narrowest one the query path can see for
+    /// free: this statement's own scan matched histogram-kind series and
+    /// dropped them ([`SqlStats::histogram_series_skipped`], counted where the
+    /// fetcher's already-decoded catalog says a series is histogram-kind). A
+    /// tenant with no histogram data, and a statement whose matchers select
+    /// none, both warn about nothing.
+    ///
+    /// One gap: a statement that ran through the ADR-0071 distributed lane
+    /// counts nothing, because the scan that did the skipping ran on a worker
+    /// and the slice stream carries rows, not that worker's DataFusion
+    /// counters. Closing it needs a field on the slice summary, which is a
+    /// wire-format change (issue #1738).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.stats.histogram_series_skipped > 0 {
+            warnings.push(HISTOGRAM_EXCLUDED_WARNING.to_string());
+        }
+        warnings
+    }
 }
 
 /// A shared, cloneable view of the [`QueryAccounting`] for the query currently
@@ -1251,6 +1304,7 @@ impl SqlExecutor {
                     stats.blocks_scanned = blocks.scanned;
                     stats.blocks_pruned_by_postings = blocks.pruned_by_postings;
                     stats.scan_timing = blocks.timing;
+                    stats.histogram_series_skipped = blocks.histogram_series_skipped;
                     let phase_snapshot = phase_accounting.snapshot();
                     return Ok(SqlOutcome {
                         output,

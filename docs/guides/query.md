@@ -549,6 +549,37 @@ listing. The request body, auth, window
 (`start`/`end`), and `min_commit_token` handling are identical to the `samples`
 case.
 
+The `samples` table columns are `ts` (`Timestamp(ns)`), `value` (`Float64`),
+`series_id` (`FixedSizeBinary(16)`), and `labels` (a dictionary-encoded
+`Map(Utf8, Utf8)`). There is no column that can hold a native histogram, so
+**native-histogram samples are not rows in `samples` and no query over it can
+see them**. On a tenant that exports native histograms, `SELECT count(*) FROM
+samples` counts the scalar samples only, and on a histogram-only tenant it
+answers 0; the same goes for every aggregation over the table. Query native
+histograms through PromQL, which has a full histogram model, rather than
+reconciling a totals count against SQL.
+
+A statement whose scan met histogram data and excluded it says so: the JSON
+response carries a top-level `warnings` array of strings beside `status`,
+`data`, and `stats`, in the same shape and with the same omit-when-empty rule
+as the PromQL endpoints. A response with no `warnings` key is a complete
+answer over what the table can represent. Two cases carry no warning even
+though the exclusion applies: an Arrow IPC response (`Accept:
+application/vnd.apache.arrow.stream`), which is a bare columnar payload with
+nowhere to put one, and Flight SQL, which has no such envelope either. A
+client on those encodings should assume the exclusion holds for its tenant.
+
+```json
+{
+  "status": "success",
+  "data": { "columns": [ ... ], "rows": [ [ 2 ] ] },
+  "stats": { ... },
+  "warnings": [
+    "native-histogram samples are excluded from the samples table, which has no column that can hold one; this result omits them, so counts and aggregations over samples are short by the histogram population"
+  ]
+}
+```
+
 The `logs` table columns are `ts`, `observed_ts` (both `Timestamp(ns)`),
 `severity_num`, `severity_text`, `body`, `trace_id`, `span_id`, `flags`, and an
 `attrs` `Map(Utf8, Utf8)` that merges each record's resource, scope, and
