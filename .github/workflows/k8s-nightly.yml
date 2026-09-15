@@ -197,11 +197,22 @@ jobs:
       # Scenario 1: kill ingest mid-flush. The script brings up MinIO itself via
       # docker compose, qualifies the store, drives strict-ack load, SIGKILLs the
       # server mid-flush, restarts, and asserts the pinned oracle.
+      # Each scenario gets its own tenant. Both scripts bring MinIO up through
+      # deploy/docker-compose/minio.yml, which bind-mounts ../../minio-data, so
+      # `docker compose down` between them leaves the host directory in place
+      # and scenario 2 starts on scenario 1's objects. Distinct tenants keep
+      # each scenario's unit counts and custody assertions attributable to it.
       - name: Chaos scenario 1 -- kill ingest mid-flush
+        env:
+          CHAOS_TENANT_NAME: chaos-ingest-flush
+          CHAOS_TENANT_TOKEN: chaos-token-ingest-flush
         run: scripts/chaos/kill-ingest-flush.sh
       # Scenario 2: kill a maintain worker mid-compaction, sibling running.
       # RELEASE-BLOCKING (ADR-0077 section 4): exit 2 on any oracle failure.
       - name: Chaos scenario 2 -- kill maintain worker mid-compaction
+        env:
+          CHAOS_TENANT_NAME: chaos-maintain-worker
+          CHAOS_TENANT_TOKEN: chaos-token-maintain-worker
         run: scripts/chaos/kill-maintain-worker.sh
       - name: Dump MinIO logs on failure
         if: failure()
