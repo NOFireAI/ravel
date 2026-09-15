@@ -161,6 +161,16 @@ cargo --locked fmt --all --check
 echo "==> scripts/guards/check-test-hygiene.sh"
 "$(dirname "$0")/guards/check-test-hygiene.sh"
 
+# Every workflow declares a top-level permissions floor (issue #1717). No local
+# gate compiles .github/, so nothing else here would notice a workflow added
+# without one, and the repository default workflow permission is write. Its own
+# cases run first, so a guard broken into always-passing fails here rather than
+# going quiet. A file scan, no build, so it sits with the other cheap guards.
+echo "==> scripts/guards/check-workflow-permissions.test.sh"
+bash "$(dirname "$0")/guards/check-workflow-permissions.test.sh"
+echo "==> scripts/guards/check-workflow-permissions.sh"
+"$(dirname "$0")/guards/check-workflow-permissions.sh"
+
 # "No wall-clock wait in an injected-clock test helper" cost two gate reruns
 # (issue #1260: the flaky pair test, then its rewrite under #1235). Another
 # check rather than another paragraph, same reasoning as the hygiene guard
