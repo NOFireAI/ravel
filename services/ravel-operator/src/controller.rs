@@ -2685,7 +2685,16 @@ pub async fn run() -> Result<(), Error> {
     // `kubernetes_version_condition` never runs for this process rather than
     // raising and clearing the condition on every transient failure.
     let kubernetes_version = match client.apiserver_version().await {
-        Ok(info) => Some(info),
+        Ok(info) => {
+            if kubernetes_minor_version(&info).is_none() {
+                warn!(
+                    minor = %info.minor,
+                    git_version = %info.git_version,
+                    "could not parse Kubernetes apiserver version; skipping the minimum-version check"
+                );
+            }
+            Some(info)
+        }
         Err(error) => {
             warn!(
                 %error,
@@ -3013,54 +3022,68 @@ mod tests {
         }
     }
 
-    /// Table-driven over apiserver `Info` shapes (issue #1714): a minor below
-    /// [`MIN_KUBERNETES_MINOR_VERSION`] sets exactly one
-    /// `KubernetesVersionUnsupported` condition naming the floor and the
-    /// detected version; a minor at or above it, including the `"32+"` form a
-    /// managed control plane reports, sets none; a minor this cannot parse at
-    /// all (and whose `git_version` gives no fallback) also sets none, since
-    /// an unreadable version must fail open rather than false-flag a
-    /// supported cluster. Reverting [`kubernetes_version_condition`] to
-    /// always build the condition (dropping the floor comparison) fails the
-    /// `"31"` case below, since `"32"`/`"32+"`/`"33"` would then also report
-    /// unsupported.
+    /// Table-driven over apiserver `Info` shapes (issue #1714). The third
+    /// column is the value [`kubernetes_minor_version`] itself must parse out
+    /// of the row, asserted independently of whether a condition follows;
+    /// whether the condition fires is then derived from that parsed value
+    /// against [`MIN_KUBERNETES_MINOR_VERSION`], so the two checks cannot
+    /// silently agree on the wrong thing. This catches a mutant a
+    /// condition-only table missed: replacing
+    /// [`kubernetes_minor_version`]'s body with a bare
+    /// `info.minor.parse::<u32>().ok()` (dropping the `git_version`
+    /// fallback) still produces no condition for `"32+"` -- `"32+".parse()`
+    /// fails on the trailing `+`, so the mutant fails open exactly where the
+    /// real parser reports `Some(32)` -- but the parsed-value assertion below
+    /// catches the mismatch directly. The `("", "v1.31.6")` row exercises the
+    /// fallback path itself: `minor` alone is unparsable, only `git_version`
+    /// recovers `31`, and that recovered value is still below the floor.
     #[test]
     fn apiserver_below_the_kubernetes_floor_sets_the_unsupported_condition() {
         let cases: &[(&str, &str, Option<u32>)] = &[
             ("31", "v1.31.6", Some(31)),
-            ("32", "v1.32.0", None),
-            ("32+", "v1.32.2-gke.1234", None),
-            ("33", "v1.33.1", None),
+            ("32", "v1.32.0", Some(32)),
+            ("32+", "v1.32.2-gke.1234", Some(32)),
+            ("33", "v1.33.1", Some(33)),
             ("unknown", "unknown", None),
+            ("", "v1.31.6", Some(31)),
         ];
 
         for (minor, git_version, expect_detected_minor) in cases {
             let info = version_info(minor, git_version);
+            assert_eq!(
+                kubernetes_minor_version(&info),
+                *expect_detected_minor,
+                "minor {minor:?} ({git_version}) should parse to {expect_detected_minor:?}"
+            );
+
             let result = kubernetes_version_condition(&info, Some(3));
-            match expect_detected_minor {
-                Some(detected) => {
-                    let cond = result.unwrap_or_else(|| {
-                        panic!("minor {minor:?} ({git_version}) should be below the floor")
-                    });
-                    assert_eq!(cond.r#type, "KubernetesVersionUnsupported");
-                    assert_eq!(cond.status, "True");
-                    assert_eq!(cond.observed_generation, Some(3));
-                    assert!(
-                        cond.message
-                            .contains(&format!("1.{MIN_KUBERNETES_MINOR_VERSION}")),
-                        "message names the floor: {}",
-                        cond.message
-                    );
-                    assert!(
-                        cond.message.contains(&detected.to_string()),
-                        "message names the detected version: {}",
-                        cond.message
-                    );
-                }
-                None => assert!(
+            let expect_condition =
+                matches!(expect_detected_minor, Some(m) if *m < MIN_KUBERNETES_MINOR_VERSION);
+            if expect_condition {
+                let detected = expect_detected_minor.expect("condition implies a parsed minor");
+                let cond = result.unwrap_or_else(|| {
+                    panic!("minor {minor:?} ({git_version}) should be below the floor")
+                });
+                assert_eq!(cond.r#type, "KubernetesVersionUnsupported");
+                assert_eq!(cond.status, "True");
+                assert_eq!(cond.observed_generation, Some(3));
+                assert!(
+                    cond.message
+                        .contains(&format!("1.{MIN_KUBERNETES_MINOR_VERSION}")),
+                    "message names the floor: {}",
+                    cond.message
+                );
+                assert!(
+                    cond.message.contains(&format!("(minor {detected})")),
+                    "message names the parsed minor, not just a substring \
+                     `git_version` also happens to contain: {}",
+                    cond.message
+                );
+            } else {
+                assert!(
                     result.is_none(),
                     "minor {minor:?} ({git_version}) should not set a condition, got {result:?}"
-                ),
+                );
             }
         }
     }

@@ -175,13 +175,23 @@ least-privilege Role), and `get` on the non-resource URL `/version`. It
 never lists, writes, or watches Secrets.
 
 **Minimum Kubernetes version: 1.32.** Every rendered ravel-server container
-carries a `preStop` `SleepAction`, GA only since 1.32; below that floor
-Kubernetes cannot create the Pod at all. The operator reads the cluster's
-version once at startup (via the `/version` grant above) and, on a cluster
-below the floor, raises a `KubernetesVersionUnsupported` condition on every
-`RavelCluster` rather than failing silently -- see "Status" below. It fails
-open (raises nothing) when it cannot read the version at all, so an RBAC
-gap or a `/version` blip never produces a false warning.
+carries a `preStop` `SleepAction`, GA only since 1.32. Below that floor the
+apiserver does not reject the Pod: server-side apply runs without strict
+field validation, so it silently prunes the unrecognized `SleepAction`
+field and the Pod comes up with no error and no preStop sleep at all. That
+is invisible in isolation -- the container starts and looks healthy -- but
+it means every rolling update can drop in-flight ingest for that pod across
+the endpoint-propagation window, since nothing holds the container open
+while its endpoint is withdrawn. The operator reads the cluster's version
+once at startup (via the `/version` grant above) so this has somewhere to
+surface: on a cluster below the floor it raises a
+`KubernetesVersionUnsupported` condition on every `RavelCluster` rather
+than leaving the drop silent -- see "Status" below. It fails open (raises
+nothing) when it cannot read the version at all, so an RBAC gap or a
+`/version` blip never produces a false warning. The version is read once at
+process startup, not per reconcile, so a control-plane upgrade across the
+floor does not clear the condition on its own -- it clears only once the
+operator pod itself restarts and re-reads `/version`.
 
 ## `RavelCluster` reference
 
