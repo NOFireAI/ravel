@@ -326,15 +326,11 @@ minio_up() {
 
   # Start every scenario on an empty store. The compose file bind-mounts
   # ../../minio-data, so `docker compose down` leaves the objects on the host
-  # and the next scenario, or a re-run of this one, inherits them. That is not
-  # only untidy: `discover_tenants` lists every tenant under `t/` and ignores
-  # --tenant-token, and `ravel_maintain_units_owned` is one store-wide gauge,
-  # so a leftover tenant inflates the universe the takeover oracles count
-  # against while their expected value stays at one scenario's worth. Those
-  # oracles compare with >=, so the inflation makes them pass without a
-  # takeover. Emptying the bucket is the fix that holds for both, and it is
-  # done through mc rather than rm because the container writes the host
-  # directory as root. RAVEL_S3_BUCKET defaults to a chaos-only bucket.
+  # and the next scenario, or a re-run of this one, inherits them. Why that
+  # breaks the takeover oracles rather than merely being untidy: see
+  # `assert_single_tenant_universe` below. Emptied through mc rather than rm
+  # because the container writes the host directory as root. RAVEL_S3_BUCKET
+  # defaults to a chaos-only bucket.
   log "emptying bucket ${RAVEL_S3_BUCKET} so this scenario starts clean"
   docker run --rm --network host \
     -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
@@ -353,11 +349,21 @@ minio_up() {
 # Count the tenants the maintain tier would discover, and record a pinned
 # oracle failure when it is not exactly one.
 #
-# The takeover oracles compare a store-wide gauge against one scenario's
-# worth of units with >=, so they discriminate a real takeover only while the
-# store holds this scenario's tenant alone. `minio_up` empties the bucket to
-# make that true; this asserts it rather than assuming it, because the
-# violated-precondition case is a PASS, not an error, and would go unnoticed.
+# NORMATIVE: this is the one place the single-tenant precondition is explained.
+# Other sites point here rather than restating it.
+#
+# `discover_tenants` (crates/ravel-maintain/src/discover.rs) lists every tenant
+# under `t/` and ignores --tenant-token, and `ravel_maintain_units_owned` is a
+# single store-wide gauge. The takeover oracles compare that gauge against one
+# scenario's worth of units with >=. So a tenant left in the store from another
+# scenario inflates the reading while the expected value stays put, and the
+# survivor clears the threshold owning only its pre-kill share: the oracle
+# passes with no takeover having happened.
+#
+# Two things keep that from happening, and they are not interchangeable.
+# `minio_up` empties the bucket so the precondition holds. This function
+# asserts that it did, because the violated-precondition case is a PASS rather
+# than an error and nothing else would mark it.
 assert_single_tenant_universe() {
   local listing count
   listing="$(docker run --rm --network host \
