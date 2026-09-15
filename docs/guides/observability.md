@@ -977,7 +977,11 @@ whose duration approaches twice the reconciliation interval ages every sibling
 snapshot past the staleness window before it is read, at which point each
 process reads the fleet as empty and starts enforcing the whole tenant cap
 alone. Alert on the duration against your configured interval, and on
-`siblings_observed` falling to zero while replicas are up. Growth in
+`siblings_observed` falling to zero while replicas are up. Scope both alerts
+to `mode="all"` and `mode="gateway"`: the four series render on every
+replica, but only those two modes run the reconciliation loop, so a `query`
+or `maintain` replica reports `siblings_observed` as zero for its whole
+life. Growth in
 `stale_keys_skipped` while `siblings_observed` is flat means the control-plane
 prefix is filling with dead processes' keys; if
 `rate(ravel_admission_reconciliation_keys_reaped_total[1h])` is at zero
