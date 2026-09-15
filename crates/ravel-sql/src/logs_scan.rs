@@ -1112,6 +1112,21 @@ pub struct LogsScanExec {
     /// metric registration) so a production query pays nothing for a
     /// timeline only the bench reporter reads.
     segment_timing: bool,
+    /// The row count DataFusion's `LimitPushdown` optimizer rule pushed into
+    /// this scan (issue #362), installed with [`Self::with_fetch`]. `None`
+    /// (the default) reproduces the pre-#362 scan exactly: every segment this
+    /// partition owns is opened.
+    ///
+    /// Set, it bounds only what THIS PARTITION may stop early at: once a
+    /// partition's own emitted row count reaches `fetch`, [`LogScanStream`]
+    /// stops opening further owned segments (never mid-segment, and never
+    /// before `fetch` rows of its own are out). The real cross-partition
+    /// limit is still enforced above this node -- by the `CoalescePartitionsExec`
+    /// or `GlobalLimitExec` that absorbed the pushdown -- so a partition
+    /// emitting more than `fetch` rows (its last batch overshooting) is
+    /// harmless; emitting fewer than `fetch` while more of its own owned data
+    /// remains would silently under-answer the query and must never happen.
+    fetch: Option<usize>,
     /// The resolved full `logs` schema this scan projects, i.e.
     /// `logs_schema_with_declared(&declared)`. Kept so [`Self::reproject`] can
     /// build a narrower sibling scan over the same table without re-deriving
@@ -1487,6 +1502,7 @@ impl LogsScanExec {
         .map(|scan| {
             scan.with_column_stats(self.column_stats.clone())
                 .with_segment_timing(self.segment_timing)
+                .with_fetch_pushed(self.fetch)
         })
     }
 
@@ -1527,6 +1543,7 @@ impl LogsScanExec {
         .map(|scan| {
             scan.with_column_stats(self.column_stats.clone())
                 .with_segment_timing(self.segment_timing)
+                .with_fetch_pushed(self.fetch)
         })
     }
 
@@ -1551,6 +1568,18 @@ impl LogsScanExec {
     /// reproduces the pre-gate scan exactly.
     pub(crate) fn with_segment_timing(mut self, segment_timing: bool) -> Self {
         self.segment_timing = segment_timing;
+        self
+    }
+
+    /// Carry a pushed `fetch` (issue #362) across a rebuild that otherwise
+    /// starts from `fetch: None` ([`Self::build`]'s default), the same way
+    /// [`Self::with_column_stats`] and [`Self::with_segment_timing`] carry
+    /// their fields across [`Self::reproject`] and [`Self::reproject_attr_keys`].
+    /// Not `pub(crate)`: the only external installer of a NEW fetch value is
+    /// the `ExecutionPlan::with_fetch` trait method, which builds the whole
+    /// struct itself rather than starting from [`Self::build`].
+    fn with_fetch_pushed(mut self, fetch: Option<usize>) -> Self {
+        self.fetch = fetch;
         self
     }
 
@@ -1683,6 +1712,7 @@ impl LogsScanExec {
             attr_keys: Arc::new(attr_keys),
             column_stats: None,
             segment_timing: false,
+            fetch: None,
             full_schema: full,
             schema,
             row_refs,
@@ -2449,6 +2479,58 @@ impl ExecutionPlan for LogsScanExec {
         Some(self.metrics.clone_inner())
     }
 
+    /// The row count DataFusion's `LimitPushdown` optimizer rule has pushed
+    /// into this scan (issue #362), if any. See [`Self::fetch`] the field's
+    /// doc comment for what this scan may act on it for.
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
+    /// Install a pushed `fetch` (issue #362), returning a sibling scan that is
+    /// otherwise identical to this one.
+    ///
+    /// An exhaustive struct literal rather than a call through [`Self::build`]:
+    /// every field of [`LogsScanExec`] is named here explicitly, so a field
+    /// added to the struct later without a matching line here is a compile
+    /// error, not a silently-dropped one (the exact bug class the
+    /// `segment_timing` fix on this file addressed for [`Self::reproject`]).
+    /// `counts` and `metrics` are shared with `self` via `Arc`/`Arc<Mutex<_>>`
+    /// clone rather than rebuilt, matching upstream's own `with_fetch` on leaf
+    /// nodes like `StreamingTableExec`: the optimizer replaces `self` with the
+    /// returned plan in the tree, so `self` is dropped and never executed, and
+    /// nothing is ever double-counted or double-planned.
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(LogsScanExec {
+            tenant_hash: self.tenant_hash,
+            fetcher: self.fetcher.clone(),
+            segments: Arc::clone(&self.segments),
+            target_partitions: self.target_partitions,
+            counts: Arc::clone(&self.counts),
+            ts_min: self.ts_min,
+            ts_max: self.ts_max,
+            content: Arc::clone(&self.content),
+            prune: Arc::clone(&self.prune),
+            erasure: Arc::clone(&self.erasure),
+            projection: Arc::clone(&self.projection),
+            columns: self.columns.clone(),
+            projected_fraction: self.projected_fraction,
+            declared: Arc::clone(&self.declared),
+            attr_keys: Arc::clone(&self.attr_keys),
+            column_stats: self.column_stats.clone(),
+            segment_timing: self.segment_timing,
+            fetch: limit,
+            full_schema: Arc::clone(&self.full_schema),
+            schema: Arc::clone(&self.schema),
+            row_refs: self.row_refs,
+            columnar_eligible: self.columnar_eligible,
+            stripe_blocks: self.stripe_blocks,
+            properties: Arc::clone(&self.properties),
+            phase_accounting: self.phase_accounting.clone(),
+            metrics: self.metrics.clone(),
+            created_at: self.created_at,
+        }))
+    }
+
     /// Report the exact row count and `ts` span straight from the catalog's
     /// committed row counts and segment bounds, for any query where nothing
     /// removes a row the committed counts still include: no content/prune
@@ -2670,6 +2752,8 @@ impl ExecutionPlan for LogsScanExec {
             current_whole_object: None,
             seg_columnar_blocks: 0,
             state,
+            fetch: self.fetch,
+            rows_emitted: 0,
         }))
     }
 }
@@ -3478,6 +3562,20 @@ struct LogScanStream {
     /// emitted twice. Reset when a new segment starts draining.
     seg_columnar_blocks: usize,
     state: LogScanState,
+    /// The `fetch` pushed into the exec (issue #362), carried unchanged from
+    /// [`LogsScanExec::fetch`]. `None` means this stream drains every segment
+    /// it owns, exactly the pre-#362 behavior.
+    fetch: Option<usize>,
+    /// Rows this partition has emitted so far, summed at every batch actually
+    /// handed downstream (post content-filter and post `attrs_raw` erasure --
+    /// whatever a caller of this stream actually receives). Consulted only at
+    /// [`LogScanState::NextSegment`], and only to decide whether to open
+    /// another owned segment; it never truncates a batch or interrupts a
+    /// segment already being drained, so a partition can finish with more
+    /// than `fetch` rows of its own (the cross-partition limit is still
+    /// enforced above this node) but never with fewer while more of its own
+    /// owned work remained.
+    rows_emitted: usize,
     /// The exec's metric set, kept so per-segment timeline points can be
     /// published as labelled metrics (`segment=<ordinal>`) alongside the
     /// per-partition totals in [`Self::blocks`].
@@ -3710,7 +3808,10 @@ impl LogScanStream {
                 };
                 this.blocks.emit_elapsed.add_elapsed(emit_started);
                 return match emitted {
-                    Ok(batch) => Poll::Ready(Some(Ok(batch))),
+                    Ok(batch) => {
+                        this.rows_emitted += batch.num_rows();
+                        Poll::Ready(Some(Ok(batch)))
+                    }
                     Err(e) => this.fail(e),
                 };
             }
@@ -3755,6 +3856,20 @@ impl LogScanStream {
                     Poll::Ready(Err(e)) => return this.fail(e),
                     Poll::Pending => return Poll::Pending,
                 },
+                LogScanState::NextSegment
+                    if this.fetch.is_some_and(|fetch| this.rows_emitted >= fetch) =>
+                {
+                    // This partition's own emitted rows already meet the
+                    // pushed fetch (issue #362): stop opening further owned
+                    // segments. Never entered mid-segment (a segment already
+                    // in `Opening`/`Columnar`/`Rows` state drains to its own
+                    // completion first, so this partition never emits fewer
+                    // than `fetch` rows while more of its own owned data
+                    // remains), and never a truncation of what is already
+                    // buffered (`has_pending` above always runs first).
+                    this.work.clear();
+                    this.state = LogScanState::Done;
+                }
                 LogScanState::NextSegment => match this.work.pop_front() {
                     Some(OwnedSeg {
                         seg,
