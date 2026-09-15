@@ -97,9 +97,34 @@ candidates="$(jq -r --argjson cutoff "${cutoff_epoch}" '
     ) ]
   | .[] | "\(.number)\t\(.state)\t\(.title)"' <<<"${prs_json}")"
 
-# An existing pull request that names the issue. Matched on the issue
-# reference with a boundary on both sides, so #12 does not match #123.
-addressing="$(jq -r --arg needle "#${issue}" --argjson cutoff "${cutoff_epoch}" '
+# A pull request that CLOSES the issue, not one that merely cites it.
+#
+# This repository's commit convention makes the distinction load-bearing:
+# `Fixes: #N` resolves the issue, `Refs: #N` says related and explicitly does
+# not close it. Treating both as "already addressed" refuses genuine first
+# dispatches -- measured on issue #1790, a coordination issue that two pull
+# requests cite with `Refs:` and neither resolves; the guard refused it and
+# pushed the operator toward DISPATCH_SKIP_DUPLICATE_CHECK=1, which trains
+# exactly the reflex that flag exists to avoid. A guard worked around by
+# habit has stopped being a guard.
+#
+# The keyword list is GitHub's own closing set, so what refuses here is what
+# GitHub would actually close on merge.
+closing_kw='([Cc]los(e[sd]?|ing)|[Ff]ix(e[sd]|ing)?|[Rr]esolv(e[sd]?|ing))'
+addressing="$(jq -r --arg needle "#${issue}" --arg kw "${closing_kw}" \
+  --argjson cutoff "${cutoff_epoch}" '
+  [ .[] | select(
+      .state == "OPEN"
+      or ((.mergedAt // .closedAt // "") != ""
+          and ((.mergedAt // .closedAt) | fromdateiso8601) >= $cutoff)
+    )
+    | select(((.body // "") + " " + (.title // ""))
+        | test($kw + "[:]?[[:space:]]+" + $needle + "([^0-9]|$)"))
+  ] | .[] | "\(.number)\t\(.state)\t\(.title)"' <<<"${prs_json}")"
+
+# Cited but not closed. Worth knowing, never a refusal.
+mentioning="$(jq -r --arg needle "#${issue}" --arg kw "${closing_kw}" \
+  --argjson cutoff "${cutoff_epoch}" '
   [ .[] | select(
       .state == "OPEN"
       or ((.mergedAt // .closedAt // "") != ""
@@ -107,6 +132,8 @@ addressing="$(jq -r --arg needle "#${issue}" --argjson cutoff "${cutoff_epoch}" 
     )
     | select(((.body // "") + " " + (.title // ""))
         | test("(^|[^0-9A-Za-z])" + $needle + "([^0-9]|$)"))
+    | select((((.body // "") + " " + (.title // ""))
+        | test($kw + "[:]?[[:space:]]+" + $needle + "([^0-9]|$)")) | not)
   ] | .[] | "\(.number)\t\(.state)\t\(.title)"' <<<"${prs_json}")"
 
 if [[ -n "${addressing}" ]]; then
@@ -119,8 +146,17 @@ if [[ -n "${addressing}" ]]; then
   exit 65
 fi
 
+if [[ -n "${mentioning}" ]]; then
+  echo "NOTE  issue #${issue} is cited by pull request(s) that do not close it:"
+  while IFS=$'\t' read -r num state title; do
+    [[ -z "${num}" ]] && continue
+    echo "      #${num} [${state}] ${title}"
+  done <<<"${mentioning}"
+  echo "      Not a blocker. Read them before dispatching so the work is not redone."
+fi
+
 if ((${#paths[@]} == 0)); then
-  echo "OK    no pull request references issue #${issue}; no paths given, so no overlap check ran"
+  echo "OK    no pull request closes issue #${issue}; no paths given, so no overlap check ran"
   exit 0
 fi
 
