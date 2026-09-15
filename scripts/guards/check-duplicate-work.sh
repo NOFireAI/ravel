@@ -2,8 +2,15 @@
 # check-duplicate-work.sh <pr-number> [remote]
 # Report open pull requests whose work overlaps <pr-number>'s, before you start
 # on it. Exit 0 when nothing overlaps; exit 1 when something does; exit 2 when
-# the check could not run (bad argument, no such pull request, gh or git
-# failed).
+# the check cannot stand behind a clean answer. Exit 2 covers two different
+# situations and a caller should treat both the same way:
+#
+#   - the check could not run at all (bad argument, no such pull request, gh or
+#     git failed), or
+#   - it ran and compared most pull requests but could not read at least one,
+#     so "nothing overlaps" would be a claim about pull requests it never saw.
+#
+# Only exit 0 means "compared everything open and found nothing".
 #
 # Several Claude sessions work this repository at once through one shared `gh`
 # account, so a pull request's author never says which session owns it, and a
