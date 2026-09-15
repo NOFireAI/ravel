@@ -1829,12 +1829,17 @@ impl QueryEngine {
             // ADR-0103 eligibility gate, evaluated ONCE per query over the whole
             // resolved snapshot's segment set and the generation history THIS
             // resolve produced (never a per-matcher-set subset, never a
-            // separately-read history). Passing `self.federation.as_deref()`
+            // separately-read history). Passing a real federation reference
             // (not a hardcoded `None`) is load-bearing: `None` here would make
             // every federated query look eligible, the exact wrong-answer bug
-            // decision 1(a) exists to prevent.
+            // decision 1(a) exists to prevent. The reference is filtered by the
+            // remotes THIS tenant reaches, because that is the set `fetch`
+            // dispatches to: a tenant with no mapped remote receives no remote
+            // runs, so no local partial of its can be incomplete for one.
             let snapshot_eligible = crate::distrib::is_pushdown_eligible(
-                self.federation.as_deref(),
+                self.federation
+                    .as_deref()
+                    .filter(|f| f.has_remotes_for(tenant_hash)),
                 &snapshot.segments,
                 &generations,
             );
@@ -7096,6 +7101,145 @@ mod prefetch_tests {
         );
 
         handle.abort();
+    }
+
+    /// A healthy remote that contributes nothing and counts its dispatches, so
+    /// a test can assert which tenant actually fanned out.
+    #[derive(Default)]
+    struct CountingEmptyFetcher {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::distrib::client::SliceFetcher for CountingEmptyFetcher {
+        async fn fetch(
+            &self,
+            _request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
+        {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                stats: FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: ravel_proto::queryfrag::v1::status::Code::Ok,
+                status_message: String::new(),
+            })
+        }
+    }
+
+    /// ADR-0103 decision 1(a) is keyed on the remotes THIS tenant reaches, not
+    /// on a federation context existing in the process. Both arms run the same
+    /// eligible `count_over_time` query on the same fixture, and differ only in
+    /// which local tenant the one remote is keyed to.
+    ///
+    /// The unmapped arm is what ADR-1295 makes reachable: a multi-tenant
+    /// coordinator with one keyed remote leaves every other local tenant
+    /// federating nothing, and declaring those tenants ineligible costs them
+    /// pushdown for a remote they never dispatch to. The mapped arm is the
+    /// control, and it is what keeps this from passing by simply disabling the
+    /// federation exclusion. The dispatch count is asserted in both arms, so
+    /// "reaches the remote" is proven rather than assumed.
+    #[tokio::test]
+    async fn pushdown_eligibility_follows_this_tenant_s_remotes() {
+        /// Returns (pushdown taken, remote dispatch count).
+        async fn run(remote_tenant: TenantHash, querying: TenantHash) -> (bool, usize) {
+            let store = Arc::new(MemoryStore::new());
+            publish_metric_segment(
+                &store,
+                querying,
+                1,
+                "m",
+                vec![
+                    Sample {
+                        ts_ns: BASE_NS - NS_PER_MIN,
+                        value: 1.0,
+                    },
+                    Sample {
+                        ts_ns: BASE_NS - 2 * NS_PER_MIN,
+                        value: 2.0,
+                    },
+                ],
+                u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket"),
+                BASE_NS,
+            )
+            .await;
+            let segments = resolve_metric_segments(Arc::clone(&store), querying, BASE_NS).await;
+            let (worker, handle) = spawn_metric_worker(Arc::clone(&store), segments).await;
+            let distributed = Arc::new(crate::distrib::Distributed::new(
+                Arc::new(worker),
+                zero_thresholds(),
+            ));
+            let fetcher = Arc::new(CountingEmptyFetcher::default());
+            let federation = Arc::new(crate::distrib::Federation::new(vec![
+                crate::distrib::RemoteCluster {
+                    name: "eu-west".to_string(),
+                    fetcher: Arc::clone(&fetcher) as Arc<dyn crate::distrib::client::SliceFetcher>,
+                    tenant: Some(remote_tenant),
+                    skip_unavailable: false,
+                    soft_timeout: Duration::from_secs(5),
+                },
+            ]));
+            let eng = engine(Arc::clone(&store))
+                .with_distributed(distributed)
+                .with_federation(federation);
+
+            let plans = plan_selectors("count_over_time(m[5m])", BASE_MS, BASE_MS).expect("plans");
+            let (source, _stats) = eng
+                .prefetch(
+                    querying,
+                    &plans,
+                    &EvalWindow::Instant { t_ns: BASE_NS },
+                    &[],
+                    BASE_NS,
+                )
+                .await
+                .expect("prefetch succeeds");
+            let got = Evaluator::new()
+                .instant(&source, "count_over_time(m[5m])", BASE_MS)
+                .expect("evaluate");
+            assert_eq!(got.len(), 1, "one series");
+            assert_eq!(
+                got[0].value, 2.0,
+                "both in-window samples counted either way"
+            );
+            handle.abort();
+            // The pushdown branch returns the partial INSTEAD OF raw runs, so
+            // an empty raw series list is the observable signal that the gate
+            // admitted this query.
+            (
+                source.series.is_empty(),
+                fetcher.calls.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+
+        let acme = TenantId::new("acme").hash();
+        let beta = TenantId::new("beta").hash();
+
+        let (unmapped_pushdown, unmapped_calls) = run(beta, acme).await;
+        assert_eq!(
+            unmapped_calls, 0,
+            "acme is not the remote's local tenant, so nothing is dispatched to it"
+        );
+        assert!(
+            unmapped_pushdown,
+            "acme reaches no remote, so its local partial cannot be incomplete for one"
+        );
+
+        let (mapped_pushdown, mapped_calls) = run(beta, beta).await;
+        assert_eq!(
+            mapped_calls, 1,
+            "beta is the remote's local tenant, so the fan-out really happens"
+        );
+        assert!(
+            !mapped_pushdown,
+            "beta reaches the remote, so decision 1(a) still excludes it"
+        );
     }
 
     /// ADR-0103 (epic #64) differential: the pushed-down result is identical to
