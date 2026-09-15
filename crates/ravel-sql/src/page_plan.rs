@@ -249,7 +249,7 @@
 use std::ops::ControlFlow;
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::sql::parser::{DFParserBuilder, Statement as DFStatement};
+use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
     Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByKind, Query, Select,
     SetExpr, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
@@ -728,12 +728,14 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
 /// [`validate`] has already accepted the text, and it accepts exactly one
 /// statement and only a `Statement::Query`.
 fn parse_query(sql: &str) -> Result<Query, PagePlanError> {
-    // Same pinned recursion limit `crate::validate` uses; see the constant.
-    let statements = DFParserBuilder::new(sql)
-        .with_recursion_limit(crate::validate::PARSER_RECURSION_LIMIT)
-        .build()
-        .and_then(|mut parser| parser.parse_statements())
-        .map_err(|e| ValidationError::Parse(e.to_string()))?;
+    // The complexity guard runs here as part of the parse rather than on the
+    // claim that `validate` already ran over this text: the rewrites below walk
+    // the tree once per level, and the guard being somebody else's job is how
+    // it came to be missing from a parse site in the first place (issue #1760).
+    // The scan stops one token past the bound, so text that already passed
+    // `validate` pays a bounded rescan and nothing else.
+    let statements = crate::complexity_guard::parse_guarded(sql)
+        .map_err(|e| PagePlanError::Invalid(ValidationError::from(e)))?;
     match statements.front() {
         Some(DFStatement::Statement(inner)) => match inner.as_ref() {
             Statement::Query(query) => Ok(query.as_ref().clone()),
@@ -2161,6 +2163,36 @@ mod tests {
     /// bytes, which is a canonical series id's width (ADR-0005).
     const SERIES_ID: [u8; 16] = [0xab; 16];
 
+    /// The page plan's own parse refuses an over-bound statement, rather than
+    /// resting on `validate` having run over the same text first (issue #1760).
+    /// `plan_page` does call `validate`, but `parse_query` is reachable without
+    /// it, and the rewrites below walk the tree it returns once per level.
+    ///
+    /// The chain runs at [`MAX_STATEMENT_COMPLEXITY`] + 1 rather than at a
+    /// depth that would actually overflow: the claim is that the bound is
+    /// enforced on this entry point at all, and a test that overflowed the
+    /// stack to prove it would abort the whole test binary.
+    ///
+    /// Flip to watch it fail: replace the `complexity_guard::parse_guarded`
+    /// call in `parse_query` with a bare parser build. The over-bound statement
+    /// then parses and the `expect_err` below panics.
+    #[test]
+    fn the_page_plan_parse_refuses_an_over_complex_statement_itself() {
+        let chain = "+1".repeat(crate::complexity_guard::MAX_STATEMENT_COMPLEXITY);
+        let sql = format!("SELECT 1{chain} FROM samples ORDER BY ts");
+        assert!(
+            crate::complexity_guard::structural_count(&sql)
+                > crate::complexity_guard::MAX_STATEMENT_COMPLEXITY,
+            "the probe must exceed the bound to be testing anything"
+        );
+
+        let err = parse_query(&sql).expect_err("an over-bound statement is refused");
+        assert!(
+            matches!(err, PagePlanError::Invalid(ValidationError::TooComplex(_))),
+            "expected TooComplex, got {err:?}"
+        );
+    }
+
     /// Its hex rendering, spelled out so the assertions below pin the exact
     /// literal text rather than recomputing it the way the code under test
     /// does.
@@ -3208,9 +3240,14 @@ mod tests {
         use datafusion::sql::sqlparser::dialect::{
             BigQueryDialect, Dialect, MySqlDialect, RedshiftSqlDialect,
         };
+        // guarded-parse-allow: this case exists to parse fixed test text
+        // through dialects the production front end never uses, which is the
+        // only way to build the shapes it classifies.
         use datafusion::sql::sqlparser::parser::Parser;
 
         fn query_of(dialect: &dyn Dialect, sql: &str) -> Query {
+            // guarded-parse-allow: fixed test text through a non-production
+            // dialect, as above.
             let statements = Parser::parse_sql(dialect, sql).expect("parsed");
             match statements.first() {
                 Some(Statement::Query(query)) => query.as_ref().clone(),

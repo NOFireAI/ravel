@@ -168,6 +168,15 @@ echo "==> scripts/guards/check-test-hygiene.sh"
 echo "==> scripts/check-injected-clock-helpers.sh"
 "$(dirname "$0")/check-injected-clock-helpers.sh"
 
+# Every parse of caller text in ravel-sql runs the pre-parse complexity guard,
+# because the walks over the parsed tree abort the process on a statement the
+# parser's own recursion limit does not bound (issue #1680). That was a
+# convention until issue #1760 made it a property: one guarded parse, and this
+# check refuses any other. A source scan, no build, same placement reasoning as
+# the two above.
+echo "==> scripts/guards/check-guarded-sql-parse.sh"
+"$(dirname "$0")/guards/check-guarded-sql-parse.sh"
+
 # The flag-doc overclaim guard defined above, in the ordinary gate run: a source
 # scan, no build, so it fails before the expensive lanes.
 echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"
