@@ -487,11 +487,24 @@ pub struct FetchedHistogramSeries {
 }
 
 /// Page-kind counters accumulated over one `fetch_soa` call, for downstream
-/// consumers to read. Currently tracks VAL_RAW_F64 pages only.
+/// consumers to read. Tracks VAL_RAW_F64 pages plus the histogram-kind series
+/// a scalar-only fetch dropped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FetchStats {
     pub raw_f64_pages: u64,
     pub raw_f64_bytes: u64,
+    /// Histogram-kind series this segment's catalog matched and a scalar-only
+    /// fetch ([`SegmentFetcher::fetch_soa_phase_accounted`] and its siblings)
+    /// did not return, because they carry no scalar float value. Nonzero means
+    /// the returned scalar series are not the whole of what the matchers
+    /// selected, which is what lets a caller with no histogram model of its own
+    /// (ravel-sql's `samples` table) say so instead of answering short in
+    /// silence (issue #1738).
+    ///
+    /// Counted per segment, so a series present in several segments counts once
+    /// per segment: this is a presence signal, not a distinct-series count.
+    /// Zero from the combined scalar-and-histogram fetch, which drops nothing.
+    pub histogram_series_skipped: u64,
 }
 
 impl FetchStats {
@@ -1801,7 +1814,11 @@ impl SegmentFetcher {
     ///
     /// Histogram-valued series are skipped here: a scalar SoA cannot hold
     /// them. They are fetched by the mirror-image
-    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) instead.
+    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) instead. How many
+    /// were skipped is reported on [`FetchStats::histogram_series_skipped`],
+    /// independently of `count_stats` (which gates the page-kind counters
+    /// only): the skip is a completeness fact about the result, not an
+    /// optional statistic.
     async fn fetch_runs(
         &self,
         tenant_hash: TenantHash,
@@ -1830,8 +1847,19 @@ impl SegmentFetcher {
             .iter()
             .filter(|e| e.entry.value_kind == ValueKind::Scalar)
             .collect();
+        // The catalog is already decoded and its value kinds already read, so
+        // the count of what this filter drops is free here and nowhere else:
+        // a caller that only ever sees the scalar result cannot reconstruct it
+        // (`FetchStats::histogram_series_skipped`).
+        let skipped = (selected.len() - scalar.len()) as u64;
         if scalar.is_empty() {
-            return Ok((Vec::new(), FetchStats::default()));
+            return Ok((
+                Vec::new(),
+                FetchStats {
+                    histogram_series_skipped: skipped,
+                    ..FetchStats::default()
+                },
+            ));
         }
         let planned = self
             .fetch_scalar_pages(
@@ -1844,7 +1872,7 @@ impl SegmentFetcher {
                 accounting.scan(),
             )
             .await?;
-        self.build_scalar_decodes(
+        let (runs, mut stats) = self.build_scalar_decodes(
             key,
             seg_ref,
             &scalar,
@@ -1852,7 +1880,9 @@ impl SegmentFetcher {
             &regions,
             count_stats,
             accounting.scan(),
-        )
+        )?;
+        stats.histogram_series_skipped = skipped;
+        Ok((runs, stats))
     }
 
     /// Decodes the already-fetched scalar page bytes of `scalar` into one

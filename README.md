@@ -125,8 +125,8 @@ a missing table and an empty vector.
 | Prometheus Remote Write 1.0 and 2.0 ingest | metrics | `none` | yes |
 | OTAP ingest, gRPC | metrics | `otap` | yes |
 | PromQL HTTP API | metrics, logs as `ravel_log_lines` and `ravel_log_bytes` | `none` | yes |
-| SQL over `POST /api/v1/sql` | metrics as `samples`, logs as `logs`, traces as `spans`, alert history as `alerts`, audit records as `audit` | `sql` | yes |
-| Flight SQL | the same five tables | `flight-sql` | yes |
+| SQL over `POST /api/v1/sql` | metrics as `samples` (scalar samples only, never native histograms), logs as `logs`, traces as `spans`, alert history as `alerts`, audit records as `audit` | `sql` | yes |
+| Flight SQL | the same five tables, with the same `samples` limit | `flight-sql` | yes |
 
 <!-- END SUPPORT MATRIX -->
 
@@ -144,6 +144,13 @@ Exactly five SQL tables are registered: `samples`, `logs`, `spans`, `alerts`,
 and `audit`. SQL is the only way to query traces, alerts, and audit records.
 Logs are also queryable over PromQL, as `ravel_log_lines` and
 `ravel_log_bytes`.
+
+The `samples` table has a `Float64` `value` column and nothing that can hold a
+native histogram, so a histogram sample is not a row there and `SELECT count(*)
+FROM samples` counts scalar samples only. A JSON response whose query met
+excluded histogram data carries a top-level `warnings` array saying so; query
+native histograms over PromQL. See the
+[query guide](docs/guides/query.md#sql-over-samples-logs-and-spans).
 
 Also live:
 

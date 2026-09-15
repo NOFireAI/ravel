@@ -815,6 +815,12 @@ async fn samples_table_documents_histogram_exclusion() {
         "the generated conformance doc must state that counts and aggregations over the samples \
          table undercount on tenants that ingest histograms (#581)"
     );
+    assert!(
+        flat.contains("The undercount is not silent")
+            && flat.contains("top-level `warnings` array"),
+        "the generated conformance doc must state that an affected statement returns a warnings \
+         array, not a bare short answer (#1738)"
+    );
 }
 
 /// The live example SQL each construct runs, checked against a committed
