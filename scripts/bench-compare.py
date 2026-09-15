@@ -113,7 +113,10 @@ def _parse_knobs(pairs):
 def _knob_drift(base_doc, cur_doc):
     """Report how the two runs' sampling knobs relate.
 
-    Returns (state, lines) where state is "match", "differ", or "unknown".
+    Returns (state, side, lines). state is "match", "differ", or "unknown";
+    side names the file or files whose knobs are missing and is None unless
+    state is "unknown".
+
     A knob such as RAVEL_BENCH_MAX_SERIES is part of the bench id, so a
     mismatch renames an arm: it reads as missing on one side and as an ignored
     extra on the other, and leaves the comparison without failing anything.
@@ -127,14 +130,14 @@ def _knob_drift(base_doc, cur_doc):
         side = "baseline file" if not base else "current file"
         if not base and not cur:
             side = "baseline and current files"
-        return f"unknown:{side}", [
+        return "unknown", side, [
             f"- sampling knobs: NOT RECORDED on the {side}, so this "
             "comparison cannot be checked for sampling drift. An enforcing run "
             "refuses this pair: re-record the baseline through "
             "`bench-tier-b.sh record`, which stamps them."
         ]
     if base == cur:
-        return "match", []
+        return "match", None, []
     differing = sorted(set(base) | set(cur))
     lines = [
         "- sampling knobs: MISMATCH between the baseline and this run. A knob "
@@ -146,7 +149,7 @@ def _knob_drift(base_doc, cur_doc):
         c = cur.get(key, "(absent)")
         if b != c:
             lines.append(f"  - `{key}`: baseline `{b}`, current `{c}`")
-    return "differ", lines
+    return "differ", None, lines
 
 
 def _pct(base, cur):
@@ -204,7 +207,7 @@ def compare(args):
     lines.append(f"- baseline: `{base_label}`")
     lines.append(f"- current: `{cur_label}`")
     lines.append(f"- threshold: +/-{threshold:g}% on median")
-    knob_state, knob_lines = _knob_drift(base_doc, cur_doc)
+    knob_state, knob_side, knob_lines = _knob_drift(base_doc, cur_doc)
     lines.extend(knob_lines)
     lines.append("")
     lines.append("| benchmark | baseline | current | change | status |")
@@ -230,9 +233,8 @@ def compare(args):
         lines.append(f"**{len(missing)} baseline benchmark(s) missing from the run.**")
     elif knob_state == "differ":
         lines.append("**The sampling knobs differ, so the two runs are not comparable.**")
-    elif knob_state.startswith("unknown"):
-        side = knob_state.split(":", 1)[1]
-        lines.append(f"**The sampling knobs are not recorded on the {side}, so the two "
+    elif knob_state == "unknown":
+        lines.append(f"**The sampling knobs are not recorded on the {knob_side}, so the two "
                      "runs cannot be shown to be comparable.**")
     else:
         lines.append(f"**No regression past +{threshold:g}%.**")
