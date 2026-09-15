@@ -47,6 +47,21 @@
 //! The response encoding follows `Accept`:
 //! `application/vnd.apache.arrow.stream` yields an Arrow IPC stream, which is
 //! bit-exact for every float; anything else yields JSON.
+//!
+//! # Warnings
+//!
+//! A JSON success body carries a top-level `warnings` array of strings when
+//! the statement's answer is non-fatally incomplete, omitted entirely when
+//! there is nothing to say. It is the same field, with the same omit-when-empty
+//! rule, that the PromQL surface renders (`ravel_query::http::json`), so a
+//! client that already reads one reads the other. The strings come from
+//! [`ravel_sql::SqlOutcome::warnings`]: the semantic decision is ravel-sql's,
+//! this module only renders it.
+//!
+//! Today's one warning is the `samples` table's native-histogram exclusion
+//! (issue #1738). An Arrow-negotiated response carries no warnings, for the
+//! same reason it carries no `stats`: an IPC stream is a bare columnar payload
+//! with no envelope to put them in.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -332,11 +347,18 @@ fn encode(
         .output
         .to_json()
         .map_err(|err| ServiceError::from_sql(err, tenant_hash))?;
-    Ok((
-        StatusCode::OK,
-        axum::Json(json!({ "status": "success", "data": data, "stats": stats })),
-    )
-        .into_response())
+    let mut body = json!({ "status": "success", "data": data, "stats": stats });
+    // Omitted when empty, the way the PromQL envelope omits its own
+    // `warnings` (crates/ravel-query/src/http/json.rs): a client that does not
+    // read warnings sees the response it saw before, and a client that does
+    // never has to distinguish an empty array from no array.
+    let warnings = outcome.warnings();
+    if !warnings.is_empty()
+        && let serde_json::Value::Object(ref mut map) = body
+    {
+        map.insert("warnings".to_string(), json!(warnings));
+    }
+    Ok((StatusCode::OK, axum::Json(body)).into_response())
 }
 
 fn wants_arrow(headers: &HeaderMap) -> bool {

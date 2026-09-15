@@ -39,9 +39,18 @@ represent a native histogram. Native-histogram samples are excluded from the
 so it is never materialized as a row and no query can observe it. `SELECT
 count(*) FROM samples`, and every other count or aggregation over the table,
 therefore undercount on tenants that ingest histograms -- the histogram samples
-are silently absent, not present with a zero or null `value`. This is a
+are absent, not present with a zero or null `value`. This is a
 property of the table shape, not of any construct in the conformance table
 below, so it holds for every row that reads `samples`.
+
+The undercount is not silent. A statement whose scan matched histogram-kind
+series and excluded them returns its rows with a top-level `warnings` array
+saying so, in the same envelope field and with the same omit-when-empty rule
+the PromQL endpoints use. A tenant with no histogram data gets no warning, so
+the signal means something when it appears. Two surfaces cannot carry it: an
+Arrow IPC response is a bare columnar payload with no envelope, and a statement
+executed through the distributed scan lane counts nothing, because the scan
+that excluded the series ran on a worker whose counters do not cross back.
 
 ## The three states
 

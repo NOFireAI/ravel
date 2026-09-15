@@ -35,7 +35,10 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_query::http::StaticBearerTokenResolver;
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_segment::{
+    HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
+    SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3, SeriesValues,
+};
 use ravel_server::alerting::ALERT_SHARD;
 use ravel_server::sql::{ARROW_STREAM_MEDIA_TYPE, SqlState, router};
 use ravel_sql::{SqlConfig, SqlExecutor};
@@ -111,6 +114,127 @@ async fn publish_segment(
         },
     )
     .expect("write segment");
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: index as u64 + 1,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: 10 + index as i64,
+        ingest_hour_bucket: 0,
+    })
+    .expect("valid commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, written.bytes, PutOptions::default())
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+}
+
+/// One native-histogram value: two populated positive buckets, integer
+/// counts, no custom bucket boundaries (so `scale` is a normal exponential
+/// scale, not the `-53` custom-values sentinel).
+fn histogram_value() -> HistogramValue {
+    HistogramValue {
+        scale: 0,
+        zero_threshold: 0.0,
+        sum: Some(12.5),
+        custom_values: None,
+        positive_spans: vec![HistogramSpan {
+            offset: 0,
+            length: 2,
+        }],
+        negative_spans: Vec::new(),
+        counts: HistogramCounts::Int {
+            zero_count: 0,
+            count: 3,
+            positive: vec![2, 1],
+            negative: Vec::new(),
+        },
+        reset_hint: ResetHint::Unknown,
+    }
+}
+
+/// Publish one real segment carrying both a scalar series and a
+/// native-histogram series, the shape a tenant that exports OTLP exponential
+/// histograms beside scalar gauges actually stores. A series is scalar-kind or
+/// histogram-kind for its whole life in one object, so the two kinds are two
+/// series in one segment, never one series with both.
+async fn publish_mixed_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    index: usize,
+    scalar_metric: &str,
+    scalar_samples: &[(i64, f64)],
+    histogram_metric: &str,
+    histogram_ts: &[i64],
+) {
+    let tenant_hash = tenant.hash();
+    let scalar_labels = labels_for(scalar_metric);
+    let histogram_labels = labels_for(histogram_metric);
+    let series = vec![
+        SeriesInputV3 {
+            series_id: SeriesId::compute(tenant, scalar_metric, &scalar_labels)
+                .expect("scalar series id"),
+            labels: scalar_labels,
+            values: SeriesValues::Scalar(
+                scalar_samples
+                    .iter()
+                    .map(|(ts_ns, value)| Sample {
+                        ts_ns: *ts_ns,
+                        value: *value,
+                    })
+                    .collect(),
+            ),
+        },
+        SeriesInputV3 {
+            series_id: SeriesId::compute(tenant, histogram_metric, &histogram_labels)
+                .expect("histogram series id"),
+            labels: histogram_labels,
+            values: SeriesValues::Histogram(
+                histogram_ts
+                    .iter()
+                    .map(|ts_ns| HistogramSample {
+                        ts_ns: *ts_ns,
+                        value: histogram_value(),
+                    })
+                    .collect(),
+            ),
+        },
+    ];
+
+    let writer_id = Uuid::from_u128(3_000 + index as u128);
+    let identity = SegmentIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.to_string(),
+        writer_epoch: 1,
+        writer_seq: index as u64 + 1,
+    };
+    let written = SegmentWriter::write_histograms(
+        series,
+        identity,
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        },
+    )
+    .expect("write mixed segment");
 
     let rec = record::build(NewCommitRecord {
         tenant_hash,
@@ -609,6 +733,72 @@ async fn sql_response_carries_phase_and_io_shape_stats() {
     assert_eq!(
         value["stats"]["io"]["planClass"], "exhaustive_scan",
         "{value}"
+    );
+}
+
+/// The `samples` table has no column that can hold a native histogram, so a
+/// histogram sample never becomes a row and every count over the table is
+/// short by the whole histogram population. That undercount must be visible in
+/// the response rather than arriving as a bare HTTP 200: this asserts both
+/// halves, the `warnings` array naming the exclusion AND the count itself
+/// being the scalar-only figure the warning is about. The fixture tenant holds
+/// two scalar samples and three histogram samples; the answer is 2, not 5.
+#[tokio::test]
+async fn a_count_over_samples_warns_when_histogram_samples_were_excluded() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_mixed_segment(
+        store.as_ref(),
+        &tenant,
+        0,
+        "requests",
+        &[(100, 1.0), (200, 2.5)],
+        "latency",
+        &[100, 200, 300],
+    )
+    .await;
+    let app = build_router(store, tokens(&[("acme-token", "acme")]));
+
+    let (status, value) = post_json(&app, "acme-token", "SELECT count(*) FROM samples").await;
+
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(
+        rows[0][0],
+        serde_json::json!(2),
+        "the count is the scalar-only figure; the three histogram samples are \
+         not rows: {value}"
+    );
+    let warnings = value["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("response carries a warnings array: {value}"));
+    assert_eq!(warnings.len(), 1, "{value}");
+    let text = warnings[0].as_str().expect("warning is a string");
+    assert!(
+        text.contains("histogram"),
+        "the warning names the excluded population: {text}"
+    );
+    assert!(
+        text.contains("samples"),
+        "the warning names the table it is about: {text}"
+    );
+}
+
+/// The other half of the signal: a tenant with no histogram data gets no
+/// warning at all, and the key is absent rather than an empty array. A warning
+/// on every `samples` query would be constant, and a constant warning is one
+/// clients learn to ignore.
+#[tokio::test]
+async fn a_count_over_samples_does_not_warn_without_histogram_data() {
+    let app = one_tenant_app("m", &[(100, 1.0), (200, 2.5)]).await;
+
+    let (status, value) = post_json(&app, "acme-token", "SELECT count(*) FROM samples").await;
+
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["data"]["rows"][0][0], serde_json::json!(2), "{value}");
+    assert!(
+        value.get("warnings").is_none(),
+        "a scalar-only tenant gets no warnings key: {value}"
     );
 }
 

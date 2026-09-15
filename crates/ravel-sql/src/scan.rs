@@ -331,6 +331,13 @@ impl ScanMetrics {
     }
 }
 
+/// The DataFusion counter name this scan publishes for the histogram-kind
+/// series its fetch dropped (issue #1738). Read back off the executed plan by
+/// `crate::executor`, which turns a nonzero total into the response warning
+/// that says the answer excludes them; a `samples` result with no warning
+/// beside it is otherwise indistinguishable from a complete one.
+pub(crate) const HISTOGRAM_SERIES_SKIPPED_METRIC: &str = "histogram_series_skipped";
+
 impl RsegScanExec {
     /// Build a scan over `segments`, split round-robin into
     /// `min(target_partitions, segments.len())` partitions, with the given
@@ -481,6 +488,7 @@ impl ExecutionPlan for RsegScanExec {
             erasure,
             reservation,
             self.phase_accounting.clone(),
+            MetricBuilder::new(&self.metrics).counter(HISTOGRAM_SERIES_SKIPPED_METRIC, partition),
         ));
         Ok(Box::pin(ScanStream {
             schema,
@@ -522,6 +530,7 @@ async fn prepare_partition(
     erasure: Arc<Vec<ErasurePredicate>>,
     reservation: MemoryReservation,
     phase_accounting: PhaseAccounting,
+    histogram_series_skipped: Count,
 ) -> DFResult<(Prepared, MemoryReservation)> {
     let mut runs: Vec<Run> = Vec::with_capacity(segs.len());
     let mut labels: HashMap<[u8; 16], LabelSet> = HashMap::new();
@@ -531,6 +540,12 @@ async fn prepare_partition(
             .fetch_soa_phase_accounted(tenant, seg, &matchers, &phase_accounting)
             .await
             .map_err(SqlError::from)?;
+        // Histogram-kind series this segment matched and the scalar-only fetch
+        // above did not return (issue #1738). Counted before any budget check
+        // or erasure filter, so a statement that trips a budget later still
+        // reports what it had already excluded by table shape.
+        histogram_series_skipped
+            .add(usize::try_from(stats.histogram_series_skipped).unwrap_or(usize::MAX));
         // Selective-erasure exclusion (ADR-0064 decision 2):
         // applied to the decoded series immediately after fetch, after the
         // ADR-0046 read cache `fetch_soa_phase_accounted` routes through,
