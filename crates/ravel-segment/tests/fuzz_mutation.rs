@@ -396,6 +396,41 @@ fn sparse_seed_point_probe_finds_known_id_unmutated() {
     }
 }
 
+/// Issue #1457: `find_index_in_window` takes an untrusted `first_index` (no
+/// `Footer`, exercised directly by the `sparse_probe` fuzz target) and must
+/// reject a `first_index` that overflows `u64` when added to the matched
+/// in-window offset, rather than panicking (debug) or wrapping (release,
+/// where `profile.release` sets no `overflow-checks` and a wrapped result
+/// silently reads back as a wrong, still-`Some`, absolute index).
+#[test]
+fn find_index_in_window_rejects_first_index_overflow() {
+    let mut window = [0u8; 48];
+    window[0..16].copy_from_slice(&[1u8; 16]);
+    window[16..32].copy_from_slice(&[2u8; 16]);
+    window[32..48].copy_from_slice(&[3u8; 16]);
+
+    // Match at offset 1 with first_index at the top of the range: mid (1)
+    // added to first_index (u64::MAX) overflows.
+    let target = [2u8; 16];
+    match find_index_in_window(&window, u64::MAX, &target) {
+        Err(SegmentError::BadSparseIndex(_)) => {}
+        other => panic!("overflowing first_index must be BadSparseIndex, got {other:?}"),
+    }
+
+    // Same window, a first_index that does not overflow. The assertion above
+    // already kills a saturating_add or wrapping_add mutant (both return
+    // Ok(Some(..)) instead of Err). This one pins the success path: a mutant
+    // that always rejects, returns Ok(None), or drops the window offset from
+    // the sum passes the assertion above and fails here, where the correct
+    // answer is 12 (10 + 2).
+    let target = [3u8; 16];
+    assert_eq!(
+        find_index_in_window(&window, 10, &target),
+        Ok(Some(12)),
+        "non-overflowing lookup must still resolve the correct absolute index"
+    );
+}
+
 #[test]
 fn retired_version_objects_are_rejected_with_typed_error() {
     // ADR-0027/ADR-0092: a stray pre-v7 object must stay detectably foreign.
