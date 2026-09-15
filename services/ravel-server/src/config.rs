@@ -1595,14 +1595,16 @@ pub struct Cli {
     /// that puts them back behind one credential.
     ///
     /// Omitting `tenant` leaves the remote reachable by every local tenant,
-    /// which is correct only where one can ever resolve. A coordinator that can
-    /// resolve more than one (two or more `--tenant-token` tenants, or any of
-    /// `--dev-insecure-tenant-header`, `--oidc-issuer`, or `--mtls-enabled`)
-    /// refuses to start with such a spec, rather than fanning every local
-    /// tenant's selectors and discovery out under the same credential and
-    /// returning another tenant's series. A `tenant` that no `--tenant-token`
-    /// configures is also refused where the tenant set is fully known: it can
-    /// never fire.
+    /// which is correct only where the coordinator runs queries for one. A
+    /// coordinator that runs queries for more than one (two or more
+    /// `--tenant-token` tenants, an `--alert-rules-file` naming a tenant no
+    /// token does, or any of `--dev-insecure-tenant-header`, `--oidc-issuer`,
+    /// or `--mtls-enabled`) refuses to start with such a spec, rather than
+    /// fanning every local tenant's selectors and discovery out under the same
+    /// credential and returning another tenant's series. A `tenant` named by
+    /// neither a `--tenant-token` nor an `--alert-rules-file` rule is also
+    /// refused where the tenant set is fully known: it can never fire. A
+    /// tenant that only alert rules name is a valid target.
     ///
     /// Example:
     /// `--remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tenant=acme,skip-unavailable=true`

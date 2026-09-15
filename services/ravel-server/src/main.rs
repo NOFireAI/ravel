@@ -258,12 +258,14 @@ async fn main() -> anyhow::Result<()> {
     // here rather than once per evaluation tick. Alerting stays off unless a
     // rules file was named and it holds at least one rule.
     //
-    // Parsed this early, before the store is built, because the tenant-mapping
-    // check below needs its tenant set: `alerting::spawn` starts one evaluator
+    // Parsed here, above the tenant-mapping check below, because that check
+    // needs its tenant set: `alerting::spawn` starts one evaluator
     // per tenant in this document against the same engine federation is
     // installed on, so a tenant named only here still federates and is a local
-    // tenant for that check's purposes. `TenantId::hash()` inside is valid at
-    // this point because the tenant-hash scheme is already installed above.
+    // tenant for that check's purposes. The two real constraints on where this
+    // sits: after `install_tenant_hash_scheme`, so `TenantId::hash()` inside
+    // resolves under the scheme the request path uses, and before
+    // `ensure_federation_tenant_mapping` and any listener bind.
     let alert_rules = match cli.alert_rules_file.as_deref() {
         Some(path) => load_rules_file(path)?,
         None => HashMap::new(),
