@@ -234,6 +234,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - name: Supply-chain pin check cases (issue #1720)
+        run: bash deploy/metricsbench/tests/every_comparator_pins_an_image_digest.test.sh
       - name: Supply-chain pin check (issue #1310)
         run: deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
       - name: Check derived-doc drift (docs/query-engine.md)

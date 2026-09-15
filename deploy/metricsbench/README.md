@@ -75,11 +75,12 @@ deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
 
 Originally scoped to this directory's compose file alone (issue #934), the
 script now also checks the two repo-wide supply-chain pins issue #1310 added,
-plus the quickstart compose file issue #1720 added: every `FROM`/`ARG` base
+plus the quickstart compose files issue #1720 added: every `FROM`/`ARG` base
 image in the root `Dockerfile` and `Dockerfile.prebuilt`, every `uses:` action
 reference under `.github/workflows/` and `.github/actions/`, and every
-`image:` reference in `deploy/docker-compose/ravel.yml`. All four categories
-run in one invocation and each is checked against its own expected count:
+`image:` reference in `deploy/docker-compose/ravel.yml` and
+`deploy/docker-compose/minio.yml`. All four categories run in one invocation
+and each is checked against its own expected count:
 
 - **Compose images** (this directory): every image reference carries an
   `@sha256:` digest, every ADR-0927-required comparator is present, and the
@@ -91,12 +92,16 @@ run in one invocation and each is checked against its own expected count:
 - **Workflow actions**: every `uses:` reference in every workflow and
   composite action carries a 40-hex commit SHA pin, and the number of
   references equals the expected count.
-- **Quickstart compose images** (`deploy/docker-compose/ravel.yml`): every
-  `image:` reference except the two `${RAVEL_IMAGE:-...}` references (Ravel's
-  own released image, excluded by exact match) carries an `@sha256:` digest,
-  and both the total image-line count and the pin-required count equal their
-  expected totals. Scoped to that one file: `deploy/k8s` carries locally built
-  placeholders with no registry manifest to pin.
+- **Quickstart compose images** (`deploy/docker-compose/ravel.yml` and
+  `deploy/docker-compose/minio.yml`): every `image:` reference except the two
+  `${RAVEL_IMAGE:-...}` references in `ravel.yml` (Ravel's own released
+  image, excluded by exact match) carries an `@sha256:` digest, and both the
+  total image-line count (8, across both files) and the pin-required count
+  (6) equal their expected totals. Scoped to these two files: `deploy/k8s`
+  carries four registry images that are not yet pinned (`minio.yaml` lines
+  49 and 140, `floci.yaml` lines 74 and 157) plus two locally built
+  placeholders (`ravel-server`, `ravel-operator`); pinning the k8s manifests
+  is a separate ticket.
 
 Exit 0 means all four categories passed. Any unpinned reference, any missing
 required comparator, or a reference count that drifts from any category's
@@ -158,12 +163,14 @@ curl -sI -H "Authorization: Bearer <TOKEN>" \
 The tag is kept in each `image:` reference alongside the digest for human
 readability; the digest is what pins the run.
 
-### Pins shared with deploy/docker-compose/ravel.yml (issue #1720)
+### Pins shared with deploy/docker-compose/ravel.yml and minio.yml (issue #1720)
 
-The quickstart compose file (`deploy/docker-compose/ravel.yml`) is scanned by
-the same script as its fourth category (see above), so its pins are recorded
-here too. The MinIO pair is the exact same tag and digest this directory
-already uses above; the other two are quickstart-only.
+The two quickstart compose files (`deploy/docker-compose/ravel.yml` and
+`deploy/docker-compose/minio.yml`) are scanned by the same script as its
+fourth category (see above), so their pins are recorded here too. The MinIO
+pair is the exact same tag and digest this directory already uses above,
+and is identical across both quickstart files (`minio.yml` is `ravel.yml`'s
+standalone MinIO mirror); the other two are `ravel.yml`-only.
 
 | Image | Tag | Digest |
 |---|---|---|

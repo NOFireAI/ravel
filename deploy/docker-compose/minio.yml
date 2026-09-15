@@ -1,7 +1,10 @@
 services:
-  # quay.io rather than Docker Hub: rationale in deploy/README.md.
+  # quay.io rather than Docker Hub: rationale in deploy/README.md. Pinned to
+  # a release tag plus an immutable @sha256: manifest digest (issue #1720),
+  # the same pin deploy/docker-compose/ravel.yml carries for the same image
+  # (ravel.yml documents this file as its MinIO mirror).
   minio:
-    image: quay.io/minio/minio:latest
+    image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"
@@ -12,7 +15,7 @@ services:
     volumes:
       - ../../minio-data:/data
   createbucket:
-    image: quay.io/minio/mc:latest
+    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z@sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952
     depends_on: [minio]
     entrypoint: >
       /bin/sh -c "
