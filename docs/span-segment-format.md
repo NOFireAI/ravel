@@ -34,11 +34,12 @@ the bump cannot read it. The irreversible step is the first write at the new
 version; before it, a rollback to the earlier build is safe. The N/N-1 window
 described below is staged for a future format-lifecycle activation milestone,
 distinct from the software's first public release at 0.9.0 and not yet reached
-(ADR-0531), not a posture any released build has had.
+(ADR-0531, proposed), not a posture any released build has had.
 
 **Version lifecycle and migration (ADR-0066, normative).** The pre-release
 posture above expires at the format-lifecycle activation milestone (ADR-0531,
-distinct from the software's 0.9.0 first public release and not yet reached).
+proposed: distinct from the software's 0.9.0 first public release and not yet
+reached).
 RSPAN is a Class A bulk
 data-object format; from that milestone onward the supported-version window
 becomes N/N-1 (single-sourced as `ravel_rspan::footer::SUPPORTED_VERSIONS`,
