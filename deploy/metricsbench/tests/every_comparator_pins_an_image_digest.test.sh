@@ -144,7 +144,7 @@ check "removing an image line also fails the pin-required-count assertion" \
 # Duplicating the grafana image line raises the combined total to 9.
 d="$(new_tree extra-image-line)"
 mutate "${d}/deploy/docker-compose/ravel.yml" \
-  '/^    image: grafana\/grafana:13\.2\.2@sha256:/{p}'
+  '/^    image: grafana\/grafana:13\.2\.2@sha256:/{p;}'
 check "an extra image line fails the total-count assertion" "${d}" 1 \
   "found 9 quickstart compose image references, expected exactly 8"
 
