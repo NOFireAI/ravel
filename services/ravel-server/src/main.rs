@@ -253,13 +253,30 @@ async fn main() -> anyhow::Result<()> {
     let remote_clusters = cli
         .parse_remote_clusters()
         .context("failed to resolve --remote-cluster settings")?;
+    // Alert rules are static per-tenant config loaded once at startup
+    // (ADR-0043 decision 2), and every validation the rules can fail happens
+    // here rather than once per evaluation tick. Alerting stays off unless a
+    // rules file was named and it holds at least one rule.
+    //
+    // Parsed this early, before the store is built, because the tenant-mapping
+    // check below needs its tenant set: `alerting::spawn` starts one evaluator
+    // per tenant in this document against the same engine federation is
+    // installed on, so a tenant named only here still federates and is a local
+    // tenant for that check's purposes. `TenantId::hash()` inside is valid at
+    // this point because the tenant-hash scheme is already installed above.
+    let alert_rules = match cli.alert_rules_file.as_deref() {
+        Some(path) => load_rules_file(path)?,
+        None => HashMap::new(),
+    };
+    let alert_rule_tenants: Vec<ravel_types::TenantHash> = alert_rules.keys().copied().collect();
     // A remote cluster's credential belongs to one local tenant. Refuse a spec
-    // that names none on a coordinator that can resolve more than one, before
-    // any listener binds, rather than silently fanning every tenant's queries
-    // out under the same credential.
+    // that names none on a coordinator that runs queries for more than one,
+    // before any listener binds, rather than silently fanning every tenant's
+    // queries out under the same credential.
     ravel_server::ensure_federation_tenant_mapping(
         &remote_clusters,
         &tenant_tokens,
+        &alert_rule_tenants,
         cli.dev_insecure_tenant_header,
         &auth,
     )?;
@@ -343,14 +360,6 @@ async fn main() -> anyhow::Result<()> {
         })?;
     }
 
-    // Alert rules are static per-tenant config loaded once at startup
-    // (ADR-0043 decision 2), and every validation the rules can fail happens
-    // here rather than once per evaluation tick. Alerting stays off unless a
-    // rules file was named and it holds at least one rule.
-    let alert_rules = match cli.alert_rules_file.as_deref() {
-        Some(path) => load_rules_file(path)?,
-        None => HashMap::new(),
-    };
     let alert_sinks = cli
         .parse_alert_sinks()
         .context("failed to parse alert sink flags")?;

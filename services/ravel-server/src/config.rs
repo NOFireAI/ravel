@@ -3133,8 +3133,9 @@ pub struct RemoteClusterConfig {
     /// A query from any other local tenant never dials this remote.
     ///
     /// `None` means the spec carried no `tenant` key: the remote serves every
-    /// local tenant. That is only expressible on a coordinator that can resolve
-    /// at most one local tenant, which
+    /// local tenant. That is only expressible on a coordinator that runs queries
+    /// for at most one local tenant (its `--tenant-token` values and its
+    /// `--alert-rules-file` tenants together), which
     /// [`crate::ensure_federation_tenant_mapping`] enforces at startup; it is
     /// what every pre-`tenant` federation deployment already is.
     ///
@@ -3960,7 +3961,7 @@ impl Cli {
     /// (see [`RemoteClusterConfig::tenant`]). Two local tenants sharing a remote
     /// endpoint is two specs, not one spec naming two tenants. A spec with no
     /// `tenant` key serves every local tenant and is accepted only on a
-    /// coordinator resolving at most one, which
+    /// coordinator that runs queries for at most one, which
     /// [`crate::ensure_federation_tenant_mapping`] checks at startup.
     ///
     /// `tls` defaults to `true`. A spec that carries `tls-ca-file` and no `tls`
