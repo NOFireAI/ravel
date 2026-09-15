@@ -370,6 +370,13 @@ pub fn verify_id_window(window: &[u8], window_meta: &IdWindow) -> Result<(), Seg
 /// bytes, `first_index` the absolute index of its first id) for `target`,
 /// returning its absolute index or `None`. Verify the window's crc32c with
 /// [`verify_id_window`] before calling.
+///
+/// `first_index` is untrusted here (this function takes no `Footer` and is
+/// exercised directly, byte slice plus `first_index`, by the `sparse_probe`
+/// fuzz target): every caller in this crate derives it from
+/// [`SparseIdIndex::locate`], which bounds it to at most `u32::MAX *
+/// u32::MAX` and so never overflows the add below, but a value that does not
+/// come from `locate` is rejected rather than silently wrapped.
 pub fn find_index_in_window(
     window: &[u8],
     first_index: u64,
@@ -388,7 +395,11 @@ pub fn find_index_in_window(
         match id.cmp(target.as_slice()) {
             std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,
-            std::cmp::Ordering::Equal => return Ok(Some(first_index + mid as u64)),
+            std::cmp::Ordering::Equal => {
+                return first_index.checked_add(mid as u64).map(Some).ok_or(
+                    SegmentError::BadSparseIndex("first_index + window offset overflows u64"),
+                );
+            }
         }
     }
     Ok(None)
