@@ -373,6 +373,30 @@ jobs:
       # by CI. Needs node, which this runner already has.
       - name: PreToolUse guard cases
         run: bash .claude/guards/pretooluse.test.sh
+      # Issue #1834. These five ran in no job: each was green locally from the
+      # day it landed and proved nothing, and flag-doc-guard.test.sh had in
+      # fact been RED for some time -- its fixture sed was pinned to a
+      # sentence in config.rs that got reworded, which the suite's own
+      # fixture-differs assertion caught and nobody saw. All bash-only.
+      - name: Epic-status nudge cases
+        run: bash .claude/guards/epic-status-nudge.test.sh
+      - name: Disk-reap cases
+        run: bash scripts/disk-reap.test.sh
+      - name: Reproduce-figure cases
+        run: bash scripts/reproduce-figure.test.sh
+      - name: Flag-doc guard cases (issue #1297)
+        run: bash scripts/tests/flag-doc-guard.test.sh
+      - name: Fleet-result-merge squash cases
+        run: bash scripts/tests/fleet-result-merge-squash.test.sh
+      # And the check that keeps this list honest. Python suites are enrolled
+      # by `unittest discover -p 'test_*.py'`, so they cannot be orphaned;
+      # shell suites are enumerated by hand and a new one runs nowhere until
+      # somebody remembers. This asserts every tracked *.test.sh is named in
+      # some workflow.
+      - name: Orphan-suite guard cases (issue #1834)
+        run: bash scripts/tests/check-test-suites-run.test.sh
+      - name: Every shell test suite runs somewhere (issue #1834)
+        run: bash scripts/guards/check-test-suites-run.sh
       - name: Python script unit tests
         run: make test-python
 
