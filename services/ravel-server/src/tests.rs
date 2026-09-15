@@ -193,6 +193,7 @@ fn harness(
             Arc::new(SystemClock),
             AdmissionLimits::default(),
         )),
+        reconcile_cycle: Arc::new(crate::admission_reconcile::ReconcileCycleMetrics::default()),
         metrics_tenant_labels: false,
         metrics_tenant_allowlist: Arc::new(HashSet::new()),
         query_accounting,

@@ -2332,6 +2332,22 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// most recent pass and drops as candidates are deleted or their records
     /// restored; a drop is not "resolved," just this pass's count.
     pub orphans_present: u64,
+    /// Orphan candidates moved to `quarantine/` since process start (ADR-0058
+    /// amendment). A counter, unlike the two gauges above: quarantining is an
+    /// event a later pass does not undo, and the pass-local figure
+    /// `SweepReport` reports is summed on
+    /// [`crate::maintain::MaintenanceSafetyMetrics`] rather than here.
+    pub orphans_quarantined: u64,
+    /// Orphan candidates whose copy to `quarantine/` failed since process
+    /// start, so the live object was left in place (fail-closed: the delete
+    /// never runs when its copy did not). The steady state is a flat line, so
+    /// an alert reads `increase(...) > 0` like the breaker-trip counter.
+    pub orphans_quarantine_refused: u64,
+    /// Objects physically deleted from `quarantine/` past the quarantine
+    /// horizon since process start. Read against `orphans_quarantined`: that
+    /// one climbing while this one stays flat is a quarantine prefix filling
+    /// and never being reaped.
+    pub quarantine_reaped: u64,
 }
 
 /// One scrape's maintenance-safety counters (ADR-0048 decisions 1, 4, 6): the three safety controls that, before this issue, reached
@@ -2343,6 +2359,33 @@ pub struct MaintenanceSafetySnapshot {
     /// signal and shard of that tick at once.
     pub legal_hold_refresh_failures: u64,
     pub signals: Vec<MaintenanceSafetySignalSnapshot>,
+}
+
+impl MaintenanceSafetySnapshot {
+    /// Read every counter for every maintained signal at scrape time (atomic
+    /// loads, no `.await`), like every other family's snapshot constructor.
+    ///
+    /// A constructor rather than a literal at the `/metrics` handler so a
+    /// field added to the metrics struct and left out of the exposition is a
+    /// failing render test rather than a series nobody notices is missing.
+    pub fn from_metrics(metrics: &crate::maintain::MaintenanceSafetyMetrics) -> Self {
+        MaintenanceSafetySnapshot {
+            legal_hold_refresh_failures: metrics.legal_hold_refresh_failures(),
+            signals: crate::maintain::MAINTAINED_SIGNALS
+                .iter()
+                .map(|&signal| MaintenanceSafetySignalSnapshot {
+                    signal,
+                    conservation_aborts: metrics.conservation_aborts(signal),
+                    orphan_breaker_trips: metrics.orphan_breaker_trips(signal),
+                    orphans_withheld: metrics.orphans_withheld(signal),
+                    orphans_present: metrics.orphans_present(signal),
+                    orphans_quarantined: metrics.orphans_quarantined(signal),
+                    orphans_quarantine_refused: metrics.orphans_quarantine_refused(signal),
+                    quarantine_reaped: metrics.quarantine_reaped(signal),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// No `tenant_hash` label on any series here. ADR-0048 decision 4 names
@@ -2438,6 +2481,62 @@ fn render_maintain_safety_family(
             "ravel_maintain_orphans_present",
             &labels(mode, signal.signal),
             signal.orphans_present,
+        );
+    }
+
+    // The quarantine leg of orphan GC (ADR-0058 amendment). Counters, not
+    // gauges like the two above: each counts what a pass did, which the next
+    // pass does not undo, so the operator question they answer is a rate.
+    write_header(
+        out,
+        "ravel_maintain_orphans_quarantined_total",
+        "Orphan candidates moved from the live L0 set to the quarantine prefix, by signal. The \
+         deletion orphan GC performs is a copy plus a delete, so this is the rate at which \
+         record-less data objects are being taken out of the live set.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_orphans_quarantined_total",
+            &labels(mode, signal.signal),
+            signal.orphans_quarantined,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_orphans_quarantine_refused_total",
+        "Orphan candidates whose copy to the quarantine prefix failed, by signal; the live \
+         object was left in place rather than deleted without a copy. The steady state is a \
+         flat line, so alert on increase() > 0: a refusal means quarantine cannot make \
+         progress, from a store fault or a permissions or capacity problem on that prefix.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_orphans_quarantine_refused_total",
+            &labels(mode, signal.signal),
+            signal.orphans_quarantine_refused,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_quarantine_reaped_total",
+        "Objects physically deleted from the quarantine prefix past the quarantine horizon, by \
+         signal. The only place orphan-GC'd data is ever physically removed. Read it against \
+         ravel_maintain_orphans_quarantined_total: that one climbing while this one stays flat \
+         is a quarantine prefix that fills and is never reaped.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_quarantine_reaped_total",
+            &labels(mode, signal.signal),
+            signal.quarantine_reaped,
         );
     }
 }
@@ -3231,6 +3330,50 @@ pub struct AdmissionCountersSnapshot {
     /// and keeps no row for a decision normalization made. Folded by the same
     /// `tenant_labels` gate as `usage`.
     pub normalize_rejects: Vec<crate::normalize_reject_metrics::TenantNormalizeRejects>,
+    /// What the last completed fleet-reconciliation cycle cost and saw
+    /// (ADR-0057). Process-global, not per (tenant, signal): one cycle covers
+    /// every tenant this process tracks, so its series carry `mode` alone.
+    /// All-zero before the first cycle, and in a mode that runs no
+    /// reconciliation loop at all.
+    pub reconcile_cycle: ReconcileCycleSnapshot,
+}
+
+/// The reconciliation cycle figures for one scrape (ADR-0057), assembled from
+/// the two places they live: the controller publishes the last cycle's own
+/// figures, and the exporter-side accumulator keeps the running reaped total
+/// the controller deliberately does not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileCycleSnapshot {
+    /// Last cycle's duration in nanoseconds, measured on the controller's
+    /// injected clock. Rendered in seconds.
+    pub cycle_duration_ns: i64,
+    /// Distinct non-stale sibling processes the last cycle saw, which is the
+    /// live fleet size this process reconciled against.
+    pub siblings_observed: u64,
+    /// Listed keys the last cycle did not GET because the LIST already showed
+    /// them past the staleness window.
+    pub stale_keys_skipped: u64,
+    /// Keys past the reap horizon deleted by every cycle since process start.
+    /// A running total, unlike the three figures above: see
+    /// [`crate::admission_reconcile::ReconcileCycleMetrics`] for why the
+    /// per-cycle count cannot carry the `_total` name itself.
+    pub keys_reaped_total: u64,
+}
+
+impl ReconcileCycleSnapshot {
+    /// Pair the controller's last-cycle copy with the exporter's running
+    /// reaped total, the two reads the `/metrics` handler makes.
+    pub fn from_parts(
+        last_cycle: ravel_ingest::ReconcileCycleStats,
+        keys_reaped_total: u64,
+    ) -> Self {
+        ReconcileCycleSnapshot {
+            cycle_duration_ns: last_cycle.cycle_duration_ns,
+            siblings_observed: last_cycle.siblings_observed,
+            stale_keys_skipped: last_cycle.stale_keys_skipped,
+            keys_reaped_total,
+        }
+    }
 }
 
 /// The counters this family sums per rendered series. Split out so the fold
@@ -3508,6 +3651,81 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
             acc.reconciliation_failures,
         );
     }
+
+    // The cycle itself, beside the failure counter above. `mode` alone, no
+    // {tenant_hash, signal}: one cycle reconciles every tenant this process
+    // tracks, so there is no per-tenant figure to label. The failure counter
+    // keeps its tenant dimension because a read failure is per (tenant,
+    // signal); nothing here is.
+    //
+    // The three per-cycle figures are gauges. Each is the last completed
+    // cycle's value and each can fall (a fleet that shrinks, a cycle that
+    // finishes faster), so none of them takes a `_total` name. Only the reaped
+    // keys accumulate, on the exporter side, and only that one is a counter.
+    let cycle = &snapshot.reconcile_cycle;
+    write_header(
+        out,
+        "ravel_admission_reconciliation_cycle_duration_seconds",
+        "Duration of the last completed fleet-admission reconciliation cycle. A cycle \
+         approaching the 2R staleness window (twice the reconciliation interval) makes every \
+         sibling snapshot read as stale, at which point each process starts enforcing the whole \
+         fleet cap alone while no failure counter moves.",
+        "gauge",
+    );
+    write_sample_f64(
+        out,
+        "ravel_admission_reconciliation_cycle_duration_seconds",
+        &[Label::Mode(mode)],
+        // The cycle saturates at zero rather than going negative if the clock
+        // steps backwards mid-cycle; clamp anyway, since a negative duration
+        // here would be a silently nonsensical sample rather than an error.
+        cycle.cycle_duration_ns.max(0) as f64 / 1_000_000_000.0,
+    );
+
+    write_header(
+        out,
+        "ravel_admission_reconciliation_siblings_observed",
+        "Distinct non-stale sibling processes the last completed reconciliation cycle saw, the \
+         live fleet size this process reconciled its share of each tenant's cap against. It \
+         falling to 0 while replicas are up means this process is reading no sibling as live.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_admission_reconciliation_siblings_observed",
+        &[Label::Mode(mode)],
+        cycle.siblings_observed,
+    );
+
+    write_header(
+        out,
+        "ravel_admission_reconciliation_stale_keys_skipped",
+        "Snapshot keys the last completed reconciliation cycle skipped reading because the LIST \
+         already showed them past the staleness window. Sustained growth alongside a flat \
+         siblings_observed is a control-plane prefix filling with dead processes' keys.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_admission_reconciliation_stale_keys_skipped",
+        &[Label::Mode(mode)],
+        cycle.stale_keys_skipped,
+    );
+
+    write_header(
+        out,
+        "ravel_admission_reconciliation_keys_reaped_total",
+        "Snapshot keys past the reap horizon deleted by reconciliation cycles since process \
+         start. A rate at zero while stale_keys_skipped climbs means the prefix is filling \
+         faster than it is being cleared.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_admission_reconciliation_keys_reaped_total",
+        &[Label::Mode(mode)],
+        cycle.keys_reaped_total,
+    );
 }
 
 /// One (tenant bucket, workload class) row's accumulated per-query cost
@@ -4523,6 +4741,12 @@ pub struct MetricsState {
     /// serves no ingest its `usage_snapshot` is simply empty, so the admission
     /// family renders its headers with no per-tenant samples.
     pub admission: Arc<AdmissionController>,
+    /// The exporter-side running total of reaped snapshot keys, shared with
+    /// [`crate::admission_reconcile`]'s loop. Always present; it stays at zero
+    /// in a mode that spawns no reconciliation loop, which is the same reading
+    /// as a loop that has reaped nothing. The last cycle's other figures come
+    /// straight off `admission` above.
+    pub reconcile_cycle: Arc<crate::admission_reconcile::ReconcileCycleMetrics>,
     /// `--metrics-tenant-labels` (ADR-0051 section 6, default off): off folds
     /// every tenant's admission counters into `tenant_hash="other"`; on renders
     /// each observed tenant's real hash. Off keeps the exposition's cardinality
@@ -4632,23 +4856,10 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                 tenant_discovery_failures: metrics.discovery_failures(),
             });
 
-    let maintain_safety_snapshot =
-        state
-            .maintenance_safety
-            .as_ref()
-            .map(|metrics| MaintenanceSafetySnapshot {
-                legal_hold_refresh_failures: metrics.legal_hold_refresh_failures(),
-                signals: crate::maintain::MAINTAINED_SIGNALS
-                    .iter()
-                    .map(|&signal| MaintenanceSafetySignalSnapshot {
-                        signal,
-                        conservation_aborts: metrics.conservation_aborts(signal),
-                        orphan_breaker_trips: metrics.orphan_breaker_trips(signal),
-                        orphans_withheld: metrics.orphans_withheld(signal),
-                        orphans_present: metrics.orphans_present(signal),
-                    })
-                    .collect(),
-            });
+    let maintain_safety_snapshot = state
+        .maintenance_safety
+        .as_ref()
+        .map(|metrics| MaintenanceSafetySnapshot::from_metrics(metrics));
 
     let maintain_ownership_snapshot =
         state
@@ -4731,6 +4942,10 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         tenant_labels: state.metrics_tenant_labels,
         wire_bytes: state.ingest_byte_metrics.snapshot(),
         normalize_rejects: state.normalize_reject_metrics.snapshot(),
+        reconcile_cycle: ReconcileCycleSnapshot::from_parts(
+            state.admission.last_reconcile_cycle_stats(),
+            state.reconcile_cycle.keys_reaped_total(),
+        ),
     };
 
     // Per-query cost rows, read at scrape time like every other family (a
@@ -6756,6 +6971,9 @@ mod tests {
                     orphan_breaker_trips: 2,
                     orphans_withheld: 7,
                     orphans_present: 9,
+                    orphans_quarantined: 4,
+                    orphans_quarantine_refused: 5,
+                    quarantine_reaped: 6,
                 },
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Logs,
@@ -6763,6 +6981,9 @@ mod tests {
                     orphan_breaker_trips: 0,
                     orphans_withheld: 0,
                     orphans_present: 0,
+                    orphans_quarantined: 0,
+                    orphans_quarantine_refused: 0,
+                    quarantine_reaped: 0,
                 },
             ],
         };
@@ -7123,6 +7344,263 @@ mod tests {
         );
     }
 
+    /// A real cycle's figures reach `/metrics`, not just hand-built ones: run
+    /// `reconcile_once`, read the copy it published on the controller, and
+    /// render that. The duration is deterministic because the cycle measures
+    /// itself on the controller's injected clock, so a fixed step gives a
+    /// fixed rendered value and nothing here reads wall time.
+    ///
+    /// `render_includes_reconcile_cycle_series` below asserts the other three
+    /// figures against distinct values; this one pins that the chain from the
+    /// producing path to the exposition is connected at all.
+    #[tokio::test]
+    async fn reconcile_cycle_figures_reach_metrics_from_the_controller() {
+        use ravel_ingest::{AdmissionController, AdmissionLimits, Clock};
+        use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        /// Advances a fixed step on every reading and returns the value before
+        /// the step, so a cycle that takes one end stamp measures exactly one
+        /// step. No wall-clock read enters the figure.
+        struct SteppingClock {
+            now_ns: AtomicI64,
+            step_ns: i64,
+        }
+
+        impl Clock for SteppingClock {
+            fn now_ns(&self) -> i64 {
+                self.now_ns.fetch_add(self.step_ns, Ordering::Relaxed)
+            }
+        }
+
+        const STEP_NS: i64 = 250_000;
+        let clock = std::sync::Arc::new(SteppingClock {
+            now_ns: AtomicI64::new(1_700_000_000_000_000_000),
+            step_ns: STEP_NS,
+        });
+        let controller = AdmissionController::new(clock.clone(), AdmissionLimits::default());
+        let store = MemoryStore::new();
+
+        let start_ns = clock.now_ns();
+        let stats = ravel_ingest::reconcile_once(
+            &controller,
+            &store,
+            std::time::Duration::from_secs(30),
+            start_ns,
+        )
+        .await;
+        let cycle_metrics = crate::admission_reconcile::ReconcileCycleMetrics::default();
+        cycle_metrics.record_cycle(&stats);
+
+        let admission = AdmissionCountersSnapshot {
+            reconcile_cycle: ReconcileCycleSnapshot::from_parts(
+                controller.last_reconcile_cycle_stats(),
+                cycle_metrics.keys_reaped_total(),
+            ),
+            ..Default::default()
+        };
+        let body = render(
+            Mode::All,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &admission,
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+        );
+
+        assert_eq!(
+            stats.cycle_duration_ns, STEP_NS,
+            "the cycle measures one step of the injected clock"
+        );
+        assert!(
+            body.contains(
+                "ravel_admission_reconciliation_cycle_duration_seconds{mode=\"all\"} 0.00025"
+            ),
+            "the cycle's own duration must render, in seconds:\n{body}"
+        );
+    }
+
+    /// The reconciliation cycle figures reach `/metrics` (ADR-0057). Every
+    /// value asserted, and each field given a different one: a renderer that
+    /// read the wrong field, or wrote a constant, passes a presence-only test
+    /// and fails this one.
+    ///
+    /// `keys_reaped_total` is the accumulated total from
+    /// `admission_reconcile::ReconcileCycleMetrics`, not the last cycle's
+    /// count, which is why it comes in through `from_parts` separately from
+    /// the controller's per-cycle copy.
+    #[test]
+    fn render_includes_reconcile_cycle_series() {
+        let admission = AdmissionCountersSnapshot {
+            reconcile_cycle: ReconcileCycleSnapshot::from_parts(
+                ravel_ingest::ReconcileCycleStats {
+                    cycle_duration_ns: 1_250_000_000,
+                    siblings_observed: 4,
+                    stale_keys_skipped: 6,
+                    keys_reaped: 2,
+                },
+                9,
+            ),
+            ..Default::default()
+        };
+        let body = render(
+            Mode::All,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &admission,
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+        );
+
+        for (header, sample) in [
+            (
+                "# TYPE ravel_admission_reconciliation_cycle_duration_seconds gauge",
+                "ravel_admission_reconciliation_cycle_duration_seconds{mode=\"all\"} 1.25",
+            ),
+            (
+                "# TYPE ravel_admission_reconciliation_siblings_observed gauge",
+                "ravel_admission_reconciliation_siblings_observed{mode=\"all\"} 4",
+            ),
+            (
+                "# TYPE ravel_admission_reconciliation_stale_keys_skipped gauge",
+                "ravel_admission_reconciliation_stale_keys_skipped{mode=\"all\"} 6",
+            ),
+            (
+                "# TYPE ravel_admission_reconciliation_keys_reaped_total counter",
+                "ravel_admission_reconciliation_keys_reaped_total{mode=\"all\"} 9",
+            ),
+        ] {
+            assert!(body.contains(header), "missing TYPE line {header}:\n{body}");
+            assert!(body.contains(sample), "missing sample {sample}:\n{body}");
+        }
+    }
+
+    /// The quarantine leg of orphan GC reaches `/metrics` (ADR-0058
+    /// amendment), through the same `MaintenanceSafetyMetrics` the server
+    /// already feeds every `SweepReport` into. The report is what a sweep pass
+    /// returns, so this covers the whole chain the figures were stopping one
+    /// step short of: `SweepReport` to counter to rendered sample.
+    ///
+    /// Three distinct values, all asserted: a renderer reading the wrong field
+    /// of the snapshot renders a plausible number and fails here.
+    #[test]
+    fn render_includes_orphan_quarantine_series() {
+        let safety = crate::maintain::MaintenanceSafetyMetrics::default();
+        safety.record_sweep(
+            Signal::Metrics,
+            &ravel_maintain::SweepReport {
+                orphans_deleted: 5,
+                orphans_quarantined: 5,
+                orphans_quarantine_refused: 2,
+                quarantine_reaped: 3,
+                ..Default::default()
+            },
+        );
+        let snapshot = MaintenanceSafetySnapshot::from_metrics(&safety);
+        let body = render(
+            Mode::Maintain,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            Some(&snapshot),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+        );
+        for (header, sample) in [
+            (
+                "# TYPE ravel_maintain_orphans_quarantined_total counter",
+                "ravel_maintain_orphans_quarantined_total{mode=\"maintain\",signal=\"metrics\"} 5",
+            ),
+            (
+                "# TYPE ravel_maintain_orphans_quarantine_refused_total counter",
+                "ravel_maintain_orphans_quarantine_refused_total{mode=\"maintain\",\
+                 signal=\"metrics\"} 2",
+            ),
+            (
+                "# TYPE ravel_maintain_quarantine_reaped_total counter",
+                "ravel_maintain_quarantine_reaped_total{mode=\"maintain\",signal=\"metrics\"} 3",
+            ),
+        ] {
+            assert!(body.contains(header), "missing TYPE line {header}:\n{body}");
+            assert!(body.contains(sample), "missing sample {sample}:\n{body}");
+        }
+
+        // A signal the pass never touched still renders, at zero, like every
+        // other series in this family.
+        assert!(
+            body.contains(
+                "ravel_maintain_orphans_quarantined_total{mode=\"maintain\",\
+                           signal=\"logs\"} 0"
+            ),
+            "an untouched signal must still render:\n{body}"
+        );
+    }
+
     /// ADR-0044 section 4's allowlist is closed at the `Label` type (see
     /// `exposition_renders_store_metrics_and_rejects_unlisted_labels`), but
     /// that only proves a label *could* be constructed safely, not that this
@@ -7143,6 +7621,9 @@ mod tests {
                 orphan_breaker_trips: 1,
                 orphans_withheld: 1,
                 orphans_present: 1,
+                orphans_quarantined: 1,
+                orphans_quarantine_refused: 1,
+                quarantine_reaped: 1,
             }],
         };
         let body = render(
@@ -7184,6 +7665,9 @@ mod tests {
                     || line.starts_with("ravel_maintain_orphan_breaker_tripped_total")
                     || line.starts_with("ravel_maintain_orphans_withheld")
                     || line.starts_with("ravel_maintain_orphans_present")
+                    || line.starts_with("ravel_maintain_orphans_quarantined_total")
+                    || line.starts_with("ravel_maintain_orphans_quarantine_refused_total")
+                    || line.starts_with("ravel_maintain_quarantine_reaped_total")
                 {
                     vec!["mode", "signal"]
                 } else {
@@ -7702,6 +8186,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             tenant_labels: false,
             wire_bytes: Vec::new(),
             normalize_rejects: Vec::new(),
+            reconcile_cycle: ReconcileCycleSnapshot::default(),
         };
         let body = render(
             Mode::Gateway,
@@ -7787,6 +8272,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             tenant_labels: true,
             wire_bytes: Vec::new(),
             normalize_rejects: Vec::new(),
+            reconcile_cycle: ReconcileCycleSnapshot::default(),
         };
         let body = render(
             Mode::Gateway,
@@ -7870,6 +8356,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             tenant_labels: true,
             wire_bytes: Vec::new(),
             normalize_rejects: Vec::new(),
+            reconcile_cycle: ReconcileCycleSnapshot::default(),
         };
         let hash = ravel_types::TenantId::new("skewed").hash().to_hex();
         let body = render(
@@ -7930,6 +8417,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                 structural_total: 3,
                 body_conversions_total: 4,
             }],
+            reconcile_cycle: ReconcileCycleSnapshot::default(),
         };
         let body = render(
             Mode::Gateway,

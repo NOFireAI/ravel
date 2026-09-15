@@ -197,6 +197,9 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
             Arc::new(SystemClock),
             AdmissionLimits::default(),
         )),
+        reconcile_cycle: Arc::new(
+            ravel_server::admission_reconcile::ReconcileCycleMetrics::default(),
+        ),
         metrics_tenant_labels: false,
         query_accounting: Arc::clone(&query_accounting),
         metrics_tenant_allowlist: Arc::new(HashSet::new()),
@@ -609,6 +612,9 @@ mod flight {
                 Arc::new(SystemClock),
                 AdmissionLimits::default(),
             )),
+            reconcile_cycle: Arc::new(
+                ravel_server::admission_reconcile::ReconcileCycleMetrics::default(),
+            ),
             metrics_tenant_labels: false,
             query_accounting: Arc::clone(&query_accounting),
             metrics_tenant_allowlist: Arc::new(HashSet::new()),
