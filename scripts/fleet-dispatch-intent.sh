@@ -10,7 +10,8 @@
 #
 # Usage:
 #   fleet-dispatch-intent.sh intent <epic-issue> <ticket> <ref-sha>
-#       Refuses on a dangling intent (exit 65), runs the fresh-ref guard,
+#       Refuses on a dangling intent (exit 65) or on an unreadable intent
+#       history (exit 69: UNKNOWN is not clean), runs the fresh-ref guard,
 #       posts a dispatch-intent comment, prints the nonce.
 #   fleet-dispatch-intent.sh record <epic-issue> <nonce> <task-id>
 #   fleet-dispatch-intent.sh failed <epic-issue> <nonce> [reason...]
@@ -59,8 +60,21 @@ case "${mode}" in
 
     # A dangling intent = an intent comment for this ticket with no
     # matching record/failed comment. Scan the most recent 100 comments.
+    #
+    # A failed read is UNKNOWN, not "no dangling intent". With `|| true` here
+    # an API failure produced an empty history, every intent looked clean,
+    # and the guard that exists to stop a double dispatch waved it through
+    # at exactly the moment GitHub was unreliable, which is when a dispatch
+    # is most likely to be a retry of one that already started.
+    comments_rc=0
     comments=$(gh issue view "${epic}" --json comments \
-      --jq '.comments[-100:][].body' 2>/dev/null || true)
+      --jq '.comments[-100:][].body' 2>/dev/null) || comments_rc=$?
+    if [[ ${comments_rc} -ne 0 ]]; then
+      echo "fleet-dispatch-intent.sh: could not read comments on epic #${epic} (gh exit ${comments_rc})." >&2
+      echo "  Intent history is UNKNOWN, which is not the same as clean. Refusing to dispatch;" >&2
+      echo "  re-run once gh works, or reconcile with scripts/epic-status.sh ${epic} --fresh." >&2
+      exit 69
+    fi
     dangling=""
     while IFS= read -r nonce_line; do
       n="${nonce_line#dispatch-intent nonce=}"
