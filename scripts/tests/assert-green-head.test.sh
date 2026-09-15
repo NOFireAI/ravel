@@ -69,6 +69,12 @@ case "${sub}" in
       view)
         id="${1:-}"
         if [[ "$*" == *"--log-failed"* ]]; then
+          # A fixture naming an error writes it to STDERR and fails, the way
+          # gh reports a run that is still in progress.
+          if [[ -f "${STUB_DIR}/log-err-${id}.txt" ]]; then
+            cat "${STUB_DIR}/log-err-${id}.txt" >&2
+            exit 1
+          fi
           [[ -f "${STUB_DIR}/log-${id}.txt" ]] && cat "${STUB_DIR}/log-${id}.txt"
           exit 0
         fi
@@ -179,6 +185,24 @@ printf 'nothing recognisable here, just noise\n' >"${d}/log-4242.txt"
 out="$(run_in "${d}" "${GUARD}" 10)"; rc=$?
 check_eq "an unparseable log still asks for a rerun (3)" "3" "${rc}"
 check_contains "and says the signature is job-level only" "COARSE" "${out}"
+
+# An empty log because the READER could not read it is a different fact from
+# an empty log because the failure had nothing parseable in it, and the next
+# action differs: re-read versus accept. gh announces the difference on
+# stderr and a `2>/dev/null` merges the two into one wrong claim.
+# Mutation: send the log fetch's stderr to /dev/null and report COARSE.
+d="$(new_case unread)"
+pr_json "${sha}" "$(checkrun check COMPLETED FAILURE)" >"${d}/pr.json"
+printf '4242\tci\n' >"${d}/runs.txt"
+printf 'check\tRun tests\n' >"${d}/jobs-4242.txt"
+printf 'run 4242 is still in progress; logs will be available when it is complete\n' \
+  >"${d}/log-err-4242.txt"
+out="$(run_in "${d}" "${GUARD}" 10)"; rc=$?
+check_eq "an unreadable log still asks for a rerun (3)" "3" "${rc}"
+check_contains "and says the reader failed, not the failure" "UNREAD" "${out}"
+check_contains "and quotes gh's own reason" "still in progress" "${out}"
+check_eq "and does not claim the log carried no identifier" "" \
+  "$(printf '%s' "${out}" | grep -o COARSE || true)"
 
 # ANSI colouring around a failure line must not hide it: this repo sets
 # CARGO_TERM_COLOR: always, and the escape sits outside the matched text.
