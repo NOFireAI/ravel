@@ -23,7 +23,7 @@
 //!   the data-object PUT, or the commit-record PUT. A flush that is later
 //!   abandoned is therefore counted in both `flushes_by_*` **and** one of the
 //!   `abandoned_*` counters. Flushes that actually reached a durable commit
-//!   are the three trigger counters summed, minus `abandoned_retry_exhausted`,
+//!   are the four trigger counters summed, minus `abandoned_retry_exhausted`,
 //!   `abandoned_input_rejected`, and `abandoned_queue_deadline`; the bare
 //!   trigger sum overcounts.
 //! - **Success-time.** `acks_ok`/`acks_err` are recorded when a flush's strict
