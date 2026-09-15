@@ -56,11 +56,18 @@ pub struct LogIngestMetrics {
     /// paths. Excludes each path's first attempt.
     put_retries: AtomicU64,
     /// Flushes abandoned because a PUT exhausted its retry budget or
-    /// `max_flush_lifetime` elapsed first ([`crate::LogWriteError::Abandoned`]).
-    /// A durability signal: the input was fine, the object store did not
-    /// accept it in time. Nothing was acknowledged and the whole write stays
-    /// retryable.
+    /// `max_flush_lifetime` elapsed while the flush's own store calls were in
+    /// flight ([`crate::LogWriteError::Abandoned`]). A durability signal about
+    /// the object store: the flush held a permit and its PUTs did not land in
+    /// time. Nothing was acknowledged and the whole write stays retryable.
+    /// Split from `abandoned_queue_deadline`, which never reached a store call.
     abandoned_retry_exhausted: AtomicU64,
+    /// Flushes abandoned because their flush-open deadline elapsed while still
+    /// queued for a `max_inflight_flushes` permit, before any store call
+    /// ([`crate::LogWriteError::Abandoned`], issue #1739). A contention signal,
+    /// distinct from `abandoned_retry_exhausted` so a deadline reached in the
+    /// queue is not read as the store failing to accept a PUT.
+    abandoned_queue_deadline: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the RLOG build, data-key derivation, or commit-record
     /// build failed ([`crate::LogWriteError::SegmentBuild`]). A client
@@ -234,6 +241,10 @@ pub struct LogIngestMetricsSnapshot {
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
+    /// Flushes abandoned by their flush-open deadline while queued for a permit,
+    /// before any store call (issue #1739). Distinct from
+    /// `abandoned_retry_exhausted` (a store failure).
+    pub abandoned_queue_deadline: u64,
     pub abandoned_input_rejected: u64,
     pub buffered_bytes_total: u64,
     pub buffered_records_total: u64,
@@ -417,10 +428,20 @@ impl LogIngestMetrics {
         self.put_retries.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A flush abandoned by retry-budget or lifetime exhaustion
-    /// ([`crate::LogWriteError::Abandoned`]): a durability signal, retryable.
+    /// A flush abandoned by retry-budget or lifetime exhaustion while its own
+    /// store calls were in flight ([`crate::LogWriteError::Abandoned`]): a
+    /// durability signal, retryable.
     pub(crate) fn record_abandoned_retry_exhausted(&self) {
         self.abandoned_retry_exhausted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A flush abandoned because its flush-open deadline elapsed while it was
+    /// queued for a permit, before any store call
+    /// ([`crate::LogWriteError::Abandoned`], issue #1739): a contention signal,
+    /// retryable.
+    pub(crate) fn record_abandoned_queue_deadline(&self) {
+        self.abandoned_queue_deadline
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -587,6 +608,7 @@ impl LogIngestMetrics {
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
+            abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
             abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
             buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),
             buffered_records_total: self.buffered_records_total.load(Ordering::Relaxed),
@@ -677,6 +699,13 @@ mod tests {
             LogIngestMetrics::record_abandoned_retry_exhausted,
             LogIngestMetricsSnapshot {
                 abandoned_retry_exhausted: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_abandoned_queue_deadline,
+            LogIngestMetricsSnapshot {
+                abandoned_queue_deadline: 1,
                 ..Default::default()
             },
         );

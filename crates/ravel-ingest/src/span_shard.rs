@@ -397,7 +397,7 @@ impl SpanFlushCtx {
         let SpanPinnedFlush {
             waiters, charges, ..
         } = pinned;
-        self.metrics.record_abandoned_retry_exhausted();
+        self.metrics.record_abandoned_queue_deadline();
         self.ack_waiters(
             waiters,
             Err(SpanWriteError::Abandoned(

@@ -723,6 +723,10 @@ pub struct IngestPipelineSnapshot {
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
+    /// Flushes abandoned by their flush-open deadline while queued for a
+    /// `max_inflight_flushes` permit, before any store call (issue #1739).
+    /// Distinct from `abandoned_retry_exhausted`, which is a store failure.
+    pub abandoned_queue_deadline: u64,
     pub abandoned_input_rejected: u64,
     pub buffered_bytes_total: u64,
     pub buffered_items_total: u64,
@@ -843,6 +847,7 @@ impl IngestPipelineSnapshot {
             flushes_manual: snapshot.flushes_manual,
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
+            abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_points_total,
@@ -880,6 +885,7 @@ impl IngestPipelineSnapshot {
             flushes_manual: snapshot.flushes_manual,
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
+            abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_records_total,
@@ -915,6 +921,7 @@ impl IngestPipelineSnapshot {
             flushes_manual: snapshot.flushes_manual,
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
+            abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_spans_total,
@@ -1002,7 +1009,8 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
     write_header(
         out,
         "ravel_ingest_abandoned_retry_exhausted_total",
-        "Flushes abandoned by retry-budget or lifetime exhaustion, by signal.",
+        "Flushes abandoned by retry-budget or lifetime exhaustion during their \
+         own store calls, by signal.",
         "counter",
     );
     for pipeline in pipelines {
@@ -1011,6 +1019,22 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_abandoned_retry_exhausted_total",
             &labels(mode, pipeline.signal),
             pipeline.abandoned_retry_exhausted,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_abandoned_queue_deadline_total",
+        "Flushes abandoned by their flush-open deadline while queued for a \
+         permit, before any store call, by signal.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_abandoned_queue_deadline_total",
+            &labels(mode, pipeline.signal),
+            pipeline.abandoned_queue_deadline,
         );
     }
 

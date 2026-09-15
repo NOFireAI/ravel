@@ -1134,15 +1134,22 @@ Counters recorded today:
   drain, and the channel-close drop-path drain. These are **attempt-time**:
   incremented when a flush is opened, before the segment build or any PUT, so
   a later-abandoned flush is counted here as well as in an `abandoned_*`
-  counter. Successful flushes = the four trigger counters minus the two
+  counter. Successful flushes = the four trigger counters minus the three
   `abandoned_*` counters.
 - `abandoned_retry_exhausted`: flush abandoned because a PUT exhausted its retry
-  budget or `max_flush_lifetime` elapsed (`WriteError::Abandoned`). Durability
-  signal; retryable.
+  budget or `max_flush_lifetime` elapsed while the flush's own store calls were
+  in flight (`WriteError::Abandoned`). Object-store durability signal;
+  retryable.
+- `abandoned_queue_deadline`: flush abandoned because its flush-open deadline
+  elapsed while it was queued for a `max_inflight_flushes` permit, before any
+  store call (`WriteError::Abandoned`, issue #1739). Contention signal, not an
+  object-store one; retryable. The abandonment deadline is re-derived from
+  permit grant, so this fires only when a flush task is scheduled after its
+  flush-open deadline already passed, never for a mere queue wait.
 - `abandoned_input_rejected`: flush abandoned because the input could not be
   built into a durable object (`WriteError::SegmentBuild`). Client signal; not
-  retryable. Split from `abandoned_retry_exhausted` so a store problem is
-  distinguishable from a bad-input problem by counter alone.
+  retryable. The three-way split keeps a store problem, permit contention, and
+  a bad-input problem distinguishable by counter alone.
 - `put_retries`: retried PUT attempts across the data-object and commit-record
   paths (first attempt of each excluded).
 - `buffered_bytes_total`, `buffered_points_total`: cumulative volume admitted
