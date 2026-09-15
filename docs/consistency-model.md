@@ -47,17 +47,27 @@ Buffered mode (opt-in per request, named "buffered"):
   flush is triggered, not when it completes: the flush task then waits for a
   `max_inflight_flushes` permit on its shard (ADR-1642) and runs its PUTs, so
   a shard whose permits are held by a stalled flush widens the window until
-  the stall clears or `max_flush_lifetime` abandons the flush.
-- Loss is not only a crash consequence. When a flush is abandoned because it
-  outran `max_flush_lifetime`, its buffered rows are dropped with no crash, and
-  in buffered mode those rows were already acked. A flush's deadline is pinned
-  at flush-open, so a flush that waits behind a stalled prefix burns its
-  lifetime while queued; a stall longer than `max_flush_lifetime` therefore
-  abandons every flush opened during it, not one. This needs a long stall:
-  `max_flush_lifetime` defaults to 3600 s and is not operator-tunable from the
-  server. Strict mode does not have this exposure, because a strict write is
-  acked only after its flush commits and an abandoned flush returns a
-  retryable error instead.
+  the stall clears.
+- The `max_flush_lifetime` abandonment budget is measured from the moment the
+  flush's permit is granted, not from flush-open, so time spent queued behind
+  a stalled prefix does not count against it: a flush that waited behind a
+  throttled tenant still gets its full lifetime for its own store calls once it
+  holds a permit. A flush whose flush-open deadline already elapsed when its
+  task is scheduled is abandoned without taking a permit rather than wasting
+  one.
+- Loss from a stalled co-resident prefix is therefore not a buffered-mode
+  outcome: a flush queued behind the stall reaches the store once the stall
+  clears. Buffered rows are dropped with no crash only when the flush's own
+  store calls, after it holds the permit, cannot complete within
+  `max_flush_lifetime` (a genuinely stuck backend, not a queue wait), and those
+  rows were already acked. `max_flush_lifetime` defaults to 3600 s and is not
+  operator-tunable from the server.
+- Strict mode does not share the buffered loss exposure, because a strict
+  write is acked only after its flush commits and an abandoned flush returns a
+  retryable error instead. A strict write co-resident with a stalled prefix
+  instead takes `WriteError::AckTimeout` once the request's ack deadline
+  elapses while its flush is still queued for the permit, even though its own
+  prefix stayed healthy.
 - Never described as durable. No commit token is returned.
 
 Rejection: admission failures (limits, auth, quota) reject before buffering
