@@ -8,8 +8,9 @@ name: bench-compare
 #  - It runs ONLY on the self-hosted reference runner where the baseline was
 #    recorded (label `ravel-reference`). A criterion timing number is only
 #    comparable to a baseline taken on the same hardware; on a GitHub-hosted
-#    runner the comparison would be noise. When the runner is offline the job is
-#    skipped, not failed.
+#    runner the comparison would be noise. When the runner is offline the job
+#    stays queued until a runner picks it up or GitHub times the queue out; it
+#    is not skipped.
 #  - It is ADVISORY by default: `bench-tier-b.sh compare` without `--enforce`
 #    exits 0 regardless of the result, so this lane never blocks a merge. It
 #    posts a comment and stops there.

@@ -102,6 +102,10 @@ case "$cmd" in
     python3 "$ROOT/scripts/bench-compare.py" collect \
       --criterion-dir "$CRITERION_DIR" --out "$current" \
       --label "current run ($(uname -m), $(nproc) cores)"
+    # .gate-logs/ is gitignored and created by gates.sh, so a fresh CI
+    # checkout does not have it. bench-compare.py opens --out-md for write
+    # with no fallback, and this script runs under set -euo pipefail.
+    mkdir -p "$ROOT/.gate-logs"
     python3 "$ROOT/scripts/bench-compare.py" compare \
       --baseline "$baseline" --current "$current" \
       --threshold "$BENCH_THRESHOLD" ${enforce:+$enforce} \
