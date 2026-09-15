@@ -238,6 +238,27 @@ future-dated record drops out just like a stale past-dated one. Worker
 identity comes from the key, not the record body, so a record whose body
 disagrees with its key cannot smuggle a false identity into the live set.
 
+That listing is also what keeps the prefix bounded. A node that drains
+gracefully deletes its own record on the way out, but one lost to a crash, a
+kill or a node failure cannot, so two rules apply to every key the listing
+returns. A key whose modification time is already older than the liveness
+window is not fetched at all: its stamp can only be older still, so the read
+cost of a coordinator tracks the live fleet rather than every node that ever
+ran. A key older than twice that window is deleted, from the same listing, so
+the delete needs no listing of its own. The doubled width is the clock-skew margin
+between the object store's clock and the reader's; a live node reaped by a
+skewed clock reappears on its next beat, at most one interval later. A store
+that reports no modification time, or one in the future, gets neither rule:
+such a key is read normally and is never deleted.
+
+The delete needs a permission the shipped `deploy/iam/query.json` does not
+grant. That template allows no `s3:DeleteObject` anywhere, so on a deployment
+using it the reap is denied per key and logged as a warning the process
+continues past: the GET is still skipped, but the prefix does not shrink. Grant
+`s3:DeleteObject` on `sys/query/workers/*` to the query role for the reap to
+take effect. The maintain and admission families carry the same gap on their
+own worker prefixes.
+
 To place a slice, the coordinator rendezvous-hashes the slice's
 `(tenant_hash, signal, shard)` unit over the live set and takes the top owner,
 then the next, and so on, giving a deterministic failover order. Two

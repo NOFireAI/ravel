@@ -32,6 +32,46 @@
 //!
 //! No production caller wires this yet by design; #864 (codec + engine seam)
 //! and #865 (server surface) consume it.
+//!
+//! # Bounding the prefix (issue #1761)
+//!
+//! [`QueryWorkers::delete_heartbeat`] removes a key on a graceful drain and on
+//! no other path, so a worker lost to a panic, a kill, an out-of-memory event
+//! or a node loss left its key behind forever and every later [`live_set`] paid
+//! a GET for it. The two bounds [`crate::worker_set`] applies to the maintain
+//! prefix for issue #1679 apply here unchanged, over the same shared
+//! predicates:
+//!
+//! - [`live_set`] skips the GET for a key the LIST result already shows as
+//!   older than the liveness window (`worker_set::mtime_stale`). A record's
+//!   `started_unix_ns` is stamped no later than the write that set the
+//!   modification time, so a key that looks past the window by its modification
+//!   time can only hold a stamp at least as old.
+//! - A key past the *reap horizon* (`worker_set::reap_horizon_ns`: the liveness
+//!   window widened by `worker_set::REAP_WINDOW_FACTOR`) is deleted, which
+//!   bounds the LIST itself. The extra width is the clock-skew margin between
+//!   the object store's clock (which sets the modification time) and the
+//!   reader's. [`QueryWorkers::live_set_read`] returns those keys from the SAME
+//!   listing it makes for the live set, and the heartbeat loop deletes them
+//!   through [`QueryWorkers::reap_keys`], so the reap costs no listing of its
+//!   own. [`QueryWorkers::reap_dead_workers`] is the standalone form for a
+//!   caller that is not already reading the live set, and it does pay one
+//!   listing. Reaping is idempotent and costs a live-but-skewed worker at most
+//!   one heartbeat interval of invisibility, since it rewrites its key every
+//!   `H`.
+//!
+//! The reap needs `s3:DeleteObject` on this prefix, which the shipped query
+//! role does not have: `deploy/iam/query.json` grants no delete at all. Under
+//! that template every delete here is denied and logged, the GET-skip still
+//! applies, and the prefix stays as large as it was. See the tracking issue on
+//! the IAM templates before relying on the bound.
+//!
+//! A backend reporting no usable modification time (`<= 0`) gets neither
+//! treatment: its keys are read as before and never reaped. The same holds for
+//! a modification time in the future, which means the store's clock runs ahead
+//! of this reader's and is a reason to read the key rather than to drop it.
+//!
+//! [`live_set`]: QueryWorkers::live_set
 
 use std::time::Duration;
 
@@ -39,7 +79,9 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, Stor
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::worker_set::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LIVENESS_FACTOR, is_stale};
+use crate::worker_set::{
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LIVENESS_FACTOR, is_stale, mtime_stale, reap_horizon_ns,
+};
 
 /// The prefix every query-worker's heartbeat key lives under (ADR-0071): a new
 /// additive control-plane prefix under `sys/query/`, sibling to the maintain
@@ -127,6 +169,18 @@ pub struct QueryWorkers {
     protocol_version: u32,
     heartbeat_interval: Duration,
     liveness_factor: u32,
+}
+
+/// What one listing of `sys/query/workers/` yields: the live set, and the keys
+/// past the reap horizon. Returned together because the heartbeat loop needs
+/// both on the same cadence over the same prefix, so a second listing would be
+/// pure cost. Mirrors [`crate::worker_set::LiveSetRead`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LiveSetRead {
+    /// Workers inside the liveness window, including this process.
+    pub live: Vec<QueryWorkerRecord>,
+    /// Keys past the reap horizon, for [`QueryWorkers::reap_keys`] to delete.
+    pub reapable: Vec<String>,
 }
 
 impl QueryWorkers {
@@ -274,14 +328,36 @@ impl QueryWorkers {
     /// self-correcting next interval); only a failed LIST or GET is an `Err`,
     /// which the caller treats fail-open, never freezing fan-out on a transient
     /// read fault.
+    ///
+    /// A key the LIST result already shows as past the liveness window costs no
+    /// GET at all (issue #1761; see the [module docs](self)), so the read cost
+    /// tracks the live fleet rather than every query worker that ever ran.
     pub async fn live_set(
         &self,
         store: &dyn ObjectStoreBackend,
         now_ns: i64,
     ) -> Result<Vec<QueryWorkerRecord>, StoreError> {
+        Ok(self.live_set_read(store, now_ns).await?.live)
+    }
+
+    /// The live set AND the keys past the reap horizon, from ONE listing
+    /// (issue #1761).
+    ///
+    /// The heartbeat loop needs both every interval, and the prefix is the
+    /// same. Returning them together is what makes the reap free rather than a
+    /// second LIST; [`crate::worker_set::WorkerSet::live_set_read`] is the same
+    /// shape for the same reason. A caller that wants only one of the two still
+    /// pays one listing, never two.
+    pub async fn live_set_read(
+        &self,
+        store: &dyn ObjectStoreBackend,
+        now_ns: i64,
+    ) -> Result<LiveSetRead, StoreError> {
         let window = self.liveness_window_ns();
+        let horizon = reap_horizon_ns(window);
         let objects = list_all(store, QUERY_WORKERS_PREFIX).await?;
         let mut live = vec![self.record_at(now_ns)];
+        let mut reapable = Vec::new();
         for meta in objects {
             let Some(pid) = process_id_of(&meta.key) else {
                 tracing::debug!(
@@ -291,6 +367,17 @@ impl QueryWorkers {
                 continue;
             };
             if pid == self.process_id {
+                continue;
+            }
+            if mtime_stale(now_ns, meta.last_modified_unix_ms, window) {
+                // Already past the liveness window by the LIST's own metadata:
+                // the body could only be older still, so it costs no GET
+                // (issue #1761). Past the wider reap horizon it is also this
+                // listing's reap candidate, collected here so the delete needs
+                // no listing of its own.
+                if mtime_stale(now_ns, meta.last_modified_unix_ms, horizon) {
+                    reapable.push(meta.key.clone());
+                }
                 continue;
             }
             let got = store.get(&meta.key, GetRange::Full).await?;
@@ -318,19 +405,83 @@ impl QueryWorkers {
         }
         live.sort_unstable_by(|a, b| a.process_id.cmp(&b.process_id));
         live.dedup_by(|a, b| a.process_id == b.process_id);
-        Ok(live)
+        Ok(LiveSetRead { live, reapable })
+    }
+
+    /// Delete the keys a [`live_set_read`] already identified. Issues no
+    /// listing of its own, which is the whole point of taking them as an
+    /// argument.
+    ///
+    /// `delete` is idempotent, so several coordinators reaping the same dead
+    /// key concurrently is not a race. A failed individual delete is logged and
+    /// retried by whichever process next lists the prefix, since a key that
+    /// outlives one tick costs one listing entry and nothing else.
+    ///
+    /// [`live_set_read`]: Self::live_set_read
+    pub async fn reap_keys(&self, store: &dyn ObjectStoreBackend, keys: &[String]) -> u64 {
+        let mut reaped = 0;
+        for key in keys {
+            match store.delete(key).await {
+                Ok(()) => reaped += 1,
+                Err(err) => tracing::warn!(
+                    key = %key,
+                    error = %err,
+                    "query_workers: reaping a dead worker record failed; retried next tick"
+                ),
+            }
+        }
+        reaped
+    }
+
+    /// Delete every record under `sys/query/workers/` that is past the reap
+    /// horizon (issue #1761), judged from the modification time the LIST result
+    /// already carries, and return how many were deleted.
+    ///
+    /// This is the standalone form and it costs one listing. The heartbeat loop
+    /// does NOT use it: that loop already calls [`live_set_read`], which returns
+    /// the same candidates from the listing it was making anyway, so it reaps
+    /// through [`reap_keys`] and pays nothing extra. Use this where no live-set
+    /// read is happening.
+    ///
+    /// Never deletes this process's own key, never deletes a key that does not
+    /// parse as `sys/query/workers/<uuid>` (something else's key under a prefix
+    /// this process does not own is not this function's to reap), and never
+    /// deletes a key whose modification time the backend reports as unknown or
+    /// as being in the future. The horizon is `reap_horizon_ns` of the liveness
+    /// window, so a worker whose record merely aged out of the live set keeps a
+    /// full extra window of grace against clock skew before it is reaped.
+    ///
+    /// A failed LIST is an `Err` the caller can treat fail-open; a failed
+    /// individual delete is logged and retried by whichever process next lists
+    /// the prefix.
+    ///
+    /// [`live_set_read`]: Self::live_set_read
+    /// [`reap_keys`]: Self::reap_keys
+    pub async fn reap_dead_workers(
+        &self,
+        store: &dyn ObjectStoreBackend,
+        now_ns: i64,
+    ) -> Result<u64, StoreError> {
+        let read = self.live_set_read(store, now_ns).await?;
+        Ok(self.reap_keys(store, &read.reapable).await)
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
 
     use super::*;
 
     const H: Duration = Duration::from_secs(60);
     const H_NS: i64 = 60 * 1_000_000_000;
+    /// `H` in milliseconds. The default liveness window is `3 * H_MS`
+    /// (`DEFAULT_LIVENESS_FACTOR` is 3), which is how the tests spell it.
+    const H_MS: u64 = 60 * 1_000;
 
     fn worker() -> QueryWorkers {
         QueryWorkers::new(
@@ -340,6 +491,38 @@ mod tests {
             H,
             DEFAULT_LIVENESS_FACTOR,
         )
+    }
+
+    /// Write `worker`'s heartbeat so the object carries a *store* modification
+    /// time of `mtime_ms`, which is what the LIST result reports and therefore
+    /// what the read-side skip and the reaper judge against. The oracle's clock
+    /// is left at `restore_ms`, so anything written afterwards lands current.
+    async fn beat_with_mtime(
+        memory: &MemoryStore,
+        store: &dyn ObjectStoreBackend,
+        worker: &QueryWorkers,
+        mtime_ms: u64,
+        restore_ms: u64,
+        stamp_ns: i64,
+    ) {
+        memory.set_clock_ms(mtime_ms);
+        worker
+            .write_heartbeat(store, stamp_ns)
+            .await
+            .expect("seed heartbeat");
+        memory.set_clock_ms(restore_ms);
+    }
+
+    /// Every key currently under `sys/query/workers/`, sorted.
+    async fn query_worker_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
+        let mut keys: Vec<String> = list_all(store, QUERY_WORKERS_PREFIX)
+            .await
+            .expect("list query workers prefix")
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect();
+        keys.sort();
+        keys
     }
 
     /// A record round-trips through its JSON encoding unchanged.
@@ -546,5 +729,220 @@ mod tests {
             "a far-future-dated record must not read as live"
         );
         assert_eq!(live.len(), 1, "only self survives");
+    }
+
+    /// `live_set` pays one GET per LIVE sibling, not per listed key (issue
+    /// #1761): 500 dead keys and 2 live ones sit under the prefix, and the 4th
+    /// GET under it is scripted to fail, so a cycle that fetches any key the
+    /// LIST already showed as stale surfaces as a fired fault. Without the
+    /// modification-time skip the GET count is one per listed key, so it scales
+    /// with every query worker that ever ran.
+    #[tokio::test]
+    async fn live_set_costs_no_get_for_a_key_the_list_shows_stale() {
+        let now_ns = 1_000 * H_NS;
+        let now_ms = 1_000 * H_MS;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Transient("a 3rd query-workers-prefix GET".into()),
+            )
+            .with_key_contains(QUERY_WORKERS_PREFIX)
+            .with_occurrence(Occurrence::Nth(3)),
+        );
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        store.inner().set_clock_ms(now_ms);
+
+        let me = worker();
+        let live_a = worker();
+        let live_b = worker();
+        beat_with_mtime(store.inner(), &store, &me, now_ms, now_ms, now_ns).await;
+        beat_with_mtime(store.inner(), &store, &live_a, now_ms, now_ms, now_ns).await;
+        beat_with_mtime(store.inner(), &store, &live_b, now_ms, now_ms, now_ns).await;
+        for _ in 0..500 {
+            beat_with_mtime(
+                store.inner(),
+                &store,
+                &worker(),
+                now_ms - 10 * H_MS,
+                now_ms,
+                now_ns - 10 * H_NS,
+            )
+            .await;
+        }
+
+        let read = me.live_set(&store, now_ns).await;
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Transient),
+            0,
+            "a 3rd GET under the query-workers prefix never happened: at most 2, one \
+             per live sibling, with self skipped and the stale keys costing none"
+        );
+        let live = read.expect("live set");
+        let ids: Vec<&str> = live.iter().map(|r| r.process_id.as_str()).collect();
+        assert!(
+            ids.contains(&live_a.process_id().to_string().as_str()),
+            "the first live sibling is in the set"
+        );
+        assert!(
+            ids.contains(&live_b.process_id().to_string().as_str()),
+            "the second live sibling is in the set"
+        );
+        assert_eq!(
+            live.len(),
+            3,
+            "self plus the two live siblings, nobody else"
+        );
+    }
+
+    /// The reaper deletes exactly the keys past the reap horizon (issue #1761):
+    /// dead workers go, a worker inside the clock-skew margin stays even though
+    /// it is already out of the live set, a fresh worker stays, a key whose
+    /// modification time is in the future stays, this process's own key stays,
+    /// and a key that is not `sys/query/workers/<uuid>` is left alone.
+    async fn reap_case(memory: MemoryStore) {
+        let now_ns = 1_000 * H_NS;
+        let now_ms = 1_000 * H_MS;
+        let store = memory;
+        store.set_clock_ms(now_ms);
+
+        let me = worker();
+        let fresh = worker();
+        // 4 * H old: past the 3 * H liveness window, inside the 6 * H horizon.
+        let skewed = worker();
+        // A store clock running ahead of this reader's: read, never reaped.
+        let future = worker();
+        let dead: Vec<QueryWorkers> = (0..3).map(|_| worker()).collect();
+
+        beat_with_mtime(&store, &store, &me, now_ms, now_ms, now_ns).await;
+        beat_with_mtime(&store, &store, &fresh, now_ms, now_ms, now_ns).await;
+        beat_with_mtime(
+            &store,
+            &store,
+            &skewed,
+            now_ms - 4 * H_MS,
+            now_ms,
+            now_ns - 4 * H_NS,
+        )
+        .await;
+        beat_with_mtime(&store, &store, &future, now_ms + 100 * H_MS, now_ms, now_ns).await;
+        for d in &dead {
+            beat_with_mtime(
+                &store,
+                &store,
+                d,
+                now_ms - 10 * H_MS,
+                now_ms,
+                now_ns - 10 * H_NS,
+            )
+            .await;
+        }
+        // A key under the same prefix that this mechanism does not own: never
+        // reaped, however old it looks.
+        store.set_clock_ms(now_ms - 100 * H_MS);
+        store
+            .put(
+                &format!("{QUERY_WORKERS_PREFIX}not-a-uuid"),
+                b"x".to_vec().into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("seed foreign key");
+        store.set_clock_ms(now_ms);
+
+        let reaped = me.reap_dead_workers(&store, now_ns).await.expect("reap");
+        assert_eq!(reaped, 3, "exactly the three keys past the horizon");
+
+        let mut expected = vec![
+            query_worker_key(&me.process_id().to_string()),
+            query_worker_key(&fresh.process_id().to_string()),
+            query_worker_key(&skewed.process_id().to_string()),
+            query_worker_key(&future.process_id().to_string()),
+            format!("{QUERY_WORKERS_PREFIX}not-a-uuid"),
+        ];
+        expected.sort();
+        assert_eq!(
+            query_worker_keys(&store).await,
+            expected,
+            "own, fresh, inside-the-margin, future-dated and foreign keys all survive"
+        );
+
+        // Reaping again is idempotent: nothing left is past the horizon.
+        assert_eq!(
+            me.reap_dead_workers(&store, now_ns)
+                .await
+                .expect("second reap"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_query_worker_heartbeats_are_reaped_past_the_horizon() {
+        reap_case(MemoryStore::new()).await;
+    }
+
+    /// The same case over a listing that pages: a reaper that only ever sees
+    /// the first page leaves most of a long-lived prefix behind.
+    #[tokio::test]
+    async fn dead_query_worker_heartbeats_are_reaped_across_list_pages() {
+        reap_case(MemoryStore::with_page_size(2)).await;
+    }
+
+    /// The tick's listing serves both purposes: `live_set_read` returns the
+    /// live set AND the reap candidates from ONE listing, so reaping costs no
+    /// second LIST of the same prefix.
+    ///
+    /// Asserted through the FaultStore's LIST counter, because that is the
+    /// claim: one listing, not two.
+    #[tokio::test]
+    async fn one_listing_serves_both_the_live_set_and_the_reap() {
+        let now_ns = 1_000 * H_NS;
+        let now_ms = 1_000 * H_MS;
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(now_ms);
+
+        let me = worker();
+        let dead = worker();
+
+        // Seed through the memory store directly: the rule below matches
+        // `list`, and seeding is `put`, but going through the plain store
+        // keeps the scripted occurrence counting only the read path.
+        beat_with_mtime(&memory, &memory, &me, now_ms, now_ms, now_ns).await;
+        beat_with_mtime(
+            &memory,
+            &memory,
+            &dead,
+            now_ms - 10 * H_MS,
+            now_ms,
+            now_ns - 10 * H_NS,
+        )
+        .await;
+
+        // Fault the SECOND listing of this prefix: a shape that called
+        // `live_set` and then `reap_dead_workers` would list twice and trip it.
+        let store = FaultStore::new(
+            memory,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("a second listing".into()),
+                )
+                .with_occurrence(Occurrence::Nth(2)),
+            ),
+        );
+
+        let read = me.live_set_read(&store, now_ns).await.expect("one read");
+        let reaped = me.reap_keys(&store, &read.reapable).await;
+
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Transient),
+            0,
+            "the live set and the reap must come from one listing, not two"
+        );
+        assert_eq!(reaped, 1, "the dead worker's key was reaped");
+        assert_eq!(read.live.len(), 1, "only this process is live");
+        assert_eq!(read.live[0].process_id, me.process_id().to_string());
     }
 }
