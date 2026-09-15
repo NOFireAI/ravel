@@ -33,12 +33,19 @@ rc=0
 bash "${GATES}" --flag-doc-guard-only "${REAL_CONFIG}" >/dev/null 2>&1 || rc=$?
 check_eq "the real config.rs passes the flag-doc guard" "0" "${rc}"
 
-# === (b) known-bad: a copy with "gzip" removed from the one sentence that
-#     pairs it with "inflate" in max_inflight_ingest_requests's doc block.
-#     The doc still claims a memory bound (it still says "resident memory"
-#     and still contains the unrelated word "decompression" from Remote
-#     Write's cap, in a different sentence with no "gzip" nearby), but the
-#     gzip-qualified inflate/decompress sentence the guard requires is gone.
+# === (b) known-bad: a copy with the gzip qualification stripped from the
+#     FIRST doc block that carries it. The doc still claims a memory bound,
+#     and other blocks keep their own qualification, so this still pins the
+#     guard's per-block scan rather than a file-wide one: a file-wide check
+#     would pass on the remaining blocks' wording.
+#
+#     Found by the word, not by one exact sentence. The previous version
+#     sed'd a literal `OTLP HTTP gzip inflate, which`; config.rs was reworded
+#     to `the OTLP HTTP gzip inflate and the Remote`, the sed became a no-op,
+#     and the fixture equalled the original. The suite's own
+#     fixture-differs assertion caught that and had been failing ever since --
+#     unseen, because the suite ran in no CI job (issue #1834). A fixture
+#     pinned to prose rots the first time the prose is edited.
 tmproot="$(mktemp -d "${TMPDIR:-/tmp}/flag-doc-guard-test.XXXXXX")"
 if [[ ! -d "${tmproot}" ]]; then
   echo "FAIL  could not create a temp dir for the fixture" >&2
@@ -51,8 +58,20 @@ if [[ ! -f "${bad_config}" ]]; then
   echo "FAIL  cp did not produce the fixture at ${bad_config}" >&2
   exit 1
 fi
-sed -i.bak 's/OTLP HTTP gzip inflate, which/OTLP HTTP transient, which/' "${bad_config}"
-rm -f "${bad_config}.bak"
+# Strip `gzip` from the first doc block that pairs it with inflate or
+# decompress, leaving every later block intact.
+awk '
+  /^[[:space:]]*\/\/\// { in_doc = 1 }
+  !/^[[:space:]]*\/\/\// { if (in_doc && done_block) done = 1; in_doc = 0; done_block = 0 }
+  {
+    if (!done && in_doc && tolower($0) ~ /gzip/) {
+      gsub(/gzip/, "compressed", $0)
+      gsub(/GZIP/, "COMPRESSED", $0)
+      done_block = 1
+    }
+    print
+  }
+' "${REAL_CONFIG}" >"${bad_config}"
 if cmp -s "${REAL_CONFIG}" "${bad_config}"; then
   echo "FAIL  fixture is identical to ${REAL_CONFIG}; the sed edit did not \
 strip the gzip qualification, so the known-bad case would test nothing" >&2
