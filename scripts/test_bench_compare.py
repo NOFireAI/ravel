@@ -59,11 +59,17 @@ class _CriterionCase(unittest.TestCase):
             _estimates(os.path.join(root, bench_id, "new"), median, mean)
         return root
 
-    def _collect(self, name, values, label, knobs=None):
+    # Every real collect stamps its knobs, because bench-tier-b.sh always
+    # passes them. Tests that are not about knob drift take this default so
+    # they exercise the same shape a real run has; pass knobs=[] for the
+    # unstamped case.
+    DEFAULT_KNOBS = ("BENCH_SAMPLE_SIZE=10", "RAVEL_BENCH_MAX_SERIES=2000")
+
+    def _collect(self, name, values, label, knobs=DEFAULT_KNOBS):
         root = self._make_criterion(name, values)
         out = os.path.join(self.tmp, f"{name}.json")
         extra = []
-        for pair in knobs or []:
+        for pair in knobs:
             extra += ["--knob", pair]
         res = _run("collect", "--criterion-dir", root, "--out", out,
                    "--label", label, *extra)
@@ -135,6 +141,11 @@ class KnobDriftTest(_CriterionCase):
             doc["_meta"]["knobs"],
             {"RAVEL_BENCH_MAX_SERIES": "2000", "BENCH_WARMUP": "1"},
         )
+        # A collect given no knobs stamps no key at all, which is what makes
+        # "not recorded" distinguishable from "recorded as empty".
+        bare = self._collect("bare", {"g/a_2000": (100.0, 100.0)}, "bare", knobs=[])
+        with open(bare, encoding="utf-8") as fh:
+            self.assertNotIn("knobs", json.load(fh)["_meta"])
         cur = self._collect("cur", {"g/a_2000": (101.0, 101.0)}, "cur",
                             knobs=["RAVEL_BENCH_MAX_SERIES=2000", "BENCH_WARMUP=1"])
         res = _run("compare", "--baseline", base, "--current", cur,
@@ -162,16 +173,29 @@ class KnobDriftTest(_CriterionCase):
         self.assertIn("MISMATCH", adv.stdout)
 
     def test_unrecorded_knobs_report_unknown_not_agreement(self):
-        base = self._collect("base", {"g/a": (100.0, 100.0)}, "base")
+        base = self._collect("base", {"g/a": (100.0, 100.0)}, "base", knobs=[])
         cur = self._collect("cur", {"g/a": (100.0, 100.0)}, "cur",
                             knobs=["RAVEL_BENCH_MAX_SERIES=2000"])
-        res = _run("compare", "--baseline", base, "--current", cur,
+        # Cannot check is not the same as checked and agreed. Advisory says so
+        # and stays green; enforcing refuses, because a baseline whose knobs
+        # were never recorded cannot be shown to have been measured the same
+        # way, and every other signal in this pair reads as a clean pass.
+        adv = _run("compare", "--baseline", base, "--current", cur, "--threshold", "15")
+        self.assertEqual(adv.returncode, 0, adv.stdout)
+        self.assertIn("NOT RECORDED on the baseline file", adv.stdout)
+        self.assertNotIn("MISMATCH", adv.stdout)
+        enf = _run("compare", "--baseline", base, "--current", cur,
                    "--threshold", "15", "--enforce")
-        # Cannot check is not the same as checked and agreed: it says so, and
-        # it does not fail a run whose baseline predates the stamping.
-        self.assertEqual(res.returncode, 0, res.stdout)
-        self.assertIn("NOT RECORDED on the baseline file", res.stdout)
-        self.assertNotIn("MISMATCH", res.stdout)
+        self.assertEqual(enf.returncode, 1, enf.stdout)
+        self.assertIn("NOT RECORDED on the baseline file", enf.stdout)
+
+    def test_unrecorded_on_both_sides_names_both(self):
+        base = self._collect("base", {"g/a": (100.0, 100.0)}, "base", knobs=[])
+        cur = self._collect("cur", {"g/a": (100.0, 100.0)}, "cur", knobs=[])
+        enf = _run("compare", "--baseline", base, "--current", cur,
+                   "--threshold", "15", "--enforce")
+        self.assertEqual(enf.returncode, 1, enf.stdout)
+        self.assertIn("NOT RECORDED on the baseline and current file", enf.stdout)
 
     def test_malformed_knob_is_refused(self):
         root = self._make_criterion("m", {"g/a": (100.0, 100.0)})

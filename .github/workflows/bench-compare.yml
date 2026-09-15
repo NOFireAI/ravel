@@ -44,6 +44,16 @@ concurrency:
 
 jobs:
   bench-compare:
+    # Same-repository pull requests only. This repository is public, so a fork
+    # can open a pull request, and this job checks out the head and runs cargo
+    # bench from it on a persistent self-hosted box that holds a rust toolchain,
+    # a cargo cache, and a token with pull-requests: write. Running fork code
+    # there is arbitrary code execution on that hardware. A workflow_dispatch
+    # run has no head repository to compare and is always allowed: only a
+    # collaborator can start one.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     # Self-hosted reference runner only (ADR-0070 decision 3). With no such
     # runner online the job stays queued until one appears or GitHub times the
     # queue out; it is not skipped.

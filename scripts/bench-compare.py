@@ -129,7 +129,9 @@ def _knob_drift(base_doc, cur_doc):
             side = "baseline and current"
         return "unknown", [
             f"- sampling knobs: NOT RECORDED on the {side} file, so this "
-            "comparison cannot be checked for sampling drift"
+            "comparison cannot be checked for sampling drift. An enforcing run "
+            "refuses this pair: re-record the baseline through "
+            "`bench-tier-b.sh record`, which stamps them."
         ]
     if base == cur:
         return "match", []
@@ -228,6 +230,9 @@ def compare(args):
         lines.append(f"**{len(missing)} baseline benchmark(s) missing from the run.**")
     elif knob_state == "differ":
         lines.append("**The sampling knobs differ, so the two runs are not comparable.**")
+    elif knob_state == "unknown":
+        lines.append("**The sampling knobs are not recorded on both sides, so the two runs "
+                     "cannot be shown to be comparable.**")
     else:
         lines.append(f"**No regression past +{threshold:g}%.**")
     lines.append("")
@@ -242,7 +247,11 @@ def compare(args):
             fh.write(report)
     sys.stdout.write(report)
 
-    fail = bool(regressions) or bool(missing) or knob_state == "differ"
+    # "unknown" fails an enforcing run as well as "differ". A baseline whose
+    # sampling knobs were never recorded cannot be shown to have been measured
+    # the same way, and enforcing against it would report agreement it never
+    # checked. Advisory runs say so and still exit 0, per ADR-0070 decision 3.
+    fail = bool(regressions) or bool(missing) or knob_state in ("differ", "unknown")
     if args.enforce and fail:
         sys.exit(1)
     sys.exit(0)
