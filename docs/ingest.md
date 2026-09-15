@@ -1142,7 +1142,7 @@ Counters recorded today:
   retryable.
 - `abandoned_queue_deadline`: flush abandoned because its flush-open deadline
   elapsed while it was queued for a `max_inflight_flushes` permit, before any
-  store call (`WriteError::Abandoned`, issue #1739). Contention signal, not an
+  store call (`WriteError::Abandoned`). Contention signal, not an
   object-store one; retryable. The abandonment deadline is re-derived from
   permit grant, so this fires only when a flush task is scheduled after its
   flush-open deadline already passed, never for a mere queue wait.
