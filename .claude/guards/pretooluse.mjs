@@ -45,8 +45,15 @@ function readStdin() {
 // a change to the guard is safe, and `[a-z0-9-]+\.sh` did not match
 // `disk-watchdog.test.sh`, whose extra dot falls outside the class. Both
 // guard directories are listed; the hook itself lives under `.claude`.
+// cargo's own flags sit BEFORE the subcommand (`cargo --locked test`,
+// `cargo +nightly clippy`, `cargo -q test`), and a pattern anchored on
+// `cargo\s+(test|clippy|...)` matches none of them: `cargo --locked test |
+// tail -1` was allowed, which is the exact command this rule exists to
+// refuse. Flags take an `=value` form only here; a flag with a separate
+// value argument would need the value consumed too, and over-consuming
+// turns a false allow into a false deny.
 const GATE_HEAD =
-  /^(cargo\s+(clippy|test|nextest|fmt|build|check)|(\.\/)?(scripts\/((gates|affected-tests|verify-dispatch-gates)\.sh|guards\/[a-z0-9.-]+\.sh)|\.claude\/guards\/[a-z0-9.-]+\.sh))\b/;
+  /^(cargo(\s+(\+[A-Za-z0-9._-]+|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+(clippy|test|nextest|fmt|build|check)|(\.\/)?(scripts\/((gates|affected-tests|verify-dispatch-gates)\.sh|guards\/[a-z0-9.-]+\.sh)|\.claude\/guards\/[a-z0-9.-]+\.sh))\b/;
 // Things that may legitimately precede a gate on the same command line.
 // A bare assignment may precede a gate (`FOO=1 cargo test`). One plain
 // alternative for it: an earlier version added a separate `NAME=$(`
