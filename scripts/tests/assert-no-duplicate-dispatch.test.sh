@@ -158,7 +158,7 @@ check_eq "Fixes: #421 does not close #42 (0)" "0" "${rc}"
 # change was written to remove. GitHub closes nothing on `hotfix #42`.
 # Mutation: drop the `(^|[^0-9A-Za-z])` prefix from closing_kw; each of these
 # then refuses.
-for word in "hotfix" "bugfix" "suffix:" "prefix" "affixes" "disclosed" "unresolved"; do
+for word in "hotfix" "bugfix" "suffix:" "prefix" "postfix" "affixes" "disclosed" "unresolved"; do
   d="$(new_case "lead_$(printf '%s' "${word}" | tr -cd '[:alnum:]')")"
   printf '[{"number":24,"title":"work","state":"OPEN","body":"%s #42","headRefName":"l","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' "${word}" >"${d}/prs.json"
   out="$(run_in "${d}" "${GUARD}" --issue 42)"; rc=$?

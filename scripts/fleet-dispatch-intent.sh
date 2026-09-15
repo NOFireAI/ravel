@@ -119,8 +119,15 @@ case "${mode}" in
     # ceiling kill). Say so in the spec when you use it.
     if [[ "${ticket}" =~ ^#?[0-9]+$ && "${DISPATCH_SKIP_DUPLICATE_CHECK:-0}" != "1" ]]; then
       dup_rc=0
-      "${script_dir}/guards/assert-no-duplicate-dispatch.sh" \
-        --issue "${ticket#\#}" ${DISPATCH_PATHS:+--paths "${DISPATCH_PATHS}"} >&2 || dup_rc=$?
+      # An array rather than `${VAR:+--paths "${VAR}"}`. Both are correct under
+      # bash, which is what runs this file: the inner quotes group, so a value
+      # containing a space stays one argument. They are NOT equivalent under
+      # zsh, where the whole alternate collapses into a single `--paths value`
+      # argument that the guard rejects with 64. The array behaves the same in
+      # both, and reading it needs no knowledge of which shell got here.
+      dup_args=(--issue "${ticket#\#}")
+      [[ -n "${DISPATCH_PATHS:-}" ]] && dup_args+=(--paths "${DISPATCH_PATHS}")
+      "${script_dir}/guards/assert-no-duplicate-dispatch.sh" "${dup_args[@]}" >&2 || dup_rc=$?
       if [[ ${dup_rc} -ne 0 ]]; then
         echo "fleet-dispatch-intent.sh: duplicate-work guard exited ${dup_rc}; refusing to dispatch." >&2
         echo "  65 = a pull request already addresses #${ticket#\#}; 66 = an open pull request is on" >&2
