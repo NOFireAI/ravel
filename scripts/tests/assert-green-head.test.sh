@@ -166,6 +166,35 @@ out="$(run_in "${d}" "${GUARD}" 10)"; rc=$?
 check_eq "the same signature twice escalates (1)" "1" "${rc}"
 check_contains "and says it is real" "real failure" "${out}"
 
+# A log with nothing recognisable in it still produces a signature, from the
+# job and step names, and that signature cannot separate two failures in the
+# same step. Say so rather than let the next run's "same signature twice"
+# escalation rest on it silently.
+# Mutation: drop the coarse branch.
+d="$(new_case coarse)"
+pr_json "${sha}" "$(checkrun check COMPLETED FAILURE)" >"${d}/pr.json"
+printf '4242\tci\n' >"${d}/runs.txt"
+printf 'check\tRun tests\n' >"${d}/jobs-4242.txt"
+printf 'nothing recognisable here, just noise\n' >"${d}/log-4242.txt"
+out="$(run_in "${d}" "${GUARD}" 10)"; rc=$?
+check_eq "an unparseable log still asks for a rerun (3)" "3" "${rc}"
+check_contains "and says the signature is job-level only" "COARSE" "${out}"
+
+# ANSI colouring around a failure line must not hide it: this repo sets
+# CARGO_TERM_COLOR: always, and the escape sits outside the matched text.
+d="$(new_case ansi)"
+pr_json "${sha}" "$(checkrun check COMPLETED FAILURE)" >"${d}/pr.json"
+printf '4242\tci\n' >"${d}/runs.txt"
+printf 'check\tRun tests\n' >"${d}/jobs-4242.txt"
+# Shaped like a real runner line: a timestamp, then cargo's colour codes
+# wrapping the token itself, which is what `CARGO_TERM_COLOR: always` emits.
+printf '2026-09-15T10:00:00.0000000Z \033[0;31mtest ravel_sql::tests::alpha ... FAILED\033[0m\n' >"${d}/log-4242.txt"
+out="$(run_in "${d}" "${GUARD}" 10)"; rc=$?
+check_eq "a colour-wrapped failure still parses (3)" "3" "${rc}"
+check_contains "and the test name is in the signature" "ravel_sql::tests::alpha" "${out}"
+check_eq "so it is not reported coarse" "" \
+  "$(printf '%s' "${out}" | grep -o COARSE || true)"
+
 # --- two different failures = a flake, and the budget is spent ----------
 d="$(new_case flake)"
 pr_json "${sha}" "$(checkrun check COMPLETED FAILURE)" >"${d}/pr.json"

@@ -142,7 +142,9 @@ runs="$(ask gh run list --repo "${repo}" --branch "${head_branch}" --limit 50 \
   --jq ".[] | select(.headSha == \"${head_sha}\" and (.conclusion == \"failure\" or .conclusion == \"startup_failure\")) | \"\(.databaseId)\t\(.workflowName)\"")"
 
 signature_lines=""
+coarse=0
 run_ids=()
+esc=$'\033'
 if [[ -n "${runs}" ]]; then
   while IFS=$'\t' read -r run_id wf; do
     [[ -z "${run_id}" ]] && continue
@@ -158,10 +160,27 @@ if [[ -n "${runs}" ]]; then
     # defects the same signature.
     log="$(gh run view "${run_id}" --repo "${repo}" --log-failed 2>/dev/null || true)"
     if [[ -n "${log}" ]]; then
-      tests="$(grep -oE '(^|[^a-zA-Z0-9_])(test [a-zA-Z0-9_:]+ \.\.\. FAILED|thread .[^.]*. panicked|error\[E[0-9]+\]|assertion .failed|FAILED \[[^]]*\] [a-zA-Z0-9_:]+)' <<<"${log}" |
-        sed 's/^[^a-zA-Z0-9_]*//' | sort -u | head -40 || true)"
+      # Colour codes first. `CARGO_TERM_COLOR: always` in ci.yml puts an SGR
+      # sequence right before the token, and the sequence ENDS in a letter
+      # (`\033[0;31m`), so the word-boundary this pattern opens with sees `m`
+      # and matches nothing. The failure is silent: the signature quietly
+      # degrades to job-level and two different failures then read as one.
+      log="$(printf '%s' "${log}" | LC_ALL=C sed "s/${esc}\\[[0-9;]*[A-Za-z]//g")"
+      # No word-boundary prefix on the alternation. It only ever cost matches:
+      # after colour stripping the character before the token is whatever the
+      # log line carried (a timestamp, a `[2/9]` counter, nothing), and a
+      # spurious match here changes only the signature TEXT, never a verdict.
+      tests="$(grep -aoE 'test [a-zA-Z0-9_:]+ \.\.\. FAILED|thread .[^.]*. panicked|error\[E[0-9]+\]|assertion .failed|FAILED \[[^]]*\] [a-zA-Z0-9_:]+' <<<"${log}" |
+        sort -u | head -40 || true)"
       if [[ -n "${tests}" ]]; then
         signature_lines+="$(sed "s|^|${wf}/log: |" <<<"${tests}")"$'\n'
+      else
+        # Say so rather than quietly signing on the job name alone. A
+        # job-level signature cannot separate two different failures in the
+        # same step, so the second one reads as "the same failure twice" and
+        # escalates. Escalating is the safe direction, but the reader has to
+        # know that is what happened.
+        coarse=1
       fi
     fi
   done <<<"${runs}"
@@ -190,6 +209,10 @@ attempts=$(jq -r --arg pr "${pr}" --arg sha "${head_sha}" \
 
 echo "RED   PR #${pr} on ${head_sha:0:12}: ${failing} failing check(s), signature ${signature}, attempt $((attempts + 1))"
 printf '%s' "${signature_lines}" | sed 's/^/      /'
+if ((coarse == 1)); then
+  echo "      COARSE: the failed log carried no test identifier, so this signature is job-level only."
+  echo "      Two different failures in that step cannot be told apart and will read as the same one."
+fi
 
 if ((seen_before > 0)); then
   echo "FAIL  the same failure signature has now been seen $((seen_before + 1)) times on this commit."
