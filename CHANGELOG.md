@@ -8,6 +8,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The physical retention sweep is now all-or-nothing under a legal
+  hold** (issue #1697). A hold on any key the pass would delete (a commit,
+  compaction or rewrite record, an L0 data object, an L1 part, or the
+  tombstone) makes the pass delete nothing and return `SweptPartial`; before,
+  the pass skipped only the held keys and deleted the commit records and
+  tombstone that named the held bytes. A bucket parked this way counts on the
+  new `held_by_lease_buckets_total` counter. `ravel hold set --scope` now
+  refuses a scope that covers only part of one shard's three hold prefixes
+  (for example `t/<hex>/m/l0/0000/`); tenant-wide and signal-wide scopes are
+  still accepted. A script that set such a partial scope must move to the
+  `--signal`/`--shard` form.
 - **`POST /api/v1/sql` now refuses a request body over 64 KiB, down from
   1 MiB, and refuses any statement over 1,000 structural tokens** (issue
   #1680). Both bounds return 400 on the HTTP surface, `InvalidArgument` on

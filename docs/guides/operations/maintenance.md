@@ -409,9 +409,40 @@ ravel-cli hold list --tenant <id>
 ```
 
 These write and read the audit records that both maintenance drivers check
-before any destructive pass. A `--signal` and `--shard` form writes all the
-prefixes one shard needs in a single command, so the partial-hold mistake is not
-reachable from the CLI.
+before any destructive pass.
+
+One shard's objects live under three sibling prefixes, `.../l0/<shard>/`,
+`.../c/<shard>/` and `.../l1/<shard>/`, and each is checked independently, so a
+hold naming only one of them covers part of a shard and not the rest. The
+`--signal` and `--shard` form writes all three in a single command, and is the
+way to hold one shard. `hold set --scope` refuses a scope that reaches into one
+or two of the three without covering all of them, and names the sugar in the
+refusal. A broader scope is still accepted, because it cannot be partial: a
+whole tenant (`t/<tenant_hex>/`) or a whole signal (`t/<tenant_hex>/<signal>/`)
+covers all three prefixes of every shard it spans. So is a scope that reaches
+none of them, such as one under `maint/`. `hold clear` accepts any scope,
+partial ones included: the fold matches a clear to a set by the exact scope
+string, so refusing a partial clear would leave a hold written before this rule
+with no way to release it.
+
+Under a hold the physical retention sweep is all-or-nothing. If any key it
+would delete is held, including a commit record or the retention tombstone, it
+deletes nothing that pass, leaves the tombstone in place, counts the bucket, and
+reports `SweptPartial`. It does not delete around the hold: the commit records
+name the data objects and the tombstone keeps the bucket excluded, so deleting
+those while keeping the held bytes would leave bytes nothing can read and
+nothing can later sweep.
+
+The count is `ravel_maintain::retention::held_by_lease_buckets_total`, the
+process-wide seam for
+`ravel_maintain_retention_held_by_lease_buckets_total`, one per bucket per
+declining pass. Like the version-hold counter beside it
+(`held_out_of_window_objects_total`, ADR-0066) it is a seam today and not yet on
+the scrape endpoint. A held bucket is a bucket kept past its retention window,
+so this rises for as long as the hold stands, which is expected; it goes flat
+again once the hold is cleared and the next pass retires the bucket. A total
+that keeps rising after every hold is cleared means some scope is still
+matching, and `hold list` shows which.
 
 **The hold is not effective the instant the command returns.** Each maintenance
 tick refreshes its hold snapshot once, before its destructive pass, so a hold set
