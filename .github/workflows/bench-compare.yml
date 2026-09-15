@@ -26,8 +26,19 @@ name: bench-compare
 # bench lanes): the compare reads criterion JSON, and a colored terminal would
 # only risk leaking ANSI codes into logs. The compare never greps stdout.
 
+# The pull_request trigger is deliberately absent until a runner carrying the
+# ravel-reference label is registered on this repository. GitHub does not skip a
+# job whose labels match no online runner: it queues it, holds it for about 24
+# hours, and then fails it. With no such runner registered, a pull_request
+# trigger would put a permanently pending check on every pull request in the
+# repository, not only on bench changes. Restore it as
+#
+#   on:
+#     pull_request:
+#
+# in the same change that registers the runner, and the same-repository guard on
+# the job below is what makes that safe on a public repository with forks.
 on:
-  pull_request:
   workflow_dispatch:
     inputs:
       enforce:
