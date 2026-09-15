@@ -2200,6 +2200,12 @@ pub async fn start(
         distributed = None;
     }
 
+    // Built in every mode, like `admission` itself, so `/metrics` can render
+    // the reconciliation family unconditionally. The reconciliation loop that
+    // adds to it is spawned only in the ingest-serving modes below; in the
+    // others it stays at the zero every counter starts from.
+    let reconcile_cycle_metrics = Arc::new(admission_reconcile::ReconcileCycleMetrics::default());
+
     // Mounted unconditionally: the store and catalog above are built in every
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
     // where today only /healthz and /readyz exist. Cloned here, before
@@ -2224,6 +2230,7 @@ pub async fn start(
         cache_max_bytes: config.cache_max_bytes,
         catalog_cache_max_bytes: config.catalog_cache_max_bytes,
         admission: admission.clone(),
+        reconcile_cycle: reconcile_cycle_metrics.clone(),
         metrics_tenant_labels: config.metrics_tenant_labels,
         query_accounting: query_accounting.clone(),
         metrics_tenant_allowlist: metrics_tenant_allowlist.clone(),
@@ -3217,6 +3224,7 @@ pub async fn start(
             admission.clone(),
             store.clone(),
             config.admission_reconcile_interval,
+            reconcile_cycle_metrics.clone(),
         )
     } else {
         admission_reconcile::AdmissionReconcileTask::none()

@@ -167,6 +167,9 @@ pub struct MaintenanceSafetyMetrics {
     orphan_breaker_trips: [AtomicU64; MAINTAINED_SIGNALS.len()],
     orphans_withheld: [AtomicU64; MAINTAINED_SIGNALS.len()],
     orphans_present: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphans_quarantined: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphans_quarantine_refused: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    quarantine_reaped: [AtomicU64; MAINTAINED_SIGNALS.len()],
 }
 
 impl MaintenanceSafetyMetrics {
@@ -218,6 +221,50 @@ impl MaintenanceSafetyMetrics {
         self.orphans_present[signal_index(signal)].load(Ordering::Relaxed)
     }
 
+    /// Orphan candidates moved to `quarantine/` since this process started
+    /// (ADR-0058 amendment), summed over every sweep pass for `signal`.
+    ///
+    /// A counter, not a gauge like [`orphans_present`]: quarantining is an
+    /// event, not a state a later pass can undo, and the operator question is
+    /// the rate at which orphans are being taken out of the live set. Reading
+    /// only the last pass's count would answer that with `0` on every quiet
+    /// pass between two busy ones.
+    ///
+    /// [`orphans_present`]: Self::orphans_present
+    pub fn orphans_quarantined(&self, signal: Signal) -> u64 {
+        self.orphans_quarantined[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Orphan candidates whose copy to `quarantine/` failed, summed over every
+    /// sweep pass for `signal`. The live object was left in place, so the
+    /// candidate is still present and is counted in [`orphans_present`] too;
+    /// this counter is what separates a store fault on the quarantine prefix
+    /// from ordinary orphan presence.
+    ///
+    /// Steady state is a flat line at whatever value it reached. Alert on
+    /// `increase(...) > 0`, the same shape as the breaker-trip counter: a
+    /// refusal means quarantine cannot make progress, and the next pass
+    /// retrying the same candidate refuses again.
+    ///
+    /// [`orphans_present`]: Self::orphans_present
+    pub fn orphans_quarantine_refused(&self, signal: Signal) -> u64 {
+        self.orphans_quarantine_refused[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Objects physically deleted from `quarantine/` past the quarantine
+    /// horizon, summed over every sweep pass for `signal`. This is the only
+    /// place orphan-GC'd data is ever physically removed.
+    ///
+    /// A counter for the same reason as [`orphans_quarantined`], and it is
+    /// read against that one: a quarantined total that climbs while this one
+    /// stays flat is a quarantine prefix that is filling and never being
+    /// reaped, which no single-pass gauge can show.
+    ///
+    /// [`orphans_quarantined`]: Self::orphans_quarantined
+    pub fn quarantine_reaped(&self, signal: Signal) -> u64 {
+        self.quarantine_reaped[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
     pub fn record_legal_hold_refresh_failure(&self) {
         self.legal_hold_refresh_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -227,24 +274,34 @@ impl MaintenanceSafetyMetrics {
         self.conservation_aborts[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One `sweep_shard` result for `signal`: increments the trip counter
-    /// when `tripped`, and always overwrites the withheld and present gauges
-    /// with this pass's counts (both `store`, never `fetch_add` -- these are
-    /// gauges), matching [`orphans_withheld`]'s and [`orphans_present`]'s docs
-    /// on why neither gauge alone can be read as "resolved". `present` is the
-    /// pass's total orphan-candidate count (`orphans_deleted +
-    /// orphans_withheld + orphans_quarantine_refused`, any number of which can
-    /// be nonzero); `withheld` is `0` unless the breaker tripped.
+    /// One `sweep_shard` result for `signal`, taken whole so no figure the
+    /// pass reported can be left behind at the call site.
+    ///
+    /// Two different accumulations, and which one a field gets is the whole of
+    /// its metric type. The withheld and present gauges are overwritten with
+    /// this pass's counts (`store`, never `fetch_add`), matching
+    /// [`orphans_withheld`]'s and [`orphans_present`]'s docs on why neither
+    /// gauge alone can be read as "resolved". The trip counter and the three
+    /// quarantine counters accumulate (`fetch_add`): each counts events the
+    /// pass performed, which a later quiet pass does not undo, and
+    /// [`SweepReport`] reports them per pass rather than as running totals, so
+    /// the running total has to be kept here.
     ///
     /// [`orphans_withheld`]: Self::orphans_withheld
     /// [`orphans_present`]: Self::orphans_present
-    pub fn record_sweep(&self, signal: Signal, tripped: bool, withheld: usize, present: usize) {
+    /// [`SweepReport`]: ravel_maintain::SweepReport
+    pub fn record_sweep(&self, signal: Signal, report: &ravel_maintain::SweepReport) {
         let index = signal_index(signal);
-        if tripped {
+        if report.orphan_breaker_tripped {
             self.orphan_breaker_trips[index].fetch_add(1, Ordering::Relaxed);
         }
-        self.orphans_withheld[index].store(withheld as u64, Ordering::Relaxed);
-        self.orphans_present[index].store(present as u64, Ordering::Relaxed);
+        self.orphans_withheld[index].store(report.orphans_withheld as u64, Ordering::Relaxed);
+        self.orphans_present[index].store(orphans_present_total(report) as u64, Ordering::Relaxed);
+        self.orphans_quarantined[index]
+            .fetch_add(report.orphans_quarantined as u64, Ordering::Relaxed);
+        self.orphans_quarantine_refused[index]
+            .fetch_add(report.orphans_quarantine_refused as u64, Ordering::Relaxed);
+        self.quarantine_reaped[index].fetch_add(report.quarantine_reaped as u64, Ordering::Relaxed);
     }
 }
 
@@ -1565,12 +1622,7 @@ pub(crate) async fn run_tick_with_clock(
                              operator expects, see the breaker runbook"
                         );
                     }
-                    safety.record_sweep(
-                        signal,
-                        report.orphan_breaker_tripped,
-                        report.orphans_withheld,
-                        orphans_present_total(&report),
-                    );
+                    safety.record_sweep(signal, &report);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -5108,6 +5160,20 @@ mod tests {
         );
     }
 
+    /// A sweep pass's report shaped the way `sweep_shard` builds one: a
+    /// tripped pass withholds and deletes nothing, an untripped one deletes
+    /// and quarantines the same candidates (`orphans_quarantined` mirrors
+    /// `orphans_deleted` in `ravel-maintain`).
+    fn sweep_report(tripped: bool, withheld: usize, deleted: usize) -> ravel_maintain::SweepReport {
+        ravel_maintain::SweepReport {
+            orphans_deleted: deleted,
+            orphans_quarantined: deleted,
+            orphan_breaker_tripped: tripped,
+            orphans_withheld: withheld,
+            ..Default::default()
+        }
+    }
+
     /// The un-trip an operator must not read as "resolved" (ADR-0048 decision
     /// 4): a second, non-tripped sweep pass for the same signal
     /// drops `orphans_withheld` back to `0`, but `orphan_breaker_trips` -- the
@@ -5116,11 +5182,11 @@ mod tests {
     #[test]
     fn orphan_breaker_withheld_gauge_drops_but_trip_counter_does_not() {
         let safety = MaintenanceSafetyMetrics::default();
-        safety.record_sweep(Signal::Metrics, true, 42, 42);
+        safety.record_sweep(Signal::Metrics, &sweep_report(true, 42, 0));
         assert_eq!(safety.orphan_breaker_trips(Signal::Metrics), 1);
         assert_eq!(safety.orphans_withheld(Signal::Metrics), 42);
 
-        safety.record_sweep(Signal::Metrics, false, 0, 0);
+        safety.record_sweep(Signal::Metrics, &sweep_report(false, 0, 0));
         assert_eq!(
             safety.orphan_breaker_trips(Signal::Metrics),
             1,
@@ -5198,7 +5264,7 @@ mod tests {
         // Breaker not tripped: candidates were deleted, so `present` is the
         // deleted count while `withheld` stays 0. This is exactly the
         // small-scale-loss case the breaker's thresholds are too coarse for.
-        safety.record_sweep(Signal::Metrics, false, 0, 3);
+        safety.record_sweep(Signal::Metrics, &sweep_report(false, 0, 3));
         assert_eq!(safety.orphans_present(Signal::Metrics), 3);
         assert_eq!(safety.orphans_withheld(Signal::Metrics), 0);
         assert_eq!(
@@ -5209,14 +5275,14 @@ mod tests {
 
         // Breaker tripped: candidates were withheld, so `present` equals the
         // withheld count (deleted is 0 on a tripped pass).
-        safety.record_sweep(Signal::Metrics, true, 55, 55);
+        safety.record_sweep(Signal::Metrics, &sweep_report(true, 55, 0));
         assert_eq!(safety.orphans_present(Signal::Metrics), 55);
         assert_eq!(safety.orphans_withheld(Signal::Metrics), 55);
 
         // A subsequent clean pass with zero candidates resets the gauge to 0:
         // gauge semantics, last observed value, not a monotonic counter that
         // remembers the earlier 55.
-        safety.record_sweep(Signal::Metrics, false, 0, 0);
+        safety.record_sweep(Signal::Metrics, &sweep_report(false, 0, 0));
         assert_eq!(
             safety.orphans_present(Signal::Metrics),
             0,
@@ -5228,6 +5294,66 @@ mod tests {
 
         // A different signal is untouched throughout.
         assert_eq!(safety.orphans_present(Signal::Logs), 0);
+    }
+
+    /// The three quarantine figures accumulate across passes, which is what
+    /// makes their `_total` names honest. `SweepReport` reports each one per
+    /// pass, so storing instead of adding would publish a counter that drops
+    /// to `0` on the first pass that quarantines, refuses or reaps nothing,
+    /// and `rate()` over it would read as a reset rather than as quiet.
+    ///
+    /// Flip to watch it fail: change any of the three `fetch_add` calls in
+    /// `record_sweep` to `store`. The second assertion block then reports the
+    /// third pass's figures instead of the sum of all three.
+    #[test]
+    fn quarantine_counters_accumulate_across_passes() {
+        let safety = MaintenanceSafetyMetrics::default();
+
+        let first = ravel_maintain::SweepReport {
+            orphans_deleted: 4,
+            orphans_quarantined: 4,
+            orphans_quarantine_refused: 1,
+            quarantine_reaped: 2,
+            ..Default::default()
+        };
+        safety.record_sweep(Signal::Metrics, &first);
+        assert_eq!(safety.orphans_quarantined(Signal::Metrics), 4);
+        assert_eq!(safety.orphans_quarantine_refused(Signal::Metrics), 1);
+        assert_eq!(safety.quarantine_reaped(Signal::Metrics), 2);
+
+        let second = ravel_maintain::SweepReport {
+            orphans_deleted: 3,
+            orphans_quarantined: 3,
+            orphans_quarantine_refused: 5,
+            quarantine_reaped: 7,
+            ..Default::default()
+        };
+        safety.record_sweep(Signal::Metrics, &second);
+
+        // A quiet pass: nothing to quarantine, nothing refused, nothing past
+        // the quarantine horizon. The totals must not move, and must not drop.
+        safety.record_sweep(Signal::Metrics, &ravel_maintain::SweepReport::default());
+
+        assert_eq!(
+            safety.orphans_quarantined(Signal::Metrics),
+            7,
+            "quarantined is the sum over passes, not the last pass's count"
+        );
+        assert_eq!(
+            safety.orphans_quarantine_refused(Signal::Metrics),
+            6,
+            "refused is the sum over passes, not the last pass's count"
+        );
+        assert_eq!(
+            safety.quarantine_reaped(Signal::Metrics),
+            9,
+            "reaped is the sum over passes, not the last pass's count"
+        );
+
+        // A different signal shares none of it.
+        assert_eq!(safety.orphans_quarantined(Signal::Logs), 0);
+        assert_eq!(safety.orphans_quarantine_refused(Signal::Logs), 0);
+        assert_eq!(safety.quarantine_reaped(Signal::Logs), 0);
     }
 
     /// A store wrapper that instruments `list_delimited` -- the call

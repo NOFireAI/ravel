@@ -543,11 +543,27 @@ Labels: `mode`, plus `signal` on all but the legal-hold counter. These carry no
 | `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. |
 | `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the most recent sweep pass, by signal. |
 | `ravel_maintain_orphans_present` | Gauge. Orphan candidates the most recent sweep pass found, by signal, whether or not the breaker tripped. |
+| `ravel_maintain_orphans_quarantined_total` | Orphan candidates moved from the live L0 set to the quarantine prefix, by signal. |
+| `ravel_maintain_orphans_quarantine_refused_total` | Orphan candidates whose copy to the quarantine prefix failed, by signal; the live object was left in place rather than deleted without a copy. |
+| `ravel_maintain_quarantine_reaped_total` | Objects physically deleted from the quarantine prefix past the quarantine horizon, by signal. |
 
 [Troubleshooting](operations/troubleshooting.md) gives the alert rules and the
 breaker runbook. A zero
 value on the `orphans_withheld` or `orphans_present` gauge does not mean a
 prior trip was resolved: it is this pass's count, not a resolution signal.
+
+The three quarantine series are counters, not gauges: each counts what a sweep
+pass did, and a later quiet pass does not undo it. Read them together. A
+`ravel_maintain_orphans_quarantined_total` that climbs while
+`ravel_maintain_quarantine_reaped_total` stays flat is a quarantine prefix
+filling and never being reclaimed. Any increase in
+`ravel_maintain_orphans_quarantine_refused_total` means quarantine cannot make
+progress at all, from a store fault or a permissions or capacity problem on
+that prefix, and the candidates it counts are still live: the copy is taken
+before the delete, so a refused copy leaves the object in place rather than
+deleting it uncopied. Alert on `increase(...) > 0` there, the same shape as the
+breaker-trip counter, because the next pass retries the same candidate and
+refuses again.
 
 ### Maintenance ownership and concurrency (`ravel_maintain_workers_live`, `ravel_maintain_units_*`, `ravel_maintain_memo_warm_start_units_total`, `ravel_maintain_full_sweep_passes_total`)
 
@@ -943,6 +959,29 @@ operational depth.
 | `ravel_admission_rejected_total` | Admission rejections, by tenant, signal, and reason. |
 | `ravel_ingest_body_conversions_total` | Log records whose structured (array or map) body was converted to canonical JSON text at normalization, by tenant and signal. Not a rejection, and not a count of stored records: see "Neither rule alerts on" below. |
 | `ravel_admission_reconciliation_failures_total` | Fleet-admission reconciliation cycles whose sibling-snapshot read (LIST or GET) failed, by tenant and signal; the last-known soft threshold stays in force. |
+
+Four more series report the reconciliation cycle itself. They carry `mode`
+alone, with no `tenant_hash` or `signal`: one cycle reconciles every tenant the
+process tracks, so there is no per-tenant figure to label.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_admission_reconciliation_cycle_duration_seconds` | Gauge. Duration of the last completed reconciliation cycle. |
+| `ravel_admission_reconciliation_siblings_observed` | Gauge. Distinct non-stale sibling processes the last cycle saw, the live fleet size this process reconciled against. |
+| `ravel_admission_reconciliation_stale_keys_skipped` | Gauge. Snapshot keys the last cycle skipped reading because the listing already showed them past the staleness window. |
+| `ravel_admission_reconciliation_keys_reaped_total` | Snapshot keys past the reap horizon deleted by reconciliation cycles since process start. |
+
+These four move before anything else does when reconciliation degrades, and
+none of them shows up as a failure: the listings and reads all succeed. A cycle
+whose duration approaches twice the reconciliation interval ages every sibling
+snapshot past the staleness window before it is read, at which point each
+process reads the fleet as empty and starts enforcing the whole tenant cap
+alone. Alert on the duration against your configured interval, and on
+`siblings_observed` falling to zero while replicas are up. Growth in
+`stale_keys_skipped` while `siblings_observed` is flat means the control-plane
+prefix is filling with dead processes' keys; if
+`rate(ravel_admission_reconciliation_keys_reaped_total[1h])` is at zero
+alongside it, the prefix is filling faster than it is being cleared.
 
 The `reason` label carries `byte_rate`, `series_rate`, `series_cap`, `clock`,
 `skew`, or `structural`. The active-streams count for logs renders under
