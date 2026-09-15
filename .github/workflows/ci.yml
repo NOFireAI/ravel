@@ -349,6 +349,12 @@ jobs:
       # already working; before these cases the script had no suite at all.
       - name: Dispatch-intent cases
         run: bash scripts/tests/fleet-dispatch-intent.test.sh
+      # verify-dispatch-gates.sh is the tier-1 check every fleet result is
+      # merged on, and its own cases ran in no job: the worktree-collision
+      # defect below shipped under a suite that was green and never executed.
+      # Stubs cargo and gates.sh, so no toolchain and no build.
+      - name: Verify-dispatch gate cases
+        run: bash scripts/tests/verify-dispatch-gates-with-gates.test.sh
       - name: Green-before-merge guard cases
         run: bash scripts/tests/assert-green-head.test.sh
       - name: Destructive pre-push hook cases

@@ -68,10 +68,24 @@ esac
 
 sha="$(git rev-parse "${ref}")"
 short_sha="$(git rev-parse --short "${ref}")"
-worktree_dir="${parent_dir_abs}/verify-${short_sha}"
+# Unique per invocation, not per ref. `verify-${short_sha}` collides whenever
+# two runs verify the same ref, which is the normal case: a result branch gets
+# verified, comes back with a finding, and is verified again while the first
+# run is still building. The second run's `git worktree add` then fails with
+# "already exists" and its EXIT trap removes the FIRST run's worktree, taking
+# an in-flight cold build with it. That surfaces as a corrupted gate rather
+# than as a collision, and on this machine it costs about an hour.
+worktree_dir="${parent_dir_abs}/verify-${short_sha}-$$-$(date +%s)"
 
+# Set only once this invocation has actually created the worktree. An
+# unconditional cleanup installed before creation is what let a failed
+# `worktree add` delete a directory this run did not make: the trap cannot
+# tell "mine, remove it" from "someone else's, leave it" unless creation is
+# what records ownership.
+created_worktree=""
 cleanup() {
-  git worktree remove "${worktree_dir}" --force >/dev/null 2>&1 || true
+  [[ -n "${created_worktree}" ]] || return 0
+  git worktree remove "${created_worktree}" --force >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -84,6 +98,8 @@ echo "==> Creating worktree at ${worktree_dir}"
 # the more correct thing for a verification run to do anyway: it pins the
 # exact commit being verified rather than tracking a branch that could move.
 git worktree add --detach "${worktree_dir}" "${sha}"
+# Creation succeeded, so this run owns that directory and may remove it.
+created_worktree="${worktree_dir}"
 
 export CARGO_TARGET_DIR="${worktree_dir}/target"
 echo "==> Cold CARGO_TARGET_DIR: ${CARGO_TARGET_DIR}"
