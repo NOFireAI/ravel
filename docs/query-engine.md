@@ -2478,13 +2478,13 @@ the clean rejection is what the guarantee requires.
 The same state-2 guarantee applies below the scored surface too, at the
 evaluator's own internal dispatch arms. `ravel-promql` used to defend several
 of these with `unreachable!()`, on the assumption that promql-parser's AST
-could never carry a shape those arms didn't expect. Issue #1701 found nine of
-them -- an unknown aggregator token, an aggregate whose inner expression
+could never carry a shape those arms didn't expect. Nine of them -- an
+unknown aggregator token, an aggregate whose inner expression
 evaluates to a non-vector, a missing or wrongly-typed
 `limitk`/`count_values` parameter, a binary operator whose operands are
 neither both scalar nor both vector, a `ManyToMany` vector match on a non-set
 operator, and a matrix-typed function argument that is not a matrix node --
-whose only protection was promql-parser's own `check_ast`. Under
+had no protection beyond promql-parser's own `check_ast`. Under
 promql-parser 0.10 no parsed query actually reaches them, so the defect is
 not a live panic: it is that the guarantee lives in a third-party crate on a
 caret version range, where a minor upgrade can relax a check without any
@@ -2498,9 +2498,9 @@ example, `apply_arith`'s fallback is narrowed by `eval_binary`'s
 operator-class check, which refuses any token that is neither arithmetic nor
 a comparison, and refuses a set operator (`and`/`or`/`unless`) on a
 Scalar/Scalar or Scalar/Vector operand pair, before `eval_scalar_scalar` or
-`eval_scalar_vector` runs. That check is Ravel's, not the parser's:
-`eval_binary` dispatches on operand types, never on operator class, so
-without it a set operator on scalar operands reached `apply_arith` and
+`eval_scalar_vector` runs. That check is Ravel's, not the parser's: the
+operand-type dispatch in `eval_binary` never looked at the operator class, so
+without the check a set operator on scalar operands reached `apply_arith` and
 aborted the process. Each remaining arm carries a one-line comment naming the
 arm that rejects first. `scripts/guards/check-promql-unreachable.sh`
 keeps this from regressing: every `unreachable!()` under
