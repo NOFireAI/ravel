@@ -87,6 +87,18 @@ case "${sub}" in
       *) exit 1 ;;
     esac
     ;;
+  api)
+    # repos/<o>/<r>/actions/runs/<id> --jq .run_attempt. A rerun keeps the run
+    # id and increments this, which is what makes a second judgement a second
+    # judgement.
+    path="${1:-}"
+    id="${path##*/runs/}"; id="${id%%/*}"
+    if [[ -f "${STUB_DIR}/attempt-${id}.txt" ]]; then
+      cat "${STUB_DIR}/attempt-${id}.txt"
+    else
+      echo 1
+    fi
+    ;;
   *) exit 1 ;;
 esac
 STUB
@@ -166,11 +178,25 @@ check_eq "and nothing was rerun without --rerun" "no" \
 check_eq "the attempt is recorded against the head sha" "1" \
   "$(jq -r --arg s "${sha}" '.ci["10"][$s].attempts' "${d}/state/ci-pr-10.json")"
 
-# The same failure again on the same commit is a real failure, not a flake.
-# Mutation: compare signatures only by job name, or skip the comparison.
+# Asking again about the SAME settled run is not a second failure. A polling
+# caller would otherwise escalate the gate's own repeat read: one red run,
+# two invocations, "the same failure twice".
+# Mutation: drop the observations key and count invocations again.
 out="$(run_in "${d}" "${GUARD}" 10)"; rc=$?
-check_eq "the same signature twice escalates (1)" "1" "${rc}"
+check_eq "re-reading one settled run replays its verdict (3)" "3" "${rc}"
+check_contains "and says nothing new was decided" "already judged" "${out}"
+check_eq "and the attempt count did not move" "1" \
+  "$(jq -r --arg s "${sha}" '.ci["10"][$s].attempts' "${d}/state/ci-pr-10.json")"
+
+# A rerun keeps the run id and increments the attempt. THAT is a second
+# judgement, and the same signature across both is a real failure.
+# Mutation: compare signatures only by job name, or skip the comparison.
+printf '2\n' >"${d}/attempt-4242.txt"
+out="$(run_in "${d}" "${GUARD}" 10)"; rc=$?
+check_eq "the same signature on a new attempt escalates (1)" "1" "${rc}"
 check_contains "and says it is real" "real failure" "${out}"
+check_eq "now two observations are recorded" "2" \
+  "$(jq -r --arg s "${sha}" '.ci["10"][$s].attempts' "${d}/state/ci-pr-10.json")"
 
 # A log with nothing recognisable in it still produces a signature, from the
 # job and step names, and that signature cannot separate two failures in the
@@ -228,6 +254,7 @@ printf 'test ravel_sql::tests::alpha ... FAILED\n' >"${d}/log-4242.txt"
 run_in "${d}" "${GUARD}" 10 >/dev/null; rc=$?
 check_eq "first failure asks for a rerun (3)" "3" "${rc}"
 printf 'test ravel_sql::tests::beta ... FAILED\n' >"${d}/log-4242.txt"
+printf '2\n' >"${d}/attempt-4242.txt"   # the rerun that produced the second failure
 out="$(run_in "${d}" "${GUARD}" 10)"; rc=$?
 check_eq "a different failure the second time is a flake (4)" "4" "${rc}"
 check_contains "and says the budget is spent" "budget" "${out}"

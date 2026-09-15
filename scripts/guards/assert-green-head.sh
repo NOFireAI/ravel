@@ -209,18 +209,64 @@ fi
 
 signature="$(printf '%s' "${signature_lines}" | sort | shasum -a 256 | cut -c1-16)"
 
+# What CI RESULT this verdict is about: every failing run id with the attempt
+# number that produced it. A rerun keeps the run id and increments the
+# attempt, so this changes exactly when there is genuinely something new to
+# judge, and does not change when the gate is simply asked twice about one
+# settled red head.
+#
+# An attempt number that cannot be read is recorded as `?`, which makes the
+# repeat read look like the SAME observation rather than a new one. That is
+# the safe direction: the alternative escalates a re-read as a second
+# failure. Neither reading can merge anything.
+run_key=""
+if ((${#run_ids[@]} > 0)); then
+  for run_id in "${run_ids[@]}"; do
+    attempt="$(gh api "repos/${repo}/actions/runs/${run_id}" --jq '.run_attempt' 2>/dev/null || true)"
+    [[ -n "${attempt}" ]] || attempt="?"
+    run_key+="${run_id}#${attempt} "
+  done
+  run_key="$(printf '%s' "${run_key}" | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/^ *//;s/ *$//')"
+else
+  # No Actions run behind the red check (a third-party status). The check
+  # names are the only identity available.
+  run_key="checks:$(jq -r '[.[] | select(.class == "failing") | .name] | sort | join(",")' <<<"${normalized}")"
+fi
+
 # --- ledger ------------------------------------------------------------
 
 state_id="${epic:-ci-pr-${pr}}"
 state_file="$("${orchestrator}" path "${state_id}")"
 [[ -f "${state_file}" ]] || "${orchestrator}" init "${state_id}" >/dev/null
 
+# Already judged this exact CI result? Then say what was decided and stop.
+# Recording it again would count one red run twice and escalate the gate's
+# own repeat read as "the same failure seen twice".
+prior_verdict=$(jq -r --arg pr "${pr}" --arg sha "${head_sha}" --arg key "${run_key}" \
+  '.ci[$pr][$sha].observations[$key].verdict // ""' "${state_file}")
+if [[ -n "${prior_verdict}" ]]; then
+  echo "SEEN  PR #${pr} on ${head_sha:0:12}: this CI result (${run_key}) was already judged, verdict ${prior_verdict}."
+  echo "      Nothing new to decide until a rerun produces a new attempt. Re-reading does not spend the budget."
+  exit "${prior_verdict}"
+fi
+
 seen_before=$(jq -r --arg pr "${pr}" --arg sha "${head_sha}" --arg sig "${signature}" \
   '[(.ci[$pr][$sha].signatures // [])[] | select(. == $sig)] | length' "${state_file}")
 attempts=$(jq -r --arg pr "${pr}" --arg sha "${head_sha}" \
   '.ci[$pr][$sha].attempts // 0' "${state_file}")
 
-"${orchestrator}" record "${state_id}" ci-attempt "pr=${pr}" "sha=${head_sha}" "signature=${signature}" >/dev/null
+# The verdict for this observation, decided before it is stored so a later
+# re-read replays it rather than recomputing from a state it changed.
+if ((seen_before > 0)); then
+  verdict=1
+elif ((attempts >= 1)); then
+  verdict=4
+else
+  verdict=3
+fi
+
+"${orchestrator}" record "${state_id}" ci-attempt "pr=${pr}" "sha=${head_sha}" \
+  "signature=${signature}" "run_key=${run_key}" "verdict=${verdict}" >/dev/null
 
 echo "RED   PR #${pr} on ${head_sha:0:12}: ${failing} failing check(s), signature ${signature}, attempt $((attempts + 1))"
 printf '%s' "${signature_lines}" | sed 's/^/      /'
