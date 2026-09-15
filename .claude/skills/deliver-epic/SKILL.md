@@ -57,7 +57,9 @@ skip it, say so in the epic body and say why.
    empty `## Ledger` section. Then assign it to yourself
    (`gh issue edit <n> --add-assignee @me`). The assignee is the claim:
    ownership that lives only in a session's head collides the moment a
-   second session picks "the next obvious thing".
+   second session picks "the next obvious thing". Then open the state
+   index for it, once, so every later stage has somewhere to write:
+   `scripts/epic-orchestrator.sh init <epic> --title "<feature>"`.
 3. **The ADR number is the epic issue number.** GitHub allocates issue
    numbers atomically, so two parallel epics cannot collide, and no
    reservation step is needed. Write the full ADR at
@@ -128,8 +130,21 @@ the first ledger entry.
    and UNATTENDED paragraphs are not optional. Spec's Tests section
    names the acceptance test.
 3. Dispatch the whole wave in parallel `fleet_dispatch` calls. Record
-   every task_id in the ledger IMMEDIATELY, before watching anything - a
-   dropped session with unrecorded task_ids orphans running work.
+   every task_id IMMEDIATELY, before watching anything - a dropped
+   session with unrecorded task_ids orphans running work. One command
+   per task does it:
+
+   ```sh
+   scripts/epic-orchestrator.sh record <epic> task-dispatched \
+     ticket=<sub-issue> task=<task_id> ref=<dispatch-sha>
+   ```
+
+   That writes the `- #<ticket> task=<uuid> dispatched` line into the
+   epic issue BODY, reads the body back to prove it arrived (exit 70 if
+   it did not: `gh` exits 0 on an edit another session overwrote), and
+   indexes it locally so Stage 3's resume can answer "where was I" in
+   one read. Hand-editing the body instead leaves the index empty, and
+   the resume procedure's first command then fails with exit 66.
 4. Watch with `scripts/fleet-watch.sh <watch-url> <interval>` in
    background, one per task. Pass the bare command straight to the
    background-execution tool with its own backgrounding flag (e.g. the
@@ -211,10 +226,33 @@ Work in a dedicated worktree of main (`git worktree add`), per CLAUDE.md.
    line carries `Fixes: #<sub-issue>`), then
    `scripts/fleet-result-merge.sh <task-id> <message-file> -p <crates>`.
    `main` is protected, so the script never pushes it: it cleans the
-   result branch's history, runs local pre-flight gates, opens a PR, and
-   enables auto-merge (`--rebase`) so GitHub lands it once the required
-   checks pass. The merge-fleet-result skill covers gate failures, scope
-   creep, and confirming the PR actually merged.
+   result branch's history, runs local pre-flight gates, and opens a PR.
+   It does NOT enable auto-merge (standing rule, 2026-08-26): the fleet
+   review posts as a comment rather than a required check, so `--auto`
+   used to land before the review arrived. It posts `@claude-fleet
+   review` instead; wait for that review, address every finding, then
+   merge by hand. `FLEET_MERGE_AUTO=1` restores the old behaviour for the
+   rare case that genuinely does not need the wait.
+
+   Before merging each PR, confirm CI is green on the head you reviewed:
+
+   ```sh
+   scripts/guards/assert-green-head.sh <pr> --epic <epic>
+   ```
+
+   Exit 0 merges. 2 means wait; 3 means rerun once; 1 is the same failure
+   twice, which is real and escalates; 4 is a flake with the budget
+   spent; 5 is no verdict, which is never a green; 6 hands a cancelled or
+   timed-out check to `ci-sweep-cancelled.sh`. Passing `--epic` keeps the
+   failure signatures in this epic's state file rather than a per-PR one.
+   Then record it:
+
+   ```sh
+   scripts/epic-orchestrator.sh record <epic> merged pr=<pr> sha=<merge-sha>
+   ```
+
+   The merge-fleet-result skill covers gate failures, scope creep, and
+   confirming the PR actually merged.
 2. Real merge conflict: STOP and read the conflicting main commits first
    (`git log <merge-base>..origin/main -- <paths>`, full bodies). If a
    structural decision killed the task's premise (an ADR, a format
