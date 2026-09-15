@@ -179,13 +179,25 @@ fn bits_lt(ty: FieldType, a: u64, b: u64) -> bool {
 /// `[min_bits, max_bits]` range -- the only case in which the arm proves the
 /// entry holds no row it can match.
 ///
-/// Null rows and NaN rows never satisfy a numeric range, so a stat's min/max
-/// (which bound exactly the non-NaN resolved values, ADR-0095) is the whole
-/// test; `null_count`/`has_nan` are irrelevant to it. A stat whose type does
-/// not match the arm's proves nothing (the reader resolves an arm to one exact
-/// `(name, type)` column, so this is defensive, not expected).
+/// Null rows never satisfy a numeric range, so a stat's `null_count` is
+/// irrelevant to this test. `has_nan` is not: under the `total_cmp` order
+/// `min_bits`/`max_bits` fold f64 under, a `+NaN` row sorts above every
+/// finite value and so satisfies any half-open arm of the form `[x, inf)`,
+/// and a `-NaN` row sorts below every finite value and satisfies any
+/// `(-inf, x]` arm -- so an f64 stat's `[min, max]` (which bounds only the
+/// non-NaN resolved values, ADR-0095) does not by itself prove a NaN row is
+/// absent from either arm shape. A stat whose type does not match the arm's
+/// proves nothing (the reader resolves an arm to one exact `(name, type)`
+/// column, so this is defensive, not expected).
 fn stat_disjoint(stat: &NumStat, arm: &NumRangeArm) -> bool {
     if stat.ty != arm.ty {
+        return false;
+    }
+    // has_nan does not record which sign of NaN the block carries, so this
+    // declines pruning outright rather than reasoning per arm shape about
+    // which sign would need to be present to defeat it: coarser than
+    // soundness strictly requires, but simple and always sound.
+    if stat.ty == FieldType::F64 && stat.has_nan {
         return false;
     }
     // Query entirely below the block: its top is strictly under the stat's min.
@@ -718,6 +730,52 @@ mod tests {
         assert!(
             idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm)
                 .is_empty()
+        );
+    }
+
+    /// An f64 stat with `has_nan` set must never prune, in either half-open
+    /// direction: a `+NaN` row would satisfy the `[500, inf)` arm below and a
+    /// `-NaN` row would satisfy the `(-inf, -500]` arm, and the stat's finite
+    /// `[1, 2]` bounds say nothing about either, since `has_nan` does not
+    /// record which sign was present. Sibling of
+    /// `candidate_blocks_numeric_range_f64_and_bool`, whose `has_nan: false`
+    /// block over the same shape of arm still prunes.
+    #[test]
+    fn f64_stat_with_nan_is_never_disjoint() {
+        let mut e = entry(0, 0, 1000, 0, 0);
+        e.record_count = 1;
+        e.stats = vec![NumStat {
+            column_id: 11,
+            ty: FieldType::F64,
+            min_bits: 1.0f64.to_bits(),
+            max_bits: 2.0f64.to_bits(),
+            null_count: 0,
+            has_nan: true,
+        }];
+        let idx = SkipIndex::build(vec![e]);
+
+        let arm = [NumRangeArm {
+            column_id: 11,
+            ty: FieldType::F64,
+            min_bits: Some(500.0f64.to_bits()),
+            max_bits: None,
+        }];
+        assert_eq!(
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            vec![0],
+            "a +NaN row would satisfy [500, inf) and the stat can't rule it out"
+        );
+
+        let arm = [NumRangeArm {
+            column_id: 11,
+            ty: FieldType::F64,
+            min_bits: None,
+            max_bits: Some((-500.0f64).to_bits()),
+        }];
+        assert_eq!(
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            vec![0],
+            "a -NaN row would satisfy (-inf, -500] and the stat can't rule it out"
         );
     }
 
