@@ -55,7 +55,9 @@ pub const DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY: Duration = Duration::from_millis
 ///
 /// The request budget's cost is per shard-hour, not per query. A busy tenant
 /// seals `ceil(3600s / max_flush_delay)` segments per shard per open hour
-/// (7,200 at the 500ms default cadence), and a cold query over that hour GETs
+/// (1,800 at the 2s deployment cadence ADR-0076 decision 4 sets; 7,200 at the
+/// 500ms reference cadence in [`DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY`]), and a
+/// cold query over that hour GETs
 /// each one, on every shard. The old flat 25,000 cap was correct only at 3
 /// shards or fewer; at the default 4 it rejected the worst legitimate open
 /// hour (4 x 7,200 = 28,800) before it could answer. Deriving from

@@ -1026,9 +1026,15 @@ hot tenant's open hour and a read-your-write query no longer 422 on count.
 Their cost is bounded instead by a per-query S3 request budget
 (`EngineConfig::max_s3_requests`, derived from the deployment's shard count
 and ingest flush cadence by `derive_max_s3_requests` rather than a flat
-constant -- ADR-0075 decisions 1-2; 48,200 at the default 4 shards and 500ms
-flush delay), checked incrementally at the same points `max_bytes_scanned`
-already is, and reported as `RequestBudgetExceeded` (HTTP 422) when tripped.
+constant -- ADR-0075 decisions 1-2; the derived default is 15,800 at the
+default 4 shards and the 2s flush cadence ADR-0076 decision 4 sets), checked
+incrementally at the same points `max_bytes_scanned` already is, and reported
+as `RequestBudgetExceeded` (HTTP 422) when tripped. A running server does not
+use the `DEFAULT_BUDGET_REFERENCE_SHARDS` (4) and
+`DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY` (500ms) reference pair that
+`EngineConfig::default` carries for context-free callers (tests, alerting,
+other non-server callers); that pair derives 48,200, which is not the
+deployment default.
 
 `crates/ravel-query/src/segment_admission.rs` is the one seam both checks go
 through: `admit(&snapshot, &origins, &config)` for the sealed-count check,
