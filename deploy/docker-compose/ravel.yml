@@ -18,7 +18,7 @@ services:
   # dir (gitignored, shared with that stack, and safe to reuse across runs).
   # quay.io rather than Docker Hub: rationale in deploy/README.md.
   minio:
-    image: quay.io/minio/minio:latest
+    image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b
     command: server /data --console-address ":9001"
     ports:
       - "127.0.0.1:9000:9000"
@@ -30,7 +30,7 @@ services:
       - ../../minio-data:/data
 
   createbucket:
-    image: quay.io/minio/mc:latest
+    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z@sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952
     depends_on: [minio]
     # `mc alias set` fails until MinIO is reachable, so the until-loop is the
     # readiness wait: this service completes successfully only once the bucket
@@ -128,7 +128,7 @@ services:
     # anonymous-pull-allowance problem as the MinIO images above, and the
     # upstream project publishes this image to ghcr.io under a different
     # repo path (collector-releases, not collector-contrib).
-    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:latest
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.160.0@sha256:799dc6cf12c96192af37b5bdba804da8c10b3bc563b43cb90c3f3c58d9572ad6
     depends_on: [ravel-server]
     command: ["--config=/etc/otel/collector-config.yaml"]
     # The collector's own metrics, for answering "is it delivering?" without
@@ -156,7 +156,7 @@ services:
   #   ghcr.io/grafana/grafana             -> 403 (forbidden)
   #   public.ecr.aws/grafana/grafana      -> 404 (no such repository)
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0
     depends_on: [ravel-server]
     ports:
       - "127.0.0.1:3000:3000"

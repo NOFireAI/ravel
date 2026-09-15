@@ -13,9 +13,10 @@
 #
 # Issue #1310 generalised it into a repo-wide pin check, on the same rationale:
 # a moving tag or a mutable action ref is unreproducible and unauditable
-# wherever it appears, not just in this one compose file. It now scans three
-# categories, each with its own exact-count assertion so a scan that finds
-# nothing in a category fails rather than passing silently:
+# wherever it appears, not just in this one compose file. Issue #1720 added a
+# fourth category for the same reason, scoped to the quickstart compose file.
+# It now scans four categories, each with its own exact-count assertion so a
+# scan that finds nothing in a category fails rather than passing silently:
 #
 #   1. every `image:` reference in deploy/metricsbench/docker-compose.yml
 #      (the original check, unchanged in behaviour);
@@ -26,11 +27,17 @@
 #      arg, whose own default is what carries the pin, checked separately);
 #   3. every `uses:` action reference in .github/workflows/*.yml and
 #      .github/actions/*/*.yml -- excluding a local action (`uses: ./...`),
-#      which is repo-tracked code, not a fetched external action.
+#      which is repo-tracked code, not a fetched external action;
+#   4. every `image:` reference in deploy/docker-compose/ravel.yml (the
+#      quickstart stack) -- excluding the two `${RAVEL_IMAGE:-...}` references
+#      by exact match, since their default is Ravel's own released image
+#      (pinned by release tag, ADR-0081), not a third-party image this check
+#      governs. Scoped to that one file: deploy/k8s carries locally built
+#      placeholders with no registry manifest to pin.
 #
-# Every category requires an `@sha256:<64 hex>` digest (categories 1 and 2) or
-# a full 40-character commit SHA (category 3): a tag alone, a branch, or a
-# short SHA is a moving or ambiguous reference and fails the same as a bare
+# Every category requires an `@sha256:<64 hex>` digest (categories 1, 2, and
+# 4) or a full 40-character commit SHA (category 3): a tag alone, a branch, or
+# a short SHA is a moving or ambiguous reference and fails the same as a bare
 # tag. Exit 0 only when every category is fully pinned and every category's
 # reference count equals its expected total.
 #
@@ -50,6 +57,7 @@ DEPLOY_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 # shellcheck disable=SC1007
 REPO_ROOT=$(CDPATH= cd -- "$DEPLOY_DIR/../.." && pwd)
 COMPOSE_FILE="$DEPLOY_DIR/docker-compose.yml"
+RAVEL_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/ravel.yml"
 
 # The comparators ADR-0927 requires in the portable cross-engine lane. Each must
 # appear as a service in the compose file. Prometheus and VictoriaMetrics are
@@ -83,6 +91,24 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # sccache-action, and a rust-cache. That job's free-disk-space step is a local
 # `./.github/actions/...` action, which this scan does not count.
 WORKFLOW_EXPECTED_ACTION_COUNT=101
+
+# Exact number of `image:` lines in the quickstart compose file
+# (deploy/docker-compose/ravel.yml): minio, createbucket (mc), qualify,
+# ravel-server, otel-collector, grafana. Update deliberately if a service is
+# added or removed.
+RAVEL_COMPOSE_EXPECTED_IMAGE_COUNT=6
+
+# Of those six, the number that must carry a digest pin: every image except
+# the two `${RAVEL_IMAGE:-...}` references excluded below. Update
+# deliberately alongside RAVEL_COMPOSE_EXPECTED_IMAGE_COUNT.
+RAVEL_COMPOSE_EXPECTED_PINNED_COUNT=4
+
+# The exact text of a stripped `image:` reference (key and surrounding
+# whitespace removed, same as IMAGE_REFS above) that is Ravel's own image
+# rather than a third-party one: excluded from category 4 by exact string
+# match, not by pattern, so a typo'd variable reference does not silently
+# slip through as "exempt".
+RAVEL_IMAGE_VAR_REF='${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.15.0}'
 
 # A pinned image reference ends in `@sha256:` followed by exactly 64 hex
 # digits. Matching the bare substring `@sha256:` is not enough: `repo:tag@sha256:`
@@ -288,6 +314,72 @@ else
   fi
 fi
 
+# --- 4. Quickstart compose file (deploy/docker-compose/ravel.yml) -----------
+
+echo
+echo "== quickstart compose image pins (deploy/docker-compose/ravel.yml, issue #1720) =="
+
+if [ ! -f "$RAVEL_COMPOSE_FILE" ]; then
+  echo "FAIL: quickstart compose file not found at $RAVEL_COMPOSE_FILE"
+  fail=1
+  ravel_image_count=0
+  ravel_required_count=0
+else
+  echo "  deployment file: $RAVEL_COMPOSE_FILE"
+
+  RAVEL_IMAGE_REFS=$(grep -E '^[[:space:]]*image:[[:space:]]*' "$RAVEL_COMPOSE_FILE" \
+    | sed -E 's/^[[:space:]]*image:[[:space:]]*//; s/[[:space:]]*$//')
+
+  if [ -z "$RAVEL_IMAGE_REFS" ]; then
+    echo "FAIL: no image references found in $RAVEL_COMPOSE_FILE; the check must never scan zero images"
+    fail=1
+    ravel_image_count=0
+    ravel_required_count=0
+  else
+    ravel_image_count=$(printf '%s\n' "$RAVEL_IMAGE_REFS" | grep -c .)
+    echo "  image references found: $ravel_image_count (expected $RAVEL_COMPOSE_EXPECTED_IMAGE_COUNT)"
+    echo "  references:"
+    printf '%s\n' "$RAVEL_IMAGE_REFS" | while IFS= read -r ref; do
+      if [ "$ref" = "$RAVEL_IMAGE_VAR_REF" ]; then
+        echo "    [ravel image, exempt] $ref"
+      elif printf '%s\n' "$ref" | grep -q "$IMAGE_DIGEST_RE"; then
+        echo "    [pinned]   $ref"
+      else
+        echo "    [UNPINNED] $ref"
+      fi
+    done
+
+    # Exclude the two Ravel-own-image references by exact match before
+    # counting and pin-checking what remains: they are checked against
+    # RAVEL_COMPOSE_EXPECTED_PINNED_COUNT, not against the digest regex.
+    RAVEL_REQUIRED_REFS=$(printf '%s\n' "$RAVEL_IMAGE_REFS" | grep -vF -x "$RAVEL_IMAGE_VAR_REF")
+
+    if [ -z "$RAVEL_REQUIRED_REFS" ]; then
+      echo "FAIL: no pin-required image references found in $RAVEL_COMPOSE_FILE; the check must never scan zero images"
+      fail=1
+      ravel_required_count=0
+    else
+      ravel_required_count=$(printf '%s\n' "$RAVEL_REQUIRED_REFS" | grep -c .)
+      ravel_unpinned=$(printf '%s\n' "$RAVEL_REQUIRED_REFS" | grep -vc "$IMAGE_DIGEST_RE")
+
+      if [ "$ravel_unpinned" -ne 0 ]; then
+        echo "FAIL: $ravel_unpinned quickstart compose image reference(s) lack an @sha256: digest"
+        fail=1
+      fi
+
+      if [ "$ravel_required_count" -ne "$RAVEL_COMPOSE_EXPECTED_PINNED_COUNT" ]; then
+        echo "FAIL: found $ravel_required_count pin-required quickstart compose image references, expected exactly $RAVEL_COMPOSE_EXPECTED_PINNED_COUNT"
+        fail=1
+      fi
+    fi
+
+    if [ "$ravel_image_count" -ne "$RAVEL_COMPOSE_EXPECTED_IMAGE_COUNT" ]; then
+      echo "FAIL: found $ravel_image_count quickstart compose image references, expected exactly $RAVEL_COMPOSE_EXPECTED_IMAGE_COUNT"
+      fail=1
+    fi
+  fi
+fi
+
 # --- Result -------------------------------------------------------------
 
 echo
@@ -296,5 +388,5 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, all pinned; comparators: $REQUIRED_COMPARATORS)"
+echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, $ravel_image_count quickstart compose images, all pinned; comparators: $REQUIRED_COMPARATORS)"
 exit 0
