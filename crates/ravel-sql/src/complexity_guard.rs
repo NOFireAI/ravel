@@ -557,16 +557,26 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                     continue;
                 }
                 // `$` is an identifier part for this dialect, so a `$` that
-                // follows one is absorbed into the preceding `Word` and opens
-                // no dollar-quoted string. The run rule below consumes it for
+                // follows a WORD is absorbed into it and opens no
+                // dollar-quoted string. The run rule below consumes it for
                 // that reason; this guard is the second half, for a `$` the
-                // run rule cannot reach (the character before it is an
-                // identifier part but not the start of a run this iteration
-                // consumed). Opening `Mode::Dollar` on one of those swallows
-                // the rest of the statement up to a terminator an attacker
-                // simply omits: `SELECT a$$` + 4,000 `+1` terms scored 3.
+                // run rule cannot reach. Opening `Mode::Dollar` on one of
+                // those swallows the rest of the statement up to a terminator
+                // an attacker simply omits: `SELECT a$$` + 4,000 `+1` terms
+                // scored 3.
+                //
+                // "Preceded by an identifier part" is NOT the same test, and
+                // an earlier revision used it. A digit is an identifier part,
+                // but a bare `1` is a `Number` token that absorbs nothing
+                // (`supports_numeric_prefix()` is false), so the tokenizer
+                // DOES open a dollar quote at `1$$...$$`. Declining there put
+                // the scan outside a region the tokenizer was inside, and the
+                // lone `'` in `SELECT 1$$ ' $$` + 1,200 terms then read as a
+                // string opener running to EOF: accepted, against 4,004
+                // tokens. `starts_token` makes the digit a boundary, which is
+                // the same correction the prefix arm above needed.
                 if c == '$'
-                    && !preceding_char(sql, at).is_some_and(is_identifier_part)
+                    && starts_token(sql, at)
                     && let Some(end) = dollar_delimiter(rest)
                 {
                     skip = end.chars().count() - 1;
@@ -856,6 +866,21 @@ mod tests {
             assert!(
                 count > MAX_STATEMENT_COMPLEXITY,
                 "{opener}: the chain is structure, got {count} units"
+            );
+        }
+
+        // A digit is an identifier part but a bare number absorbs nothing,
+        // so the tokenizer DOES open a dollar quote after one. Declining
+        // there put the scan outside a region the tokenizer was inside, and
+        // the lone quote in the body then ran to EOF.
+        for opener in ["1$$ ' $$", "1$tag$ ' $tag$", "42$$ ' $$"] {
+            let sql = format!("SELECT {opener}{chain}");
+            let count = check(&sql)
+                .expect_err("a dollar quote after a bare number is a real one")
+                .count;
+            assert!(
+                count > MAX_STATEMENT_COMPLEXITY,
+                "{opener}: got {count} units"
             );
         }
 
