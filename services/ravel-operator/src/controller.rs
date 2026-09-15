@@ -20,6 +20,7 @@ use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use k8s_openapi::apimachinery::pkg::version::Info;
 use kube::api::{DeleteParams, Patch, PatchParams};
 use kube::core::DynamicObject;
 use kube::{Api, Client, Resource, ResourceExt};
@@ -40,9 +41,9 @@ use crate::reconcile::{
     AUDIT_TOKEN_KEY_MISSING_MESSAGE, AUDIT_TOKEN_KEY_MISSING_REASON, AUDIT_TOKEN_KEY_SECRET_KEY,
     DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, GC_BOOTSTRAP_STALL_AFTER,
     GC_BOOTSTRAP_STALLED_REASON, GC_BOOTSTRAP_UNAVAILABLE_MESSAGE, GC_BOOTSTRAP_UNAVAILABLE_REASON,
-    GcBootstrapGate, QUALIFY_COMPONENT, QUALIFY_SPEC_HASH_ANNOTATION, QualificationDecision,
-    QualifyJobAction, QualifyJobObservation, QualifyStoreReason, RenderCtx, RenderError,
-    S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY, STORE_QUALIFIED_FAILED_REASON,
+    GcBootstrapGate, MIN_KUBERNETES_MINOR_VERSION, QUALIFY_COMPONENT, QUALIFY_SPEC_HASH_ANNOTATION,
+    QualificationDecision, QualifyJobAction, QualifyJobObservation, QualifyStoreReason, RenderCtx,
+    RenderError, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY, STORE_QUALIFIED_FAILED_REASON,
     STORE_QUALIFIED_MESSAGE, STORE_QUALIFIED_PENDING_REASON, STORE_QUALIFIED_SUCCEEDED_REASON,
     STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON,
     audit_token_key_missing, desired_objects, desired_qualify_job, grpcroute_api_resource,
@@ -156,6 +157,13 @@ pub enum Error {
 pub struct Context {
     /// Kubernetes API client.
     pub client: Client,
+    /// The apiserver's `/version` response, read once at [`run`] startup
+    /// (issue #1714). `None` when it could not be read (a 403 from a locked-
+    /// down RBAC setup, a network blip): the operator fails open and never
+    /// raises `KubernetesVersionUnsupported` for the life of the process in
+    /// that case, so a transient `/version` failure cannot flap the condition
+    /// across reconciles.
+    pub kubernetes_version: Option<Info>,
 }
 
 /// What the controller resolves from the token Secret: the tenant names (its
@@ -1198,8 +1206,18 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
     // here because either status writer may be the one that runs, and each
     // PATCHes the whole `conditions` array (RFC 7386 merge patch replaces it
     // wholesale). Computing them at one call site only would mean the other
-    // writer silently drops them.
-    let extra_conditions = spec_conditions(&obj.spec, obj.metadata.generation);
+    // writer silently drops them. `KubernetesVersionUnsupported` (issue
+    // #1714) rides the same mechanism rather than `Degraded`: a version
+    // warning must never displace the pass's single `Degraded` entry (see
+    // `reconcile_inner`) for a real bootstrap or qualification degradation.
+    let mut extra_conditions = spec_conditions(&obj.spec, obj.metadata.generation);
+    if let Some(cond) = ctx
+        .kubernetes_version
+        .as_ref()
+        .and_then(|info| kubernetes_version_condition(info, obj.metadata.generation))
+    {
+        extra_conditions.push(cond);
+    }
 
     // Set by `reconcile_inner` to the fresh qualified-input hash once a pass
     // reaches `QualificationDecision::Proceed`, so the degraded error path below
@@ -2174,6 +2192,62 @@ fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) ->
     )]
 }
 
+/// Take a string's leading ASCII digits and parse them, or `None` when there
+/// are none.
+fn leading_digits(s: &str) -> Option<u32> {
+    let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+/// Parse the Kubernetes minor version out of an apiserver `/version`
+/// response (issue #1714).
+///
+/// `minor` is nominally a bare integer string, but managed control planes
+/// commonly append a suffix (EKS/GKE report forms like `"32+"`); take its
+/// leading digits and ignore the rest. Falls back to `git_version` (e.g.
+/// `v1.32.2-gke.1234`) when `minor` carries no leading digit at all, so an
+/// unusual but still-parseable response is not treated as unsupported.
+/// Returns `None` when neither field yields a version, so callers fail open
+/// rather than false-flagging a cluster this cannot read.
+fn kubernetes_minor_version(info: &Info) -> Option<u32> {
+    leading_digits(&info.minor).or_else(|| {
+        let rest = info.git_version.strip_prefix('v')?;
+        leading_digits(rest.split('.').nth(1)?)
+    })
+}
+
+/// The `KubernetesVersionUnsupported` condition for a detected apiserver
+/// version (issue #1714), or `None` when the version is at or above
+/// [`MIN_KUBERNETES_MINOR_VERSION`] or could not be parsed. An unparsable
+/// version fails open: this must never flap the condition on a control
+/// plane whose `/version` response this cannot read, only report on a
+/// version it can read and confirm is below the floor.
+fn kubernetes_version_condition(
+    info: &Info,
+    observed_generation: Option<i64>,
+) -> Option<Condition> {
+    let minor = kubernetes_minor_version(info)?;
+    if minor >= MIN_KUBERNETES_MINOR_VERSION {
+        return None;
+    }
+    Some(condition(
+        "KubernetesVersionUnsupported",
+        true,
+        observed_generation,
+        "BelowMinimumKubernetesVersion",
+        &format!(
+            "cluster reports Kubernetes apiserver {} (minor {minor}), below \
+             the minimum supported version 1.{MIN_KUBERNETES_MINOR_VERSION} \
+             the operator's preStop SleepAction requires",
+            info.git_version,
+        ),
+    ))
+}
+
 /// The two durable status fields that outlive a single reconcile pass and ride
 /// through every status writer: the `sys/gc` bootstrap-wait start timestamp and
 /// the qualified-inputs hash. Grouped in one named struct (finding 5) so the two
@@ -2603,11 +2677,32 @@ fn error_policy(_obj: Arc<RavelCluster>, error: &Error, _ctx: Arc<Context>) -> A
 /// and owns the Deployments and Services it creates.
 pub async fn run() -> Result<(), Error> {
     let client = Client::try_default().await?;
+
+    // Read the apiserver version once at startup, not per reconcile: a
+    // process-lifetime value cannot flap on a later `/version` blip, only on
+    // an actually-below-floor cluster (issue #1714). A 403 (RBAC not yet
+    // applied) or a network error fails open: log once and carry `None`, so
+    // `kubernetes_version_condition` never runs for this process rather than
+    // raising and clearing the condition on every transient failure.
+    let kubernetes_version = match client.apiserver_version().await {
+        Ok(info) => Some(info),
+        Err(error) => {
+            warn!(
+                %error,
+                "could not read Kubernetes apiserver version; skipping the minimum-version check"
+            );
+            None
+        }
+    };
+
     let clusters: Api<RavelCluster> = Api::all(client.clone());
     let deployments: Api<Deployment> = Api::all(client.clone());
     let services: Api<Service> = Api::all(client.clone());
     let ingresses: Api<Ingress> = Api::all(client.clone());
-    let context = Arc::new(Context { client });
+    let context = Arc::new(Context {
+        client,
+        kubernetes_version,
+    });
 
     // Scope the owned-object watches to this operator's objects only. Without a
     // label selector, `.owns()` builds a cluster-wide reflector cache of every
@@ -2632,7 +2727,10 @@ pub async fn run() -> Result<(), Error> {
         .applied_objects()
         .predicate_filter(predicates::generation, Default::default());
 
-    info!("starting ravel-operator controller");
+    info!(
+        minimum_kubernetes_minor_version = MIN_KUBERNETES_MINOR_VERSION,
+        "starting ravel-operator controller"
+    );
     Controller::for_stream(cluster_events, reader)
         .owns(deployments, managed.clone())
         .owns(services, managed.clone())
@@ -2902,6 +3000,97 @@ mod tests {
                 vec!["Degraded", "Available"]
             );
         }
+    }
+
+    /// A `k8s_openapi` version `Info` value with only the fields
+    /// [`kubernetes_minor_version`]/[`kubernetes_version_condition`] read.
+    fn version_info(minor: &str, git_version: &str) -> Info {
+        Info {
+            major: "1".to_string(),
+            minor: minor.to_string(),
+            git_version: git_version.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Table-driven over apiserver `Info` shapes (issue #1714): a minor below
+    /// [`MIN_KUBERNETES_MINOR_VERSION`] sets exactly one
+    /// `KubernetesVersionUnsupported` condition naming the floor and the
+    /// detected version; a minor at or above it, including the `"32+"` form a
+    /// managed control plane reports, sets none; a minor this cannot parse at
+    /// all (and whose `git_version` gives no fallback) also sets none, since
+    /// an unreadable version must fail open rather than false-flag a
+    /// supported cluster. Reverting [`kubernetes_version_condition`] to
+    /// always build the condition (dropping the floor comparison) fails the
+    /// `"31"` case below, since `"32"`/`"32+"`/`"33"` would then also report
+    /// unsupported.
+    #[test]
+    fn apiserver_below_the_kubernetes_floor_sets_the_unsupported_condition() {
+        let cases: &[(&str, &str, Option<u32>)] = &[
+            ("31", "v1.31.6", Some(31)),
+            ("32", "v1.32.0", None),
+            ("32+", "v1.32.2-gke.1234", None),
+            ("33", "v1.33.1", None),
+            ("unknown", "unknown", None),
+        ];
+
+        for (minor, git_version, expect_detected_minor) in cases {
+            let info = version_info(minor, git_version);
+            let result = kubernetes_version_condition(&info, Some(3));
+            match expect_detected_minor {
+                Some(detected) => {
+                    let cond = result.unwrap_or_else(|| {
+                        panic!("minor {minor:?} ({git_version}) should be below the floor")
+                    });
+                    assert_eq!(cond.r#type, "KubernetesVersionUnsupported");
+                    assert_eq!(cond.status, "True");
+                    assert_eq!(cond.observed_generation, Some(3));
+                    assert!(
+                        cond.message
+                            .contains(&format!("1.{MIN_KUBERNETES_MINOR_VERSION}")),
+                        "message names the floor: {}",
+                        cond.message
+                    );
+                    assert!(
+                        cond.message.contains(&detected.to_string()),
+                        "message names the detected version: {}",
+                        cond.message
+                    );
+                }
+                None => assert!(
+                    result.is_none(),
+                    "minor {minor:?} ({git_version}) should not set a condition, got {result:?}"
+                ),
+            }
+        }
+    }
+
+    /// The version condition rides `extra_conditions` beside a `Degraded`
+    /// entry from the same pass (not instead of it): a version warning must
+    /// never displace a real bootstrap or qualification degradation the way
+    /// reusing the `Degraded` type would.
+    #[test]
+    fn kubernetes_version_condition_survives_alongside_degraded() {
+        let info = version_info("31", "v1.31.6");
+        let mut extra = spec_conditions(&spec_with_affinity(None), Some(5));
+        extra.extend(kubernetes_version_condition(&info, Some(5)));
+
+        let degraded = build_degraded_status(
+            Some(5),
+            "SecretNotFound",
+            "no such Secret",
+            PersistedStatus::default(),
+            extra,
+        );
+        assert_eq!(
+            condition_types(&degraded.conditions),
+            vec!["Degraded", "Available", "KubernetesVersionUnsupported"]
+        );
+        assert_eq!(find(&degraded.conditions, "Degraded").status, "True");
+        assert_eq!(
+            find(&degraded.conditions, "KubernetesVersionUnsupported").status,
+            "True"
+        );
     }
 
     /// A reconcile error during a bootstrap hold must not restart the stall
