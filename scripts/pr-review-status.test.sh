@@ -854,6 +854,33 @@ check_eq "#1758 no queue + fresh base: the guard prefix stays" \
   "1" \
   "$(printf '%s\n' "${noqueue_fresh_out}" | grep -c 'assert-fresh-merge-base')"
 
+# A failed rules lookup on the FRESH path. Blocking is right either way, but
+# the operator must be able to tell a failed lookup from an ordinary no-queue
+# repository, or they copy a guard-prefixed command believing no queue exists.
+# The existing rules_api_down / rules_unparseable cases all run stale, so this
+# path had no coverage.
+fresh_api_down_out="$(E2E_RULES="GH_FAILS" e2e "${CLEAN_BODY_JSON}")"
+fresh_unparseable_out="$(E2E_RULES="not json at all" e2e "${CLEAN_BODY_JSON}")"
+for pair in "fresh_api_down:${fresh_api_down_out}" "fresh_unparseable:${fresh_unparseable_out}"; do
+  name="${pair%%:*}"; out="${pair#*:}"
+  check_eq "#1758 ${name}: the guard prefix stays" \
+    "1" \
+    "$(printf '%s\n' "${out}" | grep -c 'assert-fresh-merge-base')"
+  check_eq "#1758 ${name}: and says the queue check did not answer" \
+    "1" \
+    "$(printf '%s\n' "${out}" | grep -c 'could not read the base branch.s rules')"
+done
+
+# One rules lookup per invocation. The memoisation has no path reaching both
+# call sites today, so this pins the property rather than the mechanism: if a
+# third caller is ever added, this is what keeps it to one call.
+export E2E_GIT_STALE=1
+E2E_RULES="${QUEUE_RULES}" e2e "${CLEAN_BODY_JSON}" >/dev/null
+unset E2E_GIT_STALE
+check_eq "#1758 the base branch's rules are read at most once per run" \
+  "1" \
+  "$(grep -c 'gh rules' "${E2E_DIR}/fx/calls.log")"
+
 # A non-CLEAN mergeState with a stale base and a queue. base_stale_blocks lets
 # the chain fall through, so this branch answers instead of the clean one, and
 # the unseen-commit list must survive: an operator told to verify by hand is

@@ -428,11 +428,9 @@ else
   # repository sets `delete_branch_on_merge`, which removes the head branch
   # when the merge lands.
   if [[ "${queue_merges}" == "1" ]]; then
-    # Reachable, despite the BEHIND branch far above: on a merge-queue
-    # repository GitHub reports mergeStateStatus CLEAN for a pull request that
-    # is behind in git, so that branch never sees this case and the merge-base
-    # guard is the only detector. Observed 2026-09-14: #1796 and #1798 both
-    # read CLEAN while the guard reported them 18 commits behind.
+    # Reachable despite the BEHIND branch above: on a queue repository GitHub
+    # reports mergeStateStatus CLEAN for a pull request behind in git, so the
+    # merge-base guard is the only detector. See f1c63bc.
     # Reported, not refused. The queue rebases this entry onto current main and
     # runs full CI on the result, so the behind-ness below is context for
     # spotting a base you do not recognise, not a reason to rebase by hand.
@@ -442,16 +440,9 @@ else
     # No assert-fresh-merge-base prefix: it would refuse on exactly the
     # behind-ness the queue exists to handle, which is issue #1758.
     #
-    # --rebase is kept even though the queue sets the merge strategy itself.
-    # Measured against this repository's live protect-main queue on
-    # 2026-09-14: this exact command was run for #1796, #1797 and #1798, each
-    # exited 0 printing the informational "! The merge strategy for main is
-    # set by the merge queue", and all three merged. gh can reject a method on
-    # some queue configurations, so this is a property of this repository, not
-    # a general one -- which is why it is recorded here with its evidence
-    # rather than re-derived. Keeping the flag also means the printed command
-    # stays correct if the queue is ever removed, where the strategy would
-    # otherwise fall back to whatever the repository default happens to be.
+    # --rebase is redundant once the queue owns the strategy, but gh accepts
+    # it here with an informational warning, and keeping it means the command
+    # stays correct if the queue is ever removed. See 6a66e04 for the check.
     echo "  -> gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
   elif queue_is_active; then
     # Base is fresh right now, but a queue is enforced, so the prefix would
@@ -460,6 +451,11 @@ else
     # the stale one. The queue re-validates the entry either way.
     echo "  -> gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
   else
+    if [[ "${_queue_rc}" == "2" ]]; then
+      # Same distinction the stale path makes: blocking is right, but the
+      # operator must not read a failed lookup as an ordinary no-queue repo.
+      echo "  -> NOTE: could not read the base branch's rules, so this command carries the freshness guard without knowing whether a merge queue would have re-validated it"
+    fi
     echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} && gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
   fi
 fi
