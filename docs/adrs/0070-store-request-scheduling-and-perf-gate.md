@@ -167,9 +167,21 @@ build". This section records the tension rather than resolving it silently.
 The machinery landed for #533 makes both behaviours reachable from one tool.
 `scripts/bench-compare.py compare` (driven by `scripts/bench-tier-b.sh`) is
 advisory by default and exits non-zero only with `--enforce`. The
-`bench-compare.yml` workflow wires the pull_request trigger to the advisory
-path, matching decision 3 as it stands, and exposes the enforcing path only on
-a manual dispatch. Nothing on the automatic PR path can block a merge today.
+`bench-compare.yml` workflow exposes the enforcing path only on a manual
+dispatch. Nothing can block a merge today.
+
+The workflow carries no pull_request trigger yet, and that is a deployment
+fact rather than a change to decision 3. No runner carrying the
+`ravel-reference` label is registered on this repository, and a job whose
+labels match no online runner is queued for about 24 hours and then failed,
+not skipped. Wiring the PR path before the runner exists would put a
+permanently pending check on every pull request in the repository. The
+trigger goes in with the runner. Two things that must hold when it does: the
+job stays gated on the head repository matching this one, because this
+repository is public and the job runs pull request code on persistent
+hardware; and the baseline must be re-recorded on that runner, since the
+committed one is labelled as a demonstration and its sampling knobs are not
+recorded, which an enforcing compare now refuses.
 
 What decision 3 already requires before enforcing, unchanged by this proposal:
 
