@@ -251,6 +251,14 @@ skewed clock reappears on its next beat, at most one interval later. A store
 that reports no modification time, or one in the future, gets neither rule:
 such a key is read normally and is never deleted.
 
+The delete needs a permission the shipped `deploy/iam/query.json` does not
+grant. That template allows no `s3:DeleteObject` anywhere, so on a deployment
+using it the reap is denied per key and logged as a warning the process
+continues past: the GET is still skipped, but the prefix does not shrink. Grant
+`s3:DeleteObject` on `sys/query/workers/*` to the query role for the reap to
+take effect. The maintain and admission families carry the same gap on their
+own worker prefixes.
+
 To place a slice, the coordinator rendezvous-hashes the slice's
 `(tenant_hash, signal, shard)` unit over the live set and takes the top owner,
 then the next, and so on, giving a deterministic failover order. Two
