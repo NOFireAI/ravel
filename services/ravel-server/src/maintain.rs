@@ -808,8 +808,9 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
 
     // `clock` is the injected [`Clock`] from the context (the real [`WallClock`]
     // in the running service, a `FixedClock` in tests). Every cycle-completion
-    // stamp, memo timestamp, and reseed "now" below reads it, so the liveness
-    // gauge advances by the same clock a test drives.
+    // stamp, memo timestamp, reseed "now", and heartbeat timestamp below reads
+    // it, so the liveness gauge and worker membership both advance by the same
+    // clock a test drives.
 
     // Worker membership (ADR-0065 decision 1) runs on its own heartbeat cadence
     // `H`, independent of the (coarser) discovery interval, and in its OWN
@@ -839,8 +840,13 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
         let store = Arc::clone(&store);
         let worker = Arc::clone(&worker);
         let ownership = Arc::clone(&ownership);
+        // The injected clock, not a fresh `WallClock`: this task writes the
+        // timestamp siblings judge this process by AND judges theirs, so both
+        // halves of the membership decision must read the clock the rest of
+        // the loop reads (issue #1756). The cadence stays on
+        // `tokio::time::interval`, which a paused runtime already controls.
+        let clock = Arc::clone(&clock);
         tokio::spawn(async move {
-            let clock = WallClock;
             let mut heartbeat = tokio::time::interval(worker.heartbeat_interval());
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -6028,6 +6034,119 @@ mod tests {
             writes_at_stop,
             "the heartbeat task must stop when the loop ends -- no writes after shutdown, no leak"
         );
+    }
+
+    /// Issue #1756: both halves of the membership decision read the ONE
+    /// injected clock. The heartbeat task writes `heartbeat_unix_ns` from it
+    /// and judges sibling staleness against it, so a test that drives a
+    /// `FixedClock` drives eviction rather than reporting on how fast the
+    /// machine ran.
+    ///
+    /// Two real `run_loop` workers heartbeat into one shared store until each
+    /// sees a live set of two. Worker B is then shut down and ONLY the injected
+    /// clock moves, past `DEFAULT_LIVENESS_FACTOR * DEFAULT_HEARTBEAT_INTERVAL`.
+    /// Worker A must drop B from its live set. Real time does not advance: the
+    /// runtime is paused, every advance below is simulated, and nothing here
+    /// sleeps or reads a wall clock.
+    ///
+    /// Flip to watch it fail against pre-fix code: build a `WallClock` inside
+    /// the spawned heartbeat task instead of cloning the context's clock. The
+    /// timestamps B wrote and the `now` A compares them against then both come
+    /// from real time, which moves by milliseconds over the whole test, so B
+    /// never ages out and the live set stays at two.
+    #[tokio::test(start_paused = true)]
+    async fn an_injected_clock_advance_evicts_a_stopped_worker() {
+        use ravel_maintain::worker_set::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LIVENESS_FACTOR};
+
+        // Epoch-relative, far behind any real wall clock, so `live_set_read`'s
+        // LIST-metadata shortcut (`mtime_stale`, which reads the store's own
+        // modification times rather than the injected clock) never fires and
+        // the heartbeat body's stamp is what decides liveness.
+        const NOW_NS: i64 = 1_000 * TEST_NS_PER_HOUR;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+        let context_for = |worker: Arc<WorkerSet>, ownership: Arc<MaintenanceOwnershipMetrics>| {
+            LoopContext {
+                store: Arc::clone(&store),
+                fallback_allow: None,
+                compactor: Arc::new(CompactorConfig::default()),
+                retention: Arc::new(RetentionConfig::default()),
+                shard_count: 1,
+                // Past the whole simulated test window, so no discovery cycle
+                // fires and only the heartbeat task's behavior is under test.
+                interval: Duration::from_secs(3600),
+                metrics: Arc::new(TenantDiscoveryMetrics::default()),
+                safety: Arc::new(MaintenanceSafetyMetrics::default()),
+                ownership,
+                worker,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(clock.clone()),
+                cycle_hook: Arc::new(|| {}),
+            }
+        };
+
+        let ownership_a = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let ownership_b = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let (shutdown_a_tx, shutdown_a_rx) = oneshot::channel();
+        let (shutdown_b_tx, shutdown_b_rx) = oneshot::channel();
+        let loop_a = tokio::spawn(run_loop(
+            context_for(
+                Arc::new(WorkerSet::with_defaults(NOW_NS)),
+                Arc::clone(&ownership_a),
+            ),
+            shutdown_a_rx,
+        ));
+        let loop_b = tokio::spawn(run_loop(
+            context_for(
+                Arc::new(WorkerSet::with_defaults(NOW_NS)),
+                Arc::clone(&ownership_b),
+            ),
+            shutdown_b_rx,
+        ));
+
+        let converged = advance_until(600, Duration::from_secs(1), || {
+            ownership_a.workers_live() == 2 && ownership_b.workers_live() == 2
+        })
+        .await;
+        assert!(
+            converged,
+            "two workers sharing a store must converge to a live set of two, saw a={} b={}",
+            ownership_a.workers_live(),
+            ownership_b.workers_live()
+        );
+
+        // Worker B stops: its heartbeat key is never refreshed again, and
+        // nothing else in the store changes.
+        shutdown_b_tx.send(()).expect("send shutdown to worker b");
+        loop_b.await.expect("worker b joins cleanly on shutdown");
+
+        // Move ONLY the injected clock, to one heartbeat interval past the
+        // liveness window, and let worker A's heartbeat cadence fire on the
+        // paused runtime.
+        let heartbeat_ns =
+            i64::try_from(DEFAULT_HEARTBEAT_INTERVAL.as_nanos()).expect("H fits in i64");
+        let window_ns = heartbeat_ns * i64::from(DEFAULT_LIVENESS_FACTOR);
+        clock.set(NOW_NS + window_ns + heartbeat_ns);
+
+        let evicted = advance_until(600, Duration::from_secs(1), || {
+            ownership_a.workers_live() == 1
+        })
+        .await;
+        assert!(
+            evicted,
+            "advancing the injected clock past {}s must evict the stopped worker, saw {} live",
+            (window_ns / 1_000_000_000),
+            ownership_a.workers_live()
+        );
+
+        shutdown_a_tx.send(()).expect("send shutdown to worker a");
+        loop_a.await.expect("worker a joins cleanly on shutdown");
     }
 
     /// A `LoopContext` for the liveness/supervisor tests: one discovered tenant
