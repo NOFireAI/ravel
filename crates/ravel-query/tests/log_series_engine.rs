@@ -1000,6 +1000,50 @@ async fn log_only_query_warns_instead_of_federating() {
     );
 }
 
+/// The same query on a coordinator whose only remote is keyed to a DIFFERENT
+/// local tenant emits no warning: this tenant reaches no remote, so its whole
+/// query is local and there is no fan-out the log selector was excluded from.
+///
+/// The case above cannot pin this on its own. Its remote is unkeyed, and an
+/// unkeyed remote is reachable by every tenant, so `has_remotes_for` and a bare
+/// "is a federation context installed" test agree there and the assertion holds
+/// either way. Only a keyed remote the querying tenant does not match tells the
+/// two apart.
+#[tokio::test]
+async fn log_only_query_does_not_warn_for_a_tenant_with_no_mapped_remote() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+    fixture(&store, th).await;
+    let (engine, _tid) = build_engine(store, EngineConfig::default());
+    let federation = Arc::new(Federation::new(vec![RemoteCluster {
+        name: "remote-1".to_string(),
+        fetcher: Arc::new(PanicsIfFetched),
+        tenant: Some(tenant("tenant-b").hash()),
+        skip_unavailable: false,
+        soft_timeout: Duration::from_secs(1),
+    }]));
+    let engine = engine.with_federation(federation);
+
+    let (_value, stats) = engine
+        .instant_with_stats(
+            th,
+            r#"count_over_time(ravel_log_lines{job="api"}[1h])"#,
+            ms(BASE + 20 * NS),
+            &[],
+            NOW_NS,
+            DEADLINE,
+        )
+        .await
+        .expect("query succeeds without ever calling the remote fetcher");
+    assert!(
+        stats.warnings.is_empty(),
+        "a tenant with no mapped remote federates nothing, so nothing was excluded from a \
+         fan-out; got: {:?}",
+        stats.warnings
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Pending erasure applies to log series through the engine, exactly as it
 // does for metrics (tests/erasure_e2e.rs's pattern, `Signal::Logs` swapped
