@@ -6,9 +6,14 @@
 //! This is the in-process, deterministic analogue of ADR-0077 section 4's
 //! scenario 2 (`scripts/chaos/kill-maintain-worker.sh`, which needs real MinIO
 //! and a real `kill -9`). The takeover math (`ravel_fleet::worker_set`) was
-//! previously exercised only as a pure function; here it drives a real
-//! `compact_bucket` interrupted by a `FaultStore` fault, so the kill, the
-//! membership change, and the completion are one end-to-end path.
+//! previously exercised only as a pure function; here it decides ownership over
+//! a real `compact_bucket` that a `FaultStore` fault interrupted, and the
+//! survivor completes that same interrupted compaction. What is new over the
+//! pure-function test is the real interrupted-then-completed compaction, not
+//! the supervisor loop: ownership is still computed by calling `owner` against
+//! the live set, and the survivor's completion is a direct second
+//! `compact_bucket` call rather than its supervisor discovering and claiming
+//! the unit. The chaos scenario covers that loop.
 //!
 //! Determinism, per the repo testing conventions:
 //!   * `MemoryStore` is the durable store, with its injectable clock left at 0
