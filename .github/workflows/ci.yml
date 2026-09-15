@@ -278,6 +278,23 @@ jobs:
       # something rather than by nothing.
       - name: Duplicate-work guard cases
         run: bash scripts/guards/check-duplicate-work.test.sh
+      # The orchestration guards. Each of these suites drives the real script
+      # against stubbed `gh` (and, for the pre-push hook, real local
+      # repositories), so they need no toolchain and no network.
+      - name: Epic orchestrator cases (state, resume, reconcile)
+        run: bash scripts/tests/epic-orchestrator.test.sh
+      - name: Duplicate-dispatch guard cases
+        run: bash scripts/tests/assert-no-duplicate-dispatch.test.sh
+      - name: Green-before-merge guard cases
+        run: bash scripts/tests/assert-green-head.test.sh
+      - name: Destructive pre-push hook cases
+        run: bash scripts/tests/pre-push-destructive.test.sh
+      # The PreToolUse guard decides what every session in this repository is
+      # allowed to run, and until now its 107 cases ran in no job at all: a
+      # regression in it would have been found by a session hitting it, not
+      # by CI. Needs node, which this runner already has.
+      - name: PreToolUse guard cases
+        run: bash .claude/guards/pretooluse.test.sh
       - name: Python script unit tests
         run: make test-python
 
