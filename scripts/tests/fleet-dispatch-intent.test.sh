@@ -55,9 +55,26 @@ new_case() {
   printf '#!/usr/bin/env bash\nexit 0\n' >"${dir}/guards/assert-fresh-dispatch-ref.sh"
   # The duplicate-work guard records that it ran, with its arguments, and
   # exits with the code this case asked for.
+  # Records the argument COUNT and each argument delimited, not "$*". `$*`
+  # joins with spaces and so renders `--paths "a b"` and `--paths a b`
+  # identically -- which is the boundary these cases exist to check, erased by
+  # the fixture. A green mutant caught that; the stub, not the assertion, was
+  # the vacuous part.
+  # It also PARSES its arguments the way the real guard does, rejecting an
+  # unrecognized one with 64. A stub that accepts anything cannot catch a
+  # caller that mis-shapes the call, and that is precisely what went wrong:
+  # `${VAR:+--paths "${VAR}"}` passes `--paths a,b` as ONE argument, the real
+  # guard exits 64 on it, and a permissive stub reported the call as fine.
   cat >"${dir}/guards/assert-no-duplicate-dispatch.sh" <<STUB
 #!/usr/bin/env bash
-printf '%s\n' "\$*" >>"${dir}/dup-calls.txt"
+{ printf 'argc=%s' "\$#"; for a in "\$@"; do printf ' <%s>' "\$a"; done; printf '\n'; } \
+  >>"${dir}/dup-calls.txt"
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --issue|--paths|--closed-days|--repo) shift 2 ;;
+    *) echo "stub: unexpected argument '\$1'" >&2; exit 64 ;;
+  esac
+done
 exit ${dup_exit}
 STUB
   chmod +x "${dir}/guards/"*.sh
@@ -93,7 +110,7 @@ out="$(run_in "${d}" intent 900 101 deadbeef)"; rc=$?
 check_eq "a clean ticket dispatches (0)" "0" "${rc}"
 check_eq "and the duplicate guard was actually consulted" "1" \
   "$(wc -l <"${d}/dup-calls.txt" | tr -d ' ')"
-check_contains "with the issue number" "--issue 101" "$(cat "${d}/dup-calls.txt")"
+check_contains "with the issue number" "<--issue> <101>" "$(cat "${d}/dup-calls.txt")"
 check_contains "and an intent comment was posted" "dispatch-intent" "$(cat "${d}/posted.txt")"
 
 # --- the guard refuses -------------------------------------------------
@@ -128,7 +145,23 @@ out="$( export DISPATCH_PATHS="crates/a/src/lib.rs,crates/b/src/lib.rs"
         run_in "${d}" intent 900 101 deadbeef )"; rc=$?
 check_eq "DISPATCH_PATHS is accepted (0)" "0" "${rc}"
 check_contains "and forwarded to the guard" \
-  "--paths crates/a/src/lib.rs,crates/b/src/lib.rs" "$(cat "${d}/dup-calls.txt")"
+  "<--paths> <crates/a/src/lib.rs,crates/b/src/lib.rs>" "$(cat "${d}/dup-calls.txt")"
+
+# A path with a space must stay ONE argument, whatever spelling the caller
+# uses to build the argument list. This passes against both the array form
+# and the `${VAR:+--paths "${VAR}"}` it replaced, because under bash those
+# are equivalent -- a review reported otherwise and the reproduction that
+# appeared to confirm it had been run in zsh, where they genuinely differ.
+# The case earns its place by pinning the CONTRACT (one argument reaches the
+# guard) rather than one spelling of it.
+d="$(new_case paths_space 0)"
+out="$( export DISPATCH_PATHS="crates/a/my file.rs"
+        run_in "${d}" intent 900 101 deadbeef )"; rc=$?
+check_eq "a path containing a space still dispatches (0)" "0" "${rc}"
+check_contains "and reaches the guard as ONE argument" \
+  "<--paths> <crates/a/my file.rs>" "$(cat "${d}/dup-calls.txt")"
+check_contains "so the guard sees exactly four arguments" \
+  "argc=4" "$(cat "${d}/dup-calls.txt")"
 
 # --- the deliberate second dispatch ------------------------------------
 d="$(new_case override 65)"
@@ -151,7 +184,7 @@ check_eq "and never called the guard" "no" \
 d="$(new_case hashform 0)"
 out="$(run_in "${d}" intent 900 '#101' deadbeef)"; rc=$?
 check_eq "a #-prefixed ticket is looked up (0)" "0" "${rc}"
-check_contains "with the # stripped" "--issue 101" "$(cat "${d}/dup-calls.txt")"
+check_contains "with the # stripped" "<--issue> <101>" "$(cat "${d}/dup-calls.txt")"
 
 # --- the duplicate check runs AFTER the dangling-intent check ----------
 # A dangling intent is the cheaper, local refusal and must still fire.
