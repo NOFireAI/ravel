@@ -205,9 +205,9 @@ window would still call a Hit.
   below), never a direct delete. The breaker is all-or-nothing: a
   tripped, non-overridden breaker quarantines zero candidates that pass.
 - **Candidate selection's initial listing runs on the full-sweep cadence, not
-  every maintain tick (issue #1734).** That listing is the one phase of a
+  every maintain tick.** That listing is the one phase of a
   pass that cannot be hour-scoped (L0 data keys carry no ingest-hour
-  component), so before this change it re-listed the whole shard's `l0/`
+  component), so it would otherwise re-list the whole shard's `l0/`
   data prefix on every maintain tick (default 300 s) even though rules 2 and
   3 already list only the tick's zone-scoped hours. `ravel-maintain`'s
   per-tick sweep now runs candidate selection only on the tick a full sweep
