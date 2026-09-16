@@ -234,8 +234,8 @@ pub struct GatewaySpec {
     /// Ingest runs only in the gateway tier (the query and maintain modes never
     /// enter the ingest path), so this is a gateway-only field, like `fold`.
     /// Omit to keep `ravel-server`'s own default of 1 (today's non-pipelined
-    /// behavior). A minimum of 1 is enforced at admission (see
-    /// [`inject_minimum_bounds`]): `ravel-server` rejects 0 as a flush deadlock.
+    /// behavior). The CRD schema enforces a minimum of 1 at admission:
+    /// `ravel-server` rejects 0 as a flush deadlock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_inflight_flushes: Option<u32>,
 }
@@ -2017,8 +2017,38 @@ mod tests {
             "shards": 4,
             "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
         });
-        let spec: RavelClusterSpec = serde_json::from_value(base).expect("deserialize");
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
         assert_eq!(spec.gateway.max_inflight_flushes, None);
+
+        // A set value reaches the field, so the serde attributes are wired
+        // to the right name.
+        let mut with_field = base;
+        with_field["gateway"] = serde_json::json!({ "maxInflightFlushes": 4 });
+        let spec: RavelClusterSpec =
+            serde_json::from_value(with_field).expect("deserialize with field");
+        assert_eq!(spec.gateway.max_inflight_flushes, Some(4));
+
+        // Gateway only: the query and maintain schemas carry no such property,
+        // so a field added to another tier without a renderer cannot hide here.
+        let crd = ravel_cluster_crd();
+        let spec_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .and_then(|s| s.properties.as_ref())
+            .expect("spec properties");
+        for tier in ["query", "maintain"] {
+            let props = spec_props
+                .get(tier)
+                .and_then(|t| t.properties.as_ref())
+                .expect("tier properties");
+            assert!(
+                !props.contains_key("maxInflightFlushes"),
+                "{tier} must not carry maxInflightFlushes"
+            );
+        }
     }
 
     #[test]
