@@ -6004,11 +6004,19 @@ fn commit_prefix_is_deletable_and_the_contract_bounds_its_retention() {
 /// and the object lands under the swept `idx/` prefix
 /// (crates/ravel-catalog/src/fold.rs).
 ///
+/// Third, the correction to the second error was itself incomplete: the
+/// `.done`-scope prose in docs/deletion-and-gc.md and the erasure stage table
+/// in docs/consistency-model.md still stated the universal in other words
+/// ("index objects carry no subject values", "the only place a subject
+/// physically lives"). Those spellings are retired here too, and the
+/// consistency doc is now one of the rows, so no file that carried the claim
+/// is outside this pin.
+///
 /// `commit_prefix_is_deletable_and_the_contract_bounds_its_retention` reads
 /// only the contract page, so reverting any other file left it green. This is
 /// the per-file pin: each row names the phrases only the corrected text
-/// carries and every phrase the two corrections retired, so reverting one file
-/// fails one named assertion.
+/// carries and every phrase the three corrections retired, so reverting one
+/// file fails one named assertion.
 const CATALOG_SWEEP_DOC_CLAIMS: &[(&str, &[&str], &[&str])] = &[
     (
         "docs/object-store-contract.md",
@@ -6030,14 +6038,22 @@ const CATALOG_SWEEP_DOC_CLAIMS: &[(&str, &[&str], &[&str])] = &[
         &["unreferenced-catalog sweep", "distinct-value dictionary"],
         CATALOG_SUBJECT_VALUE_RETIRED,
     ),
+    (
+        "docs/consistency-model.md",
+        &["unreferenced-catalog sweep", "distinct-value dictionary"],
+        CATALOG_SUBJECT_VALUE_RETIRED,
+    ),
 ];
 
 /// Phrases no doc may carry again. The first group is the "a maintenance sweep
 /// never touches the catalog family" universal in each spelling a doc used;
 /// the second is the "and so a lock there cannot delay an erasure" claim that
-/// replaced it, in each spelling. `never a sweep target` is listed because its
-/// absence from an earlier list is exactly why one summary-table row kept the
-/// universal after the prose above it had been corrected.
+/// replaced it, in each spelling; the third is the same universal in the
+/// spellings the `.done`-scope prose used, which sat seventy lines below the
+/// correction in its own file and in the consistency doc's stage table.
+/// `never a sweep target` is listed because its absence from an earlier list
+/// is exactly why one summary-table row kept the universal after the prose
+/// above it had been corrected.
 const CATALOG_SUBJECT_VALUE_RETIRED: &[&str] = &[
     "are never sweep targets",
     "never a sweep target",
@@ -6049,6 +6065,10 @@ const CATALOG_SUBJECT_VALUE_RETIRED: &[&str] = &[
     "cannot hold a subject value",
     "no catalog object can hold a subject value",
     "No subject value can live in a catalog object",
+    "carry no subject values",
+    "hold no subject values",
+    "disjoint from subject erasure by construction",
+    "the only place a subject physically lives",
 ];
 
 #[test]

@@ -763,25 +763,23 @@ adapter contract:
 4. **Object Lock, compliance mode**, on the protected prefixes: `sys/*`,
    `t/*/*/prov`, commit records `t/*/*/c/*`, and the catalog keyspace
    `t/*/catalog/*/*` (the HEAD pointer and its versions, and the snapshot
-   and index objects the same pattern reaches).
-   These are the objects whose immutability the commit and
-   catalog layers assume as a given (see "Data objects, commit records,
-   manifests, and index objects are immutable"; this section is that
-   invariant's bucket-level enforcement point). Object Lock is what makes
-   that assumption hold even against a compromised or misconfigured
-   credential that can otherwise issue deletes: compliance mode refuses
-   deletion or overwrite for the configured retention period, with no
-   principal (including the bucket owner) able to shorten or remove it.
-   Subject identifiers that must remain erasable under ADR-0064 live in
-   *values*, never in *object keys or names*, so naming a prefix in the
-   lock never exposes a subject value through the pattern itself. What a
-   locked object *contains* is a separate question, and for one member of
-   the catalog family the answer is not "nothing erasable"; see "A lock
-   on the catalog family" below. `sys/*`, `t/*/*/prov`, and
-   `t/*/catalog/*/*` are never targets
-   of supersession GC, ADR-0019 retention deletion, or ADR-0064 erasure,
-   so a lock on those three costs nothing *against those three
-   mechanisms*. That is the whole of the exemption, and it does not
+   and index objects the same pattern reaches). These are the objects whose
+   immutability the commit and catalog layers assume as a given (see "Data
+   objects, commit records, manifests, and index objects are immutable";
+   this section is that invariant's bucket-level enforcement point). Object
+   Lock is what makes that assumption hold even against a compromised or
+   misconfigured credential that can otherwise issue deletes: compliance
+   mode refuses deletion or overwrite for the configured retention period,
+   with no principal (including the bucket owner) able to shorten or remove
+   it. Subject identifiers that must remain erasable under ADR-0064 live in
+   *values*, never in *object keys or names*, so naming a prefix in the lock
+   never exposes a subject value through the pattern itself. What a locked
+   object *contains* is a separate question, and for one member of the
+   catalog family the answer is not "nothing erasable"; see "A lock on the
+   catalog family" below. `sys/*`, `t/*/*/prov`, and `t/*/catalog/*/*` are
+   never targets of supersession GC, ADR-0019 retention deletion, or
+   ADR-0064 erasure, so a lock on those three costs nothing *against those
+   three mechanisms*. That is the whole of the exemption, and it does not
    generalise: the catalog family is a target of a fourth mechanism, the
    unreferenced-catalog sweep, covered in "A lock on the catalog family"
    below. Commit records (`t/*/*/c/*`) are not exempt even that far: once
@@ -831,28 +829,44 @@ adapter contract:
    min, a `ColumnValue` max, and a repeated `DictEntry` dictionary, and a
    `ColumnValue` admits `str_utf8` and `bytes_val`
    (proto/ravel/catalog.proto). The fold tallies a declared `Str` or
-   `Bytes` column exactly: its min, its max, and its
-   distinct-value dictionary
-   (`crates/ravel-catalog/src/column_stats_build.rs`). A tenant may
-   declare any attribute key, `user.id` among them, as a `STR` typed
+   `Bytes` column exactly: its distinct-value dictionary and its exact min
+   and max (`crates/ravel-catalog/src/column_stats_build.rs`). A tenant
+   may declare any attribute key, `user.id` among them, as a `STR` typed
    attribute column whose key is the SQL column name verbatim
-   (proto/ravel/sys.proto, `TypedAttrColumn`). Those objects are written
-   as `t/<hash>/catalog/<signal>/idx/*.cstat`
+   (proto/ravel/sys.proto, `TypedAttrColumn`). Those objects are written as
+   `t/<hash>/catalog/<signal>/idx/*.cstat`
    (`crates/ravel-catalog/src/fold.rs`), inside the `idx/` prefix this
    sweep lists.
 
    So for any tenant with a `STR` or `BYTES` typed attribute column, an
-   erased subject's own value can sit verbatim in a `.cstat`. Erasure
-   does not rewrite that object in place; the rewrite pass and the fold
-   that follows it write new catalog objects and swap HEAD, which leaves
-   the stale `.cstat` unreferenced, and the unreferenced-catalog sweep is
-   the only mechanism that then removes it. A retention `R` on
-   `t/*/catalog/*/*` refuses that delete, so the physical-removal bound
-   for that value becomes `max(bound, R)`: a real `+R` erasure bound of
-   the same shape the commit records carry. An operator who wants the
-   immutability guarantee without that bound scopes the mechanism to
-   `catalog/<signal>/HEAD` alone, which is the object the immutability
-   argument above actually rests on.
+   erased subject's own value can sit verbatim in a `.cstat`. Erasure does
+   not rewrite that object in place, and it does not refresh the catalog
+   either: the rewrite pass publishes new data objects and a rewrite record
+   and drives no tenant-catalog fold of its own
+   (`crates/ravel-maintain/src/rewrite.rs`, whose catalog calls are the
+   segment-internal catalog a rewrite decodes). The catalog picks the
+   rewrite up only when the fold reconciles that hour, through the fixed
+   reconcile window or the retention-frontier band, or when a HEAD rebuild
+   re-derives every hour (`crates/ravel-catalog/src/fold.rs`,
+   docs/catalog-and-mvcc.md "Fold reconcile pass"). Until one of those
+   runs, the live HEAD still names the pre-rewrite part, the sweep keeps
+   that part's `.cstat` precisely because HEAD names it
+   (`crates/ravel-maintain/src/sweep.rs`), and the erased value persists
+   with no retention involved at all. Only after the reconcile or the
+   rebuild is the stale `.cstat` unreferenced, and only then does a
+   retention `R` on `t/*/catalog/*/*` start to matter. The erasure bound
+   for such a tenant is therefore "until the fold reconciles that hour,
+   then `+R`", not `max(bound, R)` alone.
+
+   Under the shipped IAM templates it is worse than that bound.
+   `deploy/iam/maintain.json`'s `DenyDeleteProtected` statement denies the
+   Maintain role every delete under `t/*/catalog/*/*`, so the unreferenced
+   `.cstat` is not deletable at all today, whatever the retention posture
+   is: the bound is open-ended rather than `+R` until that template
+   changes. An operator who wants the immutability guarantee without the
+   erasure bound scopes the mechanism to `catalog/<signal>/HEAD` alone,
+   which is the object the immutability argument above actually rests on.
+   That scoping is necessary but not sufficient while the IAM deny stands.
 
    The refusal is not confined to the locked object either. The sweep's
    delete loop propagates the first refusal, so one locked object aborts

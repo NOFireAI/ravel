@@ -101,15 +101,29 @@ reclamation. The per-part column-statistics objects under `idx/` are the
 exception: when a tenant declares an attribute key such as `user.id` as a
 typed string or bytes column, the fold stores that column's exact minimum,
 exact maximum and exact distinct-value dictionary, so a subject's own value is
-held verbatim. Erasure writes new catalog objects and swaps HEAD rather than
-rewriting the old ones, which leaves the stale column-statistics object
-unreferenced, and this sweep is the only thing that deletes it. For any tenant
-with a typed string or bytes attribute column, a retention over the whole
-catalog keyspace therefore holds an erased subject's value for the full
-retention period, which extends the erasure bound just as a locked commit
-record does. Keep the retention period inside the same window as for commit
-records, and scope the mechanism to `catalog/<signal>/HEAD` alone if that
-erasure bound is unacceptable.
+held verbatim.
+
+Erasure does not rewrite that object, and it does not refresh the catalog
+either. The erasure rewrite publishes new data objects and a rewrite record;
+nothing in it folds the tenant catalog. The catalog picks the rewrite up only
+when the fold reconciles that hour, through its fixed window or the
+retention-frontier band, or when an operator rebuilds HEAD. Until one of those
+runs, the live HEAD still names the pre-rewrite part, so that part's
+column-statistics object is still referenced, is not a sweep candidate, and
+holds the erased value with no retention involved. Only afterwards does the
+object become unreferenced and the retention period start to matter. So for a
+tenant with a typed string or bytes attribute column the erasure bound is
+"until the fold reconciles that hour, then plus the retention period", not the
+retention period alone.
+
+Today it is open-ended instead. The maintenance IAM policy Ravel ships denies
+the maintenance role every delete under the catalog keyspace, so even the
+unreferenced column-statistics object cannot be deleted, whatever retention
+period is chosen, until that policy changes. Keep the retention period inside
+the same window as for commit records, and scope the mechanism to
+`catalog/<signal>/HEAD` alone if the retention half of that bound is
+unacceptable; that scoping is necessary but not sufficient while the policy
+denies the delete.
 
 **One lifecycle rule is not optional for any bucket Ravel writes to.**
 Configure `AbortIncompleteMultipartUpload` with a cleanup period of seven days
