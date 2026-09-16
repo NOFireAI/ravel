@@ -775,7 +775,10 @@ adapter contract:
    `ColumnValue` admits `str_utf8` and `bytes_val`
    (proto/ravel/catalog.proto). The fold tallies a declared `Str` or
    `Bytes` column exactly: its distinct-value dictionary and its exact min
-   and max (`crates/ravel-catalog/src/column_stats_build.rs`). A tenant
+   and max (`crates/ravel-catalog/src/column_stats_build.rs`; the
+   dictionary is kept only up to a fixed entry cap and dropped past it,
+   the min and max are always kept, so a subject value can sit in the
+   extrema of a high-cardinality column with no dictionary). A tenant
    may declare any attribute key, `user.id` among them, as a `STR` typed
    attribute column whose key is the SQL column name verbatim
    (proto/ravel/sys.proto, `TypedAttrColumn`). Those objects are written as
