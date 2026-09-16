@@ -35,25 +35,39 @@ paired with versioning:
 - the deployment records under `sys/`,
 - the per-(tenant, signal) provisioning records,
 - the commit records,
-- the catalog HEAD history.
+- the catalog keyspace `t/*/catalog/*/*` (the HEAD pointer and its versions,
+  and the snapshot and index objects the same pattern reaches).
 
 Versioning is what makes the last of those work: a HEAD compare-and-swap
 creates a new locked version rather than overwriting one. None of those four
 prefix families holds an erasable subject value, deliberately, so locking any
 of them never exposes a subject to Object Lock's own reach. That is not the
 same as carrying no erasure cost at all: the deployment records, the
-provisioning records, and the catalog HEAD history are never targets of the
-sweeps that back retention deletion and erasure, so locking those three is
-free. The commit records are not: they are physically deleted, once
+provisioning records, and the catalog keyspace are never targets of the three
+mechanisms that physically remove tenant data (supersession GC, retention
+deletion, and subject erasure), so locking those three costs nothing against
+those three mechanisms. The commit records
+are not exempt even that far: they are physically deleted, once
 superseded, by the same sweeps, so a still-locked commit record delays that
 delete until its retention period elapses, and the sweep pass touching it
 pauses for the difference. Keep that retention period short enough for the
 sweeps to keep making progress; see the object store contract's "Required
-bucket configuration" for the bound. The scoped posture is therefore still
-not a disaster-recovery choice, and for three of the four families it
-carries no erasure cost either; it is the baseline the commit and catalog
+bucket configuration" for the bound.
+
+The catalog keyspace carries a cost of its own, from a different mechanism.
+The unreferenced-catalog sweep deletes the snapshot and index objects under
+`t/*/catalog/*/snap/` and `t/*/catalog/*/idx/` that the current HEAD no longer
+names, once they are older than the protection horizon. A retention covering
+the whole keyspace refuses those deletes until it elapses, and the sweep's
+delete loop stops at the first refusal, so the rest of that tenant and
+signal's unreferenced catalog objects are left behind as well and the next
+maintenance tick retries. This delays reclamation, never erasure: a catalog
+object cannot hold a subject value, so nothing erasable is being held. Keep
+that retention period inside the same window, or scope the mechanism to the
+HEAD pointer alone. The scoped posture is therefore still
+not a disaster-recovery choice; it is the baseline the commit and catalog
 layers already assume, with the commit-record family carrying the sweep-delay
-cost above.
+cost above and the catalog family the reclamation delay here.
 
 Scoping the lock takes an operator-run mechanism, and it is a requirement of
 levels 0 and 1, not an optional extra. Level 2 replaces it with a bucket
@@ -70,16 +84,20 @@ these:
 - [ ] One of the two mechanisms below, applying per-object retention in
       compliance mode, for the chosen retention period, to new objects under
       `sys/`, the provisioning records, the commit records, and the catalog
-      HEAD history.
+      keyspace.
 
-The retention period is unconstrained for the deployment records, the
-provisioning records, and the catalog HEAD history: nothing ever deletes
-them out from under a legitimate erasure request. For the commit records,
-the period is not free to pick arbitrarily long: it delays the maintenance
+The retention period is unconstrained for the deployment records and the
+provisioning records: no sweep deletes either of them, so no choice of period
+delays anything. For the commit records the period is not free to pick
+arbitrarily long: it delays the maintenance
 sweeps that physically remove a superseded commit record, so choose a
 period the object store contract's "Required bucket configuration" bounds
 against the sweeps' own default window, or accept those sweeps pausing on
-a commit record until the period elapses.
+a commit record until the period elapses. For the catalog keyspace the same
+window applies for a different reason: the unreferenced-catalog sweep deletes
+the snapshot and index objects the current HEAD no longer names, and a
+retention covering them pauses that sweep for the tenant and signal it fires
+on. Neither delay is an erasure delay; both are reclamation delays.
 
 | Mechanism | What it does | Coverage window |
 |---|---|---|

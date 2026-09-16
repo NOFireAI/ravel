@@ -15,6 +15,12 @@ that list on purpose: `MaintainDelete` grants delete on `t/*/*/c/*`
 because the maintenance sweep physically removes a commit record once
 it is superseded, and an IAM deny there would make every sweep pass fail.
 
+The `t/*/catalog/*/*` entry in that deny list is in tension with the same
+argument: the unreferenced-catalog sweep runs under the Maintain role and
+deletes the superseded snapshot and index objects the pattern covers, so the
+shipped templates refuse those deletes outright rather than merely delaying
+them. That tension is real and is tracked separately.
+
 This is a separate list from the Object Lock compliance-mode prefixes in
 `docs/object-store-contract.md`'s "Required bucket configuration" section,
 which does include commit records: they get bucket-layer, per-object

@@ -706,8 +706,10 @@ adapter contract:
    - The noncurrent-version expiration rule required by point 1 when
      versioning is ON.
 4. **Object Lock, compliance mode**, on the protected prefixes: `sys/*`,
-   `t/*/*/prov`, commit records `t/*/*/c/*`, and `t/*/catalog/*/*` HEAD
-   history. These are the objects whose immutability the commit and
+   `t/*/*/prov`, commit records `t/*/*/c/*`, and the catalog keyspace
+   `t/*/catalog/*/*` (the HEAD pointer and its versions, and the snapshot
+   and index objects the same pattern reaches).
+   These are the objects whose immutability the commit and
    catalog layers assume as a given (see "Data objects, commit records,
    manifests, and index objects are immutable"; this section is that
    invariant's bucket-level enforcement point). Object Lock is what makes
@@ -719,24 +721,65 @@ adapter contract:
    *values*, never in *object keys or names*, so locking these prefixes
    never exposes a subject value to Object Lock's own reach. That keeps
    confidentiality out of the conflict; it does not keep the prefixes out
-   of it. `sys/*`, `t/*/*/prov`, and `t/*/catalog/*/*` HEAD history are
-   never targets of supersession GC, ADR-0019 retention deletion, or
-   ADR-0064 erasure, so a lock on those three costs nothing there. Commit
-   records (`t/*/*/c/*`) are not exempt the same way: once superseded,
-   supersession GC, ADR-0019 retention deletion, and ADR-0064 erasure all
-   physically delete them, and a per-object compliance-mode retention `R`
-   on a still-locked commit record refuses that delete until `R` elapses,
-   so the physical-removal bound for the record (and for the sweep pass
-   holding it) becomes `max(bound, R)`. The superseded sweep deletes a
-   chain's input commit records before its input data objects; a record
-   still under retention aborts that pass at the record-delete step, and
-   the data-delete step after it never runs, so the L0 data the pass would
-   otherwise collect stays in place, undeleted, until the record's
-   retention expires and a later pass completes the delete. An operator
-   who needs these sweeps to keep making progress keeps `R` at or under
-   `protection_horizon` (about 25 hours with `CompactorConfig` defaults);
-   an `R` longer than that pauses collection on that record for the
-   difference.
+   of it. `sys/*`, `t/*/*/prov`, and `t/*/catalog/*/*` are never targets
+   of supersession GC, ADR-0019 retention deletion, or ADR-0064 erasure,
+   so a lock on those three costs nothing *against those three
+   mechanisms*. That is the whole of the exemption, and it does not
+   generalise: the catalog family is a target of a fourth mechanism, the
+   unreferenced-catalog sweep, covered in "A lock on the catalog family"
+   below. Commit records (`t/*/*/c/*`) are not exempt even that far: once
+   superseded, supersession GC and ADR-0019 retention deletion physically
+   delete them, and ADR-0064 erasure reaches them transitively (the
+   erasure sweep itself deletes only the `.dreq` request objects; the
+   rewrite pass supersedes its inputs, and the superseded sweep then
+   removes those inputs' commit records like any other superseded chain).
+   A per-object compliance-mode retention `R` on a still-locked commit
+   record refuses that delete until `R` elapses, so the physical-removal
+   bound for the record (and for the sweep pass holding it) becomes
+   `max(bound, R)`. The superseded sweep deletes a chain's input commit
+   records before its input data objects, and it runs the record-delete
+   loop over every cleared group in the pass before the data-delete loop
+   runs at all; a record still under retention aborts that pass at the
+   record-delete step, so the data-delete step never runs for any chain
+   in it, and the L0 data the pass would otherwise collect stays in
+   place, undeleted, until the record's retention expires and a later
+   pass completes the delete. An operator who needs these sweeps to keep
+   making progress keeps `R` at or under `protection_horizon` (about 25
+   hours with `CompactorConfig` defaults); an `R` longer than that pauses
+   collection on that record for the difference.
+
+   **A lock on the catalog family.** `t/*/catalog/*/*` reaches more than
+   the HEAD pointer and its versions: the same pattern covers the
+   snapshot parts under `catalog/<signal>/snap/` and the name-postings
+   and column-statistics objects under `catalog/<signal>/idx/`
+   (docs/catalog-and-mvcc.md, object layout). Those are swept. Every fold
+   writes new content-addressed objects and swaps HEAD, and
+   `sweep_unreferenced_catalog_objects`
+   (`crates/ravel-maintain/src/sweep.rs`, driven in production by
+   `services/ravel-server/src/maintain.rs`'s maintenance tick) deletes
+   every object under those two prefixes that the current HEAD no longer
+   names, once it is older than `protection_horizon`. A compliance-mode
+   retention on the family therefore has a cost, but a different one from
+   the commit records above. It is **not** an erasure cost: catalog
+   snapshot entries, name postings, and column statistics carry
+   identities, hashes, counts, timestamps, and metric names only, never a
+   label or attribute value (ADR-0064 Context and its §7 requirement), so
+   no catalog object can hold a subject value, erasure never rewrites or
+   deletes one, and the `+R` erasure bound the commit records carry does
+   not extend here. The cost is storage: an unreferenced catalog object
+   under a retention `R` lingers for `R` past the horizon instead of
+   being reclaimed. It is not confined to the locked object either. The
+   sweep's delete loop propagates the first refusal, so one locked object
+   aborts that `(tenant, signal)` pass and the unreferenced objects
+   behind it in the same pass are left in place too. The production
+   driver logs the failed pass and retries on the next maintenance tick,
+   where the same object refuses again, so collection of that
+   `(tenant, signal)`'s catalog garbage resumes only once `R` elapses.
+   Operators who apply the scoped posture to the whole catalog keyspace
+   should keep `R` inside `protection_horizon` here for the same reason
+   as for commit records, or scope the mechanism to `catalog/<signal>/HEAD`
+   alone, which is the object the immutability argument above actually
+   rests on.
 
    **How the prefix scoping is achieved.** Object Lock has no prefix
    scope of its own. It is enabled once per bucket, at bucket creation,
