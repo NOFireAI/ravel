@@ -2523,20 +2523,35 @@ annotation, as it does for floats. The set operators (`and`, `or`, `unless`)
 pass matched samples through without combining values, so they carry
 histograms unchanged and are outside this split.
 
-`h + h` and `h - h` align their two operands before merging buckets. An
-exponential-schema histogram paired with a custom-buckets (NHCB) one, or two
-custom-buckets histograms with different bounds, have no common bucket layout:
-the sample drops with one warning annotation on the response's `warnings`
-channel, reading `incompatible bucket layout encountered for binary operator
-<op>`. Prometheus raises that same single warning for both shapes, catching
-`ErrHistogramsIncompatibleSchema` and `ErrHistogramsIncompatibleBounds` from
-`FloatHistogram.Add`/`Sub` and answering either with
-`NewIncompatibleBucketLayoutInBinOpWarning`. Two
-exponential histograms at different schemas are both down-converted to the
-coarser one first, so each bucket index means the same value range on both
-sides; the result carries the coarser schema. That is not a corner case:
-RSEG down-converts a flush whose bucket count exceeds its limit, so two
-flushes of one series can persist at different schemas.
+`h + h` and `h - h` align their two operands before merging buckets, and only
+one shape has no common layout at all. An exponential-schema histogram paired
+with a custom-buckets (NHCB) one cannot be combined: the sample drops with one
+warning annotation on the response's `warnings` channel, reading `incompatible
+bucket layout encountered for binary operator <op>`, matching Prometheus, which
+catches `ErrHistogramsIncompatibleSchema` from `FloatHistogram.Add`/`Sub` and
+raises `NewIncompatibleBucketLayoutInBinOpWarning`.
+
+Every other layout difference reconciles rather than dropping. Two
+custom-buckets histograms with different bounds are each re-bucketed onto the
+intersection of their two boundary sets and then merged (Prometheus'
+`addCustomBucketsWithMismatches`); the result carries one info annotation,
+`mismatched custom buckets were reconciled during addition` (or `during
+subtraction`). There is no `ErrHistogramsIncompatibleBounds` in v3.13.1;
+differing bounds are not an error. Two exponential histograms at different
+schemas are both down-converted to the coarser one first, so each bucket index
+means the same value range on both sides, and the result carries the coarser
+schema. Two exponential histograms with different zero thresholds have the
+narrower threshold widened to the larger, folding the regular buckets that now
+fall inside it into the zero count before the merge (Prometheus'
+`reconcileZeroBuckets`). None of these is a corner case: RSEG down-converts a
+flush whose bucket count exceeds its limit, so two flushes of one series can
+persist at different schemas.
+
+One more difference is carried through as a warning without blocking the merge.
+When the two operands disagree on their counter-reset hint (one `CounterReset`,
+one `NotCounterReset`), the buckets still combine but the result carries the
+warning `conflicting counter resets during histogram <op>`, matching
+Prometheus' `NewHistogramCounterResetCollisionWarning`.
 
 The table below is generated from a run, not hand-maintained: the state
 column is recomputed from which corpus entries actually exercise each
