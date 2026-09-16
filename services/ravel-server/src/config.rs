@@ -1558,8 +1558,8 @@ pub struct Cli {
     pub max_inflight_fragments: u64,
 
     /// The distinct internal-workload admission cap for inbound `Resolve`
-    /// (cross-cluster federation) fragment requests (ADR-0071 deliverable:
-    /// admission disjointness): the maximum number of federation slice
+    /// (cross-cluster federation) fragment requests (issue #1722): the maximum
+    /// number of federation slice
     /// fetches this process serves concurrently for peer-cluster
     /// coordinators. A separate class from `--max-inflight-fragments`, which
     /// now gates `Pinned` (intra-cluster) fragment requests only: a peer
@@ -3107,8 +3107,7 @@ pub struct DistribSettings {
     /// (`--max-inflight-fragments`, clamped `>= 1`).
     pub max_inflight_fragments: usize,
     /// The `Resolve` (cross-cluster federation) fragment admission cap, a
-    /// distinct workload class from `max_inflight_fragments` (ADR-0071
-    /// deliverable: admission disjointness), so a peer cluster's federation
+    /// distinct workload class from `max_inflight_fragments` (issue #1722), so a peer cluster's federation
     /// reads can never starve this cluster's own `Pinned` slices
     /// (`--max-inflight-federated-resolves`, clamped `>= 1`).
     pub max_inflight_federated_resolves: usize,

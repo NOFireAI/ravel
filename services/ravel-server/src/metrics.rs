@@ -283,8 +283,8 @@ pub enum Label {
     /// accounting (or give each component its own counter) before either
     /// sample can be read as a share.
     MemoryComponent(MemoryComponent),
-    /// Which ADR-0071 fragment admission class a `ravel_distrib_fragment_*`
-    /// sample belongs to (deliverable: admission disjointness): `Pinned`
+    /// Which fragment admission class a `ravel_distrib_fragment_*`
+    /// sample belongs to (issue #1722): `Pinned`
     /// (intra-cluster fan-out) or `Resolve` (cross-cluster federation). A
     /// closed enum owned by [`crate::distrib`], since the classes are the
     /// admission layer's own, not a dimension this renderer invents.
@@ -4312,9 +4312,8 @@ fn render_attribution_family(out: &mut String, mode: Mode, rows: &[TenantAttribu
 pub struct DistribSnapshot {
     pub fragment_requests_total: u64,
     pub fragment_auth_failures_total: u64,
-    /// In-flight fragment requests per ADR-0071 admission class
-    /// (`Pinned`, `Resolve`; deliverable: admission disjointness, issue
-    /// #1722).
+    /// In-flight fragment requests per fragment admission class
+    /// (`Pinned`, `Resolve`; issue #1722).
     pub fragment_inflight_by_class: [(crate::distrib::AdmissionClass, u64); 2],
     /// Cumulative admission-queue waits per class (issue #1722).
     pub fragment_admission_waits_by_class: [(crate::distrib::AdmissionClass, u64); 2],
@@ -7281,8 +7280,7 @@ mod tests {
     /// the new `ravel_distrib_*` names, and every one of its series carries only
     /// the closed `{mode}` label, except the per-class fragment in-flight gauge
     /// and admission-wait counter, which also carry `class` (ADR-0044 section 4;
-    /// `class` added by ADR-0071's admission disjointness deliverable, issue
-    /// #1722): no per-shard, per-worker, or per-tenant label. Also asserts the
+    /// `class` added for the fragment admission classes, issue #1722): no per-shard, per-worker, or per-tenant label. Also asserts the
     /// family is absent entirely when the snapshot is `None`, matching the "off
     /// unless --distributed-query" wiring.
     #[test]
