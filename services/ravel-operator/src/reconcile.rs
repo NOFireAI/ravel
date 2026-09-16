@@ -120,7 +120,12 @@ pub const PRE_STOP_DRAIN_DELAY_SECONDS: i64 = 10;
 /// assert more than that: below 1.34 (where the gate goes stable and
 /// locked on) an operator of the control plane can still have disabled the
 /// gate manually, and this check -- which only reads the apiserver version
-/// -- cannot detect that.
+/// -- cannot detect that. The gate also lives in the kubelet, not only the
+/// apiserver, and Kubernetes' supported skew policy allows a kubelet up to
+/// three minors behind the control plane: a 1.32 apiserver with a 1.29 node
+/// pool reads as 32 here and passes, but PodLifecycleSleepAction is off by
+/// default on those nodes, so the preStop hook is dropped there and this
+/// check -- which only reads the apiserver version -- cannot see it.
 pub const MIN_KUBERNETES_MINOR_VERSION: u32 = 30;
 
 /// `terminationGracePeriodSeconds` on every ravel-server pod.

@@ -80,6 +80,14 @@ const RETRY: Duration = Duration::from_secs(30);
 /// ready, and deliberately not [`RETRY`], which is the failure path.
 const BOOTSTRAP_POLL: Duration = Duration::from_secs(10);
 
+/// Bound on the startup `/version` read in [`run`] (issue #1714). kube-client
+/// 4.2's `Config` defaults leave `read_timeout` unset, so an apiserver that
+/// completes the TCP handshake but never answers would otherwise leave `run`
+/// pending forever, with no `RavelCluster` ever reconciled and no liveness
+/// probe to restart the pod. An elapsed timeout is treated exactly like a
+/// network error: warn once and carry `None` (fail open).
+const APISERVER_VERSION_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Reconcile errors.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -2235,20 +2243,27 @@ fn kubernetes_version_condition(
     if minor >= MIN_KUBERNETES_MINOR_VERSION {
         return None;
     }
+    // An empty `git_version` (some managed control planes omit it even when
+    // `minor` parses fine) must not render as a doubled space with nothing
+    // between "apiserver" and "(minor ...)".
+    let git_version = if info.git_version.is_empty() {
+        "unknown"
+    } else {
+        info.git_version.as_str()
+    };
     Some(condition(
         "KubernetesVersionUnsupported",
         true,
         observed_generation,
         "BelowMinimumKubernetesVersion",
         &format!(
-            "cluster reports Kubernetes apiserver {} (minor {minor}), below \
+            "cluster reports Kubernetes apiserver {git_version} (minor {minor}), below \
              the minimum supported version 1.{MIN_KUBERNETES_MINOR_VERSION}: \
              the PodLifecycleSleepAction gate the operator's preStop \
              SleepAction needs is not on by default below that version, so \
              pods here run without the preStop drain hook and a rolling \
              update can drop in-flight ingest across the endpoint-\
-             propagation window",
-            info.git_version,
+             propagation window"
         ),
     ))
 }
@@ -2706,24 +2721,50 @@ pub async fn run() -> Result<(), Error> {
     // Read the apiserver version once at startup, not per reconcile: a
     // process-lifetime value cannot flap on a later `/version` blip, only on
     // an actually-below-floor cluster (issue #1714). A 403 (RBAC not yet
-    // applied) or a network error fails open: log once and carry `None`, so
-    // `kubernetes_version_condition` never runs for this process rather than
-    // raising and clearing the condition on every transient failure.
-    let kubernetes_version = match client.apiserver_version().await {
-        Ok(info) => {
-            if kubernetes_minor_version(&info).is_none() {
-                warn!(
-                    minor = %info.minor,
-                    git_version = %info.git_version,
-                    "could not parse Kubernetes apiserver version; skipping the minimum-version check"
-                );
+    // applied), a network error, or a bound timeout (see
+    // `APISERVER_VERSION_READ_TIMEOUT`) all fail open the same way: log once
+    // and carry `None`, so `kubernetes_version_condition` never runs for this
+    // process rather than raising and clearing the condition on every
+    // transient failure.
+    let kubernetes_version = match tokio::time::timeout(
+        APISERVER_VERSION_READ_TIMEOUT,
+        client.apiserver_version(),
+    )
+    .await
+    {
+        Ok(Ok(info)) => {
+            match kubernetes_minor_version(&info) {
+                Some(minor) if minor < MIN_KUBERNETES_MINOR_VERSION => {
+                    warn!(
+                        minor,
+                        git_version = %info.git_version,
+                        minimum_kubernetes_minor_version = MIN_KUBERNETES_MINOR_VERSION,
+                        "Kubernetes apiserver is below the minimum supported version; \
+                         every RavelCluster will carry a KubernetesVersionUnsupported condition"
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    warn!(
+                        minor = %info.minor,
+                        git_version = %info.git_version,
+                        "could not parse Kubernetes apiserver version; skipping the minimum-version check"
+                    );
+                }
             }
             Some(info)
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             warn!(
                 %error,
                 "could not read Kubernetes apiserver version; skipping the minimum-version check"
+            );
+            None
+        }
+        Err(_elapsed) => {
+            warn!(
+                timeout_seconds = APISERVER_VERSION_READ_TIMEOUT.as_secs(),
+                "timed out reading Kubernetes apiserver version; skipping the minimum-version check"
             );
             None
         }
@@ -2787,6 +2828,7 @@ mod tests {
     use crate::crd::{
         GatewaySpec, IngestAffinitySpec, MaintainSpec, QuerySpec, S3Spec, StorageSpec,
     };
+    use kube::Config;
 
     #[test]
     fn rfc3339_formats_known_instants() {
@@ -3081,6 +3123,11 @@ mod tests {
             ("unknown", "unknown", None),
             ("", "v1.28.9", Some(28)),
             ("", "1.31.6", Some(31)),
+            // Empty `git_version`: `minor` alone is enough to parse and to
+            // detect below-floor, but the condition message must fall back
+            // to a placeholder rather than rendering a doubled space where
+            // `git_version` would have gone.
+            ("29", "", Some(29)),
         ];
 
         for (minor, git_version, expect_detected_minor) in cases {
@@ -3112,6 +3159,12 @@ mod tests {
                     cond.message.contains(&format!("(minor {detected})")),
                     "message names the parsed minor, not just a substring \
                      `git_version` also happens to contain: {}",
+                    cond.message
+                );
+                assert!(
+                    !cond.message.contains("  "),
+                    "message must never render a doubled space for an \
+                     empty git_version: {}",
                     cond.message
                 );
             } else {
@@ -3173,6 +3226,48 @@ mod tests {
         let at_floor = version_info("30", "v1.30.0");
         let at = pass_conditions(&spec, Some(5), Some(&at_floor));
         assert_eq!(condition_types(&at), Vec::<&str>::new());
+    }
+
+    /// `reconcile`'s call site (issue #1714) reads `ctx.kubernetes_version.as_ref()`
+    /// off a real `Context`, not a bare `Option<&Info>` built by hand: a
+    /// regression that quietly swapped that expression for `None` would leave
+    /// clippy and every other test in this module green, since
+    /// `pass_conditions_adds_the_kubernetes_version_condition_only_below_the_floor`
+    /// above never touches `Context` at all. This builds an actual `Context`
+    /// (with a real `Client`, pointed at a loopback port nothing serves --
+    /// building it makes no network call and the test never awaits an RPC on
+    /// it) holding a below-floor `Info`, then runs the same
+    /// `ctx.kubernetes_version.as_ref()` expression `reconcile` does. Demonstrated
+    /// failing (assertion fails, no condition added) with that expression
+    /// replaced by `None` in this test.
+    #[tokio::test]
+    async fn context_kubernetes_version_reaches_pass_conditions_below_the_floor() {
+        // Building a rustls-tls `Client` needs a process-level crypto
+        // provider installed; `main` does this (see main.rs), but nothing
+        // does it for `cargo test`. Harmless to call more than once: a
+        // provider already installed by an earlier test in this binary makes
+        // `install_default` return `Err`, which is exactly why it is
+        // ignored rather than unwrapped. `Client::try_from` also builds a
+        // tower `Buffer` service that needs a live Tokio reactor, hence
+        // `#[tokio::test]` rather than a plain `#[test]`.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::try_from(Config::new(
+            "http://127.0.0.1:1".parse().expect("valid loopback URI"),
+        ))
+        .expect("Client builds from a bare Config without contacting anything");
+        let ctx = Context {
+            client,
+            kubernetes_version: Some(version_info("29", "v1.29.5")),
+        };
+        let spec = spec_with_affinity(None);
+
+        let extra = pass_conditions(&spec, Some(5), ctx.kubernetes_version.as_ref());
+
+        assert_eq!(
+            condition_types(&extra),
+            vec!["KubernetesVersionUnsupported"]
+        );
+        assert_eq!(find(&extra, "KubernetesVersionUnsupported").status, "True");
     }
 
     /// A reconcile error during a bootstrap hold must not restart the stall
