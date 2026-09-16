@@ -134,6 +134,7 @@ use crate::metadata_agg::MetadataOnlyAggregate;
 use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
 use crate::provider::RavelTableProvider;
 use crate::spans_provider::SpansTableProvider;
+use crate::trace_id_planner::trace_id_hex_literal_planner;
 use crate::udf::{label_match_udf, label_udf};
 
 /// The metrics table name (`Signal::Metrics`).
@@ -715,6 +716,13 @@ pub fn build_session(
     // feature. Registered for both tables, since `samples.labels` is a `Map`
     // column too and this planner is table-agnostic.
     ctx.register_expr_planner(map_field_access_planner())?;
+
+    // Register a hand-written `ExprPlanner` so `trace_id = '<32-hex>'`
+    // plans against the `spans` table's `FixedSizeBinary(16)` `trace_id`
+    // column instead of failing `type_coercion` with `Cannot infer common
+    // argument type for comparison operation FixedSizeBinary(16) = Utf8`.
+    // See `crate::trace_id_planner` for why only `Eq`/`NotEq` are covered.
+    ctx.register_expr_planner(trace_id_hex_literal_planner())?;
 
     // Allowlist enforcement (ADR-0022 decision 2), the hard registration
     // boundary behind the parse gate. Enumerate every aggregate UDAF the
