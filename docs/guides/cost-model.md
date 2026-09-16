@@ -45,9 +45,11 @@ by whichever of three bands applies:
 - **Waiter**: `max_flush_delay` (2s default). Applies whenever a strict-mode
   export is waiting on this buffer's flush, regardless of buffered bytes.
 
-The byte floor and the waiter bands share the same fixed threshold by
-default; they diverge only when adaptive flush delay (off by default) widens
-the waiter band's threshold toward a per-tenant ceiling. A low-volume buffer
+The byte floor and the waiter bands are one branch in the code, so they
+always carry the same threshold: a buffer qualifies for it through either
+condition. On the metrics pipeline, turning on adaptive flush delay (off by
+default) widens that threshold toward a per-tenant ceiling for both; the log
+and span pipelines have no adaptive band. A low-volume buffer
 that never reaches the byte floor or gets a waiter flushes on the idle clock;
 a busy or strict-mode buffer flushes on the faster of the other two.
 

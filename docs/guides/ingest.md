@@ -361,14 +361,19 @@ Attributing an event-time skew problem
 ([observability guide](observability.md#reading-the-reason-label)) to one
 misbehaving writer depends on this: `ravel_admission_rejected_total{reason="skew"}`
 is broken out only by `tenant_hash` and `signal`. Ravel deliberately keeps
-per-shard and per-writer detail out of the unauthenticated `/metrics` scrape,
-so `instance` is the only axis available for narrowing a skew alert down to
-a single pod. That only works if the
-collector config gives each pod a distinct `service.instance.id` (for
-example, populated from the pod name via the downward API); a static or
-unset value collapses every replica of a job onto one `instance` label, and
-one pod's broken clock becomes indistinguishable from the rest of the
-fleet.
+per-writer detail out of the unauthenticated `/metrics` scrape, and the
+`instance` label a Prometheus scrape attaches to that counter identifies the
+Ravel process, not the writer that sent the skewed data. So Ravel's own
+metrics tell you that a tenant is being rejected, never which of its pods.
+
+To find the pod, query the tenant's own ingested series, where
+`service.instance.id` becomes the `instance` label. That works only if the
+collector config gives each pod a distinct value (for example, populated
+from the pod name via the downward API); a static or unset value collapses
+every replica of a job onto one `instance`. Note that rejected points are
+never stored, so this narrows a writer whose clock drifted far enough to be
+visible but not far enough to be rejected. For a writer already past the
+limit, the collector's own logs are the remaining source.
 
 ## Commit tokens and read-your-write
 
