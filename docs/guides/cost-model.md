@@ -245,8 +245,8 @@ published us-east-1 list prices, never read off an invoice. The absolute
 amounts for a single benchmark pass are small, so they matter as a rate at
 production query volume, not as cents.
 
-The measured example is the ClickBench corpus (42 statements, cold, reference
-box, with the pass procedure in
+The measured example is one experiment on the ClickBench corpus (42
+statements, cold, reference box, with the pass procedure in
 [clickbench-aws-runbook.md](../internal/clickbench-aws-runbook.md)). Reading
 every segment whole against routing narrow projections to ranged reads:
 
@@ -258,7 +258,11 @@ cold bytes       403.97 GB whole  194.19 GB ranged  (-52%)
 Half the bytes and 3.7x the requests. The ranged pass finished faster despite
 the extra requests, at 222.19 s cold. Modeled at us-east-1 list prices it
 costs about 2.2x more in request charges than the whole-object pass, and it
-is faster.
+is faster. Those two fenced lines and that 222.19 s time are one pass. Its
+fetch concurrency is not recorded, and the whole-versus-ranged comparison is
+sensitive to it, so read the three figures as a single experiment at an
+unrecorded concurrency and reproduce the procedure through the runbook linked
+above.
 
 Both of those can be true at once because of an asymmetry in the price sheet:
 same-region S3-to-EC2 transfer is not billed, so on that deployment shape
@@ -282,15 +286,14 @@ deployment's billing shape, which is why this is a flag and not a constant.
    reads. Setting the flag at all is what would take that away, since an
    explicit value replaces the saturated rate with a finite one; unset is the
    setting that keeps it. The whole-object shape that saturation produces
-   measures slower and heavier, not faster: 486.0s and 463.79 GB transferred
-   against 285.8s and 150.28 GB for the ranged shape, on the same
-   42-statement corpus, cold. Leaving this unset is still the right starting
-   point when the object-store bill, not wall-clock time, is what is being
-   minimized. An operator who wants the faster, byte-lighter shape has to ask
-   for it explicitly through the fetch-policy flag (see
-   [caching.md](caching.md)); this knob does not select it, and a different
-   store, region, or fetch concurrency shifts the break-even for this knob
-   independently of that choice.
+   measures slower and heavier, not faster. Leaving this unset is still the
+   right starting point when the object-store bill, not wall-clock time, is
+   what is being minimized. An operator who wants the faster, byte-lighter
+   shape has to ask for it explicitly through the fetch-policy flag (see
+   [caching.md](caching.md)); the fetch-policy record listed under Background
+   carries the current whole-versus-ranged ratio. This knob does not select
+   that shape, and a different store, region, or fetch concurrency shifts the
+   break-even for this knob independently of that choice.
 2. **Leave it unset on an egress-billed backend** too, and give that backend's
    prices to `--store-cost-profile` instead. Unset with those prices loaded, the
    cost-based resolution derives a rate at that deployment's own dollar
