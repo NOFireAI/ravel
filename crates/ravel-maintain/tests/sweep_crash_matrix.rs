@@ -16,17 +16,19 @@ mod common;
 
 use common::*;
 use prost::Message;
-use ravel_commit::keys;
+use ravel_commit::{keys, signal};
 use ravel_maintain::{
-    Bucket, Clock, CompactionOutcome, CompactorConfig, FixedClock, NoLeases, PublishOutcome,
-    compact_bucket, sweep_orphans, sweep_shard, sweep_shard_zoned, sweep_superseded,
+    Bucket, Clock, CompactionOutcome, CompactorConfig, ErasureRewriteOutcome, FixedClock,
+    MaintainMemo, NoLeases, PendingErasureRequest, PublishOutcome, compact_bucket,
+    erasure_rewrite_bucket, sweep_orphans, sweep_shard, sweep_shard_zoned, sweep_superseded,
 };
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError, list_all};
-use ravel_proto::commit::v1::RetentionTombstone;
+use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest, RetentionTombstone};
+use ravel_types::Signal;
 use uuid::Uuid;
 
 /// Which signal fixture a shared test runs over.
@@ -482,8 +484,7 @@ async fn row8c_record_loop_stops_at_the_first_refused_delete() {
         assert_eq!(
             store.fault_count(Op::Delete, FaultKind::Timeout),
             1,
-            "the Nth(2) record-delete fault must have fired exactly once; a \
-             higher count means the loop kept issuing deletes after the refusal"
+            "the Nth(2) record-delete fault must have fired"
         );
 
         let after_records = l0_commit_count(&store, &bucket).await;
@@ -503,6 +504,242 @@ async fn row8c_record_loop_stops_at_the_first_refused_delete() {
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
     run(Sig::Spans).await;
+}
+
+// --- Row 8d: a lock on the chain's own record aborts the third loop --------
+
+/// Two metrics L0 inputs carrying a "victim" series an erasure request can
+/// match, so a rewrite over the compacted bucket supersedes the compaction
+/// record via `superseded_record_key`. That is the only path that puts a
+/// chain's own record into `chain_record_keys` (the third delete loop):
+/// `gather_superseded_chain` in `crates/ravel-maintain/src/sweep.rs`.
+fn erasure_metrics_specs() -> Vec<InputSpec> {
+    vec![
+        InputSpec::new(
+            Uuid::from_u128(1),
+            10,
+            1,
+            vec![
+                raw_series("keep", &[("k", "a")], &[(1_000, 1.0), (2_000, 2.0)]),
+                raw_series("victim", &[("k", "b")], &[(1_000, 5.0)]),
+            ],
+        ),
+        InputSpec::new(
+            Uuid::from_u128(2),
+            10,
+            2,
+            vec![raw_series("victim", &[("k", "b")], &[(3_000, 3.0)])],
+        ),
+    ]
+}
+
+/// A windowless metrics erasure request matching every series named `metric`,
+/// acknowledged at time 0.
+fn pending_erasure(seed: u128, metric: &str) -> PendingErasureRequest {
+    let request_id = Uuid::from_u128(seed);
+    PendingErasureRequest {
+        request_key: keys::erasure_request_key(&tenant_hash(), Signal::Metrics, request_id)
+            .unwrap(),
+        request: ErasureRequest {
+            format_version: 1,
+            tenant_hash: tenant_hash().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            request_id: request_id.to_string(),
+            created_unix_ns: 0,
+            predicate: vec![ErasurePredicateMatcher {
+                key: "__name__".to_string(),
+                value: metric.to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: String::new(),
+        },
+    }
+}
+
+/// The single compaction record key in the metrics test bucket.
+async fn compaction_record_key(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> String {
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .unwrap();
+    for m in list_all(store, &prefix).await.unwrap() {
+        if matches!(
+            keys::partition_bucket_entry(&m.key),
+            Ok(keys::BucketEntry::CompactionRecord(_))
+        ) {
+            return m.key;
+        }
+    }
+    panic!("no compaction record in the bucket");
+}
+
+/// The chain's own records: the `l1.*.cmt` compaction records and `rw.*.cmt`
+/// rewrite records in the bucket. These are what the third delete loop removes.
+async fn chain_record_count(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> usize {
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .unwrap();
+    list_all(store, &prefix)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| {
+            matches!(
+                keys::partition_bucket_entry(&m.key),
+                Ok(keys::BucketEntry::CompactionRecord(_))
+                    | Ok(keys::BucketEntry::RewriteRecord(_))
+            )
+        })
+        .count()
+}
+
+/// Row 8d: a compliance lock on a chain's OWN compaction or rewrite record does
+/// not hold the superseded data. `sweep_superseded` runs three delete loops in
+/// order (`sweep_superseded_impl`, `crates/ravel-maintain/src/sweep.rs`): every
+/// cleared group's input commit records, then every cleared group's data
+/// objects, then every cleared group's own chain records, so a rewrite record
+/// outlives every input it superseded. By the time a lock on a chain record
+/// refuses, the pass has already deleted the input records, the L0 data, and
+/// the pre-rewrite L1 parts; the refusal aborts the pass at the third loop, and
+/// the chain's own record survives for the next pass to retry.
+///
+/// The fixture compacts two L0 inputs, then rewrites the compacted bucket so
+/// the rewrite record supersedes the compaction record (the
+/// `superseded_record_key` path, the only one that populates
+/// `chain_record_keys`). The commit keyspace then holds two input commit
+/// records (deleted in loop one), one compaction record (deleted in loop
+/// three), and the live rewrite record (never deleted); the L0 data and the L1
+/// parts carry no `/c/` in their keys. So a `Nth(3)` fault on `/c/` lands on
+/// the first (and only) chain-record delete, after loops one and two ran to
+/// completion.
+///
+/// Discrimination: moving the fault to loop one (`Nth(1)`) instead aborts
+/// before the data loop, leaving the L0 data in place and failing the
+/// `l0_data_count == 0` assertion, so this row separates a third-loop refusal
+/// from a first-loop one. Metrics-only, like the rewrite fixtures in
+/// `erasure_sweep.rs`: an erasure predicate matching an RLOG or RSPAN series is
+/// signal-specific, and the third loop the row exercises is signal-generic.
+#[tokio::test]
+async fn row8d_locked_chain_record_aborts_after_inputs_and_data_gone() {
+    let inner = MemoryStore::new();
+    // Nth(3) on `/c/`: loop one deletes the two input commit records, loop two
+    // deletes the L0 data and pre-rewrite L1 parts (neither key carries `/c/`),
+    // and the third `/c/` delete is the chain's own compaction record in loop
+    // three.
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Delete, ScriptedFault::Timeout)
+            .with_key_contains("/c/")
+            .with_occurrence(Occurrence::Nth(3)),
+    );
+    let store = FaultStore::new(inner, plan);
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let bucket = bucket();
+
+    for spec in erasure_metrics_specs() {
+        seed_input(&store, &spec).await;
+    }
+    let outcome = compact_bucket(&store, &clock, &cfg(), &bucket)
+        .await
+        .expect("compact");
+    assert!(
+        matches!(outcome, CompactionOutcome::Compacted { .. }),
+        "expected Compacted, got {outcome:?}"
+    );
+    let comp_key = compaction_record_key(&store, &bucket).await;
+
+    let mut memo = MaintainMemo::with_default_interval();
+    let rewrite = erasure_rewrite_bucket(
+        &store,
+        &clock,
+        &cfg(),
+        &NoLeases,
+        &bucket,
+        &[pending_erasure(42, "victim")],
+        &mut memo,
+    )
+    .await
+    .expect("rewrite");
+    assert!(
+        matches!(rewrite, ErasureRewriteOutcome::Rewritten { .. }),
+        "the rewrite must supersede the compaction record, got {rewrite:?}"
+    );
+
+    clock.set(past_horizon(created, &cfg()));
+    let before_data = l0_data_count(&store, &bucket).await;
+    assert!(before_data > 0, "L0 data exists before the sweep");
+    assert_eq!(
+        l0_commit_count(&store, &bucket).await,
+        2,
+        "the fixture must hold two superseded L0 input commit records"
+    );
+    let before_chain = chain_record_count(&store, &bucket).await;
+    assert_eq!(
+        before_chain, 2,
+        "the fixture must hold the compaction record and the live rewrite \
+         record; the Nth(3) /c/ fault reaches the compaction record only after \
+         the two input records are gone, so the third /c/ delete is a \
+         chain-record delete in loop three"
+    );
+    assert!(
+        store.head(&comp_key).await.is_ok(),
+        "the superseded compaction record is present before the sweep"
+    );
+
+    let err = sweep_superseded(
+        &store,
+        &clock,
+        &cfg(),
+        &NoLeases,
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+    )
+    .await;
+    assert!(
+        err.is_err(),
+        "a refused chain-record delete must abort the pass"
+    );
+    assert_eq!(
+        store.fault_count(Op::Delete, FaultKind::Timeout),
+        1,
+        "the Nth(3) chain-record-delete fault must have fired"
+    );
+
+    // Loops one and two ran to completion before the third loop refused, so a
+    // lock on the chain's own record did not hold the data behind it.
+    assert_eq!(
+        l0_commit_count(&store, &bucket).await,
+        0,
+        "the input commit records are gone: loop one completed before the \
+         chain-record loop refused"
+    );
+    assert_eq!(
+        l0_data_count(&store, &bucket).await,
+        0,
+        "the L0 data is gone: loop two completed before the chain-record loop \
+         refused. Moving the fault to loop one (Nth(1)) leaves this data in \
+         place and fails here, which is what makes the row discriminate the \
+         third loop from the first"
+    );
+    assert_eq!(
+        chain_record_count(&store, &bucket).await,
+        before_chain,
+        "the chain's own record count is unchanged: the refused compaction \
+         record survives the retention period for the next pass to retry"
+    );
+    assert!(
+        store.head(&comp_key).await.is_ok(),
+        "the superseded compaction record survives the refused delete"
+    );
 }
 
 // --- Row 9: pinned query outlives horizon, input deleted under it ----------

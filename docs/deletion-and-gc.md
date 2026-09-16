@@ -621,13 +621,17 @@ into them. An operator with erasure obligations must budget them deliberately.
   an operator-run mechanism applying per-object retention instead;
   docs/object-store-contract.md "Required bucket configuration", ADR-0072
   decision 3), a superseded commit record still under its retention period
-  `R` refuses the same sweep delete `+D` describes: `sweep_superseded`
-  deletes a chain's input commit records before its input data objects,
-  and it runs the record-delete loop over every cleared group in the pass
-  before the data-delete loop runs at all, so a single locked record
-  aborts that pass at the record-delete step and the data-delete step
-  never runs for any chain in it, holding the physical-removal bound at
-  `max(bound, R)` until `R` elapses. `sys/*`, `t/*/*/prov`, and
+  `R` refuses the same sweep delete `+D` describes. `sweep_superseded` runs
+  three delete loops in order over every cleared chain: every chain's input
+  commit records first, then every chain's input data objects, then every
+  chain's own compaction or rewrite records last. A lock on a chain's input
+  commit record aborts the pass at the first loop, so the data-delete loop
+  never runs for any chain in that pass and the physical-removal bound stays
+  at `max(bound, R)` until `R` elapses. A lock on a chain's own compaction or
+  rewrite record instead aborts the pass at the third loop, after that
+  chain's input records and their data are already gone: it holds only that
+  record at `max(bound, R)`, and the chain survives the retention period for
+  the next pass to retry. `sys/*`, `t/*/*/prov`, and
   `t/*/catalog/*/*` carry the same scoped retention but are never targets
   of supersession GC, ADR-0019 retention deletion, or ADR-0064 erasure.
   That is a statement about those three mechanisms and nothing wider: the
@@ -637,67 +641,18 @@ into them. An operator with erasure obligations must budget them deliberately.
   keeps making progress on superseded chains.
 
 - **`+R` again, scoped per-object compliance retention on the catalog
-  keyspace (`t/*/catalog/*/*`).** `sweep_unreferenced_catalog_objects`
-  (`crates/ravel-maintain/src/sweep.rs`, driven in production by
-  `services/ravel-server/src/maintain.rs`'s maintenance tick) deletes
-  every snapshot part under `catalog/<signal>/snap/` and every
-  name-postings or column-statistics object under `catalog/<signal>/idx/`
-  that the current HEAD no longer names, once it is older than
-  `protection_horizon`. Those keys sit inside `t/*/catalog/*/*`, so a
-  scoped retention applied to the whole catalog keyspace refuses those
-  deletes for `R` too.
-
-  For most of that family the delay costs reclamation only: the catalog
-  HEAD, the snapshot entries, and the name postings hold identities,
-  hashes, counts, timestamps, and metric names, never a label or
-  attribute value (ADR-0064 Context, which enumerates `SnapshotEntry`,
-  `SnapshotPartHeader`, and name postings, and its §7 requirement). The
-  per-part `.cstat` column-statistics objects post-date that ADR and are
-  the exception. A `ColumnStat` carries a `ColumnValue` min and max and a
-  repeated `DictEntry` dictionary, `ColumnValue` admits `str_utf8` and
-  `bytes_val` (proto/ravel/catalog.proto), the fold tallies a declared
-  `Str` or `Bytes` column's exact min, max, and distinct-value dictionary
-  (`crates/ravel-catalog/src/column_stats_build.rs`; the dictionary is
-  kept only up to a fixed entry cap and dropped past it, the min and max
-  are always kept), and a tenant may
-  declare any attribute key, `user.id` among them, as a `STR` typed
-  attribute column (proto/ravel/sys.proto). So for a tenant with a `STR`
-  or `BYTES` typed attribute column, an erased subject's value can sit
-  verbatim in a `.cstat` written under `catalog/<signal>/idx/`
-  (`crates/ravel-catalog/src/fold.rs`).
-
-  Erasure does not rewrite that object, and it does not refresh the
-  catalog either: the rewrite pass publishes new data objects and a
-  rewrite record and drives no tenant-catalog fold of its own
-  (`crates/ravel-maintain/src/rewrite.rs`, whose catalog calls are the
-  segment-internal catalog a rewrite decodes). The catalog picks the
-  rewrite up only when the fold reconciles that hour, through the fixed
-  window or the retention-frontier band, or when a HEAD rebuild
-  re-derives every hour (the same trigger the `.done` scope note below
-  states). Until one of those runs, the live HEAD still names the
-  pre-rewrite part, so that part's `.cstat` is referenced, not sweepable,
-  and the erased value persists with no retention involved at all. Only
-  after the reconcile or the rebuild is the stale `.cstat` unreferenced,
-  and only then does a retention `R` over the keyspace start to matter.
-  The erasure bound for such a tenant is therefore "until the fold
-  reconciles that hour, then `+R`", not `max(bound, R)` alone.
-
-  Under the shipped IAM templates it is worse than that bound.
-  `deploy/iam/maintain.json`'s `DenyDeleteProtected` statement denies the
-  Maintain role every delete under `t/*/catalog/*/*`, so the unreferenced
-  `.cstat` is not deletable at all today, whatever the retention posture
-  is: the bound is open-ended rather than `+R` until that template
-  changes. Scoping the retention mechanism to `catalog/<signal>/HEAD`
-  alone is necessary but not sufficient while that deny stands.
-
-  The refusal also reaches past the locked object. The sweep's delete
-  loop propagates the first refusal, so one locked object aborts that
-  `(tenant, signal)` pass and the unreferenced objects behind it in the
-  same pass are left in place as well; the production driver logs the
-  failed pass and retries on the next maintenance tick, where the same
-  object refuses again, so that tenant and signal's catalog garbage
-  accumulates until `R` elapses. Keep `R` inside `protection_horizon`
-  here for the same reason.
+  keyspace (`t/*/catalog/*/*`).** A compliance lock on this keyspace
+  costs an erasure obligation, not only reclamation. The unreferenced-catalog
+  sweep deletes the snapshot and index objects the current HEAD no longer
+  names, and for a tenant with a `STR` or `BYTES` typed attribute column a
+  per-part `.cstat` index object among them holds that subject's own column
+  value; a lock over the keyspace delays that delete, and the erased value
+  persists until the fold reconciles the hour and then a further `R`. Under
+  the shipped Maintain IAM policy the delete is denied outright, so the
+  bound is open-ended until that policy changes. The four-step mechanism,
+  the exact bound, the IAM ceiling, and the HEAD-scoping advice are in
+  docs/object-store-contract.md's "Required bucket configuration" section,
+  "A lock on the catalog family".
 
 - **`+E_v`, bucket versioning.** On a versioned bucket every physical delete
   becomes a soft delete, and the noncurrent version survives until the

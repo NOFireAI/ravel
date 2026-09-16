@@ -736,17 +736,27 @@ adapter contract:
    A per-object compliance-mode retention `R` on a still-locked commit
    record refuses that delete until `R` elapses, so the physical-removal
    bound for the record (and for the sweep pass holding it) becomes
-   `max(bound, R)`. The superseded sweep deletes a chain's input commit
-   records before its input data objects, and it runs the record-delete
-   loop over every cleared group in the pass before the data-delete loop
-   runs at all; a record still under retention aborts that pass at the
-   record-delete step, so the data-delete step never runs for any chain
-   in it, and the L0 data the pass would otherwise collect stays in
-   place, undeleted, until the record's retention expires and a later
-   pass completes the delete. An operator who needs these sweeps to keep
-   making progress keeps `R` at or under `protection_horizon` (about 25
-   hours with `CompactorConfig` defaults); an `R` longer than that pauses
-   collection on that record for the difference.
+   `max(bound, R)`. The superseded sweep runs three delete loops in order
+   over every cleared chain in the pass: every chain's input commit
+   records first, then every chain's input data objects (its L0 data and
+   pre-rewrite L1 segments), then every chain's own compaction or rewrite
+   records last, so a rewrite record outlives every input it superseded.
+   A lock on a chain's input commit record therefore aborts the pass at
+   the first loop, before the data loop runs at all: the data-delete step
+   never runs for any chain in that pass, and the L0 data the pass would
+   otherwise collect stays in place, undeleted, until the record's
+   retention expires and a later pass completes the delete. A lock on a
+   chain's own compaction or rewrite record is different: by the time the
+   third loop reaches it the pass has already deleted that chain's input
+   records and their data, so the refusal holds only the chain's own
+   record, aborts the pass at the third loop, and leaves that record in
+   place through the retention period for the next pass to retry once `R`
+   elapses; the crash ordering the sweep is built around, a record
+   outliving the objects it superseded, is preserved either way. An
+   operator who needs these sweeps to keep making progress keeps `R` at
+   or under `protection_horizon` (about 25 hours with `CompactorConfig`
+   defaults); an `R` longer than that pauses collection on that record
+   for the difference.
 
    **A lock on the catalog family.** `t/*/catalog/*/*` reaches more than
    the HEAD pointer and its versions: the same pattern covers the
