@@ -1173,9 +1173,14 @@ Counters recorded today:
   strict waiter, so this is an ack-outcome counter, not a flush-outcome one.
 - `series_id_collisions`: batches rejected fail-loud on an ADR-0005 series-id
   collision.
-- `shard_deaths`: shard-actor deaths observed by the router, counted once per
-  death including each respawned incarnation, so it can exceed
-  `shard_count`.
+- `shard_deaths`: shard-actor deaths observed by the router. What a death means
+  differs by signal. The metrics router respawns, so `IngestMetrics` counts
+  every death including each respawned incarnation and the figure can exceed
+  `shard_count`; a low steady rate there is transient recovery. The log and
+  span routers never respawn, so on `LogIngestMetrics` and `SpanIngestMetrics`
+  a death is already a condemnation: it is counted once per shard per live
+  generation, never more, and `shards_condemned` below moves on the same death
+  (see the Log and Span pipeline sections).
 - `shards_condemned`: shards condemned and no longer accepting writes, counted
   at most once per shard per live generation and bounded by
   `live_generations * shard_count`, not `shard_count`: under resharding each
