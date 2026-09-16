@@ -124,6 +124,14 @@ tenant `acme`. There is no default tenant and no anonymous access. A
 deployment is unauthenticated only if you never pass `--tenant-token`,
 which is a conscious choice, not an oversight.
 
+`--tenant-token-file PATH` (env `RAVEL_TENANT_TOKEN_FILE` for the path) is a
+file-based alternative so a token never has to sit in argv or a process
+listing: one `TOKEN=TENANT` pair per line, blank lines and `#` comments
+ignored. Each line is split on the first `=`, exactly like `--tenant-token`,
+so a token value containing `=` is mis-parsed the same way either way.
+`--tenant-token` and `--tenant-token-file` are mutually exclusive;
+`ravel-server` refuses to start with both set.
+
 `--dev-insecure-tenant-header` adds a second resolver, tried only if the
 bearer lookup fails. It reads the tenant name directly from an
 `x-ravel-tenant` request header, with no token. If `--listen-http` does not

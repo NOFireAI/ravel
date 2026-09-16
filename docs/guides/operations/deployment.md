@@ -461,6 +461,14 @@ ravel-server --mode query \
   --remote-cluster name=eu-beta,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-beta.token,tenant=beta
 ```
 
+`--tenant-token` on the command line puts every bearer token into argv, which
+a pod spec or process listing exposes. `--tenant-token-file PATH` (env
+`RAVEL_TENANT_TOKEN_FILE` for the path only) reads the same `TOKEN=TENANT`
+pairs from a file instead, one per line, blank lines and `#` comments
+skipped; mount it from a Secret rather than templating tokens into args.
+`--tenant-token` and `--tenant-token-file` are mutually exclusive; startup
+refuses if both are set.
+
 A local tenant no remote names gets local data only, reported as a complete
 result: a remote it holds no credential for is outside its query, not missing
 from it, so no warning and no `partial: true` appear.
