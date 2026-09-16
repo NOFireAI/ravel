@@ -40,6 +40,19 @@ Shipped:
   the floor at compile time. Without it, an `audit` query on a `--shards 1`
   deployment would have listed only the legal-hold shard and returned an
   exact-looking answer with every statement missing.
+- **The query-audit pipeline install.** Landed after the first cut of this
+  epic, which left every query surface on the no-op sink. `start`
+  (services/ravel-server/src/lib.rs) now spawns a real
+  `ravel_maintain::AuditPipeline` and wires every query surface's audit sink
+  to it under `--mode all` and `--mode query`
+  (`Mode::installs_query_audit_pipeline`, services/ravel-server/src/config.rs),
+  overriding the `NoopQueryAuditSink` those surfaces install internally by
+  default; `--mode gateway` and `--mode maintain` serve no query surface and
+  keep the no-op. `attrs['kind'] = 'query'` now selects real rows on the
+  modes that serve queries, and `audit_mode=required` (the default) does
+  fail closed: a batch flush failure under `AuditMode::Required` is returned
+  to every awaiting query rather than swallowed
+  (crates/ravel-maintain/src/audit_pipeline.rs). Tracked as #1187.
 
 Deliberately not shipped:
 
@@ -67,17 +80,6 @@ Deliberately not shipped:
   prefers the departing evaluator rather than the later write. One current row
   per alert is guaranteed either way, and the SQL fold matches the evaluator's
   own. Tracked as #1175.
-- **The query-audit pipeline install.** Fixed. `start` (services/ravel-server/src/lib.rs)
-  now spawns a real `ravel_maintain::AuditPipeline` and wires every query
-  surface's audit sink to it under `--mode all` and `--mode query`
-  (`Mode::installs_query_audit_pipeline`, services/ravel-server/src/config.rs),
-  overriding the `NoopQueryAuditSink` those surfaces install internally by
-  default; `--mode gateway` and `--mode maintain` serve no query surface and
-  keep the no-op. `attrs['kind'] = 'query'` now selects real rows on the
-  modes that serve queries, and `audit_mode=required` (the default) does
-  fail closed: a batch flush failure under `AuditMode::Required` is returned
-  to every awaiting query rather than swallowed
-  (crates/ravel-maintain/src/audit_pipeline.rs). Tracked as #1187.
 
 ## Epic #8: RSPAN v2/v3/v4 trace investigation
 

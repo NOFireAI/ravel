@@ -357,18 +357,26 @@ and replaces dots with underscores. The default allowlist is
 any resource attribute that is not on this list and not one of the three
 above; it does not store it as a label.
 
-Attributing an event-time skew problem
-([observability guide](observability.md#reading-the-reason-label)) to one
-misbehaving writer depends on this: `ravel_admission_rejected_total{reason="skew"}`
-is broken out only by `tenant_hash` and `signal`. Ravel deliberately keeps
-per-shard and per-writer detail out of the unauthenticated `/metrics` scrape,
-so `instance` is the only axis available for narrowing a skew alert down to
-a single pod. That only works if the
-collector config gives each pod a distinct `service.instance.id` (for
-example, populated from the pod name via the downward API); a static or
-unset value collapses every replica of a job onto one `instance` label, and
-one pod's broken clock becomes indistinguishable from the rest of the
-fleet.
+An event-time skew alert
+([observability guide](observability.md#reading-the-reason-label)) cannot be
+attributed to one writer from `/metrics` alone.
+`ravel_admission_rejected_total{reason="skew"}` is broken out by
+`tenant_hash`, `signal` and `reason`, and by nothing that names a sender. A
+skew-rejected point is never stored, so it produces no ingested series that
+could carry the sender's `instance`. The `instance` label Prometheus attaches
+beside that counter is the scrape target: the Ravel pod that rejected the
+point, not the pod that sent it. The counter cannot be narrowed per shard
+either. `shard` is never combined with `tenant_hash` on any sample, and this
+counter is per tenant.
+
+Finding the writer is a different query against the tenant's admitted
+series. A lagging pod's points that pass admission still carry its late
+timestamps, so the newest sample time per `instance` shows which pod's clock
+trails the rest. That works only if the collector config gives each pod a
+distinct `service.instance.id` (for example, populated from the pod name via
+the downward API). A static or unset value collapses every replica of a job
+onto one `instance` label, and one pod's broken clock becomes
+indistinguishable from the rest of the fleet.
 
 ## Commit tokens and read-your-write
 

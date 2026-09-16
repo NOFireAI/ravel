@@ -34,22 +34,27 @@ engine itself chooses, and one flag moves it.
 PUTs/day = 2 x tenants x signals x shards x replicas x (86400 / age_threshold_s)
 ```
 
-`age_threshold_s` is decided per `(tenant, signal, shard)` buffer, per flush,
-by whichever of three bands applies:
+`age_threshold_s` is decided per `(tenant, signal, shard)` buffer, per flush.
+A buffer has priority when a strict-mode export is waiting on its flush, or
+when its estimated flush size has reached `min_flush_bytes` (256KiB default).
+Either condition is enough, and the two share one threshold:
 
-- **Idle clock**: `max_flush_delay_idle` (40s default). Applies when the
-  buffer has no strict-mode waiter and has not reached `min_flush_bytes`.
-- **Byte floor**: `max_flush_delay` (2s default). Applies once the buffer's
-  estimated flush size reaches `min_flush_bytes` (256KiB default), even with
-  no waiter.
-- **Waiter**: `max_flush_delay` (2s default). Applies whenever a strict-mode
-  export is waiting on this buffer's flush, regardless of buffered bytes.
+- **Idle clock**: `max_flush_delay_idle` (40s default). Applies to a buffer
+  with no priority: no waiter, and not yet at `min_flush_bytes`.
+- **Priority**: `max_flush_delay` (2s default). Applies to a buffer with a
+  waiter, with enough bytes, or both. A buffer that crossed `min_flush_bytes`
+  with no waiter flushes on the same clock as a strict-mode one; the two
+  cases cannot drift apart.
+- **Adaptive priority** (off by default, metrics only): with adaptive flush
+  delay on, the metrics actor widens the priority threshold inside a corridor
+  from `max_flush_delay` up to a ceiling. The ceiling comes from the shard's
+  observed PUT round-trip time and the strict-visibility budget. Where the
+  threshold lands inside the corridor is per tenant, from the tenant's
+  observed arrival gap. Log and span shards have no corridor and always use
+  the fixed pair above.
 
-The byte floor and the waiter bands share the same fixed threshold by
-default; they diverge only when adaptive flush delay (off by default) widens
-the waiter band's threshold toward a per-tenant ceiling. A low-volume buffer
-that never reaches the byte floor or gets a waiter flushes on the idle clock;
-a busy or strict-mode buffer flushes on the faster of the other two.
+A low-volume buffer that never gains priority flushes on the idle clock; a
+busy or strict-mode buffer flushes on the priority threshold.
 
 Every flush is a data-object PUT and a commit-record PUT (the two-object
 commit protocol, unchanged by anything in this guide). Buffers are scoped

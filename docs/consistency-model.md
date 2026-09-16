@@ -331,20 +331,34 @@ query sees. Guarantees:
   `min_commit_token` (read-your-write) path is unaffected: it always GETs its
   exact commit key directly, never through the snapshot.
 - The same exception has a mirror direction: a writer whose own clock lags
-  true time by more than `clock_skew_allowance` (the bound the seal lemma
-  assumes, docs/catalog-and-mvcc.md "Sealed hours") can publish a commit for
-  bucket H after wall time has already sealed it, even though the writer's
-  own clock shows no `max_flush_lifetime` violation. `CreateIfAbsent` does
-  not consult the seal boundary, so the publish succeeds and the record is
-  invisible to non-token queries the same way as the folder-fast case above,
-  until a HEAD rebuild. This direction has no dedicated alarm; it is only
-  caught after the fact, and by the same mechanism: the scheduled
+  true time. `clock_skew_allowance` (5 minutes by default) is the bound the
+  seal lemma assumes of every writer (docs/catalog-and-mvcc.md "Sealed
+  hours"), so a writer lagging by more than that has already broken the
+  assumption. It reaches a sealed hour only once its lag exceeds the seal
+  margin, `max_flush_lifetime + clock_skew_allowance + fold_safety_margin`
+  (1h20m by default). The watermark subtracts that margin from the folder's
+  clock, so a smaller lag still lands in an unsealed bucket. Past the margin
+  the writer publishes a commit for bucket H after wall time has sealed it,
+  while its own clock shows no `max_flush_lifetime` violation.
+  `CreateIfAbsent` does not consult the seal boundary, so the publish
+  succeeds and the record is invisible to non-token queries the same way as
+  the folder-fast case above, until a HEAD rebuild. ADR-1685 decides a
+  writer-side refusal for this direction: a flush whose clock lags the
+  observed store time by more than `clock_skew_allowance` is refused, counted
+  under `clock_lag_refused`, with `clock_lag_unchecked` counting flushes that
+  had no observation to check against. The shipped binary does not implement
+  that refusal or its counters yet. Until it lands, this direction has no
+  dedicated alarm and is caught only after the fact, by the scheduled
   seal-divergence scrubber (`services/ravel-server/src/scrub.rs`,
-  `run_seal_divergence_tick`, run on the fold cadence) re-lists sealed commit
-  records and diffs them against the snapshot, and a late slow-writer commit
-  surfaces as a `missing` entry (`SealDivergenceReport::missing`, exported as
-  the `ravel_scrub_seal_divergence_total` counter). No new refusal is added
-  for this case.
+  `run_seal_divergence_tick`). That tick re-lists sealed commit records and
+  diffs them against the snapshot, and a late slow-writer commit surfaces as
+  a `missing` entry (`SealDivergenceReport::missing`, exported as the
+  `ravel_scrub_seal_divergence_total` counter). It runs on the scrub tick,
+  one hour by default (a `--scrub-period` under one hour shortens it), not
+  on the fold cadence. It runs only in a process started with
+  `--mode maintain`, on the replica that owns shard 0 of a signal, and covers
+  the maintained signals (metrics, logs, spans). A single-process `--mode all`
+  deployment runs no scrub task, so nothing detects this case there.
 
 The fold protocol (the CAS'd HEAD pointer, watermark computation, and how
 each degraded path resolves) is in docs/catalog-and-mvcc.md.
