@@ -201,7 +201,14 @@ floor does not clear the condition on its own -- it clears only once the
 operator pod itself restarts and re-reads `/version`. Note the floor only
 asserts the gate's default: a control-plane operator can still have
 disabled `PodLifecycleSleepAction` manually on a 1.30-1.33 cluster, and this
-check, which only reads the apiserver version, cannot detect that.
+check, which only reads the apiserver version, cannot detect that. The gate
+also lives in the kubelet, not only the apiserver, and Kubernetes' supported
+skew policy allows a kubelet up to three minors behind the control plane: a
+1.32 apiserver with a 1.29 node pool reports 1.32 to this check and passes
+it, but `PodLifecycleSleepAction` is off by default on those nodes, so the
+preStop hook is dropped for pods scheduled there -- a kubelet below the
+floor within the supported skew window is equally invisible to a check that
+only reads the apiserver version.
 
 ## `RavelCluster` reference
 
