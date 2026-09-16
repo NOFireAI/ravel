@@ -84,6 +84,12 @@ async fn forward(
 
     let mut headers = parts.headers.clone();
     strip_hop_by_hop(&mut headers);
+    // This router never installs the mTLS resolver (ADR-0050 decision 1
+    // shape: `--mtls-enabled` is refused at startup), so no header here was
+    // ever verified as a real client certificate. Strip it unconditionally
+    // rather than pass through whatever a client set, so the upstream never
+    // sees this header as if a trusted proxy had stamped it.
+    headers.remove(ravel_tenant_resolve::MtlsResolver::DEFAULT_HEADER);
     // reqwest sets Host from the URL authority (the pod address); a forwarded
     // client Host would conflict with it.
     headers.remove(axum::http::header::HOST);

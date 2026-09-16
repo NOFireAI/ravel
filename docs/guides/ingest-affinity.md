@@ -646,10 +646,12 @@ Ravel's own resolver produces, not any raw wire value. **Immune to token
 rotation**: rotating a tenant's token does not move it to a new subset. This is
 the one key source that survives a rotation cleanly. Caveats: it is rejected on
 `backend: ingressNginx` (nginx cannot run the resolver), and it only works for
-clusters authenticating with static tenant tokens (`tenantTokensSecretRef`),
-because OIDC and mTLS resolution have no CRD surface. Selecting
-`canonicalTenant` without a resolver degrades the router with
-`CanonicalTenantResolverMissing`. See
+clusters authenticating with static tenant tokens (`tenantTokensSecretRef`):
+OIDC has no CRD surface, and mTLS resolution is not an option at all, because
+`ravel-ingest-router` refuses `--mtls-enabled` unconditionally (it builds one
+resolver chain shared by every listener, with no dedicated mTLS listener to
+isolate it behind). Selecting `canonicalTenant` without a resolver degrades
+the router with `CanonicalTenantResolverMissing`. See
 [The `canonicalTenant` key source](#the-canonicaltenant-key-source).
 
 Under the legacy backend, header names are lowercased with every character
