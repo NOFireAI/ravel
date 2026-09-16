@@ -7357,7 +7357,8 @@ mod tests {
             assert!(body.contains(expected), "missing `{expected}`:\n{body}");
         }
         assert_eq!(
-            body.matches("ravel_distrib_fragment_inflight{mode=").count(),
+            body.matches("ravel_distrib_fragment_inflight{mode=")
+                .count(),
             2,
             "exactly one in-flight sample per admission class:\n{body}"
         );

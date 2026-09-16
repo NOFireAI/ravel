@@ -186,6 +186,7 @@ fn always_distribute_settings() -> DistribSettings {
     DistribSettings {
         fragment_keys: vec![FRAGMENT_KEY],
         max_inflight_fragments: 32,
+        max_inflight_federated_resolves: 8,
         thresholds: DistribThresholds {
             min_store_bytes: 0,
             min_segments: 0,

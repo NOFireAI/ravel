@@ -55,7 +55,7 @@ use ravel_segment::{
     SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3, SeriesValues,
 };
 use ravel_server::config::RemoteClusterConfig;
-use ravel_server::distrib::{FragmentAdmission, FragmentMetrics, FragmentService};
+use ravel_server::distrib::{AdmissionClasses, FragmentMetrics, FragmentService};
 use ravel_server::query::build_catalog;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId, TimeRange};
 use tokio::sync::oneshot;
@@ -299,7 +299,7 @@ async fn spawn_remote(
 ) -> Remote {
     let catalog = build_catalog(store.clone(), 1, true, 0, None, None, None).expect("catalog");
     let metrics = Arc::new(FragmentMetrics::new());
-    let admission = FragmentAdmission::new(8, metrics.clone());
+    let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let tokens = std::collections::HashMap::from([(credential.to_string(), tenant.clone())]);
     let resolver: Arc<dyn TenantResolver> = Arc::new(StaticBearerTokenResolver::new(tokens));
