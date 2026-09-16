@@ -227,6 +227,17 @@ pub struct GatewaySpec {
     /// a CEL rule attached to the `gateway` object (see [`ravel_cluster_crd`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposure: Option<GatewayExposureSpec>,
+
+    /// Per-shard cross-tenant flush isolation bound (`--max-inflight-flushes`).
+    /// It caps how many flushes a shard actor runs at once, so one tenant's
+    /// stalled flush cannot block co-resident tenants beyond this many permits.
+    /// Ingest runs only in the gateway tier (the query and maintain modes never
+    /// enter the ingest path), so this is a gateway-only field, like `fold`.
+    /// Omit to keep `ravel-server`'s own default of 1 (today's non-pipelined
+    /// behavior). A minimum of 1 is enforced at admission (see
+    /// [`inject_minimum_bounds`]): `ravel-server` rejects 0 as a flush deadlock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_flushes: Option<u32>,
 }
 
 impl Default for GatewaySpec {
@@ -238,6 +249,7 @@ impl Default for GatewaySpec {
             fold: None,
             ingest_affinity: None,
             exposure: None,
+            max_inflight_flushes: None,
         }
     }
 }
@@ -922,8 +934,8 @@ fn inject_shards_immutability(crd: &mut CustomResourceDefinition) {
 }
 
 /// Attach OpenAPI `minimum: 1` bounds to the count fields that must be positive:
-/// `spec.shards`, `spec.gateway.replicas`, `spec.query.replicas`, and
-/// `spec.maintain.replicas`.
+/// `spec.shards`, `spec.gateway.replicas`, `spec.query.replicas`,
+/// `spec.maintain.replicas`, and `spec.gateway.maxInflightFlushes`.
 ///
 /// Without this, `shards: 0` or a negative replica count passes CRD validation
 /// and only fails much later as a confusing Deployment-apply error or a
@@ -961,6 +973,17 @@ fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
             {
                 replicas.minimum = Some(1.0);
             }
+        }
+        // schemars renders a u32 with `minimum: 0.0`, which is not a positive
+        // floor. ravel-server rejects `--max-inflight-flushes 0` as a flush
+        // deadlock, so the CRD must refuse it at admission rather than let the
+        // pod crashloop.
+        if let Some(max_inflight) = spec_props
+            .get_mut("gateway")
+            .and_then(|g| g.properties.as_mut())
+            .and_then(|p| p.get_mut("maxInflightFlushes"))
+        {
+            max_inflight.minimum = Some(1.0);
         }
     }
 }
@@ -1971,6 +1994,31 @@ mod tests {
         assert_eq!(gateway_api.gateway_ref.namespace, None);
         assert!(gateway_api.grpc, "grpc defaults to true");
         assert_eq!(gateway_api.hostnames, Vec::<String>::new());
+    }
+
+    #[test]
+    fn max_inflight_flushes_is_optional_and_carries_a_minimum_one_bound() {
+        // #1743: the gateway-only flush-isolation bound surfaces under the
+        // gateway schema with minimum 1.0 (injected by inject_minimum_bounds,
+        // since schemars renders a u32 with minimum 0.0). Omitting it still
+        // deserializes with None, so an existing spec is unaffected.
+        let props = gateway_schema_props();
+        assert_eq!(
+            props
+                .get("maxInflightFlushes")
+                .expect("maxInflightFlushes prop")
+                .minimum,
+            Some(1.0),
+            "maxInflightFlushes must reject 0 at admission"
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base).expect("deserialize");
+        assert_eq!(spec.gateway.max_inflight_flushes, None);
     }
 
     #[test]

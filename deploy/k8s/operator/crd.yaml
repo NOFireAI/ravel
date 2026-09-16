@@ -234,6 +234,13 @@
                           }
                         ]
                       },
+                      "maxInflightFlushes": {
+                        "description": "Per-shard cross-tenant flush isolation bound (`--max-inflight-flushes`).\nIt caps how many flushes a shard actor runs at once, so one tenant's\nstalled flush cannot block co-resident tenants beyond this many permits.\nIngest runs only in the gateway tier (the query and maintain modes never\nenter the ingest path), so this is a gateway-only field, like `fold`.\nOmit to keep `ravel-server`'s own default of 1 (today's non-pipelined\nbehavior). A minimum of 1 is enforced at admission (see\n[`inject_minimum_bounds`]): `ravel-server` rejects 0 as a flush deadlock.",
+                        "format": "uint32",
+                        "minimum": 1.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
                       "replicas": {
                         "default": 1,
                         "description": "Replica count for the gateway Deployment.",
