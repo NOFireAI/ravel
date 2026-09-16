@@ -174,6 +174,16 @@ pub struct Context {
     pub kubernetes_version: Option<Info>,
 }
 
+impl Context {
+    /// The apiserver version `reconcile` hands to [`pass_conditions`]. It is
+    /// the one read `reconcile` makes of [`Self::kubernetes_version`], so a
+    /// test can pin the value that reaches the condition builder through the
+    /// same path rather than by copying the field access.
+    pub(crate) fn kubernetes_version(&self) -> Option<&Info> {
+        self.kubernetes_version.as_ref()
+    }
+}
+
 /// What the controller resolves from the token Secret: the tenant names (its
 /// keys), their live token values, and the Secret's `resourceVersion` (fed
 /// into the secrets checksum).
@@ -1218,11 +1228,8 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
     // #1714) rides the same mechanism rather than `Degraded`: a version
     // warning must never displace the pass's single `Degraded` entry (see
     // `reconcile_inner`) for a real bootstrap or qualification degradation.
-    let extra_conditions = pass_conditions(
-        &obj.spec,
-        obj.metadata.generation,
-        ctx.kubernetes_version.as_ref(),
-    );
+    let extra_conditions =
+        pass_conditions(&obj.spec, obj.metadata.generation, ctx.kubernetes_version());
 
     // Set by `reconcile_inner` to the fresh qualified-input hash once a pass
     // reaches `QualificationDecision::Proceed`, so the degraded error path below
@@ -3228,18 +3235,18 @@ mod tests {
         assert_eq!(condition_types(&at), Vec::<&str>::new());
     }
 
-    /// `reconcile`'s call site (issue #1714) reads `ctx.kubernetes_version.as_ref()`
-    /// off a real `Context`, not a bare `Option<&Info>` built by hand: a
-    /// regression that quietly swapped that expression for `None` would leave
-    /// clippy and every other test in this module green, since
-    /// `pass_conditions_adds_the_kubernetes_version_condition_only_below_the_floor`
-    /// above never touches `Context` at all. This builds an actual `Context`
-    /// (with a real `Client`, pointed at a loopback port nothing serves --
-    /// building it makes no network call and the test never awaits an RPC on
-    /// it) holding a below-floor `Info`, then runs the same
-    /// `ctx.kubernetes_version.as_ref()` expression `reconcile` does. Demonstrated
-    /// failing (assertion fails, no condition added) with that expression
-    /// replaced by `None` in this test.
+    /// `reconcile`'s call site (issue #1714) reads `ctx.kubernetes_version()`
+    /// off a real `Context`, not a bare `Option<&Info>` built by hand.
+    /// `reconcile` itself cannot run under test (it needs a live apiserver),
+    /// so the accessor is the pin: `reconcile` reads the field only through
+    /// it, this test asserts the accessor yields the below-floor `Info` and
+    /// that the same call feeds `pass_conditions` into the condition, and a
+    /// regression that swapped the call site for `None` is then a visible
+    /// edit of that one line rather than a silent argument swap. This builds
+    /// an actual `Context` (with a real `Client`, pointed at a loopback port
+    /// nothing serves; building it makes no network call and the test never
+    /// awaits an RPC on it) holding a below-floor `Info`. Demonstrated failing
+    /// with the accessor body replaced by `None`.
     #[tokio::test]
     async fn context_kubernetes_version_reaches_pass_conditions_below_the_floor() {
         // Building a rustls-tls `Client` needs a process-level crypto
@@ -3261,7 +3268,13 @@ mod tests {
         };
         let spec = spec_with_affinity(None);
 
-        let extra = pass_conditions(&spec, Some(5), ctx.kubernetes_version.as_ref());
+        let seen = ctx
+            .kubernetes_version()
+            .expect("the accessor yields the version the context holds");
+        assert_eq!(seen.minor, "29");
+        assert_eq!(kubernetes_minor_version(seen), Some(29));
+
+        let extra = pass_conditions(&spec, Some(5), ctx.kubernetes_version());
 
         assert_eq!(
             condition_types(&extra),
