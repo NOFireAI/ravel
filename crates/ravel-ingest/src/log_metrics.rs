@@ -281,6 +281,17 @@ pub struct LogIngestMetricsSnapshot {
     pub dynamic_columns_used_total: u64,
     pub dynamic_columns_overflowed_total: u64,
     pub dynamic_columns_used_max: u64,
+    /// Sum across shards of [`LogIngestMetrics::in_flight_flushes_by_shard`] at
+    /// snapshot time. The per-shard breakdown does not fit this struct's flat
+    /// Copy shape; call `in_flight_flushes_by_shard` directly for that.
+    pub in_flight_flushes_total: u64,
+    /// Sum across shards of `flush_permit_wait_ns` from
+    /// [`LogIngestMetrics::shard_skew_by_shard`] at snapshot time: total
+    /// injected-`Clock` nanoseconds every flush task has spent waiting on its
+    /// shard's `max_inflight_flushes` semaphore. The per-shard breakdown does
+    /// not fit this struct's flat Copy shape; call `shard_skew_by_shard`
+    /// directly for that.
+    pub flush_permit_wait_ns_total: u64,
 }
 
 /// One shard's flush count split by the trigger that opened each flush (issue
@@ -639,6 +650,16 @@ impl LogIngestMetrics {
                 .dynamic_columns_overflowed_total
                 .load(Ordering::Relaxed),
             dynamic_columns_used_max: self.dynamic_columns_used_max.load(Ordering::Relaxed),
+            in_flight_flushes_total: self
+                .in_flight_flushes_by_shard()
+                .into_iter()
+                .map(|(_, count)| count)
+                .sum(),
+            flush_permit_wait_ns_total: self
+                .shard_skew_by_shard()
+                .into_iter()
+                .map(|(_, stats)| stats.flush_permit_wait_ns)
+                .sum(),
         }
     }
 }
