@@ -214,6 +214,17 @@ pub struct SweepReport {
     /// decision 4's one-shot operator override). Always `false` when
     /// `orphan_breaker_tripped` is `true`.
     pub orphan_breaker_overridden: bool,
+    /// Whether this pass ran rule 1 at all (see [`OrphanPass`]).
+    ///
+    /// Every orphan field above is zero/`false` on a [`OrphanPass::Skip`]
+    /// pass because rule 1 never ran, not because the pass looked and found
+    /// nothing. The two are indistinguishable from the counts alone, so a
+    /// consumer keeping a last-observed-value gauge (`ravel-server`'s
+    /// `orphans_present` and `orphans_withheld`) reads this field and leaves
+    /// its gauges alone on `Skip`: the gauge then reports the last pass that
+    /// actually measured, whose cadence is the full-sweep interval, instead
+    /// of being zeroed by every tick in between.
+    pub orphan_pass: OrphanPass,
     /// `true` if this pass listed the whole shard (rule 1 always does; rules
     /// 2 and 3 did here too, either because the caller used [`sweep_shard`]
     /// or because [`sweep_shard_zoned`] was asked to widen to every hour).
@@ -311,6 +322,7 @@ pub async fn sweep_shard_with_holds(
             orphan_breaker_tripped,
             orphans_withheld,
             orphan_breaker_overridden,
+            orphan_pass: OrphanPass::Run,
             full_pass: true,
         },
         superseded_holds,
@@ -325,10 +337,16 @@ pub async fn sweep_shard_with_holds(
 /// pass. The caller drives `Run` vs `Skip` from its own full-sweep cadence
 /// memo (e.g. [`crate::MaintainMemo::full_sweep_due`]'s consumer): there is no
 /// new interval or flag here, only a gate on the existing one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OrphanPass {
     /// Run rule 1 (candidate selection, the re-verify LIST, the breaker gate,
     /// and quarantine) exactly as an ungated pass would.
+    ///
+    /// The default, so a [`SweepReport`] built from [`Default`] reports a
+    /// measured orphan pass: that is what [`sweep_shard`] does
+    /// unconditionally and what every pass did before this gate existed.
+    /// Only a call site that asks for [`OrphanPass::Skip`] reports otherwise.
+    #[default]
     Run,
     /// Skip rule 1 entirely this pass: no `l0/` data prefix LIST, no
     /// candidate selection, no breaker evaluation. The quarantine reaper
@@ -394,7 +412,11 @@ pub async fn sweep_shard_zoned(
 /// `orphan_breaker_tripped`, `orphans_withheld`, `orphan_breaker_overridden`)
 /// are all zero/`false` for this pass -- never a stale value carried over
 /// from a previous [`OrphanPass::Run`] pass, since they are computed fresh
-/// every call and this call never touches rule 1's state. `quarantine_reaped`
+/// every call and this call never touches rule 1's state. Those zeros are
+/// structural, not a measurement of zero orphans, which is why the report
+/// also carries [`SweepReport::orphan_pass`]: a consumer that cannot tell
+/// them apart publishes "no orphans" for every tick between two full sweeps.
+/// `quarantine_reaped`
 /// is unaffected by `orphan_pass`: the reaper is rule 1's second horizon over
 /// the separate `quarantine/` prefix, not the `l0/` prefix rule 1's candidate
 /// selection lists, and it still runs every pass so objects already
@@ -489,6 +511,7 @@ pub async fn sweep_shard_zoned_with_holds(
             orphan_breaker_tripped,
             orphans_withheld,
             orphan_breaker_overridden,
+            orphan_pass,
             full_pass: false,
         },
         superseded_holds,

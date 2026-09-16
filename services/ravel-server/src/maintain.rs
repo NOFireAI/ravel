@@ -185,12 +185,16 @@ impl MaintenanceSafetyMetrics {
         self.orphan_breaker_trips[signal_index(signal)].load(Ordering::Relaxed)
     }
 
-    /// Orphan candidates withheld by the most recent sweep pass for `signal`.
+    /// Orphan candidates withheld by the most recent sweep pass for `signal`
+    /// that actually ran rule 1 (a pass that skipped it measured nothing and
+    /// leaves this gauge alone, see [`record_sweep`]).
     /// Always `0` when that pass did not trip the breaker -- including a
     /// pass after a previous trip, when dilution or partial restoration let
     /// the breaker clear. That drop to `0` is the un-trip: `orphan_breaker_trips`
     /// above is the durable record that a trip (and its withheld data) ever
     /// happened; this gauge alone must never be read as "resolved."
+    ///
+    /// [`record_sweep`]: Self::record_sweep
     pub fn orphans_withheld(&self, signal: Signal) -> u64 {
         self.orphans_withheld[signal_index(signal)].load(Ordering::Relaxed)
     }
@@ -216,7 +220,15 @@ impl MaintenanceSafetyMetrics {
     /// record that orphans were ever present is the operator's own
     /// investigation the alert triggered, not a later reading of this gauge.
     ///
+    /// "Most recent pass" means the most recent pass that ran rule 1. Since
+    /// the orphan-cadence split (issue #1734) the per-tick zoned sweep skips
+    /// rule 1 and reports structural zeros; those never reach this gauge (see
+    /// [`record_sweep`]), so it holds the last completed orphan pass's count
+    /// and its update cadence is the full-sweep interval
+    /// (`interior_reverify_ns`, default 6 h), not the maintain tick.
+    ///
     /// [`orphans_withheld`]: Self::orphans_withheld
+    /// [`record_sweep`]: Self::record_sweep
     pub fn orphans_present(&self, signal: Signal) -> u64 {
         self.orphans_present[signal_index(signal)].load(Ordering::Relaxed)
     }
@@ -287,6 +299,20 @@ impl MaintenanceSafetyMetrics {
     /// [`SweepReport`] reports them per pass rather than as running totals, so
     /// the running total has to be kept here.
     ///
+    /// A pass that did not run rule 1 at all ([`OrphanPass::Skip`], the
+    /// per-tick zoned sweep since the orphan-cadence split) leaves both gauges
+    /// untouched. Its orphan fields are structurally zero rather than
+    /// measured, and storing them would zero the gauges on every tick between
+    /// two full sweeps: with a 300 s tick and the default 6 h
+    /// `interior_reverify_ns`, 71 of every 72 ticks, which is well inside the
+    /// 12 h window the `ravel_maintain_orphans_present > 0` alert evaluates
+    /// over (ADR-0058 decision 1, `docs/guides/operations/troubleshooting.md`).
+    /// The counters are unaffected: a `Skip` pass adds zero, which is the
+    /// truth about events it performed. The same rule holds across the units
+    /// of one tick, since this runs once per shard while the gauges are per
+    /// signal: a `Skip` shard cannot clear what a `Run` shard just measured,
+    /// whichever order the unit loop visits them in.
+    ///
     /// [`orphans_withheld`]: Self::orphans_withheld
     /// [`orphans_present`]: Self::orphans_present
     /// [`SweepReport`]: ravel_maintain::SweepReport
@@ -295,8 +321,11 @@ impl MaintenanceSafetyMetrics {
         if report.orphan_breaker_tripped {
             self.orphan_breaker_trips[index].fetch_add(1, Ordering::Relaxed);
         }
-        self.orphans_withheld[index].store(report.orphans_withheld as u64, Ordering::Relaxed);
-        self.orphans_present[index].store(orphans_present_total(report) as u64, Ordering::Relaxed);
+        if report.orphan_pass == OrphanPass::Run {
+            self.orphans_withheld[index].store(report.orphans_withheld as u64, Ordering::Relaxed);
+            self.orphans_present[index]
+                .store(orphans_present_total(report) as u64, Ordering::Relaxed);
+        }
         self.orphans_quarantined[index]
             .fetch_add(report.orphans_quarantined as u64, Ordering::Relaxed);
         self.orphans_quarantine_refused[index]
