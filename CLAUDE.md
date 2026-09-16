@@ -431,8 +431,11 @@ than passing for "no pull request open".
   That has bitten three times, each a green suite that had never executed
   sitting beside a real defect. Runs in `gates.sh` as well as CI, because the
   person it exists for is the one who just added a suite. It does not see
-  suites named by another convention: `deploy/metricsbench/tests/*.sh` is
-  outside the `*.test.sh` key and is wired by hand.
+  suites named by another convention. `deploy/metricsbench/tests/` holds one
+  of each: its `.test.sh` file is scanned and its `.sh` sibling is not, though
+  both are wired by hand. It reads only the `*.yml`/`*.yaml` directly under
+  `.github/workflows`, since a README or a disabled file there is not
+  something that runs a suite.
 - `scripts/guards/assert-worktree.sh`: exits non-zero if the cwd is the
   PRIMARY checkout rather than a linked worktree. Run it before the first
   edit/commit of any isolated unit of work. A concurrent session can hold

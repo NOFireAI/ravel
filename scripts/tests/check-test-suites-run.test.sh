@@ -63,6 +63,10 @@ new_repo() {
   git -C "${dir}" init -q -b main
   git -C "${dir}" config user.email t@example.test
   git -C "${dir}" config user.name t
+  # A developer with commit.gpgsign=true globally would otherwise fail every
+  # case here on a signing prompt, the way the sibling verify-dispatch suite
+  # already guards against.
+  git -C "${dir}" config commit.gpgsign false
   cp "${GUARD}" "${dir}/scripts/guards/check-test-suites-run.sh"
   chmod +x "${dir}/scripts/guards/check-test-suites-run.sh"
   printf 'name: ci\non: [push]\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n' \
@@ -283,6 +287,40 @@ check_contains "and says what the format is" "<path>|<reason>" "${out}"
 out="$( cd "${d}" && CHECK_TEST_SUITES_EXCEPTED='scripts/tests/slow.test.sh|' \
         ./scripts/guards/check-test-suites-run.sh 2>&1 )"; rc=$?
 check_eq "an empty reason is refused too (2)" "2" "${rc}"
+
+# --- only the files GitHub actually runs count ---------------------------
+# A recursive scan of .github/workflows also read prose and disabled files, so
+# a suite named in any of them read as run. Same false clean as the comment
+# and `name:` cases, one layer out.
+# Mutation: scan the directory recursively again; each case below fails.
+for extra in "README.md" "old.yml.disabled" "archive/retired.yml"; do
+  d="$(new_repo "wfscope_$(printf '%s' "${extra}" | tr -cd '[:alnum:]')")"
+  add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+  add_suite "${d}" "scripts/tests/slow.test.sh"
+  mkdir -p "${d}/.github/workflows/$(dirname "${extra}")"
+  printf '      - run: bash scripts/tests/slow.test.sh\n' >"${d}/.github/workflows/${extra}"
+  commit_all "${d}"
+  out="$(run_guard "${d}")"; rc=$?
+  check_eq "a suite named only in ${extra} is an orphan (1)" "1" "${rc}"
+done
+
+# A second real workflow still counts, so the narrowing did not overshoot.
+d="$(new_repo wfscope_yaml)"
+add_suite "${d}" "scripts/tests/slow.test.sh"
+printf 'name: nightly\non:\n  schedule:\n    - cron: "0 3 * * *"\njobs:\n  y:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bash scripts/tests/slow.test.sh\n' \
+  >"${d}/.github/workflows/nightly.yaml"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a .yaml workflow counts (0)" "0" "${rc}"
+
+# No real workflow file at all is "could not check", not a pass.
+d="$(new_repo wfscope_none)"
+add_suite "${d}" "scripts/tests/slow.test.sh"
+rm -f "${d}/.github/workflows/ci.yml"
+printf 'prose only\n' >"${d}/.github/workflows/README.md"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a workflows dir with no yml exits 2, not 0" "2" "${rc}"
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [[ ${fail} -eq 0 ]]
