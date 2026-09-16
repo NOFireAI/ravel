@@ -138,28 +138,20 @@ QUICKSTART_EXPECTED_PINNED_COUNT=6
 # slip through as "exempt".
 RAVEL_IMAGE_VAR_REF='${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.15.0}'
 
-# The four workflow files category 5 scans for `docker run`/`docker
-# pull`/`docker create` image arguments. Fixed list, not a glob over
-# .github/workflows/*.yml like category 3: quickstart-published.yml also
-# carries `docker run` invocations (two unpinned telemetrygen calls,
-# identical to ci.yml's) but pinning it is a separate ticket, and scanning it
-# here would make this category permanently red with no file in this check's
-# scope able to fix it.
-CI_WORKFLOW_FILE="$REPO_ROOT/.github/workflows/ci.yml"
-METRICSBENCH_NIGHTLY_WORKFLOW_FILE="$REPO_ROOT/.github/workflows/metricsbench-nightly.yml"
-K8S_NIGHTLY_WORKFLOW_FILE="$REPO_ROOT/.github/workflows/k8s-nightly.yml"
-PUBLISH_IMAGES_WORKFLOW_FILE="$REPO_ROOT/.github/workflows/publish-images.yml"
+# Category 5 scans every workflow under .github/workflows, the same glob
+# category 3 uses for action refs. A fixed file list would leave a workflow
+# added tomorrow scanned by nothing, with no count assertion to notice.
 
 # Exact number of `docker run`/`docker pull`/`docker create` image arguments
-# across the four files above. Update deliberately if a `docker run`,
+# across every scanned workflow. Update deliberately if a `docker run`,
 # `docker pull`, or `docker create` invocation is added, removed, or
 # repointed at a different image inside one of their `run:` blocks.
-RUN_IMAGE_EXPECTED_COUNT=15
+RUN_IMAGE_EXPECTED_COUNT=17
 
 # Of those, the number that must carry a digest pin: every reference except
 # the three shell-variable exemptions below. Update deliberately alongside
 # RUN_IMAGE_EXPECTED_COUNT.
-RUN_IMAGE_EXPECTED_PINNED_COUNT=9
+RUN_IMAGE_EXPECTED_PINNED_COUNT=11
 
 # The exact text of an extracted image argument (same stripping as the
 # extraction below: the whitespace-delimited token itself, quotes included
@@ -469,18 +461,15 @@ fi
 # --- 5. docker run/pull/create image pins in workflow run: blocks -----------
 
 echo
-echo "== docker run/pull/create image pins (ci.yml, metricsbench-nightly.yml, k8s-nightly.yml, publish-images.yml, issue #1338) =="
+echo "== docker run/pull/create image pins (every workflow under .github/workflows) =="
 
-for f in "$CI_WORKFLOW_FILE" "$METRICSBENCH_NIGHTLY_WORKFLOW_FILE" \
-         "$K8S_NIGHTLY_WORKFLOW_FILE" "$PUBLISH_IMAGES_WORKFLOW_FILE"; do
-  if [ ! -f "$f" ]; then
-    echo "FAIL: workflow file not found at $f"
-    fail=1
-  fi
-done
+workflow_scan_count=$(ls "$REPO_ROOT"/.github/workflows/*.yml "$REPO_ROOT"/.github/workflows/*.yaml 2>/dev/null | wc -l | tr -d '[:space:]')
+if [ "$workflow_scan_count" -eq 0 ]; then
+  echo "FAIL: no workflow files found under .github/workflows"
+  fail=1
+fi
 
-if [ -f "$CI_WORKFLOW_FILE" ] && [ -f "$METRICSBENCH_NIGHTLY_WORKFLOW_FILE" ] \
-  && [ -f "$K8S_NIGHTLY_WORKFLOW_FILE" ] && [ -f "$PUBLISH_IMAGES_WORKFLOW_FILE" ]; then
+if [ "$workflow_scan_count" -gt 0 ]; then
   # A run: block is shell, not YAML, so a `docker run ...` line is scanned by
   # joining a trailing backslash continuation onto the next physical line
   # before matching (the image commonly lands on a later line than the
@@ -553,8 +542,15 @@ if [ -f "$CI_WORKFLOW_FILE" ] && [ -f "$METRICSBENCH_NIGHTLY_WORKFLOW_FILE" ] \
       was_comment = buf_is_comment
 
       if (was_comment) next
-      if (!match(logical, /docker[ \t]+(run|pull|create)([ \t]|$)/)) next
-      rest = substr(logical, RSTART + RLENGTH)
+      # Every invocation on the logical line, not just the first: `docker pull
+      # a && docker run b` is ordinary shell, and stopping at the first one
+      # would let b through unscanned with the reference count unchanged.
+      # Global flags may sit between `docker` and the subcommand
+      # (`docker --context ci run ...`), so allow a run of them.
+      tail = logical
+      while (match(tail, /docker([ \t]+-[^ \t]+([ \t]+[^- \t][^ \t]*)?)*[ \t]+(run|pull|create)([ \t]|$)/)) {
+      rest = substr(tail, RSTART + RLENGTH)
+      tail = rest
       sub(/^[ \t]+/, "", rest)
       image = ""
       while (rest != "") {
@@ -579,10 +575,10 @@ if [ -f "$CI_WORKFLOW_FILE" ] && [ -f "$METRICSBENCH_NIGHTLY_WORKFLOW_FILE" ] \
       if (image != "") {
         print FILENAME ":" bufstart ":" image
       }
+      }
     }
-  ' "$CI_WORKFLOW_FILE" "$METRICSBENCH_NIGHTLY_WORKFLOW_FILE" \
-    "$K8S_NIGHTLY_WORKFLOW_FILE" "$PUBLISH_IMAGES_WORKFLOW_FILE" \
-    >"$RUN_IMAGE_REFS_FILE"
+  ' "$REPO_ROOT"/.github/workflows/*.yml "$REPO_ROOT"/.github/workflows/*.yaml \
+    >"$RUN_IMAGE_REFS_FILE" 2>/dev/null
 fi
 
 run_image_count=$(wc -l <"$RUN_IMAGE_REFS_FILE" | tr -d '[:space:]')
