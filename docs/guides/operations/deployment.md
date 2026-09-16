@@ -185,9 +185,11 @@ operator credential rather than a service credential:
 
 `/readyz` reflects store reachability, not just startup completion. It also
 reflects ingest health: an `all` or `gateway` process turns 503 permanently once
-one of its metrics shard actors exhausts its respawn budget and is condemned
-(`shards_condemned > 0` at `/metrics`), which no probe can recover and which
-needs the process rolled -- see
+one of its ingest shard actors is condemned (`shards_condemned > 0` at
+`/metrics`, on any `signal`), which no probe can recover and which needs the
+process rolled. The metrics pipeline condemns a shard only after it exhausts its
+respawn budget, but the logs and spans pipelines never respawn, so a single
+shard-actor death on either condemns immediately -- see
 [troubleshooting.md](troubleshooting.md). The rest of
 this section is about the store condition, the one that recovers on its own.
 

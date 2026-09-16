@@ -344,6 +344,19 @@ async fn dead_shard_is_observable_and_counted_once() {
         "a dead shard is reported as the typed ShardUnavailable, got {err}"
     );
     assert_eq!(router.metrics().snapshot().shard_deaths, 1);
+    // The log router never respawns, so the first death condemns the shard:
+    // the counter that drives /readyz 503 moves on this same death, and the
+    // router reports not-ready.
+    assert_eq!(
+        router.metrics().snapshot().shards_condemned,
+        1,
+        "the first shard death condemns the shard (logs never respawn)"
+    );
+    assert_eq!(router.metrics().condemned_shards(), 1);
+    assert!(
+        !router.ready(),
+        "a condemned shard makes the router report not-ready"
+    );
 
     // A survivor shard still acks durably.
     let receipt = router
@@ -373,6 +386,15 @@ async fn dead_shard_is_observable_and_counted_once() {
         router.metrics().snapshot().shard_deaths,
         1,
         "a permanently dead shard is counted once, not once per routed write"
+    );
+    assert_eq!(
+        router.metrics().snapshot().shards_condemned,
+        1,
+        "condemnation is counted once per shard, not once per routed write"
+    );
+    assert!(
+        !router.ready(),
+        "the condemned shard keeps the router not-ready"
     );
 
     router.shutdown().await;
