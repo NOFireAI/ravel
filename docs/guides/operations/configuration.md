@@ -658,6 +658,13 @@ rejected; the health and `/metrics` routes carry no tenant, and
 `--dev-insecure-tenant-header` on a loopback listener is the development
 exception.
 
+`--tenant-token-file PATH` (env `RAVEL_TENANT_TOKEN_FILE` for the path only,
+never a token value) is a file-based alternative to repeating `--tenant-token`,
+so a token never has to sit in argv or a process listing: one `TOKEN=TENANT`
+pair per line, blank lines and `#` comments skipped, each line split on the
+first `=` the same way `--tenant-token` is. `--tenant-token` and
+`--tenant-token-file` are mutually exclusive; startup refuses if both are set.
+
 Tenant identity affects only key prefixing and authorization. It carries no
 other per-tenant configuration.
 

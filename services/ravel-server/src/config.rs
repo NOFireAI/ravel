@@ -10077,10 +10077,7 @@ mod tests {
         // The third row pins that the file path reuses the split_once loop:
         // a value containing '=' is mis-parsed (only the first '=' splits)
         // the same way for both sources.
-        assert_eq!(
-            from_file.get("has"),
-            Some(&TenantId::new("equals=gamma"))
-        );
+        assert_eq!(from_file.get("has"), Some(&TenantId::new("equals=gamma")));
     }
 
     #[test]
@@ -10105,11 +10102,12 @@ mod tests {
 
     #[test]
     fn tenant_token_file_missing_path_fails_startup() {
-        let err = cli(&["--tenant-token-file", "/nonexistent/ravel-tenant-tokens.txt"])
-            .parse_tenant_tokens()
-            .expect_err(
-                "a missing --tenant-token-file path must be a typed error, not an empty map",
-            );
+        let err = cli(&[
+            "--tenant-token-file",
+            "/nonexistent/ravel-tenant-tokens.txt",
+        ])
+        .parse_tenant_tokens()
+        .expect_err("a missing --tenant-token-file path must be a typed error, not an empty map");
         let msg = err.to_string();
         assert!(
             msg.contains("/nonexistent/ravel-tenant-tokens.txt"),
