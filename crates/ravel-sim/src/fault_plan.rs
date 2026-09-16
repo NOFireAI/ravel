@@ -50,8 +50,10 @@ use crate::seed::MasterSeed;
 pub const L0_DATA_SUBSTR: &str = "/l0/";
 /// Key substring matching the L0 commit records an ingest flush publishes
 /// (`t/<tenant>/<signal>/c/<shard>/<hour>/...`). Also matches the compaction
-/// record and retention tombstone, which is why every rule uses
-/// [`Occurrence::Nth`] and is consumed during ingest (see the module docs).
+/// record and retention tombstone, which is why every rule keyed on it uses
+/// [`Occurrence::Nth`]: the ingest-plan rules are consumed during ingest, and
+/// the sweep-plan delete rule on the first commit-record delete of a sweep
+/// pass (see the module docs).
 pub const COMMIT_SUBSTR: &str = "/c/";
 /// Key substring matching every object a compaction publishes and nothing an
 /// ingest flush writes: the `l1/` part directory (`.../l1/<shard>/...`) and
@@ -235,10 +237,13 @@ pub fn generate(master_seed: &MasterSeed, config: &FaultScheduleConfig) -> Fault
     }
 }
 
-/// Derive the compaction- and sweep-phase fault plans. All four kinds are armed on every run so the nightly
-/// 200-seed sweep always exercises them; only the pagination and delete
-/// faults' flavor (transient vs throttled) varies with the seed, keeping the
-/// draw deterministic. Every rule is retryable-once (`Occurrence::Nth(1)`):
+/// Derive the compaction- and sweep-phase fault plans. All four kinds are
+/// armed on every run; the three compaction-phase faults fire whenever
+/// compaction runs, and the sweep delete fault fires only when rule 2 clears
+/// a group in that cycle (the default workload may leave it unfired). Only
+/// the pagination and delete faults' flavor (transient vs throttled) varies
+/// with the seed, keeping the draw deterministic. Every rule is
+/// retryable-once (`Occurrence::Nth(1)`):
 /// the driver wraps the compaction and sweep entry points in a bounded
 /// idempotent re-run, so each fault surfaces a typed error on the first
 /// attempt and the re-run recovers to an equivalent result (the
