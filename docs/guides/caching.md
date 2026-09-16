@@ -100,7 +100,11 @@ you gave it; Ravel sets modes only on what it creates, which includes the
 root and any missing ancestor of it when the path does not exist yet. On
 startup Ravel also narrows the directories and entries beneath its own
 namespace that an older build left at the ambient umask, so upgrading a node
-in place closes the same gap on a cache tree that already exists.
+in place closes the same gap on a cache tree that already exists. A tree
+from before the per-instance namespace layout sits beside the namespace
+rather than under it, and the startup narrowing does not reach it: remove
+it with `ravel-cli cache reclaim-legacy` (see the maintenance guide's
+section on reclaiming a pre-namespacing cache directory).
 
 ## CLI flags
 
