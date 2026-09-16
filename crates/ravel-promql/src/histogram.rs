@@ -424,15 +424,25 @@ impl FloatHistogram {
     /// For exponential operands this first runs [`Self::reconcile_zero_buckets`]
     /// so a differing zero threshold widens to the larger of the two and the
     /// buckets it swallows fold into the zero count, then drops any merged
-    /// bucket that now lies inside that threshold (Prometheus' `addBuckets`
-    /// passes the zero threshold and excludes such buckets). Custom-bucket
-    /// operands carry no zero bucket, so that step is skipped.
+    /// bucket that now lies WHOLLY inside that threshold (Prometheus'
+    /// `addBuckets` passes the zero threshold and excludes such buckets). A
+    /// bucket that straddles the threshold is kept: only a reconcile snaps the
+    /// threshold onto a bucket boundary, and it does not run when the two
+    /// thresholds already match. Custom-bucket operands carry no zero bucket,
+    /// so that step is skipped.
     fn combine(&mut self, other: &FloatHistogram, sign: f64) -> bool {
         let collision = self.counter_reset_collision(other);
 
         if self.uses_custom_buckets() {
-            // NHCB: no zero bucket to reconcile, and Prometheus' custom-bucket
-            // Add/Sub leaves the receiver's zero count untouched.
+            // NHCB carry no zero threshold, so there is nothing to reconcile and
+            // no threshold to filter the merged buckets against. Prometheus'
+            // custom-bucket Add/Sub merges only the positive side because its
+            // `Histogram.Validate` rejects an NHCB carrying a zero count or
+            // negative buckets; Ravel's ingest admits both, and `count`/`sum`
+            // below take the whole of `other`, so every side merges here or the
+            // other operand's counts would vanish from the buckets while still
+            // showing in the total.
+            self.zero_count += sign * other.zero_count;
             self.count += sign * other.count;
             self.sum += sign * other.sum;
             let pos = combine_side(
@@ -440,9 +450,17 @@ impl FloatHistogram {
                 &other.positive_index_map(),
                 sign,
             );
+            let neg = combine_side(
+                &self.negative_index_map(),
+                &other.negative_index_map(),
+                sign,
+            );
             let (ps, pb) = rebuild_side(&pos);
+            let (ns, nb) = rebuild_side(&neg);
             self.positive_spans = ps;
             self.positive_buckets = pb;
+            self.negative_spans = ns;
+            self.negative_buckets = nb;
             return collision;
         }
 
@@ -462,18 +480,19 @@ impl FloatHistogram {
             &other.negative_index_map(),
             sign,
         );
-        // A bucket whose inner edge is inside the (reconciled) zero threshold
-        // has already been folded into the zero count on both sides; drop it
-        // from the regular merge. `self`'s were trimmed by the reconcile step,
-        // `other`'s are excluded here, matching Prometheus' `addBuckets`.
-        let pos: BTreeMap<i32, f64> = pos
-            .into_iter()
-            .filter(|&(idx, _)| self.bucket_bound(idx - 1) >= threshold)
-            .collect();
-        let neg: BTreeMap<i32, f64> = neg
-            .into_iter()
-            .filter(|&(idx, _)| self.bucket_bound(idx - 1) >= threshold)
-            .collect();
+        // A bucket lying wholly inside the (reconciled) zero threshold has
+        // already been folded into the zero count on both sides; drop it from
+        // the regular merge, matching Prometheus' `addBuckets`. The test is on
+        // the bucket's OUTER edge, `bucket_bound(idx)`: a reconcile snaps the
+        // threshold onto a bucket boundary, so there the outer test and the
+        // inner one agree, but `reconcile_zero_buckets` returns early when the
+        // two thresholds are already equal, and that threshold need not sit on
+        // a boundary. An inner-edge test would then delete a bucket that merely
+        // straddles the threshold, along with a count nothing folded anywhere.
+        // A NaN threshold folds nothing either, so it drops nothing.
+        let keep = |idx: i32| threshold.is_nan() || self.bucket_bound(idx) > threshold;
+        let pos: BTreeMap<i32, f64> = pos.into_iter().filter(|&(idx, _)| keep(idx)).collect();
+        let neg: BTreeMap<i32, f64> = neg.into_iter().filter(|&(idx, _)| keep(idx)).collect();
         let (ps, pb) = rebuild_side(&pos);
         let (ns, nb) = rebuild_side(&neg);
         self.positive_spans = ps;
@@ -524,6 +543,16 @@ impl FloatHistogram {
     /// path when the thresholds already match, so equal-threshold operands
     /// (every one the corpus carries) keep their exact prior behavior.
     fn reconcile_zero_buckets(&mut self, other: &FloatHistogram) -> f64 {
+        // A NaN threshold reaches here from ingest: neither the remote-write nor
+        // the OTLP normalizer validates the field and the segment writer
+        // round-trips the raw bits. It compares unequal to everything including
+        // itself, so the loop below would spin forever (its two `>` tests are
+        // both false, so neither side ever moves) and hang the query thread.
+        // Neither side can be widened onto a threshold that orders against
+        // nothing, so leave both operands as they are.
+        if self.zero_threshold.is_nan() || other.zero_threshold.is_nan() {
+            return other.zero_count;
+        }
         let mut other_zero_count = other.zero_count;
         let mut other_zero_threshold = other.zero_threshold;
         while other_zero_threshold != self.zero_threshold {
@@ -1765,5 +1794,131 @@ mod tests {
         assert!(!mk(ResetHint::Unknown).add_assign(&mk(ResetHint::Yes)));
         assert!(!mk(ResetHint::Yes).add_assign(&mk(ResetHint::Yes)));
         assert!(!mk(ResetHint::Gauge).add_assign(&mk(ResetHint::No)));
+    }
+
+    /// Issue #1700 fourth fix round: two operands whose zero thresholds already
+    /// match skip the reconcile entirely, so nothing was folded into the zero
+    /// count and the merge must keep every bucket the threshold only cuts
+    /// through. The threshold here is 0.001, the shape the ravel-otlp and
+    /// ravel-bench fixtures carry, which is not a power of two and so lands
+    /// strictly inside bucket -9, covering (2^-10, 2^-9].
+    #[test]
+    fn combine_keeps_a_bucket_straddling_an_unreconciled_zero_threshold() {
+        let mut a = positive(0, -9, &[4.0], 0.006);
+        a.zero_threshold = 0.001;
+        let b = a.clone();
+
+        assert_eq!(a.bucket_bound(-10), 0.0009765625, "2^-10");
+        assert_eq!(a.bucket_bound(-9), 0.001953125, "2^-9");
+        assert!(
+            a.bucket_bound(-10) < a.zero_threshold && a.zero_threshold < a.bucket_bound(-9),
+            "the threshold cuts through bucket -9 rather than sitting on a bound"
+        );
+
+        a.add_assign(&b);
+
+        assert_eq!(a.count, 8.0, "4 + 4");
+        assert_eq!(a.zero_count, 0.0, "nothing folded into the zero bucket");
+        assert_eq!(a.zero_threshold, 0.001, "an equal threshold does not move");
+        assert_eq!(
+            a.positive_spans,
+            vec![Span {
+                offset: -9,
+                length: 1
+            }],
+            "the straddling bucket keeps its index"
+        );
+        assert_eq!(a.positive_buckets, vec![8.0], "4 + 4, not dropped");
+        let buckets = a.all_buckets();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].lower, 0.0009765625);
+        assert_eq!(buckets[0].upper, 0.001953125);
+        assert_eq!(buckets[0].count, 8.0);
+    }
+
+    /// Issue #1700 fourth fix round: a NaN zero threshold survives ingest (no
+    /// normalizer validates the field), and `reconcile_zero_buckets` must stay
+    /// total on it. Before the fix this hung: its loop condition
+    /// `other_zero_threshold != self.zero_threshold` is always true for a NaN,
+    /// and both `>` tests inside are always false, so nothing ever moved.
+    #[test]
+    fn combine_with_a_nan_zero_threshold_terminates() {
+        let mut a = positive(0, 1, &[3.0], 6.0);
+        a.zero_threshold = f64::NAN;
+        a.zero_count = 2.0;
+        let b = a.clone();
+
+        a.add_assign(&b);
+
+        assert!(a.zero_threshold.is_nan(), "the threshold is left as it was");
+        assert_eq!(a.zero_count, 4.0, "2 + 2, folded from nothing");
+        assert_eq!(a.count, 6.0, "3 + 3");
+        assert_eq!(
+            a.positive_buckets,
+            vec![6.0],
+            "a threshold that orders against nothing drops no bucket"
+        );
+
+        // One NaN side is enough to take the same path.
+        let mut c = positive(0, 1, &[3.0], 6.0);
+        c.zero_threshold = f64::NAN;
+        let d = positive(0, 1, &[3.0], 6.0);
+        c.add_assign(&d);
+        assert!(c.zero_threshold.is_nan());
+        assert_eq!(c.positive_buckets, vec![6.0]);
+    }
+
+    /// Issue #1700 fourth fix round: an NHCB pair carrying negative buckets and
+    /// a zero count merges all of them. Prometheus' `Histogram.Validate` rejects
+    /// such a value so its custom-bucket `Add` never sees one, but
+    /// ravel-remote-write admits it; since `count` and `sum` take the whole of
+    /// both operands, merging only the positive side would leave the totals
+    /// disagreeing with the buckets.
+    #[test]
+    fn combine_custom_buckets_merges_the_negative_side_and_the_zero_count() {
+        let mut a = FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: CUSTOM_BUCKETS_SCALE,
+            zero_threshold: 0.0,
+            zero_count: 3.0,
+            count: 11.0,
+            sum: 20.0,
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 2,
+            }],
+            positive_buckets: vec![1.0, 2.0],
+            negative_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_buckets: vec![5.0],
+            custom_values: vec![1.0, 2.0],
+        };
+        let b = FloatHistogram {
+            zero_count: 1.0,
+            count: 15.0,
+            sum: 10.0,
+            positive_buckets: vec![3.0, 4.0],
+            negative_buckets: vec![7.0],
+            ..a.clone()
+        };
+
+        let collision = a.add_assign(&b);
+
+        assert!(!collision);
+        assert_eq!(a.positive_buckets, vec![4.0, 6.0], "1+3 and 2+4");
+        assert_eq!(a.negative_buckets, vec![12.0], "5 + 7");
+        assert_eq!(
+            a.negative_spans,
+            vec![Span {
+                offset: 1,
+                length: 1
+            }]
+        );
+        assert_eq!(a.zero_count, 4.0, "3 + 1");
+        assert_eq!(a.count, 26.0, "11 + 15");
+        assert_eq!(a.observation_sum(), 30.0, "20 + 10");
+        assert_eq!(a.custom_values, vec![1.0, 2.0], "the bounds are unchanged");
     }
 }

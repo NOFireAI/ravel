@@ -45,6 +45,7 @@
 //! series (RSEG down-converts a flush whose bucket count exceeds its limit), so
 //! this is a normal input shape, not a corner case.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use promql_parser::label::Labels;
@@ -245,13 +246,17 @@ fn hist_op_word(op: TokenId) -> &'static str {
 /// classified: a schema-aligned in-place merge, a custom-bounds reconciliation
 /// (both re-bucketed onto the intersection of their bounds), or an outright drop
 /// for a pair with no common bucket layout.
-enum HistogramAlignment {
+///
+/// The left operand is always owned: every combining path mutates it in place.
+/// The right operand is read-only in all of them, so it is a [`Cow`] that
+/// borrows the caller's value unless a down-conversion had to build a new one.
+enum HistogramAlignment<'a> {
     /// Combine `lhs + sign*rhs` directly (schema/scale already reconciled, or
     /// two custom-bucket histograms whose bounds already match).
-    Combine(FloatHistogram, FloatHistogram),
+    Combine(FloatHistogram, Cow<'a, FloatHistogram>),
     /// Two custom-bucket histograms with differing bounds: reconcile onto the
     /// intersection and raise [`mismatched_custom_buckets_info`].
-    ReconcileCustomBounds(FloatHistogram, FloatHistogram),
+    ReconcileCustomBounds(FloatHistogram, Cow<'a, FloatHistogram>),
     /// No common bucket layout (an exponential/custom mix): drop and raise
     /// [`incompatible_bucket_layout_warning`].
     Incompatible,
@@ -273,18 +278,28 @@ enum HistogramAlignment {
 /// bounds combine directly; with differing bounds they reconcile onto the
 /// intersection of their bounds (Prometheus' `addCustomBucketsWithMismatches`).
 /// Only a mix of the two schema families has no common layout and drops.
-fn align_histogram_operands(lhs: &FloatHistogram, rhs: &FloatHistogram) -> HistogramAlignment {
+fn align_histogram_operands<'a>(
+    lhs: &FloatHistogram,
+    rhs: &'a FloatHistogram,
+) -> HistogramAlignment<'a> {
     if lhs.uses_custom_buckets() != rhs.uses_custom_buckets() {
         return HistogramAlignment::Incompatible;
     }
     if lhs.uses_custom_buckets() {
         if lhs.custom_bounds_match(rhs) {
-            return HistogramAlignment::Combine(lhs.clone(), rhs.clone());
+            return HistogramAlignment::Combine(lhs.clone(), Cow::Borrowed(rhs));
         }
-        return HistogramAlignment::ReconcileCustomBounds(lhs.clone(), rhs.clone());
+        return HistogramAlignment::ReconcileCustomBounds(lhs.clone(), Cow::Borrowed(rhs));
     }
     let scale = lhs.scale.min(rhs.scale);
-    HistogramAlignment::Combine(lhs.copy_to_scale(scale), rhs.copy_to_scale(scale))
+    // `copy_to_scale` clones even when it has nothing to convert, so the equal-
+    // scale case (every matched pair the corpus carries) borrows instead.
+    let rhs = if rhs.scale == scale {
+        Cow::Borrowed(rhs)
+    } else {
+        Cow::Owned(rhs.copy_to_scale(scale))
+    };
+    HistogramAlignment::Combine(lhs.copy_to_scale(scale), rhs)
 }
 
 /// The outcome of combining one matched (or scalar-paired) sample: a plain
