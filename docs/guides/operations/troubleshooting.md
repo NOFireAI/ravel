@@ -95,7 +95,20 @@ breaker as an all-clear:
 
 The gauge that closes the small-scale gap is `ravel_maintain_orphans_present`,
 which carries the most recent pass's total candidate count whether or not the
-breaker tripped. Alert on it sustained:
+breaker tripped.
+
+"Most recent pass" means the most recent pass that actually ran the orphan
+rule. Orphan candidate selection runs on the full-sweep cadence
+(`interior_reverify_ns`, default 6 h), not on every maintain tick (default
+300 s); the ticks in between skip the rule entirely and report nothing about
+orphans, so they leave the gauge alone rather than resetting it to zero. The
+gauge therefore reports the last completed orphan pass and is refreshed once
+per full-sweep interval. Read a change in its value as "the last orphan pass
+found this", never as "as of this scrape"; a value can be up to one
+full-sweep interval old, and a genuine return to zero shows up on the next
+pass that runs, not on the next tick.
+
+Alert on it sustained:
 
 | Symptom | Likely cause | How to confirm | Corrective action |
 |---|---|---|---|
@@ -103,8 +116,13 @@ breaker tripped. Alert on it sustained:
 
 Twelve hours is roughly half the grace window: long enough that one normal
 abandoned-flush cleanup between passes does not page, short enough that real
-loss alarms with hours to spare. `ravel_maintain_orphans_withheld` is not an
-alert target. It reflects only the most recent pass and drops to zero on the
+loss alarms with hours to spare. It is also comfortably longer than the
+default 6 h full-sweep interval that refreshes the gauge, so a sustained
+alert window always spans at least one orphan pass; keep that relationship
+if you raise `interior_reverify_ns`, or the window can close on a single
+stale sample. `ravel_maintain_orphans_withheld` is not an
+alert target. It reflects only the most recent pass that ran the orphan rule
+and drops to zero on the
 next non-tripping pass, including one that stopped tripping through dilution.
 
 ## Commit records were deleted out of band
