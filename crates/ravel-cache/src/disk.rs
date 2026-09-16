@@ -316,6 +316,8 @@ fn narrow_existing(_path: &Path, _mode: u32) {}
 /// at that path with a wider one. `create_new` also refuses a stale scratch
 /// file instead of truncating it and inheriting its mode; the caller removes
 /// the path on error, so a collision costs one admission and clears itself.
+/// Both properties are Unix-only: the other arm keeps the previous
+/// truncating write.
 #[cfg(unix)]
 fn write_entry_file(tmp_path: &Path, buf: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
