@@ -1965,6 +1965,81 @@ mod tests {
         );
         h.shutdown().await;
     }
+
+    /// Issue #865: the span pipeline's `flush_permit_wait_ns` is measured on
+    /// the injected clock, exactly like the metrics and log pipelines. Flush
+    /// A holds the only permit (`max_inflight_flushes: 1`) with its data PUT
+    /// held open; flush B queues behind it. Advancing the clock while B waits
+    /// on the semaphore, then releasing A, pins B's recorded wait to exactly
+    /// the advance.
+    ///
+    /// Prove-the-test: reverting the acquire site in `flush` to the pre-fix
+    /// code (no `permit_wait_start_ns` / `record_shard_flush_permit_wait_ns`
+    /// around `semaphore.acquire_owned()`) makes the final assertion fail --
+    /// `flush_permit_wait_ns_total` stays 0 no matter how long B actually
+    /// waited for the permit.
+    #[tokio::test]
+    async fn permit_wait_is_measured_on_the_injected_clock() {
+        let config = IngestConfig {
+            max_inflight_flushes: 1,
+            ..flush_on_first()
+        };
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let h = Harness::spawn_with_store(config, Arc::clone(&store));
+        let tenant = TenantId::new("acme");
+        // Held on A's data PUT, so A holds the flush's one permit for its
+        // whole duration rather than releasing it before B is sent.
+        let gate = fault.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+
+        let (ack_a_tx, ack_a_rx) = oneshot::channel();
+        h.tx.send(SpanShardMsg::Write {
+            tenant: tenant.clone(),
+            spans: vec![norm_span(1, 1, 1_000, "a")],
+            ack: Some(ack_a_tx),
+            charge: None,
+        })
+        .await
+        .expect("send A");
+        gate.wait_until_held(1).await;
+
+        let (ack_b_tx, ack_b_rx) = oneshot::channel();
+        h.tx.send(SpanShardMsg::Write {
+            tenant: tenant.clone(),
+            spans: vec![norm_span(2, 1, 2_000, "b")],
+            ack: Some(ack_b_tx),
+            charge: None,
+        })
+        .await
+        .expect("send B");
+
+        // Nothing else in this test blocks the executor, so yielding a
+        // bounded number of times deterministically lets B's flush task run
+        // up to (and park on) the semaphore acquire before the clock moves.
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+
+        h.clock.advance_ns(5_000);
+
+        let ids = gate.held();
+        assert_eq!(ids.len(), 1, "exactly one PUT is held (A's)");
+        gate.release(ids[0]);
+
+        ack_a_rx.await.expect("ack A").expect("A commits");
+        ack_b_rx
+            .await
+            .expect("ack B")
+            .expect("B commits once A releases the permit");
+
+        let snapshot = h.metrics.snapshot();
+        assert_eq!(
+            snapshot.flush_permit_wait_ns_total, 5_000,
+            "B's recorded wait must equal exactly the clock advance while it queued for the permit"
+        );
+
+        h.shutdown().await;
+    }
 }
 
 #[cfg(test)]
