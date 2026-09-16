@@ -125,6 +125,7 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
         subset_size: config.subset_size,
         round_robin: select::RoundRobin::new(config.round_robin_max_entries, idle_ttl_ns),
         clock: Arc::new(clock::SystemClock),
+        identity_header: config.identity_header,
         http,
         grpc_http,
     });

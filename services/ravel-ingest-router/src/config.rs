@@ -156,9 +156,11 @@ pub struct Cli {
     pub mtls_enabled: bool,
 
     /// Header the reverse proxy forwards the verified client-certificate
-    /// identity in. Defaults to `x-ravel-client-cert-cn`. Used by the
-    /// `mtls-subject` key source only: `--mtls-enabled` is refused, so no
-    /// canonical-tenant chain ever reads this header.
+    /// identity in. Defaults to `x-ravel-client-cert-cn`. Read as a routing key
+    /// by the `mtls-subject` key source only (`--mtls-enabled` is refused, so no
+    /// canonical-tenant chain ever reads this header), and stripped from every
+    /// forwarded request under every key source, since nothing in this router
+    /// verifies it.
     #[arg(long, value_name = "HEADER")]
     pub mtls_header: Option<String>,
 }
@@ -263,6 +265,13 @@ pub struct RouterConfig {
     pub gateway_port_name: Option<String>,
     pub subset_size: usize,
     pub key: KeyConfig,
+    /// The client-certificate identity header this deployment names
+    /// (`--mtls-header`, defaulting to [`MtlsResolver::DEFAULT_HEADER`]).
+    /// Nothing here verifies it, so both forwarding paths strip it from every
+    /// request before dialing the upstream; it is resolved under every key
+    /// source, not only `mtls-subject`, because a deployment that names it and
+    /// then routes by another key would otherwise forward it untouched.
+    pub identity_header: HeaderName,
     pub listen_http: SocketAddr,
     pub listen_grpc: Option<SocketAddr>,
     pub round_robin_max_entries: usize,
@@ -278,6 +287,7 @@ impl std::fmt::Debug for RouterConfig {
             .field("subset_size", &self.subset_size)
             // `key`'s own Debug (via CanonicalAuthSettings) redacts any tokens.
             .field("key", &self.key)
+            .field("identity_header", &self.identity_header)
             .field("listen_http", &self.listen_http)
             .field("listen_grpc", &self.listen_grpc)
             .field("round_robin_max_entries", &self.round_robin_max_entries)
@@ -343,6 +353,11 @@ impl Cli {
             _ => {}
         }
 
+        // Resolved under every key source: the forwarding paths strip this name
+        // whatever the router routes by, so an invalid `--mtls-header` is a
+        // startup failure rather than a name that silently fails to strip.
+        let identity_header = self.identity_header_name()?;
+
         let key = if self.key_source == KeySource::CanonicalTenant {
             KeyConfig::CanonicalTenant(self.canonical_auth_settings()?)
         } else {
@@ -384,6 +399,7 @@ impl Cli {
             gateway_port_name: self.gateway_port_name,
             subset_size: self.subset_size as usize,
             key,
+            identity_header,
             listen_http: self.listen_http,
             listen_grpc: self.listen_grpc,
             round_robin_max_entries: self.round_robin_max_entries,
@@ -401,16 +417,25 @@ impl Cli {
                 HeaderName::try_from(name)
                     .map_err(|e| anyhow::anyhow!("invalid --key-header-name '{name}': {e}"))?
             }
-            KeySource::MtlsSubject => {
-                let name = self
-                    .mtls_header
-                    .as_deref()
-                    .unwrap_or(MtlsResolver::DEFAULT_HEADER);
-                HeaderName::try_from(name)
-                    .map_err(|e| anyhow::anyhow!("invalid --mtls-header '{name}': {e}"))?
-            }
+            KeySource::MtlsSubject => self.identity_header_name()?,
             KeySource::CanonicalTenant => unreachable!("canonical-tenant is not a header source"),
         })
+    }
+
+    /// The client-certificate identity header this deployment names
+    /// (`--mtls-header`, defaulting to [`MtlsResolver::DEFAULT_HEADER`]).
+    ///
+    /// One resolution shared by the two readers of the flag: the `mtls-subject`
+    /// key source hashes this header, and both forwarding paths strip it before
+    /// dialing the upstream. Resolving it twice would let a configured name be
+    /// routed by and still forwarded.
+    fn identity_header_name(&self) -> anyhow::Result<HeaderName> {
+        let name = self
+            .mtls_header
+            .as_deref()
+            .unwrap_or(MtlsResolver::DEFAULT_HEADER);
+        HeaderName::try_from(name)
+            .map_err(|e| anyhow::anyhow!("invalid --mtls-header '{name}': {e}"))
     }
 
     /// Reject flags that only make sense under `--key-source canonical-tenant`.
@@ -596,12 +621,64 @@ mod tests {
     }
 
     #[test]
-    fn canonical_only_flags_rejected_under_header_source() {
-        let err = cli(&["--key-source", "authorization-header", "--mtls-enabled"])
+    fn identity_header_defaults_to_the_mtls_default_name() {
+        let config = cli(&["--key-source", "authorization-header"])
             .into_config()
-            .expect_err("--mtls-enabled under a header source must fail");
-        assert!(err.to_string().contains("--mtls-enabled"));
+            .expect("valid config");
+        assert_eq!(
+            config.identity_header.as_str(),
+            MtlsResolver::DEFAULT_HEADER,
+            "a deployment that never sets --mtls-header still strips the default name"
+        );
+    }
 
+    #[test]
+    fn configured_mtls_header_becomes_the_identity_header() {
+        // Under `mtls-subject` the configured name is both the routing key and
+        // the name the forwarding paths strip.
+        let config = cli(&["--key-source", "mtls-subject", "--mtls-header", "x-cert-cn"])
+            .into_config()
+            .expect("valid config");
+        assert_eq!(config.identity_header.as_str(), "x-cert-cn");
+        match config.key {
+            KeyConfig::Header(name) => assert_eq!(name.as_str(), "x-cert-cn"),
+            other => panic!("expected header key config, got {other:?}"),
+        }
+
+        // And under a key source that never reads it: the name is still carried
+        // through, because a deployment that names an identity header must not
+        // forward it whatever it routes by.
+        let config = cli(&[
+            "--key-source",
+            "authorization-header",
+            "--mtls-header",
+            "x-cert-cn",
+        ])
+        .into_config()
+        .expect("valid config");
+        assert_eq!(config.identity_header.as_str(), "x-cert-cn");
+    }
+
+    #[test]
+    fn invalid_mtls_header_is_refused_under_every_key_source() {
+        for source in ["mtls-subject", "authorization-header"] {
+            let err = cli(&["--key-source", source, "--mtls-header", "bad header"])
+                .into_config()
+                .expect_err("an invalid header name must fail startup");
+            assert!(
+                err.to_string().contains("--mtls-header"),
+                "error names the flag: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_only_flags_rejected_under_header_source() {
+        // `--mtls-enabled` is not covered here: it now trips the unconditional
+        // refusal at the top of `into_config`, which runs before the key source
+        // is looked at, so it never reaches `reject_canonical_only_flags`.
+        // `mtls_enabled_is_refused_on_the_ingest_router` covers it under both a
+        // header and the canonical-tenant key source.
         let err = cli(&[
             "--key-source",
             "authorization-header",
@@ -628,6 +705,17 @@ mod tests {
         ])
         .into_config()
         .expect_err("--mtls-enabled must be refused unconditionally");
+        assert!(
+            err.to_string().contains("--mtls-enabled"),
+            "error names the flag: {err}"
+        );
+
+        // And under a header key source, where the refusal at the top of
+        // `into_config` is the only thing that rejects it: the key source never
+        // reaches `reject_canonical_only_flags`, which does not name this flag.
+        let err = cli(&["--key-source", "authorization-header", "--mtls-enabled"])
+            .into_config()
+            .expect_err("--mtls-enabled under a header source must fail too");
         assert!(
             err.to_string().contains("--mtls-enabled"),
             "error names the flag: {err}"

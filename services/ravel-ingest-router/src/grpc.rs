@@ -67,7 +67,15 @@ async fn proxy(State(state): State<Arc<RouterState>>, req: Request) -> Response 
         Err(err) => return reject(&err),
     };
 
-    match forward(&state.grpc_http, selection.addr, parts, body).await {
+    match forward(
+        &state.grpc_http,
+        &state.identity_header,
+        selection.addr,
+        parts,
+        body,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(err) => {
             tracing::warn!(addr = %selection.addr, error = %err, "grpc upstream forward failed");
@@ -88,6 +96,7 @@ fn reject(err: &RouteError) -> Response {
 /// back, preserving gRPC response trailers.
 async fn forward(
     client: &reqwest::Client,
+    identity_header: &HeaderName,
     addr: SocketAddr,
     parts: axum::http::request::Parts,
     body: Body,
@@ -104,12 +113,10 @@ async fn forward(
 
     let mut headers = parts.headers.clone();
     strip_hop_by_hop(&mut headers);
-    // This router never installs the mTLS resolver (ADR-0050 decision 1
-    // shape: `--mtls-enabled` is refused at startup), so no header here was
-    // ever verified as a real client certificate. Strip it unconditionally
-    // rather than pass through whatever a client set, so the upstream never
-    // sees this header as if a trusted proxy had stamped it.
-    headers.remove(ravel_tenant_resolve::MtlsResolver::DEFAULT_HEADER);
+    // Strip the client-certificate identity header, both the configured name
+    // and the default one. gRPC metadata rides in these same HTTP/2 headers, so
+    // this is the same strip the HTTP path does, through the same helper.
+    crate::router::strip_identity_headers(&mut headers, identity_header);
     // reqwest sets Host from the URL authority (the pod address); a forwarded
     // client Host would conflict with it.
     headers.remove(axum::http::header::HOST);
