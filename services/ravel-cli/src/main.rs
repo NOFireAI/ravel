@@ -871,8 +871,16 @@ enum StoreCommand {
         /// page size, so a default run proves a real continuation-token
         /// boundary is crossed; must match the store this command builds, so
         /// the cross-page probe judges a real pagination boundary rather than
-        /// a mismatched, meaningless one.
-        #[arg(long, default_value_t = ravel_object_store::s3::LIST_PAGE_SIZE)]
+        /// a mismatched, meaningless one. The upper bound is the number of
+        /// objects a run would write: each listing probe puts the page size
+        /// plus two scratch objects into the bucket, so a page size beyond a
+        /// million is a typo that would fill a bucket, not a page size any
+        /// backend serves.
+        #[arg(
+            long,
+            default_value_t = ravel_object_store::s3::LIST_PAGE_SIZE,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000_000)
+        )]
         list_page_size: usize,
     },
 }
@@ -3352,6 +3360,55 @@ mod tests {
             panic!("expected the cache reclaim-legacy subcommand");
         };
         assert!(apply, "--apply flips to true when given");
+    }
+
+    /// `store qualify --list-page-size` takes an operator-supplied count that
+    /// the conformance suite turns into writes: it puts `page_size + 2`
+    /// objects per listing probe into the bucket. Both ends of the range are
+    /// refused at parse time, before the store is built or a single scratch
+    /// object is written.
+    #[test]
+    fn list_page_size_is_range_checked() {
+        use super::StoreCommand;
+
+        let Command::Store {
+            command: StoreCommand::Qualify { list_page_size },
+        } = Cli::try_parse_from(["ravel", "store", "qualify"])
+            .expect("a bare qualify invocation parses")
+            .command
+        else {
+            panic!("expected the store qualify subcommand");
+        };
+        assert_eq!(
+            list_page_size,
+            ravel_object_store::s3::LIST_PAGE_SIZE,
+            "the default is the production S3 page size"
+        );
+
+        for out_of_range in ["0", "1000001"] {
+            let err = Cli::try_parse_from([
+                "ravel",
+                "store",
+                "qualify",
+                "--list-page-size",
+                out_of_range,
+            ])
+            .expect_err("a page size outside 1..=1_000_000 must be refused");
+            assert!(
+                err.to_string().contains("1..=1000000"),
+                "the refusal must name the accepted range, got: {err}"
+            );
+        }
+
+        let Command::Store {
+            command: StoreCommand::Qualify { list_page_size },
+        } = Cli::try_parse_from(["ravel", "store", "qualify", "--list-page-size", "1000000"])
+            .expect("the upper bound itself parses")
+            .command
+        else {
+            panic!("expected the store qualify subcommand");
+        };
+        assert_eq!(list_page_size, 1_000_000);
     }
 
     #[test]

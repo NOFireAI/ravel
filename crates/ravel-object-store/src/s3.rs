@@ -861,12 +861,16 @@ impl S3Store {
         Ok((builder, credential_provider, instance_role_provider))
     }
 
-    /// Same backend, a different `list()`/`list_after()` page size. This
-    /// re-chunks the results client-side, after the underlying `object_store`
-    /// crate has already fully streamed a listing over the wire: it does NOT
-    /// change the real `ListObjectsV2` `MaxKeys` sent to S3, so shrinking it
-    /// does not shrink the request page size and cannot, by itself, force a
-    /// real continuation-token boundary against a small number of objects.
+    /// Same backend, a different `list()`/`list_after()` page size. This is a
+    /// client-side cut of one wire response, not a smaller request: nothing
+    /// here sets `ListObjectsV2`'s `MaxKeys`, so S3 answers with its default
+    /// of up to 1000 keys. [`ObjectStoreBackend::list`] opens a fresh
+    /// `object_store` listing stream per [`crate::ListPage`], pulls at most
+    /// `page_size` entries off it, and drops it, which leaves that response's
+    /// own `NextContinuationToken` unfollowed unless `page_size` exceeds what
+    /// one response carries. Shrinking `page_size` therefore only shortens
+    /// what Ravel reads out of a single S3 response; it cannot, by itself,
+    /// make the backend serve a continuation boundary.
     /// Proving [`crate::conformance::run_conformance_suite`]'s cross-page
     /// probe against this backend needs more keys than this store's actual
     /// page size, not a smaller declared one.
