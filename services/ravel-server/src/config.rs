@@ -357,10 +357,17 @@ pub struct Cli {
     /// lines and `#` comment lines are ignored; every other line is split on
     /// the first `=`, exactly like `--tenant-token`, so a token containing
     /// `=` is mis-parsed the same way in both sources (see the CRD docs
-    /// warning in `services/ravel-operator/src/crd.rs`). Mutually exclusive
-    /// with `--tenant-token`: `Cli::validate` refuses startup if both are set.
-    /// The env var carries only the path, never a token value, which is the
-    /// same exposure class as argv.
+    /// warning in `services/ravel-operator/src/crd.rs`). A leading UTF-8 byte
+    /// order mark is stripped before parsing. Mutually exclusive with
+    /// `--tenant-token`: `Cli::validate` refuses startup if both are set. The
+    /// env var carries only the path, never a token value, which is the same
+    /// exposure class as argv. An empty or comment-only file parses to an
+    /// empty map: that authenticates nothing, the same as passing no
+    /// `--tenant-token` at all, and because an empty static bearer map also
+    /// means no `--maintain-tenant`-equivalent restriction, background fold,
+    /// compaction and retention widen to every tenant discovery finds in
+    /// storage rather than refusing startup. A Secret mount that failed to
+    /// populate looks like this, not like a startup error.
     #[arg(
         long = "tenant-token-file",
         value_name = "PATH",
@@ -370,9 +377,10 @@ pub struct Cli {
 
     /// Repeatable tenant name this process runs background maintenance for
     /// (catalog fold, compaction, retention, the GC sweeper), in addition to
-    /// every tenant named by `--tenant-token`. Required for a deployment that
-    /// authenticates through OIDC or mTLS: those tenants are only known once a
-    /// request arrives, so maintenance has no other way to learn about them.
+    /// every tenant named by `--tenant-token` or `--tenant-token-file`.
+    /// Required for a deployment that authenticates through OIDC or mTLS:
+    /// those tenants are only known once a request arrives, so maintenance
+    /// has no other way to learn about them.
     #[arg(long = "maintain-tenant", value_name = "TENANT")]
     pub maintain_tenants: Vec<String>,
 
@@ -3264,31 +3272,49 @@ impl Cli {
 
     pub fn parse_tenant_tokens(&self) -> anyhow::Result<HashMap<String, TenantId>> {
         let mut map = HashMap::new();
-        let insert_pair = |map: &mut HashMap<String, TenantId>, pair: &str| -> anyhow::Result<()> {
-            let (token, tenant) = pair.split_once('=').ok_or_else(|| {
-                anyhow::anyhow!("invalid --tenant-token '{pair}', expected TOKEN=TENANT")
-            })?;
-            if token.is_empty() || tenant.is_empty() {
-                anyhow::bail!("invalid --tenant-token '{pair}', expected TOKEN=TENANT");
-            }
-            map.insert(token.to_string(), TenantId::new(tenant));
-            Ok(())
-        };
+        // `ctx` names where a malformed pair came from (an argv position, or a
+        // file and line number) but never the pair's own text: for the file
+        // source that text is the bearer token itself, and `main` prints this
+        // error to stderr, so echoing it back would leak the secret into the
+        // container log.
+        let insert_pair =
+            |map: &mut HashMap<String, TenantId>, pair: &str, ctx: &str| -> anyhow::Result<()> {
+                let (token, tenant) = pair
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("invalid {ctx}, expected TOKEN=TENANT"))?;
+                if token.is_empty() || tenant.is_empty() {
+                    anyhow::bail!("invalid {ctx}, expected TOKEN=TENANT");
+                }
+                map.insert(token.to_string(), TenantId::new(tenant));
+                Ok(())
+            };
 
-        for pair in &self.tenant_tokens {
-            insert_pair(&mut map, pair)?;
+        for (i, pair) in self.tenant_tokens.iter().enumerate() {
+            insert_pair(
+                &mut map,
+                pair,
+                &format!("--tenant-token (position {})", i + 1),
+            )?;
         }
 
         if let Some(path) = &self.tenant_token_file {
             let raw = std::fs::read_to_string(path).map_err(|e| {
                 anyhow::anyhow!("failed to read --tenant-token-file {}: {e}", path.display())
             })?;
-            for line in raw.lines() {
+            // A BOM-prefixed file otherwise registers a token with a leading
+            // U+FEFF, which never matches any `Authorization: Bearer` header
+            // and fails closed with no diagnostic pointing at the cause.
+            let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw.as_str());
+            for (i, line) in raw.lines().enumerate() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                insert_pair(&mut map, line)?;
+                insert_pair(
+                    &mut map,
+                    line,
+                    &format!("line {} in --tenant-token-file {}", i + 1, path.display()),
+                )?;
             }
         }
 
@@ -10095,8 +10121,9 @@ mod tests {
         .expect_err("--tenant-token and --tenant-token-file together must refuse startup");
         let msg = err.to_string();
         assert!(
-            msg.contains("--tenant-token") && msg.contains("--tenant-token-file"),
-            "the refusal must name both flags, got: {msg}"
+            msg.contains("--tenant-token ") && msg.contains("--tenant-token-file"),
+            "the refusal must name the plain flag on its own, not only as a \
+             substring of --tenant-token-file, got: {msg}"
         );
     }
 
@@ -10135,5 +10162,95 @@ mod tests {
         expected.insert("dev".to_string(), TenantId::new("acme"));
         expected.insert("other".to_string(), TenantId::new("beta"));
         assert_eq!(map, expected);
+    }
+
+    #[test]
+    fn tenant_token_file_malformed_line_names_path_and_line_not_token() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(file.path(), "dev=acme\nsecrettoken\n").expect("write tenant token file");
+
+        let err = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect_err("a line with no '=' must fail, not silently drop the pair");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(file.path().to_str().expect("utf8 path")) && msg.contains("line 2"),
+            "the error must name the file path and line number, got: {msg}"
+        );
+        assert!(
+            !msg.contains("secrettoken"),
+            "the error must never echo the malformed line's content, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tenant_token_file_empty_tenant_line_names_path_and_line_not_token() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(file.path(), "secrettoken=\n").expect("write tenant token file");
+
+        let err = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect_err("a line with an empty tenant must fail, not map to an empty TenantId");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(file.path().to_str().expect("utf8 path")) && msg.contains("line 1"),
+            "the error must name the file path and line number, got: {msg}"
+        );
+        assert!(
+            !msg.contains("secrettoken"),
+            "the error must never echo the malformed line's content, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tenant_token_file_strips_leading_bom() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        let mut bytes = vec![0xEFu8, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"dev=acme\n");
+        std::fs::write(file.path(), bytes).expect("write BOM-prefixed tenant token file");
+
+        let map = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect("a leading BOM must be stripped, not folded into the first token");
+
+        let mut expected = HashMap::new();
+        expected.insert("dev".to_string(), TenantId::new("acme"));
+        assert_eq!(map, expected);
+    }
+
+    #[test]
+    fn tenant_token_file_crlf_matches_lf() {
+        let lf = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(lf.path(), "dev=acme\nother=beta\n").expect("write LF tenant token file");
+        let crlf = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(crlf.path(), "dev=acme\r\nother=beta\r\n")
+            .expect("write CRLF tenant token file");
+
+        let from_lf = cli(&[
+            "--tenant-token-file",
+            lf.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect("LF tenant token file parses");
+        let from_crlf = cli(&[
+            "--tenant-token-file",
+            crlf.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect("CRLF tenant token file parses");
+
+        assert_eq!(
+            from_lf, from_crlf,
+            "a CRLF tenant token file must parse to the same map as its LF equivalent"
+        );
     }
 }

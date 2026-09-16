@@ -443,7 +443,13 @@ a pod spec or process listing exposes. `--tenant-token-file PATH` (env
 pairs from a file instead, one per line, blank lines and `#` comments
 skipped; mount it from a Secret rather than templating tokens into args.
 `--tenant-token` and `--tenant-token-file` are mutually exclusive; startup
-refuses if both are set.
+refuses if both are set. The file is read once, at startup: rotating the
+mounted Secret still needs a pod restart to pick up the new tokens. An empty
+or comment-only file (a Secret mount that failed to populate looks exactly
+like this) parses to an empty map with no startup error: it authenticates
+nothing, and because it also leaves no `--maintain-tenant`-equivalent
+restriction, background fold, compaction and retention widen to every
+tenant storage discovers.
 
 A local tenant no remote names gets local data only, reported as a complete
 result: a remote it holds no credential for is outside its query, not missing
