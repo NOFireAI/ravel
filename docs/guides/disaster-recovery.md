@@ -70,15 +70,29 @@ under `idx/` are different. When a tenant declares an attribute key such as
 `user.id` as a typed string or bytes column, the fold records that column's
 exact minimum, exact maximum and exact distinct-value dictionary into the
 column-statistics object for each part, so the subject's own value is stored
-verbatim. Erasure never rewrites that object: it writes new catalog objects
-and swaps HEAD, which leaves the stale one unreferenced, and this sweep is the
-only thing that removes it. So for any tenant with a typed string or bytes
-attribute column, a retention covering the whole catalog keyspace holds an
-erased subject's value for the full retention period. That is a real addition
-to the erasure bound, not a storage cost. Keep that retention period inside
-the same window as for commit records, and if the erasure bound is
-unacceptable, scope the mechanism to `catalog/<signal>/HEAD` alone, which is
-the object the immutability argument actually rests on. The scoped posture is
+verbatim.
+
+Erasure never rewrites that object, and it does not refresh the catalog
+either. The erasure rewrite publishes new data objects and a rewrite record;
+nothing in it folds the tenant catalog. The catalog picks the rewrite up only
+when the fold reconciles that hour, through its fixed window or the
+retention-frontier band, or when an operator rebuilds HEAD. Until one of those
+runs, the live HEAD still names the pre-rewrite part, so that part's
+column-statistics object is still referenced, is not a sweep candidate at all,
+and holds the erased value with no retention involved. Only after the
+reconcile or the rebuild does that object become unreferenced, and only then
+does the retention period start to matter. So for a tenant with a typed string
+or bytes attribute column the erasure bound is "until the fold reconciles that
+hour, then plus the retention period", not the retention period alone.
+
+Under the maintenance IAM policy Ravel ships, it is longer still. That policy
+denies the maintenance role every delete under the catalog keyspace, so the
+unreferenced column-statistics object is not deletable at all today, whatever
+retention period is chosen, and the bound stays open-ended until that policy
+changes. Scoping the mechanism to `catalog/<signal>/HEAD` alone, which is the
+object the immutability argument actually rests on, is necessary to remove the
+retention half of this but is not sufficient on its own. Keep the retention
+period inside the same window as for commit records. The scoped posture is
 therefore still not a disaster-recovery choice; it is the baseline the commit
 and catalog layers already assume, with the commit-record family carrying the
 sweep-delay cost above and the catalog family the sweep delay and, for those
@@ -111,11 +125,17 @@ or accept those sweeps pausing on a commit record until the period elapses.
 For the catalog keyspace the same window applies for a different reason: the
 unreferenced-catalog sweep deletes the snapshot and index objects the current
 HEAD no longer names, and a retention covering them pauses that sweep for the
-tenant and signal it fires on. Both delays extend the erasure bound rather
-than only deferring reclamation: a locked commit record holds the superseded
-data behind it, and a locked column-statistics object holds an erased
-subject's own column value for any tenant with a typed string or bytes
-attribute column.
+tenant and signal it fires on. The commit-record delay extends the erasure
+bound rather than only deferring reclamation: a locked commit record holds the
+superseded data behind it. The catalog delay does the same for a tenant with a
+typed string or bytes attribute column, and only for such a tenant: a locked
+column-statistics object holds that subject's own column value. For that
+tenant the catalog half is not bounded by the retention period alone. The
+stale object stays referenced, and so not a sweep candidate, until the fold
+reconciles that hour or an operator rebuilds HEAD, and the maintenance IAM
+policy Ravel ships denies the maintenance role every delete under the catalog
+keyspace, so the object is not deletable at all today and that half of the
+bound is open-ended until the policy changes.
 
 | Mechanism | What it does | Coverage window |
 |---|---|---|
@@ -473,7 +493,7 @@ record: a real end-to-end run against MinIO is what fills a row.
 
 | Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
-| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound, R)` where `R` is the chosen retention period, until it elapses. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and a retention over the whole keyspace holds a stale per-part column-statistics object: `max(bound, R)` as well for any tenant with a typed string or bytes attribute column, whose erased value that object stores verbatim. Scope the mechanism to `catalog/<signal>/HEAD` alone to keep the lock without that bound | Not a recovery control |
+| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound, R)` where `R` is the chosen retention period, until it elapses. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and for any tenant with a typed string or bytes attribute column a stale per-part column-statistics object stores an erased value verbatim. That bound is not `max(bound, R)`: the object stays referenced until the fold reconciles that hour or HEAD is rebuilt, so it is "until the fold reconciles, then plus `R`", and under the maintenance IAM policy Ravel ships, which denies the maintenance role every delete under the catalog keyspace, it is open-ended until that policy changes. Scope the mechanism to `catalog/<signal>/HEAD` alone to drop the retention half of it | Not a recovery control |
 | **level 0** (default) | Versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup; no replica | Primary `+E_v` | None; bucket loss is total loss |
 | **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended; the replica versioned with `NoncurrentDays = E_v_r` and expired-delete-marker cleanup | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound, D)`; query-time exclusion still immediate | As level 1 |

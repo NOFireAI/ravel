@@ -662,12 +662,31 @@ into them. An operator with erasure obligations must budget them deliberately.
   attribute column (proto/ravel/sys.proto). So for a tenant with a `STR`
   or `BYTES` typed attribute column, an erased subject's value can sit
   verbatim in a `.cstat` written under `catalog/<signal>/idx/`
-  (`crates/ravel-catalog/src/fold.rs`). Erasure does not rewrite that
-  object: the rewrite pass and the fold after it write new catalog
-  objects and swap HEAD, leaving the stale `.cstat` unreferenced, and
-  this sweep is the only mechanism that removes it. A retention `R` over
-  the whole keyspace therefore holds that value for `R`, which is a
-  genuine erasure bound of `max(bound, R)`, not a reclamation delay.
+  (`crates/ravel-catalog/src/fold.rs`).
+
+  Erasure does not rewrite that object, and it does not refresh the
+  catalog either: the rewrite pass publishes new data objects and a
+  rewrite record and drives no tenant-catalog fold of its own
+  (`crates/ravel-maintain/src/rewrite.rs`, whose catalog calls are the
+  segment-internal catalog a rewrite decodes). The catalog picks the
+  rewrite up only when the fold reconciles that hour, through the fixed
+  window or the retention-frontier band, or when a HEAD rebuild
+  re-derives every hour (the same trigger the `.done` scope note below
+  states). Until one of those runs, the live HEAD still names the
+  pre-rewrite part, so that part's `.cstat` is referenced, not sweepable,
+  and the erased value persists with no retention involved at all. Only
+  after the reconcile or the rebuild is the stale `.cstat` unreferenced,
+  and only then does a retention `R` over the keyspace start to matter.
+  The erasure bound for such a tenant is therefore "until the fold
+  reconciles that hour, then `+R`", not `max(bound, R)` alone.
+
+  Under the shipped IAM templates it is worse than that bound.
+  `deploy/iam/maintain.json`'s `DenyDeleteProtected` statement denies the
+  Maintain role every delete under `t/*/catalog/*/*`, so the unreferenced
+  `.cstat` is not deletable at all today, whatever the retention posture
+  is: the bound is open-ended rather than `+R` until that template
+  changes. Scoping the retention mechanism to `catalog/<signal>/HEAD`
+  alone is necessary but not sufficient while that deny stands.
 
   The refusal also reaches past the locked object. The sweep's delete
   loop propagates the first refusal, so one locked object aborts that
@@ -676,9 +695,7 @@ into them. An operator with erasure obligations must budget them deliberately.
   failed pass and retries on the next maintenance tick, where the same
   object refuses again, so that tenant and signal's catalog garbage
   accumulates until `R` elapses. Keep `R` inside `protection_horizon`
-  here for the same reason. An operator who needs the immutability
-  guarantee without the `+R` erasure bound scopes the retention mechanism
-  to `catalog/<signal>/HEAD` alone.
+  here for the same reason.
 
 - **`+E_v`, bucket versioning.** On a versioned bucket every physical delete
   becomes a soft delete, and the noncurrent version survives until the
@@ -727,16 +744,28 @@ into them. An operator with erasure obligations must budget them deliberately.
 
 ### Scope and interactions
 
-- **Why the `.done` guarantee needs only the commit-record pass.** The
+- **What the `.done` pass verifies, and the one object it does not.** The
   completion pass walks `c/<shard>/<hour>/` commit records and verifies the
   segment data a snapshot resolves is subject-free. It does NOT separately
-  walk index objects or analytics, and it does not need to, because neither
-  can hold a record matching an erasure subject:
-  - **Index objects carry no subject values.** `SnapshotEntry`,
-    `SnapshotPartHeader`, and name postings hold identities, hashes, counts,
-    and metric names, never label/attribute *values*. So the deny-deleted
-    `catalog/`, `prov`, and `sys/*` prefixes are disjoint from subject
-    erasure by construction. This holds *only if* subject identifiers appear
+  walk index objects or analytics. For analytics that is sound (below); for
+  the catalog family it is sound for three of its four object kinds and not
+  for the fourth:
+  - **Three index object kinds hold no value, and `.cstat` is the
+    exception.** `SnapshotEntry`, `SnapshotPartHeader`, and name postings
+    hold identities, hashes, counts, and metric names, never label/attribute
+    *values*, and a snapshot entry's own typed-column stamp is restricted to
+    `I64` and `BOOL` extrema (proto/ravel/commit.proto,
+    `DeclaredColumnStatValue`), which cannot represent a `STR` or `BYTES`
+    value either. The per-part `.cstat` column-statistics objects are the
+    exception the `+R` modifier above sets out: for a tenant with a `STR` or
+    `BYTES` typed attribute column they hold that column's exact min, max,
+    and distinct-value dictionary, so an erased subject's own value can sit
+    in one verbatim. So the deny-deleted `prov` and `sys/*` prefixes hold
+    nothing an erasure subject can match, while the `catalog/` prefix does:
+    the deny list's "disjoint by construction" claim no longer holds for the
+    catalog family. ADR-0064's Decision still states the wider form;
+    amending it is tracked separately. The three value-free kinds are
+    value-free *only if* subject identifiers appear
     as label/attribute values and never inside metric names (a documented
     requirement; see docs/object-store-contract.md "Required bucket
     configuration" point 5). A snapshot entry whose object a rewrite
@@ -767,9 +796,17 @@ into them. An operator with erasure obligations must budget them deliberately.
     analytics-adjacent store that can retain subject values is the
     query-audit keyspace, covered next.
 
-  Because index and derived state hold no subject values, the pass verifying
-  only commit-record segments is not under-asserting the `.done` guarantee;
-  it verifies the only place a subject physically lives.
+  So the pass's commit-record scope covers the data objects a snapshot
+  resolves and the three value-free index kinds, and it covers no `.cstat`:
+  a stale column-statistics object the live HEAD still names sits outside
+  everything the pass verifies. What covers that gap is the query-time
+  exclusion filter, not the pass. The filter cannot retire while the
+  superseded-input sweep still holds an input this request's rewrites
+  superseded (`crates/ravel-maintain/src/sweep.rs`), which is the same
+  condition under which the stale `.cstat` is still HEAD-referenced, and a
+  metadata-only answer read from typed-column statistics is refused
+  outright while any erasure predicate is pending
+  (`crates/ravel-sql/src/logs_scan.rs`).
 
 - **The query-audit keyspace is the one excluded derived store.** It may
   retain matcher values from audited query text, and it is deny-deleted
