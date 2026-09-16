@@ -864,7 +864,7 @@ adapter contract:
    `.cstat` is not deletable at all today, whatever the retention posture
    is: the bound is open-ended rather than `+R` until that template
    changes. An operator who wants the immutability guarantee without the
-   erasure bound scopes the mechanism to `catalog/<signal>/HEAD` alone,
+   retention half scopes the mechanism to `catalog/<signal>/HEAD` alone,
    which is the object the immutability argument above actually rests on.
    That scoping is necessary but not sufficient while the IAM deny stands.
 
