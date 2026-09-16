@@ -15,9 +15,10 @@
 //! ADR-0021 requires mirroring Prometheus' float algorithms operation-for-
 //! operation, verified by the differential gate. That gate now runs: native
 //! histograms flow ingest -> storage -> query -> evaluator, and the
-//! `histogram_native` corpus diffs 33 native-histogram cells against the
-//! pinned Prometheus binary, with the `binop.txt` histogram cells covering the
-//! binary operators on top. Algorithms without a corpus cell to cover them are
+//! `histogram_native` corpus diffs 32 native-histogram cells against the
+//! pinned Prometheus binary (its 33rd cell pins a deliberate divergence, a
+//! refused matrix selector), with the `binop.txt` histogram cells covering
+//! the binary operators on top. Algorithms without a corpus cell to cover them are
 //! still structural ports of Prometheus' `model/histogram` and
 //! `promql/quantile.go`/`functions.go` checked against hand-computed fixtures.
 //! Two known residues, to be resolved to ADR-0025 allowlist entries or exact
@@ -26,8 +27,10 @@
 //! * `bucket_bound` computes `2^(idx * 2^-scale)` arithmetically. Prometheus
 //!   uses hard-coded `exponentialBounds` tables for `scale > 0` for bit-exact
 //!   bounds; the arithmetic form may differ by a ULP for fractional
-//!   exponents. `scale <= 0` bounds are exact powers of two and match. The
-//!   corpus dataset is schema 0 throughout, so no cell exercises this.
+//!   exponents. `scale <= 0` bounds are exact powers of two and match. No
+//!   corpus cell renders a `scale > 0` histogram's bucket bounds: the only
+//!   schema-1 samples (`diff_native_hist_schema`, samples 13 to 26) appear
+//!   under `resets` and `histogram_count(rate(...))`, which reduce to floats.
 //! * Differing zero-thresholds between two operands of `add`/`sub` are not
 //!   reconciled. Prometheus reconciles them inside `FloatHistogram.Add`/`Sub`
 //!   themselves (`reconcileZeroBuckets`, which widens the zero bucket to the

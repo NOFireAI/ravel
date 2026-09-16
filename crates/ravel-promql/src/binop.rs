@@ -144,8 +144,9 @@ fn is_arithmetic(op: TokenId) -> bool {
     matches!(op, T_ADD | T_SUB | T_MUL | T_DIV | T_MOD | T_POW | T_ATAN2)
 }
 
-/// A binary operator's source symbol, for the info annotation raised when a
-/// histogram-carrying pair falls outside the supported set. Only the
+/// A binary operator's source symbol, for the annotations raised when a
+/// histogram-carrying pair falls outside the supported set or cannot be
+/// aligned. Only the
 /// arithmetic and comparison tokens reach [`combine_value`]; the catch-all
 /// keeps this total without an `unreachable!`.
 fn op_symbol(op: TokenId) -> &'static str {
