@@ -172,7 +172,7 @@ check "a missing minio.yml also fails the total-count assertion" "${d}" 1 \
 # reference. This is the acceptance test for issue #1338.
 d="$(new_tree docker-run-image-with-tag-only-fails)"
 mutate "${d}/.github/workflows/ci.yml" \
-  's#quay\.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727#quay.io/minio/mc:latest#'
+  's#quay\.io/minio/mc:RELEASE\.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727#quay.io/minio/mc:latest#'
 check "docker_run_image_with_tag_only_fails" "${d}" 1 \
   "ci.yml:1217: quay.io/minio/mc:latest"
 
