@@ -171,8 +171,13 @@ block was pruned.
 The first query's `trace_id = '<32-hex>'` literal is both planned and
 re-applied as a residual over the real `FixedSizeBinary(16)` column: a
 32-character hex string and a 16-byte binary literal (`X'00112233...'`) plan
-identically, both taking the `trace_id` fast path and returning the same
-rows.
+identically for `=` and `!=`, both taking the `trace_id` fast path and
+returning the same rows. This does not extend to `IN`: DataFusion builds an
+`IN` list directly from its operands without consulting an expression
+planner, so `trace_id IN ('00112233...', ...)` still fails to plan while
+`trace_id IN (X'00112233...', ...)` works. The same hex-string spelling also
+plans against the `logs` table's `trace_id` column, which is
+`FixedSizeBinary(16)` at the same width.
 
 ## Incomplete traces
 
