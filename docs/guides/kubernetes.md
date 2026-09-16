@@ -497,7 +497,12 @@ service and gets no probe.
   background store-reachability probe is healthy, while no ingest shard has been
   condemned, and until SIGTERM flips the drain latch. 503 before startup
   completes, after four consecutive failed probes until the next successful one,
-  once a shard actor exhausts its respawn budget, and for the whole drain. Only
+  once any ingest shard actor is condemned, and for the whole drain. When a
+  shard actor is condemned depends on the signal: the metrics pipeline respawns
+  a dead shard actor and condemns only on the death that exhausts its respawn
+  budget, while the logs and spans pipelines never respawn, so their first
+  shard-actor death condemns
+  ([observability](observability.md#ingest-pipelines-ravel_ingest_)). Only
   the store-probe condition recovers on its own; a condemned shard holds the pod
   out of its Service until someone rolls it, because readiness sheds traffic and
   never restarts or reschedules a pod

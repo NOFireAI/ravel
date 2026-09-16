@@ -207,7 +207,12 @@ store outage never makes it fail.
 `/readyz` (and `/-/ready`) is readiness, the AND of four conditions: startup has
 completed (config parsed, the object-store capability gate passed, listeners
 bound), the process is not draining, the store is reachable, and no ingest shard
-actor has been condemned after exhausting its respawn budget. It issues no
+actor has been condemned. When a shard actor is condemned depends on the signal:
+the metrics pipeline respawns a dead shard actor and condemns only on the death
+that exhausts its respawn budget, while the logs and spans pipelines never
+respawn, so their first shard-actor death condemns
+([observability guide](../guides/observability.md#ingest-pipelines-ravel_ingest_)).
+It issues no
 object-store request itself and takes no lock: each condition is an atomic load,
 including the ingest one, which reads the condemned-shard counter. A background
 store probe with hysteresis supplies the store atomic: four consecutive failed

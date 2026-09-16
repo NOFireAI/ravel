@@ -69,9 +69,13 @@ pub struct Readiness {
     /// forever.
     draining: Arc<AtomicBool>,
     /// In-process ingest health sources (issue #1299): each reports not-ready
-    /// once one of an ingest router's shard actors has been condemned after
-    /// exhausting its respawn budget. `is_ready` ANDs `shards_ready` across all
-    /// of them, so a condemned shard turns `/readyz` to 503, which sheds
+    /// once one of an ingest router's shard actors has been condemned. When a
+    /// shard actor is condemned is the router's own rule, not this module's:
+    /// the metrics router respawns and condemns on the death that exhausts a
+    /// shard's respawn budget within one decay window, while the log and span
+    /// routers never respawn and condemn on the first shard-actor death
+    /// (issue #1691). `is_ready` ANDs `shards_ready` across all of them, so a
+    /// condemned shard turns `/readyz` to 503, which sheds
     /// traffic: Kubernetes removes the pod from its Service endpoints. Nothing
     /// restarts or reschedules it, so an operator has to roll the pod.
     ///
@@ -86,7 +90,8 @@ pub struct Readiness {
 
 /// In-process ingest health consulted by the readiness probe (issue #1299): the
 /// source reports not-ready once one of an ingest router's shard actors has
-/// exhausted its respawn budget and been condemned. Pull-based --
+/// been condemned, on whichever per-signal rule that router applies (see the
+/// `ingest` field on [`Readiness`]). Pull-based --
 /// [`Readiness::is_ready`] reads it on each probe -- so no code path has to
 /// remember to set a flag, matching the store-probe design's one-truth,
 /// read-on-demand shape.
@@ -148,7 +153,12 @@ impl Readiness {
 
     /// Whether every ingest source reports its shards ready. True when none is
     /// attached (the modes that run no ingest router).
-    fn ingest_shards_ready(&self) -> bool {
+    ///
+    /// `pub(crate)` so the crate's own tests can assert this condition alone,
+    /// separating "an ingest source reported a condemned shard" from the other
+    /// three conditions [`Readiness::is_ready`] ANDs it with. Not public: the
+    /// probe surface outside this crate is `/readyz` and `is_ready`.
+    pub(crate) fn ingest_shards_ready(&self) -> bool {
         self.ingest.iter().all(|source| source.shards_ready())
     }
 
@@ -184,8 +194,10 @@ impl Readiness {
     /// Whether the process is ready to serve, the AND of four conditions:
     /// startup has completed, the process is NOT draining, the background store
     /// probe currently reports the store reachable (ADR-0050 section 7), AND
-    /// every attached ingest source still has all its shards (none condemned
-    /// after exhausting its respawn budget, issue #1299). Any one false yields
+    /// every attached ingest source still has all its shards (none condemned,
+    /// issue #1299, on whichever per-signal rule the source's router applies:
+    /// respawn-budget exhaustion for metrics, the first shard-actor death for
+    /// logs and spans, issue #1691). Any one false yields
     /// 503 at `/readyz`. Each is an atomic load; nothing on this path locks or
     /// performs I/O.
     pub fn is_ready(&self) -> bool {
@@ -221,8 +233,9 @@ async fn healthz() -> &'static str {
 /// hold (startup completed, the process is not draining, the background store
 /// probe reports the store reachable, and no ingest shard is condemned); 503
 /// whenever any one is false, so before startup completes, once graceful
-/// shutdown begins draining, during a store outage, or once a shard actor has
-/// exhausted its respawn budget.
+/// shutdown begins draining, during a store outage, or once a shard actor is
+/// condemned (on exhausting its respawn budget for metrics, on its first death
+/// for logs and spans).
 async fn readyz(State(readiness): State<Readiness>) -> StatusCode {
     if readiness.is_ready() {
         StatusCode::OK
