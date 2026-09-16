@@ -30,13 +30,19 @@ pub use ravel_object_store::conformance::{QUALIFICATION_KEY, QualificationRecord
 /// it instead, and overwrites one written under an older suite version with the
 /// current pass. Returns an error -- without writing anything -- if any
 /// property fails, naming which one(s).
+///
+/// `list_page_size` must be the page size `store` was actually built with
+/// (see `ravel-cli store qualify --list-page-size`): it is passed straight
+/// through to `run_conformance_suite`, whose cross-page and ordering probes
+/// size their key counts against it.
 pub async fn qualify(
     store: Arc<dyn ObjectStoreBackend>,
     backend_identity: String,
     run_id: &str,
+    list_page_size: usize,
 ) -> anyhow::Result<()> {
     let scratch_prefix = format!("sys/qualify/{run_id}/");
-    let report = run_conformance_suite(store.as_ref(), &scratch_prefix).await;
+    let report = run_conformance_suite(store.as_ref(), &scratch_prefix, list_page_size).await;
 
     for result in &report.results {
         println!(

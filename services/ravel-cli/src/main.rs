@@ -865,7 +865,16 @@ enum TenancyCommand {
 enum StoreCommand {
     /// Run the conformance suite against the configured backend and, on a
     /// pass, record the outcome at `sys/qualification`.
-    Qualify {},
+    Qualify {
+        /// List page size to build the store with and declare to the
+        /// conformance suite's listing probes. Defaults to the production S3
+        /// page size, so a default run proves a real continuation-token
+        /// boundary is crossed; must match the store this command builds, so
+        /// the cross-page probe judges a real pagination boundary rather than
+        /// a mismatched, meaningless one.
+        #[arg(long, default_value_t = ravel_object_store::s3::LIST_PAGE_SIZE)]
+        list_page_size: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1508,13 +1517,14 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Command::Store {
-            command: StoreCommand::Qualify {},
+            command: StoreCommand::Qualify { list_page_size },
         } => {
             let run_id = uuid::Uuid::new_v4();
             ravel_cli::qualify::qualify(
-                store::build_store(&cli.store)?,
+                store::build_store_with_list_page_size(&cli.store, Some(list_page_size))?,
                 cli.store.backend_identity(),
                 &run_id.to_string(),
+                list_page_size,
             )
             .await
         }

@@ -110,8 +110,11 @@ use crate::instrument::{StoreMetrics, StoreOp};
 
 /// Default entries per `ListPage`, chosen to line up with S3's own
 /// `ListObjectsV2` page size. Overridable per instance via
-/// [`S3Store::with_page_size`].
-const LIST_PAGE_SIZE: usize = 1000;
+/// [`S3Store::with_page_size`]. Public so callers that must declare this
+/// store's real page size elsewhere (`ravel-cli store qualify`'s
+/// `--list-page-size` default, matching what `build_store` constructs) have
+/// one definition to reference instead of a duplicated literal.
+pub const LIST_PAGE_SIZE: usize = 1000;
 
 /// Part size [`S3Store::put`] cuts an over-threshold payload into: 8 MiB.
 ///
@@ -858,11 +861,15 @@ impl S3Store {
         Ok((builder, credential_provider, instance_role_provider))
     }
 
-    /// Same backend, a smaller `list()` page size. Mirrors
-    /// [`crate::memory::MemoryStore::with_page_size`] so the contract
-    /// suite's manual-pagination assertion can force real multi-page
-    /// continuation (via `list_with_offset`) against a real bucket without
-    /// needing 1000+ objects.
+    /// Same backend, a different `list()`/`list_after()` page size. This
+    /// re-chunks the results client-side, after the underlying `object_store`
+    /// crate has already fully streamed a listing over the wire: it does NOT
+    /// change the real `ListObjectsV2` `MaxKeys` sent to S3, so shrinking it
+    /// does not shrink the request page size and cannot, by itself, force a
+    /// real continuation-token boundary against a small number of objects.
+    /// Proving [`crate::conformance::run_conformance_suite`]'s cross-page
+    /// probe against this backend needs more keys than this store's actual
+    /// page size, not a smaller declared one.
     pub fn with_page_size(config: S3Config, page_size: usize) -> Result<Self, StoreError> {
         let mut store = Self::new(config)?;
         store.page_size = page_size.max(1);

@@ -58,3 +58,39 @@ fn store_qualify_prints_informational_object_lock_probe() {
         "qualification must still pass regardless of the probe; got:\n{stdout}"
     );
 }
+
+/// `--list-page-size` reaches `run_conformance_suite` end to end: `build_store`
+/// builds the memory backend with that same page size (`build_store_with_
+/// list_page_size`), so declaring 10 makes both the store's real pagination
+/// boundary and the probe's declared size 10, and the cross-page probe writes
+/// `page_size + 2` = 12 keys, split as 10 then 2 across exactly two key-bearing
+/// pages (issue #1695). A flag that failed to reach the suite would leave the
+/// default 1000-key probe shape in the output instead of this one.
+#[test]
+fn store_qualify_list_page_size_flag_reaches_the_cross_page_probe() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ravel-cli"))
+        .args([
+            "--store",
+            "memory",
+            "store",
+            "qualify",
+            "--list-page-size",
+            "10",
+        ])
+        .output()
+        .expect("ravel-cli runs");
+
+    assert!(
+        output.status.success(),
+        "store qualify with --list-page-size 10 against the memory oracle must \
+         succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("12 distinct keys across 2 pages (2 carrying keys)"),
+        "the cross-page probe detail must reflect the declared --list-page-size \
+         of 10 (12 = page_size + 2 keys, split 10 then 2); got:\n{stdout}"
+    );
+}
