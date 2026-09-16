@@ -59,11 +59,6 @@ if [[ ! -d "${tmproot}" ]]; then
 fi
 trap 'rm -rf "${tmproot}"' EXIT
 bad_config="${tmproot}/config.rs"
-cp "${REAL_CONFIG}" "${bad_config}" || exit 1
-if [[ ! -f "${bad_config}" ]]; then
-  echo "FAIL  cp did not produce the fixture at ${bad_config}" >&2
-  exit 1
-fi
 # Strip `gzip` from the first doc block that pairs it with inflate or
 # decompress, leaving every later block intact.
 awk '
@@ -82,7 +77,7 @@ awk '
   }
 ' "${REAL_CONFIG}" >"${bad_config}"
 if cmp -s "${REAL_CONFIG}" "${bad_config}"; then
-  echo "FAIL  fixture is identical to ${REAL_CONFIG}; the sed edit did not \
+  echo "FAIL  fixture is identical to ${REAL_CONFIG}; the awk filter did not \
 strip the gzip qualification, so the known-bad case would test nothing" >&2
   exit 1
 fi

@@ -100,11 +100,11 @@ excepted_reason() {
 #
 # SCOPE: the `*.test.sh` suffix is itself a hand-maintained convention, which
 # is this guard's own problem one level up. A suite named another way is
-# invisible here, and one exists: `deploy/metricsbench/tests/*.sh` is a
-# `#!/bin/sh` acceptance suite wired by hand in ci.yml. It is not an orphan
-# today, checked rather than assumed. The summary line below says "shell test
-# suite(s)" and means "matching this key", not "every shell suite in the
-# repository".
+# invisible here. `deploy/metricsbench/tests/` holds one of each: the
+# `.test.sh` file IS scanned, and its `.sh` sibling is not, though both are
+# wired by hand in ci.yml so neither is an orphan today. The summary line
+# below says "shell test suite(s)" and means "matching this key", not "every
+# shell suite in the repository".
 suites="$(git ls-files -- '*.test.sh' 2>/dev/null)" || {
   echo "check-test-suites-run.sh: git ls-files failed" >&2
   exit 2
@@ -137,7 +137,23 @@ fi
 # way a comment is -- `- name: we should run x.test.sh one day` counted as
 # running it, the same false clean one YAML key over. The `run:` line that
 # actually invokes the suite is untouched.
-workflow_text="$(grep -rhvE '^[[:space:]]*#|^[[:space:]]*-?[[:space:]]*name:' -- "${workflow_dir}" 2>/dev/null)"
+# Only the files GitHub actually runs: top-level `*.yml`/`*.yaml` directly
+# under .github/workflows. A recursive scan of the directory also read a
+# README, an archived subdirectory and a `*.yml.disabled`, any of which made
+# an orphan read as run -- the same false clean as the comment and `name:`
+# cases, one layer out. `-maxdepth 1` because GitHub does not run workflows
+# in subdirectories either.
+workflow_files=()
+while IFS= read -r wf; do
+  [[ -n "${wf}" ]] && workflow_files+=("${wf}")
+done < <(find "${workflow_dir}" -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null | sort)
+
+if ((${#workflow_files[@]} == 0)); then
+  echo "check-test-suites-run.sh: no *.yml/*.yaml directly under ${workflow_dir}; cannot tell what CI runs" >&2
+  exit 2
+fi
+
+workflow_text="$(grep -hvE '^[[:space:]]*#|^[[:space:]]*-?[[:space:]]*name:' -- "${workflow_files[@]}" 2>/dev/null)"
 if [[ -z "${workflow_text}" ]]; then
   echo "check-test-suites-run.sh: ${workflow_dir} has no non-comment content; cannot tell what CI runs" >&2
   exit 2
