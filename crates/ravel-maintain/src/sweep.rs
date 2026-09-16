@@ -192,7 +192,10 @@ pub struct SweepReport {
     /// The quarantine reaper ([`sweep_quarantine`]): objects physically deleted
     /// from `quarantine/` this pass because their embedded quarantine timestamp
     /// is more than `quarantine_horizon_ns` behind the clock. This is the only
-    /// place orphan-GC'd data is ever physically removed.
+    /// place orphan-GC'd data is ever physically removed. Always `0` on a pass
+    /// that did not run rule 1 ([`OrphanPass::Skip`]) or whose breaker tripped:
+    /// the reaper runs on candidate selection's cadence so the breaker's hold
+    /// on it holds until the next selecting pass, not until the next tick.
     pub quarantine_reaped: usize,
     /// Rule 2: superseded L0 commit records deleted.
     pub superseded_records_deleted: usize,
@@ -349,9 +352,12 @@ pub enum OrphanPass {
     #[default]
     Run,
     /// Skip rule 1 entirely this pass: no `l0/` data prefix LIST, no
-    /// candidate selection, no breaker evaluation. The quarantine reaper
-    /// (a different rule, over the `quarantine/` prefix, not `l0/`) is
-    /// unaffected and still runs.
+    /// candidate selection, no breaker evaluation. The quarantine reaper is
+    /// skipped with it: a pass that did not evaluate the breaker reports
+    /// not-tripped structurally, so reaping here would undo the hold a
+    /// tripped selecting pass just took. Reaping stays on candidate
+    /// selection's cadence, which is what makes the two horizons chained
+    /// rather than independent.
     Skip,
 }
 
@@ -416,11 +422,12 @@ pub async fn sweep_shard_zoned(
 /// structural, not a measurement of zero orphans, which is why the report
 /// also carries [`SweepReport::orphan_pass`]: a consumer that cannot tell
 /// them apart publishes "no orphans" for every tick between two full sweeps.
-/// `quarantine_reaped`
-/// is unaffected by `orphan_pass`: the reaper is rule 1's second horizon over
-/// the separate `quarantine/` prefix, not the `l0/` prefix rule 1's candidate
-/// selection lists, and it still runs every pass so objects already
-/// quarantined by an earlier `Run` pass keep aging out on schedule.
+/// `quarantine_reaped` is `0` on a `Skip` pass too: the reaper is rule 1's
+/// second horizon, and it runs only on a pass that ran candidate selection
+/// and did not trip the breaker, so the breaker's hold on the reaper cannot
+/// be stepped around by the next pass that skipped rule 1 (see
+/// [`OrphanPass::Skip`]). Quarantined objects keep aging out on the
+/// full-sweep cadence.
 #[allow(clippy::too_many_arguments)]
 pub async fn sweep_shard_zoned_with_holds(
     store: &dyn ObjectStoreBackend,
@@ -488,16 +495,18 @@ pub async fn sweep_shard_zoned_with_holds(
             }
         }
     };
-    // The quarantine reaper runs on every pass, including the zone-scoped one
-    // and one where `orphan_pass` is `Skip`, so a per-tick sweep reaps expired
-    // quarantine too; it is whole-shard because quarantine keys are not
-    // hour-bucketed (like rule 1 itself), and it is a different prefix
-    // (`quarantine/`, not `l0/`) so `OrphanPass` does not gate it. It is
-    // skipped on a tripped-breaker pass for the reason given in `sweep_all`.
-    let quarantine = if orphan_breaker_tripped {
-        QuarantineSweepOutcome::default()
-    } else {
+    // The quarantine reaper runs only on a pass that ran candidate selection
+    // and whose breaker did not trip, so it keeps rule 1's cadence and the two
+    // horizons stay chained by construction. A `Skip` pass never evaluated the
+    // breaker, so its `orphan_breaker_tripped` is structurally false; reaping
+    // there would physically delete the very copies the previous selecting
+    // pass held by tripping. It is whole-shard because quarantine keys are not
+    // hour-bucketed (like rule 1 itself). A `force_orphan_gc` override is not
+    // a trip, so an operator who has decided still reclaims.
+    let quarantine = if orphan_pass == OrphanPass::Run && !orphan_breaker_tripped {
         sweep_quarantine(store, clock, config, lease, tenant, signal, shard).await?
+    } else {
+        QuarantineSweepOutcome::default()
     };
     Ok((
         SweepReport {
@@ -3326,9 +3335,10 @@ mod tests {
     /// registered with `Op::List` and `key_contains("/l0/")`, it also matches
     /// the quarantine reaper's LIST (`quarantine/` + the `l0/` prefix is a
     /// superstring of it, so no substring pattern can separate the two), so
-    /// each pass's progress is candidate-selection-lists-or-not plus exactly
-    /// one reaper LIST: 2 on the `Run` pass below, then a delta of only 1 (the
-    /// reaper alone, no candidate-selection LIST at all) on the `Skip` pass.
+    /// each pass's progress is candidate-selection-lists-or-not plus the
+    /// reaper's LIST when it runs: 2 on the `Run` pass below, then a delta of
+    /// 0 on the `Skip` pass, which lists neither prefix (the reaper runs on
+    /// candidate selection's cadence, see `OrphanPass::Skip`).
     #[tokio::test]
     async fn skip_pass_reports_zero_orphan_figures_while_run_pass_reports_the_seeded_count() {
         let tenant = tenant();
@@ -3403,9 +3413,10 @@ mod tests {
         let progress_after_skip = store.sequence_progress(0);
         assert_eq!(
             progress_after_skip - progress_after_run,
-            1,
-            "Skip pass issues only the quarantine reaper's LIST; zero l0 data \
-             prefix LISTs for candidate selection"
+            0,
+            "Skip pass issues no l0-embedding LIST at all: no candidate \
+             selection, and no reaper either, since the reaper runs on \
+             candidate selection's cadence"
         );
 
         let remaining = list_all(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
@@ -3866,6 +3877,170 @@ mod tests {
             .await
             .is_empty(),
             "nothing left in quarantine"
+        );
+    }
+
+    /// A pass that did not run candidate selection never reaps quarantine,
+    /// however expired the copies are. The breaker's hold on the reaper is the
+    /// caller's condition alone, and a `Skip` pass reports not-tripped because
+    /// it never evaluated the breaker, so a reaping `Skip` pass 300 s after a
+    /// tripped full sweep destroys exactly the copies that trip held.
+    ///
+    /// The second half asserts the reaper's own horizon semantics are
+    /// unchanged: the same store, clock, and copy are reaped by a `Run` pass.
+    ///
+    /// Flip to watch it fail: change the reaper's condition in
+    /// `sweep_shard_zoned_with_holds` from
+    /// `orphan_pass == OrphanPass::Run && !orphan_breaker_tripped` back to
+    /// `!orphan_breaker_tripped` and the `Skip` pass reaps 1.
+    #[tokio::test]
+    async fn a_skipped_pass_does_not_reap_quarantine() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 13;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+
+        // One object quarantined at t1, then a whole horizon passes: it is
+        // reapable by any pass that gets as far as the reaper.
+        put_orphan(&store, &tenant, signal, shard, 0).await;
+        let t1 = config.orphan_age_gate_ns() + 1;
+        let clock = FixedClock::new(t1);
+        let out = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("quarantine the single candidate");
+        assert_eq!(out.deleted, 1);
+        clock.set(t1 + config.quarantine_horizon_ns + 1);
+
+        let (skip_report, _holds) = sweep_shard_zoned_with_holds(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            signal,
+            shard,
+            &[],
+            OrphanPass::Skip,
+        )
+        .await
+        .expect("skipped pass");
+        assert!(
+            !skip_report.orphan_breaker_tripped,
+            "a Skip pass reports not-tripped because it never evaluated the breaker"
+        );
+        assert_eq!(
+            skip_report.quarantine_reaped, 0,
+            "a pass that did not run candidate selection reaps nothing"
+        );
+        assert_eq!(
+            keys_under(
+                &store,
+                &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+            )
+            .await
+            .len(),
+            1,
+            "the expired copy survives a skipped pass"
+        );
+
+        // Same store, same clock, same expired copy: a selecting pass reaps it,
+        // so the horizon itself is unchanged.
+        let (run_report, _holds) = sweep_shard_zoned_with_holds(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            signal,
+            shard,
+            &[],
+            OrphanPass::Run,
+        )
+        .await
+        .expect("selecting pass");
+        assert_eq!(
+            run_report.quarantine_reaped, 1,
+            "the reaper's own horizon semantics are unchanged"
+        );
+        assert!(
+            keys_under(
+                &store,
+                &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+            )
+            .await
+            .is_empty(),
+            "nothing left in quarantine"
+        );
+    }
+
+    /// The chained interlock across two consecutive passes at this layer: the
+    /// selecting pass trips the breaker and holds the reaper, and the skipped
+    /// pass that follows it must not reap what the trip held. The tick-path
+    /// counterpart (`run_tick_with_clock` driving the same sequence) lives in
+    /// `ravel-server`'s `maintain` tests.
+    ///
+    /// Flip to watch it fail: change the reaper's condition in
+    /// `sweep_shard_zoned_with_holds` from
+    /// `orphan_pass == OrphanPass::Run && !orphan_breaker_tripped` back to
+    /// `!orphan_breaker_tripped` and the skipped pass reaps the copy the
+    /// tripped pass just held.
+    #[tokio::test]
+    async fn a_skipped_pass_after_a_tripped_breaker_keeps_the_held_copies() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 14;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+
+        // One object quarantined while the loss was still small.
+        put_orphan(&store, &tenant, signal, shard, 0).await;
+        let t1 = config.orphan_age_gate_ns() + 1;
+        let clock = FixedClock::new(t1);
+        let out = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("quarantine the single candidate");
+        assert_eq!(out.deleted, 1);
+
+        // A horizon later the copy is reapable and the loss has grown past the
+        // breaker's thresholds.
+        clock.set(t1 + config.quarantine_horizon_ns + 1);
+        for seq in 1..61u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+
+        let report = sweep_shard(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("the selecting pass reports the trip, it is not an error here");
+        assert!(report.orphan_breaker_tripped, "60 of 60 trips the breaker");
+        assert_eq!(report.quarantine_reaped, 0, "the trip holds the reaper");
+
+        let (skip_report, _holds) = sweep_shard_zoned_with_holds(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            signal,
+            shard,
+            &[],
+            OrphanPass::Skip,
+        )
+        .await
+        .expect("the next tick's skipped pass");
+        assert_eq!(
+            skip_report.quarantine_reaped, 0,
+            "the tick after a trip must not reap what the trip held"
+        );
+        assert_eq!(
+            keys_under(
+                &store,
+                &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+            )
+            .await
+            .len(),
+            1,
+            "the only recovery copy survives both passes"
         );
     }
 

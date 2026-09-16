@@ -233,11 +233,14 @@ window would still call a Hit.
   and the breaker-trip counter) are unaffected: a skipped pass adds zero,
   which is the truth about the events it performed. The L0 listing cost that
   used to be paid every 300 s is now paid once per full-sweep interval
-  instead. The
-  quarantine reaper (a different rule, over the separate `quarantine/`
-  prefix) is unaffected and still runs every tick, so objects already
-  quarantined keep aging out on schedule. The key layout of `l0/` and
-  `quarantine/` is unchanged.
+  instead. The quarantine reaper runs on that same cadence: it is a different
+  rule over the separate `quarantine/` prefix, but it runs only on a pass that
+  ran candidate selection, so the breaker's hold on it cannot be stepped
+  around by the next tick (see "A tripped breaker holds the reaper" below).
+  Objects already quarantined keep aging out, one full-sweep interval at a
+  time rather than one tick at a time, which moves the effective second
+  horizon later by at most one full-sweep interval and never earlier. The key
+  layout of `l0/` and `quarantine/` is unchanged.
 - The mass-orphan circuit breaker (ADR-0048 decision 4) trips when a
   pass's surviving candidate count is at least `orphan_breaker_min_count`
   (default 50) AND exceeds `orphan_breaker_max_ratio` (default 0.10) of
@@ -321,15 +324,22 @@ prefix and a separate reaper deletes it only after a second horizon:
   object whose embedded timestamp is more than `quarantine_horizon_ns`
   (default 7 days) behind the clock, deletes it. A key whose `/q<ns>`
   segment cannot be parsed is skipped, never deleted (fail-closed: an
-  unreadable age is treated as not-yet-expired). It runs on the same
-  maintain tick as the sweep, whole-shard like orphan GC itself (quarantine
-  keys are not hour-bucketed), and is stateless and idempotent.
+  unreadable age is treated as not-yet-expired). It runs on the same pass as
+  orphan GC's candidate selection, so on the full-sweep cadence
+  (`interior_reverify_ns`, default 6 h) rather than on every maintain tick,
+  whole-shard like orphan GC itself (quarantine keys are not hour-bucketed),
+  and is stateless and idempotent.
 - **A tripped breaker holds the reaper.** A pass whose mass-orphan breaker
   tripped reaps nothing, whatever the quarantine ages say. A loss that grows
   over time reaches the breaker's thresholds days after it started, so
   reaping on such a pass deletes the copies taken while it was still small.
-  The two horizons are therefore chained, not independent. A
-  `force_orphan_gc` override is not a trip and still reclaims.
+  The two horizons are therefore chained, not independent, and they are
+  chained because both run on the same pass: a pass that skipped candidate
+  selection never evaluated the breaker, so it reports not-tripped
+  structurally, and reaping there would delete on the next tick exactly what
+  the trip just held. Tying the reaper to candidate selection's cadence makes
+  the hold hold by construction, with no breaker state persisted between
+  passes. A `force_orphan_gc` override is not a trip and still reclaims.
 - **The event is visible in the logs, not yet on `/metrics`.** A pass counts
   objects quarantined (equal to the retained `orphans_deleted` count of
   candidates removed from the live set), refused, and reaped, and emits a
