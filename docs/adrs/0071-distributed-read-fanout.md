@@ -11,6 +11,11 @@ local tenant it belongs to and `Federation::fetch` selects remotes by the
 caller's tenant before dispatch, so the one-credential-per-process model
 described below is one credential per local tenant.
 
+Amended by ADR-1689: the dedicated fragment listener also serves Flight SQL
+slice `DoGet`, the SQL slice ticket is the capability under its own key file,
+`PROTOCOL_VERSION` moves to 5, and the `Combined` listener role is removed one
+release after the operator renders the dedicated listener.
+
 ## Context
 
 Ravel's compute is stateless and disposable over an S3 source of truth. A

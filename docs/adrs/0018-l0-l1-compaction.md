@@ -25,6 +25,9 @@ since re-encoding decouples output size from input size. The overlap-harmlessnes
 and non-atomic-swap reasoning below still holds; only the "page bytes copied
 verbatim" mechanism is superseded.
 
+Amended by ADR-0593: L2 is designed there as a direction and is not
+scheduled.
+
 ## Context
 
 Phase 1 never deletes or rewrites anything. Every flush leaves one L0

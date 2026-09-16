@@ -110,6 +110,10 @@ scrub read bandwidth is bounded at `corpus_bytes / (7 * 86400)` bytes/sec,
 a knob an operator sizes against their own corpus the same way `R` (the
 admission-reconciliation interval, ADR-0057) is an operator-facing knob.
 
+ADR-1686 amends how the cursor enumerates the corpus: the tick walks the
+commit shard prefix from a persisted start-after marker and stops at its
+budget, rather than rebuilding the corpus each tick.
+
 ### 2. Seal-divergence check: schedule `catalog verify`'s comparison logic
 
 Factor `ravel-cli catalog verify`'s comparison logic

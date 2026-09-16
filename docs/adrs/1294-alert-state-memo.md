@@ -26,6 +26,10 @@ per rule, yet reading it costs `2N` GETs over a history that never stops
 growing. A tenant with 10 rules and a year of flap history pays for the year on
 every tick to learn 10 current states.
 
+ADR-0117 replaces this premise: a rule holds up to 1000 live identities plus
+every retired series identity, which makes the #1438 pruning a precondition
+for rules over churning label sets.
+
 The object key layout (docs/catalog-and-mvcc.md) and the RLOG record format
 (ADR-0040, docs/log-segment-format.md) are frozen contracts. The alert history
 is also read by the `alerts` SQL table (ADR-1101), so it cannot be trimmed or
@@ -242,6 +246,9 @@ must keep these invariants:
 
 Issue #1438 is the tracked implementation of that pruning; this ADR only states
 the bound and freezes the contract the implementation must meet.
+
+ADR-1688 consumes this contract: the alert retention sweep keeps each
+identity's latest record and derives its keep set from the memo.
 
 ### Erasure
 

@@ -239,6 +239,11 @@ tenants; anything else folds into `tenant_hash="other"`. `shard` is not a
 label. Query text, metric names, label values, stream ids, trace ids, and
 object keys are never labels.
 
+**Amendment (ADR-1692).** `shard` is a permitted label for the per-shard
+ingest skew family only. Its payload is a `u32` bounded by
+`MAX_SHARD_COUNT`, it is never combined with `tenant_hash`, and its
+cardinality is set by `--shards`.
+
 **Amendment.** ADR-0051 section 6 added an
 eighth permitted label, `reason`, for the admission family's
 `ravel_admission_rejected_total`. That decision belongs to ADR-0051; this
@@ -301,7 +306,9 @@ today, so a slow query cannot be attributed to a phase.
 6. **Emit per-shard metrics.** Rejected: shard count times tenant count
    times operation count is unbounded in the dimension Ravel controls
    least. Shards are aggregated; per-shard detail belongs in a debug
-   endpoint, not in the scrape.
+   endpoint, not in the scrape. Narrowed by ADR-1692: a per-shard family
+   that carries no tenant and no operation dimension is permitted; the
+   shard times tenant times operation product stays rejected.
 
 ## Consequences
 

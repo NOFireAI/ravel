@@ -6,6 +6,8 @@ Deployment and operations tooling only: no change to any frozen contract
 (RSEG layout, proto schemas, series identity, commit tokens, object key
 layout) and no change to ingest or query semantics.
 
+Amended by ADR-1731 (operator listener, probes and supported topology).
+
 ## Context
 
 `services/ravel-server` is one binary with `--mode all|gateway|query|
