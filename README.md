@@ -24,9 +24,9 @@ Ravel process loses that data.
 Buffered acknowledgement is opt-in per request. It
 acknowledges after admission and enqueue to a shard actor, and it returns no
 commit token: it trades the guarantee above for write latency. A crash between
-that acknowledgement and the flush loses the buffered window, bounded by the
-maximum flush delay. A flush whose own store calls exceed their budget is
-abandoned instead, dropping already-acknowledged rows with no crash at all.
+that acknowledgement and the flush loses the buffered window. A flush whose own
+store calls exceed the flush lifetime budget is abandoned instead, dropping
+already-acknowledged rows with no crash at all.
 The [consistency model](docs/consistency-model.md) is normative for both
 modes.
 

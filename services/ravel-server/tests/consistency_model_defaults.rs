@@ -56,6 +56,10 @@ const INGEST_STALE_LOSS_SENTENCE: &str = "A crash between the ack and the next f
 const README_STALE_SHUTDOWN_SENTENCE: &str =
     "A clean shutdown drains the window, so the loss is specific to a crash.";
 
+/// The clause that bounded the buffered window by the flush delay, which only
+/// starts a flush and never ends one.
+const README_STALE_BOUND_CLAUSE: &str = "bounded by the maximum flush delay";
+
 /// `docs/consistency-model.md`, resolved from this crate's manifest directory
 /// rather than the process working directory, which differs between a
 /// crate-scoped `cargo test` and one run from the workspace root.
@@ -441,6 +445,12 @@ fn readme_does_not_claim_a_clean_shutdown_makes_buffered_loss_crash_only() {
         "README.md still states {README_STALE_SHUTDOWN_SENTENCE:?}. An \
          abandoned flush drops already-acked buffered rows without any crash, \
          so loss is not specific to one."
+    );
+    assert_eq!(
+        readme.matches(README_STALE_BOUND_CLAUSE).count(),
+        0,
+        "README.md still says the buffered window is {README_STALE_BOUND_CLAUSE:?}. \
+         The flush delay bounds when a flush is triggered, not when it completes."
     );
 }
 

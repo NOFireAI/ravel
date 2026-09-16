@@ -165,9 +165,10 @@ Every write has a mode. The default is strict:
   moment the permit is granted rather than from flush open, and it is not
   tunable from the server, so that case is a stuck backend and not a queue
   wait. A flush already past its flush-open deadline is abandoned without
-  taking a permit, and a flush queued behind a stalled co-resident prefix
-  reaches the store once the stall clears, so a co-resident stall is not a
-  buffered-mode loss. `ravel_ingest_abandoned_retry_exhausted_total` counts
+  taking a permit, and its rows are lost the same way. A flush queued behind
+  a stalled co-resident prefix reaches the store once the stall clears, so a
+  co-resident stall on its own is not a buffered-mode loss.
+  `ravel_ingest_abandoned_retry_exhausted_total` counts
   the flushes abandoned for store-call exhaustion and
   `ravel_ingest_abandoned_queue_deadline_total` those abandoned at the queue
   deadline ([docs/consistency-model.md](../consistency-model.md)).
