@@ -652,18 +652,25 @@ process that runs no maintenance loop configures nothing.
 Repeated `--tenant-token TOKEN=TENANT` flags configure tenants entirely. There is
 no tenant database and no admin API. To add, remove or rotate a token, restart
 with a different flag set. That is safe: every process is stateless, so a
-restart has no data migration to do. With no `--tenant-token` and no OIDC or
-mTLS resolver configured, every request to a tenant-protected route is
-rejected; the health and `/metrics` routes carry no tenant, and
-`--dev-insecure-tenant-header` on a loopback listener is the development
-exception.
+restart has no data migration to do. With no `--tenant-token`, no
+`--tenant-token-file`, and no OIDC or mTLS resolver configured, every request
+to a tenant-protected route is rejected; the health and `/metrics` routes
+carry no tenant, and `--dev-insecure-tenant-header` on a loopback listener is
+the development exception.
 
 `--tenant-token-file PATH` (env `RAVEL_TENANT_TOKEN_FILE` for the path only,
 never a token value) is a file-based alternative to repeating `--tenant-token`,
 so a token never has to sit in argv or a process listing: one `TOKEN=TENANT`
 pair per line, blank lines and `#` comments skipped, each line split on the
-first `=` the same way `--tenant-token` is. `--tenant-token` and
-`--tenant-token-file` are mutually exclusive; startup refuses if both are set.
+first `=` the same way `--tenant-token` is. A leading UTF-8 byte order mark is
+stripped before parsing. `--tenant-token` and `--tenant-token-file` are
+mutually exclusive; startup refuses if both are set. An empty or
+comment-only file parses to an empty map, the same as passing no
+`--tenant-token` at all: that authenticates nothing, and because it also
+leaves no `--maintain-tenant`-equivalent restriction, background fold,
+compaction and retention widen to every tenant storage discovers rather than
+refusing startup. A Secret mount that failed to populate produces exactly
+this, with no error at startup.
 
 Tenant identity affects only key prefixing and authorization. It carries no
 other per-tenant configuration.

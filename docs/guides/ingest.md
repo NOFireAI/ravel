@@ -121,8 +121,8 @@ ravel-server --tenant-token devtoken=acme --tenant-token other=other-co ...
 
 A request must send `Authorization: Bearer devtoken` to resolve as
 tenant `acme`. There is no default tenant and no anonymous access. A
-deployment is unauthenticated only if you never pass `--tenant-token`,
-which is a conscious choice, not an oversight.
+deployment is unauthenticated only if you pass no `--tenant-token` and no
+`--tenant-token-file`, which is a conscious choice, not an oversight.
 
 `--tenant-token-file PATH` (env `RAVEL_TENANT_TOKEN_FILE` for the path) is a
 file-based alternative so a token never has to sit in argv or a process
