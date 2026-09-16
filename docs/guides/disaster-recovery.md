@@ -335,6 +335,26 @@ reordered or lagged them. So there is **no automatic or live failover**, and no
 Ravel code path learns about a second bucket. Restore is a deliberate,
 verified operation.
 
+0. **Custody manifest.** Confirm, before touching anything else, that the
+   material later steps depend on survived the loss of the primary cluster
+   itself, because none of it is Ravel state and none of it replicates with
+   the bucket:
+   - The deployment key (`--tenant-hash-key-file`), which keys the tenant
+     hash scheme. A keyed-tenancy deployment that cannot supply the same key
+     back to the restored process will hash the same tenant differently and
+     can never rejoin its own existing data.
+   - The per-tenant KMS configuration (`--tenant-kms-config`), which maps
+     each tenant to its KMS key id for `KmsRoutingStore`. Without it, writes
+     for a tenant with a configured key silently fall back to the default
+     store's key instead of failing, so this must be confirmed present, not
+     assumed.
+   - The admin credential used to mint the fresh per-mode storage credentials
+     step 6 scopes to the restore bucket.
+   All three must be held somewhere that survives the primary cluster's
+   loss (a separate secrets manager, a cross-region vault, an offline copy)
+   and not only on the primary cluster itself; a custody plan that stores
+   them nowhere else is a single point of failure the rest of this runbook
+   cannot work around.
 1. **Freeze.** Stop every Ravel process writing to the lost or suspect primary
    (region loss usually does this for you). Nothing may write to the restore
    target until step 5.
