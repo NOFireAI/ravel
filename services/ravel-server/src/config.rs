@@ -352,6 +352,22 @@ pub struct Cli {
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 
+    /// File holding `TOKEN=TENANT` pairs for the static bearer map, one per
+    /// line, so a token never has to sit in argv or a process listing. Blank
+    /// lines and `#` comment lines are ignored; every other line is split on
+    /// the first `=`, exactly like `--tenant-token`, so a token containing
+    /// `=` is mis-parsed the same way in both sources (see the CRD docs
+    /// warning in `services/ravel-operator/src/crd.rs`). Mutually exclusive
+    /// with `--tenant-token`: `Cli::validate` refuses startup if both are set.
+    /// The env var carries only the path, never a token value, which is the
+    /// same exposure class as argv.
+    #[arg(
+        long = "tenant-token-file",
+        value_name = "PATH",
+        env = "RAVEL_TENANT_TOKEN_FILE"
+    )]
+    pub tenant_token_file: Option<PathBuf>,
+
     /// Repeatable tenant name this process runs background maintenance for
     /// (catalog fold, compaction, retention, the GC sweeper), in addition to
     /// every tenant named by `--tenant-token`. Required for a deployment that
@@ -3248,7 +3264,7 @@ impl Cli {
 
     pub fn parse_tenant_tokens(&self) -> anyhow::Result<HashMap<String, TenantId>> {
         let mut map = HashMap::new();
-        for pair in &self.tenant_tokens {
+        let insert_pair = |map: &mut HashMap<String, TenantId>, pair: &str| -> anyhow::Result<()> {
             let (token, tenant) = pair.split_once('=').ok_or_else(|| {
                 anyhow::anyhow!("invalid --tenant-token '{pair}', expected TOKEN=TENANT")
             })?;
@@ -3256,7 +3272,26 @@ impl Cli {
                 anyhow::bail!("invalid --tenant-token '{pair}', expected TOKEN=TENANT");
             }
             map.insert(token.to_string(), TenantId::new(tenant));
+            Ok(())
+        };
+
+        for pair in &self.tenant_tokens {
+            insert_pair(&mut map, pair)?;
         }
+
+        if let Some(path) = &self.tenant_token_file {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("failed to read --tenant-token-file {}: {e}", path.display())
+            })?;
+            for line in raw.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                insert_pair(&mut map, line)?;
+            }
+        }
+
         Ok(map)
     }
 
@@ -4229,6 +4264,16 @@ impl Cli {
     /// dev-header loopback rule this consolidates from `main`). Every case
     /// here refuses startup outright; none of them warn and continue.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Two sources for the same static bearer map: refuse both at once
+        // rather than silently picking one, mirroring the
+        // --distributed-query/--fragment-key-file pairing checks below.
+        if !self.tenant_tokens.is_empty() && self.tenant_token_file.is_some() {
+            anyhow::bail!(
+                "--tenant-token and --tenant-token-file are mutually exclusive: both populate \
+                 the same static bearer map. Drop --tenant-token, or drop --tenant-token-file."
+            );
+        }
+
         // No value of `--max-inflight-ingest-requests` is invalid (`0` is a
         // deliberate "unlimited", not a footgun), but it is still parsed here
         // so a malformed future extension of this flag fails startup rather
@@ -9998,5 +10043,99 @@ mod tests {
             merge_fold_tenants(&none, &from_maintain),
             vec![TenantId::new("acme").hash()]
         );
+    }
+
+    #[test]
+    fn tenant_token_file_matches_repeated_flags() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(file.path(), "dev=acme\nother=beta\nhas=equals=gamma\n")
+            .expect("write tenant token file");
+
+        let from_file = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect("file-sourced tenant tokens parse");
+
+        let from_flags = cli(&[
+            "--tenant-token",
+            "dev=acme",
+            "--tenant-token",
+            "other=beta",
+            "--tenant-token",
+            "has=equals=gamma",
+        ])
+        .parse_tenant_tokens()
+        .expect("flag-sourced tenant tokens parse");
+
+        assert_eq!(
+            from_file, from_flags,
+            "--tenant-token-file must produce the same map as the equivalent \
+             --tenant-token flags"
+        );
+        // The third row pins that the file path reuses the split_once loop:
+        // a value containing '=' is mis-parsed (only the first '=' splits)
+        // the same way for both sources.
+        assert_eq!(
+            from_file.get("has"),
+            Some(&TenantId::new("equals=gamma"))
+        );
+    }
+
+    #[test]
+    fn tenant_token_file_and_flag_together_refuse_startup() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(file.path(), "dev=acme\n").expect("write tenant token file");
+
+        let err = cli(&[
+            "--tenant-token",
+            "dev=acme",
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .validate()
+        .expect_err("--tenant-token and --tenant-token-file together must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--tenant-token") && msg.contains("--tenant-token-file"),
+            "the refusal must name both flags, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tenant_token_file_missing_path_fails_startup() {
+        let err = cli(&["--tenant-token-file", "/nonexistent/ravel-tenant-tokens.txt"])
+            .parse_tenant_tokens()
+            .expect_err(
+                "a missing --tenant-token-file path must be a typed error, not an empty map",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/nonexistent/ravel-tenant-tokens.txt"),
+            "the error must name the path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tenant_token_file_skips_blank_and_comment_lines() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(
+            file.path(),
+            "# comment\n\ndev=acme\n   \n# another comment\nother=beta\n",
+        )
+        .expect("write tenant token file");
+
+        let map = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect("blank lines and comments must be skipped, not parsed as pairs");
+
+        let mut expected = HashMap::new();
+        expected.insert("dev".to_string(), TenantId::new("acme"));
+        expected.insert("other".to_string(), TenantId::new("beta"));
+        assert_eq!(map, expected);
     }
 }
