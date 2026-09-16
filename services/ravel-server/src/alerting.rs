@@ -4483,10 +4483,10 @@ mod tick_tests {
     /// state the test above pins: it must count under its own outcome and leave
     /// the liveness gauge where the last completed tick left it, because the
     /// recommended operator alert keys on exactly this series. The fault is
-    /// `Transient`, which reaches `acquire_lease`'s catch-all `Err` arm; a
-    /// `FailedConditionalWrite` would surface as `AlreadyExists` and be
-    /// swallowed into the lease-not-held path instead. Both ticks fold into one
-    /// handle, as every tenant's evaluator does in a real process.
+    /// `Transient`, which reaches `acquire_lease`'s catch-all `Err` arm and is
+    /// the error class a stuck backend produces; the lease-not-held path needs
+    /// a live peer lease to read back, which this store never holds. Both ticks
+    /// fold into one handle, as every tenant's evaluator does in a real process.
     #[tokio::test]
     async fn a_lease_unavailable_tick_records_the_store_failure() {
         let metrics = Arc::new(AlertMetrics::default());
