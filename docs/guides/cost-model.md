@@ -34,6 +34,23 @@ engine itself chooses, and one flag moves it.
 PUTs/day = 2 x tenants x signals x shards x replicas x (86400 / age_threshold_s)
 ```
 
+`age_threshold_s` is decided per `(tenant, signal, shard)` buffer, per flush,
+by whichever of three bands applies:
+
+- **Idle clock**: `max_flush_delay_idle` (40s default). Applies when the
+  buffer has no strict-mode waiter and has not reached `min_flush_bytes`.
+- **Byte floor**: `max_flush_delay` (2s default). Applies once the buffer's
+  estimated flush size reaches `min_flush_bytes` (256KiB default), even with
+  no waiter.
+- **Waiter**: `max_flush_delay` (2s default). Applies whenever a strict-mode
+  export is waiting on this buffer's flush, regardless of buffered bytes.
+
+The byte floor and the waiter bands share the same fixed threshold by
+default; they diverge only when adaptive flush delay (off by default) widens
+the waiter band's threshold toward a per-tenant ceiling. A low-volume buffer
+that never reaches the byte floor or gets a waiter flushes on the idle clock;
+a busy or strict-mode buffer flushes on the faster of the other two.
+
 Every flush is a data-object PUT and a commit-record PUT (the two-object
 commit protocol, unchanged by anything in this guide). Buffers are scoped
 per `(tenant, signal, shard)` per ingest replica, so the PUT rate scales

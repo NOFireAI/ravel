@@ -1,8 +1,10 @@
 # Agents (MCP)
 
-> This page describes the surface as designed. The tools ship behind the
-> `mcp` cargo feature and the `--mcp` flag, both off by default. The
-> `POST /mcp` route does not exist until the feature ships.
+> The tools ship behind the `mcp` cargo feature and the `--mcp` flag, both
+> off by default. Build `ravel-server` with `--features mcp`, then run it
+> with `--mcp` (only supported under `--mode all` or `--mode query`) to
+> mount `POST /mcp` on the query router; `--mcp-allowed-origins` is required
+> once that listener is reachable from anywhere but localhost.
 
 ## What the MCP surface is for
 
