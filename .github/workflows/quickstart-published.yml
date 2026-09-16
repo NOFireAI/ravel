@@ -170,7 +170,7 @@ jobs:
       - name: Generate deterministic telemetry with telemetrygen
         run: |
           docker run --rm --network host \
-            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen@sha256:49322fa664f1568e24c3b44cf00d7a48e0066e8e8a018b171662b3692c7e2ef5 \
             metrics \
             --otlp-http \
             --otlp-endpoint 127.0.0.1:4318 \
@@ -193,7 +193,7 @@ jobs:
       - name: Generate deterministic logs with telemetrygen
         run: |
           docker run --rm --network host \
-            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen@sha256:49322fa664f1568e24c3b44cf00d7a48e0066e8e8a018b171662b3692c7e2ef5 \
             logs \
             --otlp-http \
             --otlp-endpoint 127.0.0.1:4318 \

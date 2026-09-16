@@ -206,7 +206,25 @@ d="$(new_tree docker-run-wrong-count)"
 mutate "${d}/.github/workflows/metricsbench-nightly.yml" \
   '/^          docker run --rm --network host --entrypoint sh \\$/,/^            quay\.io\/minio\/mc@sha256:/d'
 check "removing a docker run line fails the docker-run-image count assertion" \
-  "${d}" 1 "found 14 docker run/pull/create image references, expected exactly 15"
+  "${d}" 1 "found 16 docker run/pull/create image references, expected exactly 17"
+
+# A second invocation on the same logical line is scanned too. Chaining with
+# && is ordinary shell, and a scanner that stops at the first `docker` on the
+# line lets the second image through with the reference count unchanged, so
+# the count assertion cannot catch it either.
+d="$(new_tree docker-run-second-invocation-on-one-line)"
+mutate "${d}/.github/workflows/k8s-nightly.yml" \
+  's#^      - name: Install sccache#      - name: Chained docker invocations\n        run: docker pull alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000 \&\& docker run busybox:latest echo hi\n      - name: Install sccache#'
+check "docker_run_second_invocation_on_one_line_is_scanned" "${d}" 1 \
+  "busybox:latest"
+
+# A global flag between `docker` and its subcommand must not hide the
+# invocation.
+d="$(new_tree docker-run-global-flag-before-subcommand)"
+mutate "${d}/.github/workflows/k8s-nightly.yml" \
+  's#^      - name: Install sccache#      - name: Global flag before the subcommand\n        run: docker --context ci run nginx:latest\n      - name: Install sccache#'
+check "docker_run_global_flag_before_subcommand_is_scanned" "${d}" 1 \
+  "nginx:latest"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
