@@ -43,22 +43,24 @@
 #      (ravel-server, ravel-operator); pinning the k8s manifests is a
 #      separate ticket.
 #   5. every image argument of a `docker run`, `docker pull`, or
-#      `docker create` invocation inside a `run:` block, across
-#      .github/workflows/ci.yml, metricsbench-nightly.yml, k8s-nightly.yml,
-#      and publish-images.yml -- a backslash line continuation is joined
-#      before matching, since the image commonly sits on a line after the
-#      `docker run` token (ci.yml's MinIO and floci starts), and a line
+#      `docker create` invocation inside a `run:` block, across every
+#      workflow under .github/workflows and every composite action under
+#      .github/actions -- the same scope category 3 scans. Docker's
+#      management-command spellings (`docker image pull`, `docker container
+#      run`, `docker container create`) are matched too, as are global flags
+#      between `docker` and its subcommand. A backslash line continuation is
+#      joined before matching, since the image commonly sits on a line after
+#      the `docker run` token (ci.yml's MinIO and floci starts), and a line
 #      inside a here-doc body (publish-images.yml's release-notes template,
 #      which contains a literal `docker pull ...` example for humans, not an
-#      invocation this job runs) is skipped -- excluding `"$RAVEL_SERVER_IMAGE"`,
-#      `"$RAVEL_OPERATOR_IMAGE"`, and `"$ref"` by exact match: each is a shell
-#      variable holding an image this same workflow just built or resolved
-#      (a locally assembled tag being smoke-tested, or `$image@$digest` from
-#      a platform loop that already pins by digest one line above), not a
-#      third-party image reference this scan can check statically. Scoped to
-#      these four files: quickstart-published.yml carries two more unpinned
-#      `docker run` telemetrygen invocations, identical to ci.yml's; pinning
-#      that file is a separate ticket.
+#      invocation this job runs) is skipped. Every invocation on a logical
+#      line is scanned, not only the first. `"$RAVEL_SERVER_IMAGE"`,
+#      `"$RAVEL_OPERATOR_IMAGE"` and `"$ref"` are excluded by exact match:
+#      each is a shell variable holding an image this same workflow just
+#      built or resolved (a locally assembled tag being smoke-tested, or
+#      `$image@$digest` from a platform loop that already pins by digest one
+#      line above), not a third-party image reference this scan can check
+#      statically.
 #
 # Every category requires an `@sha256:<64 hex>` digest (categories 1, 2, 4,
 # and 5) or a full 40-character commit SHA (category 3): a tag alone, a
@@ -463,9 +465,10 @@ fi
 echo
 echo "== docker run/pull/create image pins (every workflow under .github/workflows) =="
 
-workflow_scan_count=$(ls "$REPO_ROOT"/.github/workflows/*.yml "$REPO_ROOT"/.github/workflows/*.yaml 2>/dev/null | wc -l | tr -d '[:space:]')
+workflow_scan_count=$(find "$REPO_ROOT/.github/workflows" "$REPO_ROOT/.github/actions" \
+  -type f \( -name '*.yml' -o -name '*.yaml' \) | wc -l | tr -d '[:space:]')
 if [ "$workflow_scan_count" -eq 0 ]; then
-  echo "FAIL: no workflow files found under .github/workflows"
+  echo "FAIL: no workflow or composite-action files found under .github"
   fail=1
 fi
 
@@ -548,7 +551,7 @@ if [ "$workflow_scan_count" -gt 0 ]; then
       # Global flags may sit between `docker` and the subcommand
       # (`docker --context ci run ...`), so allow a run of them.
       tail = logical
-      while (match(tail, /docker([ \t]+-[^ \t]+([ \t]+[^- \t][^ \t]*)?)*[ \t]+(run|pull|create)([ \t]|$)/)) {
+      while (match(tail, /docker([ \t]+-[^ \t]+([ \t]+[^- \t][^ \t]*)?)*([ \t]+(image|container))?[ \t]+(run|pull|create)([ \t]|$)/)) {
       rest = substr(tail, RSTART + RLENGTH)
       tail = rest
       sub(/^[ \t]+/, "", rest)
@@ -569,6 +572,12 @@ if [ "$workflow_scan_count" -gt 0 ]; then
           continue
         } else {
           image = tok
+          # A quoted literal is the same reference as an unquoted one, so
+          # strip the quotes before the digest check. A token holding a shell
+          # variable keeps them: the exemption list matches its exact text.
+          if (index(image, "$") == 0) {
+            gsub(/^["'"'"']|["'"'"']$/, "", image)
+          }
           break
         }
       }
@@ -577,8 +586,9 @@ if [ "$workflow_scan_count" -gt 0 ]; then
       }
       }
     }
-  ' "$REPO_ROOT"/.github/workflows/*.yml "$REPO_ROOT"/.github/workflows/*.yaml \
-    >"$RUN_IMAGE_REFS_FILE" 2>/dev/null
+  ' $(find "$REPO_ROOT/.github/workflows" "$REPO_ROOT/.github/actions" \
+        -type f \( -name '*.yml' -o -name '*.yaml' \) | sort) \
+    >"$RUN_IMAGE_REFS_FILE"
 fi
 
 run_image_count=$(wc -l <"$RUN_IMAGE_REFS_FILE" | tr -d '[:space:]')
