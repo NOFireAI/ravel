@@ -71,14 +71,16 @@ pub struct SpanWriteReceipt {
     pub tokens: Vec<CommitToken>,
 }
 
-/// A duplicate of [`crate::log_router`]'s private `LogShardHandle`: two
-/// fields, so duplicating is cheaper than making one module's struct
-/// `pub(crate)` across an unrelated boundary for one shared shape.
+/// The span pipeline's counterpart of [`crate::log_router`]'s private
+/// `LogShardHandle`: the same two-field shape over the span message type,
+/// and at two fields a separate struct is cheaper than sharing one across
+/// an unrelated boundary.
 struct SpanShardHandle {
     tx: mpsc::Sender<SpanShardMsg>,
     /// Set once the router first observes this shard's channel closed. The
     /// actor is never restarted, so this only flips false to true; it dedups
-    /// the `shard_deaths` counter to one increment per shard.
+    /// the `shard_deaths` and `shards_condemned` counters to one increment
+    /// per shard per generation.
     dead: AtomicBool,
 }
 
