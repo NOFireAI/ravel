@@ -174,6 +174,10 @@ settings that move as a set. Moving one alone does little: raising only
 raising only the delay while `min_flush_bytes` stays at 64 KiB flips buffers onto
 the fast tier at 6.8 s regardless.
 
+ADR-1737 adds an opt-in third tier below `min_flush_bytes`: a buffer under
+`idle_flush_byte_floor` waits `max_flush_lifetime`; the shipped default of 0
+leaves this tier off.
+
 `docs/consistency-model.md:33-34` states a p99 visibility target under one second
 in strict mode. That target is amended to a **configurable visibility budget**
 with a default of **2 s** in strict mode, chosen to sit well clear of the 5-10 s

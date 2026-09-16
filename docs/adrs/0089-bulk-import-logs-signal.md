@@ -2,6 +2,10 @@
 
 Status: Accepted
 
+Amended by ADR-1713 (a resumable load marker replaces the no-deduplication
+rerun below) and by ADR-1751, which widens this ADR from the logs signal to
+metrics and spans and adds the inverse export.
+
 ## Context
 
 The only way to write log records into Ravel is OTLP: `crates/ravel-otlp`
@@ -181,3 +185,4 @@ flowchart TB
   is a genuine partial load, not a rollback, and re-running the loader
   re-ingests the whole file with no deduplication; the CLI's output and
   the docs must say so plainly so an operator doesn't assume otherwise.
+  ADR-1713 replaces this with a resumable load marker.

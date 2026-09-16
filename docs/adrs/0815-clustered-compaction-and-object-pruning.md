@@ -5,6 +5,9 @@ Status: Proposed.
 The number is issue #815's, the ticket that produced this ADR, per the
 README's issue-number rule.
 
+ADR-0593 adopts decision 7's cross-hour record mechanism as the L2 design
+direction.
+
 ## Context
 
 On the ClickBench reference tenant `clickbench-v4` (8,424 objects, 17,731

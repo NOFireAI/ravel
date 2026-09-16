@@ -159,6 +159,10 @@ unit of: the hold refresh is small (a control-plane shard LIST plus GETs) and
 duplicating it at most `min(replicas, signals x shards)` times per tenant is
 cheaper and simpler than a hold-snapshot handoff protocol.
 
+ADR-1693 adds the ADR-0020 catalog fold to this list, per `(tenant, signal)`
+and owned by the owner of shard 0 of that pair, so the fold and the
+catalog-object sweep for a pair run in the same process.
+
 **Why correctness survives overlap.** During a membership transition (at most
 `3 * H` plus one heartbeat), two workers may both believe they own a unit.
 Every operation they can both run is already concurrency-safe by prior

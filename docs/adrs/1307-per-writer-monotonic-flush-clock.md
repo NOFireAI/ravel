@@ -65,6 +65,10 @@ plausibility-checked, then raised to that floor, in these steps:
      `record_flush` is deferred until after the stamp is decided, so a refused
      flush is not counted as a flush that happened.
 
+ADR-1685 adds a lag bound at this same flush-open site: after step 2 and
+before step 3, a raw reading more than `clock_skew_allowance` behind the
+store-observed time is refused with `FlushClockError::LagRefused`.
+
 `MAX_FLUSH_CLOCK_HOLD_NS` is the catalog clock-skew allowance alone, derived
 from `ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS` (5 min) rather than a
 literal. That allowance is the only term that governs the *future* end of the

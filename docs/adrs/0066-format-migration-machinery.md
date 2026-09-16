@@ -93,6 +93,8 @@ repeated FormatFloor format_floors = 7;  // CAS append, like generations
 
 A recorded floor F for family X asserts that no live object of family X below version F exists for this (tenant, signal). Floors are raised only by the verification step of the migration job (Decision 5) after an audit-versions enumeration over current commit and compaction records comes back clean at >= F, and never lower. The load-bearing consumer is release engineering: deleting version V's read support is legal only when every bucket's floor exceeds V — a checkable fact, where today there is only ADR-0027's wipe-and-hope. This is deliberately the ADR-0052 shape: version facts live in the per-(tenant, signal) durable record, appended under CAS, never rewritten.
 
+ADR-1746 amends this decision: a floor also records the basis of the audit that raised it, a stored floor counts as evidence only when re-classified `Current` against current records, and a writer below a floor warns at startup and refuses in the write path.
+
 ### 4. Convergence, by migration class
 
 **Class A — bulk data objects (RSEG, RLOG, RSPAN).** Large, immutable, never rewritten in place. Three convergence forces, in preference order:
@@ -100,6 +102,8 @@ A recorded floor F for family X asserts that no live object of family X below ve
 1. Retention: old-version objects age out with their hour buckets at zero marginal cost. Deployments whose retention window is shorter than their release cadence converge on this alone.
 2. Rewrite-on-touch: compaction outputs are always current-version, so L0 converges through the normal maintenance loop once the N-1 reader exists. Additionally, maintenance treats "live L1 part with `segment_format_version` < current" as compaction-eligible at low priority under the existing maintenance cost budget, so compacted data converges opportunistically too. Caveat honored from Context: this carries trailer/section-layer bumps through the existing verbatim-copy pipeline; a page-grammar bump routes through the re-encode primitive of Decision 5 instead.
 3. The operator-triggered migration job (Decision 5) for the tail neither force reaches fast enough, and for verify-and-raise-floor.
+
+ADR-1331 narrows rewrite-on-touch to compaction parts: a rewrite record's below-target parts are reported as a blocked bucket with a reason and are not migrated.
 
 **Class B — derived catalog objects (.csnap, .npost, HEAD).** Rebuildable from commit records by construction; the fold rewrites them continuously. A version bump needs no migration tool: the upgraded fold emits the new version, supersession GCs the old parts, and dual-read is needed only across the rolling-upgrade window. Multi-part fold (ADR-0063) is exactly such a bump and is this rule's first consumer.
 

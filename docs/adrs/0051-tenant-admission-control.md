@@ -322,7 +322,9 @@ deliberate flag, not a new auth subsystem.
   buffered-mode trickle tenants' PUT floor drops ~20x. A strict-mode
   trickle tenant still pays the floor — that is the price of its ack
   latency, and the per-tenant `max_flush_delay` override is the operator
-  lever for tenants that prefer cost over latency.
+  lever for tenants that prefer cost over latency. ADR-1737 adds an opt-in
+  third tier below `min_flush_bytes`: a buffer under `idle_flush_byte_floor`
+  waits `max_flush_lifetime`; the shipped default of 0 leaves this tier off.
 - **Incremental `max_series`:** the query engine enforces
   `max_series` during `by_id` construction, aborting the loop at the
   bound, so peak memory is bounded by the cap rather than by the match.

@@ -2,6 +2,11 @@
 
 Status: Accepted
 
+Amended by ADR-1727: the startup probes answer affirmatively on
+S3-compatible backends, the fatal set grows to the contract's required
+conditions, and two gauges (`conditions_failed`, `conditions_unknown`) join
+`ravel_bucket_protection_unknown`.
+
 ## Context
 
 ADR-0055 scoped storage credentials per role (Gateway / Query / Maintain /

@@ -2,6 +2,10 @@
 
 Status: Accepted
 
+Amended by ADR-1727: bucket configuration is read through a sibling
+`BucketControlPlane` trait on `S3Store` over read-only SigV4 GETs; the
+rejection of a write side channel stands.
+
 ## Context
 
 A codebase survey found Ravel already has more of this than expected,

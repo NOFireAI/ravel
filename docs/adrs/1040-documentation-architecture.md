@@ -222,6 +222,9 @@ standard library, matching the checkers already in `scripts/`. It checks:
     workspace, and the matrix states whether the published image builds
     it. This is the check that would have caught the Flight SQL row.
 
+ADR-1658 adds a claims rule, run by `scripts/check-doc-claims.py` beside
+this gate.
+
 The two generated flag tables under `docs/reference/` are held to every
 rule except the citation half of rule 3 and rule 5. Their prose is the
 clap help text, so satisfying those two rules would mean rewording doc
