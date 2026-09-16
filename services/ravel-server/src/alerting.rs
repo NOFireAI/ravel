@@ -4503,9 +4503,9 @@ mod tick_tests {
             "the first tick holds the lease on a healthy store"
         );
 
-        // Scoped to the lease key, so the state memo (`t/<hex>/a/state/latest`)
-        // and every commit-record put still succeed and only the lease write
-        // fails.
+        // Scoped to the lease key. On this tick the lease create is the only
+        // put that runs (the memo and rule writes sit behind the held lease),
+        // so the scoping documents intent rather than changing the outcome.
         let plan = FaultPlan::empty().with_rule(
             FaultRule::new(
                 Op::Put,
