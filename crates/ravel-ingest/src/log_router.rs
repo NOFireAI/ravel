@@ -65,14 +65,16 @@ pub struct LogWriteReceipt {
     pub tokens: Vec<CommitToken>,
 }
 
-/// A duplicate of [`crate::router`]'s private `ShardHandle`: two fields, so
-/// duplicating is cheaper than making the metrics module's struct
-/// `pub(crate)` across an unrelated boundary for one shared shape.
+/// The log pipeline's counterpart of [`crate::router`]'s private
+/// `ShardHandle`. Its fields differ (a channel and a death flag instead of a
+/// mutex and a flush floor), and at two fields a separate struct is cheaper
+/// than sharing one across an unrelated boundary.
 struct LogShardHandle {
     tx: mpsc::Sender<LogShardMsg>,
     /// Set once the router first observes this shard's channel closed. The
     /// actor is never restarted, so this only flips false to true; it dedups
-    /// the `shard_deaths` counter to one increment per shard.
+    /// the `shard_deaths` and `shards_condemned` counters to one increment
+    /// per shard per generation.
     dead: AtomicBool,
 }
 

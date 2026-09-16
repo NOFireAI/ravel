@@ -280,8 +280,10 @@ double-count it, and:
 Surviving shards keep working throughout.
 
 Operationally (see docs/guides/operations/troubleshooting.md,
-"Readiness, storage and authentication"): `shard_deaths` counts every death including respawned
-incarnations, so it can exceed `shard_count`; a low steady rate is
+"Readiness, storage and authentication"): on this pipeline `shard_deaths`
+counts every death including respawned incarnations, so it can exceed
+`shard_count` (the log and span pipelines never respawn and count once
+per shard per live generation, see their sections below); a low steady rate is
 transient recovery, a sustained climb on one shard is a poison-pill
 input. `shards_condemned` counts each condemned shard at most once per live
 generation, so under resharding it is bounded by `live_generations *
