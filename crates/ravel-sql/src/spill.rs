@@ -352,7 +352,8 @@ mod tests {
         assert!(root.path().is_dir(), "the configured root must survive");
     }
 
-    /// The scratch subdirectory is owner-only, whatever the ambient umask is.
+    /// The scratch subdirectory is owner-only under every usual umask (a
+    /// umask can only narrow the mode the builder asks for).
     /// DataFusion's disk manager writes the spill files inside it, so this
     /// mode is what keeps another local user from reading one query's spilled
     /// rows. The bits asserted here are the ones `create_scratch_dir` sets
