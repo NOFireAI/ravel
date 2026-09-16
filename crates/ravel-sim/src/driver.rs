@@ -348,8 +348,6 @@ pub struct CycleOutcome {
     /// with the delete rule absent; a suppressed delete would show up here as a
     /// shortfall. To read the faulted pass in isolation, use
     /// [`Self::faulted_pass_superseded_records_deleted`].
-    ///
-    /// [`FaultSchedule::sweep_plan`]: crate::fault_plan::FaultSchedule::sweep_plan
     pub sweep_superseded_records_deleted: usize,
     /// Same as [`Self::sweep_superseded_records_deleted`], for
     /// [`SweepReport::superseded_data_deleted`] -- the superseded L0 data

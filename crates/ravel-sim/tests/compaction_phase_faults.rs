@@ -136,10 +136,12 @@ fn each_compaction_fault_kind_recovers() {
         // its OWN superseded-delete counts are positive and exact.
         // `compacting_config` fixes the workload shape (2 tenants x 8 series x 6
         // samples across 2 shards) independently of the seed, so compaction
-        // supersedes the same L0 inputs every run. The faulted pass
-        // (tenant-000/shard 0) covers the series that route to that shard: rule
-        // 2 deletes 6 superseded commit records and their 6 data objects, and
-        // no unreferenced `/l1` part (this workload's compaction leaves none).
+        // supersedes the same L0 inputs every run. The 6 comes from the flush
+        // shape, not the series count: strict-mode ingest flushes once per
+        // sample-index batch per shard, so each (tenant, shard) publishes 6 L0
+        // commit records with 6 data objects, and rule 2 deletes all of them in
+        // the faulted pass (tenant-000/shard 0), with no unreferenced `/l1`
+        // part (this workload's compaction leaves none).
         // On the first round's placement (delete keyed on `/l0/`, firing after
         // every commit record of the pass was already gone) this pass reported
         // 0/0 and the keyspace converged through orphan GC instead; these exact
