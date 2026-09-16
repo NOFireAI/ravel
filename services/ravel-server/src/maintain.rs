@@ -2729,6 +2729,153 @@ mod tests {
         assert!(memo.is_empty());
     }
 
+    /// Wraps a store and counts real `list()` calls whose prefix is exactly a
+    /// shard's `l0/` data prefix (issue #1734).
+    ///
+    /// `FaultStore`'s own counters only track calls a scripted fault actually
+    /// fired on, and even a passthrough `Sequence` step's `key_contains` is a
+    /// substring match that cannot separate this prefix from the quarantine
+    /// reaper's, which is this exact string with `quarantine/` prepended (so
+    /// any pattern matching one matches the other too). An exact-string
+    /// comparison against a precomputed prefix sidesteps both limits.
+    struct L0ListCounter<S> {
+        inner: S,
+        l0_prefix: String,
+        l0_list_calls: AtomicU64,
+    }
+
+    impl<S> L0ListCounter<S> {
+        fn new(inner: S, l0_prefix: String) -> Self {
+            L0ListCounter {
+                inner,
+                l0_prefix,
+                l0_list_calls: AtomicU64::new(0),
+            }
+        }
+
+        fn l0_list_calls(&self) -> u64 {
+            self.l0_list_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for L0ListCounter<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            if prefix == self.l0_prefix {
+                self.l0_list_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// THE deliverable-1 acceptance test (issue #1734): ten maintain ticks
+    /// over a clock that never advances must together issue exactly one
+    /// LIST of the shard's `l0/` data prefix, not ten.
+    ///
+    /// A cold `MaintainMemo` makes tick 1 the due full sweep
+    /// (`sweep_shard`, unconditional rule 1) and records it; since the clock
+    /// never advances, `full_sweep_due` reads `now - last_ns == 0` on every
+    /// later tick, so ticks 2 through 10 all take the zoned,
+    /// `OrphanPass::Skip` branch in `run_tick_with_clock` instead. Before the
+    /// orphan-cadence split, that zoned branch ran rule 1's candidate
+    /// selection unconditionally, so the same ten-tick drive listed the
+    /// prefix once per tick: flipping the zoned call site's `OrphanPass::Skip`
+    /// back to `OrphanPass::Run` reproduces that regression (10 calls, not
+    /// 1).
+    #[tokio::test]
+    async fn ten_ticks_drain_the_l0_prefix_once_after_the_orphan_cadence_split() {
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let l0_prefix = format!(
+            "t/{}/{}/l0/{:04}/",
+            tenant.to_hex(),
+            Signal::Metrics.key_prefix(),
+            0u32
+        );
+        let store = L0ListCounter::new(MemoryStore::new(), l0_prefix);
+
+        let clock = ravel_maintain::FixedClock::new(1_000);
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        for _ in 0..10 {
+            run_tick_with_clock(
+                &clock,
+                &store,
+                &tenant,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &safety,
+                &ownership,
+                &worker,
+                &worker.solo_live_set(),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            store.l0_list_calls(),
+            1,
+            "10 ticks over a clock that never advances past the full-sweep \
+             cadence must list the l0 data prefix exactly once: tick 1's \
+             cold-memo full sweep, and none of ticks 2 through 10's \
+             OrphanPass::Skip zoned passes"
+        );
+    }
+
     /// THE deliverable-3 acceptance test (ADR-0066 decision 6): retention keeps
     /// running for a tenant whose token was removed from `sys/auth`. This closes
     /// the named bug -- removing a token to "deprovision" a tenant must not

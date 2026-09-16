@@ -3081,7 +3081,8 @@ mod tests {
     use ravel_ingest::{IdempotencyReceipt, LookupOutcome, marker_key, read_marker, write_marker};
     use ravel_object_store::PutOptions;
     use ravel_object_store::fault::{
-        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
+        SequenceStep,
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_proto::catalog::v1::{
@@ -3290,6 +3291,108 @@ mod tests {
                 "batched: only two commit-prefix LISTs per pass, regardless of candidate count"
             );
         }
+    }
+
+    /// Issue #1734's acceptance claim at the `SweepReport` level: an
+    /// `OrphanPass::Skip` pass reports fresh zeros for every rule-1 figure,
+    /// never a value carried over from a prior `Run` pass, while a `Run` pass
+    /// over the same live candidates reports exactly the seeded count.
+    ///
+    /// The `FaultStore` sequence proves *which* passes actually issued the
+    /// `l0/` data prefix LIST, rather than trusting the returned counts alone:
+    /// registered with `Op::List` and `key_contains("/l0/")`, it also matches
+    /// the quarantine reaper's LIST (`quarantine/` + the `l0/` prefix is a
+    /// superstring of it, so no substring pattern can separate the two), so
+    /// each pass's progress is candidate-selection-lists-or-not plus exactly
+    /// one reaper LIST: 2 on the `Run` pass below, then a delta of only 1 (the
+    /// reaper alone, no candidate-selection LIST at all) on the `Skip` pass.
+    #[tokio::test]
+    async fn skip_pass_reports_zero_orphan_figures_while_run_pass_reports_the_seeded_count() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 9;
+        const SEEDED_ORPHANS: u64 = 3;
+
+        let mem = MemoryStore::new();
+        for seq in 0..SEEDED_ORPHANS {
+            put_orphan(&mem, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::List)
+                .with_key_contains("/l0/")
+                .with_steps(vec![SequenceStep::Passthrough; 8]),
+        );
+        let store = FaultStore::new(mem, plan);
+
+        let (run_report, _holds) = sweep_shard_zoned_with_holds(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            signal,
+            shard,
+            &[],
+            OrphanPass::Run,
+        )
+        .await
+        .expect("run pass");
+        assert_eq!(run_report.orphans_deleted, SEEDED_ORPHANS as usize);
+        assert_eq!(run_report.orphans_quarantined, SEEDED_ORPHANS as usize);
+        assert_eq!(run_report.orphans_quarantine_refused, 0);
+        assert!(!run_report.orphan_breaker_tripped);
+        assert_eq!(run_report.orphans_withheld, 0);
+        assert!(!run_report.orphan_breaker_overridden);
+        let progress_after_run = store.sequence_progress(0);
+        assert_eq!(
+            progress_after_run, 2,
+            "Run pass lists the l0 data prefix for candidate selection, plus the \
+             quarantine reaper's l0-embedding prefix, once each"
+        );
+
+        // Re-seed the same identities so the Skip pass below has live
+        // candidates it must not touch: this is what makes the zero figures
+        // asserted next mean "did not run", not "nothing there to find".
+        for seq in 0..SEEDED_ORPHANS {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let (skip_report, _holds) = sweep_shard_zoned_with_holds(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            signal,
+            shard,
+            &[],
+            OrphanPass::Skip,
+        )
+        .await
+        .expect("skip pass");
+        assert_eq!(skip_report.orphans_deleted, 0);
+        assert_eq!(skip_report.orphans_quarantined, 0);
+        assert_eq!(skip_report.orphans_quarantine_refused, 0);
+        assert!(!skip_report.orphan_breaker_tripped);
+        assert_eq!(skip_report.orphans_withheld, 0);
+        assert!(!skip_report.orphan_breaker_overridden);
+        let progress_after_skip = store.sequence_progress(0);
+        assert_eq!(
+            progress_after_skip - progress_after_run,
+            1,
+            "Skip pass issues only the quarantine reaper's LIST; zero l0 data \
+             prefix LISTs for candidate selection"
+        );
+
+        let remaining = list_all(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            SEEDED_ORPHANS as usize,
+            "the Skip pass left every live candidate untouched"
+        );
     }
 
     // --- Quarantine (ADR-0058 amendment, issue #528) -----------------------
