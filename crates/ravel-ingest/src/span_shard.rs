@@ -1850,7 +1850,7 @@ mod tests {
         let store: Arc<dyn ObjectStoreBackend> =
             Arc::new(FaultStore::new(MemoryStore::new(), plan));
         let clock = TestClock::new(BASE_NS);
-        let metrics = Arc::new(SpanIngestMetrics::default());
+        let metrics = Arc::new(SpanIngestMetrics::new(1));
         let (tx, rx) = mpsc::channel(64);
         let actor = SpanShardActor::new(
             0,
@@ -2037,6 +2037,15 @@ mod tests {
             snapshot.flush_permit_wait_ns_total, 5_000,
             "B's recorded wait must equal exactly the clock advance while it queued for the permit"
         );
+        let by_shard = h.metrics.shard_skew_by_shard();
+        let shard0 = by_shard
+            .iter()
+            .find(|(shard, _)| *shard == 0)
+            .expect("shard 0 flushed both A and B");
+        assert_eq!(
+            shard0.1.flush_permit_wait_ns, 5_000,
+            "the wait must be recorded against the shard that actually flushed, not a constant"
+        );
 
         h.shutdown().await;
     }
@@ -2054,7 +2063,7 @@ mod inflight_guard_tests {
     /// this asserts on the raw signed count.
     #[test]
     fn a_flush_task_dropped_before_its_first_poll_leaves_the_gauge_balanced() {
-        let metrics = Arc::new(SpanIngestMetrics::default());
+        let metrics = Arc::new(SpanIngestMetrics::new(1));
         assert_eq!(metrics.in_flight_flushes_signed(0), 0);
 
         let guard = InFlightFlushGuard::new(Arc::clone(&metrics), 0);

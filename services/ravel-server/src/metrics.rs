@@ -6143,17 +6143,17 @@ mod tests {
                 flushes_by_age_adaptive: 7,
                 grace_extended_stale_flushes: 3,
                 in_flight_flushes_total: 2,
-                flush_permit_wait_ns_total: 11_000_000_000,
+                flush_permit_wait_ns_total: 11_500_000_000,
                 ..Default::default()
             }),
             IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
                 in_flight_flushes_total: 3,
-                flush_permit_wait_ns_total: 4_000_000_000,
+                flush_permit_wait_ns_total: 4_250_000_000,
                 ..Default::default()
             }),
             IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot {
                 in_flight_flushes_total: 5,
-                flush_permit_wait_ns_total: 6_000_000_000,
+                flush_permit_wait_ns_total: 6_750_000_000,
                 ..Default::default()
             }),
         ];
@@ -6215,24 +6215,29 @@ mod tests {
              pipeline's:\n{body}"
         );
         assert!(
-            body.contains(
-                "ravel_ingest_flush_permit_wait_seconds_total{mode=\"gateway\",signal=\"metrics\"} 11"
-            ),
-            "conversion must carry the metrics pipeline's permit-wait total in seconds:\n{body}"
+            body.contains("# TYPE ravel_ingest_flush_permit_wait_seconds_total counter\n"),
+            "permit-wait family must declare its TYPE as a counter:\n{body}"
         );
         assert!(
             body.contains(
-                "ravel_ingest_flush_permit_wait_seconds_total{mode=\"gateway\",signal=\"logs\"} 4"
+                "ravel_ingest_flush_permit_wait_seconds_total{mode=\"gateway\",signal=\"metrics\"} 11.5\n"
+            ),
+            "conversion must carry the metrics pipeline's permit-wait total in seconds, not a \
+             wrong divisor:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_flush_permit_wait_seconds_total{mode=\"gateway\",signal=\"logs\"} 4.25\n"
             ),
             "conversion must carry the log pipeline's own permit-wait total, not another \
-             pipeline's:\n{body}"
+             pipeline's or a wrong divisor:\n{body}"
         );
         assert!(
             body.contains(
-                "ravel_ingest_flush_permit_wait_seconds_total{mode=\"gateway\",signal=\"spans\"} 6"
+                "ravel_ingest_flush_permit_wait_seconds_total{mode=\"gateway\",signal=\"spans\"} 6.75\n"
             ),
             "conversion must carry the span pipeline's own permit-wait total, not another \
-             pipeline's:\n{body}"
+             pipeline's or a wrong divisor:\n{body}"
         );
     }
 
@@ -6251,6 +6256,7 @@ mod tests {
         let ingest = vec![IngestPipelineSnapshot::from_log_metrics(
             LogIngestMetricsSnapshot {
                 in_flight_flushes_total: 4,
+                flush_permit_wait_ns_total: 2_500_000_000,
                 ..Default::default()
             },
         )];
@@ -6292,6 +6298,16 @@ mod tests {
         assert!(
             body.contains("ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"logs\"} 4"),
             "a logs-only process must render its own in-flight gauge sample:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_ingest_flush_permit_wait_seconds_total counter\n"),
+            "a logs-only process must still declare the permit-wait family's TYPE:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_flush_permit_wait_seconds_total{mode=\"gateway\",signal=\"logs\"} 2.5\n"
+            ),
+            "a logs-only process must render its own permit-wait sample:\n{body}"
         );
     }
 

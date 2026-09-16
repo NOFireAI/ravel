@@ -170,9 +170,12 @@ metrics-pipeline feature, so that sample is structurally absent for logs and
 spans, not zero. `ravel_ingest_in_flight_flushes`,
 `ravel_ingest_flush_permit_wait_seconds_total`, and
 `ravel_ingest_grace_extended_stale_flushes_total` are carried for every
-signal: the `max_inflight_flushes` permit acquire runs off-actor for all three
-ingest pipelines, so a logs- or spans-only process still renders a real
-(possibly zero) sample for both.
+signal, each for its own reason: the in-flight gauge because all three shard
+actors arm an `InFlightFlushGuard`; the permit-wait counter because the
+`max_inflight_flushes` acquire runs off-actor for all three ingest pipelines;
+the grace-extended counter because all three snapshots already expose the
+stale-provisioning counter it pairs with. A logs- or spans-only process
+therefore still renders a real (possibly zero) sample for all three.
 
 #### Per-tenant PUT attribution (`ravel_ingest_attribution_puts_total`)
 

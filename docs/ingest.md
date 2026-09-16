@@ -1196,13 +1196,21 @@ either pipeline. This matters because `ravel-cli load` drives the logs pipeline
 and not the metrics one: while the accounting existed only on the metrics side,
 every skew figure for the bulk-load path read as absent, and ADR-0807's audit of
 that path had to reason from the code instead of from a measurement. The span
-path (`span_router.rs`, `span_shard.rs`) is still uncovered.
+path (`span_router.rs`, `span_shard.rs`) now records one of the three spans:
+`flush_permit_wait_ns`, at the same off-actor acquire site as the metrics and
+log pipelines (`span_shard.rs` around line 1143). `messages_enqueued`,
+`messages_processed`, `queue_depth`, `on_actor_ns`, and `off_actor_ns` are
+still uncovered there.
 
-It is not part of the flat
-`IngestMetricsSnapshot`, whose `Copy` shape holds no per-shard dimension, so the
-process `/metrics` surface renders it no more than it renders per-shard
-in-flight flushes today; wiring either into an operator scrape is a follow-up in
-`services/ravel-server`. Per shard (`ShardSkewStats`):
+The per-shard dimension is not part of the flat `IngestMetricsSnapshot` or its
+log and span counterparts, whose `Copy` shape holds no per-shard field. The
+flat totals `in_flight_flushes_total` and `flush_permit_wait_ns_total` are on
+every snapshot, and the process `/metrics` surface renders
+`ravel_ingest_in_flight_flushes` and
+`ravel_ingest_flush_permit_wait_seconds_total` for every signal
+(`services/ravel-server/src/metrics.rs`); the per-shard breakdown stays
+internal, read only through `shard_skew_by_shard()`. Per shard
+(`ShardSkewStats`):
 
 - `messages_enqueued`: `Write` messages the router sent into the shard's
   channel, counted at the router's `send`.
