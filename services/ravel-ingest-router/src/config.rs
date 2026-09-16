@@ -688,6 +688,15 @@ mod tests {
         .into_config()
         .expect_err("--tenant-token under a header source must fail");
         assert!(err.to_string().contains("--tenant-token"));
+
+        let err = cli(&[
+            "--key-source",
+            "authorization-header",
+            "--dev-insecure-tenant-header",
+        ])
+        .into_config()
+        .expect_err("--dev-insecure-tenant-header under a header source must fail");
+        assert!(err.to_string().contains("--dev-insecure-tenant-header"));
     }
 
     #[test]
