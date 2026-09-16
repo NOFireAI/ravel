@@ -127,6 +127,17 @@ pub struct LogIngestMetrics {
     /// Counted once per shard on the first observation, so it never exceeds
     /// `shard_count` and makes a permanently degraded process observable.
     shard_deaths: AtomicU64,
+    /// Shards condemned and no longer serving (issue #1691). Unlike the metrics
+    /// pipeline, the log router does not respawn a dead shard actor, so a shard
+    /// is condemned on its FIRST death rather than after a respawn budget is
+    /// exhausted: the two counters move together here, one per shard. Nonzero
+    /// means at least one shard is permanently down in this process and its
+    /// streams keep failing until the process is replaced, which nothing does
+    /// automatically. It makes the router report itself not-ready
+    /// ([`crate::LogIngestRouter::ready`]), which sheds traffic from this
+    /// replica (Kubernetes drops the pod from its Service endpoints) but does
+    /// not restart or reschedule it. This is the counter to alert on.
+    shards_condemned: AtomicU64,
     /// Flushes failed closed on a stale provisioning view (ADR-0052 section 3),
     /// the log-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.
     stale_provisioning_flushes: AtomicU64,
@@ -270,6 +281,11 @@ pub struct LogIngestMetricsSnapshot {
     /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
     pub partial_writes: u64,
     pub shard_deaths: u64,
+    /// Shards condemned after a permanent death (issue #1691). The log router
+    /// never respawns, so this equals `shard_deaths` for distinct shards.
+    /// Nonzero drives `/readyz` to 503. Exported as
+    /// `ravel_ingest_shards_condemned_total`.
+    pub shards_condemned: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
     pub indexed_fields_stale_fallbacks: u64,
@@ -514,6 +530,19 @@ impl LogIngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One shard condemned (issue #1691). The log router does not respawn, so a
+    /// shard is condemned on its first death; called once per shard beside
+    /// [`Self::record_shard_death`], with the same per-shard dedup.
+    pub(crate) fn record_shard_condemned(&self) {
+        self.shards_condemned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Shards condemned so far in this process (issue #1691). A direct atomic
+    /// load, the value [`crate::LogIngestRouter::ready`] tests against zero.
+    pub fn condemned_shards(&self) -> u64 {
+        self.shards_condemned.load(Ordering::Relaxed)
+    }
+
     /// Adjusts shard `shard`'s in-flight-flush gauge by `delta`. Both deltas
     /// belong to `log_shard`'s `InFlightFlushGuard`: +1 in its constructor, -1
     /// in its `Drop`, including on panic. Nothing else may call this, or the
@@ -631,6 +660,7 @@ impl LogIngestMetrics {
             flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
+            shards_condemned: self.shards_condemned.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
             indexed_fields_stale_fallbacks: self
@@ -776,6 +806,13 @@ mod tests {
             LogIngestMetrics::record_shard_death,
             LogIngestMetricsSnapshot {
                 shard_deaths: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_shard_condemned,
+            LogIngestMetricsSnapshot {
+                shards_condemned: 1,
                 ..Default::default()
             },
         );

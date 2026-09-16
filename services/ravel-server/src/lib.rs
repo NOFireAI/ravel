@@ -1106,20 +1106,33 @@ impl DrainRouter for SpanIngestRouter {
     }
 }
 
-/// The ingest health sources the readiness probe consults (issue #1299).
+/// The ingest health sources the readiness probe consults (issue #1299): one
+/// per present router, across all three signals (metrics, logs, spans).
 ///
-/// Deliberately returns the router's METRICS handle, never a clone of the
-/// router `Arc` itself. `drain_router` below joins the shard actors only when
-/// it is the sole `Arc` owner, and `readiness` lives for the whole process, so
-/// a router clone parked in readiness makes that `Arc::try_unwrap` fail on
-/// every graceful shutdown and the actors are never joined. The metrics handle
-/// carries the same condemned-shard count, is shared by design, and keeps
-/// reading correctly after the router itself is dropped, which a `Weak` would
-/// not.
-fn ingest_health_sources(router: Option<&Arc<IngestRouter>>) -> Vec<Arc<dyn health::IngestHealth>> {
-    router
-        .map(|router| vec![router.metrics_handle() as Arc<dyn health::IngestHealth>])
-        .unwrap_or_default()
+/// Deliberately pushes each router's METRICS handle, never a clone of the
+/// router `Arc` itself. `drain_router` below joins a router's shard actors only
+/// when it is the sole `Arc` owner, and `readiness` lives for the whole
+/// process, so a router clone parked in readiness makes that `Arc::try_unwrap`
+/// fail on every graceful shutdown and the actors are never joined. The metrics
+/// handle carries the same condemned-shard count, is shared by design, and
+/// keeps reading correctly after the router itself is dropped, which a `Weak`
+/// would not.
+fn ingest_health_sources(
+    metrics_router: Option<&Arc<IngestRouter>>,
+    log_router: Option<&Arc<LogIngestRouter>>,
+    span_router: Option<&Arc<SpanIngestRouter>>,
+) -> Vec<Arc<dyn health::IngestHealth>> {
+    let mut sources: Vec<Arc<dyn health::IngestHealth>> = Vec::new();
+    if let Some(router) = metrics_router {
+        sources.push(router.metrics_handle() as Arc<dyn health::IngestHealth>);
+    }
+    if let Some(router) = log_router {
+        sources.push(router.metrics_handle() as Arc<dyn health::IngestHealth>);
+    }
+    if let Some(router) = span_router {
+        sources.push(router.metrics_handle() as Arc<dyn health::IngestHealth>);
+    }
+    sources
 }
 
 /// Attempt to flush a router's buffers, then join its shard actors only as a
@@ -1962,15 +1975,19 @@ pub async fn start(
     // capability gate (enforced in `store::build_store` before `start` is
     // called) has already passed. Merged like every other mode's routes, so
     // `/healthz` truly reflects "the axum server task can route requests".
-    // Wire the metrics ingest router's shard-supervisor health into readiness
-    // (issue #1299): once one of its shard actors exhausts its respawn budget
-    // and is condemned, `/readyz` turns 503, which sheds traffic (Kubernetes
-    // drops the pod from its Service endpoints) but does not restart or
-    // reschedule the pod, so an operator has to roll it. The log and span
-    // routers do not yet respawn or condemn (they share the same
-    // single-point-of-permanent-failure spawn), so they contribute no source.
-    let readiness =
-        health::Readiness::new().with_ingest_health(ingest_health_sources(ingest_router.as_ref()));
+    // Wire every ingest router's shard-supervisor health into readiness
+    // (issue #1299): once one of a router's shard actors is condemned,
+    // `/readyz` turns 503, which sheds traffic (Kubernetes drops the pod from
+    // its Service endpoints) but does not restart or reschedule the pod, so an
+    // operator has to roll it. The metrics router condemns a shard only after
+    // it exhausts its respawn budget; the log and span routers do not respawn,
+    // so they condemn on the first shard death. All three sources feed the same
+    // probe.
+    let readiness = health::Readiness::new().with_ingest_health(ingest_health_sources(
+        ingest_router.as_ref(),
+        log_ingest_router.as_ref(),
+        span_ingest_router.as_ref(),
+    ));
     let mut http_router = Router::new().merge(health::router(readiness.clone()));
     // The dedicated mTLS listener's router (ADR-0050 section 1): built up in
     // parallel with `http_router` below, merging the same tenant-resolving
@@ -3525,12 +3542,12 @@ mod shutdown_drain_tests {
         drain_router::<FakeRouter>(None, "metrics").await;
     }
 
-    /// Wiring readiness to the ingest router must leave the router's reference
+    /// Wiring readiness to the ingest routers must leave each router's reference
     /// count at one, or `drain_router`'s `Arc::try_unwrap` takes the `Err` arm
-    /// and the shard actors are never joined on a graceful shutdown of `all` or
-    /// `gateway` (issue #1299). Builds the sources through
-    /// `ingest_health_sources`, the same call `start` makes, so returning a
-    /// router clone from it fails here. With
+    /// and that router's shard actors are never joined on a graceful shutdown of
+    /// `all` or `gateway` (issue #1299). Covers all three signals (metrics,
+    /// logs, spans). Builds the sources through `ingest_health_sources`, the
+    /// same call `start` makes, so returning a router clone from it fails here. With
     /// `drain_router_joins_the_shard_actors_when_sole_owner` above proving that
     /// sole ownership selects the join arm, sole ownership is the whole
     /// condition.
@@ -3543,27 +3560,52 @@ mod shutdown_drain_tests {
         let store = Arc::new(ravel_object_store::memory::MemoryStore::new());
         let router = Arc::new(IngestRouter::new(
             IngestConfig::default(),
-            store,
+            store.clone(),
             Signal::Metrics,
             Arc::new(SystemClock),
         ));
+        let log_router = Arc::new(LogIngestRouter::new(
+            IngestConfig::default(),
+            store.clone(),
+            Arc::new(SystemClock),
+        ));
+        let span_router = Arc::new(SpanIngestRouter::new(
+            IngestConfig::default(),
+            store,
+            Arc::new(SystemClock),
+        ));
 
-        let readiness =
-            health::Readiness::new().with_ingest_health(ingest_health_sources(Some(&router)));
+        let readiness = health::Readiness::new().with_ingest_health(ingest_health_sources(
+            Some(&router),
+            Some(&log_router),
+            Some(&span_router),
+        ));
         readiness.mark_ready();
 
         assert_eq!(
             Arc::strong_count(&router),
             1,
-            "readiness must hold no reference to the ingest router"
+            "readiness must hold no reference to the metrics ingest router"
+        );
+        assert_eq!(
+            Arc::strong_count(&log_router),
+            1,
+            "readiness must hold no reference to the log ingest router"
+        );
+        assert_eq!(
+            Arc::strong_count(&span_router),
+            1,
+            "readiness must hold no reference to the span ingest router"
         );
         assert!(readiness.is_ready(), "no shard condemned yet");
 
         drain_router(Some(router), "metrics").await;
+        drain_router(Some(log_router), "log").await;
+        drain_router(Some(span_router), "span").await;
 
         assert!(
             readiness.is_ready(),
-            "the health source must keep answering after the router is dropped"
+            "the health sources must keep answering after the routers are dropped"
         );
     }
 

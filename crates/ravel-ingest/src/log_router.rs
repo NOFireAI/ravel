@@ -65,7 +65,7 @@ pub struct LogWriteReceipt {
     pub tokens: Vec<CommitToken>,
 }
 
-/// A duplicate of [`crate::router`]'s private `ShardHandle`: five fields, so
+/// A duplicate of [`crate::router`]'s private `ShardHandle`: two fields, so
 /// duplicating is cheaper than making the metrics module's struct
 /// `pub(crate)` across an unrelated boundary for one shared shape.
 struct LogShardHandle {
@@ -248,6 +248,22 @@ impl LogIngestRouter {
     /// drain counts into it).
     pub fn metrics_handle(&self) -> Arc<LogIngestMetrics> {
         self.metrics.clone()
+    }
+
+    /// Whether every shard actor this router owns is live enough to serve:
+    /// false once any shard actor has died and been condemned (issue #1691).
+    /// The log router never respawns a dead actor, so a single death condemns
+    /// the shard immediately, unlike the metrics router
+    /// ([`crate::IngestRouter::ready`]), which condemns only after a respawn
+    /// budget is exhausted. `services/ravel-server` ANDs this into `/readyz`,
+    /// so a false here sheds traffic from this replica: Kubernetes removes the
+    /// pod from its Service endpoints. It does not restart or reschedule the pod
+    /// (`/healthz` is deliberately independent of ingest health), so recovering
+    /// the shard needs an operator to roll it. Monotonic: nothing un-condemns a
+    /// shard, and it reads the condemned-shard counter rather than live handles,
+    /// which the shard-actor sets never drop for the process lifetime.
+    pub fn ready(&self) -> bool {
+        self.metrics.condemned_shards() == 0
     }
 
     /// Resolve the tenant's active shard-actor set for a write at `now_ns`,
@@ -590,6 +606,11 @@ impl LogIngestRouter {
     fn mark_shard_dead(&self, handle: &LogShardHandle) {
         if !handle.dead.swap(true, Ordering::Relaxed) {
             self.metrics.record_shard_death();
+            // The log router never respawns a dead actor, so the first death is
+            // already permanent: condemn the shard in the same step, once per
+            // shard the way `record_shard_death` is (issue #1691). This is what
+            // `ready()` reads to turn `/readyz` to 503.
+            self.metrics.record_shard_condemned();
         }
     }
 

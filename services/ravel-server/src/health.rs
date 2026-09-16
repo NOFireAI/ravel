@@ -91,21 +91,35 @@ pub struct Readiness {
 /// remember to set a flag, matching the store-probe design's one-truth,
 /// read-on-demand shape.
 ///
-/// Implemented for [`ravel_ingest::IngestMetrics`] and NOT for
-/// [`ravel_ingest::IngestRouter`], deliberately. Readiness holds its sources in
-/// an `Arc` for the process lifetime, and the graceful-shutdown path drains the
-/// router by `Arc::try_unwrap`ing it to take ownership and join the shard
-/// actors. An `Arc<IngestRouter>` parked here is a second strong reference that
-/// makes that unwrap fail on every shutdown, so the actors are never joined.
-/// The metrics handle carries the same condemned count and is already shared by
-/// design, so reading health through it keeps the router's reference count
-/// under the drain path's sole control.
+/// Implemented for [`ravel_ingest::IngestMetrics`],
+/// [`ravel_ingest::LogIngestMetrics`], and [`ravel_ingest::SpanIngestMetrics`],
+/// and NOT for [`ravel_ingest::IngestRouter`], [`ravel_ingest::LogIngestRouter`],
+/// or [`ravel_ingest::SpanIngestRouter`], deliberately. Readiness holds its
+/// sources in an `Arc` for the process lifetime, and the graceful-shutdown path
+/// drains each router by `Arc::try_unwrap`ing it to take ownership and join the
+/// shard actors. An `Arc<...Router>` parked here is a second strong reference
+/// that makes that unwrap fail on every shutdown, so the actors are never
+/// joined. The metrics handle carries the same condemned count and is already
+/// shared by design, so reading health through it keeps the router's reference
+/// count under the drain path's sole control.
 pub trait IngestHealth: Send + Sync {
     /// False once the observed router has a condemned shard.
     fn shards_ready(&self) -> bool;
 }
 
 impl IngestHealth for ravel_ingest::IngestMetrics {
+    fn shards_ready(&self) -> bool {
+        self.condemned_shards() == 0
+    }
+}
+
+impl IngestHealth for ravel_ingest::LogIngestMetrics {
+    fn shards_ready(&self) -> bool {
+        self.condemned_shards() == 0
+    }
+}
+
+impl IngestHealth for ravel_ingest::SpanIngestMetrics {
     fn shards_ready(&self) -> bool {
         self.condemned_shards() == 0
     }

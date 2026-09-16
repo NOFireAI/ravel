@@ -902,7 +902,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.stream_id_collisions),
             shard_deaths: snapshot.shard_deaths,
-            shards_condemned: None,
+            shards_condemned: Some(snapshot.shards_condemned),
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: Some(PostingsCounters {
@@ -940,7 +940,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: None,
             shard_deaths: snapshot.shard_deaths,
-            shards_condemned: None,
+            shards_condemned: Some(snapshot.shards_condemned),
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
@@ -1163,8 +1163,11 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         );
     }
 
-    // Metrics-only, like ravel_ingest_collisions_total above: only the metrics
-    // router respawns and condemns, so logs and spans render no sample here.
+    // Rendered for every signal whose snapshot carries the counter (metrics,
+    // logs, spans). The condemnation threshold differs by signal: the metrics
+    // router respawns a shard up to its budget and condemns only on the death
+    // that exhausts it, while the log and span routers do not respawn and
+    // condemn on the first shard death.
     let with_condemned: Vec<_> = pipelines
         .iter()
         .filter(|pipeline| pipeline.shards_condemned.is_some())
@@ -1173,10 +1176,11 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         write_header(
             out,
             "ravel_ingest_shards_condemned_total",
-            "Shards condemned after exhausting their respawn budget (issue #1299), counted at \
-             most once per shard per live generation (bounded by live_generations * shard_count \
-             under resharding, not shard_count); any nonzero value makes the process report \
-             /readyz 503, by signal.",
+            "Shards condemned and no longer accepting writes (issue #1299), counted at most once \
+             per shard per live generation (bounded by live_generations * shard_count under \
+             resharding, not shard_count); the metrics router condemns after exhausting a shard's \
+             respawn budget, logs and spans on the first shard death; any nonzero value makes the \
+             process report /readyz 503, by signal.",
             "counter",
         );
         for pipeline in with_condemned {
@@ -5815,24 +5819,29 @@ mod tests {
         );
     }
 
-    /// `shards_condemned` renders for the metrics pipeline with the driven
-    /// value and renders nothing for logs/spans (issue #1299): only the metrics
-    /// router respawns and condemns shard actors, so this family follows the
-    /// same structural-absence convention as `metadata_sink` above. Pins the
-    /// conditional render, whose input is `Option<u64>`: a `None` that started
-    /// being unwrapped to `Some(0)` would silently export a 0 for two
-    /// pipelines that have no such concept, and a family that stopped
-    /// rendering would silently disarm the `shards_condemned > 0` alert
-    /// docs/guides/observability.md tells operators to set.
+    /// `shards_condemned` renders one sample per signal (metrics, logs, spans)
+    /// with each pipeline's own driven value (issue #1299). The distinct counts
+    /// catch cross-pipeline miswiring: a `from_log_metrics` that read the span
+    /// snapshot's field, or a render that labelled all three the same, would
+    /// fail here. Pins the conditional render, whose input is `Option<u64>`: a
+    /// family that stopped rendering for any signal would silently disarm the
+    /// `shards_condemned > 0` alert docs/guides/observability.md tells operators
+    /// to set.
     #[test]
-    fn shards_condemned_counters_render_for_metrics_only() {
+    fn shards_condemned_counters_render_for_every_signal() {
         let ingest = vec![
             IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
                 shards_condemned: 2,
                 ..Default::default()
             }),
-            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot::default()),
-            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+                shards_condemned: 1,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot {
+                shards_condemned: 3,
+                ..Default::default()
+            }),
         ];
         let body = render(
             Mode::Gateway,
@@ -5869,15 +5878,19 @@ mod tests {
             body.contains(
                 "ravel_ingest_shards_condemned_total{mode=\"gateway\",signal=\"metrics\"} 2"
             ),
-            "the metrics pipeline must render the driven condemned count"
+            "the metrics pipeline must render its driven condemned count"
         );
         assert!(
-            !body.contains("ravel_ingest_shards_condemned_total{mode=\"gateway\",signal=\"logs\""),
-            "logs pipeline must render no shards_condemned sample"
+            body.contains(
+                "ravel_ingest_shards_condemned_total{mode=\"gateway\",signal=\"logs\"} 1"
+            ),
+            "the logs pipeline must render its driven condemned count"
         );
         assert!(
-            !body.contains("ravel_ingest_shards_condemned_total{mode=\"gateway\",signal=\"spans\""),
-            "spans pipeline must render no shards_condemned sample"
+            body.contains(
+                "ravel_ingest_shards_condemned_total{mode=\"gateway\",signal=\"spans\"} 3"
+            ),
+            "the spans pipeline must render its driven condemned count"
         );
     }
 
