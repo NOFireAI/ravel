@@ -88,11 +88,11 @@ use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_
 use ravel_maintain::worker_set::{DEFAULT_UNIT_CONCURRENCY, run_bounded};
 use ravel_maintain::{
     Bucket, Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureRewriteOutcome,
-    LeaseCheck, LegalHoldCheck, MaintainError, PendingErasureRequest, QUERY_AUDIT_SHARD,
-    RetentionConfig, WorkerSet, erasure_rewrite_bucket, pending_erasure_requests,
-    read_all_memo_snapshots, scan_and_compact, sweep_audit_retention, sweep_erasure_requests,
-    sweep_idempotency_markers, sweep_shard, sweep_shard_zoned, sweep_unreferenced_catalog_objects,
-    write_memo_snapshot,
+    LeaseCheck, LegalHoldCheck, MaintainError, OrphanPass, PendingErasureRequest,
+    QUERY_AUDIT_SHARD, RetentionConfig, WorkerSet, erasure_rewrite_bucket,
+    pending_erasure_requests, read_all_memo_snapshots, scan_and_compact, sweep_audit_retention,
+    sweep_erasure_requests, sweep_idempotency_markers, sweep_shard, sweep_shard_zoned_with_holds,
+    sweep_unreferenced_catalog_objects, write_memo_snapshot,
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
 use ravel_proto::commit::v1::{ErasureCompletion, ErasureDeferralCause, ErasureRequest};
@@ -1502,6 +1502,14 @@ pub(crate) async fn run_tick_with_clock(
                 // itself left permanently unswept, still gets a full pass. A
                 // failed scan carries no head+tail set to scope by, so it also
                 // falls back to a full pass rather than sweeping nothing.
+                //
+                // Rule 1 (orphan GC) rides the same cadence memo: its `l0/`
+                // data prefix LIST cannot be hour-scoped (issue #1734), so
+                // this per-tick zoned pass skips it (`OrphanPass::Skip`) and
+                // `sweep_shard` below runs it (unconditionally, as it always
+                // has) only when this branch's own guard says a full sweep is
+                // due. The gate is driven purely by `full_sweep_due`; no new
+                // interval or flag.
                 let now = clock_ref.now_ns();
                 let sweep = match &scan {
                     Ok(report)
@@ -1513,7 +1521,7 @@ pub(crate) async fn run_tick_with_clock(
                             compactor.interior_reverify_ns,
                         ) =>
                     {
-                        sweep_shard_zoned(
+                        sweep_shard_zoned_with_holds(
                             store,
                             clock_ref,
                             compactor,
@@ -1522,8 +1530,10 @@ pub(crate) async fn run_tick_with_clock(
                             signal,
                             shard,
                             &report.head_tail_hours,
+                            OrphanPass::Skip,
                         )
                         .await
+                        .map(|(zoned_report, _holds)| zoned_report)
                     }
                     _ => {
                         let outcome = sweep_shard(

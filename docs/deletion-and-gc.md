@@ -204,6 +204,25 @@ window would still call a Hit.
   candidate, a move to quarantine (see "Quarantine and the second horizon"
   below), never a direct delete. The breaker is all-or-nothing: a
   tripped, non-overridden breaker quarantines zero candidates that pass.
+- **Candidate selection's initial listing runs on the full-sweep cadence, not
+  every maintain tick (issue #1734).** That listing is the one phase of a
+  pass that cannot be hour-scoped (L0 data keys carry no ingest-hour
+  component), so before this change it re-listed the whole shard's `l0/`
+  data prefix on every maintain tick (default 300 s) even though rules 2 and
+  3 already list only the tick's zone-scoped hours. `ravel-maintain`'s
+  per-tick sweep now runs candidate selection only on the tick a full sweep
+  is due -- the same cadence memo (`MaintainMemo::full_sweep_due`,
+  `interior_reverify_ns`, default 6 h) that already governs when rules 2 and
+  3 fall back to their own unscoped pass. Every other tick skips candidate
+  selection entirely: no LIST of the `l0/` data prefix, and that pass's
+  orphan and breaker figures (deleted, quarantined, quarantine-refused, and
+  the breaker fields) are reported as zero rather than a value carried over
+  from the last tick that did run it. The L0 listing cost that used to be
+  paid every 300 s is now paid once per full-sweep interval instead. The
+  quarantine reaper (a different rule, over the separate `quarantine/`
+  prefix) is unaffected and still runs every tick, so objects already
+  quarantined keep aging out on schedule. The key layout of `l0/` and
+  `quarantine/` is unchanged.
 - The mass-orphan circuit breaker (ADR-0048 decision 4) trips when a
   pass's surviving candidate count is at least `orphan_breaker_min_count`
   (default 50) AND exceeds `orphan_breaker_max_ratio` (default 0.10) of
