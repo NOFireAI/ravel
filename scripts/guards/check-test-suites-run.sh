@@ -64,6 +64,14 @@ excepted=(
 if [[ -n "${CHECK_TEST_SUITES_EXCEPTED:-}" ]]; then
   while IFS= read -r extra; do
     [[ -z "${extra}" ]] && continue
+    # The reason is the whole point of the list, so it is required rather
+    # than requested. Without this an entry of just the path printed the path
+    # AS its own reason and exited 0, which is the quiet exclusion the comment
+    # above says the format exists to prevent.
+    if [[ "${extra}" != *"|"* || -z "${extra#*|}" ]]; then
+      echo "check-test-suites-run.sh: exception '${extra}' has no reason; use '<path>|<reason>'" >&2
+      exit 2
+    fi
     excepted+=("${extra}")
   done <<<"${CHECK_TEST_SUITES_EXCEPTED}"
 fi
@@ -89,6 +97,14 @@ excepted_reason() {
 
 # Tracked files only: an untracked scratch suite in someone's worktree is not
 # this check's business, and would fail it on every machine differently.
+#
+# SCOPE: the `*.test.sh` suffix is itself a hand-maintained convention, which
+# is this guard's own problem one level up. A suite named another way is
+# invisible here, and one exists: `deploy/metricsbench/tests/*.sh` is a
+# `#!/bin/sh` acceptance suite wired by hand in ci.yml. It is not an orphan
+# today, checked rather than assumed. The summary line below says "shell test
+# suite(s)" and means "matching this key", not "every shell suite in the
+# repository".
 suites="$(git ls-files -- '*.test.sh' 2>/dev/null)" || {
   echo "check-test-suites-run.sh: git ls-files failed" >&2
   exit 2
@@ -117,7 +133,11 @@ fi
 #
 # A trailing comment on a real step (`run: bash x.test.sh  # why`) keeps its
 # line, because the line is not a comment line.
-workflow_text="$(grep -rhv '^[[:space:]]*#' -- "${workflow_dir}" 2>/dev/null)"
+# Comment lines AND `name:` values are dropped. A step name is prose the same
+# way a comment is -- `- name: we should run x.test.sh one day` counted as
+# running it, the same false clean one YAML key over. The `run:` line that
+# actually invokes the suite is untouched.
+workflow_text="$(grep -rhvE '^[[:space:]]*#|^[[:space:]]*-?[[:space:]]*name:' -- "${workflow_dir}" 2>/dev/null)"
 if [[ -z "${workflow_text}" ]]; then
   echo "check-test-suites-run.sh: ${workflow_dir} has no non-comment content; cannot tell what CI runs" >&2
   exit 2
@@ -143,12 +163,24 @@ while IFS= read -r suite; do
   #
   # The boundary class is the set of characters a filename can contain, so a
   # name touching `/`, whitespace or a quote still matches.
-  # Only `.` needs escaping: a basename cannot contain a slash, and no other
-  # regex metacharacter appears in a `*.test.sh` name. Done with parameter
-  # expansion rather than a sed subshell, because a sed that errors returns
-  # empty and an empty key matches EVERY line -- the guard would then report
-  # every suite as run, which is its worst possible failure and a silent one.
-  base_re="${base//./\\.}"
+  # Every character outside [A-Za-z0-9_-] is escaped, not just the dot. A
+  # basename carrying a regex metacharacter otherwise becomes a PATTERN:
+  # `a+b.test.sh` matched the wired `ab.test.sh` line and was reported run,
+  # which is the silent false-run this guard exists to prevent. Escaping by
+  # enumeration rather than by assuming which characters appear, because the
+  # assumption is what failed.
+  #
+  # Built in the shell rather than by a sed subshell: a sed that errors
+  # returns empty, and an empty key matches EVERY line, so the guard would
+  # report every suite as run while printing the error above its own summary.
+  base_re=""
+  for (( _i = 0; _i < ${#base}; _i++ )); do
+    _c="${base:_i:1}"
+    case "${_c}" in
+      [A-Za-z0-9_-]) base_re+="${_c}" ;;
+      *) base_re+="\\${_c}" ;;
+    esac
+  done
   if [[ -z "${base_re}" ]]; then
     echo "check-test-suites-run.sh: empty match key for '${suite}'; refusing to judge it" >&2
     exit 2

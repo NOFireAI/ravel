@@ -230,6 +230,17 @@ echo "==> scripts/guards/check-quick-xml-entry-points.sh"
 echo "==> scripts/guards/check-quick-xml-shipped-reachability.test.sh"
 bash "$(dirname "$0")/guards/check-quick-xml-shipped-reachability.test.sh"
 
+# Every shell test suite must be run by some workflow (issue #1834). Here as
+# well as in CI, because the person this guard exists for is the one who just
+# added a suite and has not wired it: they run gates.sh before committing, per
+# the gate list in CLAUDE.md, and would otherwise learn it from a red pull
+# request instead. Cases first, so a guard broken into always-passing fails
+# here rather than going quiet. A git and grep scan, no build.
+echo "==> scripts/tests/check-test-suites-run.test.sh"
+bash "$(dirname "$0")/tests/check-test-suites-run.test.sh"
+echo "==> scripts/guards/check-test-suites-run.sh"
+"$(dirname "$0")/guards/check-test-suites-run.sh"
+
 # The flag-doc overclaim guard defined above, in the ordinary gate run: a source
 # scan, no build, so it fails before the expensive lanes.
 echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"

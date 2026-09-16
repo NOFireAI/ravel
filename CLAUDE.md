@@ -419,6 +419,20 @@ than passing for "no pull request open".
   diffstat, and (with `--hard`) the uncommitted work that would go with no
   reflog entry. Run it before setting `ALLOW_DESTRUCTIVE=1`; that is what the
   flag is meant to be read beside.
+- `scripts/guards/check-test-suites-run.sh [--list]`: every tracked
+  `*.test.sh` must be named on a non-comment, non-`name:` line of some
+  workflow, or be listed as an exception carrying a reason. Exit 1 names the
+  orphans; exit 2 is "could not check" (no suites found at all, no workflows
+  directory, an exception with no reason), which is deliberately not a pass.
+  The two halves of the test tree fail differently: `make test-python` uses
+  `unittest discover -p 'test_*.py'`, so a Python suite cannot be orphaned and
+  grepping a workflow for its filename proves nothing, while shell suites are
+  enumerated by hand and a new one runs nowhere until somebody remembers.
+  That has bitten three times, each a green suite that had never executed
+  sitting beside a real defect. Runs in `gates.sh` as well as CI, because the
+  person it exists for is the one who just added a suite. It does not see
+  suites named by another convention: `deploy/metricsbench/tests/*.sh` is
+  outside the `*.test.sh` key and is wired by hand.
 - `scripts/guards/assert-worktree.sh`: exits non-zero if the cwd is the
   PRIMARY checkout rather than a linked worktree. Run it before the first
   edit/commit of any isolated unit of work. A concurrent session can hold
