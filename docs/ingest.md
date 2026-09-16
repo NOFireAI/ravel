@@ -481,7 +481,7 @@ ADR-0067 decisions 1 and 2 apply here too, so a flush runs in a spawned
 task bounded by `max_inflight_flushes` and shutdown joins every in-flight
 flush before the actor completes; the permit is acquired inside that task
 under ADR-1642, so this actor does not park on it either) and diverge in
-exactly four places:
+exactly five places:
 
 - Objects are RLOG, built with `ravel_logseg::RlogWriter`, not RSEG built
   with `SegmentWriter`. They land under the `l` keyspace
@@ -506,6 +506,15 @@ exactly four places:
   `stream_id_collisions`; every other `LogSegError` becomes
   `LogWriteError::SegmentBuild`. Duplicating the check in the buffer would
   be dead code with a second chance to drift.
+- A dead shard actor is never respawned, so it is condemned on its first
+  death. Where the metrics router respawns up to `MAX_SHARD_RESPAWNS` and
+  condemns only on the death that exhausts that budget (the fourth death),
+  `LogIngestRouter` has no respawn path at all: the first shard-actor death
+  increments both `shard_deaths` and `shards_condemned` and turns
+  `LogIngestRouter::ready()` false. `services/ravel-server` ANDs that into
+  `/readyz` exactly as it does for metrics, so the pod is shed from its
+  Service. Surviving shards keep serving; the condemned shard cannot recover
+  in-process, so an operator has to roll the pod.
 
 Commit-record fields the log flush fills differently: `sample_count` is the
 log record count (a record is the RLOG analogue of a sample), `series_count`
@@ -572,6 +581,11 @@ acquired inside the flush task under ADR-1642) and diverge in these places:
   underscore-prefixed `attrs` keys (`_kind`, `_trace_state`, `_flags`,
   `_events_raw`, `_links_raw`); events and links are opaque hex blobs in
   v1 (ADR-0041 decision 4).
+- A dead shard actor is never respawned, exactly as in the log pipeline:
+  the first shard-actor death increments both `shard_deaths` and
+  `shards_condemned` and turns `SpanIngestRouter::ready()` false, which
+  `services/ravel-server` ANDs into `/readyz`. The metrics router's
+  respawn-then-condemn budget has no span analogue.
 
 Commit-record fields the span flush fills differently: `sample_count` is the
 span count, `series_count` is the number of distinct `trace_id`s in the batch
@@ -1162,12 +1176,15 @@ Counters recorded today:
 - `shard_deaths`: shard-actor deaths observed by the router, counted once per
   death including each respawned incarnation, so it can exceed
   `shard_count`.
-- `shards_condemned`: shards that exhausted their respawn budget within one
-  decay window and were condemned, counted at most once per shard per live
-  generation and bounded by
+- `shards_condemned`: shards condemned and no longer accepting writes, counted
+  at most once per shard per live generation and bounded by
   `live_generations * shard_count`, not `shard_count`: under resharding each
-  generation's handle for a shard index can condemn independently.
-  Nonzero turns `IngestRouter::ready()` false and, through
+  generation's handle for a shard index can condemn independently. On the
+  metrics pipeline a shard is condemned only after it exhausts its respawn
+  budget within one decay window; `LogIngestMetrics` and `SpanIngestMetrics`
+  carry the same counter but their routers never respawn, so the first
+  shard-actor death condemns (see the Log and Span pipeline sections).
+  Nonzero turns the router's `ready()` false and, through
   `services/ravel-server`, `/readyz` to 503, and nothing recovers it in
   process.
 - `in_flight_flushes_total`: gauge, sum across shards of flush tasks spawned
