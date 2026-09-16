@@ -87,7 +87,7 @@ check() {
 # --- the committed files pass ------------------------------------------------
 
 d="$(new_tree committed)"
-check "the committed tree passes with all four categories pinned" "${d}" 0 \
+check "the committed tree passes with all five categories pinned" "${d}" 0 \
   "RESULT: PASS"
 
 # --- a bare tag in ravel.yml fails naming the line --------------------------
@@ -225,6 +225,24 @@ mutate "${d}/.github/workflows/k8s-nightly.yml" \
   's#^      - name: Install sccache#      - name: Global flag before the subcommand\n        run: docker --context ci run nginx:latest\n      - name: Install sccache#'
 check "docker_run_global_flag_before_subcommand_is_scanned" "${d}" 1 \
   "nginx:latest"
+
+# Docker's management-command spellings are matched: `docker image pull X`
+# and `docker container run X` are the same invocations with a subcommand
+# group in front, and a scanner that misses them extracts nothing, so the
+# count assertion cannot notice either.
+d="$(new_tree docker-management-command-spelling)"
+mutate "${d}/.github/workflows/k8s-nightly.yml" \
+  's#^      - name: Install sccache#      - name: Management command spellings\n        run: docker image pull nginx:latest\n      - name: Install sccache#'
+check "docker_management_command_spelling_is_scanned" "${d}" 1 \
+  "nginx:latest"
+
+# A composite action under .github/actions is scanned too. Category 3 already
+# covers that directory for `uses:` refs, and the actions here do run docker.
+d="$(new_tree docker-run-in-composite-action)"
+mutate "${d}/.github/actions/free-disk-space/action.yml" \
+  's#^      run: |#      run: |\n        docker run redis:latest true#'
+check "docker_run_in_a_composite_action_is_scanned" "${d}" 1 \
+  "redis:latest"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
