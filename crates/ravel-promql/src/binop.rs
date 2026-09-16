@@ -16,6 +16,29 @@
 //! Prometheus' `VectorMatchFillValues` (`<expr> + on() lhs=1,rhs=2 <expr>`)
 //! is a promql-parser grammar extension with no real Prometheus equivalent;
 //! any non-default value is rejected as [`Error::Unsupported`].
+//!
+//! # Native histograms
+//!
+//! Seven pairings compute a result: `h + h` and `h - h` (a histogram),
+//! `h * f`, `f * h` and `h / f` (a scaled histogram), and `h == h` and
+//! `h != h` (filter mode passes the surviving histogram through, `bool` mode
+//! answers 1/0). Every other pairing that carries a histogram operand drops
+//! the sample and raises one info annotation: any arithmetic between a
+//! histogram and a float other than `*` and `h / f`, `h * h`, `h / h`, every
+//! `%`, `^` and `atan2` pairing, any ordering comparison (`<`, `>`, `<=`,
+//! `>=`) involving a histogram, and `==`/`!=` between a histogram and a
+//! float. Set operators (`and`, `or`, `unless`) pass matched samples through
+//! without combining values, so they carry histograms unchanged and are not
+//! part of this split.
+//!
+//! `h + h` and `h - h` align their operands first, as every other combining
+//! caller in [`crate::histogram`] does: an exponential/custom-buckets mix, or
+//! two custom-buckets histograms with different bounds, cannot be combined at
+//! all and drops with an info annotation; two exponential histograms at
+//! different scales are both down-converted to the coarser scale before the
+//! buckets are merged. Stored data really does mix scales within one series
+//! (RSEG down-converts a flush whose bucket count exceeds its limit), so this
+//! is a normal input shape, not a corner case.
 
 use std::collections::{HashMap, HashSet};
 
@@ -158,6 +181,51 @@ fn incompatible_types_info(op: TokenId, lhs_is_histogram: bool, rhs_is_histogram
     )
 }
 
+/// Prometheus' `histogram.ErrHistogramsIncompatibleSchema` text: `+`/`-`
+/// between an exponential-schema histogram and a custom-buckets one has no
+/// defined result, so the sample drops and this is raised.
+const MIXED_SCHEMAS_INFO: &str = "cannot apply this operation on histograms with a mix of \
+                                  exponential and custom bucket schemas";
+
+/// Prometheus' `histogram.ErrHistogramsIncompatibleBounds` text: two
+/// custom-bucket histograms whose boundaries differ have no common bucket
+/// layout to merge into, so the sample drops and this is raised.
+const INCOMPATIBLE_BOUNDS_INFO: &str = "cannot apply this operation on custom buckets histograms \
+                                        with different custom bounds";
+
+/// Establish [`FloatHistogram::add_assign`]/[`FloatHistogram::sub_assign`]'s
+/// precondition for a `h + h` / `h - h` pair, returning the two operands to
+/// combine or the info text for a pair that cannot be combined at all.
+///
+/// `combine` merges by absolute bucket index and keeps the receiver's scale,
+/// so two operands at different scales would otherwise add bucket `i` to
+/// bucket `i` across two different value ranges and label the result with the
+/// receiver's scale. Both sides are down-converted to the coarser scale first,
+/// exactly as [`crate::histogram::sum_histograms`] and
+/// [`crate::histogram::histogram_rate`] do. Custom-bucket histograms cannot be
+/// rescaled, so the two unalignable shapes Prometheus rejects outright (a mix
+/// of the two schema families, and differing custom bounds) drop instead.
+///
+/// A differing `zero_threshold` is NOT reconciled here: no caller in this
+/// crate does, and doing so is Prometheus' separate `reconcileZeroBuckets`
+/// pass rather than part of schema alignment.
+fn align_histogram_operands(
+    lhs: &FloatHistogram,
+    rhs: &FloatHistogram,
+) -> Result<(FloatHistogram, FloatHistogram), &'static str> {
+    if lhs.uses_custom_buckets() != rhs.uses_custom_buckets() {
+        return Err(MIXED_SCHEMAS_INFO);
+    }
+    if lhs.uses_custom_buckets() {
+        if !lhs.custom_bounds_match(rhs) {
+            return Err(INCOMPATIBLE_BOUNDS_INFO);
+        }
+        return Ok((lhs.clone(), rhs.clone()));
+    }
+    let scale = lhs.scale.min(rhs.scale);
+    Ok((lhs.copy_to_scale(scale), rhs.copy_to_scale(scale)))
+}
+
 /// The outcome of combining one matched (or scalar-paired) sample: a plain
 /// float, a native histogram, or a drop. A drop is either a filter-mode
 /// comparison that did not hold (no annotation) or a histogram/float pairing
@@ -253,7 +321,9 @@ fn eval_scalar_scalar(op: TokenId, l: f64, r: f64) -> f64 {
 /// `histogram / float`, and `==`/`!=` between two histograms. Every other
 /// pairing that carries a histogram drops the sample and raises an info
 /// annotation. A filter-mode comparison that does not hold drops without an
-/// annotation, exactly as for floats.
+/// annotation, exactly as for floats. The two combining arms (`+`, `-`) run
+/// [`align_histogram_operands`] first, which is where a pair that shares no
+/// bucket layout drops with its own annotation.
 fn combine_value(
     op: TokenId,
     lhs: (f64, Option<&FloatHistogram>),
@@ -304,16 +374,20 @@ fn combine_value(
     } else {
         match (op, lh, rh) {
             (_, None, None) => Combined::Value(apply_arith(op, lv, rv)),
-            (T_ADD, Some(a), Some(b)) => {
-                let mut out = a.clone();
-                out.add_assign(b);
-                Combined::Histogram(out)
-            }
-            (T_SUB, Some(a), Some(b)) => {
-                let mut out = a.clone();
-                out.sub_assign(b);
-                Combined::Histogram(out)
-            }
+            (T_ADD | T_SUB, Some(a), Some(b)) => match align_histogram_operands(a, b) {
+                Ok((mut out, other)) => {
+                    if op == T_ADD {
+                        out.add_assign(&other);
+                    } else {
+                        out.sub_assign(&other);
+                    }
+                    Combined::Histogram(out)
+                }
+                Err(message) => {
+                    ctx.info(message);
+                    Combined::Drop
+                }
+            },
             (T_MUL, Some(a), None) => {
                 let mut out = a.clone();
                 out.mul(rv);
@@ -716,6 +790,37 @@ mod tests {
             negative_buckets: Vec::new(),
             custom_values: Vec::new(),
         }
+    }
+
+    /// A positive-only histogram at `scale`: `counts.len()` consecutive
+    /// buckets from absolute index 1, `sum` chosen as the running total so the
+    /// fixture stays readable.
+    fn nh_at_scale(scale: i32, counts: &[f64]) -> crate::histogram::FloatHistogram {
+        let total: f64 = counts.iter().sum();
+        crate::histogram::FloatHistogram {
+            counter_reset_hint: crate::histogram::ResetHint::Unknown,
+            scale,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count: total,
+            sum: total * 2.0,
+            positive_spans: vec![crate::histogram::Span {
+                offset: 1,
+                length: counts.len() as u32,
+            }],
+            negative_spans: Vec::new(),
+            positive_buckets: counts.to_vec(),
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        }
+    }
+
+    /// A custom-buckets (NHCB) histogram: scale `-53` with explicit ascending
+    /// boundaries, the schema family that cannot be rescaled.
+    fn nh_custom(bounds: &[f64], counts: &[f64]) -> crate::histogram::FloatHistogram {
+        let mut h = nh_at_scale(crate::histogram::CUSTOM_BUCKETS_SCALE, counts);
+        h.custom_values = bounds.to_vec();
+        h
     }
 
     fn source() -> TestSource {
@@ -1250,6 +1355,125 @@ mod tests {
         assert_eq!(h.observation_sum(), 84.0);
     }
 
+    /// Issue #1700 fix round: `h + h` over two exponential histograms at
+    /// different scales down-converts both to the coarser scale before merging
+    /// buckets, so every bucket index means the same value range on both sides.
+    /// The finer operand is on the left, which is the direction that exposes
+    /// the unaligned merge: `combine` keeps the receiver's scale, so without
+    /// alignment the result is labelled scale 1 and carries the coarse
+    /// operand's counts at indexes that mean a different range there.
+    #[test]
+    fn addition_of_two_histograms_at_different_scales_aligns_to_the_coarser_scale() {
+        // Scale 1, indexes 1..=4. Down-converting to scale 0 merges index
+        // pairs: (1, 2) -> 1 and (3, 4) -> 2, so counts 1+2 = 3 and 3+4 = 7.
+        let fine = nh_at_scale(1, &[1.0, 2.0, 3.0, 4.0]);
+        // Scale 0, indexes 1..=2, already at the coarser scale.
+        let coarse = nh_at_scale(0, &[10.0, 20.0]);
+        let src = TestSource::new()
+            .with_histogram_series(&[("__name__", "hf"), ("job", "x")], &[(0, fine)])
+            .expect("valid histogram series")
+            .with_histogram_series(&[("__name__", "hc"), ("job", "x")], &[(0, coarse)])
+            .expect("valid histogram series");
+        let v = Evaluator::new()
+            .instant(&src, "hf + hc", 0)
+            .expect("mixed-scale addition must evaluate");
+        assert_eq!(v.len(), 1);
+        let h = v[0]
+            .histogram
+            .as_ref()
+            .expect("the result element must carry a histogram");
+        assert_eq!(h.scale, 0, "the result is labelled with the coarser scale");
+        assert_eq!(
+            h.positive_spans,
+            vec![crate::histogram::Span {
+                offset: 1,
+                length: 2
+            }],
+            "two merged buckets from index 1"
+        );
+        assert_eq!(
+            h.positive_buckets,
+            vec![13.0, 27.0],
+            "index 1 is 1+2+10 and index 2 is 3+4+20 once both sides are at scale 0"
+        );
+        assert_eq!(h.observation_count(), 40.0, "10 + 30");
+        assert_eq!(h.observation_sum(), 80.0, "20 + 60");
+    }
+
+    /// Issue #1700 fix round: a custom-buckets histogram and an
+    /// exponential-schema one have no common bucket layout, so `h + h` drops
+    /// the sample and raises exactly one info, matching Prometheus'
+    /// `ErrHistogramsIncompatibleSchema` drop-and-annotate.
+    #[test]
+    fn addition_of_a_custom_buckets_and_exponential_pair_drops_and_annotates() {
+        let src = TestSource::new()
+            .with_histogram_series(
+                &[("__name__", "hn"), ("job", "x")],
+                &[(0, nh_custom(&[1.0, 2.0, 4.0], &[1.0, 2.0, 3.0]))],
+            )
+            .expect("valid histogram series")
+            .with_histogram_series(
+                &[("__name__", "he"), ("job", "x")],
+                &[(0, nh_at_scale(0, &[1.0, 2.0, 3.0]))],
+            )
+            .expect("valid histogram series");
+        let (value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&src, "hn + he", 0)
+            .expect("an unalignable pair must drop, not error");
+        let Value::Vector(v) = value else {
+            panic!("expected a vector result");
+        };
+        assert!(
+            v.is_empty(),
+            "a custom-buckets and exponential pair cannot be combined"
+        );
+        assert_eq!(
+            annotations.infos(),
+            [
+                "cannot apply this operation on histograms with a mix of exponential \
+                 and custom bucket schemas"
+            ],
+            "exactly one info, carrying Prometheus' incompatible-schema wording"
+        );
+        assert!(
+            annotations.warnings().is_empty(),
+            "the drop is an info, not a warning"
+        );
+    }
+
+    /// Issue #1700 fix round: two custom-buckets histograms whose boundaries
+    /// differ have no shared layout either, and `-` drops them the same way
+    /// `+` does (Prometheus' `ErrHistogramsIncompatibleBounds`).
+    #[test]
+    fn subtraction_of_custom_buckets_with_different_bounds_drops_and_annotates() {
+        let src = TestSource::new()
+            .with_histogram_series(
+                &[("__name__", "ha"), ("job", "x")],
+                &[(0, nh_custom(&[1.0, 2.0, 4.0], &[1.0, 2.0, 3.0]))],
+            )
+            .expect("valid histogram series")
+            .with_histogram_series(
+                &[("__name__", "hb"), ("job", "x")],
+                &[(0, nh_custom(&[1.0, 3.0, 5.0], &[1.0, 2.0, 3.0]))],
+            )
+            .expect("valid histogram series");
+        let (value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&src, "ha - hb", 0)
+            .expect("an unalignable pair must drop, not error");
+        let Value::Vector(v) = value else {
+            panic!("expected a vector result");
+        };
+        assert!(v.is_empty(), "different custom bounds cannot be combined");
+        assert_eq!(
+            annotations.infos(),
+            [
+                "cannot apply this operation on custom buckets histograms with \
+                 different custom bounds"
+            ],
+            "exactly one info, carrying Prometheus' incompatible-bounds wording"
+        );
+    }
+
     /// Issue #1700: a comparison between a histogram and a float is not defined
     /// (only `==`/`!=` between two histograms is), so the sample is dropped and
     /// exactly one info annotation is raised, read back through
@@ -1268,9 +1492,12 @@ mod tests {
             other => panic!("expected an empty vector, got {other:?}"),
         }
         assert_eq!(
-            annotations.infos().len(),
-            1,
-            "exactly one info annotation for the dropped incompatible comparison"
+            annotations.infos(),
+            [
+                "incompatible sample types encountered for binary operator \">\": \
+                 histogram > float"
+            ],
+            "the one info must carry Prometheus' IncompatibleTypesInBinOpInfo wording"
         );
         assert!(
             annotations.warnings().is_empty(),

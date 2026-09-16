@@ -593,10 +593,7 @@ pub static REGISTRY: &[Construct] = &[
     binop("+", corpus("corpus/binop.txt")),
     binop("-", corpus("corpus/binop.txt")),
     binop("*", corpus("corpus/binop.txt")),
-    binop(
-        "/",
-        unit("ravel-promql:scalar_scalar_arithmetic_and_bool_comparison"),
-    ),
+    binop("/", corpus("corpus/binop.txt")),
     binop("%", corpus("corpus/binop.txt")),
     binop("^", corpus("corpus/binop.txt")),
     word_binop("atan2"),
