@@ -28,6 +28,7 @@ use promql_parser::parser::{BinModifier, BinaryExpr, LabelModifier, VectorMatchC
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL};
 
 use crate::eval::{Error, Evaluator, InstantSample, InstantVector, QueryWindow, Value};
+use crate::histogram::FloatHistogram;
 use crate::source::SeriesSource;
 
 /// Evaluate a `BinaryExpr` at one instant: evaluate both operands, then
@@ -86,13 +87,13 @@ pub(crate) fn eval_binary(
     match (lhs, rhs) {
         (Value::Scalar(l), Value::Scalar(r)) => Ok(Value::Scalar(eval_scalar_scalar(op, l, r))),
         (Value::Scalar(l), Value::Vector(r)) => {
-            eval_scalar_vector(op, l, r, &modifier, true).map(Value::Vector)
+            eval_scalar_vector(op, l, r, &modifier, true, ctx).map(Value::Vector)
         }
         (Value::Vector(l), Value::Scalar(r)) => {
-            eval_scalar_vector(op, r, l, &modifier, false).map(Value::Vector)
+            eval_scalar_vector(op, r, l, &modifier, false, ctx).map(Value::Vector)
         }
         (Value::Vector(l), Value::Vector(r)) => {
-            eval_vector_vector(op, l, r, &modifier).map(Value::Vector)
+            eval_vector_vector(op, l, r, &modifier, ctx).map(Value::Vector)
         }
         (l, r) => Err(Error::Unsupported {
             construct: format!(
@@ -119,26 +120,61 @@ fn is_arithmetic(op: TokenId) -> bool {
     matches!(op, T_ADD | T_SUB | T_MUL | T_DIV | T_MOD | T_POW | T_ATAN2)
 }
 
-/// Whether any element of `v` is a native-histogram sample.
-fn has_histogram(v: &InstantVector) -> bool {
-    v.iter().any(|s| s.histogram.is_some())
+/// A binary operator's source symbol, for the info annotation raised when a
+/// histogram-carrying pair falls outside the supported set. Only the
+/// arithmetic and comparison tokens reach [`combine_value`]; the catch-all
+/// keeps this total without an `unreachable!`.
+fn op_symbol(op: TokenId) -> &'static str {
+    match op {
+        T_ADD => "+",
+        T_SUB => "-",
+        T_MUL => "*",
+        T_DIV => "/",
+        T_MOD => "%",
+        T_POW => "^",
+        T_ATAN2 => "atan2",
+        T_EQLC => "==",
+        T_NEQ => "!=",
+        T_GTR => ">",
+        T_LSS => "<",
+        T_GTE => ">=",
+        T_LTE => "<=",
+        _ => "?",
+    }
 }
 
-/// Native-histogram arithmetic/comparison is not yet implemented (issue
-/// #524): [`combine_value`] and its callers only ever read `l`/`r` as plain
-/// `f64`, so a histogram element's real value is invisible to them and its
-/// `value` field is a meaningless `0.0` placeholder (see
-/// [`crate::eval::InstantSample::histogram`]'s doc comment). Combining that
-/// placeholder would silently fabricate a wrong answer -- exactly the
-/// defect this guard exists to prevent -- so every arithmetic/comparison
-/// binop rejects histogram-carrying operands with a typed error instead.
-/// Set operators (`and`/`or`/`unless`) are unaffected: they pass matched
-/// [`InstantSample`](crate::eval::InstantSample)s through unchanged (label
-/// matching only, no value combination), so they already handle histogram
-/// operands correctly and are not guarded here.
-fn histogram_binop_unsupported() -> Error {
-    Error::Unsupported {
-        construct: "binary operator over native histograms".to_string(),
+/// Prometheus' `IncompatibleTypesInBinOpInfo` message: the operator is not
+/// defined for this histogram/float operand pairing, so the sample is dropped
+/// and this info is raised. Matches Prometheus' wording so the differential
+/// harness (which compares the `infos` channel by presence) and a reader see
+/// the same text.
+fn incompatible_types_info(op: TokenId, lhs_is_histogram: bool, rhs_is_histogram: bool) -> String {
+    let ty = |is_hist: bool| if is_hist { "histogram" } else { "float" };
+    format!(
+        "incompatible sample types encountered for binary operator \"{sym}\": {lhs} {sym} {rhs}",
+        sym = op_symbol(op),
+        lhs = ty(lhs_is_histogram),
+        rhs = ty(rhs_is_histogram),
+    )
+}
+
+/// The outcome of combining one matched (or scalar-paired) sample: a plain
+/// float, a native histogram, or a drop. A drop is either a filter-mode
+/// comparison that did not hold (no annotation) or a histogram/float pairing
+/// the operator does not define (annotated through [`QueryWindow::info`] by
+/// [`combine_value`] before returning).
+enum Combined {
+    Value(f64),
+    Histogram(FloatHistogram),
+    Drop,
+}
+
+/// Build the output sample for a combined pair, or `None` when it was dropped.
+fn output_sample(combined: Combined, labels: LabelSet, ts_ns: i64) -> Option<InstantSample> {
+    match combined {
+        Combined::Drop => None,
+        Combined::Value(value) => Some(InstantSample::scalar(labels, ts_ns, ts_ns, value)),
+        Combined::Histogram(h) => Some(InstantSample::histogram(labels, ts_ns, ts_ns, h)),
     }
 }
 
@@ -203,25 +239,98 @@ fn eval_scalar_scalar(op: TokenId, l: f64, r: f64) -> f64 {
     }
 }
 
-/// The combined value for one matched (or scalar-paired) sample: `l`/`r`
-/// are the operator's literal left/right values. `filter_value` is what a
-/// filter-mode (non-`bool`) comparison reports when it holds — the
-/// surviving operand's own original value, not necessarily `l` (e.g. `5 <
-/// vector` keeps the vector's value, even though it is `r`). Returns `None`
-/// when a filter-mode comparison does not hold, meaning the pair is
-/// dropped.
-fn combine_value(op: TokenId, l: f64, r: f64, return_bool: bool, filter_value: f64) -> Option<f64> {
+/// Combine one matched (or scalar-paired) pair. `lhs`/`rhs` carry the
+/// operator's literal left/right operands as `(value, histogram)`; the
+/// histogram is `Some` for a native-histogram element and `None` for a plain
+/// float. `filter` is the operand a filter-mode (non-`bool`) comparison
+/// reports when it holds — the surviving operand's own value/histogram, not
+/// necessarily `lhs` (e.g. `5 < vector` keeps the vector's value, even though
+/// it is the right operand).
+///
+/// The supported histogram set, pinned empirically against the Prometheus
+/// v3.13.1 binary (issue #1700): `histogram + histogram`,
+/// `histogram - histogram`, `histogram * float`, `float * histogram`,
+/// `histogram / float`, and `==`/`!=` between two histograms. Every other
+/// pairing that carries a histogram drops the sample and raises an info
+/// annotation. A filter-mode comparison that does not hold drops without an
+/// annotation, exactly as for floats.
+fn combine_value(
+    op: TokenId,
+    lhs: (f64, Option<&FloatHistogram>),
+    rhs: (f64, Option<&FloatHistogram>),
+    return_bool: bool,
+    filter: (f64, Option<&FloatHistogram>),
+    ctx: &QueryWindow,
+) -> Combined {
+    let (lv, lh) = lhs;
+    let (rv, rh) = rhs;
+    let unsupported = |ctx: &QueryWindow| {
+        ctx.info(incompatible_types_info(op, lh.is_some(), rh.is_some()));
+        Combined::Drop
+    };
+
     if is_comparison(op) {
-        let holds = apply_cmp(op, l, r);
-        if return_bool {
-            Some(if holds { 1.0 } else { 0.0 })
-        } else if holds {
-            Some(filter_value)
-        } else {
-            None
+        match (lh, rh) {
+            (None, None) => {
+                let holds = apply_cmp(op, lv, rv);
+                if return_bool {
+                    Combined::Value(if holds { 1.0 } else { 0.0 })
+                } else if holds {
+                    Combined::Value(filter.0)
+                } else {
+                    Combined::Drop
+                }
+            }
+            // Only equality is defined between two histograms; ordering is not.
+            (Some(a), Some(b)) if matches!(op, T_EQLC | T_NEQ) => {
+                let holds = if op == T_EQLC {
+                    a.equals(b)
+                } else {
+                    !a.equals(b)
+                };
+                if return_bool {
+                    Combined::Value(if holds { 1.0 } else { 0.0 })
+                } else if holds {
+                    match filter.1 {
+                        Some(h) => Combined::Histogram(h.clone()),
+                        None => Combined::Value(filter.0),
+                    }
+                } else {
+                    Combined::Drop
+                }
+            }
+            _ => unsupported(ctx),
         }
     } else {
-        Some(apply_arith(op, l, r))
+        match (op, lh, rh) {
+            (_, None, None) => Combined::Value(apply_arith(op, lv, rv)),
+            (T_ADD, Some(a), Some(b)) => {
+                let mut out = a.clone();
+                out.add_assign(b);
+                Combined::Histogram(out)
+            }
+            (T_SUB, Some(a), Some(b)) => {
+                let mut out = a.clone();
+                out.sub_assign(b);
+                Combined::Histogram(out)
+            }
+            (T_MUL, Some(a), None) => {
+                let mut out = a.clone();
+                out.mul(rv);
+                Combined::Histogram(out)
+            }
+            (T_MUL, None, Some(b)) => {
+                let mut out = b.clone();
+                out.mul(lv);
+                Combined::Histogram(out)
+            }
+            (T_DIV, Some(a), None) => {
+                let mut out = a.clone();
+                out.div(rv);
+                Combined::Histogram(out)
+            }
+            _ => unsupported(ctx),
+        }
     }
 }
 
@@ -234,31 +343,30 @@ fn eval_scalar_vector(
     vector: InstantVector,
     modifier: &BinModifier,
     scalar_is_lhs: bool,
+    ctx: &QueryWindow,
 ) -> Result<InstantVector, Error> {
-    if has_histogram(&vector) {
-        return Err(histogram_binop_unsupported());
-    }
     let drop_name = should_drop_metric_name(op, modifier.return_bool);
     let mut out = Vec::with_capacity(vector.len());
     for s in vector {
-        let (l, r) = if scalar_is_lhs {
-            (scalar, s.value)
+        let (lhs, rhs) = if scalar_is_lhs {
+            ((scalar, None), (s.value, s.histogram.as_ref()))
         } else {
-            (s.value, scalar)
+            ((s.value, s.histogram.as_ref()), (scalar, None))
         };
-        if let Some(value) = combine_value(op, l, r, modifier.return_bool, s.value) {
-            let labels = if drop_name {
-                crate::eval::drop_metric_name(s.labels)
-            } else {
-                s.labels
-            };
-            out.push(InstantSample {
-                labels,
-                ts_ns: s.ts_ns,
-                orig_sample_ts_ns: s.ts_ns,
-                value,
-                histogram: None,
-            });
+        // A filter-mode comparison always reports the vector operand's own
+        // value/histogram, regardless of the scalar's position.
+        let filter = (s.value, s.histogram.as_ref());
+        let combined = combine_value(op, lhs, rhs, modifier.return_bool, filter, ctx);
+        if matches!(combined, Combined::Drop) {
+            continue;
+        }
+        let labels = if drop_name {
+            crate::eval::drop_metric_name(s.labels)
+        } else {
+            s.labels
+        };
+        if let Some(sample) = output_sample(combined, labels, s.ts_ns) {
+            out.push(sample);
         }
     }
     Ok(out)
@@ -272,6 +380,7 @@ fn eval_vector_vector(
     lhs: InstantVector,
     rhs: InstantVector,
     modifier: &BinModifier,
+    ctx: &QueryWindow,
 ) -> Result<InstantVector, Error> {
     if is_set_operator(op) {
         let matching = modifier.matching.as_ref();
@@ -285,16 +394,13 @@ fn eval_vector_vector(
             _ => unreachable!("is_set_operator matched an unhandled token"),
         });
     }
-    if has_histogram(&lhs) || has_histogram(&rhs) {
-        return Err(histogram_binop_unsupported());
-    }
     match &modifier.card {
-        VectorMatchCardinality::OneToOne => one_to_one(op, lhs, rhs, modifier),
+        VectorMatchCardinality::OneToOne => one_to_one(op, lhs, rhs, modifier, ctx),
         VectorMatchCardinality::ManyToOne(extra) => {
-            group_match(op, lhs, rhs, modifier, extra, true)
+            group_match(op, lhs, rhs, modifier, extra, true, ctx)
         }
         VectorMatchCardinality::OneToMany(extra) => {
-            group_match(op, lhs, rhs, modifier, extra, false)
+            group_match(op, lhs, rhs, modifier, extra, false, ctx)
         }
         VectorMatchCardinality::ManyToMany => Err(Error::Unsupported {
             construct: "many-to-many vector matching for a non-set binary operator".to_string(),
@@ -393,6 +499,7 @@ fn one_to_one(
     lhs: InstantVector,
     rhs: InstantVector,
     modifier: &BinModifier,
+    ctx: &QueryWindow,
 ) -> Result<InstantVector, Error> {
     let matching = modifier.matching.as_ref();
     let mut rhs_map: HashMap<LabelSet, &InstantSample> = HashMap::new();
@@ -414,14 +521,19 @@ fn one_to_one(
         if !matched_sigs.insert(key.clone()) {
             return Err(ambiguous_match_error(&key));
         }
-        if let Some(value) = combine_value(op, l.value, r.value, modifier.return_bool, l.value) {
-            out.push(InstantSample {
-                labels: one_to_one_output_labels(&l.labels, matching, drop_name),
-                ts_ns: l.ts_ns,
-                orig_sample_ts_ns: l.ts_ns,
-                value,
-                histogram: None,
-            });
+        // The surviving value/histogram of a filter-mode comparison is the
+        // literal left operand's own.
+        let combined = combine_value(
+            op,
+            (l.value, l.histogram.as_ref()),
+            (r.value, r.histogram.as_ref()),
+            modifier.return_bool,
+            (l.value, l.histogram.as_ref()),
+            ctx,
+        );
+        let labels = one_to_one_output_labels(&l.labels, matching, drop_name);
+        if let Some(sample) = output_sample(combined, labels, l.ts_ns) {
+            out.push(sample);
         }
     }
     check_unique_output_labels(out)
@@ -441,6 +553,7 @@ fn group_match(
     modifier: &BinModifier,
     extra: &Labels,
     lhs_is_many: bool,
+    ctx: &QueryWindow,
 ) -> Result<InstantVector, Error> {
     let matching = modifier.matching.as_ref();
     let (many, one): (&InstantVector, &InstantVector) = if lhs_is_many {
@@ -464,19 +577,31 @@ fn group_match(
         let Some(o) = one_map.get(&key) else {
             continue;
         };
-        let (l_val, r_val) = if lhs_is_many {
-            (m.value, o.value)
+        // Preserve the query's literal left/right order for the operator and
+        // for a filter-mode comparison's surviving value, regardless of which
+        // side is "many".
+        let (lhs_operand, rhs_operand) = if lhs_is_many {
+            (
+                (m.value, m.histogram.as_ref()),
+                (o.value, o.histogram.as_ref()),
+            )
         } else {
-            (o.value, m.value)
+            (
+                (o.value, o.histogram.as_ref()),
+                (m.value, m.histogram.as_ref()),
+            )
         };
-        if let Some(value) = combine_value(op, l_val, r_val, modifier.return_bool, l_val) {
-            out.push(InstantSample {
-                labels: grouped_output_labels(&m.labels, &o.labels, extra, drop_name),
-                ts_ns: m.ts_ns,
-                orig_sample_ts_ns: m.ts_ns,
-                value,
-                histogram: None,
-            });
+        let combined = combine_value(
+            op,
+            lhs_operand,
+            rhs_operand,
+            modifier.return_bool,
+            lhs_operand,
+            ctx,
+        );
+        let labels = grouped_output_labels(&m.labels, &o.labels, extra, drop_name);
+        if let Some(sample) = output_sample(combined, labels, m.ts_ns) {
+            out.push(sample);
         }
     }
     check_unique_output_labels(out)
@@ -591,16 +716,6 @@ mod tests {
             negative_buckets: Vec::new(),
             custom_values: Vec::new(),
         }
-    }
-
-    fn expect_histogram_binop_unsupported(err: Error) {
-        let Error::Unsupported { construct } = err else {
-            panic!("expected Unsupported, got {err:?}");
-        };
-        assert!(
-            construct.contains("binary operator over native histograms"),
-            "construct {construct:?} should name the histogram-binop construct"
-        );
     }
 
     fn source() -> TestSource {
@@ -799,7 +914,8 @@ mod tests {
             card: VectorMatchCardinality::ManyToMany,
             ..BinModifier::default()
         };
-        let err = super::eval_vector_vector(T_ADD, Vec::new(), Vec::new(), &modifier)
+        let ctx = crate::eval::QueryWindow::for_test();
+        let err = super::eval_vector_vector(T_ADD, Vec::new(), Vec::new(), &modifier, &ctx)
             .expect_err("must reject, not panic");
         let Error::Unsupported { construct } = err else {
             panic!("expected Error::Unsupported, got {err:?}");
@@ -1092,55 +1208,116 @@ mod tests {
         assert!(matches!(err, Error::AmbiguousMatch { .. }));
     }
 
-    /// Issue #524: a binop over a native histogram must be a typed error,
-    /// never a silently fabricated float computed from the histogram
-    /// element's meaningless placeholder `value` (always `0.0`).
+    /// Issue #1700: `histogram * scalar` scales every population, matching the
+    /// pinned Prometheus binary. Reverting the fix (restoring the histogram
+    /// guard in `eval_scalar_vector`) makes `instant(..).expect(..)` panic
+    /// here, before any count/sum assertion runs, because the pre-fix code
+    /// returned `Error::Unsupported` for this query.
     #[test]
-    fn scalar_vector_arithmetic_over_histogram_is_unsupported() {
+    fn scalar_vector_multiplication_scales_the_histogram() {
         let src = TestSource::new()
             .with_histogram_series(&[("__name__", "h"), ("job", "x")], &[(0, nh(6.0, 42.0))])
             .expect("valid histogram series");
-        let err = Evaluator::new()
+        let v = Evaluator::new()
             .instant(&src, "h * 2", 0)
-            .expect_err("h * 2 must be rejected, not silently computed on a placeholder 0.0");
-        expect_histogram_binop_unsupported(err);
+            .expect("h * 2 must scale the histogram, not be rejected");
+        assert_eq!(v.len(), 1);
+        let h = v[0]
+            .histogram
+            .as_ref()
+            .expect("the result element must carry a histogram");
+        assert_eq!(h.observation_count(), 12.0, "count scaled by 2");
+        assert_eq!(h.observation_sum(), 84.0, "sum scaled by 2");
+        assert_eq!(v[0].value, 0.0, "a histogram element's float value is 0.0");
     }
 
+    /// Issue #1700: `histogram + histogram` sums the populations, matching the
+    /// pinned Prometheus binary.
     #[test]
-    fn vector_vector_arithmetic_over_two_histograms_is_unsupported() {
+    fn vector_vector_addition_over_two_histograms_sums_populations() {
         let src = TestSource::new()
             .with_histogram_series(&[("__name__", "h"), ("job", "x")], &[(0, nh(6.0, 42.0))])
             .expect("valid histogram series");
-        let err = Evaluator::new()
+        let v = Evaluator::new()
             .instant(&src, "h + h", 0)
-            .expect_err("h + h must be rejected, not silently computed on placeholder 0.0s");
-        expect_histogram_binop_unsupported(err);
+            .expect("h + h must sum the histograms, not be rejected");
+        assert_eq!(v.len(), 1);
+        let h = v[0]
+            .histogram
+            .as_ref()
+            .expect("the result element must carry a histogram");
+        assert_eq!(h.observation_count(), 12.0);
+        assert_eq!(h.observation_sum(), 84.0);
     }
 
+    /// Issue #1700: a comparison between a histogram and a float is not defined
+    /// (only `==`/`!=` between two histograms is), so the sample is dropped and
+    /// exactly one info annotation is raised, read back through
+    /// `eval_instant_annotated`. The difftest comparator matches the `infos`
+    /// channel by presence, so this behavior is what pins the corpus cell.
     #[test]
-    fn vector_vector_arithmetic_mixed_histogram_and_float_is_unsupported() {
-        // Histogram on the lhs, plain float on the rhs: the guard must fire
-        // regardless of which side carries the histogram.
-        let src = TestSource::new()
-            .with_histogram_series(&[("__name__", "h"), ("job", "x")], &[(0, nh(6.0, 42.0))])
-            .expect("valid histogram series")
-            .with_series(&[("__name__", "f"), ("job", "x")], &[(0, 3.0)])
-            .expect("valid series");
-        let err = Evaluator::new()
-            .instant(&src, "h + on(job) f", 0)
-            .expect_err("h + f must be rejected: h's value is a meaningless placeholder");
-        expect_histogram_binop_unsupported(err);
-    }
-
-    #[test]
-    fn comparison_over_histogram_is_unsupported() {
+    fn comparison_over_histogram_drops_and_annotates() {
         let src = TestSource::new()
             .with_histogram_series(&[("__name__", "h"), ("job", "x")], &[(0, nh(6.0, 42.0))])
             .expect("valid histogram series");
-        let err = Evaluator::new()
-            .instant(&src, "h > 5", 0)
-            .expect_err("comparing a histogram's placeholder value must be rejected");
-        expect_histogram_binop_unsupported(err);
+        let (value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&src, "h > 5", 0)
+            .expect("h > 5 must succeed with a dropped sample, not error");
+        match value {
+            Value::Vector(v) => assert!(v.is_empty(), "the histogram sample must be dropped"),
+            other => panic!("expected an empty vector, got {other:?}"),
+        }
+        assert_eq!(
+            annotations.infos().len(),
+            1,
+            "exactly one info annotation for the dropped incompatible comparison"
+        );
+        assert!(
+            annotations.warnings().is_empty(),
+            "no warning, only an info"
+        );
+    }
+
+    /// Issue #1700: `histogram == histogram` in filter mode keeps the surviving
+    /// left histogram unchanged when the two are equal, and raises no
+    /// annotation (it is a supported operation).
+    #[test]
+    fn equality_over_two_equal_histograms_keeps_the_left_histogram() {
+        let src = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "x")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let (value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&src, "h == h", 0)
+            .expect("h == h must succeed");
+        let Value::Vector(v) = value else {
+            panic!("expected a vector result");
+        };
+        assert_eq!(v.len(), 1);
+        let h = v[0].histogram.as_ref().expect("carries the left histogram");
+        assert_eq!(h.observation_count(), 6.0);
+        assert_eq!(h.observation_sum(), 42.0);
+        assert!(
+            annotations.is_empty(),
+            "a supported comparison raises nothing"
+        );
+    }
+
+    /// Issue #1700: an unsupported arithmetic pairing (a histogram divided by
+    /// a histogram) drops the sample and raises one info annotation, rather
+    /// than fabricating a value.
+    #[test]
+    fn division_of_two_histograms_drops_and_annotates() {
+        let src = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "x")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let (value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&src, "h / h", 0)
+            .expect("h / h must succeed with a dropped sample, not error");
+        let Value::Vector(v) = value else {
+            panic!("expected a vector result");
+        };
+        assert!(v.is_empty(), "histogram / histogram is not defined");
+        assert_eq!(annotations.infos().len(), 1);
     }
 
     /// Set operators pass matched samples through unchanged (no value
