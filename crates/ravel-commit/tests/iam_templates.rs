@@ -5979,3 +5979,64 @@ fn commit_prefix_is_deletable_and_the_contract_bounds_its_retention() {
          the bounded compliance-mode retention this doc claim describes"
     );
 }
+
+/// The three operator-facing docs that restate the compliance-mode claim must
+/// restate the *qualified* form. The contract scopes "never a target" to three
+/// named mechanisms (supersession GC, retention deletion, subject erasure);
+/// each guide previously widened that into a universal ("never sweep
+/// targets", "never deleted by a maintenance sweep", "nothing ever deletes
+/// them"), which is false: `sweep_unreferenced_catalog_objects` deletes every
+/// catalog snapshot and index object the current HEAD no longer names, and
+/// those keys are inside the locked `t/*/catalog/*/*` family.
+///
+/// The test above reverts to green if any of these three files is reverted,
+/// because it reads only the contract page. This one is the per-file pin: each
+/// row names the phrase only the corrected text carries and the universal the
+/// correction retired, so reverting one file fails one named assertion.
+const CATALOG_SWEEP_DOC_CLAIMS: &[(&str, &str, &[&str])] = &[
+    (
+        "docs/deletion-and-gc.md",
+        "unreferenced-catalog sweep",
+        &["are never sweep targets"],
+    ),
+    (
+        "docs/guides/disaster-recovery.md",
+        "unreferenced-catalog sweep",
+        &[
+            "never targets of the sweeps",
+            "nothing ever deletes",
+            "locking those three is free",
+        ],
+    ),
+    (
+        "docs/guides/operations/deployment.md",
+        "unreferenced-catalog sweep",
+        &[
+            "never deleted by a maintenance sweep",
+            "costs nothing beyond the mechanism itself",
+        ],
+    ),
+];
+
+#[test]
+fn guides_qualify_the_catalog_family_sweep_claim() {
+    for (rel, required, retired) in CATALOG_SWEEP_DOC_CLAIMS {
+        let path = format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"));
+        let doc = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        assert!(
+            doc.contains(required),
+            "{rel} must name the {required:?} as a deleter of objects under \
+             t/*/catalog/*/*, or it is back to claiming that locking the \
+             catalog family costs nothing"
+        );
+        for phrase in *retired {
+            assert!(
+                !doc.contains(phrase),
+                "{rel} still carries the retired universal {phrase:?}; \
+                 sweep_unreferenced_catalog_objects deletes catalog snapshot \
+                 and index objects, so no doc may say a maintenance sweep \
+                 never touches that family"
+            );
+        }
+    }
+}

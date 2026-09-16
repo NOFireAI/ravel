@@ -622,14 +622,43 @@ into them. An operator with erasure obligations must budget them deliberately.
   docs/object-store-contract.md "Required bucket configuration", ADR-0072
   decision 3), a superseded commit record still under its retention period
   `R` refuses the same sweep delete `+D` describes: `sweep_superseded`
-  deletes a chain's input commit records before its input data objects, so
-  a locked record blocks that delete and the data-delete step never runs
-  for that chain, holding the physical-removal bound at `max(bound, R)`
-  until `R` elapses. `sys/*`, `t/*/*/prov`, and `t/*/catalog/*/*` HEAD
-  history carry the same scoped retention but are never sweep targets, so
-  `+R` applies to commit records only. Keep `R` inside `protection_horizon`
+  deletes a chain's input commit records before its input data objects,
+  and it runs the record-delete loop over every cleared group in the pass
+  before the data-delete loop runs at all, so a single locked record
+  aborts that pass at the record-delete step and the data-delete step
+  never runs for any chain in it, holding the physical-removal bound at
+  `max(bound, R)` until `R` elapses. `sys/*`, `t/*/*/prov`, and
+  `t/*/catalog/*/*` carry the same scoped retention but are never targets
+  of supersession GC, ADR-0019 retention deletion, or ADR-0064 erasure, so
+  `+R` applies to commit records only. That is a statement about those
+  three mechanisms and nothing wider: the catalog family is swept by a
+  fourth one, the unreferenced-catalog sweep, whose cost is storage rather
+  than erasure latency (below). Keep `R` inside `protection_horizon`
   (about 25 h with defaults) so the sweep keeps making progress on
   superseded chains.
+
+- **not a bound, but a cost of the same lock: unreferenced catalog
+  objects.** `sweep_unreferenced_catalog_objects`
+  (`crates/ravel-maintain/src/sweep.rs`, driven in production by
+  `services/ravel-server/src/maintain.rs`'s maintenance tick) deletes
+  every snapshot part under `catalog/<signal>/snap/` and every
+  name-postings or column-statistics object under `catalog/<signal>/idx/`
+  that the current HEAD no longer names, once it is older than
+  `protection_horizon`. Those keys sit inside `t/*/catalog/*/*`, so a
+  scoped retention applied to the whole catalog keyspace refuses those
+  deletes for `R` too. This adds nothing to any erasure bound: catalog
+  snapshot entries, name postings, and column statistics hold identities,
+  hashes, counts, timestamps, and metric names only, never a label or
+  attribute value (ADR-0064 Context and its §7 requirement), so no catalog
+  object can hold a subject value and erasure neither rewrites nor deletes
+  one. What it costs is reclamation. The sweep's delete loop propagates
+  the first refusal, so one locked object aborts that `(tenant, signal)`
+  pass and the unreferenced objects behind it in the same pass are left in
+  place as well; the production driver logs the failed pass and retries on
+  the next maintenance tick, where the same object refuses again, so that
+  tenant and signal's catalog garbage accumulates until `R` elapses. Keep
+  `R` inside `protection_horizon` here for the same reason, or scope the
+  retention mechanism to `catalog/<signal>/HEAD` alone.
 
 - **`+E_v`, bucket versioning.** On a versioned bucket every physical delete
   becomes a soft delete, and the noncurrent version survives until the

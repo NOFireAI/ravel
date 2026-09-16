@@ -72,16 +72,30 @@ configuration section; this is the operational summary.
 Object Lock enabled on the bucket, versioning, and the lifecycle rules that go
 with erasure obligations are bucket-layer settings. The compliance-mode
 retention on the control prefixes (`sys/*`, the provisioning records, commit
-records and the catalog HEAD history) is per-object retention that an
+records and the catalog keyspace `t/*/catalog/*/*`) is per-object retention
+that an
 operator-run mechanism applies, because Object Lock has no prefix scope of its
 own; the contract page describes the two shapes that mechanism can take. Three
-of those four prefix families are never deleted by a maintenance sweep, so
-locking them costs nothing beyond the mechanism itself. The commit records
-are: a maintenance sweep physically removes a superseded commit record, and a
+of those four prefix families are never touched by the three mechanisms that
+physically remove tenant data (supersession GC, retention deletion, and
+subject erasure), so locking them costs nothing against those three. The commit records are: a maintenance sweep physically
+removes a superseded commit record, and a
 still-locked one refuses that delete until its retention period elapses, so
 the retention period chosen for commit records is also a bound on how long
 that sweep can pause; the contract page's "Required bucket configuration"
 names the default window to keep it inside.
+
+One of the other three families does carry a further cost, and it is a
+maintenance cost rather than an erasure one. The catalog keyspace is swept:
+the unreferenced-catalog sweep deletes the snapshot and index objects under
+`t/*/catalog/*/snap/` and `t/*/catalog/*/idx/` that the current HEAD no longer
+names. A retention applied to the whole keyspace refuses those deletes until
+it elapses, and one refused delete aborts that pass for the tenant and signal
+it was running on, so the rest of that pass's garbage is left behind too and
+the next tick retries. No subject value can live in a catalog object, so this
+delays reclamation, not erasure. Either keep the retention period inside the
+same window as for commit records, or scope the mechanism to the HEAD pointer
+alone.
 
 **One lifecycle rule is not optional for any bucket Ravel writes to.**
 Configure `AbortIncompleteMultipartUpload` with a cleanup period of seven days

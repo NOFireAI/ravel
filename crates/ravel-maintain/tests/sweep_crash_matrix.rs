@@ -303,9 +303,11 @@ async fn row8_records_deleted_data_not_orphan_gc_converges() {
 /// refuses every delete attempt against it, not just the first. The
 /// superseded sweep's record-delete loop runs before its data-delete loop
 /// (docs/deletion-and-gc.md, docs/object-store-contract.md "Required bucket
-/// configuration"), so a record that never stops faulting aborts the pass at
-/// the record loop and the data loop after it never runs: the L0 data the
-/// pass would otherwise collect is left exactly as it was.
+/// configuration"), and the record loop covers every cleared group in the
+/// pass before the data loop runs at all, so a record that never stops
+/// faulting aborts the pass at the record loop and the data loop never runs
+/// for any chain in it. The pass must therefore leave both counts exactly as
+/// they were: no commit record deleted, and no L0 data object either.
 #[tokio::test]
 async fn row8b_locked_commit_record_delete_blocks_before_data_loop() {
     async fn run(sig: Sig) {
@@ -322,6 +324,11 @@ async fn row8b_locked_commit_record_delete_blocks_before_data_loop() {
         clock.set(past_horizon(created, &cfg()));
         let before_data = l0_data_count(&store, &bucket).await;
         assert!(before_data > 0, "L0 data exists before the sweep");
+        let before_records = l0_commit_count(&store, &bucket).await;
+        assert!(
+            before_records > 0,
+            "L0 commit records exist before the sweep"
+        );
 
         let err = sweep_superseded(
             &store,
@@ -340,6 +347,12 @@ async fn row8b_locked_commit_record_delete_blocks_before_data_loop() {
         assert!(
             store.fault_count(Op::Delete, FaultKind::Timeout) >= 1,
             "the record-delete fault must have fired"
+        );
+        assert_eq!(
+            l0_commit_count(&store, &bucket).await,
+            before_records,
+            "a refused record delete must leave every commit record in place: \
+             the pass deleted nothing, not merely nothing of the data"
         );
         assert_eq!(
             l0_data_count(&store, &bucket).await,
