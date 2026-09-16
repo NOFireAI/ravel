@@ -1280,10 +1280,11 @@ async fn probe_lexicographic_listing_order(
     // second literal restated beside the value it must agree with.
     for listing in [ProbeListing::List, ProbeListing::After(None)] {
         let entry_point = listing.method();
-        let (delivered, _pages, _key_bearing_pages) = match drain_probe_pages(store, &list_prefix, listing).await {
-            Ok(result) => result,
-            Err(detail) => return ProbeResult::fail(property, detail),
-        };
+        let (delivered, _pages, _key_bearing_pages) =
+            match drain_probe_pages(store, &list_prefix, listing).await {
+                Ok(result) => result,
+                Err(detail) => return ProbeResult::fail(property, detail),
+            };
         // Check the order on the RAW delivery sequence, before deduplication:
         // the contract's sequence never decreases, and the repeat it permits
         // re-delivers the last key already delivered (equal adjacent keys pass
@@ -1321,11 +1322,11 @@ async fn probe_lexicographic_listing_order(
     // owns the label on every path.
     let tail_listing = ProbeListing::After(Some(&marker));
     let tail_method = tail_listing.method();
-    let (tail_delivered, _pages, _key_bearing_pages) = match drain_probe_pages(store, &list_prefix, tail_listing).await
-    {
-        Ok(result) => result,
-        Err(detail) => return ProbeResult::fail(property, detail),
-    };
+    let (tail_delivered, _pages, _key_bearing_pages) =
+        match drain_probe_pages(store, &list_prefix, tail_listing).await {
+            Ok(result) => result,
+            Err(detail) => return ProbeResult::fail(property, detail),
+        };
     if let Some(key) = tail_delivered.iter().find(|key| *key <= &marker) {
         return ProbeResult::fail(
             property,
@@ -1516,10 +1517,11 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
     // `list_after` caller outside this crate. Naming the entry point tells an
     // operator which path still re-delivers the deleted key.
     for listing in [ProbeListing::List, ProbeListing::After(None)] {
-        let (delivered, _pages, _key_bearing_pages) = match drain_probe_pages(store, &list_prefix, listing).await {
-            Ok(result) => result,
-            Err(detail) => return ProbeResult::fail(property, detail),
-        };
+        let (delivered, _pages, _key_bearing_pages) =
+            match drain_probe_pages(store, &list_prefix, listing).await {
+                Ok(result) => result,
+                Err(detail) => return ProbeResult::fail(property, detail),
+            };
         let distinct = distinct_in_delivery_order(&delivered);
         if distinct != expected {
             return ProbeResult::fail(
@@ -1545,10 +1547,11 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
         );
     }
     for listing in [ProbeListing::List, ProbeListing::After(None)] {
-        let (delivered, _pages, _key_bearing_pages) = match drain_probe_pages(store, &list_prefix, listing).await {
-            Ok(result) => result,
-            Err(detail) => return ProbeResult::fail(property, detail),
-        };
+        let (delivered, _pages, _key_bearing_pages) =
+            match drain_probe_pages(store, &list_prefix, listing).await {
+                Ok(result) => result,
+                Err(detail) => return ProbeResult::fail(property, detail),
+            };
         let distinct = distinct_in_delivery_order(&delivered);
         if distinct != expected {
             return ProbeResult::fail(
@@ -2437,7 +2440,8 @@ mod tests {
     #[tokio::test]
     async fn a_backend_with_a_delete_stale_on_list_after_fails_qualification() {
         let store = WeakDeleteOnListAfterStore::new();
-        let report = run_conformance_suite(&store, "sys/qualify/delete-stale-list-after/", 1000).await;
+        let report =
+            run_conformance_suite(&store, "sys/qualify/delete-stale-list-after/", 1000).await;
         assert!(
             !report.passed(),
             "a delete invisible through list_after must not qualify even when list is correct"
@@ -3255,9 +3259,10 @@ mod tests {
 
         // The repeat really fired: seven deliveries of five keys, never
         // decreasing, with the two repeats adjacent to the key they repeat.
-        let (delivered, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
-            .await
-            .expect("draining the probe's own prefix");
+        let (delivered, pages, _key_bearing_pages) =
+            drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
+                .await
+                .expect("draining the probe's own prefix");
         assert_eq!(
             delivered,
             vec![
@@ -3333,9 +3338,10 @@ mod tests {
         // The repeat fired on the list pass: seven deliveries of five keys
         // across three pages, never decreasing, with each repeat adjacent to
         // the key it repeats.
-        let (delivered, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
-            .await
-            .expect("draining the probe's own prefix through list");
+        let (delivered, pages, _key_bearing_pages) =
+            drain_probe_pages(&store, &list_prefix, ProbeListing::List)
+                .await
+                .expect("draining the probe's own prefix through list");
         assert_eq!(
             delivered,
             vec![
@@ -3394,9 +3400,10 @@ mod tests {
         // The repeat really fired, and on the pass under test: the raw
         // sequence holds seven deliveries of five keys, and its first
         // backwards step is the repeated key after a larger one.
-        let (delivered, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
-            .await
-            .expect("draining the probe's own prefix");
+        let (delivered, pages, _key_bearing_pages) =
+            drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
+                .await
+                .expect("draining the probe's own prefix");
         assert_eq!(
             delivered,
             vec![
@@ -3728,9 +3735,10 @@ mod tests {
 
         // The repeat fired on the list pass: seven deliveries of five keys
         // across three pages, going backwards once at the repeated earlier key.
-        let (delivered, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
-            .await
-            .expect("draining the probe's own prefix through list");
+        let (delivered, pages, _key_bearing_pages) =
+            drain_probe_pages(&store, &list_prefix, ProbeListing::List)
+                .await
+                .expect("draining the probe's own prefix through list");
         assert_eq!(
             delivered,
             vec![
@@ -3921,9 +3929,10 @@ mod tests {
         );
 
         // list is reversed across three pages, list_after is untouched.
-        let (via_list, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
-            .await
-            .expect("draining list");
+        let (via_list, pages, _key_bearing_pages) =
+            drain_probe_pages(&store, &list_prefix, ProbeListing::List)
+                .await
+                .expect("draining list");
         assert_eq!(
             via_list,
             vec![
@@ -3981,13 +3990,15 @@ mod tests {
 
         // list is in order; list_after's full drain is reversed across three
         // pages.
-        let (via_list, _pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
-            .await
-            .expect("draining list");
+        let (via_list, _pages, _key_bearing_pages) =
+            drain_probe_pages(&store, &list_prefix, ProbeListing::List)
+                .await
+                .expect("draining list");
         assert_eq!(first_order_violation(&via_list), None);
-        let (via_after, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
-            .await
-            .expect("draining list_after");
+        let (via_after, pages, _key_bearing_pages) =
+            drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
+                .await
+                .expect("draining list_after");
         assert_eq!(
             via_after,
             vec![
