@@ -73,29 +73,43 @@ Object Lock enabled on the bucket, versioning, and the lifecycle rules that go
 with erasure obligations are bucket-layer settings. The compliance-mode
 retention on the control prefixes (`sys/*`, the provisioning records, commit
 records and the catalog keyspace `t/*/catalog/*/*`) is per-object retention
-that an
-operator-run mechanism applies, because Object Lock has no prefix scope of its
-own; the contract page describes the two shapes that mechanism can take. Three
-of those four prefix families are never touched by the three mechanisms that
-physically remove tenant data (supersession GC, retention deletion, and
-subject erasure), so locking them costs nothing against those three. The commit records are: a maintenance sweep physically
-removes a superseded commit record, and a
-still-locked one refuses that delete until its retention period elapses, so
-the retention period chosen for commit records is also a bound on how long
-that sweep can pause; the contract page's "Required bucket configuration"
-names the default window to keep it inside.
+that an operator-run mechanism applies, because Object Lock has no prefix
+scope of its own; the contract page describes the two shapes that mechanism
+can take. Three of those four prefix families are never touched by the three
+mechanisms that physically remove tenant data (supersession GC, retention
+deletion, and subject erasure), so locking them costs nothing against those
+three. Commit records are not exempt even that far: a maintenance sweep
+physically removes a superseded commit record, and a still-locked one refuses
+that delete until its retention period elapses, so the retention period chosen
+for commit records is also a bound on how long that sweep can pause; the
+contract page's "Required bucket configuration" names the default window to
+keep it inside.
 
-One of the other three families does carry a further cost, and it is a
-maintenance cost rather than an erasure one. The catalog keyspace is swept:
-the unreferenced-catalog sweep deletes the snapshot and index objects under
-`t/*/catalog/*/snap/` and `t/*/catalog/*/idx/` that the current HEAD no longer
-names. A retention applied to the whole keyspace refuses those deletes until
-it elapses, and one refused delete aborts that pass for the tenant and signal
-it was running on, so the rest of that pass's garbage is left behind too and
-the next tick retries. No subject value can live in a catalog object, so this
-delays reclamation, not erasure. Either keep the retention period inside the
-same window as for commit records, or scope the mechanism to the HEAD pointer
-alone.
+One of the other three families does carry a further cost, from a fourth
+mechanism. The catalog keyspace is swept: the unreferenced-catalog sweep
+deletes the snapshot and index objects under `t/*/catalog/*/snap/` and
+`t/*/catalog/*/idx/` that the current HEAD no longer names. A retention
+applied to the whole keyspace refuses those deletes until it elapses, and one
+refused delete aborts that pass for the tenant and signal it was running on,
+so the rest of that pass's garbage is left behind too and the next tick
+retries.
+
+Whether that is only a maintenance cost depends on the tenant. The catalog
+HEAD, the snapshot entries and the name postings hold identities, hashes,
+counts, timestamps and metric names, so for them the retention delays
+reclamation. The per-part column-statistics objects under `idx/` are the
+exception: when a tenant declares an attribute key such as `user.id` as a
+typed string or bytes column, the fold stores that column's exact minimum,
+exact maximum and exact distinct-value dictionary, so a subject's own value is
+held verbatim. Erasure writes new catalog objects and swaps HEAD rather than
+rewriting the old ones, which leaves the stale column-statistics object
+unreferenced, and this sweep is the only thing that deletes it. For any tenant
+with a typed string or bytes attribute column, a retention over the whole
+catalog keyspace therefore holds an erased subject's value for the full
+retention period, which extends the erasure bound just as a locked commit
+record does. Keep the retention period inside the same window as for commit
+records, and scope the mechanism to `catalog/<signal>/HEAD` alone if that
+erasure bound is unacceptable.
 
 **One lifecycle rule is not optional for any bucket Ravel writes to.**
 Configure `AbortIncompleteMultipartUpload` with a cleanup period of seven days
