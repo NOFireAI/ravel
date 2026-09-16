@@ -330,6 +330,21 @@ query sees. Guarantees:
   docs/guides/operations/maintenance.md "Catalog fold and verify"). The
   `min_commit_token` (read-your-write) path is unaffected: it always GETs its
   exact commit key directly, never through the snapshot.
+- The same exception has a mirror direction: a writer whose own clock lags
+  true time by more than `clock_skew_allowance` (the bound the seal lemma
+  assumes, docs/catalog-and-mvcc.md "Sealed hours") can publish a commit for
+  bucket H after wall time has already sealed it, even though the writer's
+  own clock shows no `max_flush_lifetime` violation. `CreateIfAbsent` does
+  not consult the seal boundary, so the publish succeeds and the record is
+  invisible to non-token queries the same way as the folder-fast case above,
+  until a HEAD rebuild. This direction has no dedicated alarm; it is only
+  caught after the fact, and by the same mechanism: the scheduled
+  seal-divergence scrubber (`services/ravel-server/src/scrub.rs`,
+  `run_seal_divergence_tick`, run on the fold cadence) re-lists sealed commit
+  records and diffs them against the snapshot, and a late slow-writer commit
+  surfaces as a `missing` entry (`SealDivergenceReport::missing`, exported as
+  the `ravel_scrub_seal_divergence_total` counter). No new refusal is added
+  for this case.
 
 The fold protocol (the CAS'd HEAD pointer, watermark computation, and how
 each degraded path resolves) is in docs/catalog-and-mvcc.md.
