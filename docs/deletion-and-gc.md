@@ -657,7 +657,9 @@ into them. An operator with erasure obligations must budget them deliberately.
   repeated `DictEntry` dictionary, `ColumnValue` admits `str_utf8` and
   `bytes_val` (proto/ravel/catalog.proto), the fold tallies a declared
   `Str` or `Bytes` column's exact min, max, and distinct-value dictionary
-  (`crates/ravel-catalog/src/column_stats_build.rs`), and a tenant may
+  (`crates/ravel-catalog/src/column_stats_build.rs`; the dictionary is
+  kept only up to a fixed entry cap and dropped past it, the min and max
+  are always kept), and a tenant may
   declare any attribute key, `user.id` among them, as a `STR` typed
   attribute column (proto/ravel/sys.proto). So for a tenant with a `STR`
   or `BYTES` typed attribute column, an erased subject's value can sit
@@ -759,7 +761,8 @@ into them. An operator with erasure obligations must budget them deliberately.
     value either. The per-part `.cstat` column-statistics objects are the
     exception the `+R` modifier above sets out: for a tenant with a `STR` or
     `BYTES` typed attribute column they hold that column's exact min, max,
-    and distinct-value dictionary, so an erased subject's own value can sit
+    and distinct-value dictionary (the dictionary only up to a fixed entry
+    cap; the min and max always), so an erased subject's own value can sit
     in one verbatim. So the deny-deleted `prov` and `sys/*` prefixes hold
     nothing an erasure subject can match, while the `catalog/` prefix does:
     the deny list's "disjoint by construction" claim no longer holds for the

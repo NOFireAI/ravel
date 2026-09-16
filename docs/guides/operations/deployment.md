@@ -100,8 +100,9 @@ counts, timestamps and metric names, so for them the retention delays
 reclamation. The per-part column-statistics objects under `idx/` are the
 exception: when a tenant declares an attribute key such as `user.id` as a
 typed string or bytes column, the fold stores that column's exact minimum,
-exact maximum and exact distinct-value dictionary, so a subject's own value is
-held verbatim.
+exact maximum and exact distinct-value dictionary (the dictionary only up to
+a fixed entry cap; the minimum and maximum always), so a subject's own value
+is held verbatim.
 
 Erasure does not rewrite that object, and it does not refresh the catalog
 either. The erasure rewrite publishes new data objects and a rewrite record;
