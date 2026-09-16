@@ -534,8 +534,10 @@ looked like data loss rather than a misconfigured store.
 
 `crates/ravel-object-store/src/conformance.rs` is this contract turned into
 a suite that empirically probes a live backend rather than reading its
-declared flags. `run_conformance_suite(store, scratch_prefix)` runs, under a
-throwaway key prefix:
+declared flags. `run_conformance_suite(store, scratch_prefix, page_size)`
+runs, under a throwaway key prefix (`page_size` is the declared list page
+size the two listing probes size their key counts against; see
+`CrossPageListing` below):
 
 - `ConditionalWriteCreateIfAbsent`: a `CreateIfAbsent` put on a key an
   earlier `CreateIfAbsent` put already created must fail `AlreadyExists` and
@@ -581,18 +583,28 @@ throwaway key prefix:
   states: a repeat of the last delivered key passes, a repeat of an earlier
   one fails. Judging a deduplicated sequence instead, or only one entry
   point, would qualify a backend whose every drain then fails with
-  `ListOrderViolation`.
+  `ListOrderViolation`. Each full drain must also have crossed a real page
+  boundary, on the same at-least-two-key-bearing-pages rule
+  `CrossPageListing` states below: order observed inside a single page is
+  order the backend already had in hand, and says nothing about whether a
+  continuation token names a position in the key space, which is the claim
+  this probe exists to check.
 - `CrossPageListing`: the suite is given a declared list page size (the real
   page size the backend under test was built with -- `ravel-cli store
   qualify --list-page-size`, defaulting to the production S3 page size of
   1000); the probe writes `page_size + 2` keys, floored at 5, before the
-  first page request. `S3Store::with_page_size` only re-chunks a listing
-  client-side after `object_store` has already streamed it in full over the
-  wire -- it does not change the real `ListObjectsV2` page size -- so writing
-  more keys than the backend's actual page size is the only way to force a
-  real continuation-token boundary; a shrunken declared page size against a
-  large real one exercises only Ravel's own client-side drain loop, not the
-  backend. All `page_size + 2` keys written must come back as that many
+  first page request. `S3Store::with_page_size` cuts one wire response
+  client-side rather than asking for a smaller one: `S3Store::list` sets no
+  `MaxKeys`, so S3 answers with its default of up to 1000 keys, and the
+  method opens a fresh `object_store` listing stream per page, pulls at most
+  `page_size` entries off it, and drops it -- leaving that response's own
+  `NextContinuationToken` unfollowed unless `page_size` exceeds what one
+  response carries. Writing more keys than the backend's actual page size is
+  therefore the only way to force a real continuation-token boundary; a
+  shrunken declared page size against a large real one exercises only Ravel's
+  own client-side drain loop, not the backend. At the default the run does
+  prove the backend's side: 1002 keys means S3 serves a full 1000-key
+  response and then honours an exclusive `start-after` resume past it. All `page_size + 2` keys written must come back as that many
   distinct keys, none lost between pages, AND delivered across at least two
   pages that actually carry objects: a backend may emit a trailing empty page
   purely to signal the end of a listing once total keys exactly fill a
@@ -690,12 +702,35 @@ outage an operator disables. A mismatch is instead the signal that a
 replicated, restored, or migrated bucket carries a qualification a different
 backend earned: verify the backend and re-run `store qualify` if it is
 genuinely a different store. The command only ever writes under
-`sys/qualify/<run-id>/` (a handful of small scratch objects the suite does
-not delete afterward: each run's key is unique, so this is unbounded
-untracked storage a runbook should sweep periodically, not a correctness
-issue) and the single `sys/qualification` key; it never reads, lists, or
-writes any tenant-prefixed key, so it is safe to run against a bucket that
-already holds production data.
+`sys/qualify/<run-id>/` and the single `sys/qualification` key; it never
+reads, lists, or writes any tenant-prefixed key, so it is safe to run
+against a bucket that already holds production data.
+
+The scratch objects the suite leaves behind are no longer a handful. The two
+listing probes dominate the count, and each writes `max(page_size + 2, 5)`
+small objects, so a run leaves `2 x max(page_size + 2, 5)` of them plus the
+14 the other probes leave (two conditional-write keys, five read-after-write,
+five list-after-write, one concurrent-create, and the delete probe's
+surviving key): 2018 objects at the default page size of 1000, against 24
+before the page size became a parameter. None are deleted
+afterward and each run's prefix is unique, so this is unbounded untracked
+storage a runbook should sweep periodically (delete `sys/qualify/` between
+runs), not a correctness issue. A bucket qualified with a small
+`--list-page-size` writes proportionally fewer, but proves proportionally
+less.
+
+A `sys/qualification` record written by this suite before the page size
+became a parameter recorded a pass that never crossed a real pagination
+boundary, so it is weaker evidence than its version number suggests.
+`CONFORMANCE_SUITE_VERSION` deliberately stays at `2`: bumping it would make
+`ravel-server` refuse startup on every deployed bucket's record until each
+was re-qualified, which is an outage traded for evidence of a property no
+deployment has been observed to lack. The consequence is that re-running
+`store qualify` against such a bucket does not replace the record: the
+stored version is the current one, so the run leaves it untouched and
+reports it (the once-per-bucket no-op above). The re-run's own printed probe
+results are the evidence that pagination holds; installing a fresh record
+instead requires removing the old one out of band.
 
 ## Required bucket configuration (ADR-0064 §7, ADR-0072 decision 3)
 

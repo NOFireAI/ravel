@@ -265,7 +265,7 @@ Run the conformance suite against the configured backend and, on a pass, record 
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--list-page-size` |  | `1000` | List page size to build the store with and declare to the conformance suite's listing probes. Defaults to the production S3 page size, so a default run proves a real continuation-token boundary is crossed; must match the store this command builds, so the cross-page probe judges a real pagination boundary rather than a mismatched, meaningless one |
+| `--list-page-size` |  | `1000` | List page size to build the store with and declare to the conformance suite's listing probes. Defaults to the production S3 page size, so a default run proves a real continuation-token boundary is crossed; must match the store this command builds, so the cross-page probe judges a real pagination boundary rather than a mismatched, meaningless one. The upper bound is the number of objects a run would write: each listing probe puts the page size plus two scratch objects into the bucket, so a page size beyond a million is a typo that would fill a bucket, not a page size any backend serves |
 
 ## hold
 
