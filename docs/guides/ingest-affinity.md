@@ -644,7 +644,12 @@ can pin itself onto a busy subset.
 TLS with client-certificate authentication configured. If it is not, the subject
 is empty, every request hashes to the same key, and **every tenant lands on one
 subset**, a much worse outcome than no affinity. Verify client-cert
-authentication is actually on before selecting this.
+authentication is actually on before selecting this. The router reads the
+subject from the identity header the terminating layer stamps and never
+verifies a certificate itself, so under `ravelNative` a client that can reach
+the router directly can set that header and choose its own subset, the same
+way it can under `header`. Only use this when clients cannot reach the router
+without passing through the terminating layer.
 
 **`canonicalTenant` (`ravelNative` only).** Hashes the canonical `TenantId` that
 Ravel's own resolver produces, not any raw wire value. **Immune to token

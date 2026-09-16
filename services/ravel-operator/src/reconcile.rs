@@ -1426,15 +1426,18 @@ fn router_key_source_value(source: AffinityKeySource) -> &'static str {
 /// `--gateway-service-name`/`--gateway-service-namespace` name this
 /// `RavelCluster`'s own gateway Service (the router watches its EndpointSlices);
 /// `--subset-size` and `--key-source` come from the affinity spec. The
-/// OIDC/mTLS/tenant-token/dev-header flags are REJECTED by the router's own CLI
+/// OIDC/tenant-token/dev-header flags are REJECTED by the router's own CLI
 /// unless `--key-source canonical-tenant`, so the only such flag rendered here
 /// (`--tenant-token`, when a `tenantTokensSecretRef` exists) is gated on that
-/// source. The router's OIDC and mTLS configuration has NO operator-side CRD
-/// surface today -- `ravel-server`'s own OIDC/mTLS config is CLI-flag-only with
-/// no CRD field the operator threads -- so those flags are intentionally not
-/// rendered; giving the canonical-tenant resolver its OIDC/mTLS config is a
-/// separate, larger CRD design task (documented in the task report), not
-/// invented here.
+/// source. `--mtls-enabled` is refused by the router under every key source
+/// (it builds one resolver chain shared by every listener and cannot trust a
+/// client-supplied identity header), so no CRD field could ever render it;
+/// `--mtls-header` only names the identity header the router strips before
+/// forwarding and is never rendered either. The router's OIDC configuration
+/// has NO operator-side CRD surface today -- `ravel-server`'s own OIDC config
+/// is CLI-flag-only with no CRD field the operator threads -- so those flags
+/// are intentionally not rendered; giving the canonical-tenant resolver its
+/// OIDC config is a separate CRD design task, not invented here.
 fn router_args(
     affinity: &IngestAffinitySpec,
     instance: &str,

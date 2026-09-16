@@ -616,9 +616,15 @@ async fn client_supplied_client_cert_header_does_not_reach_the_upstream() {
     );
     let custom_router_addr = spawn_router(build_app(custom_state)).await;
 
+    // The default name rides along on the same request: under a custom
+    // configuration it is no longer the configured name, so only the strip of
+    // the default name itself removes it. Sending both is what makes that
+    // second removal observable; with the default name alone the two names
+    // coincide and either removal covers the other.
     let response = reqwest::Client::new()
         .post(format!("http://{custom_router_addr}/v1/metrics"))
         .header(&custom, "victim-tenant")
+        .header("x-ravel-client-cert-cn", "victim-tenant")
         .send()
         .await
         .unwrap();
@@ -630,6 +636,11 @@ async fn client_supplied_client_cert_header_does_not_reach_the_upstream() {
         forwarded[1].get(&custom).is_none(),
         "the configured identity header name must be stripped before forwarding, got {:?}",
         forwarded[1].get(&custom)
+    );
+    assert!(
+        forwarded[1].get("x-ravel-client-cert-cn").is_none(),
+        "the default identity header name must be stripped under a custom configuration too, got {:?}",
+        forwarded[1].get("x-ravel-client-cert-cn")
     );
 }
 
@@ -991,6 +1002,12 @@ async fn grpc_client_supplied_client_cert_header_does_not_reach_the_upstream() {
     request
         .metadata_mut()
         .insert("x-cert-cn", "victim-tenant".parse().unwrap());
+    // The default name rides along too; see the HTTP twin for why both names
+    // on one request is what proves the default-name strip under a custom
+    // configuration.
+    request
+        .metadata_mut()
+        .insert("x-ravel-client-cert-cn", "victim-tenant".parse().unwrap());
 
     client
         .export(request)
@@ -1007,6 +1024,11 @@ async fn grpc_client_supplied_client_cert_header_does_not_reach_the_upstream() {
         recorded[1].get(&custom).is_none(),
         "the configured identity header name must be stripped before forwarding, got {:?}",
         recorded[1].get(&custom)
+    );
+    assert!(
+        recorded[1].get("x-ravel-client-cert-cn").is_none(),
+        "the default identity header name must be stripped under a custom configuration too, got {:?}",
+        recorded[1].get("x-ravel-client-cert-cn")
     );
 }
 
