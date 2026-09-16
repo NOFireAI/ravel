@@ -2205,4 +2205,29 @@ mod tests {
             "exposure + disabled ravelNative affinity is allowed"
         );
     }
+
+    /// Regenerates the CRD from [`ravel_cluster_crd`] with the exact
+    /// serializer and trailing newline `main.rs`'s `--print-crd` path uses
+    /// (`serde_json::to_string_pretty` plus `println!`'s trailing `\n`), and
+    /// fails with the regeneration command when the checked-in
+    /// `deploy/k8s/operator/crd.yaml` differs. Both `--print-crd` and this
+    /// test call the same [`ravel_cluster_crd`], so this pins the file to the
+    /// function that also backs what an operator actually applies.
+    #[test]
+    fn checked_in_crd_matches_print_crd_output() {
+        let generated = serde_json::to_string_pretty(&ravel_cluster_crd())
+            .expect("serialize CRD to pretty JSON")
+            + "\n";
+        let checked_in_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/k8s/operator/crd.yaml"
+        );
+        let checked_in = std::fs::read_to_string(checked_in_path)
+            .unwrap_or_else(|error| panic!("read {checked_in_path}: {error}"));
+        assert_eq!(
+            checked_in, generated,
+            "deploy/k8s/operator/crd.yaml is stale; regenerate with: \
+             cargo run -p ravel-operator -- --print-crd > deploy/k8s/operator/crd.yaml"
+        );
+    }
 }
