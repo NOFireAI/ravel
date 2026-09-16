@@ -598,6 +598,25 @@ than passing for "no pull request open".
   `unreachable!` occurrences found or a missing source directory, so a rename
   or move cannot silently turn this into a no-op. Wired into `gates.sh` and
   CI's doc-scripts job; cases in `scripts/guards/check-promql-unreachable.test.sh`.
+- `scripts/guards/check-quick-xml-entry-points.sh [Cargo.lock] [deny.toml]`:
+  exits non-zero unless deny.toml's RUSTSEC-2026-0194/-0195 ignore comment
+  names every direct Cargo.lock parent of an affected quick-xml version
+  (0.26.0 or 0.39.4; 0.41.0 fixes both). Two live parents pull them in
+  today, inferno (0.26.0, behind the off-by-default `profiling` feature)
+  and object_store 0.13.2 (0.39.4, behind the off-by-default
+  `parquet-baseline` feature), and the comment is the only place recording
+  which binaries the ignore actually rests on; a rename or a third parent
+  showing up must fail loud rather than leave the comment stale. Exit 1 is
+  a parent missing from the comment, 2 is zero quick-xml parents found at
+  all (the anchor moved, or both versions dropped out of the lock) or the
+  `"RUSTSEC-2026-0194"` line itself missing from deny.toml, 64 is bad
+  usage. `scripts/guards/check-quick-xml-shipped-reachability.sh` is the
+  companion check that the four Dockerfile release builds never reach
+  either version at all, via `cargo tree -i`; wired into ci.yml's
+  supply-chain job and supply-chain-nightly.yml instead of gates.sh, since
+  it needs the cargo toolchain and a real dependency graph, not just a
+  text scan. Wired into `gates.sh` and CI's doc-scripts job; cases in
+  `scripts/guards/check-quick-xml-entry-points.test.sh`.
 - `scripts/guards/check-workflow-permissions.sh [dir ...]`: exits non-zero
   when a workflow under `.github/workflows/` declares no top-level
   `permissions:` block, or when that block itself grants a write scope. The

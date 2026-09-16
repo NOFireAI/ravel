@@ -203,6 +203,16 @@ echo "==> scripts/guards/check-guarded-sql-parse.sh"
 echo "==> scripts/guards/check-promql-unreachable.sh"
 "$(dirname "$0")/guards/check-promql-unreachable.sh"
 
+# deny.toml's quick-xml ignore comment records the direct Cargo.lock parents
+# of RUSTSEC-2026-0194/-0195 (issue #1718); this checks the comment still
+# names every one of them. Cases first, same reason as the guards above. A
+# Cargo.lock/deny.toml scan, no build, so it sits with the other cheap
+# guards.
+echo "==> scripts/guards/check-quick-xml-entry-points.test.sh"
+bash "$(dirname "$0")/guards/check-quick-xml-entry-points.test.sh"
+echo "==> scripts/guards/check-quick-xml-entry-points.sh"
+"$(dirname "$0")/guards/check-quick-xml-entry-points.sh"
+
 # The flag-doc overclaim guard defined above, in the ordinary gate run: a source
 # scan, no build, so it fails before the expensive lanes.
 echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"

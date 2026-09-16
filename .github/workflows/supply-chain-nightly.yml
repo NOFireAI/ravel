@@ -74,6 +74,16 @@ jobs:
           tool: cargo-deny
       - name: cargo deny check
         run: cargo deny check
+      # deny.toml ignores RUSTSEC-2026-0194/-0195 on the premise that no
+      # shipped binary's feature set reaches an affected quick-xml version
+      # (issue #1718), mirrored from ci.yml's supply-chain job so the nightly
+      # lane catches a drift the per-PR job's docs_only skip could miss.
+      # `cargo tree -i` needs the pinned toolchain, which cargo-deny (a
+      # static binary from the action above) does not.
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: quick-xml shipped-reachability guard (issue #1718)
+        run: scripts/guards/check-quick-xml-shipped-reachability.sh
 
   # Failure routing, deliberately a separate job: this is the only place that
   # needs `issues: write`, and it is the only job that runs no third-party

@@ -286,6 +286,13 @@ jobs:
         run: bash scripts/guards/check-promql-unreachable.test.sh
       - name: PromQL-unreachable guard (issue #1701)
         run: bash scripts/guards/check-promql-unreachable.sh
+      # deny.toml's quick-xml ignore comment must name every direct Cargo.lock
+      # parent of RUSTSEC-2026-0194/-0195 (issue #1718). Cases first, same
+      # reason as the guards above.
+      - name: quick-xml entry-point guard cases (issue #1718)
+        run: bash scripts/guards/check-quick-xml-entry-points.test.sh
+      - name: quick-xml entry-point guard (issue #1718)
+        run: bash scripts/guards/check-quick-xml-entry-points.sh
       # ci-sweep-cancelled.sh must not blind-rerun a job that hit its own
       # timeout-minutes (issue #1590): a rerun on a faster runner can pass and
       # hide the missing headroom. These cases stub gh, hit no network, and
@@ -1012,6 +1019,14 @@ jobs:
           tool: cargo-deny
       - name: cargo deny check
         run: cargo deny check
+      # deny.toml ignores RUSTSEC-2026-0194/-0195 on the premise that no
+      # shipped binary's feature set reaches an affected quick-xml version
+      # (issue #1718). `cargo tree -i` needs the pinned toolchain, which
+      # cargo-deny (a static binary from the action above) does not.
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: quick-xml shipped-reachability guard (issue #1718)
+        run: scripts/guards/check-quick-xml-shipped-reachability.sh
 
   # Corrupt-input mutation fuzzing for the byte parsers. Runs the stable-only
   # proptest mutation targets for the
