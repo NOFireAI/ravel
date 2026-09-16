@@ -2508,6 +2508,32 @@ keeps this from regressing: every `unreachable!()` under
 added without one fails the gate instead of becoming the next reachable
 panic.
 
+Binary operators over native histograms compute a specific subset and drop
+the rest, matching the pinned Prometheus v3.13.1 binary rather than refusing
+the query. Seven pairings compute: `h + h` and `h - h` (a histogram), `h * f`,
+`f * h` and `h / f` (a scaled histogram), and `h == h` and `h != h` (filter
+mode passes the surviving histogram through, `bool` mode answers 1 or 0).
+Every other pairing carrying a histogram operand drops the sample and raises
+one info annotation on the response's `infos` channel: arithmetic between a
+histogram and a float other than those three scaling forms, `h * h`, `h / h`,
+every `%`, `^` and `atan2` pairing, any ordering comparison (`<`, `>`, `<=`,
+`>=`) involving a histogram, and `==`/`!=` between a histogram and a float. A
+filter-mode comparison that is supported but does not hold drops with no
+annotation, as it does for floats. The set operators (`and`, `or`, `unless`)
+pass matched samples through without combining values, so they carry
+histograms unchanged and are outside this split.
+
+`h + h` and `h - h` align their two operands before merging buckets. An
+exponential-schema histogram paired with a custom-buckets (NHCB) one, or two
+custom-buckets histograms with different bounds, have no common bucket layout:
+the sample drops with an info annotation, which is what Prometheus does with
+`ErrHistogramsIncompatibleSchema` and `ErrHistogramsIncompatibleBounds`. Two
+exponential histograms at different schemas are both down-converted to the
+coarser one first, so each bucket index means the same value range on both
+sides; the result carries the coarser schema. That is not a corner case:
+RSEG down-converts a flush whose bucket count exceeds its limit, so two
+flushes of one series can persist at different schemas.
+
 The table below is generated from a run, not hand-maintained: the state
 column is recomputed from which corpus entries actually exercise each
 construct and whether they actually passed, so a regression appears as a diff
@@ -2521,7 +2547,7 @@ conformance_table`; regenerate that same command with
 `RAVEL_UPDATE_CONFORMANCE_TABLE=1`. Do not edit the block between
 the markers by hand.
 
-Surface: 132 constructs over 260 corpus entries in 10 corpus files.
+Surface: 132 constructs over 265 corpus entries in 10 corpus files.
 
 | State | Constructs |
 | --- | --- |
@@ -2534,10 +2560,10 @@ Surface: 132 constructs over 260 corpus entries in 10 corpus files.
 | Construct | Category | State | Evidence |
 | --- | --- | --- | --- |
 | aggregate expression | ast node | supported | `corpus/aggregate.txt`, 20 entries |
-| binary expression | ast node | supported | `corpus/binop.txt`, 49 entries |
+| binary expression | ast node | supported | `corpus/binop.txt`, 54 entries |
 | function call | ast node | supported | `corpus/transform.txt`, 59 entries |
 | matrix selector | ast node | supported | `corpus/selectors.txt`, 4 entries |
-| number literal | ast node | supported | `corpus/binop.txt`, 26 entries |
+| number literal | ast node | supported | `corpus/binop.txt`, 29 entries |
 | paren expression | ast node | supported | `corpus/selectors.txt`, 2 entries |
 | string literal | ast node | supported | `corpus/transform.txt`, 6 entries |
 | `subquery` | ast node | supported | `corpus/subquery.txt`, 11 entries |
@@ -2565,10 +2591,10 @@ Surface: 132 constructs over 260 corpus entries in 10 corpus files.
 | `without` | modifier | supported | `corpus/aggregate.txt`, 1 entry |
 | `!=` | binary operator | supported | `corpus/binop.txt`, 4 entries |
 | `%` | binary operator | supported | `corpus/binop.txt`, 2 entries |
-| `*` | binary operator | supported | `corpus/binop.txt`, 8 entries |
-| `+` | binary operator | supported | `corpus/binop.txt`, 6 entries |
-| `-` | binary operator | supported | `corpus/binop.txt`, 3 entries |
-| `/` | binary operator | supported | no difftest corpus entry; proven by `ravel-promql`'s `scalar_scalar_arithmetic_and_bool_comparison` |
+| `*` | binary operator | supported | `corpus/binop.txt`, 9 entries |
+| `+` | binary operator | supported | `corpus/binop.txt`, 7 entries |
+| `-` | binary operator | supported | `corpus/binop.txt`, 4 entries |
+| `/` | binary operator | supported | `corpus/binop.txt`, 5 entries |
 | `<` | binary operator | supported | no difftest corpus entry; proven by `ravel-promql`'s `scalar_vector_filter_and_bool_both_directions` |
 | `<=` | binary operator | supported | `corpus/binop.txt`, 2 entries |
 | `==` | binary operator | supported | `corpus/binop.txt`, 5 entries |

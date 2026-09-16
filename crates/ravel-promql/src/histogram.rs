@@ -110,6 +110,15 @@ impl FloatHistogram {
         self.scale == CUSTOM_BUCKETS_SCALE
     }
 
+    /// Whether two custom-bucket histograms carry the same boundaries,
+    /// Prometheus' `FloatBucketsMatch` over `CustomValues`. Only meaningful
+    /// when both sides use custom buckets; a caller combining two histograms
+    /// checks that first (Prometheus' `ErrHistogramsIncompatibleSchema`) and
+    /// this second (`ErrHistogramsIncompatibleBounds`).
+    pub fn custom_bounds_match(&self, other: &FloatHistogram) -> bool {
+        float_buckets_match(&self.custom_values, &other.custom_values)
+    }
+
     /// Multiply every population (buckets, zero, count) and the sum by
     /// `factor`, in place: Prometheus' `FloatHistogram.Mul`, used to apply
     /// rate's per-second / extrapolation factor and `avg`'s `1/n`. Order of
@@ -131,14 +140,36 @@ impl FloatHistogram {
     /// field for field, exactly as Prometheus' `Div` does. This is NOT
     /// `mul(1/scalar)`: for a non-power-of-two divisor the two round
     /// differently, and only the direct division matches the pinned binary.
-    /// Ravel's only callers pass a positive scalar (`avg`'s group size,
-    /// `irate`'s sampled interval), so Prometheus' `scalar == 0`
-    /// bucket-clearing and `scalar < 0` gauge-hint special cases are
-    /// unreachable and not reproduced here.
+    ///
+    /// `histogram / float` takes its divisor from query text, so zero and
+    /// negative divisors are both reachable:
+    ///
+    /// * `scalar == 0` (either sign of zero, as in Go): count, sum and the
+    ///   zero bucket become an infinity and both bucket vectors are cleared,
+    ///   spans included. Verified against the pinned v3.13.1 binary, which
+    ///   answers `diff_native_hist / 0` with the zero bucket alone at `+Inf`
+    ///   and no positive buckets at all.
+    /// * `scalar < 0`: every population is negated as the plain division
+    ///   gives, with no other special case. The pinned binary's answer for
+    ///   `diff_native_hist / -2` is the negated buckets; its rendering drops
+    ///   the zero bucket there because a non-positive zero count is not
+    ///   emitted at all (see [`FloatHistogram::all_buckets`]), not because
+    ///   `div` treats it specially. Prometheus also re-labels such a result as
+    ///   a gauge internally; `counter_reset_hint` is left alone here because
+    ///   nothing downstream of a binary operator reads it (the hint is not
+    ///   part of the query response and Ravel's subquery grid is float-only),
+    ///   so there is no oracle for it.
     pub fn div(&mut self, scalar: f64) {
         self.zero_count /= scalar;
         self.count /= scalar;
         self.sum /= scalar;
+        if scalar == 0.0 {
+            self.positive_spans.clear();
+            self.positive_buckets.clear();
+            self.negative_spans.clear();
+            self.negative_buckets.clear();
+            return;
+        }
         for b in &mut self.positive_buckets {
             *b /= scalar;
         }
@@ -238,7 +269,8 @@ impl FloatHistogram {
     /// ascending order, exactly the order Prometheus' `AllFloatBucketIterator`
     /// yields: negative buckets most-negative first, the zero bucket, then
     /// positive buckets. Empty buckets are omitted (callers skip zero-count
-    /// buckets anyway); the zero bucket is emitted only when it has count.
+    /// buckets anyway); the zero bucket is emitted only when its count is
+    /// strictly positive.
     pub fn all_buckets(&self) -> Vec<Bucket> {
         let mut out = Vec::new();
 
@@ -253,8 +285,12 @@ impl FloatHistogram {
             });
         }
 
-        // Zero bucket.
-        if self.zero_count != 0.0 {
+        // Zero bucket, emitted only for a strictly positive count, as
+        // Prometheus' `allFloatBucketIterator` does. A zero count of exactly
+        // zero has nothing to report; a negative one (reachable since `h - h`
+        // and `h / <negative>` became query-expressible) is omitted too, which
+        // is what the pinned binary answers for `diff_native_hist / -2`.
+        if self.zero_count > 0.0 {
             out.push(Bucket {
                 lower: -self.zero_threshold,
                 upper: self.zero_threshold,
@@ -1147,6 +1183,54 @@ mod tests {
         assert_eq!(h.zero_count.to_bits(), (5.0_f64 / 3.0).to_bits());
         assert_eq!(h.positive_buckets[0].to_bits(), (10.0_f64 / 3.0).to_bits());
         assert_eq!(h.positive_buckets[1].to_bits(), (20.0_f64 / 3.0).to_bits());
+    }
+
+    /// Issue #1700 fix round: `histogram / float` takes its divisor from query
+    /// text, so a zero divisor is reachable. The pinned v3.13.1 binary answers
+    /// `diff_native_hist / 0` with the zero bucket alone at `+Inf` and no
+    /// positive buckets, so `div` clears both bucket vectors and their spans
+    /// rather than filling them with infinities.
+    #[test]
+    fn div_by_zero_clears_the_buckets_and_leaves_infinite_populations() {
+        let mut h = positive(0, 1, &[10.0, 20.0], 30.0);
+        h.zero_count = 5.0;
+        h.count += 5.0;
+        h.div(0.0);
+        assert_eq!(h.count, f64::INFINITY);
+        assert_eq!(h.sum, f64::INFINITY);
+        assert_eq!(h.zero_count, f64::INFINITY);
+        assert!(h.positive_buckets.is_empty(), "positive buckets cleared");
+        assert!(h.positive_spans.is_empty(), "positive spans cleared too");
+        assert!(h.negative_buckets.is_empty());
+        assert!(h.negative_spans.is_empty());
+        // Only the zero bucket survives into the rendered bucket list.
+        let buckets = h.all_buckets();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].count, f64::INFINITY);
+    }
+
+    /// Issue #1700 fix round: a negative divisor negates every population with
+    /// no special case, and the resulting non-positive zero bucket is not
+    /// rendered at all, matching the pinned binary's answer for
+    /// `diff_native_hist / -2`.
+    #[test]
+    fn div_by_a_negative_scalar_negates_and_hides_the_zero_bucket() {
+        let mut h = positive(0, 1, &[10.0, 20.0], 30.0);
+        h.zero_count = 5.0;
+        h.count += 5.0;
+        h.div(-2.0);
+        assert_eq!(h.count, -17.5);
+        assert_eq!(h.sum, -15.0);
+        assert_eq!(h.zero_count, -2.5);
+        assert_eq!(h.positive_buckets, vec![-5.0, -10.0]);
+        let buckets = h.all_buckets();
+        assert_eq!(
+            buckets.len(),
+            2,
+            "the two negated positive buckets, and no zero bucket: {buckets:?}"
+        );
+        assert_eq!(buckets[0].count, -5.0);
+        assert_eq!(buckets[1].count, -10.0);
     }
 
     #[test]
