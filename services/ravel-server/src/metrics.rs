@@ -734,12 +734,14 @@ pub struct IngestPipelineSnapshot {
     pub acks_err: u64,
     pub collisions: Option<u64>,
     pub shard_deaths: u64,
-    /// Shards condemned after exhausting their respawn budget (issue #1299).
-    /// `Some` only for the metrics pipeline, whose router is the one readiness
-    /// consults and the only one that respawns and condemns; logs and
-    /// spans render no sample for this family, the same structural-absence
-    /// convention `collisions` and `exemplars` use.
-    pub shards_condemned: Option<u64>,
+    /// Shards condemned and no longer accepting writes (issue #1299). Carried
+    /// unconditionally, not as an `Option`: all three pipelines condemn and all
+    /// three feed readiness, so the family renders a sample for every signal.
+    /// The threshold differs by signal, not the presence of the counter: the
+    /// metrics router condemns on the death that exhausts a shard's respawn
+    /// budget, the log and span routers on the first shard-actor death
+    /// (issue #1691).
+    pub shards_condemned: u64,
     /// Multi-shard Strict writes that committed on at least one shard and
     /// then failed on a sibling: partial multi-shard commits, reported to the
     /// client as a retryable error carrying the durable tokens.
@@ -863,7 +865,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.series_id_collisions),
             shard_deaths: snapshot.shard_deaths,
-            shards_condemned: Some(snapshot.shards_condemned),
+            shards_condemned: snapshot.shards_condemned,
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
@@ -902,7 +904,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.stream_id_collisions),
             shard_deaths: snapshot.shard_deaths,
-            shards_condemned: Some(snapshot.shards_condemned),
+            shards_condemned: snapshot.shards_condemned,
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: Some(PostingsCounters {
@@ -940,7 +942,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: None,
             shard_deaths: snapshot.shard_deaths,
-            shards_condemned: Some(snapshot.shards_condemned),
+            shards_condemned: snapshot.shards_condemned,
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
@@ -1150,8 +1152,10 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
     write_header(
         out,
         "ravel_ingest_shard_deaths_total",
-        "Shard-actor deaths observed by the router, counted once per death including each \
-         respawned incarnation (issue #1299) so it can exceed the shard count, by signal.",
+        "Shard-actor deaths observed by the router (issue #1299), by signal. The metrics router \
+         respawns, so its figure counts each respawned incarnation and can exceed the shard \
+         count; the log and span routers never respawn, so their deaths are counted once per \
+         shard per live generation and each one also condemns that shard (issue #1691).",
         "counter",
     );
     for pipeline in pipelines {
@@ -1163,34 +1167,27 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         );
     }
 
-    // Rendered for every signal whose snapshot carries the counter (metrics,
-    // logs, spans). The condemnation threshold differs by signal: the metrics
-    // router respawns a shard up to its budget and condemns only on the death
-    // that exhausts it, while the log and span routers do not respawn and
-    // condemn on the first shard death.
-    let with_condemned: Vec<_> = pipelines
-        .iter()
-        .filter(|pipeline| pipeline.shards_condemned.is_some())
-        .collect();
-    if !with_condemned.is_empty() {
-        write_header(
+    // Rendered for every signal: all three pipelines condemn. The condemnation
+    // threshold differs by signal: the metrics router respawns a shard up to
+    // its budget and condemns only on the death that exhausts it, while the log
+    // and span routers do not respawn and condemn on the first shard death.
+    write_header(
+        out,
+        "ravel_ingest_shards_condemned_total",
+        "Shards condemned and no longer accepting writes (issue #1299), counted at most once \
+         per shard per live generation (bounded by live_generations * shard_count under \
+         resharding, not shard_count); the metrics router condemns after exhausting a shard's \
+         respawn budget, logs and spans on the first shard death; any nonzero value makes the \
+         process report /readyz 503, by signal.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
             out,
             "ravel_ingest_shards_condemned_total",
-            "Shards condemned and no longer accepting writes (issue #1299), counted at most once \
-             per shard per live generation (bounded by live_generations * shard_count under \
-             resharding, not shard_count); the metrics router condemns after exhausting a shard's \
-             respawn budget, logs and spans on the first shard death; any nonzero value makes the \
-             process report /readyz 503, by signal.",
-            "counter",
+            &labels(mode, pipeline.signal),
+            pipeline.shards_condemned,
         );
-        for pipeline in with_condemned {
-            write_sample(
-                out,
-                "ravel_ingest_shards_condemned_total",
-                &labels(mode, pipeline.signal),
-                pipeline.shards_condemned.unwrap_or_default(),
-            );
-        }
     }
 
     write_header(
@@ -5823,8 +5820,7 @@ mod tests {
     /// with each pipeline's own driven value (issue #1299). The distinct counts
     /// catch cross-pipeline miswiring: a `from_log_metrics` that read the span
     /// snapshot's field, or a render that labelled all three the same, would
-    /// fail here. Pins the conditional render, whose input is `Option<u64>`: a
-    /// family that stopped rendering for any signal would silently disarm the
+    /// fail here. A family that stopped rendering for any signal would silently disarm the
     /// `shards_condemned > 0` alert docs/guides/observability.md tells operators
     /// to set.
     #[test]

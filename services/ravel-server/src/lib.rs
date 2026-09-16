@@ -3879,3 +3879,392 @@ mod shutdown_drain_tests {
         );
     }
 }
+
+/// End to end inside this crate: a real log or span shard actor killed by a
+/// real store fault must turn this process's readiness false (issue #1691).
+///
+/// The ravel-ingest side pins `router.ready()` and the condemned counter, and
+/// `readiness_registration_still_allows_the_shard_actor_join` above pins that
+/// `ingest_health_sources` parks no router `Arc`. Neither proves the join
+/// between them: a `shards_ready` hardcoded to `true` passes both. These tests
+/// drive one write into a poisoned store, let the shard actor die for real, and
+/// then read `Readiness` itself, so the whole chain from a dead actor to
+/// `/readyz` 503 is covered for the two pipelines that condemn on a first
+/// death.
+///
+/// Time is injected ([`ShardTestClock`]) and the failure is synchronous: the
+/// poisoned commit lands a conflicting record and answers `AlreadyExists`,
+/// which `publish` classifies as split brain, which panics the shard actor
+/// mid-flush, which the write observes as the typed `ShardUnavailable`. No
+/// sleep, no timeout band, nothing to tune.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod ingest_readiness_tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_ingest::{
+        Clock, IngestConfig, LogIngestRouter, LogWriteError, SpanIngestRouter, SpanWriteError,
+        WriteMode, shard_for_span,
+    };
+    use ravel_logseg::stream_attrs_bytes;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{
+        Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta,
+        ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
+    };
+    use ravel_otlp::logs_normalize::NormalizedLogRecord;
+    use ravel_otlp::traces_normalize::NormalizedSpan;
+    use ravel_rspan::StatusCode;
+    use ravel_types::logstream::{AttrValue, log_stream_id};
+    use ravel_types::{Signal, TenantId, shard_for_log};
+    use tokio::sync::watch;
+    use uuid::Uuid;
+
+    use super::{drain_router, health, ingest_health_sources};
+
+    const BASE_NS: i64 = 1_700_000_000_000_000_000;
+    const TENANT: &str = "acme";
+
+    /// Injected clock, the same shape the ravel-ingest router tests use: the
+    /// reading only moves when the test moves it, and `sleep` parks on a watch
+    /// channel rather than on wall time, so the shard actor's flush tick can
+    /// never fire on its own and no assertion here depends on real elapsed
+    /// time. These tests never advance it: the flush they need is driven inline
+    /// by a strict write at `target_bytes: 1`.
+    struct ShardTestClock {
+        now_ns: AtomicI64,
+        wake_tx: watch::Sender<()>,
+    }
+
+    impl ShardTestClock {
+        fn new(start_ns: i64) -> Arc<Self> {
+            let (wake_tx, _rx) = watch::channel(());
+            Arc::new(ShardTestClock {
+                now_ns: AtomicI64::new(start_ns),
+                wake_tx,
+            })
+        }
+    }
+
+    impl Clock for ShardTestClock {
+        fn now_ns(&self) -> i64 {
+            self.now_ns.load(Ordering::SeqCst)
+        }
+
+        fn sleep(&self, dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            let deadline = self
+                .now_ns()
+                .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
+            let mut rx = self.wake_tx.subscribe();
+            Box::pin(async move {
+                loop {
+                    if self.now_ns() >= deadline {
+                        return;
+                    }
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+    }
+
+    /// Flushes on the first buffered item and never on age, so one strict write
+    /// drives a complete flush inline and returns its outcome.
+    fn flush_on_first(shard_count: u32) -> IngestConfig {
+        IngestConfig {
+            shard_count,
+            target_bytes: 1,
+            max_flush_delay: Duration::from_secs(3600),
+            flush_tick: Duration::from_millis(20),
+            put_retry_base_delay: Duration::from_millis(1),
+            put_retry_max_delay: Duration::from_millis(5),
+            ..IngestConfig::default()
+        }
+    }
+
+    /// Lands a different, structurally valid commit record at the exact key the
+    /// first flush targets and then answers `AlreadyExists`, the state
+    /// `publish` classifies as split brain, which panics the shard actor.
+    /// Replicated here rather than shared with
+    /// `crates/ravel-ingest/tests/log_router.rs`: the crate-private
+    /// `record_shard_condemned` is what a shared helper would otherwise be
+    /// tempted to reach for, and it must stay crate-private to ravel-ingest.
+    /// `key_marker` selects the commit keyspace so the poison fires on the
+    /// pipeline under test (`/c/` for logs, `/s/c/` for spans).
+    struct SplitBrainOnFirstCommit {
+        inner: MemoryStore,
+        poisoned: AtomicBool,
+        key_marker: &'static str,
+        signal: Signal,
+    }
+
+    impl SplitBrainOnFirstCommit {
+        fn new(key_marker: &'static str, signal: Signal) -> Self {
+            SplitBrainOnFirstCommit {
+                inner: MemoryStore::new(),
+                poisoned: AtomicBool::new(false),
+                key_marker,
+                signal,
+            }
+        }
+
+        fn conflicting_record(&self) -> Bytes {
+            let rec = record::build(NewCommitRecord {
+                tenant_hash: TenantId::new(TENANT).hash(),
+                signal: self.signal,
+                shard: 0,
+                writer_id: Uuid::nil(),
+                writer_epoch: 1,
+                writer_seq: 0,
+                object_size: 1,
+                content_hash: [0xAA; 32],
+                sample_count: 1,
+                series_count: 1,
+                min_event_ts_ns: 0,
+                max_event_ts_ns: 0,
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+                segment_format_version: 1,
+                created_unix_ns: 0,
+                ingest_hour_bucket: 0,
+            })
+            .expect("valid conflicting record");
+            record::encode(&rec)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for SplitBrainOnFirstCommit {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            if key.contains(self.key_marker) && !self.poisoned.swap(true, Ordering::SeqCst) {
+                self.inner
+                    .put(key, self.conflicting_record(), PutOptions::default())
+                    .await?;
+                return Err(StoreError::AlreadyExists);
+            }
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            // multipart: false to match the refusing default `put_multipart`
+            // this double inherits.
+            Capabilities {
+                multipart: false,
+                ..self.inner.capabilities()
+            }
+        }
+    }
+
+    /// First record (by an incrementing `host` label) whose stream routes to
+    /// `want_shard`.
+    fn log_record_on_shard(want_shard: u32, shard_count: u32, ts_ns: i64) -> NormalizedLogRecord {
+        for i in 0..100_000u32 {
+            let host = i.to_string();
+            let res: Vec<(String, AttrValue)> = vec![
+                (
+                    "service.name".to_string(),
+                    AttrValue::Str("api".to_string()),
+                ),
+                ("host".to_string(), AttrValue::Str(host)),
+            ];
+            let scope_attrs: Vec<(String, AttrValue)> = Vec::new();
+            let stream_id = log_stream_id(&res, "scope", "", &scope_attrs);
+            if shard_for_log(&stream_id, shard_count) != want_shard {
+                continue;
+            }
+            return NormalizedLogRecord {
+                stream_id,
+                stream_attrs: stream_attrs_bytes(&res, "scope", "", &scope_attrs),
+                ts_ns,
+                observed_ts_ns: ts_ns,
+                severity_num: 9,
+                severity_text: "INFO".to_string(),
+                body: "poison".to_string(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: Vec::new(),
+            };
+        }
+        panic!("no log stream found for shard {want_shard} of {shard_count}");
+    }
+
+    /// First span (by an incrementing trace-id prefix) routed to `want_shard`.
+    fn span_on_shard(want_shard: u32, shard_count: u32, start_ns: i64) -> NormalizedSpan {
+        for i in 0..100_000u32 {
+            let mut trace_id = [0u8; 16];
+            trace_id[..4].copy_from_slice(&i.to_be_bytes());
+            if shard_for_span(&trace_id, shard_count) != want_shard {
+                continue;
+            }
+            return NormalizedSpan {
+                trace_id,
+                span_id: [1u8; 8],
+                parent_span_id: None,
+                name: "handle".to_string(),
+                start_ts_ns: start_ns,
+                end_ts_ns: start_ns + 100,
+                status_code: StatusCode::Unset,
+                status_message: None,
+                attrs: vec![("service.name".to_string(), "checkout".to_string())],
+            };
+        }
+        panic!("no trace id found for shard {want_shard} of {shard_count}");
+    }
+
+    /// A real dead log shard makes this process not ready.
+    ///
+    /// Non-vacuity: make `impl IngestHealth for LogIngestMetrics` in
+    /// `health.rs` return `true` and the `ingest_shards_ready` assertion below
+    /// fails, because the write still fails and the router still condemns; the
+    /// only thing that changes is whether readiness reads it.
+    #[tokio::test]
+    async fn a_condemned_log_shard_makes_the_process_not_ready() {
+        let shard_count = 4;
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(SplitBrainOnFirstCommit::new("/c/", Signal::Logs));
+        let router = Arc::new(LogIngestRouter::new(
+            flush_on_first(shard_count),
+            Arc::clone(&store),
+            ShardTestClock::new(BASE_NS),
+        ));
+
+        // Built exactly as `start` builds it, from the router's metrics handle.
+        let readiness = health::Readiness::new().with_ingest_health(ingest_health_sources(
+            None,
+            Some(&router),
+            None,
+        ));
+        readiness.mark_ready();
+        assert!(
+            readiness.is_ready() && readiness.ingest_shards_ready(),
+            "ready before any shard dies"
+        );
+
+        // One write onto shard 0, whose flush hits the poisoned commit key and
+        // panics the actor. The log router never respawns, so this first death
+        // condemns the shard.
+        let err = router
+            .write(
+                TenantId::new(TENANT),
+                vec![log_record_on_shard(0, shard_count, 1_000)],
+                WriteMode::Strict,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("the split-brain panic takes the shard actor down mid-flush");
+        assert!(
+            matches!(err, LogWriteError::ShardUnavailable),
+            "the dead shard must surface as the typed ShardUnavailable, got {err}"
+        );
+
+        assert!(
+            !readiness.ingest_shards_ready(),
+            "the condemned log shard must make the ingest readiness source report not-ready"
+        );
+        assert!(
+            !readiness.is_ready(),
+            "a condemned log shard must make /readyz answer 503"
+        );
+        assert!(
+            readiness.startup_complete() && !readiness.is_draining(),
+            "the ingest condition, not an unset startup latch or a drain, is what dropped readiness"
+        );
+
+        drain_router(Some(router), "log").await;
+    }
+
+    /// A real dead span shard makes this process not ready.
+    ///
+    /// Non-vacuity: make `impl IngestHealth for SpanIngestMetrics` in
+    /// `health.rs` return `true` and the `ingest_shards_ready` assertion below
+    /// fails, for the same reason as the log test above.
+    #[tokio::test]
+    async fn a_condemned_span_shard_makes_the_process_not_ready() {
+        let shard_count = 4;
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(SplitBrainOnFirstCommit::new("/s/c/", Signal::Spans));
+        let router = Arc::new(SpanIngestRouter::new(
+            flush_on_first(shard_count),
+            Arc::clone(&store),
+            ShardTestClock::new(BASE_NS),
+        ));
+
+        let readiness = health::Readiness::new().with_ingest_health(ingest_health_sources(
+            None,
+            None,
+            Some(&router),
+        ));
+        readiness.mark_ready();
+        assert!(
+            readiness.is_ready() && readiness.ingest_shards_ready(),
+            "ready before any shard dies"
+        );
+
+        let err = router
+            .write(
+                TenantId::new(TENANT),
+                vec![span_on_shard(0, shard_count, 1_000)],
+                WriteMode::Strict,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("the split-brain panic takes the shard actor down mid-flush");
+        assert!(
+            matches!(err, SpanWriteError::ShardUnavailable),
+            "the dead shard must surface as the typed ShardUnavailable, got {err}"
+        );
+
+        assert!(
+            !readiness.ingest_shards_ready(),
+            "the condemned span shard must make the ingest readiness source report not-ready"
+        );
+        assert!(
+            !readiness.is_ready(),
+            "a condemned span shard must make /readyz answer 503"
+        );
+        assert!(
+            readiness.startup_complete() && !readiness.is_draining(),
+            "the ingest condition, not an unset startup latch or a drain, is what dropped readiness"
+        );
+
+        drain_router(Some(router), "span").await;
+    }
+}
