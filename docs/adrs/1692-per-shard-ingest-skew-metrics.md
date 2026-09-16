@@ -60,7 +60,8 @@ number the operator chooses: `shard_count` defaults to 4
    `String` or `&str` reaches the exposition through it, and adding the
    variant is a compile error at every exhaustive match, as ADR-0044
    section 4 requires. The permitted-label list in that section gains
-   `shard` as its sixteenth key, and the renderer's module documentation
+   `shard` as its ninth key, after the `reason` the ADR-0051 amendment
+   added, and the renderer's module documentation
    replaces "`shard` is deliberately absent" with the narrowed rule.
 
 3. **One family, six samples per shard, labelled `mode`, `signal`,
