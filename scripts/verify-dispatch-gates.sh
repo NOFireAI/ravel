@@ -82,6 +82,15 @@ worktree_dir="${parent_dir_abs}/verify-${short_sha}-$$-$(date +%s)"
 # `worktree add` delete a directory this run did not make: the trap cannot
 # tell "mine, remove it" from "someone else's, leave it" unless creation is
 # what records ownership.
+#
+# No test discriminates on this alone, and that is a property of the fix
+# rather than a gap someone forgot to close: with the per-invocation naming
+# above, `worktree_dir` cannot name a directory this run did not create, so
+# the situation this guard changes is unreachable. It is defence in depth
+# against the naming being weakened later, and the suite's case (e) says so
+# explicitly rather than appearing to cover it. Do not delete this as dead
+# code; delete it only if you also intend the name to go back to being
+# shared, and then case (d) fails.
 created_worktree=""
 cleanup() {
   [[ -n "${created_worktree}" ]] || return 0

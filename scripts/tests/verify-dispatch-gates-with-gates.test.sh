@@ -282,16 +282,29 @@ own="$(git -C "${repo}" worktree list --porcelain \
   | sed -n "s|^worktree ${worktree_parent}/|&|p" | grep -vc "verify-${short}$" || true)"
 check_eq "and removes only the worktree it created" "0" "${own}"
 
-# === (e) a failed `worktree add` removes nothing. =========================
+# === (e) an early failure, before the trap is installed, touches nothing. ==
 #
-# The narrow case: creation fails, so this run owns no directory, so its
-# cleanup must be a no-op. Forced by pointing the run at a parent directory
-# whose target path already exists as a plain file.
+# THIS CASE DOES NOT PIN THE OWNERSHIP GUARD, and saying so is the point of
+# the comment. An unresolvable ref fails at `git rev-parse` before the EXIT
+# trap is installed and before any worktree is created, so `cleanup` never
+# runs at all and a bystander survives whether or not `created_worktree`
+# exists. Verified: with the ownership guard removed entirely, this whole
+# suite still reports 25 passed / 0 failed.
+#
+# What it does check is narrow and still worth a case: an early exit leaves
+# the parent directory alone, so a future change that moves the trap above
+# the ref resolution, or adds cleanup work to the early-exit path, fails
+# here. Case (d) above is what pins the collision fix.
+#
+# The ownership guard itself has no discriminating test, and cannot easily
+# have one: with per-invocation naming there is no way for `worktree_dir` to
+# name a directory this run did not create, which is the only situation the
+# guard changes. It is defence in depth against the naming scheme being
+# weakened later, and it is recorded as such in the script.
 repo="${tmproot}/repo-e"
 worktree_parent="${tmproot}/wt-e"
 new_repo "${repo}"
 mkdir -p "${worktree_parent}"
-# Pre-create a bystander worktree; nothing this run does may touch it.
 bystander="${worktree_parent}/bystander"
 git -C "${repo}" worktree add --detach -q "${bystander}" HEAD
 printf 'keep me\n' >"${bystander}/.keep"
