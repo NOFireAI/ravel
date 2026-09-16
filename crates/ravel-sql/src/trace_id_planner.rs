@@ -67,18 +67,22 @@ impl ExprPlanner for TraceIdHexLiteralPlanner {
                     left.eq(fixed)
                 }));
             }
-        } else if is_trace_id_column(&right, schema) {
-            if let Some(bytes) = hex_trace_id_literal(&left) {
-                let fixed = trace_id_scalar(bytes);
-                return Ok(PlannerResult::Planned(if not_eq {
-                    fixed.not_eq(right)
-                } else {
-                    fixed.eq(right)
-                }));
-            }
+        } else if is_trace_id_column(&right, schema)
+            && let Some(bytes) = hex_trace_id_literal(&left)
+        {
+            let fixed = trace_id_scalar(bytes);
+            return Ok(PlannerResult::Planned(if not_eq {
+                fixed.not_eq(right)
+            } else {
+                fixed.eq(right)
+            }));
         }
 
-        let op = if not_eq { BinaryOperator::NotEq } else { BinaryOperator::Eq };
+        let op = if not_eq {
+            BinaryOperator::NotEq
+        } else {
+            BinaryOperator::Eq
+        };
         Ok(PlannerResult::Original(RawBinaryExpr { op, left, right }))
     }
 }
@@ -101,7 +105,10 @@ fn is_trace_id_column(e: &Expr, schema: &DFSchema) -> bool {
 }
 
 fn trace_id_scalar(bytes: [u8; 16]) -> Expr {
-    lit(ScalarValue::FixedSizeBinary(TRACE_ID_WIDTH, Some(bytes.to_vec())))
+    lit(ScalarValue::FixedSizeBinary(
+        TRACE_ID_WIDTH,
+        Some(bytes.to_vec()),
+    ))
 }
 
 /// Convenience constructor for [`crate::session::build_session`].
