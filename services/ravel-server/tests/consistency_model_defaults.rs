@@ -35,6 +35,27 @@ const SEGMENTS_ANCHOR: &str = "`max_segments` (default ";
 /// S3 request budget. A stock server's figure follows it directly.
 const REQUEST_BUDGET_ANCHOR: &str = "the derived default is ";
 
+/// The prose in `docs/guides/ingest.md` that introduces the abandonment budget
+/// a buffered flush gets for its own store calls. The figure follows it
+/// directly, in seconds, the unit the constant is declared in.
+const INGEST_LIFETIME_ANCHOR: &str =
+    "`max_flush_lifetime`, the budget for those store calls, defaults to ";
+
+/// The sentence `docs/guides/ingest.md` used to bound buffered-mode loss with,
+/// byte for byte. It named the flush-trigger cadence as the loss bound and a
+/// crash as the only way to lose an acked row, which the consistency model
+/// contradicts on both counts: the trigger delay does not bound when a flush
+/// completes, and an abandoned flush drops already-acked rows with no crash.
+const INGEST_STALE_LOSS_SENTENCE: &str = "A crash between the ack and the next flush loses that buffered window, \
+     bounded by `max_flush_delay` (2s default).";
+
+/// The sentence `README.md` used to close its buffered paragraph with, byte for
+/// byte. A clean shutdown draining the window does not make loss specific to a
+/// crash: a flush whose store calls exhaust `max_flush_lifetime` is abandoned
+/// and its already-acked rows are dropped while the process keeps running.
+const README_STALE_SHUTDOWN_SENTENCE: &str =
+    "A clean shutdown drains the window, so the loss is specific to a crash.";
+
 /// `docs/consistency-model.md`, resolved from this crate's manifest directory
 /// rather than the process working directory, which differs between a
 /// crate-scoped `cargo test` and one run from the workspace root.
@@ -56,6 +77,26 @@ fn query_engine_doc_path() -> PathBuf {
         .join("query-engine.md")
 }
 
+/// `docs/guides/ingest.md`, resolved from this crate's manifest directory the
+/// same way [`doc_path`] resolves the consistency model.
+fn ingest_guide_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("docs")
+        .join("guides")
+        .join("ingest.md")
+}
+
+/// `README.md`, resolved from this crate's manifest directory the same way
+/// [`doc_path`] resolves the consistency model.
+fn readme_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("README.md")
+}
+
 /// The document with every run of whitespace collapsed to a single space, so a
 /// claim the 80-column wrap split across two lines still matches one anchor.
 fn normalized_doc() -> String {
@@ -66,6 +107,17 @@ fn normalized_doc() -> String {
 /// [`normalized_doc`].
 fn normalized_query_engine_doc() -> String {
     normalized(&query_engine_doc_path())
+}
+
+/// The whitespace-collapsed form of `docs/guides/ingest.md`, matching
+/// [`normalized_doc`].
+fn normalized_ingest_guide() -> String {
+    normalized(&ingest_guide_path())
+}
+
+/// The whitespace-collapsed form of `README.md`, matching [`normalized_doc`].
+fn normalized_readme() -> String {
+    normalized(&readme_path())
 }
 
 /// Read `path` and collapse every run of whitespace to a single space.
@@ -80,7 +132,10 @@ fn normalized(path: &Path) -> String {
 /// expects instead of trusting the first hit. Thousands separators are
 /// accepted and stripped; the unit is the alphabetic run after the digits, and
 /// is empty when a delimiter follows them directly.
-fn figures_after(doc: &str, anchor: &str) -> Vec<(u64, String)> {
+///
+/// `doc_name` is the document `doc` was read from, so the panic below names the
+/// file whose anchor lost its figure rather than one fixed document.
+fn figures_after(doc: &str, doc_name: &str, anchor: &str) -> Vec<(u64, String)> {
     let mut found = Vec::new();
     let mut rest = doc;
     while let Some(at) = rest.find(anchor) {
@@ -94,7 +149,7 @@ fn figures_after(doc: &str, anchor: &str) -> Vec<(u64, String)> {
             .parse::<u64>()
             .unwrap_or_else(|e| {
                 panic!(
-                    "docs/consistency-model.md states no figure after {anchor:?}: \
+                    "{doc_name} states no figure after {anchor:?}: \
                      read {digits:?} ({e}). The anchor and the figure must stay \
                      adjacent, or this check silently stops covering the claim."
                 )
@@ -130,7 +185,7 @@ fn grouped(value: usize) -> String {
 #[test]
 fn query_deadline_figure_matches_the_derived_constant() {
     let doc = normalized_doc();
-    let figures = figures_after(&doc, DEADLINE_ANCHOR);
+    let figures = figures_after(&doc, "docs/consistency-model.md", DEADLINE_ANCHOR);
     assert_eq!(
         figures.len(),
         2,
@@ -171,7 +226,7 @@ fn query_deadline_figure_matches_the_derived_constant() {
 #[test]
 fn max_query_duration_ceiling_figure_matches_the_gc_default() {
     let doc = normalized_doc();
-    let figures = figures_after(&doc, CEILING_ANCHOR);
+    let figures = figures_after(&doc, "docs/consistency-model.md", CEILING_ANCHOR);
     assert_eq!(
         figures.len(),
         2,
@@ -225,7 +280,7 @@ fn max_query_duration_ceiling_figure_matches_the_gc_default() {
 #[test]
 fn max_segments_figure_matches_the_derived_constant() {
     let doc = normalized_doc();
-    let figures = figures_after(&doc, SEGMENTS_ANCHOR);
+    let figures = figures_after(&doc, "docs/consistency-model.md", SEGMENTS_ANCHOR);
     assert_eq!(
         figures.len(),
         1,
@@ -264,7 +319,7 @@ fn request_budget_figure_matches_the_derived_default() {
     use clap::Parser;
 
     let doc = normalized_query_engine_doc();
-    let figures = figures_after(&doc, REQUEST_BUDGET_ANCHOR);
+    let figures = figures_after(&doc, "docs/query-engine.md", REQUEST_BUDGET_ANCHOR);
     assert_eq!(
         figures.len(),
         1,
@@ -310,6 +365,82 @@ fn request_budget_figure_matches_the_derived_default() {
         doc.contains(&rendered),
         "docs/query-engine.md must render the derived S3 request budget with \
          comma thousands separators, as {rendered:?}"
+    );
+}
+
+/// The buffered-mode loss bound `docs/guides/ingest.md` gives a reader is the
+/// one `docs/consistency-model.md` is normative for. Two claims are pinned.
+/// The guide no longer bounds the loss by the flush-trigger cadence and no
+/// longer reads as if only a crash can lose an acked row, so the sentence that
+/// said both is gone byte for byte. And the budget it puts in its place is the
+/// real one: `max_flush_lifetime`, read from the constant rather than restated,
+/// which is what an abandoned flush's own store calls have to finish inside.
+#[test]
+fn buffered_mode_loss_bound_in_the_ingest_guide_matches_the_consistency_model() {
+    let doc = normalized_ingest_guide();
+    assert!(
+        doc.contains("## Strict vs. buffered acknowledgement"),
+        "docs/guides/ingest.md is missing the acknowledgement-mode section the \
+         buffered loss bound lives in, so the path is wrong or the guide has \
+         been restructured"
+    );
+
+    assert_eq!(
+        doc.matches(INGEST_STALE_LOSS_SENTENCE).count(),
+        0,
+        "docs/guides/ingest.md still states {INGEST_STALE_LOSS_SENTENCE:?}. \
+         max_flush_delay bounds when a flush is triggered, not when it \
+         completes, and a crash is not the only way a buffered row is lost: an \
+         abandoned flush drops already-acked rows with no crash at all."
+    );
+
+    let figures = figures_after(&doc, "docs/guides/ingest.md", INGEST_LIFETIME_ANCHOR);
+    assert_eq!(
+        figures.len(),
+        1,
+        "docs/guides/ingest.md must state the buffered abandonment budget \
+         exactly once, using the phrase {INGEST_LIFETIME_ANCHOR:?}; found {} \
+         occurrence(s)",
+        figures.len()
+    );
+
+    let (value, unit) = &figures[0];
+    let expected = ravel_ingest::IngestConfig::default()
+        .max_flush_lifetime
+        .as_secs();
+    assert_eq!(
+        unit, "s",
+        "the abandonment budget in docs/guides/ingest.md must be stated in \
+         seconds to match IngestConfig::default().max_flush_lifetime, not in \
+         {unit:?}"
+    );
+    assert_eq!(
+        *value, expected,
+        "docs/guides/ingest.md states an abandonment budget of {value} s but \
+         ravel-ingest defaults max_flush_lifetime to {expected} s. That figure \
+         is how long a buffered flush's own store calls may take before its \
+         already-acked rows are dropped, so the guide must track the constant."
+    );
+}
+
+/// `README.md` does not tell a reader that a clean shutdown makes buffered loss
+/// specific to a crash. It is not: a flush whose store calls exceed
+/// `max_flush_lifetime` is abandoned and drops rows Ravel already acknowledged,
+/// with every process still running.
+#[test]
+fn readme_does_not_claim_a_clean_shutdown_makes_buffered_loss_crash_only() {
+    let readme = normalized_readme();
+    assert!(
+        readme.contains("Buffered acknowledgement is opt-in per request."),
+        "README.md is missing the buffered acknowledgement paragraph, so the \
+         path is wrong or the section has been restructured"
+    );
+    assert_eq!(
+        readme.matches(README_STALE_SHUTDOWN_SENTENCE).count(),
+        0,
+        "README.md still states {README_STALE_SHUTDOWN_SENTENCE:?}. An \
+         abandoned flush drops already-acked buffered rows without any crash, \
+         so loss is not specific to one."
     );
 }
 

@@ -198,7 +198,8 @@ what is in MinIO. See
 
 The claim it proves is specific to strict acknowledgement, which is the default.
 Buffered acknowledgement, opt-in per request, returns before the flush and
-carries no commit token, so a crash loses its buffered window. The
+carries no commit token, so a crash loses its buffered window, and an
+abandoned flush can drop already-acknowledged rows with no crash. The
 [consistency model](../consistency-model.md#acknowledgement-semantics) is
 normative for both.
 

@@ -151,11 +151,26 @@ Every write has a mode. The default is strict:
   shard). After you have that ack, the data survives the crash of any Ravel
   process, because it survives everything the object store survives
   ([docs/consistency-model.md](../consistency-model.md)).
-- **Buffered**: the call returns as soon as Ravel validates the request and
-  enqueues it into its shard's in-memory buffer, before any flush. This is
-  lower latency but not durable. A crash between the ack and the next flush
-  loses that buffered window, bounded by `max_flush_delay` (2s default).
-  Ravel issues no commit token, because there is nothing yet to point one at.
+- **Buffered**: the call returns as soon as Ravel admits the request and
+  enqueues it to its shard actor, before any flush. This is lower latency but
+  not durable, and Ravel issues no commit token, because there is nothing yet
+  to point one at. `max_flush_delay` (2s default) bounds when the shard's
+  flush is triggered, not when it completes: the flush task then waits for a
+  `max_inflight_flushes` permit on its shard before it issues its store
+  calls, so a shard whose permits are held by a stalled flush widens the
+  window a crash between the ack and the flush would lose. Already-acked rows
+  are dropped with no crash at all when the flush's own store calls, made
+  after it holds the permit, cannot complete in time: `max_flush_lifetime`,
+  the budget for those store calls, defaults to 3600 s. It runs from the
+  moment the permit is granted rather than from flush open, and it is not
+  tunable from the server, so that case is a stuck backend and not a queue
+  wait. A flush already past its flush-open deadline is abandoned without
+  taking a permit, and a flush queued behind a stalled co-resident prefix
+  reaches the store once the stall clears, so a co-resident stall is not a
+  buffered-mode loss. `ravel_ingest_abandoned_retry_exhausted_total` counts
+  the flushes abandoned for store-call exhaustion and
+  `ravel_ingest_abandoned_queue_deadline_total` those abandoned at the queue
+  deadline ([docs/consistency-model.md](../consistency-model.md)).
 
 To use buffered mode for one request, send `x-ravel-ingest-mode: buffered` as
 an HTTP header or as gRPC metadata on the export. For strict mode, omit it or
