@@ -198,10 +198,10 @@ pub async fn ensure_provisioning_record(
 
 /// Validate the configured `shard_count` for every statically-known tenant at
 /// startup (ADR-0050 section 5), refusing to start on the first disagreement.
-/// The static tenant set is the union of `--tenant-token` and
-/// `--maintain-tenant` (already hashed), so an OIDC/mTLS deployment with no
-/// static tenants (an empty set) has nothing to validate here and every dynamic
-/// tenant is validated at first touch instead.
+/// The static tenant set is the union of `--tenant-token` (or
+/// `--tenant-token-file`) and `--maintain-tenant` (already hashed), so an
+/// OIDC/mTLS deployment with no static tenants (an empty set) has nothing to
+/// validate here and every dynamic tenant is validated at first touch instead.
 ///
 /// Uses [`AbsentPolicy::AdoptIfData`]: a (tenant, signal) with no record and no
 /// data passes through without refusing (the fresh-deployment case), a

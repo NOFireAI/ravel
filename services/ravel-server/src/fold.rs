@@ -117,7 +117,8 @@ pub(crate) const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Sig
 /// mean a signal-aware short-circuit inside `ravel-catalog`, deliberately out
 /// of scope here.
 ///
-/// `fallback_allow` is the merged `--tenant-token`/`--maintain-tenant` set:
+/// `fallback_allow` is the merged static tenant set (`--tenant-token` or
+/// `--tenant-token-file`, plus `--maintain-tenant`):
 /// empty means unconfigured, and it otherwise governs only tenants with no
 /// durable config record (ADR-0048 decision 3, ADR-0066 decision 6). A tenant
 /// carrying a config record is maintained unconditionally, so no flag can
