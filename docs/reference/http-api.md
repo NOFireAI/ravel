@@ -21,7 +21,8 @@ over gRPC on a second listener (`--listen-grpc`); this page documents the HTTP
 surface only.
 
 A tenant-scoped route resolves the request to a tenant before it does any work.
-The default resolver is a static bearer-token map (`--tenant-token`); a
+The default resolver is a static bearer-token map (`--tenant-token` or
+`--tenant-token-file`); a
 deployment may instead resolve the tenant from an OIDC token or a
 proxy-forwarded mTLS identity. Whichever resolver is configured, a request that
 carries no resolvable credential to a tenant-scoped route is rejected with 401

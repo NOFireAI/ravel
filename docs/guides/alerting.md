@@ -56,7 +56,7 @@ The file is JSON with a top-level `rules` array. Each entry is one rule:
 Fields on a rule:
 
 - `tenant` (required): the tenant id this rule belongs to, matching a
-  `--tenant-token` tenant.
+  `--tenant-token` or `--tenant-token-file` tenant.
 - `rule_id` (required): a stable operator-chosen identifier. Together with
   `labels` it forms the alert's identity, so keep it stable across restarts.
 - Exactly one of `promql` or `sql` (required): the query text. Naming both, or

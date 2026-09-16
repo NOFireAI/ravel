@@ -363,11 +363,10 @@ pub struct Cli {
     /// env var carries only the path, never a token value, which is the same
     /// exposure class as argv. An empty or comment-only file parses to an
     /// empty map: that authenticates nothing, the same as passing no
-    /// `--tenant-token` at all, and because an empty static bearer map also
-    /// means no `--maintain-tenant`-equivalent restriction, background fold,
-    /// compaction and retention widen to every tenant discovery finds in
-    /// storage rather than refusing startup. A Secret mount that failed to
-    /// populate looks like this, not like a startup error.
+    /// `--tenant-token` at all, and unless `--maintain-tenant` names tenants,
+    /// background fold, compaction and retention widen to every tenant
+    /// discovery finds in storage rather than refusing startup. A Secret mount
+    /// that failed to populate looks like this, not like a startup error.
     #[arg(
         long = "tenant-token-file",
         value_name = "PATH",
