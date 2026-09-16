@@ -120,12 +120,22 @@ ravel-server --mode all \
   listener and never on the mTLS listener. A node with no gRPC listener never
   registers itself as a worker, so every slice of every query runs
   coordinator-local. That is correct, just not distributed.
-- `--max-inflight-fragments` (default 32) caps how many inbound slice fetches
-  this process serves concurrently for other coordinators. This is a **distinct
-  admission class** from `--max-concurrent-queries`: a coordinator holding a
-  client-query permit while it waits on its own dispatched fragments can never
-  deadlock behind client queries queued on the client cap. Over the cap a
-  fragment request queues; it is not rejected.
+- `--max-inflight-fragments` (default 32) caps how many inbound `Pinned`
+  (intra-cluster) slice fetches this process serves concurrently for other
+  coordinators in the same cluster. This is a **distinct admission class**
+  from `--max-concurrent-queries`: a coordinator holding a client-query
+  permit while it waits on its own dispatched fragments can never deadlock
+  behind client queries queued on the client cap. Over the cap a fragment
+  request queues; it is not rejected.
+- `--max-inflight-federated-resolves` (default 8) caps how many inbound
+  `Resolve` (cross-cluster federation) slice fetches this process serves
+  concurrently for peer-cluster coordinators. It admits against an
+  **independent semaphore** from `--max-inflight-fragments`: a peer cluster driving
+  federation reads at this cap can never delay this cluster's own `Pinned`
+  slices, because the two classes never share a permit pool. Over the cap a
+  `Resolve` request queues; it is not rejected. The `/metrics` fragment
+  in-flight gauge and admission-wait counter carry a `class` label
+  (`pinned`|`resolve`) so the two classes' queueing can be told apart.
 
 ### How a slice fetch is authorized
 
@@ -506,14 +516,17 @@ label.
 
 `GET /metrics` renders the `ravel_distrib_*` family on any process with
 distribution enabled, under the closed `mode` label alone (no per-shard,
-per-worker, or per-tenant label). The family is absent entirely when
-distribution is off.
+per-worker, or per-tenant label), except the fragment in-flight gauge and
+admission-wait counter, which also carry a `class` label (`pinned`|`resolve`).
+The family is
+absent entirely when distribution is off.
 
 | Metric | Type | What it tells you |
 |---|---|---|
 | `ravel_distrib_fragment_requests_total` | counter | Inbound slice fetches this process served for other coordinators. |
 | `ravel_distrib_fragment_auth_failures_total` | counter | Inbound `Resolve`-scope federation requests whose presented credential did not resolve to a tenant. It does not count `Pinned` capability rejections: those are counted per reason in-process only, and reach the coordinator as re-dispatch and fallback. |
-| `ravel_distrib_fragment_inflight` | gauge | Fragments in flight now. Riding at `--max-inflight-fragments` means inbound slices are queueing. |
+| `ravel_distrib_fragment_inflight{class}` | gauge | Fragments in flight now, split by admission class. `class="pinned"` riding at `--max-inflight-fragments` or `class="resolve"` riding at `--max-inflight-federated-resolves` means that class's inbound slices are queueing; the two never contend for the same permits. |
+| `ravel_distrib_fragment_admission_waits_total{class}` | counter | Inbound fragment requests, by admission class, that found their class's semaphore saturated and had to queue rather than being admitted immediately. |
 | `ravel_distrib_slices_local_total` | counter | Slices this coordinator ran itself with no hop. |
 | `ravel_distrib_slices_remote_total` | counter | Slices dispatched to a peer. |
 | `ravel_distrib_slices_redispatched_total` | counter | Slices re-dispatched after a failed first attempt. |
