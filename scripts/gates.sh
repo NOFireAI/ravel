@@ -203,6 +203,16 @@ echo "==> scripts/guards/check-guarded-sql-parse.sh"
 echo "==> scripts/guards/check-promql-unreachable.sh"
 "$(dirname "$0")/guards/check-promql-unreachable.sh"
 
+# A user guide must not keep a figure a later record superseded, or an operator
+# picks a flag value from a retired number (issue #1736). This scans the guides
+# tree for the retired ADR-0996 ClickBench pair. Cases first, same reason as the
+# guards above: a source scan, no build, and it passes everything if its anchor
+# page is gone.
+echo "==> scripts/guards/check-superseded-figures.test.sh"
+bash "$(dirname "$0")/guards/check-superseded-figures.test.sh"
+echo "==> scripts/guards/check-superseded-figures.sh"
+"$(dirname "$0")/guards/check-superseded-figures.sh"
+
 # deny.toml's quick-xml ignore comment records the direct Cargo.lock parents
 # of RUSTSEC-2026-0194/-0195 (issue #1718); this checks the comment still
 # names every one of them. Cases first, same reason as the guards above. A

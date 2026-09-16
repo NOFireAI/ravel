@@ -286,6 +286,14 @@ jobs:
         run: bash scripts/guards/check-promql-unreachable.test.sh
       - name: PromQL-unreachable guard (issue #1701)
         run: bash scripts/guards/check-promql-unreachable.sh
+      # A user guide must not keep a figure a later record superseded (issue
+      # #1736): an operator picks a flag value from it. Cases first, same reason
+      # as the guards above, and this one passes everything if its anchor page
+      # is gone.
+      - name: Superseded-figures guard cases (issue #1736)
+        run: bash scripts/guards/check-superseded-figures.test.sh
+      - name: Superseded-figures guard (issue #1736)
+        run: bash scripts/guards/check-superseded-figures.sh
       # deny.toml's quick-xml ignore comment must name every direct Cargo.lock
       # parent of RUSTSEC-2026-0194/-0195 (issue #1718). Cases first, same
       # reason as the guards above.
