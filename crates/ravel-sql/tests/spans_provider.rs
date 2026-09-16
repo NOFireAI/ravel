@@ -27,23 +27,28 @@ mod util;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use datafusion::arrow::array::{
     Array, FixedSizeBinaryArray, StringArray, TimestampNanosecondArray,
 };
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::collect;
+use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::{col, lit};
 use datafusion::scalar::ScalarValue;
-use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
+use ravel_catalog::{Catalog, CatalogConfig, SegmentLevel, SegmentRef, Snapshot};
+use ravel_commit::publish::RetryPolicy;
+use ravel_commit::record::NewCommitRecord;
+use ravel_commit::{keys, publish, record};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_rspan::{
     ObjectIdentity, RspanConfig, RspanWriter, ScanStats, SpanQuery, SpanRecord, StatusCode,
 };
-use ravel_sql::{SpanSegmentFetcher, SpansScanExec, SpansTableProvider};
-use ravel_types::TenantHash;
+use ravel_sql::{SpanSegmentFetcher, SpansScanExec, SpansTableProvider, SqlConfig, SqlExecutor};
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use ravel_types::{Signal, TenantHash, TenantId, TimeRange};
 use uuid::Uuid;
 
 fn identity() -> ObjectIdentity {
@@ -496,6 +501,282 @@ async fn a_spans_scan_is_accounted() {
         snap.s3_bytes(AccountedOp::Get),
         expected_bytes,
         "the accounted GET records the whole object's transferred bytes"
+    );
+}
+
+fn tenant() -> TenantId {
+    TenantId::new("trace-id-hex-literal".to_string())
+}
+
+/// Publish one RSPAN object as a real `Signal::Spans` commit record, so
+/// `SqlExecutor`'s `Catalog::resolve` finds it exactly as a production caller
+/// would (no hand-built `Snapshot`). Mirrors
+/// `flight_reachability::publish_spans_segment` below, which cannot be reused
+/// directly: that copy lives inside a `#[cfg(feature = "flight-sql")]`
+/// module and this test must run under the crate's unconditional SQL surface.
+async fn publish_spans_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    records: &[SpanRecord],
+) {
+    let tenant_hash = tenant.hash();
+    let identity = ObjectIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: [2u8; 16],
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let mut w = RspanWriter::new(RspanConfig::default(), identity);
+    for r in records {
+        w.push(r.clone());
+    }
+    let bytes = w.finish().expect("finish object");
+    let min = records
+        .iter()
+        .map(|r| r.start_ts_ns)
+        .min()
+        .expect("nonempty");
+    let max = records.iter().map(|r| r.end_ts_ns).max().expect("nonempty");
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    let new_record = NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Spans,
+        shard: 0,
+        writer_id: Uuid::from_u128(1),
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: records.len() as u64,
+        series_count: 0,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        min_ingest_ts_ns: min,
+        max_ingest_ts_ns: max,
+        segment_format_version: 1,
+        created_unix_ns: 0,
+        ingest_hour_bucket: 0,
+    };
+    let rec = record::build(new_record).expect("valid commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+}
+
+/// A `SqlExecutor` over a fresh tenant holding `records`, built exactly as
+/// `SqlExecutor::new` is built in `tests/bounded_topk_aggregate.rs`.
+async fn executor_with_spans(records: &[SpanRecord]) -> SqlExecutor {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_spans_segment(store.as_ref(), &tenant(), records).await;
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    SqlExecutor::new(
+        catalog,
+        SegmentFetcher::new(Arc::clone(&store)),
+        LogSegmentFetcher::new(Arc::clone(&store)),
+        SpanSegmentFetcher::new(Arc::clone(&store)),
+        SqlConfig::default(),
+        1 << 30,
+    )
+}
+
+fn sql_request(sql: &str) -> ravel_sql::SqlRequest {
+    ravel_sql::SqlRequest {
+        sql: sql.to_string(),
+        window: TimeRange {
+            start_ns: 0,
+            end_ns: i64::MAX,
+        },
+        min_tokens: Vec::new(),
+        now_ns: 1_000_000,
+        deadline: Duration::from_secs(120),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
+    }
+}
+
+/// The physical plan `sql` produces under `executor`, for assertions that
+/// inspect operators (e.g. downcasting to `SpansScanExec`) rather than rendered
+/// text. Mirrors `tests/bounded_topk_aggregate.rs::physical_plan_tree`.
+async fn spans_physical_plan(executor: &SqlExecutor, sql: &str) -> Arc<dyn ExecutionPlan> {
+    let accounting = QueryAccounting::new();
+    let declared = executor
+        .resolve_declared_columns(tenant().hash(), sql_request(sql).now_ns)
+        .await;
+    let (snapshot, _) = executor
+        .resolve_snapshot(tenant().hash(), &sql_request(sql), &accounting)
+        .await
+        .expect("snapshot resolves");
+    let planned = executor
+        .plan_pinned(tenant().hash(), snapshot, sql, &accounting, &declared)
+        .await
+        .expect("query plans");
+    planned
+        .create_physical_plan()
+        .await
+        .expect("physical plan builds")
+}
+
+/// Find the `SpansScanExec` leaf anywhere in `plan`'s tree. Trait-upcast to
+/// `Any` before downcasting, sidestepping the `as_any` name shared by the
+/// in-scope arrow `Array` trait (same reason
+/// `trace_id_query_takes_the_cheap_trace_lookup` above does it).
+fn find_spans_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<SpanQuery> {
+    let any_ref: &dyn std::any::Any = plan.as_ref();
+    if let Some(scan) = any_ref.downcast_ref::<SpansScanExec>() {
+        return Some(scan.query());
+    }
+    for child in plan.children() {
+        if let Some(q) = find_spans_scan(child) {
+            return Some(q);
+        }
+    }
+    None
+}
+
+/// Reduce `SELECT trace_id, span_id, start_ts, name FROM spans ...` output
+/// batches to the set of rows they contain, in that exact column order.
+/// Unlike `batches_to_rows` above, this does not assert the full public
+/// `spans` schema, since these queries select a narrower column list.
+fn query_rows(
+    batches: &[datafusion::arrow::record_batch::RecordBatch],
+) -> BTreeSet<([u8; 16], [u8; 8], i64, String)> {
+    let mut out = BTreeSet::new();
+    for batch in batches {
+        let trace = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("trace_id col");
+        let span = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("span_id col");
+        let start = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("start_ts col");
+        let name = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name col");
+        for i in 0..batch.num_rows() {
+            let tid: [u8; 16] = trace.value(i).try_into().expect("16-byte trace");
+            let sid: [u8; 8] = span.value(i).try_into().expect("8-byte span");
+            out.insert((tid, sid, start.value(i), name.value(i).to_string()));
+        }
+    }
+    out
+}
+
+fn to_hex(bytes: [u8; 16]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Issue #1709: `trace_id = '<32-hex>'`, sent as SQL text through the real
+/// `SqlExecutor`, plans and takes the `SpanQuery::trace` fast path exactly
+/// like the already-working `X'<32-hex>'` binary-literal form.
+///
+/// On the unmodified tree (before `TraceIdHexLiteralPlanner` was
+/// registered), the string-literal query below failed to plan at all:
+///
+/// ```text
+/// SQL planning failed: type_coercion
+/// caused by
+/// Error during planning: Cannot infer common argument type for comparison
+/// operation FixedSizeBinary(16) = Utf8
+/// ```
+///
+/// (captured by temporarily running this same query through `executor`
+/// before `crate::session::build_session` registered the planner). Reverting
+/// the `ctx.register_expr_planner(trace_id_hex_literal_planner())?;` line in
+/// `session.rs` reproduces that failure again.
+#[tokio::test]
+async fn trace_id_hex_string_literal_plans_and_takes_the_trace_fast_path() {
+    let target = [0x11u8; 16];
+    let other = [0x22u8; 16];
+    let records = vec![
+        span(target, 0, 100, 110, "root"),
+        span(target, 1, 120, 130, "child"),
+        span(other, 0, 200, 210, "unrelated"),
+    ];
+    let executor = executor_with_spans(&records).await;
+    let hex = to_hex(target);
+
+    let string_sql =
+        format!("SELECT trace_id, span_id, start_ts, name FROM spans WHERE trace_id = '{hex}'");
+    let binary_sql =
+        format!("SELECT trace_id, span_id, start_ts, name FROM spans WHERE trace_id = X'{hex}'");
+
+    // Both literal forms plan to the cheap trace lookup, not a full scan.
+    for sql in [&string_sql, &binary_sql] {
+        let plan = spans_physical_plan(&executor, sql).await;
+        let issued = find_spans_scan(&plan).expect("plan contains a SpansScanExec");
+        assert_eq!(
+            issued.trace_id,
+            Some(target),
+            "trace_id = '{hex}' (via {sql}) must compile to a SpanQuery::trace lookup, not a ts_range scan"
+        );
+    }
+
+    // Both forms return exactly the same rows through the real executor.
+    let string_outcome = executor
+        .execute(tenant().hash(), &sql_request(&string_sql))
+        .await
+        .expect("string-literal query executes");
+    let binary_outcome = executor
+        .execute(tenant().hash(), &sql_request(&binary_sql))
+        .await
+        .expect("binary-literal query executes");
+
+    let string_rows = query_rows(string_outcome.output.batches());
+    let binary_rows = query_rows(binary_outcome.output.batches());
+
+    let mut want = BTreeSet::new();
+    want.insert((target, [0u8; 8], 100i64, "root".to_string()));
+    want.insert((target, [1u8; 8], 120i64, "child".to_string()));
+
+    assert_eq!(
+        string_rows, want,
+        "trace_id = '<hex>' must return exactly the target trace's spans"
+    );
+    assert_eq!(
+        string_rows, binary_rows,
+        "the string and binary trace_id literal forms must return identical rows"
+    );
+}
+
+/// Issue #1709: a 31-character `trace_id` literal (one hex digit short) is
+/// not silently matched as a truncated or padded id. It fails a typed
+/// `SqlError::Plan`, the same shape DataFusion's own `type_coercion` failure
+/// takes, because `TraceIdHexLiteralPlanner` leaves a non-32-character
+/// literal unplanned (`PlannerResult::Original`) and DataFusion's ordinary
+/// coercion then has no path from `Utf8` to `FixedSizeBinary(16)`.
+#[tokio::test]
+async fn trace_id_literal_wrong_length_is_a_plan_error() {
+    let records = vec![span([0x11u8; 16], 0, 100, 110, "root")];
+    let executor = executor_with_spans(&records).await;
+    let short_hex = "1".repeat(31);
+    assert_eq!(short_hex.len(), 31);
+    let sql = format!("SELECT trace_id FROM spans WHERE trace_id = '{short_hex}'");
+
+    let err = executor
+        .execute(tenant().hash(), &sql_request(&sql))
+        .await
+        .expect_err("a 31-character trace_id literal must not plan");
+    assert!(
+        matches!(err, ravel_sql::SqlError::Plan(_)),
+        "expected a typed SqlError::Plan, got: {err:?}"
     );
 }
 

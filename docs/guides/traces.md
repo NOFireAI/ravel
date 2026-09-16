@@ -168,12 +168,11 @@ with a status, service, name, or duration prune. Each `WHERE` clause is also
 re-applied exactly above the scan, so every result is correct whether or not a
 block was pruned.
 
-The block-pruning path accepts the 32-character hex form of the `trace_id`
-literal in the first query. The residual filter that re-applies the predicate
-above the scan compares a `FixedSizeBinary(16)` column against the literal,
-and its behaviour with a text literal is not verified end to end. Treat the
-hex-string form as illustrative, and supply a 16-byte binary literal where you
-need the whole comparison proven.
+The first query's `trace_id = '<32-hex>'` literal is both planned and
+re-applied as a residual over the real `FixedSizeBinary(16)` column: a
+32-character hex string and a 16-byte binary literal (`X'00112233...'`) plan
+identically, both taking the `trace_id` fast path and returning the same
+rows.
 
 ## Incomplete traces
 

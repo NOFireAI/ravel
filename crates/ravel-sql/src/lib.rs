@@ -98,6 +98,7 @@ mod spans_scan;
 mod spans_schema;
 pub mod spill;
 pub mod stats_json;
+mod trace_id_planner;
 mod udf;
 mod validate;
 
