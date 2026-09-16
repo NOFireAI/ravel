@@ -99,8 +99,9 @@
 //! rather than at the ambient umask: the payload is raw segment bytes under a
 //! filename that carries the tenant hash verbatim, so a default umask of
 //! `0o022` would otherwise make both the bytes and the tenant set readable by
-//! every local user. The configured root itself is never created or chmodded
-//! by this crate, so an operator who pre-creates it keeps their own mode.
+//! every local user. The configured root is never chmodded by this crate: an
+//! operator who pre-creates it keeps their own mode, and a root that does not
+//! exist yet is created `0o700` by the first insert like any other directory.
 //!
 //! **Eviction is S3-FIFO** (decision 6, amended 2026-08-02), the same
 //! policy and the same implementation the RAM tier uses (see [`crate::s3fifo`]):
@@ -1212,7 +1213,8 @@ mod tests {
     /// An admitted entry is owner-read-write only, and both directories the
     /// cache created to hold it are owner-only. The mode bits asserted here
     /// are the ones `insert` sets explicitly, so this test neither reads nor
-    /// changes the umask; a process at any umask must produce these.
+    /// changes the umask; a umask can only narrow them further, and every
+    /// usual one (022, 002, 027, 077) leaves them as asserted.
     ///
     /// FLIP (non-vacuity): restore `fs::create_dir_all(parent)` and
     /// `fs::write(&tmp_path, &buf)` in `Inner::insert`. Under `umask 022` the
