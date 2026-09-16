@@ -829,6 +829,13 @@ pub fn desired_gateway_deployment(
             args.push(secs.to_string());
         }
     }
+    // Ingest runs only in the gateway tier, so this per-shard flush-isolation
+    // bound is pushed here and nowhere else. Unset leaves the argv byte for byte
+    // as before, and ravel-server keeps its own default of 1.
+    if let Some(max_inflight) = spec.gateway.max_inflight_flushes {
+        args.push("--max-inflight-flushes".to_string());
+        args.push(max_inflight.to_string());
+    }
 
     let tier_override = spec.gateway.credentials_secret_ref.as_ref();
     let mut env = s3_credential_env(spec, tier_override);
@@ -2983,6 +2990,7 @@ mod tests {
                 }),
                 ingest_affinity: None,
                 exposure: None,
+                max_inflight_flushes: None,
             },
             query: QuerySpec {
                 replicas: 2,
@@ -3086,6 +3094,55 @@ mod tests {
             .expect("no gc render error")
             .expect("maintain enabled");
         assert_eq!(arg_value(&args_of(&m), "--shards").as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn max_inflight_flushes_renders_onto_the_gateway_only() {
+        // #1743: spec.gateway.maxInflightFlushes renders --max-inflight-flushes
+        // with its value on the gateway container, and on no other tier. Ingest
+        // runs only in the gateway mode, so the flag is inert on query/maintain
+        // and must not appear there.
+        let mut spec = base_spec();
+        spec.gateway.max_inflight_flushes = Some(4);
+
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        assert_eq!(
+            arg_value(&args_of(&g), "--max-inflight-flushes").as_deref(),
+            Some("4"),
+            "gateway must render the flush bound verbatim: {:?}",
+            args_of(&g)
+        );
+
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
+        assert!(
+            !args_of(&q).iter().any(|a| a == "--max-inflight-flushes"),
+            "query must not carry the flush bound: {:?}",
+            args_of(&q)
+        );
+        assert!(
+            !args_of(&m).iter().any(|a| a == "--max-inflight-flushes"),
+            "maintain must not carry the flush bound: {:?}",
+            args_of(&m)
+        );
+
+        // Unset: no tier emits the flag at all.
+        let mut none_spec = base_spec();
+        none_spec.gateway.max_inflight_flushes = None;
+        let g = desired_gateway_deployment(&none_spec, "prod", &ctx());
+        let q = desired_query_deployment(&none_spec, "prod", &ctx());
+        let m = desired_maintain_deployment(&none_spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
+        for (tier, dep) in [("gateway", &g), ("query", &q), ("maintain", &m)] {
+            assert!(
+                !args_of(dep).iter().any(|a| a == "--max-inflight-flushes"),
+                "{tier} must omit the flush bound when unset: {:?}",
+                args_of(dep)
+            );
+        }
     }
 
     #[test]

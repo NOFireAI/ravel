@@ -42,6 +42,9 @@ so those tenants' writes are still accepted and their age triggers still fire;
 what they wait for is a permit to flush on. The control for
 cross-tenant flush isolation on a shard is `max_inflight_flushes`
 (docs/ingest.md "Shard actor"), not the subset size and not the shard count.
+Under the operator, set it with `spec.gateway.maxInflightFlushes` on the
+`RavelCluster` (see [kubernetes.md](kubernetes.md)), which renders
+`--max-inflight-flushes` onto the gateway Deployment; it defaults to 1.
 
 There is a read-side benefit too. Fewer, larger L0 objects mean fewer open-hour
 segments for a query to open, which lowers the per-query request budget.

@@ -237,6 +237,7 @@ A minimal example is in
 | `spec.gateway.resources` | object | none | `requests` / `limits` maps, as in a Pod spec. |
 | `spec.gateway.fold.disabled` | boolean | `false` | `--disable-fold`. Fold is a query-cost optimization only; disabling it never changes results. |
 | `spec.gateway.fold.intervalSecs` | integer | none | `--fold-interval-secs`. |
+| `spec.gateway.maxInflightFlushes` | integer | `1` | `--max-inflight-flushes`. Per-shard cap on concurrent flushes. This is the cross-tenant flush isolation control, not only a throughput knob: at `1` one tenant's stalled flush blocks co-resident tenants' flushes on that shard, so raise it to bound that. Gateway-only (ingest runs in no other tier). Omit to keep the server default of `1`; `0` is rejected at admission. |
 | `spec.gateway.ingestAffinity` | object | none | Layer-7 ingest affinity. Omit and nothing is rendered. Present, it pins tenant identity to a stable subset of gateway replicas, cutting flush PUTs by `replicas / subsetSize`, via one of two backends. Full reference, backend comparison, and sizing guidance in [ingest-affinity.md](ingest-affinity.md). |
 | `spec.gateway.ingestAffinity.enabled` | boolean | `true` | `false` deletes the rendered objects and returns to the affinity-absent render. |
 | `spec.gateway.ingestAffinity.backend` | string | `ingressNginx` | `ingressNginx` (deprecated, renders Ingress objects) or `ravelNative` (renders the `ravel-ingest-router` service). Omitting it keeps an existing CR's backend. |
