@@ -79,7 +79,7 @@ plus the quickstart compose files issue #1720 added: every `FROM`/`ARG` base
 image in the root `Dockerfile` and `Dockerfile.prebuilt`, every `uses:` action
 reference under `.github/workflows/` and `.github/actions/`, and every
 `image:` reference in `deploy/docker-compose/ravel.yml` and
-`deploy/docker-compose/minio.yml`. All four categories run in one invocation
+`deploy/docker-compose/minio.yml`. All five categories run in one invocation
 and each is checked against its own expected count:
 
 - **Compose images** (this directory): every image reference carries an
@@ -103,7 +103,17 @@ and each is checked against its own expected count:
   placeholders (`ravel-server`, `ravel-operator`); pinning the k8s manifests
   is a separate ticket.
 
-Exit 0 means all four categories passed. Any unpinned reference, any missing
+- **Workflow docker invocations**: every image argument of a `docker run`,
+  `docker pull` or `docker create` inside a `run:` block, across every
+  workflow under `.github/workflows`, carries an `@sha256:` digest. Image
+  references that come from a shell variable are excluded by exact match,
+  since the variable holds either a locally built tag or a reference the
+  workflow already resolved to a digest. Both the total (17) and the
+  pin-required count (11) equal their expected totals. Backslash
+  continuations are joined before matching, here-doc bodies are skipped, and
+  every invocation on a line is scanned, not just the first.
+
+Exit 0 means all five categories passed. Any unpinned reference, any missing
 required comparator, or a reference count that drifts from any category's
 expected number fails the check with a non-zero exit. The script prints what
 it checked and how many references it found in each category.

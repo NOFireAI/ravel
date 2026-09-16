@@ -489,7 +489,7 @@ if [ "$workflow_scan_count" -gt 0 ]; then
   # the image argument.
   awk '
     BEGIN {
-      n = split("-p -e --name --network --entrypoint -v --volume -u --user -w --workdir -h --hostname --env --add-host --link --label -l --platform", vf, " ")
+      n = split("-p -e --name --network --entrypoint -v --volume -u --user -w --workdir -h --hostname --env --add-host --link --label -l --platform --pull --mount --device --gpus -m --memory --cpus --restart", vf, " ")
       for (i = 1; i <= n; i++) VALUE_FLAGS[vf[i]] = 1
     }
     FNR == 1 {
