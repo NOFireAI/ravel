@@ -4159,7 +4159,7 @@ mod ingest_readiness_tests {
     async fn a_condemned_log_shard_makes_the_process_not_ready() {
         let shard_count = 4;
         let store: Arc<dyn ObjectStoreBackend> =
-            Arc::new(SplitBrainOnFirstCommit::new("/c/", Signal::Logs));
+            Arc::new(SplitBrainOnFirstCommit::new("/l/c/", Signal::Logs));
         let router = Arc::new(LogIngestRouter::new(
             flush_on_first(shard_count),
             Arc::clone(&store),
