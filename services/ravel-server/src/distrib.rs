@@ -144,7 +144,7 @@ impl CapabilityReject {
 }
 
 /// The two independent admission classes for inbound fragment fetches
-/// (ADR-0071 deliverable: admission disjointness). `Pinned` fetches serve
+/// (issue #1722). `Pinned` fetches serve
 /// this cluster's own intra-cluster fan-out; `Resolve` fetches serve
 /// cross-cluster federation reads. Each class queues (never rejects) against
 /// its own cap, so a class saturated with one kind of traffic never delays
@@ -517,7 +517,7 @@ impl Drop for FragmentPermit {
 }
 
 /// The two independent admission classes a [`FragmentService`] admits fetches
-/// against (ADR-0071 deliverable: admission disjointness). `Pinned` and
+/// against (issue #1722). `Pinned` and
 /// `Resolve` each carry their own semaphore and their own cap, so a peer
 /// cluster's federation reads queuing on `Resolve` never delays this
 /// cluster's own `Pinned` slices, and a `Pinned` backlog never delays
@@ -1014,8 +1014,7 @@ impl SeriesFetch for FragmentService {
                 self.verify_capability(&inner)?;
             }
         }
-        // Pinned and Resolve admit against disjoint classes (ADR-0071
-        // deliverable: admission disjointness), so a peer cluster's
+        // Pinned and Resolve admit against disjoint classes (issue #1722), so a peer cluster's
         // federation reads queuing on Resolve can never delay this cluster's
         // own Pinned slices.
         let class = match &inner.scope {
@@ -2029,7 +2028,7 @@ mod tests {
         )
     }
 
-    /// ADR-0071 deliverable: admission disjointness. A cross-cluster
+    /// issue #1722. A cross-cluster
     /// federation coordinator saturating the `Resolve` class (here bounded to
     /// 1) must never delay this cluster's own `Pinned` fetches: the two
     /// classes are independent semaphores, so a `Pinned` fetch is admitted
