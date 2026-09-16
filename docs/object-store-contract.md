@@ -604,8 +604,9 @@ size the two listing probes size their key counts against; see
   shrunken declared page size against a large real one exercises only Ravel's
   own client-side drain loop, not the backend. At the default the run does
   prove the backend's side: 1002 keys means S3 serves a full 1000-key
-  response and then honours an exclusive `start-after` resume past it. All `page_size + 2` keys written must come back as that many
-  distinct keys, none lost between pages, AND delivered across at least two
+  response and then honours an exclusive `start-after` resume past it. All
+  `page_size + 2` keys written must come back as that many distinct keys,
+  none lost between pages, AND delivered across at least two
   pages that actually carry objects: a backend may emit a trailing empty page
   purely to signal the end of a listing once total keys exactly fill a
   multiple of the page size, and counting that page toward "more than one

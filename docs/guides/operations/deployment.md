@@ -55,8 +55,10 @@ needs qualification.
 `store qualify` writes transient scratch objects under `sys/qualify/<run-id>/`
 while it runs its suite, not only the final record. The Admin policy grants no
 delete anywhere, so that scratch is never cleaned up by the credential itself.
-It is bounded, one run's worth of small objects per invocation, and harmless to
-leave, but repeated runs against the same bucket accumulate it.
+It is bounded per run, but not small: the two listing probes write two keys
+more than the declared page size each, so a run at the default page size
+leaves about two thousand small objects, and repeated runs against the same
+bucket accumulate them. Sweep the prefix from a runbook when it matters.
 
 ## The bucket protection contract
 
