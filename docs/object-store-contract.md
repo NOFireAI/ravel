@@ -716,8 +716,27 @@ adapter contract:
    deletion or overwrite for the configured retention period, with no
    principal (including the bucket owner) able to shorten or remove it.
    Subject identifiers that must remain erasable under ADR-0064 live in
-   *values*, never in *object keys or names*, precisely so Object Lock on
-   these prefixes never conflicts with a legitimate erasure request.
+   *values*, never in *object keys or names*, so locking these prefixes
+   never exposes a subject value to Object Lock's own reach. That keeps
+   confidentiality out of the conflict; it does not keep the prefixes out
+   of it. `sys/*`, `t/*/*/prov`, and `t/*/catalog/*/*` HEAD history are
+   never targets of supersession GC, ADR-0019 retention deletion, or
+   ADR-0064 erasure, so a lock on those three costs nothing there. Commit
+   records (`t/*/*/c/*`) are not exempt the same way: once superseded,
+   supersession GC, ADR-0019 retention deletion, and ADR-0064 erasure all
+   physically delete them, and a per-object compliance-mode retention `R`
+   on a still-locked commit record refuses that delete until `R` elapses,
+   so the physical-removal bound for the record (and for the sweep pass
+   holding it) becomes `max(bound, R)`. The superseded sweep deletes a
+   chain's input commit records before its input data objects; a record
+   still under retention aborts that pass at the record-delete step, and
+   the data-delete step after it never runs, so the L0 data the pass would
+   otherwise collect stays in place, undeleted, until the record's
+   retention expires and a later pass completes the delete. An operator
+   who needs these sweeps to keep making progress keeps `R` at or under
+   `protection_horizon` (about 25 hours with `CompactorConfig` defaults);
+   an `R` longer than that pauses collection on that record for the
+   difference.
 
    **How the prefix scoping is achieved.** Object Lock has no prefix
    scope of its own. It is enabled once per bucket, at bucket creation,

@@ -5913,3 +5913,69 @@ fn every_shipped_template_passes_the_choke_point() {
         }
     }
 }
+
+/// The object-store contract's compliance-mode paragraph must state the true
+/// consequence of a locked commit record instead of the retired claim that
+/// Object Lock on the protected prefixes never conflicts with a legitimate
+/// erasure request, and must name `protection_horizon` as the bound an
+/// operator keeps the retention period inside. `t/*/*/c/*` must stay
+/// deletable: present in Maintain's own delete grant and absent from
+/// `PROTECTED_DELETE_KEYS` (`DenyDeleteProtected`), or the superseded sweep
+/// this doc claim rests on could not run at all. Reverting the doc edit
+/// restores the retired sentence and fails the first assertion below.
+#[test]
+fn commit_prefix_is_deletable_and_the_contract_bounds_its_retention() {
+    let doc_path = format!(
+        "{}/../../docs/object-store-contract.md",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let doc = std::fs::read_to_string(&doc_path).unwrap_or_else(|e| panic!("read {doc_path}: {e}"));
+
+    assert!(
+        !doc.contains("never conflicts with a legitimate erasure request"),
+        "{doc_path} still carries the retired claim that Object Lock on the \
+         protected prefixes never conflicts with a legitimate erasure \
+         request; a locked commit record delays supersession GC, ADR-0019 \
+         retention deletion, and ADR-0064 erasure until its retention period \
+         elapses"
+    );
+
+    let commit_paragraph: String = doc
+        .lines()
+        .skip_while(|l| !l.contains("commit records `t/*/*/c/*`"))
+        .take_while(|l| !l.trim_start().starts_with("**How the prefix scoping"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !commit_paragraph.is_empty(),
+        "{doc_path}: could not find the paragraph naming commit records \
+         `t/*/*/c/*` under the compliance-mode Object Lock point; the \
+         anchor text this test scans for may have moved"
+    );
+    assert!(
+        commit_paragraph.contains("protection_horizon"),
+        "the paragraph naming t/*/*/c/* must name protection_horizon as the \
+         bound an operator keeps the retention period inside; paragraph was:\n\
+         {commit_paragraph}"
+    );
+
+    let policy = load_policy("maintain");
+    let maintain_delete = policy_statements(&policy)
+        .iter()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("MaintainDelete"))
+        .expect("maintain.json carries a MaintainDelete statement");
+    let resources = statement_resources(maintain_delete);
+    assert!(
+        resources.iter().any(|r| r.ends_with("t/*/*/c/*")),
+        "MaintainDelete must grant delete on t/*/*/c/*, or the superseded \
+         sweep this doc claim rests on could not delete a commit record at \
+         all: {resources:?}"
+    );
+    assert!(
+        !PROTECTED_DELETE_KEYS.contains(&"t/*/*/c/*"),
+        "t/*/*/c/* must stay out of PROTECTED_DELETE_KEYS (DenyDeleteProtected); \
+         an IAM Deny there would block every superseded-sweep delete of a \
+         commit record outright, which is a stronger and permanent block, not \
+         the bounded compliance-mode retention this doc claim describes"
+    );
+}

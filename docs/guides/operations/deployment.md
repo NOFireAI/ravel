@@ -72,7 +72,14 @@ with erasure obligations are bucket-layer settings. The compliance-mode
 retention on the control prefixes (`sys/*`, the provisioning records, commit
 records and the catalog HEAD history) is per-object retention that an
 operator-run mechanism applies, because Object Lock has no prefix scope of its
-own; the contract page describes the two shapes that mechanism can take.
+own; the contract page describes the two shapes that mechanism can take. Three
+of those four prefix families are never deleted by a maintenance sweep, so
+locking them costs nothing beyond the mechanism itself. The commit records
+are: a maintenance sweep physically removes a superseded commit record, and a
+still-locked one refuses that delete until its retention period elapses, so
+the retention period chosen for commit records is also a bound on how long
+that sweep can pause; the contract page's "Required bucket configuration"
+names the default window to keep it inside.
 
 **One lifecycle rule is not optional for any bucket Ravel writes to.**
 Configure `AbortIncompleteMultipartUpload` with a cleanup period of seven days
