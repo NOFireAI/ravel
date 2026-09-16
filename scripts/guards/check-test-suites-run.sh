@@ -133,7 +133,27 @@ while IFS= read -r suite; do
   # Named on a non-comment line. A basename is the right key: a step may
   # invoke it via `bash scripts/tests/x.test.sh` or a variable path, and
   # matching the full repo-relative path would miss the latter.
-  if grep -qF -- "${base}" <<<"${workflow_text}"; then
+  #
+  # Bounded on both sides, because a plain substring match lets one suite's
+  # line cover another's name: with `prefix-foo.test.sh` wired, a search for
+  # `foo.test.sh` hits that same line and reports an orphan as run. No such
+  # pair exists among the suites today, which is exactly why the match has to
+  # be right before one does -- a false "run" is the failure this guard exists
+  # to prevent, and it would be silent.
+  #
+  # The boundary class is the set of characters a filename can contain, so a
+  # name touching `/`, whitespace or a quote still matches.
+  # Only `.` needs escaping: a basename cannot contain a slash, and no other
+  # regex metacharacter appears in a `*.test.sh` name. Done with parameter
+  # expansion rather than a sed subshell, because a sed that errors returns
+  # empty and an empty key matches EVERY line -- the guard would then report
+  # every suite as run, which is its worst possible failure and a silent one.
+  base_re="${base//./\\.}"
+  if [[ -z "${base_re}" ]]; then
+    echo "check-test-suites-run.sh: empty match key for '${suite}'; refusing to judge it" >&2
+    exit 2
+  fi
+  if grep -qE -- "(^|[^A-Za-z0-9._-])${base_re}([^A-Za-z0-9._-]|\$)" <<<"${workflow_text}"; then
     ((list_all == 1)) && printf 'run       %s\n' "${suite}"
     continue
   fi

@@ -219,5 +219,30 @@ out="$( cd "${d}" && CHECK_TEST_SUITES_EXCEPTED='scripts/tests/other.test.sh|unr
         ./scripts/guards/check-test-suites-run.sh 2>&1 )"; rc=$?
 check_eq "an unrelated exception leaves the orphan failing (1)" "1" "${rc}"
 
+# --- one suite's name must not be covered by another's line -------------
+# A plain substring match lets `prefix-foo.test.sh` cover `foo.test.sh`, so
+# an orphan reads as run. That is the guard's own worst failure and a silent
+# one. No such pair exists among the real suites, which is why the match has
+# to be right before one appears.
+# Mutation: drop the boundaries (plain grep -qF on the basename).
+d="$(new_repo substring)"
+add_suite "${d}" "scripts/tests/prefix-foo.test.sh" wired
+add_suite "${d}" "scripts/tests/foo.test.sh"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a name covered only as another's substring is an orphan (1)" "1" "${rc}"
+check_contains "and is named" "ORPHAN    scripts/tests/foo.test.sh" "${out}"
+check_true "and the wired longer name is not called an orphan" \
+  "$([[ "${out}" != *"ORPHAN    scripts/tests/prefix-foo.test.sh"* ]] && echo 1 || echo 0)"
+
+# The reverse direction: the longer name is genuinely wired, and a name that
+# merely SHARES a prefix must not steal its coverage either.
+d="$(new_repo substring_rev)"
+add_suite "${d}" "scripts/tests/foo.test.sh" wired
+add_suite "${d}" "scripts/tests/foo.test.sh.bak.test.sh"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a longer name is not covered by a shorter wired one (1)" "1" "${rc}"
+
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [[ ${fail} -eq 0 ]]
