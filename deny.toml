@@ -36,27 +36,38 @@ ignore = [
   # through two separate direct parents, checked mechanically by
   # scripts/guards/check-quick-xml-entry-points.sh:
   #
-  # - quick-xml 0.26.0 enters through inferno's SVG rendering (inferno <-
-  #   pprof, `flamegraph` feature), which both ravel-bench and
+  # - quick-xml 0.26.0 enters through inferno 0.11.21's SVG rendering
+  #   (inferno <- pprof, `flamegraph` feature), which both ravel-bench and
   #   services/ravel-cli pull behind their own off-by-default `profiling`
   #   feature (see the matching `inferno` CDDL-1.0 license exception
   #   below).
-  # - quick-xml 0.39.4 enters through object_store 0.13.2 (object_store <-
-  #   parquet's `object_store` feature <- ravel-bench's `object_store`
-  #   dependency), which ravel-bench pulls behind its own off-by-default
-  #   `parquet-baseline` feature. Not through inferno: pprof/inferno never
-  #   links this copy of object_store.
+  # - quick-xml 0.39.4 enters through object_store 0.13.2's own `aws`
+  #   feature, which crates/ravel-bench/Cargo.toml turns on directly
+  #   (`object_store = { version = "0.13", optional = true, features =
+  #   ["aws"] }`), gated by ravel-bench's own off-by-default
+  #   `parquet-baseline` feature. NOT through parquet's `object_store`
+  #   feature: that feature only adds parquet's own (optional) dependency
+  #   on the object_store crate for its async reader, without `aws` or any
+  #   other cloud feature, and pulls no quick-xml on its own
+  #   (`cargo tree --locked -p ravel-cli -i object_store@0.13.2` shows
+  #   object_store 0.13.2 reachable through both parquet and datafusion,
+  #   but `cargo tree --locked -p ravel-cli -i quick-xml@0.39.4` exits 101,
+  #   "did not match any packages": quick-xml only enters once
+  #   ravel-bench's own `aws` feature is turned on, via
+  #   `--features parquet-baseline`). Not through inferno either:
+  #   pprof/inferno never links this copy of object_store.
   #
   # Both advisories describe CPU/memory exhaustion from parsing
   # attacker-controlled, untrusted XML with many attributes or namespace
   # declarations on a single start tag. Neither reachable input is
   # attacker-controlled here: inferno's quick-xml usage only parses and
   # writes flamegraph SVG built from locally generated pprof sample data
-  # (symbol names and stack frames from the same process), and
-  # object_store's quick-xml usage only parses S3-compatible XML
-  # responses this bench-only reader issues to endpoints it configured
-  # itself, over the read-side Parquet accounting harness's own requests,
-  # never externally supplied or untrusted XML.
+  # (symbol names and stack frames from the same process). object_store's
+  # quick-xml usage parses ListObjectsV2 and error response bodies from
+  # the S3-compatible endpoints this bench-only reader is configured to
+  # talk to, which are remote HTTP responses, not locally generated data;
+  # the ignore does not rest on that XML being trusted, only on the
+  # shipped-build unreachability below.
   #
   # The ignore rests on ravel-bench being `publish = false` with no
   # production caller, and on no shipped binary's feature set turning on
@@ -67,10 +78,15 @@ ignore = [
   # ravel-object-store's own object_store dependency is 0.14.1, which
   # resolves quick-xml 0.41.0 and is unaffected.
   #
-  # No fixed inferno release pins quick-xml >=0.41.0 yet, and no
-  # object_store 0.13.x release beyond 0.13.2 exists yet either (parquet's
-  # dependency is a caret range, so a patch bump would resolve
-  # automatically); revisit when either happens.
+  # No object_store 0.13.x release beyond 0.13.2 exists yet (parquet's own
+  # dependency on it is a caret range, so a patch bump would resolve
+  # automatically). Inferno itself is not the blocker for quick-xml
+  # 0.26.0: inferno 0.12.7 and later already declare `quick-xml = "^0.41"`.
+  # The live blocker is pprof: every pprof release from 0.12 through 0.15
+  # still requires `inferno = "0.11"`, so nothing in this workspace can
+  # reach an inferno past 0.11.x without a pprof release that moves to
+  # inferno 0.12, followed by a workspace bump of both. Revisit when
+  # pprof does that, or when a fixed object_store 0.13.x appears.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
 ]
@@ -113,6 +129,11 @@ multiple-versions = "warn"
 # Cargo.toml, so no wildcard fires here while registry wildcards stay denied.
 # (allow-wildcard-paths does not apply: these crates are not publish = false.)
 wildcards = "deny"
+# Backstop for the RUSTSEC-2026-0194/-0195 ignore above: if either wrapper
+# ever resolves a quick-xml older than 0.41 through some OTHER path than the
+# two named above, or a third wrapper starts pulling one in, this fails the
+# build instead of silently widening the ignore's blast radius.
+deny = [{ crate = "quick-xml:<0.41", wrappers = ["inferno", "object_store"] }]
 
 [sources]
 unknown-registry = "deny"

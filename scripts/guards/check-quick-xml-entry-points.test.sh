@@ -136,13 +136,108 @@ cat >"${d}/deny.toml" <<'DENY'
 [advisories]
 ignore = [
   # RUSTSEC-2026-0194 and RUSTSEC-2026-0195: quick-xml enters through
-  # inferno's SVG rendering and through object_store 0.13.2.
+  # inferno 0.11.21's SVG rendering and through object_store 0.13.2.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
 ]
 DENY
 check "comment_must_name_every_parent_of_an_affected_quick_xml: corrected fixture naming both is clean" \
   0 "clean" -- "${d}/Cargo.lock" "${d}/deny.toml"
+
+# A parent named without its own version does not count as documented: the
+# comment must pair each parent with the version it resolves at in the lock,
+# not just its bare name, so a later version bump cannot silently outrun the
+# comment. Re-uses the both-named lock fixture but drops inferno's version
+# number from the prose.
+d="${TMP}/named-without-version"
+mkdir -p "${d}"
+lock_two_parents "${d}"
+cat >"${d}/deny.toml" <<'DENY'
+[advisories]
+ignore = [
+  # RUSTSEC-2026-0194 and RUSTSEC-2026-0195: quick-xml enters through
+  # inferno's SVG rendering and through object_store 0.13.2.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
+DENY
+check "a parent named without its own version still fails" \
+  1 "inferno 0.11.21" -- "${d}/Cargo.lock" "${d}/deny.toml"
+
+# A parent whose name is a substring of a longer identifier the comment DOES
+# mention (here a fixture crate literally named "store", which is a
+# substring of the real "object_store" text) must not be considered
+# documented by that longer word: the match is anchored on word boundaries,
+# not a bare substring test.
+d="${TMP}/substring-name-anchoring"
+mkdir -p "${d}"
+cat >"${d}/Cargo.lock" <<'LOCK'
+version = 4
+
+[[package]]
+name = "store"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "quick-xml",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.39.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "memchr",
+]
+LOCK
+cat >"${d}/deny.toml" <<'DENY'
+[advisories]
+ignore = [
+  # RUSTSEC-2026-0194 and RUSTSEC-2026-0195: enters through object_store
+  # 1.0.0, not through a crate literally named "store".
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
+DENY
+check "a parent name that is only a substring of a longer word in the comment still fails" \
+  1 "store 1.0.0" -- "${d}/Cargo.lock" "${d}/deny.toml"
+
+# A named parent whose version in the lock has moved past what the comment
+# says (object_store bumping from 0.13.2 to 0.14.1 while STILL resolving an
+# affected quick-xml) must fail: the version pairing is what catches this,
+# a bare name match would not.
+d="${TMP}/version-drifted"
+mkdir -p "${d}"
+cat >"${d}/Cargo.lock" <<'LOCK'
+version = 4
+
+[[package]]
+name = "object_store"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "quick-xml",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.39.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "memchr",
+]
+LOCK
+cat >"${d}/deny.toml" <<'DENY'
+[advisories]
+ignore = [
+  # RUSTSEC-2026-0194 and RUSTSEC-2026-0195: enters through object_store
+  # 0.13.2 (stale: the lock fixture has since moved to 0.14.1).
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
+DENY
+check "a parent that bumped to a version the comment does not name still fails" \
+  1 "object_store 0.14.1" -- "${d}/Cargo.lock" "${d}/deny.toml"
 
 # A parent name that is only a substring away from what is written (e.g. the
 # comment naming "object-store" with a hyphen, not the real crate name
@@ -248,7 +343,7 @@ LOCK
 cat >"${d}/deny.toml" <<'DENY'
 [advisories]
 ignore = [
-  # RUSTSEC-2026-0194 and RUSTSEC-2026-0195: enters through inferno.
+  # RUSTSEC-2026-0194 and RUSTSEC-2026-0195: enters through inferno 0.11.21.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
 ]
