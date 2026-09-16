@@ -569,9 +569,19 @@ impl NoncurrentVersionSource for dyn ObjectStoreBackend {
 /// `StoreError` or an unexpected success as a failed [`ProbeResult`], not a
 /// crash, so this is safe to run against an unqualified or actively broken
 /// backend.
+///
+/// `page_size` is the caller's declared list page size for `store` -- the
+/// real per-request page a backend such as `S3Store` or `MemoryStore` was
+/// constructed with, not merely a hint. The two listing probes
+/// ([`probe_lexicographic_listing_order`], [`probe_cross_page_listing`])
+/// write `page_size + 2` keys (see [`page_probe_key_count`]) so a page size
+/// that matches the backend's real configuration forces at least one real
+/// continuation-token boundary; a mismatched value either proves nothing (too
+/// small) or wastes writes proving nothing new (too large).
 pub async fn run_conformance_suite(
     store: &dyn ObjectStoreBackend,
     scratch_prefix: &str,
+    page_size: usize,
 ) -> ConformanceReport {
     let prefix = if scratch_prefix.ends_with('/') {
         scratch_prefix.to_string()
@@ -586,8 +596,8 @@ pub async fn run_conformance_suite(
         // Appended, not interleaved with the four probes above, so a report's
         // result order stays stable for anything that already reads it.
         probe_concurrent_create_if_absent(store, &prefix).await,
-        probe_lexicographic_listing_order(store, &prefix).await,
-        probe_cross_page_listing(store, &prefix).await,
+        probe_lexicographic_listing_order(store, &prefix, page_size).await,
+        probe_cross_page_listing(store, &prefix, page_size).await,
         probe_delete_visibility(store, &prefix).await,
     ];
     ConformanceReport { results }
@@ -802,7 +812,7 @@ async fn probe_consistent_list_after_write(
         // would collapse membership into an ordering failure, so drain the raw
         // pages here instead.
         match drain_probe_pages(store, &list_prefix, ProbeListing::List).await {
-            Ok((keys, _pages)) => {
+            Ok((keys, _pages, _key_bearing_pages)) => {
                 if !keys.contains(&key) {
                     return ProbeResult::fail(
                         property,
@@ -1100,7 +1110,12 @@ impl ProbeListing<'_> {
 }
 
 /// Drain every page of `prefix` through `listing` and return the keys in
-/// delivery order together with the number of pages served.
+/// delivery order, the number of pages served, and how many of those pages
+/// carried at least one key. A store that serves a final, empty page just to
+/// hand back `next: None` still counts as more than one page served, so
+/// `pages > 1` alone proves nothing about a real multi-page boundary being
+/// crossed: the key-bearing count is what [`probe_cross_page_listing`] checks
+/// instead.
 ///
 /// Deliberately not [`crate::list_all`] or [`crate::drain_pages`]: those
 /// deduplicate and discard both the delivery order and the page count, which
@@ -1111,7 +1126,7 @@ async fn drain_probe_pages(
     store: &dyn ObjectStoreBackend,
     prefix: &str,
     listing: ProbeListing<'_>,
-) -> Result<(Vec<String>, usize), String> {
+) -> Result<(Vec<String>, usize, usize), String> {
     let method = listing.method();
     // The call the failure detail names, carrying the `start_after` marker for a
     // tail drain so a `list_after` tail failure reads distinctly from a full
@@ -1124,6 +1139,7 @@ async fn drain_probe_pages(
     };
     let mut delivered: Vec<String> = Vec::new();
     let mut pages = 0usize;
+    let mut key_bearing_pages = 0usize;
     let mut token = None;
     loop {
         let result = match listing {
@@ -1132,10 +1148,13 @@ async fn drain_probe_pages(
         };
         let page = result.map_err(|err| format!("{call} failed: {err}"))?;
         pages += 1;
+        if !page.objects.is_empty() {
+            key_bearing_pages += 1;
+        }
         delivered.extend(page.objects.into_iter().map(|meta| meta.key));
         match page.next {
             Some(next) => token = Some(next),
-            None => return Ok((delivered, pages)),
+            None => return Ok((delivered, pages, key_bearing_pages)),
         }
         if pages >= MAX_PROBE_PAGES {
             return Err(format!(
@@ -1168,9 +1187,13 @@ fn first_order_violation(delivered: &[String]) -> Option<(&str, &str)> {
         .map(|pair| (pair[0].as_str(), pair[1].as_str()))
 }
 
-/// Written in this order, so a backend that simply echoes insertion order
-/// fails the probe instead of passing it by accident.
-const ORDER_PROBE_SUFFIXES: [&str; 5] = ["d", "a", "e", "c", "b"];
+/// Fixed alphabet for the ordering probe's default shape (declared page size
+/// 2, the exact count [`page_probe_key_count`] floors every smaller size to),
+/// written in this order so a backend that simply echoes insertion order
+/// fails the probe instead of passing it by accident. Every hardcoded `a`
+/// through `e` key literal in this module's own tests is tied to this exact
+/// set and sorted order, so its length must stay 5.
+const ORDER_PROBE_ALPHABET: [&str; 5] = ["d", "a", "e", "c", "b"];
 
 /// [`probe_lexicographic_listing_order`] indexes `expected[1]` for the
 /// `start_after` marker, `expected[2..]` for the tail it must return, and
@@ -1179,10 +1202,38 @@ const ORDER_PROBE_SUFFIXES: [&str; 5] = ["d", "a", "e", "c", "b"];
 /// qualification run against a live bucket into a panic; here it fails the
 /// build instead.
 const _: () = assert!(
-    ORDER_PROBE_SUFFIXES.len() >= 3,
+    ORDER_PROBE_ALPHABET.len() >= 3,
     "probe_lexicographic_listing_order needs at least three keys: one before the start_after \
      marker, the marker, and a non-empty tail after it"
 );
+
+/// How many keys the two LIST probes ([`probe_lexicographic_listing_order`]
+/// and [`probe_cross_page_listing`]) write, given the caller's declared list
+/// page size. `page_size + 2` guarantees a real continuation-token boundary is
+/// crossed rather than merely a client-side re-chunking of an already fully
+/// streamed listing (`S3Store::with_page_size` does not change the wire-level
+/// `ListObjectsV2` page size, so shrinking it alone proves nothing about a
+/// real backend); floored at 5 so the existing page-size-2 pagination-oracle
+/// fixtures in this module's tests keep their exact 5-key/3-page shape.
+fn page_probe_key_count(page_size: usize) -> usize {
+    (page_size + 2).max(5)
+}
+
+/// Suffixes [`probe_lexicographic_listing_order`] writes, `count` keys long.
+/// `count == ORDER_PROBE_ALPHABET.len()` -- the page-size-2 shape every
+/// existing fixture in this module's tests is built on -- reuses that fixed
+/// letter alphabet unchanged. A larger `count` (a declared page size above 3,
+/// e.g. production's 1000) falls back to zero-padded numeric suffixes,
+/// written in descending order so an insertion-order echo still fails the
+/// probe: unpadded numbers would sort lexicographically wrong ("k10" before
+/// "k9"), which zero-padding to the width of the largest index avoids.
+fn order_probe_suffixes(count: usize) -> Vec<String> {
+    if count == ORDER_PROBE_ALPHABET.len() {
+        return ORDER_PROBE_ALPHABET.iter().map(|s| s.to_string()).collect();
+    }
+    let width = count.saturating_sub(1).to_string().len();
+    (0..count).rev().map(|i| format!("{i:0width$}")).collect()
+}
 
 /// Lexicographic listing order and `start_after` resumption.
 ///
@@ -1196,11 +1247,13 @@ const _: () = assert!(
 async fn probe_lexicographic_listing_order(
     store: &dyn ObjectStoreBackend,
     prefix: &str,
+    page_size: usize,
 ) -> ProbeResult {
     let property = Property::LexicographicListingOrder;
     let list_prefix = format!("{prefix}order/");
+    let suffixes = order_probe_suffixes(page_probe_key_count(page_size));
 
-    for suffix in ORDER_PROBE_SUFFIXES {
+    for suffix in &suffixes {
         let key = format!("{list_prefix}{suffix}");
         if let Err(err) = store
             .put(&key, Bytes::from_static(b"x"), PutOptions::default())
@@ -1209,7 +1262,7 @@ async fn probe_lexicographic_listing_order(
             return ProbeResult::fail(property, format!("put {key} failed: {err}"));
         }
     }
-    let mut expected: Vec<String> = ORDER_PROBE_SUFFIXES
+    let mut expected: Vec<String> = suffixes
         .iter()
         .map(|suffix| format!("{list_prefix}{suffix}"))
         .collect();
@@ -1227,7 +1280,7 @@ async fn probe_lexicographic_listing_order(
     // second literal restated beside the value it must agree with.
     for listing in [ProbeListing::List, ProbeListing::After(None)] {
         let entry_point = listing.method();
-        let (delivered, _pages) = match drain_probe_pages(store, &list_prefix, listing).await {
+        let (delivered, _pages, _key_bearing_pages) = match drain_probe_pages(store, &list_prefix, listing).await {
             Ok(result) => result,
             Err(detail) => return ProbeResult::fail(property, detail),
         };
@@ -1260,7 +1313,7 @@ async fn probe_lexicographic_listing_order(
     }
 
     // start_after: resume strictly after the second key, which must yield
-    // exactly the last three, still in order.
+    // exactly the remaining tail, still in order.
     let marker = expected[1].clone();
     let expected_tail: Vec<String> = expected[2..].to_vec();
     // The tail names its entry point through the same `method()` the full drain
@@ -1268,7 +1321,7 @@ async fn probe_lexicographic_listing_order(
     // owns the label on every path.
     let tail_listing = ProbeListing::After(Some(&marker));
     let tail_method = tail_listing.method();
-    let (tail_delivered, _pages) = match drain_probe_pages(store, &list_prefix, tail_listing).await
+    let (tail_delivered, _pages, _key_bearing_pages) = match drain_probe_pages(store, &list_prefix, tail_listing).await
     {
         Ok(result) => result,
         Err(detail) => return ProbeResult::fail(property, detail),
@@ -1319,24 +1372,27 @@ async fn probe_lexicographic_listing_order(
     )
 }
 
-/// How many keys [`probe_cross_page_listing`] writes. Small enough to be cheap
-/// on a real bucket, and an odd number so a page size that divides it evenly
-/// is not the only shape exercised.
-const PAGE_PROBE_KEYS: usize = 5;
-
 /// Cross-page listing consistency, the probe ADR-0050 section 6 names and the
 /// suite did not have: every key written before the first page request is
-/// delivered, across however many pages the backend serves, with none lost.
+/// delivered, across however many pages the backend serves, with none lost --
+/// and, per [`page_probe_key_count`], across at least two pages that actually
+/// carry keys, so the probe proves a real continuation-token boundary was
+/// crossed rather than a single page a trailing empty page merely padded out.
 ///
 /// A key lost between pages is invisible to a caller and to
 /// [`probe_consistent_list_after_write`], which only ever looks for one key at
 /// a time under a prefix small enough to fit one page.
-async fn probe_cross_page_listing(store: &dyn ObjectStoreBackend, prefix: &str) -> ProbeResult {
+async fn probe_cross_page_listing(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    page_size: usize,
+) -> ProbeResult {
     let property = Property::CrossPageListing;
     let list_prefix = format!("{prefix}pages/");
+    let key_count = page_probe_key_count(page_size);
 
-    let mut expected: Vec<String> = Vec::with_capacity(PAGE_PROBE_KEYS);
-    for i in 0..PAGE_PROBE_KEYS {
+    let mut expected: Vec<String> = Vec::with_capacity(key_count);
+    for i in 0..key_count {
         let key = format!("{list_prefix}k{i}");
         if let Err(err) = store
             .put(&key, Bytes::from_static(b"x"), PutOptions::default())
@@ -1353,11 +1409,11 @@ async fn probe_cross_page_listing(store: &dyn ObjectStoreBackend, prefix: &str) 
     // to a probe that only drains `list_after`. `list_after`'s own full-drain
     // completeness is judged by the ordering probe's `list_after` pass over the
     // same page shape.
-    let (delivered, pages) = match drain_probe_pages(store, &list_prefix, ProbeListing::List).await
-    {
-        Ok(result) => result,
-        Err(detail) => return ProbeResult::fail(property, detail),
-    };
+    let (delivered, pages, key_bearing_pages) =
+        match drain_probe_pages(store, &list_prefix, ProbeListing::List).await {
+            Ok(result) => result,
+            Err(detail) => return ProbeResult::fail(property, detail),
+        };
     let mut distinct = distinct_in_delivery_order(&delivered);
     distinct.sort();
     if distinct != expected {
@@ -1365,9 +1421,23 @@ async fn probe_cross_page_listing(store: &dyn ObjectStoreBackend, prefix: &str) 
             property,
             format!(
                 "a paginated listing of {list_prefix} returned {} distinct keys across {pages} \
-                 pages, expected exactly {PAGE_PROBE_KEYS}: got {distinct:?}, expected \
+                 pages, expected exactly {key_count}: got {distinct:?}, expected \
                  {expected:?}; a key was lost or invented across pages",
                 distinct.len()
+            ),
+        );
+    }
+    if key_bearing_pages < 2 {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "a paginated listing of {list_prefix} served all {key_count} keys on a single \
+                 key-bearing page ({pages} page{} served overall, only {key_bearing_pages} \
+                 carrying keys); the declared list page size of {page_size} never forced a real \
+                 continuation-token boundary, so this run proves nothing about cross-page \
+                 behavior -- more keys than the backend's real page size must be written to \
+                 cross one",
+                if pages == 1 { "" } else { "s" }
             ),
         );
     }
@@ -1375,8 +1445,8 @@ async fn probe_cross_page_listing(store: &dyn ObjectStoreBackend, prefix: &str) 
     ProbeResult::pass(
         property,
         format!(
-            "{PAGE_PROBE_KEYS} distinct keys across {pages} pages, none lost \
-             ({} deliveries; the cross-page guarantee allows repeats)",
+            "{key_count} distinct keys across {pages} pages ({key_bearing_pages} carrying keys), \
+             none lost ({} deliveries; the cross-page guarantee allows repeats)",
             delivered.len()
         ),
     )
@@ -1446,7 +1516,7 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
     // `list_after` caller outside this crate. Naming the entry point tells an
     // operator which path still re-delivers the deleted key.
     for listing in [ProbeListing::List, ProbeListing::After(None)] {
-        let (delivered, _pages) = match drain_probe_pages(store, &list_prefix, listing).await {
+        let (delivered, _pages, _key_bearing_pages) = match drain_probe_pages(store, &list_prefix, listing).await {
             Ok(result) => result,
             Err(detail) => return ProbeResult::fail(property, detail),
         };
@@ -1475,7 +1545,7 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
         );
     }
     for listing in [ProbeListing::List, ProbeListing::After(None)] {
-        let (delivered, _pages) = match drain_probe_pages(store, &list_prefix, listing).await {
+        let (delivered, _pages, _key_bearing_pages) = match drain_probe_pages(store, &list_prefix, listing).await {
             Ok(result) => result,
             Err(detail) => return ProbeResult::fail(property, detail),
         };
@@ -1631,7 +1701,7 @@ mod tests {
         // (c) Whatever the probe reports, qualification pass/fail is unchanged:
         // the conforming oracle passes, and the suite carries exactly its
         // gating properties -- the probe is none of them.
-        let report = run_conformance_suite(&store, "sys/qualify/object-lock/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/object-lock/", 1000).await;
         assert!(
             report.passed(),
             "the informational probe must not change the qualification result"
@@ -1646,7 +1716,7 @@ mod tests {
     #[tokio::test]
     async fn conforming_backend_qualifies() {
         let store = MemoryStore::new();
-        let report = run_conformance_suite(&store, "sys/qualify/test-1/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/test-1/", 1000).await;
         assert!(
             report.passed(),
             "expected every property to pass on the oracle, got failures: {:?}",
@@ -1723,7 +1793,7 @@ mod tests {
     #[tokio::test]
     async fn weak_list_backend_fails_qualification() {
         let store = WeakListStore::new();
-        let report = run_conformance_suite(&store, "sys/qualify/test-2/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/test-2/", 1000).await;
         assert!(!report.passed());
         let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
         assert_eq!(
@@ -1823,7 +1893,7 @@ mod tests {
             inner: MemoryStore::new(),
             hidden_from_next_list: Mutex::new(HashSet::new()),
         };
-        let report = run_conformance_suite(&store, "sys/qualify/weak-list-only/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/weak-list-only/", 1000).await;
         assert!(!report.passed());
         let failed: HashSet<&'static str> = report.failures().map(|r| r.property.name()).collect();
         assert_eq!(
@@ -1921,7 +1991,7 @@ mod tests {
             inner: MemoryStore::new(),
             pages: Mutex::new(0),
         };
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 1000).await;
         assert!(!report.passed());
         let failed: HashSet<&'static str> = report.failures().map(|r| r.property.name()).collect();
         assert_eq!(
@@ -2031,7 +2101,7 @@ mod tests {
     #[tokio::test]
     async fn backend_without_conditional_writes_fails_qualification() {
         let store = NoCasStore::new();
-        let report = run_conformance_suite(&store, "sys/qualify/test-3/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/test-3/", 1000).await;
         assert!(!report.passed());
         let failed: HashSet<&'static str> = report.failures().map(|r| r.property.name()).collect();
         assert!(failed.contains(Property::ConditionalWriteCreateIfAbsent.name()));
@@ -2143,7 +2213,7 @@ mod tests {
     #[tokio::test]
     async fn unsorted_listing_backend_fails_qualification() {
         let store = UnsortedListStore::new();
-        let report = run_conformance_suite(&store, "sys/qualify/unsorted/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/unsorted/", 1000).await;
         assert!(!report.passed());
         let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
         assert_eq!(
@@ -2237,7 +2307,7 @@ mod tests {
     #[tokio::test]
     async fn lying_delete_visibility_backend_fails_qualification() {
         let store = LyingDeleteStore::new();
-        let report = run_conformance_suite(&store, "sys/qualify/lying-delete/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/lying-delete/", 1000).await;
         assert!(!report.passed());
         let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
         assert_eq!(
@@ -2367,7 +2437,7 @@ mod tests {
     #[tokio::test]
     async fn a_backend_with_a_delete_stale_on_list_after_fails_qualification() {
         let store = WeakDeleteOnListAfterStore::new();
-        let report = run_conformance_suite(&store, "sys/qualify/delete-stale-list-after/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/delete-stale-list-after/", 1000).await;
         assert!(
             !report.passed(),
             "a delete invisible through list_after must not qualify even when list is correct"
@@ -2402,7 +2472,7 @@ mod tests {
     async fn delete_probe_pass_detail_is_pinned() {
         let store = MemoryStore::new();
         let prefix = "sys/qualify/delete-pass-detail/";
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 1000).await;
         assert!(
             report.passed(),
             "the oracle must pass every probe, got: {:?}",
@@ -2478,7 +2548,7 @@ mod tests {
 
         // (b) The probe reaches the same verdict on the oracle, and says so
         // with the exact counts.
-        let report = run_conformance_suite(&store, "sys/qualify/race/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/race/", 1000).await;
         assert!(
             report.passed(),
             "the oracle must pass every probe, got: {:?}",
@@ -2614,7 +2684,7 @@ mod tests {
     #[tokio::test]
     async fn losing_racer_transient_once_is_retried_and_the_probe_still_passes() {
         let store = TransientLoserStore::once();
-        let report = run_conformance_suite(&store, "sys/qualify/transient-once/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/transient-once/", 1000).await;
         assert!(
             report.passed(),
             "a backend whose losing racers are retryable exactly once is conformant, got \
@@ -2652,7 +2722,7 @@ mod tests {
     #[tokio::test]
     async fn losing_racer_transient_forever_fails_the_probe_naming_the_attempt_bound() {
         let store = TransientLoserStore::forever();
-        let report = run_conformance_suite(&store, "sys/qualify/transient-forever/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/transient-forever/", 1000).await;
         assert!(!report.passed(), "an unsettled racer must not qualify");
         let failed: HashSet<&'static str> = report.failures().map(|r| r.property.name()).collect();
         assert_eq!(
@@ -2791,7 +2861,7 @@ mod tests {
     #[tokio::test]
     async fn lost_winner_response_fails_the_probe_as_unevaluable_not_non_atomic() {
         let store = LostWinnerResponseStore::new();
-        let report = run_conformance_suite(&store, "sys/qualify/lost-winner/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/lost-winner/", 1000).await;
         assert!(
             !report.passed(),
             "a run that never established a winner must not qualify"
@@ -2838,7 +2908,7 @@ mod tests {
     #[tokio::test]
     async fn cross_page_listing_over_five_keys_at_page_size_two_returns_all_five() {
         let store = MemoryStore::with_page_size(2);
-        let report = run_conformance_suite(&store, "sys/qualify/pages/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/pages/", 2).await;
         assert!(
             report.passed(),
             "the oracle must pass every probe at page size 2, got: {:?}",
@@ -2879,6 +2949,72 @@ mod tests {
             keys.iter().collect::<HashSet<_>>().len(),
             5,
             "5 distinct keys: {keys:?}"
+        );
+    }
+
+    /// The premise this whole change exists to fix (issue #1695): a declared
+    /// page size that is smaller than the store's REAL page size does not
+    /// force any real continuation-token boundary. Here the store's actual
+    /// page size is 1000 (`MemoryStore::new()`), but `run_conformance_suite`
+    /// is told a declared page size of 1, so the probe writes only
+    /// `page_probe_key_count(1) == 5` keys -- all five fit on the store's one
+    /// real 1000-capacity page. Before this change the probe only checked
+    /// `pages > 1` (which a trailing empty page satisfies even here) and
+    /// passed; the fix instead requires at least two KEY-BEARING pages, which
+    /// a single real page never has, so this must fail.
+    #[tokio::test]
+    async fn cross_page_probe_fails_when_the_drain_served_one_page() {
+        let store = MemoryStore::new();
+        let report = run_conformance_suite(&store, "sys/qualify/pages/", 1).await;
+        let paging = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::CrossPageListing)
+            .expect("the cross-page probe ran");
+        assert!(
+            !paging.passed,
+            "a declared page size of 1 against a real page size of 1000 must not \
+             pass the cross-page probe: {}",
+            paging.detail
+        );
+        assert!(
+            paging.detail.contains("single key-bearing page")
+                || paging.detail.contains("1 page")
+                || paging.detail.contains("carrying keys"),
+            "the failure detail must name the single page the drain actually \
+             served: {}",
+            paging.detail
+        );
+    }
+
+    /// At a page size matching production S3 (1000), the probe writes
+    /// `page_size + 2` = 1002 keys and the declared size equals the store's
+    /// real page size, so the drain really does cross a continuation-token
+    /// boundary: 1000 keys on the first page, 2 on the second, both
+    /// key-bearing.
+    #[tokio::test]
+    async fn cross_page_probe_writes_enough_keys_to_cross_the_declared_page() {
+        let page_size = 1000;
+        let store = MemoryStore::with_page_size(page_size);
+        let report = run_conformance_suite(&store, "sys/qualify/pages/", page_size).await;
+        assert!(
+            report.passed(),
+            "the store's real page size matches the declared one, so every \
+             probe must pass: {:?}",
+            report.failures().collect::<Vec<_>>()
+        );
+        let paging = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::CrossPageListing)
+            .expect("the cross-page probe ran");
+        assert!(
+            paging
+                .detail
+                .contains("1002 distinct keys across 2 pages (2 carrying keys)"),
+            "the pass detail must name the production-scale key and page \
+             counts: {}",
+            paging.detail
         );
     }
 
@@ -3104,7 +3240,7 @@ mod tests {
     async fn listing_order_probe_accepts_a_repeat_of_the_last_delivered_key() {
         let store = PageBoundaryStore::new(PageBoundary::RepeatLastKey, ListingPass::Full);
         let prefix = "sys/qualify/order-repeat-last-full/";
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 2).await;
         assert!(
             report.passed(),
             "a repeat of the last delivered key is a permitted delivery, so every probe must \
@@ -3119,7 +3255,7 @@ mod tests {
 
         // The repeat really fired: seven deliveries of five keys, never
         // decreasing, with the two repeats adjacent to the key they repeat.
-        let (delivered, pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
+        let (delivered, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
             .await
             .expect("draining the probe's own prefix");
         assert_eq!(
@@ -3181,7 +3317,7 @@ mod tests {
     async fn listing_order_probe_accepts_a_repeat_of_the_last_delivered_key_on_list() {
         let store = PageBoundaryStore::new_on_list(PageBoundary::RepeatLastKey);
         let prefix = "sys/qualify/order-repeat-last-on-list/";
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 2).await;
         assert!(
             report.passed(),
             "a repeat of the last delivered key on list is a permitted delivery, so every probe \
@@ -3197,7 +3333,7 @@ mod tests {
         // The repeat fired on the list pass: seven deliveries of five keys
         // across three pages, never decreasing, with each repeat adjacent to
         // the key it repeats.
-        let (delivered, pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
+        let (delivered, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
             .await
             .expect("draining the probe's own prefix through list");
         assert_eq!(
@@ -3237,7 +3373,7 @@ mod tests {
     async fn listing_order_probe_rejects_a_cross_page_repeat_of_an_earlier_key() {
         let store = PageBoundaryStore::new(PageBoundary::RepeatEarlierKey, ListingPass::Full);
         let prefix = "sys/qualify/order-repeat-full/";
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 2).await;
         assert!(!report.passed());
         let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
         assert_eq!(
@@ -3258,7 +3394,7 @@ mod tests {
         // The repeat really fired, and on the pass under test: the raw
         // sequence holds seven deliveries of five keys, and its first
         // backwards step is the repeated key after a larger one.
-        let (delivered, pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
+        let (delivered, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
             .await
             .expect("draining the probe's own prefix");
         assert_eq!(
@@ -3331,7 +3467,7 @@ mod tests {
     async fn listing_order_probe_rejects_a_swap_across_a_page_boundary() {
         let store = PageBoundaryStore::new(PageBoundary::SwapAcrossBoundary, ListingPass::Full);
         let prefix = "sys/qualify/order-swap-full/";
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 2).await;
         assert!(!report.passed());
         let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
         assert_eq!(
@@ -3351,7 +3487,7 @@ mod tests {
 
         // Five keys, each delivered exactly once, in a swapped order: nothing
         // for deduplication to collapse.
-        let (delivered, _pages) =
+        let (delivered, _pages, _key_bearing_pages) =
             drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
                 .await
                 .expect("draining the probe's own prefix");
@@ -3375,7 +3511,7 @@ mod tests {
     async fn list_after_tail_rejects_a_cross_page_repeat_of_an_earlier_key() {
         let store = PageBoundaryStore::new(PageBoundary::RepeatEarlierKey, ListingPass::Tail);
         let prefix = "sys/qualify/order-repeat-tail/";
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 2).await;
         assert!(!report.passed());
         let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
         assert_eq!(failed, vec![Property::LexicographicListingOrder]);
@@ -3391,7 +3527,7 @@ mod tests {
         // The repeat fired in the tail pass only: four deliveries of the three
         // keys after the marker, going backwards once.
         let marker = format!("{list_prefix}b");
-        let (tail_delivered, pages) =
+        let (tail_delivered, pages, _key_bearing_pages) =
             drain_probe_pages(&store, &list_prefix, ProbeListing::After(Some(&marker)))
                 .await
                 .expect("draining the probe's own tail");
@@ -3420,7 +3556,7 @@ mod tests {
         );
         // The full drain was left alone, so this test's evidence is the tail:
         // the full pass is in order and the probe still failed.
-        let (delivered, _pages) =
+        let (delivered, _pages, _key_bearing_pages) =
             drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
                 .await
                 .expect("draining the probe's own prefix");
@@ -3433,7 +3569,7 @@ mod tests {
     async fn list_after_tail_rejects_a_swap_across_a_page_boundary() {
         let store = PageBoundaryStore::new(PageBoundary::SwapAcrossBoundary, ListingPass::Tail);
         let prefix = "sys/qualify/order-swap-tail/";
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 2).await;
         assert!(!report.passed());
         let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
         assert_eq!(failed, vec![Property::LexicographicListingOrder]);
@@ -3447,7 +3583,7 @@ mod tests {
         );
 
         let marker = format!("{list_prefix}b");
-        let (tail_delivered, _pages) =
+        let (tail_delivered, _pages, _key_bearing_pages) =
             drain_probe_pages(&store, &list_prefix, ProbeListing::After(Some(&marker)))
                 .await
                 .expect("draining the probe's own tail");
@@ -3531,10 +3667,16 @@ mod tests {
     #[tokio::test]
     async fn list_after_tail_drain_failure_names_the_start_after_marker() {
         let store = TailErrorStore {
-            inner: MemoryStore::new(),
+            // Page size 2, matching the declared page_size passed to
+            // run_conformance_suite below: this test's marker literal is tied
+            // to the 5-key letter alphabet that shape produces, and a
+            // mismatched declared size would trip the cross-page probe's
+            // key-bearing-pages check instead of proving anything about this
+            // test's actual target, the list_after tail failure detail.
+            inner: MemoryStore::with_page_size(2),
         };
         let prefix = "sys/qualify/tail-error/";
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 2).await;
         assert!(!report.passed());
         let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
         assert_eq!(
@@ -3565,7 +3707,7 @@ mod tests {
     async fn listing_order_probe_rejects_a_cross_page_repeat_of_an_earlier_key_on_list() {
         let store = PageBoundaryStore::new_on_list(PageBoundary::RepeatEarlierKey);
         let prefix = "sys/qualify/repeat-earlier-on-list/";
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 2).await;
         assert!(!report.passed());
         let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
         assert_eq!(
@@ -3586,7 +3728,7 @@ mod tests {
 
         // The repeat fired on the list pass: seven deliveries of five keys
         // across three pages, going backwards once at the repeated earlier key.
-        let (delivered, pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
+        let (delivered, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
             .await
             .expect("draining the probe's own prefix through list");
         assert_eq!(
@@ -3609,7 +3751,7 @@ mod tests {
         );
         // list_after was left untouched, so the evidence is the list pass
         // alone: draining list_after over the same backend is in order.
-        let (via_after, _pages) =
+        let (via_after, _pages, _key_bearing_pages) =
             drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
                 .await
                 .expect("draining the probe's own prefix through list_after");
@@ -3757,7 +3899,7 @@ mod tests {
     async fn a_backend_ordered_on_list_after_but_reversed_on_list_fails_qualification() {
         let store = ReversedOrderStore::new(ReversedEntryPoint::List);
         let prefix = "sys/qualify/reversed-on-list/";
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 2).await;
         assert!(
             !report.passed(),
             "a backend reversed on list must not qualify even when list_after is ordered"
@@ -3779,7 +3921,7 @@ mod tests {
         );
 
         // list is reversed across three pages, list_after is untouched.
-        let (via_list, pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
+        let (via_list, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
             .await
             .expect("draining list");
         assert_eq!(
@@ -3793,7 +3935,7 @@ mod tests {
             ]
         );
         assert_eq!(pages, 3, "5 keys at page size 2 is exactly 3 pages");
-        let (via_after, _pages) =
+        let (via_after, _pages, _key_bearing_pages) =
             drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
                 .await
                 .expect("draining list_after");
@@ -3816,7 +3958,7 @@ mod tests {
     async fn a_backend_ordered_on_list_but_reversed_on_list_after_fails_qualification() {
         let store = ReversedOrderStore::new(ReversedEntryPoint::ListAfter);
         let prefix = "sys/qualify/reversed-on-list-after/";
-        let report = run_conformance_suite(&store, prefix).await;
+        let report = run_conformance_suite(&store, prefix, 2).await;
         assert!(
             !report.passed(),
             "a backend reversed on list_after must not qualify even when list is ordered"
@@ -3839,11 +3981,11 @@ mod tests {
 
         // list is in order; list_after's full drain is reversed across three
         // pages.
-        let (via_list, _pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
+        let (via_list, _pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
             .await
             .expect("draining list");
         assert_eq!(first_order_violation(&via_list), None);
-        let (via_after, pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
+        let (via_after, pages, _key_bearing_pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
             .await
             .expect("draining list_after");
         assert_eq!(
@@ -3870,7 +4012,7 @@ mod tests {
                 .with_occurrence(Occurrence::Nth(1)),
         );
         let store = FaultStore::new(MemoryStore::new(), plan);
-        let report = run_conformance_suite(&store, "sys/qualify/delete-fault/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/delete-fault/", 1000).await;
         assert!(!report.passed());
         let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
         assert_eq!(failed, vec![Property::DeleteVisibility]);
@@ -3899,7 +4041,7 @@ mod tests {
                 .with_occurrence(Occurrence::Nth(1)),
         );
         let store = FaultStore::new(MemoryStore::new(), plan);
-        let report = run_conformance_suite(&store, "sys/qualify/test-4/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/test-4/", 1000).await;
         assert!(!report.passed());
         let failure = report
             .results
@@ -4155,7 +4297,7 @@ mod tests {
         );
 
         // And it never touches qualification pass/fail.
-        let report = run_conformance_suite(&store, "sys/qualify/bucket-config/").await;
+        let report = run_conformance_suite(&store, "sys/qualify/bucket-config/", 1000).await;
         assert!(report.passed());
         assert_eq!(report.results.len(), GATING_PROPERTIES);
     }

@@ -328,8 +328,23 @@ fn instance_role_credential_conflict(args: &StoreArgs) -> Option<anyhow::Error> 
 }
 
 pub fn build_store(args: &StoreArgs) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
+    build_store_with_list_page_size(args, None)
+}
+
+/// Same as [`build_store`], with an explicit override for the store's list
+/// page size (`None` keeps each backend's own default). Exists for `store
+/// qualify`, which must declare the exact page size it built so the
+/// conformance suite's cross-page probe can be told the real boundary to
+/// cross ([`ravel_object_store::conformance::run_conformance_suite`]).
+pub fn build_store_with_list_page_size(
+    args: &StoreArgs,
+    page_size: Option<usize>,
+) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
     match args.store_kind() {
-        StoreKind::Memory => Ok(Arc::new(MemoryStore::new())),
+        StoreKind::Memory => Ok(Arc::new(match page_size {
+            Some(n) => MemoryStore::with_page_size(n),
+            None => MemoryStore::new(),
+        })),
         StoreKind::S3 => {
             let bucket = args
                 .s3_bucket
@@ -374,8 +389,11 @@ pub fn build_store(args: &StoreArgs) -> anyhow::Result<Arc<dyn ObjectStoreBacken
                 auth,
                 instance_metadata_endpoint: args.s3_instance_metadata_endpoint.clone(),
             };
-            let store = S3Store::new(config)
-                .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
+            let store = match page_size {
+                Some(n) => S3Store::with_page_size(config, n),
+                None => S3Store::new(config),
+            }
+            .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
             Ok(Arc::new(store))
         }
     }

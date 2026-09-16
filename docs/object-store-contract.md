@@ -560,27 +560,46 @@ throwaway key prefix:
   drains `list` itself, which `S3Store` implements separately from
   `list_after` and every catalog scan issues, so the suite covers both
   methods rather than reaching one only through the other's default.
-- `LexicographicListingOrder`: five keys written in non-sorted order must
-  come back in lexicographic key order on both `list` and `list_after`, and
-  `list_after` must additionally resume strictly after its marker in that
-  same order, delivering exactly the keys above it. A continuation token only
-  names a position when the order is the lexicographic one, which is what
-  `S3Store::list` pagination and every catalog scan built on it assume.
-  `S3Store` implements `list` and `list_after` separately (the default
-  `list_after` is `list` plus a client-side filter), so a backend can be
-  ordered on one entry point and reversed on the other; the probe drains a
-  full pass through each and names the offending entry point in its failure,
-  including when the failure is the drain itself (a `list`/`list_after` error,
-  or pagination that never terminates), not only an out-of-order delivery.
-  Every pass judges the raw delivery sequence, repeats included, on the rule
-  the listing bullet above states: a repeat of the last delivered key passes,
-  a repeat of an earlier one fails. Judging a deduplicated sequence instead,
-  or only one entry point, would qualify a backend whose every drain then
-  fails with `ListOrderViolation`.
-- `CrossPageListing`: five keys written before the first page request must
-  all be delivered, as exactly five distinct keys across however many pages
-  the backend serves, with none lost between pages. Repeat deliveries are
-  allowed (the cross-page guarantee above permits them); losses are not.
+- `LexicographicListingOrder`: `page_size + 2` keys (the suite's declared list
+  page size, floored at 5; see `CrossPageListing` below) written in
+  non-sorted order must come back in lexicographic key order on both `list`
+  and `list_after`, and `list_after` must additionally resume strictly after
+  its marker in that same order, delivering exactly the keys above it. At the
+  floor of 5 the keys are a fixed five-letter alphabet; above it they are
+  zero-padded numeric suffixes written in descending order, so an unpadded
+  ordering (where `"k10"` would otherwise sort before `"k9"`) cannot pass by
+  accident. A continuation token only names a position when the order is the
+  lexicographic one, which is what `S3Store::list` pagination and every
+  catalog scan built on it assume. `S3Store` implements `list` and
+  `list_after` separately (the default `list_after` is `list` plus a
+  client-side filter), so a backend can be ordered on one entry point and
+  reversed on the other; the probe drains a full pass through each and names
+  the offending entry point in its failure, including when the failure is the
+  drain itself (a `list`/`list_after` error, or pagination that never
+  terminates), not only an out-of-order delivery. Every pass judges the raw
+  delivery sequence, repeats included, on the rule the listing bullet above
+  states: a repeat of the last delivered key passes, a repeat of an earlier
+  one fails. Judging a deduplicated sequence instead, or only one entry
+  point, would qualify a backend whose every drain then fails with
+  `ListOrderViolation`.
+- `CrossPageListing`: the suite is given a declared list page size (the real
+  page size the backend under test was built with -- `ravel-cli store
+  qualify --list-page-size`, defaulting to the production S3 page size of
+  1000); the probe writes `page_size + 2` keys, floored at 5, before the
+  first page request. `S3Store::with_page_size` only re-chunks a listing
+  client-side after `object_store` has already streamed it in full over the
+  wire -- it does not change the real `ListObjectsV2` page size -- so writing
+  more keys than the backend's actual page size is the only way to force a
+  real continuation-token boundary; a shrunken declared page size against a
+  large real one exercises only Ravel's own client-side drain loop, not the
+  backend. All `page_size + 2` keys written must come back as that many
+  distinct keys, none lost between pages, AND delivered across at least two
+  pages that actually carry objects: a backend may emit a trailing empty page
+  purely to signal the end of a listing once total keys exactly fill a
+  multiple of the page size, and counting that page toward "more than one
+  page" would let a single real page of results pass as if a boundary had
+  been crossed. Repeat deliveries across real pages are allowed (the
+  cross-page guarantee above permits them); losses are not.
 - `DeleteVisibility`: after a successful delete, a `get` of the key returns
   `NotFound` and a listing of its prefix omits it while still holding the
   sibling key that was not deleted; a second delete of the now-absent key

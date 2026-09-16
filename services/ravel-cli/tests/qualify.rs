@@ -16,7 +16,7 @@ use ravel_object_store::{GetRange, ObjectStoreBackend};
 async fn qualify_records_a_pass_against_a_conforming_backend() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
 
-    qualify::qualify(store.clone(), "memory".to_string(), "run-1")
+    qualify::qualify(store.clone(), "memory".to_string(), "run-1", 1000)
         .await
         .expect("a conforming backend must qualify");
 
@@ -34,7 +34,7 @@ async fn qualify_records_a_pass_against_a_conforming_backend() {
 async fn a_second_qualify_run_does_not_overwrite_the_existing_record() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
 
-    qualify::qualify(store.clone(), "memory".to_string(), "run-1")
+    qualify::qualify(store.clone(), "memory".to_string(), "run-1", 1000)
         .await
         .expect("first run qualifies");
     let first = store
@@ -44,7 +44,7 @@ async fn a_second_qualify_run_does_not_overwrite_the_existing_record() {
 
     // A distinct scratch run-id proves the second run actually re-executed
     // the suite (not skipped), yet the durable record must be left alone.
-    qualify::qualify(store.clone(), "memory".to_string(), "run-2")
+    qualify::qualify(store.clone(), "memory".to_string(), "run-2", 1000)
         .await
         .expect("second run also qualifies and must not error");
     let second = store
@@ -85,7 +85,7 @@ async fn qualify_re_records_over_a_stale_suite_version() {
         .await
         .expect("seed a stale-version record");
 
-    qualify::qualify(store.clone(), "memory".to_string(), "run-1")
+    qualify::qualify(store.clone(), "memory".to_string(), "run-1", 1000)
         .await
         .expect("re-qualification upgrades a stale record instead of erroring");
 
@@ -157,7 +157,7 @@ async fn a_concurrent_newer_record_is_not_downgraded_during_re_record() {
     let run_store: Arc<dyn ObjectStoreBackend> = fault.clone();
     let run =
         tokio::spawn(
-            async move { qualify::qualify(run_store, "memory".to_string(), "run-1").await },
+            async move { qualify::qualify(run_store, "memory".to_string(), "run-1", 1000).await },
         );
 
     // The run has read the stale record and is parked at the CAS write. Exactly
