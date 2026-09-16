@@ -5765,6 +5765,132 @@ mod tests {
         );
     }
 
+    /// The chained-horizon interlock through the real tick path: a tripped
+    /// mass-orphan breaker holds the quarantine reaper, and the skipped tick
+    /// that follows must not reap what the trip held.
+    ///
+    /// Tick 1 has a cold memo, so it takes the `sweep_shard` full-sweep branch:
+    /// 60 record-less L0 objects trip the breaker and the reaper is held. The
+    /// clock never advances, so tick 2 takes the zoned `OrphanPass::Skip`
+    /// branch, which never evaluates the breaker and therefore reports
+    /// not-tripped. The quarantined copy is past `quarantine_horizon_ns` the
+    /// whole time, so only the pass's own gate can keep it.
+    ///
+    /// The existing `a_tripped_breaker_holds_the_quarantine_reaper` in
+    /// `ravel-maintain` drives `sweep_shard` alone, which cannot see this: the
+    /// reaping pass is the tick after the tripping one.
+    ///
+    /// Flip to watch it fail: change the reaper's condition in
+    /// `sweep_shard_zoned_with_holds` from
+    /// `orphan_pass == OrphanPass::Run && !orphan_breaker_tripped` back to
+    /// `!orphan_breaker_tripped`. Tick 2 reaps the copy and the quarantine
+    /// prefix is empty.
+    #[tokio::test]
+    async fn a_skipped_tick_after_a_tripped_breaker_keeps_the_quarantined_copies() {
+        const MASS_ORPHANS: u64 = 60;
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let store = MemoryStore::new();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+
+        // A live mass orphan population: 60 record-less L0 data objects, which
+        // is both over `orphan_breaker_min_count` and the whole shard, so the
+        // ratio condition holds too.
+        for seq in 1..=MASS_ORPHANS {
+            let key = keys::data_key(
+                &tenant,
+                Signal::Metrics,
+                0,
+                Uuid::from_u128(u128::from(seq)),
+                1,
+                seq,
+                &[0u8; 32],
+            )
+            .expect("orphan data key");
+            store
+                .put(
+                    &key,
+                    bytes::Bytes::from_static(b"orphaned flush"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed an orphan");
+        }
+
+        // One copy quarantined at timestamp 0, before the loss grew: the only
+        // recovery copy of an object an earlier pass took out of the live set.
+        // The key layout is `quarantine/<original key>/q<ns>` (ADR-0058
+        // amendment, docs/deletion-and-gc.md).
+        let original = keys::data_key(
+            &tenant,
+            Signal::Metrics,
+            0,
+            Uuid::from_u128(0xfeed),
+            1,
+            0,
+            &[0u8; 32],
+        )
+        .expect("original data key");
+        let quarantined_key = format!("quarantine/{original}/q{:020}", 0);
+        store
+            .put(
+                &quarantined_key,
+                bytes::Bytes::from_static(b"the only copy"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed the quarantined copy");
+
+        // Past both horizons: the L0 objects are older than the orphan age
+        // gate, and the quarantined copy is older than `quarantine_horizon_ns`.
+        let now = compactor.quarantine_horizon_ns + 1;
+        let clock = ravel_maintain::FixedClock::new(now);
+
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        // Tick 1: the full sweep that trips. Tick 2: the skipped pass 300 s
+        // later in production, on the same clock here.
+        for _ in 0..2 {
+            run_tick_with_clock(
+                &clock,
+                &store,
+                &tenant,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &safety,
+                &ownership,
+                &worker,
+                &worker.solo_live_set(),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            safety.orphan_breaker_trips(Signal::Metrics),
+            1,
+            "exactly one tick evaluated the breaker, and it tripped"
+        );
+        assert_eq!(
+            safety.quarantine_reaped(Signal::Metrics),
+            0,
+            "neither the tripping tick nor the skipped tick after it may reap"
+        );
+        let still_quarantined = list_all(&store, "quarantine/")
+            .await
+            .expect("list quarantine");
+        assert_eq!(
+            still_quarantined.iter().map(|m| &m.key).collect::<Vec<_>>(),
+            vec![&quarantined_key],
+            "the only recovery copy survives both ticks"
+        );
+    }
+
     /// A store wrapper that instruments `list_delimited` -- the call
     /// `scan_and_maintain_with_memo` makes first, via `list_shard_hours`,
     /// before touching anything else for a unit -- with a run of

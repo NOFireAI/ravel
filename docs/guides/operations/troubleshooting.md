@@ -108,6 +108,11 @@ found this", never as "as of this scrape"; a value can be up to one
 full-sweep interval old, and a genuine return to zero shows up on the next
 pass that runs, not on the next tick.
 
+The gauge also reports only one unit per tick: it is labelled by mode and
+signal while the sweep runs per tenant, signal and shard, so each pass
+overwrites the same series and a unit that measured zero can mask another
+unit's nonzero measurement.
+
 Alert on it sustained:
 
 | Symptom | Likely cause | How to confirm | Corrective action |
