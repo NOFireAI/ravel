@@ -293,6 +293,12 @@ jobs:
         run: bash scripts/guards/check-quick-xml-entry-points.test.sh
       - name: quick-xml entry-point guard (issue #1718)
         run: bash scripts/guards/check-quick-xml-entry-points.sh
+      # check-quick-xml-shipped-reachability.sh itself needs a real cargo
+      # toolchain and dependency graph (it stays in the supply-chain job
+      # below, not here), but its own cases run against a stubbed cargo on
+      # PATH and cost nothing here, same reason as the entry-points cases.
+      - name: quick-xml shipped-reachability guard cases (issue #1718)
+        run: bash scripts/guards/check-quick-xml-shipped-reachability.test.sh
       # ci-sweep-cancelled.sh must not blind-rerun a job that hit its own
       # timeout-minutes (issue #1590): a rerun on a faster runner can pass and
       # hide the missing headroom. These cases stub gh, hit no network, and
@@ -1008,7 +1014,14 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 15, matching supply-chain-nightly.yml's timeout: the eight cold
+    # `cargo tree` invocations below (issue #1718) resolve the full
+    # dependency graph with no warm cache, and this job's own pin-count
+    # fixture (deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh)
+    # lives outside this round's edit scope, so a Swatinem/rust-cache step
+    # is not added here; raising the ceiling is the change available without
+    # touching that fixture.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

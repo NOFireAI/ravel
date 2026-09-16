@@ -600,22 +600,42 @@ than passing for "no pull request open".
   CI's doc-scripts job; cases in `scripts/guards/check-promql-unreachable.test.sh`.
 - `scripts/guards/check-quick-xml-entry-points.sh [Cargo.lock] [deny.toml]`:
   exits non-zero unless deny.toml's RUSTSEC-2026-0194/-0195 ignore comment
-  names every direct Cargo.lock parent of an affected quick-xml version
-  (0.26.0 or 0.39.4; 0.41.0 fixes both). Two live parents pull them in
-  today, inferno (0.26.0, behind the off-by-default `profiling` feature)
-  and object_store 0.13.2 (0.39.4, behind the off-by-default
-  `parquet-baseline` feature), and the comment is the only place recording
-  which binaries the ignore actually rests on; a rename or a third parent
-  showing up must fail loud rather than leave the comment stale. Exit 1 is
-  a parent missing from the comment, 2 is zero quick-xml parents found at
-  all (the anchor moved, or both versions dropped out of the lock) or the
+  names every direct Cargo.lock parent of an affected quick-xml version,
+  each together with its OWN version as it appears in Cargo.lock (e.g.
+  "object_store 0.13.2"), so a parent bumping to a version that newly
+  resolves an affected quick-xml fails against a comment still naming the
+  old one. The affected set (every quick-xml version older than 0.41.0,
+  the release that fixes both advisories) is derived from Cargo.lock
+  itself, not hardcoded. Two live parents pull them in today, inferno
+  0.11.21 (quick-xml 0.26.0, behind the off-by-default `profiling`
+  feature) and object_store 0.13.2 (quick-xml 0.39.4, entering through
+  object_store's own `aws` feature, which ravel-bench turns on directly
+  behind its own off-by-default `parquet-baseline` feature, not through
+  parquet's unrelated `object_store` feature), and the comment is the
+  only place recording which binaries the ignore actually rests on; a
+  rename or a third parent showing up must fail loud rather than leave
+  the comment stale. Matching is anchored on both the parent name and its
+  version, not a bare substring test, so a crate named e.g. "store" is
+  not read as documented by a comment that only names "object_store
+  0.13.2". Exit 1 is a parent (or parent version) missing from the
+  comment, 2 is zero quick-xml parents found at all (the anchor moved, or
+  every affected version dropped out of the lock) or the
   `"RUSTSEC-2026-0194"` line itself missing from deny.toml, 64 is bad
-  usage. `scripts/guards/check-quick-xml-shipped-reachability.sh` is the
-  companion check that the four Dockerfile release builds never reach
-  either version at all, via `cargo tree -i`; wired into ci.yml's
-  supply-chain job and supply-chain-nightly.yml instead of gates.sh, since
-  it needs the cargo toolchain and a real dependency graph, not just a
-  text scan. Wired into `gates.sh` and CI's doc-scripts job; cases in
+  usage, 70 is the underlying Cargo.lock scan itself failing.
+  `scripts/guards/check-quick-xml-shipped-reachability.sh` is the
+  companion check that the four Dockerfile release builds never reach any
+  affected version at all, via `cargo tree -i`, first proving each
+  affected version resolves SOMEWHERE in the workspace (`cargo tree
+  --locked --workspace --all-features -i quick-xml@<version>` must exit
+  0) before trusting any per-build "not reachable" result as a pass: a
+  version that resolves nowhere (a stale or mistyped entry) exits 70
+  rather than reading every build as clean. The guard itself is wired
+  into ci.yml's supply-chain job and supply-chain-nightly.yml instead of
+  gates.sh, since it needs the cargo toolchain and a real dependency
+  graph, not just a text scan, but its own cases
+  (`scripts/guards/check-quick-xml-shipped-reachability.test.sh`, driven
+  by a stubbed `cargo` on PATH) are cheap and run in both `gates.sh` and
+  CI's doc-scripts job, same as the entry-points guard's own cases in
   `scripts/guards/check-quick-xml-entry-points.test.sh`.
 - `scripts/guards/check-workflow-permissions.sh [dir ...]`: exits non-zero
   when a workflow under `.github/workflows/` declares no top-level

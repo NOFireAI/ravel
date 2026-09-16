@@ -213,6 +213,13 @@ bash "$(dirname "$0")/guards/check-quick-xml-entry-points.test.sh"
 echo "==> scripts/guards/check-quick-xml-entry-points.sh"
 "$(dirname "$0")/guards/check-quick-xml-entry-points.sh"
 
+# check-quick-xml-shipped-reachability.sh itself needs a real cargo toolchain
+# and dependency graph (it stays CI-only, in the supply-chain job and
+# supply-chain-nightly.yml), but its own cases run against a stubbed cargo
+# and cost nothing here, same reason as the entry-points cases above.
+echo "==> scripts/guards/check-quick-xml-shipped-reachability.test.sh"
+bash "$(dirname "$0")/guards/check-quick-xml-shipped-reachability.test.sh"
+
 # The flag-doc overclaim guard defined above, in the ordinary gate run: a source
 # scan, no build, so it fails before the expensive lanes.
 echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"
