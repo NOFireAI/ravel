@@ -244,5 +244,45 @@ commit_all "${d}"
 out="$(run_guard "${d}")"; rc=$?
 check_eq "a longer name is not covered by a shorter wired one (1)" "1" "${rc}"
 
+# --- a step's name: value is prose, like a comment ----------------------
+# Mutation: drop the name: alternative from the filter.
+d="$(new_repo nameonly)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+add_suite "${d}" "scripts/tests/slow.test.sh"
+printf '      - name: we should run scripts/tests/slow.test.sh one day\n        run: echo hi\n' \
+  >>"${d}/.github/workflows/ci.yml"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a suite named only in a step name: is an orphan (1)" "1" "${rc}"
+check_contains "and is named" "ORPHAN    scripts/tests/slow.test.sh" "${out}"
+
+# --- a regex metacharacter in a basename is not a pattern ---------------
+# `a+b.test.sh` escaped only for `.` matched the wired `ab.test.sh` line and
+# reported an orphan as run. Mutation: escape only `.` again.
+d="$(new_repo metachar)"
+add_suite "${d}" "scripts/tests/ab.test.sh" wired
+add_suite "${d}" "scripts/tests/a+b.test.sh"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a name with a regex metacharacter is not a pattern (1)" "1" "${rc}"
+check_contains "and is reported as the orphan it is" "ORPHAN    scripts/tests/a+b.test.sh" "${out}"
+
+# --- an exception must carry a reason -----------------------------------
+# Without one the path printed as its own reason and the run exited 0, which
+# is the quiet exclusion the format exists to prevent.
+# Mutation: accept an entry with no `|`.
+d="$(new_repo noreason)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+add_suite "${d}" "scripts/tests/slow.test.sh"
+commit_all "${d}"
+out="$( cd "${d}" && CHECK_TEST_SUITES_EXCEPTED='scripts/tests/slow.test.sh' \
+        ./scripts/guards/check-test-suites-run.sh 2>&1 )"; rc=$?
+check_eq "an exception with no reason is refused (2)" "2" "${rc}"
+check_contains "and says what the format is" "<path>|<reason>" "${out}"
+
+out="$( cd "${d}" && CHECK_TEST_SUITES_EXCEPTED='scripts/tests/slow.test.sh|' \
+        ./scripts/guards/check-test-suites-run.sh 2>&1 )"; rc=$?
+check_eq "an empty reason is refused too (2)" "2" "${rc}"
+
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [[ ${fail} -eq 0 ]]
