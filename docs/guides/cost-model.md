@@ -54,7 +54,15 @@ Either condition is enough, and the two share one threshold:
   the fixed pair above.
 
 A low-volume buffer that never gains priority flushes on the idle clock; a
-busy or strict-mode buffer flushes on the priority threshold.
+strict-mode buffer flushes on the priority threshold.
+
+Age is not the only trigger. A buffer also flushes as soon as its estimated
+object size reaches `target_bytes` (8MiB default), without waiting for any
+clock. For a busy buffer that is the trigger that fires, so its PUT rate is
+its byte rate divided by `target_bytes`, not `86400 / age_threshold_s`. Use
+the age formula for buffers that flush on a clock, which is the low-volume
+and strict-mode cases, and the byte rate for buffers that reach the target
+size within their flush window.
 
 Every flush is a data-object PUT and a commit-record PUT (the two-object
 commit protocol, unchanged by anything in this guide). Buffers are scoped
