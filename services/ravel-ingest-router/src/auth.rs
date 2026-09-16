@@ -117,8 +117,11 @@ mod tests {
         // The mTLS resolver must never be part of this chain (ADR-0050
         // decision 1 shape): a chain built from a static bearer token alone
         // must not resolve a tenant from the client-certificate identity
-        // header. Reverting the fix (folding MtlsResolver back into `build`)
-        // resolves this to Ok(TenantId("victim-tenant")) instead.
+        // header. What this kills is an unconditional push of MtlsResolver
+        // onto `resolvers` in `build`: with one there, this resolves to
+        // Ok(TenantId("victim-tenant")) instead of an error. It cannot kill
+        // the original conditional folding, which read a `mtls_header` field
+        // CanonicalAuthSettings no longer has.
         let settings = CanonicalAuthSettings {
             tokens: vec![("tok".to_string(), "acme".to_string())],
             dev_header: false,

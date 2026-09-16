@@ -237,10 +237,15 @@ is the resolved tenant, not the token. `authorizationHeader`, by contrast, moves
 a tenant on every rotation (see [Choosing the key](#choosing-the-key)).
 
 There is a real gap to know before choosing it: **the only resolver the CRD
-wires through is static tenant tokens**, via `spec.tenantTokensSecretRef`. The
-resolver chain itself can do OIDC and mTLS resolution, but there is no CRD
-field that threads OIDC issuer or JWKS, or mTLS CA configuration, into the
-router. So `canonicalTenant` works
+wires through is static tenant tokens**, via `spec.tenantTokensSecretRef`. OIDC
+is a resolver the chain can run, but no CRD field threads an issuer or JWKS URL
+into the router. mTLS resolution is not available at any layer: the router
+builds one resolver chain shared by every listener, and the mTLS resolver trusts
+a client-supplied identity header with no verification of its own, so
+`ravel-ingest-router` refuses `--mtls-enabled` outright rather than let any
+client set that header and pick its own tenant. A CRD field would not change
+that; isolating the resolver needs a dedicated mTLS listener the router does not
+have. So `canonicalTenant` works
 only for clusters authenticating with static tenant tokens. If you rely on OIDC
 or mTLS for tenancy, `canonicalTenant` is not usable for you; use
 `authorizationHeader`, which hashes the token bytes.
