@@ -93,6 +93,20 @@
 //! it at the filesystem layer, the same precedent ADR-0042 already set for
 //! object storage.
 //!
+//! What this tier does control is who can read those plaintext bytes locally.
+//! On Unix, every entry file is created `0o600` and every directory this
+//! crate creates beneath the configured root is created `0o700`, explicitly
+//! rather than at the ambient umask: the payload is raw segment bytes under a
+//! filename that carries the tenant hash verbatim, so a default umask of
+//! `0o022` would otherwise make both the bytes and the tenant set readable by
+//! every local user. The configured root is never chmodded by this crate: an
+//! operator who pre-creates it keeps their own mode, and a root that does not
+//! exist yet is created `0o700` by the first insert, along with any missing
+//! ancestor of it. Directories and entries an older build left at the
+//! ambient umask beneath the namespaced root are narrowed to these modes by
+//! the startup scan, so an in-place upgrade closes the same exposure on a
+//! cache tree that already exists.
+//!
 //! **Eviction is S3-FIFO** (decision 6, amended 2026-08-02), the same
 //! policy and the same implementation the RAM tier uses (see [`crate::s3fifo`]):
 //! this tier instantiates `S3Fifo<()>`, since the payload itself lives on
@@ -250,6 +264,75 @@ fn path_for(dir: &Path, key: &CacheKey) -> PathBuf {
     name.push('-');
     push_hex(&mut name, &key.len.to_be_bytes());
     dir.join(shard).join(name).with_extension(ENTRY_EXTENSION)
+}
+
+/// Creates an entry's shard directory, and any ancestor of it still missing,
+/// owner-only rather than at the ambient umask.
+///
+/// Recursive, so it stays as idempotent as `create_dir_all`, and a recursive
+/// `DirBuilder` never changes the mode of a directory that already exists: an
+/// operator-created cache root keeps whatever mode the operator gave it, and
+/// only the directories this process brings into existence carry `0o700`.
+#[cfg(unix)]
+fn create_entry_dir(parent: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+}
+
+#[cfg(not(unix))]
+fn create_entry_dir(parent: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(parent)
+}
+
+/// Narrows a directory or entry file that an older build created at the
+/// ambient umask to `mode`, so an in-place upgrade closes the tenant-hash
+/// listing on a cache tree that already exists. Only the startup scan calls
+/// it, and only on paths beneath the namespaced root, so the operator's own
+/// root is never touched. Best effort: a failure leaves the mode as it was,
+/// and nothing the scan does depends on it.
+#[cfg(unix)]
+fn narrow_existing(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    if meta.permissions().mode() & 0o777 & !mode != 0 {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    }
+}
+
+#[cfg(not(unix))]
+fn narrow_existing(_path: &Path, _mode: u32) {}
+
+/// Writes one entry's bytes to its scratch path, readable and writable by the
+/// owner only rather than at the ambient umask.
+///
+/// The mode is set at create time rather than by a `chmod` afterwards: there
+/// is no second syscall that can fail, and the rename onto the final
+/// content-addressed path preserves the mode, so the file is never reachable
+/// at that path with a wider one. `create_new` also refuses a stale scratch
+/// file instead of truncating it and inheriting its mode; the caller removes
+/// the path on error, so a collision costs one admission and clears itself.
+/// Both properties are Unix-only: the other arm keeps the previous
+/// truncating write.
+#[cfg(unix)]
+fn write_entry_file(tmp_path: &Path, buf: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp_path)?;
+    file.write_all(buf)
+}
+
+#[cfg(not(unix))]
+fn write_entry_file(tmp_path: &Path, buf: &[u8]) -> std::io::Result<()> {
+    fs::write(tmp_path, buf)
 }
 
 /// The shared, `Arc`-held state of a [`DiskCache`]: everything the cache and
@@ -542,6 +625,7 @@ impl Inner {
         let Ok(shards) = fs::read_dir(dir) else {
             return fifo;
         };
+        narrow_existing(dir, 0o700);
         for shard in shards.flatten() {
             let Ok(file_type) = shard.file_type() else {
                 continue;
@@ -549,6 +633,7 @@ impl Inner {
             if !file_type.is_dir() {
                 continue;
             }
+            narrow_existing(&shard.path(), 0o700);
             let Ok(entries) = fs::read_dir(shard.path()) else {
                 continue;
             };
@@ -559,6 +644,7 @@ impl Inner {
                         if path_for(dir, &key) == path
                             && now_ns.saturating_sub(written_at_ns) <= limits.max_entry_age_ns =>
                     {
+                        narrow_existing(&path, 0o600);
                         fifo.seed(key, (), size);
                     }
                     _ => {
@@ -752,7 +838,7 @@ impl Inner {
         let Some(parent) = path.parent() else {
             return;
         };
-        if fs::create_dir_all(parent).is_err() {
+        if create_entry_dir(parent).is_err() {
             return;
         }
         let tmp_path = self.tmp_path_for(parent);
@@ -760,7 +846,7 @@ impl Inner {
         let mut buf = Vec::with_capacity(HEADER_LEN + value.len());
         buf.extend_from_slice(&encode_header(&key, value, written_at_ns));
         buf.extend_from_slice(value);
-        if fs::write(&tmp_path, &buf).is_err() {
+        if write_entry_file(&tmp_path, &buf).is_err() {
             let _ = fs::remove_file(&tmp_path);
             return;
         }
@@ -1153,6 +1239,116 @@ mod tests {
         bypassed
     }
 
+    /// An admitted entry is owner-read-write only, and both directories the
+    /// cache created to hold it are owner-only. The mode bits asserted here
+    /// are the ones `insert` sets explicitly, so this test neither reads nor
+    /// changes the umask; a umask can only narrow them further, and every
+    /// usual one (022, 002, 027, 077) leaves them as asserted.
+    ///
+    /// FLIP (non-vacuity): restore `fs::create_dir_all(parent)` and
+    /// `fs::write(&tmp_path, &buf)` in `Inner::insert`. Under `umask 022` the
+    /// file assertion then reads `0o644` and both directory assertions read
+    /// `0o755`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_inserted_entry_and_its_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let payload: &[u8] = b"owner-only payload";
+        let key = test_key_with_len(70, payload.len() as u64);
+        cache.insert(key, payload);
+
+        let path = path_for(cache.dir(), &key);
+        assert!(
+            path.is_file(),
+            "precondition: the entry must have been admitted"
+        );
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "an entry file carries raw segment bytes under a filename holding \
+             the tenant hash, so it must be readable by its owner alone"
+        );
+        let shard = path.parent().unwrap();
+        assert_eq!(
+            mode_of(shard),
+            0o700,
+            "a shard directory must not be listable by other local users"
+        );
+        assert_eq!(
+            mode_of(cache.dir()),
+            0o700,
+            "the namespaced root this instance created must be owner-only too"
+        );
+    }
+
+    /// A cache tree an older build left at the ambient umask is narrowed by
+    /// the startup scan: the namespaced root and its shard directories to
+    /// `0o700`, a live entry to `0o600`. The configured root above the
+    /// namespace is the operator's and keeps its mode, and the narrowed entry
+    /// is still served.
+    ///
+    /// FLIP (non-vacuity): make `narrow_existing` a no-op. The three narrowed
+    /// assertions then read the widened modes (`0o755`, `0o755`, `0o644`)
+    /// while the operator-root assertion still passes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_startup_scan_narrows_a_tree_an_older_build_left_wide() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let payload: &[u8] = b"pre-upgrade payload";
+        let key = test_key_with_len(71, payload.len() as u64);
+        let (namespaced_root, shard, entry) = {
+            let cache = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+            cache.insert(key, payload);
+            let entry = path_for(cache.dir(), &key);
+            assert!(entry.is_file(), "precondition: the entry must be admitted");
+            let shard = entry.parent().unwrap().to_path_buf();
+            (cache.dir().to_path_buf(), shard, entry)
+        };
+        // Widen everything the way a build that wrote at umask 022 left it.
+        let widen = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        widen(tmp.path(), 0o755);
+        widen(&namespaced_root, 0o755);
+        widen(&shard, 0o755);
+        widen(&entry, 0o644);
+
+        let cache = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode_of(&namespaced_root),
+            0o700,
+            "the namespaced root must be narrowed on startup"
+        );
+        assert_eq!(
+            mode_of(&shard),
+            0o700,
+            "an existing shard directory must be narrowed on startup"
+        );
+        assert_eq!(
+            mode_of(&entry),
+            0o600,
+            "a live entry an older build wrote wide must be narrowed on startup"
+        );
+        assert_eq!(
+            mode_of(tmp.path()),
+            0o755,
+            "the operator's configured root above the namespace keeps its mode"
+        );
+        assert_eq!(
+            cache.get(&key).as_deref(),
+            Some(payload),
+            "the narrowed entry is still served after the restart"
+        );
+    }
+
     #[tokio::test]
     async fn round_trip_identical_bytes_all_zero_and_zero_length() {
         let tmp = TempDir::new().unwrap();
@@ -1185,8 +1381,8 @@ mod tests {
     /// express keeps the mode bit and is skipped under a DAC bypass.
     ///
     /// FLIP (non-vacuity): in `Inner::insert`, replace
-    /// `if fs::create_dir_all(parent).is_err() { return; }` with
-    /// `fs::create_dir_all(parent).unwrap();`. The ENOTDIR phases then panic
+    /// `if create_entry_dir(parent).is_err() { return; }` with
+    /// `create_entry_dir(parent).unwrap();`. The ENOTDIR phases then panic
     /// inside `insert` instead of degrading, and the test fails at any uid.
     #[tokio::test]
     async fn every_disk_failure_degrades_to_a_miss() {

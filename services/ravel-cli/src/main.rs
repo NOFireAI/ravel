@@ -113,6 +113,13 @@ fn command_hashes_tenant(command: &Command) -> bool {
         | Command::Rspan { .. }
         | Command::Store { .. }
         | Command::Idem { .. }
+        // `inspect cstat` takes an explicit object key, exactly like
+        // `segment inspect`/`rlog inspect`: no tenant to hash.
+        | Command::Inspect { .. }
+        // `tenancy show` decodes the marker itself and takes no `--tenant`;
+        // `tenancy resolve` (issue #1180) resolves the scheme itself inline
+        // (mirroring `show`), rather than going through this shared gate, so
+        // its dispatch arm stays self-contained and directly testable.
         | Command::Tenancy { .. }
         // sys/gc is a bucket-root object, not under any tenant prefix, so
         // gc-config never hashes a tenant. sys/auth (ADR-0072 decision 4) is
@@ -123,6 +130,111 @@ fn command_hashes_tenant(command: &Command) -> bool {
         // `cache reclaim-legacy` operates on a local directory, not object
         // storage: no tenant prefix, no store built.
         | Command::Cache { .. } => false,
+    }
+}
+
+/// Whether `command` writes to the object store (issue #1184). Used ahead of
+/// dispatch to require the bucket's `sys/tenancy` marker (or an explicit
+/// `--tenant-hash-key-file` / `--tenant-hash-unkeyed`) before the first write,
+/// rather than the lenient absent-marker default [`tenancy::resolve_scheme`]
+/// gives read-only commands: a fresh bucket defaults to keyed on the server,
+/// so a write there under the silent v1-unkeyed fallback lands under a prefix
+/// nothing addresses once the bucket is eventually bootstrapped keyed.
+///
+/// Exhaustive match, no catch-all: adding a `Command` variant must fail to
+/// compile here until someone classifies it, so the gate fails closed on
+/// future commands instead of silently treating them as reads (this is the
+/// hole issue #1184's original `_ => false` left open). Mirrors
+/// `command_hashes_tenant` above: every group names why it is a write or not.
+fn command_is_write(command: &Command) -> bool {
+    match command {
+        Command::Load { .. } => true,
+        // Both `provision` shapes write a durable record (or, for `adopt`, a
+        // control record and audit entry via `reshard`); neither has a
+        // read-only variant.
+        Command::Provision { .. } => true,
+        Command::TypedAttrColumn { command } => {
+            matches!(command, TypedAttrColumnCommand::Set { .. })
+        }
+        Command::Hold { command } => {
+            matches!(command, HoldCommand::Set { .. } | HoldCommand::Clear { .. })
+        }
+        Command::Erase { command } => matches!(command, EraseCommand::Submit { .. }),
+        // sys/gc is a bucket-root object (see `command_hashes_tenant`), but
+        // `gc-config set` still clears this same write gate: see
+        // `gc_config_set_refuses_on_marker_less_bucket` and the final report
+        // for the tension this raises with deliverable 3 of issue #1184's
+        // follow-up (closing the `command_is_write` catch-all).
+        Command::GcConfig { command } => matches!(command, GcConfigCommand::Set { .. }),
+        Command::Commit { command } => match command {
+            // Decode-only shapes never write, only read an existing record.
+            CommitCommand::Decode { .. }
+            | CommitCommand::DecodeCompaction { .. }
+            | CommitCommand::DecodeTombstone { .. } => false,
+            // Writes CreateIfAbsent-only commit records under
+            // `t/<tenant_hash>/<signal>/<shard>/...`, computed from
+            // `--tenant` (see `command_hashes_tenant`).
+            CommitCommand::Reconstruct { .. } => true,
+        },
+        Command::Catalog { command } => match command {
+            // `list`/`inspect`/`verify` only read the catalog and commit
+            // records; they never publish a snapshot.
+            CatalogCommand::List { .. }
+            | CatalogCommand::Inspect { .. }
+            | CatalogCommand::Verify { .. } => false,
+            // Publishes a new snapshot HEAD and part objects under
+            // `t/<tenant_hash>/<signal>/...`.
+            CatalogCommand::Fold { .. } => true,
+        },
+        Command::Maintain { command } => match command {
+            // Writes L1 segment objects and a compaction record under
+            // `t/<tenant_hash>/<signal>/<shard>/...`, EXCEPT under `--dry-run`,
+            // which only reports the plan it would run. Gating a dry run would
+            // stop an operator inspecting that plan on a marker-less bucket,
+            // which is the one case where they most need to look before acting.
+            MaintainCommand::CompactBucket { dry_run, .. }
+            | MaintainCommand::CompactTenant { dry_run, .. } => !dry_run,
+            // Deletes orphaned/superseded/unreferenced segment objects under
+            // `t/<tenant_hash>/<signal>/<shard>/...`; `--dry-run` only lists
+            // what it would delete.
+            MaintainCommand::Sweep { dry_run, .. } => !dry_run,
+            // Rewrites objects to the target format version and raises the
+            // recorded format floor under `t/<tenant_hash>/...`.
+            MaintainCommand::Migrate { .. } => true,
+            // Read-only inspection/reporting: `status` reports maintenance
+            // state, `audit-versions` audits live format versions, and
+            // `verify-custody` re-verifies the content-addressed chain; none
+            // writes or deletes.
+            MaintainCommand::Status { .. }
+            | MaintainCommand::AuditVersions { .. }
+            | MaintainCommand::VerifyCustody { .. } => false,
+        },
+        // `store qualify` writes `sys/qualification`, a bucket-root object,
+        // never under `t/<tenant_hash>/`; gating it would also break the
+        // documented bootstrap order (it runs before the first server start,
+        // which is what writes `sys/tenancy` in the first place).
+        Command::Store { .. } => false,
+        Command::Tenant { command } => match command {
+            TenantCommand::Token { command } => match command {
+                // `list` only reads `sys/auth`.
+                TenantTokenCommand::List { .. } => false,
+                // `upsert`/`revoke` write `sys/auth`, a bucket-root object,
+                // never under `t/<tenant_hash>/`.
+                TenantTokenCommand::Upsert { .. } | TenantTokenCommand::Revoke { .. } => false,
+            },
+        },
+        // Pure inspection commands that take an explicit key/path or decode a
+        // marker directly (`tenancy show`/`resolve` resolve the scheme
+        // inline rather than through this gate, per `command_hashes_tenant`),
+        // plus `cache reclaim-legacy`, which never touches object storage.
+        Command::Segment { .. }
+        | Command::Rlog { .. }
+        | Command::Rspan { .. }
+        | Command::Idem { .. }
+        | Command::Tenancy { .. }
+        | Command::Cache { .. }
+        // `inspect cstat` only reads the named object.
+        | Command::Inspect { .. } => false,
     }
 }
 
@@ -152,6 +264,12 @@ enum Command {
     Catalog {
         #[command(subcommand)]
         command: CatalogCommand,
+    },
+    /// Inspect a standalone object by key or local path, outside the
+    /// segment/rlog/rspan/commit/catalog families above.
+    Inspect {
+        #[command(subcommand)]
+        command: InspectCommand,
     },
     /// Run and inspect maintenance: compaction, sweep, retention, version audit.
     Maintain {
@@ -727,13 +845,44 @@ enum TenancyCommand {
         #[arg(long, value_name = "PATH")]
         tenant_hash_key_file: Option<std::path::PathBuf>,
     },
+    /// Hash a tenant id under the bucket's resolved scheme and print its
+    /// object-store prefix (`t/<hash>/`) on stdout and nothing else (issue
+    /// #1180): the one entry point for turning a tenant id into the prefix a
+    /// bytes-summed total, a lifecycle rule, or an erasure check needs,
+    /// instead of scraping it off a failure message. Exits nonzero when the
+    /// bucket's marker is `v2-keyed` and the global `--tenant-hash-key-file`
+    /// was not given: that flag supplies the key the derivation needs. The
+    /// global `--tenant-hash-unkeyed` is not an alternative way to satisfy a
+    /// keyed marker: it selects the `v1-unkeyed` derivation, and is itself
+    /// rejected against a keyed bucket.
+    Resolve {
+        /// Tenant id to resolve (hashed under the bucket's pinned scheme).
+        tenant: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum StoreCommand {
     /// Run the conformance suite against the configured backend and, on a
     /// pass, record the outcome at `sys/qualification`.
-    Qualify {},
+    Qualify {
+        /// List page size to build the store with and declare to the
+        /// conformance suite's listing probes. Defaults to the production S3
+        /// page size, so a default run proves a real continuation-token
+        /// boundary is crossed; must match the store this command builds, so
+        /// the cross-page probe judges a real pagination boundary rather than
+        /// a mismatched, meaningless one. The upper bound is the number of
+        /// objects a run would write: each listing probe puts the page size
+        /// plus two scratch objects into the bucket, so a page size beyond a
+        /// million is a typo that would fill a bucket, not a page size any
+        /// backend serves.
+        #[arg(
+            long,
+            default_value_t = ravel_object_store::s3::LIST_PAGE_SIZE,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000_000)
+        )]
+        list_page_size: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -741,6 +890,18 @@ enum SegmentCommand {
     Inspect {
         /// Local file path or object store key.
         path: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InspectCommand {
+    /// Decode a column-statistics (`.cstat`) object's envelope and header
+    /// (ADR-0850/ADR-0942/ADR-1413), and report whether its declared
+    /// `body_uncompressed_len` exceeds the decode ceiling, without ever
+    /// decompressing the body.
+    Cstat {
+        /// Local file path or object store key.
+        key: String,
     },
 }
 
@@ -1040,6 +1201,10 @@ enum CatalogCommand {
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
+        /// Print the full `FoldReport` as JSON instead of the human-readable
+        /// text report. Either form carries every counter on the report.
+        #[arg(long)]
+        json: bool,
     },
     /// Decode and print HEAD and every referenced snapshot part for one
     /// (tenant, signal).
@@ -1080,9 +1245,25 @@ async fn main() -> anyhow::Result<()> {
             cli.tenancy.tenant_hash_key_file.as_deref(),
             cli.tenancy.tenant_hash_unkeyed,
         )?;
-        let scheme = tenancy::resolve_scheme(store.as_ref(), configured).await?;
+        let scheme = if command_is_write(&cli.command) {
+            tenancy::resolve_scheme_for_write(store.as_ref(), configured).await?
+        } else {
+            tenancy::resolve_scheme(store.as_ref(), configured).await?
+        };
         ravel_types::install_tenant_hash_scheme(scheme)
             .map_err(|_| anyhow::anyhow!("tenant-hash scheme was already installed"))?;
+    } else if command_is_write(&cli.command) {
+        // A writing command that does not hash a tenant (`gc-config set`:
+        // `sys/gc` is a bucket-root object) still writes into the same
+        // bucket the server must accept at startup, so it clears the same
+        // fail-closed gate even though it needs no `TenantHashScheme`
+        // installed (issue #1184).
+        let store = store::build_store(&cli.store)?;
+        let configured = tenancy::configured_scheme_from_flags(
+            cli.tenancy.tenant_hash_key_file.as_deref(),
+            cli.tenancy.tenant_hash_unkeyed,
+        )?;
+        tenancy::resolve_scheme_for_write(store.as_ref(), configured).await?;
     }
 
     match cli.command {
@@ -1154,6 +1335,7 @@ async fn main() -> anyhow::Result<()> {
                     shards,
                     signal,
                     max_flush_lifetime,
+                    json,
                 },
         } => catalog::fold(
             store::build_store(&cli.store)?,
@@ -1163,9 +1345,16 @@ async fn main() -> anyhow::Result<()> {
             signal,
             max_flush_lifetime,
             now_ns()?,
+            json,
         )
         .await
         .map(|_report| ()),
+        Command::Inspect {
+            command: InspectCommand::Cstat { key },
+        } => {
+            let bytes = store::read_bytes(&cli.store, &key).await?;
+            catalog::inspect_cstat(&bytes)
+        }
         Command::Catalog {
             command: CatalogCommand::Inspect { tenant, signal },
         } => {
@@ -1336,13 +1525,14 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Command::Store {
-            command: StoreCommand::Qualify {},
+            command: StoreCommand::Qualify { list_page_size },
         } => {
             let run_id = uuid::Uuid::new_v4();
             ravel_cli::qualify::qualify(
-                store::build_store(&cli.store)?,
+                store::build_store_with_list_page_size(&cli.store, Some(list_page_size))?,
                 cli.store.backend_identity(),
                 &run_id.to_string(),
+                list_page_size,
             )
             .await
         }
@@ -1458,6 +1648,19 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             print!("{report}");
+            Ok(())
+        }
+        Command::Tenancy {
+            command: TenancyCommand::Resolve { tenant },
+        } => {
+            let configured = tenancy::configured_scheme_from_flags(
+                cli.tenancy.tenant_hash_key_file.as_deref(),
+                cli.tenancy.tenant_hash_unkeyed,
+            )?;
+            let scheme =
+                tenancy::resolve_scheme(store::build_store(&cli.store)?.as_ref(), configured)
+                    .await?;
+            println!("{}", tenancy::resolve(&scheme, &tenant));
             Ok(())
         }
         Command::Provision {
@@ -2517,7 +2720,7 @@ mod tests {
     use clap::Parser;
 
     use super::rspan_status_mask_names;
-    use super::{Cli, Command};
+    use super::{Cli, Command, tenancy};
     use ravel_rspan::skip_index::{STATUS_BIT_ERROR, STATUS_BIT_OK, STATUS_BIT_UNSET};
 
     /// This unit test binary is built from this binary root, so it links the
@@ -2636,6 +2839,345 @@ mod tests {
             max_flush_delay,
             Some(std::time::Duration::from_secs(600)),
             "--max-flush-delay 10m reaches the field as 600s"
+        );
+    }
+
+    /// Issue #1184's classification: `load`, `typed-attr-column set`, `hold
+    /// set`/`clear`, `erase submit`, `provision adopt`/`reshard`, `gc-config
+    /// set`, `commit reconstruct`, `catalog fold`, and the mutating `maintain`
+    /// subcommands write; their `show`/`list`/`status`/`decode`/`inspect`
+    /// siblings do not, and neither do the bucket-root writers `store
+    /// qualify` and `tenant token upsert`/`revoke` (see `command_is_write`'s
+    /// comments for why the latter two are deliberately left ungated).
+    #[test]
+    fn command_is_write_classifies_the_named_shapes() {
+        let cases: &[(&[&str], bool)] = &[
+            (
+                &[
+                    "ravel",
+                    "load",
+                    "--parquet",
+                    "h.parquet",
+                    "--tenant",
+                    "t",
+                    "--mapping",
+                    "m.toml",
+                ],
+                true,
+            ),
+            (&["ravel", "typed-attr-column", "set", "t", "k:str"], true),
+            (&["ravel", "typed-attr-column", "show", "t"], false),
+            (
+                &["ravel", "hold", "set", "--tenant", "t", "--scope", "t/x/"],
+                true,
+            ),
+            (
+                &["ravel", "hold", "clear", "--tenant", "t", "--scope", "t/x/"],
+                true,
+            ),
+            (&["ravel", "hold", "list", "--tenant", "t"], false),
+            (
+                &[
+                    "ravel",
+                    "erase",
+                    "submit",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--matcher",
+                    "k=v",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel", "erase", "status", "--tenant", "t", "--signal", "logs",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel",
+                    "provision",
+                    "adopt",
+                    "--tenant",
+                    "t",
+                    "--shards",
+                    "4",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "provision",
+                    "reshard",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--shard-count",
+                    "8",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "gc-config",
+                    "set",
+                    "--protection-horizon",
+                    "25h",
+                    "--grace",
+                    "24h",
+                    "--max-query-duration",
+                    "1h",
+                    "--max-flush-lifetime",
+                    "1h",
+                ],
+                true,
+            ),
+            (&["ravel", "gc-config", "show"], false),
+            (&["ravel", "tenancy", "show"], false),
+            (&["ravel", "tenancy", "resolve", "t"], false),
+            (
+                &[
+                    "ravel",
+                    "commit",
+                    "reconstruct",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--shard",
+                    "0",
+                ],
+                true,
+            ),
+            (&["ravel", "commit", "decode", "some-key"], false),
+            (&["ravel", "catalog", "fold", "--tenant", "t"], true),
+            (&["ravel", "catalog", "list", "--tenant", "t"], false),
+            (
+                &[
+                    "ravel", "maintain", "sweep", "--tenant", "t", "--signal", "logs", "--shard",
+                    "0",
+                ],
+                true,
+            ),
+            // `--dry-run` reports the plan and mutates nothing, so it is a read
+            // even on the commands whose non-dry form writes. Gating it would
+            // stop an operator inspecting the plan on a marker-less bucket.
+            (
+                &[
+                    "ravel",
+                    "maintain",
+                    "sweep",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--shard",
+                    "0",
+                    "--dry-run",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel",
+                    "maintain",
+                    "compact-tenant",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--dry-run",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel", "maintain", "status", "--tenant", "t", "--signal", "logs", "--shard",
+                    "0", "--hour", "0",
+                ],
+                false,
+            ),
+            (&["ravel", "store", "qualify"], false),
+            (
+                &[
+                    "ravel",
+                    "tenant",
+                    "token",
+                    "upsert",
+                    "--deployment-key-file",
+                    "k",
+                    "--token",
+                    "tok",
+                    "--tenant",
+                    "t",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel",
+                    "tenant",
+                    "token",
+                    "list",
+                    "--deployment-key-file",
+                    "k",
+                ],
+                false,
+            ),
+        ];
+        for (args, expect_write) in cases {
+            let cli =
+                Cli::try_parse_from(*args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+            assert_eq!(
+                super::command_is_write(&cli.command),
+                *expect_write,
+                "{args:?} classified as write={}, expected {}",
+                super::command_is_write(&cli.command),
+                expect_write
+            );
+        }
+    }
+
+    /// Issue #1184, end to end against the exact gate `main` runs before
+    /// dispatch: `hold set` (a writing shape that hashes a tenant) against a
+    /// fresh, marker-less bucket with no scheme flag refuses with the
+    /// server's own `FreshBucketNeedsKey` wording, and the store holds zero
+    /// objects both before and after the attempt -- proving the refusal
+    /// happens before any write, not just that an error was raised.
+    ///
+    /// Non-vacuity: before this fix, `command_is_write` did not exist and
+    /// every tenant-hashing command (write or not) called plain
+    /// `resolve_scheme`, whose `Unspecified` arm returns
+    /// `Ok(TenantHashScheme::V1Unkeyed)`. Reverting the `if
+    /// super::command_is_write(&cli.command) { resolve_scheme_for_write }
+    /// else { resolve_scheme }` branch below to always call `resolve_scheme`
+    /// turns this test's `expect_err` into a panic on `Ok`.
+    #[tokio::test]
+    async fn hold_set_refuses_and_writes_nothing_on_marker_less_bucket() {
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::memory::MemoryStore;
+
+        let cli = Cli::try_parse_from([
+            "ravel", "hold", "set", "--tenant", "acme", "--scope", "t/x/",
+        ])
+        .expect("hold set parses");
+        let store: std::sync::Arc<dyn ObjectStoreBackend> = std::sync::Arc::new(MemoryStore::new());
+
+        let objects_before = store
+            .list("", None)
+            .await
+            .expect("list succeeds on an empty store")
+            .objects
+            .len();
+        assert_eq!(objects_before, 0);
+
+        let configured = tenancy::configured_scheme_from_flags(None, false)
+            .expect("no scheme flags is a valid configuration");
+        let gate = if super::command_is_write(&cli.command) {
+            tenancy::resolve_scheme_for_write(store.as_ref(), configured).await
+        } else {
+            tenancy::resolve_scheme(store.as_ref(), configured).await
+        };
+        let err = gate.expect_err("hold set on a fresh bucket with no scheme flag must refuse");
+        assert!(
+            err.to_string().contains(
+                "this is a fresh bucket and the tenant hash is keyed by default, but no \
+                 --tenant-hash-key-file was configured"
+            ),
+            "err: {err}"
+        );
+
+        let objects_after = store
+            .list("", None)
+            .await
+            .expect("list still succeeds")
+            .objects
+            .len();
+        assert_eq!(
+            objects_after, 0,
+            "the refused hold set must not have written any object"
+        );
+    }
+
+    /// The read-only sibling in the same command group, `hold list`, keeps
+    /// working against the same marker-less bucket with no scheme flag
+    /// (issue #1184's explicit requirement): `command_is_write` is false for
+    /// it, so it takes the lenient `resolve_scheme` path and gets the
+    /// v1-unkeyed default rather than a refusal.
+    #[tokio::test]
+    async fn hold_list_still_succeeds_on_marker_less_bucket() {
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::memory::MemoryStore;
+
+        let cli = Cli::try_parse_from(["ravel", "hold", "list", "--tenant", "acme"])
+            .expect("hold list parses");
+        assert!(!super::command_is_write(&cli.command));
+
+        let store: std::sync::Arc<dyn ObjectStoreBackend> = std::sync::Arc::new(MemoryStore::new());
+        let configured = tenancy::configured_scheme_from_flags(None, false)
+            .expect("no scheme flags is a valid configuration");
+        tenancy::resolve_scheme(store.as_ref(), configured)
+            .await
+            .expect("a read-only command must keep working on a fresh, marker-less bucket");
+    }
+
+    /// `gc-config set` writes `sys/gc`, a bucket-root object with no tenant
+    /// prefix, so it never reaches the tenant-hashing gate above; it still
+    /// must clear the write gate on its own (the `else if
+    /// command_is_write(&cli.command)` arm in `main`), since the invariant
+    /// is "does the server accept this bucket", not "does this command hash
+    /// a tenant".
+    #[tokio::test]
+    async fn gc_config_set_refuses_on_marker_less_bucket() {
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::memory::MemoryStore;
+
+        let cli = Cli::try_parse_from([
+            "ravel",
+            "gc-config",
+            "set",
+            "--protection-horizon",
+            "25h",
+            "--grace",
+            "24h",
+            "--max-query-duration",
+            "1h",
+            "--max-flush-lifetime",
+            "1h",
+        ])
+        .expect("gc-config set parses");
+        assert!(!super::command_hashes_tenant(&cli.command));
+        assert!(super::command_is_write(&cli.command));
+
+        let store: std::sync::Arc<dyn ObjectStoreBackend> = std::sync::Arc::new(MemoryStore::new());
+        let configured = tenancy::configured_scheme_from_flags(None, false)
+            .expect("no scheme flags is a valid configuration");
+        let err = tenancy::resolve_scheme_for_write(store.as_ref(), configured)
+            .await
+            .expect_err("gc-config set on a fresh bucket with no scheme flag must refuse");
+        assert!(
+            err.to_string().contains(
+                "this is a fresh bucket and the tenant hash is keyed by default, but no \
+                 --tenant-hash-key-file was configured"
+            ),
+            "err: {err}"
+        );
+
+        let objects_after = store
+            .list("", None)
+            .await
+            .expect("list succeeds")
+            .objects
+            .len();
+        assert_eq!(
+            objects_after, 0,
+            "the refused gc-config set must not have written sys/gc"
         );
     }
 
@@ -2818,6 +3360,55 @@ mod tests {
             panic!("expected the cache reclaim-legacy subcommand");
         };
         assert!(apply, "--apply flips to true when given");
+    }
+
+    /// `store qualify --list-page-size` takes an operator-supplied count that
+    /// the conformance suite turns into writes: it puts `page_size + 2`
+    /// objects per listing probe into the bucket. Both ends of the range are
+    /// refused at parse time, before the store is built or a single scratch
+    /// object is written.
+    #[test]
+    fn list_page_size_is_range_checked() {
+        use super::StoreCommand;
+
+        let Command::Store {
+            command: StoreCommand::Qualify { list_page_size },
+        } = Cli::try_parse_from(["ravel", "store", "qualify"])
+            .expect("a bare qualify invocation parses")
+            .command
+        else {
+            panic!("expected the store qualify subcommand");
+        };
+        assert_eq!(
+            list_page_size,
+            ravel_object_store::s3::LIST_PAGE_SIZE,
+            "the default is the production S3 page size"
+        );
+
+        for out_of_range in ["0", "1000001"] {
+            let err = Cli::try_parse_from([
+                "ravel",
+                "store",
+                "qualify",
+                "--list-page-size",
+                out_of_range,
+            ])
+            .expect_err("a page size outside 1..=1_000_000 must be refused");
+            assert!(
+                err.to_string().contains("1..=1000000"),
+                "the refusal must name the accepted range, got: {err}"
+            );
+        }
+
+        let Command::Store {
+            command: StoreCommand::Qualify { list_page_size },
+        } = Cli::try_parse_from(["ravel", "store", "qualify", "--list-page-size", "1000000"])
+            .expect("the upper bound itself parses")
+            .command
+        else {
+            panic!("expected the store qualify subcommand");
+        };
+        assert_eq!(list_page_size, 1_000_000);
     }
 
     #[test]

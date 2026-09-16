@@ -32,7 +32,7 @@ That brings up five things, all from published images:
   bootstrap-and-continue path for it, so a freshly created bucket has to be
   qualified before the server starts. The step is idempotent: on an
   already-qualified bucket it reports the existing record and exits 0.
-- `ravel-server` from `ghcr.io/nofireai/ravel-server:0.12.0` (override the pin
+- `ravel-server` from `ghcr.io/nofireai/ravel-server:0.15.0` (override the pin
   with the `RAVEL_IMAGE` environment variable), listening on `127.0.0.1:4318`
   (HTTP) and `127.0.0.1:4317` (gRPC), with the tenant token `demo-token` mapped
   to tenant `demo-tenant`.
@@ -45,6 +45,10 @@ That brings up five things, all from published images:
 Every published port binds loopback (`127.0.0.1`) only, and every credential is
 a fixed development value (`demo-token`, and `ravel` / `ravel-dev-secret` for
 MinIO). None of it is for a network-reachable deployment.
+
+The compose file also sets `RAVEL_AUDIT_TOKEN_KEY` to a fixed development key
+so the audit trail can tokenize query text. Set your own 64-hex-character
+value with that same variable for anything beyond a laptop.
 
 Because the store-qualify one-shot and the bucket creation both have to finish
 before `ravel-server` starts, the server is usually ready a few seconds after
@@ -194,7 +198,8 @@ what is in MinIO. See
 
 The claim it proves is specific to strict acknowledgement, which is the default.
 Buffered acknowledgement, opt-in per request, returns before the flush and
-carries no commit token, so a crash loses its buffered window. The
+carries no commit token, so a crash loses its buffered window, and an
+abandoned flush can drop already-acknowledged rows with no crash. The
 [consistency model](../consistency-model.md#acknowledgement-semantics) is
 normative for both.
 
@@ -293,6 +298,7 @@ export RAVEL_S3_BUCKET=ravel-dev
 export RAVEL_S3_REGION=us-east-1
 export RAVEL_S3_ACCESS_KEY=ravel
 export RAVEL_S3_SECRET_KEY=ravel-dev-secret
+export RAVEL_AUDIT_TOKEN_KEY=998626405d16aeca71f4fac7673b55213a774ba40401709022e81a27f050ffd8
 
 cargo run -p ravel-cli -- --store s3 store qualify
 
@@ -305,7 +311,10 @@ cargo run -p ravel-server --features sql -- \
 That binds the defaults, `127.0.0.1:4318` (HTTP) and `127.0.0.1:4317` (gRPC),
 and accepts requests carrying `Authorization: Bearer devtoken` for tenant
 `acme`. The environment variables stand in for the `--s3-*` flags, and both
-binaries read them the same way. `store qualify` is idempotent: on an
+binaries read them the same way. `RAVEL_AUDIT_TOKEN_KEY` is the same
+development key the compose stack uses, needed here for the same reason: this
+bucket is unkeyed, so there is no deployment key to derive one from.
+`store qualify` is idempotent: on an
 already-qualified bucket it reports the existing record and exits 0. Drop
 `--features sql` and the same command gives you the PromQL and ingest surfaces
 without the SQL endpoint.

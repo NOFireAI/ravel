@@ -15,7 +15,7 @@
 //! [`Profile::is_publishable`] is that check, and [`gate_workload`] refuses a
 //! manifest that marks `ci` comparable at all.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -251,6 +251,46 @@ impl WorkloadFile {
     /// The label dimension named `name`, or `None`.
     pub fn dimension(&self, name: &str) -> Option<&LabelDimension> {
         self.label_dimensions.iter().find(|d| d.name == name)
+    }
+
+    /// Distinct values each FIXED label dimension carries: every dimension
+    /// the manifest declares in `label_dimensions`, name to value count. This
+    /// deliberately excludes the scaling label
+    /// ([`GeneratorConfig::scaling_label`]): its cardinality depends on the
+    /// run's churn epochs (`Generator::generate_into` offsets each family's
+    /// instance ordinal per epoch), a single-epoch, manifest-only formula
+    /// cannot state it, and the manifest gate (`gate_workload`) refuses to
+    /// let the scaling label be declared as an ordinary dimension here in
+    /// the first place. The artifact reports the scaling label's
+    /// cardinality separately, computed by
+    /// [`crate::metrics_gen::Generator::scaling_label_cardinality`] for a
+    /// concrete step count: as `profile.scaling_label.cardinality_declared`
+    /// (evaluated at the profile's declared step count) and as
+    /// `profile.run.scaling_label_cardinality` (evaluated at the steps the
+    /// run actually generated).
+    pub fn label_cardinalities(&self) -> BTreeMap<String, u64> {
+        self.label_dimensions
+            .iter()
+            .map(|d| (d.name.clone(), d.values.len() as u64))
+            .collect()
+    }
+
+    /// Cardinality of each of `family`'s fixed label dimensions, in
+    /// `family.labels` order. Falls back to a single-valued dimension for a
+    /// name `gate_workload` would have refused as undeclared, matching
+    /// [`crate::metrics_gen::Generator::new`]'s own fallback so the two never
+    /// disagree about a manifest that never passed the gate.
+    pub(crate) fn family_dimension_cardinalities(&self, family: &MetricFamily) -> Vec<u64> {
+        family
+            .labels
+            .iter()
+            .map(|label| {
+                self.dimension(label)
+                    .map(|d| d.values.len() as u64)
+                    .unwrap_or(1)
+                    .max(1)
+            })
+            .collect()
     }
 
     /// Time series one instance of `kind` emits: one for a gauge, a counter, or

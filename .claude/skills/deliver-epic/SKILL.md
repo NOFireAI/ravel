@@ -57,7 +57,9 @@ skip it, say so in the epic body and say why.
    empty `## Ledger` section. Then assign it to yourself
    (`gh issue edit <n> --add-assignee @me`). The assignee is the claim:
    ownership that lives only in a session's head collides the moment a
-   second session picks "the next obvious thing".
+   second session picks "the next obvious thing". Then open the state
+   index for it, once, so every later stage has somewhere to write:
+   `scripts/epic-orchestrator.sh init <epic> --title "<feature>"`.
 3. **The ADR number is the epic issue number.** GitHub allocates issue
    numbers atomically, so two parallel epics cannot collide, and no
    reservation step is needed. Write the full ADR at
@@ -127,9 +129,50 @@ the first ledger entry.
 2. Write each spec with the fleet-task-spec skill. The harness-override
    and UNATTENDED paragraphs are not optional. Spec's Tests section
    names the acceptance test.
-3. Dispatch the whole wave in parallel `fleet_dispatch` calls. Record
-   every task_id in the ledger IMMEDIATELY, before watching anything - a
-   dropped session with unrecorded task_ids orphans running work.
+3. Dispatch each task in the wave through the intent script, never by
+   calling `fleet_dispatch` straight. That script is the chokepoint where
+   the pre-dispatch guards actually run: a stale ref, a dangling intent
+   from a previous attempt, and a ticket some open pull request is already
+   working all refuse there. Calling the MCP tool directly skips all
+   three, and "remember to check first" is not a check.
+
+   ```sh
+   sha=$(git fetch origin main -q && git rev-parse origin/main)
+   # Predicted files for this task, from the Stage 2 table. Optional, but
+   # it is what turns an overlapping open pull request into a refusal
+   # instead of two divergent rewrites of one file.
+   export DISPATCH_PATHS="crates/x/src/a.rs,crates/x/src/b.rs"
+   nonce=$(scripts/fleet-dispatch-intent.sh intent <epic> <sub-issue> "$sha")
+   ```
+
+   Refusals here are terminal for that task this tick: 65 means a pull
+   request already addresses the ticket, 66 that one is already touching
+   those files, 69 that GitHub could not be asked, which is not the same
+   as a clean answer. Resolve the named pull request rather than reaching
+   for `DISPATCH_SKIP_DUPLICATE_CHECK=1`; that flag is for a deliberate
+   second task on one ticket (a fix round, a continuation after a ceiling
+   kill), and a habit of using it to get past a refusal retires the guard.
+
+   Then `fleet_dispatch` with `ref=$sha`, and close out the intent with
+   the task id (or `failed` and the reason, if the dispatch errored):
+
+   ```sh
+   scripts/fleet-dispatch-intent.sh record <epic> "$nonce" <task_id>
+   scripts/epic-orchestrator.sh record <epic> task-dispatched \
+     ticket=<sub-issue> task=<task_id> ref="$sha"
+   ```
+
+   Both, not either. The intent script writes COMMENTS, which close out
+   the dangling-intent check; `epic-orchestrator.sh record` writes the
+   `- #<ticket> task=<uuid> dispatched` line into the issue BODY and reads
+   it back to prove it arrived (exit 70 if not: `gh` exits 0 on an edit
+   another session overwrote), and indexes it locally. `epic-status.sh`
+   reads the body and nothing else, so a task recorded only in comments is
+   invisible to the reconciliation that exists to catch a silently dead
+   one. Record every task id IMMEDIATELY, before watching anything: a
+   dropped session with unrecorded task ids orphans running work, and
+   hand-editing the body instead leaves the index empty, so the resume
+   procedure's first command fails with exit 66.
 4. Watch with `scripts/fleet-watch.sh <watch-url> <interval>` in
    background, one per task. Pass the bare command straight to the
    background-execution tool with its own backgrounding flag (e.g. the
@@ -211,10 +254,33 @@ Work in a dedicated worktree of main (`git worktree add`), per CLAUDE.md.
    line carries `Fixes: #<sub-issue>`), then
    `scripts/fleet-result-merge.sh <task-id> <message-file> -p <crates>`.
    `main` is protected, so the script never pushes it: it cleans the
-   result branch's history, runs local pre-flight gates, opens a PR, and
-   enables auto-merge (`--rebase`) so GitHub lands it once the required
-   checks pass. The merge-fleet-result skill covers gate failures, scope
-   creep, and confirming the PR actually merged.
+   result branch's history, runs local pre-flight gates, and opens a PR.
+   It does NOT enable auto-merge (standing rule, 2026-08-26): the fleet
+   review posts as a comment rather than a required check, so `--auto`
+   used to land before the review arrived. It posts `@claude-fleet
+   review` instead; wait for that review, address every finding, then
+   merge by hand. `FLEET_MERGE_AUTO=1` restores the old behaviour for the
+   rare case that genuinely does not need the wait.
+
+   Before merging each PR, confirm CI is green on the head you reviewed:
+
+   ```sh
+   scripts/guards/assert-green-head.sh <pr> --epic <epic>
+   ```
+
+   Exit 0 merges. 2 means wait; 3 means rerun once; 1 is the same failure
+   twice, which is real and escalates; 4 is a flake with the budget
+   spent; 5 is no verdict, which is never a green; 6 hands a cancelled or
+   timed-out check to `ci-sweep-cancelled.sh`. Passing `--epic` keeps the
+   failure signatures in this epic's state file rather than a per-PR one.
+   Then record it:
+
+   ```sh
+   scripts/epic-orchestrator.sh record <epic> merged pr=<pr> sha=<merge-sha>
+   ```
+
+   The merge-fleet-result skill covers gate failures, scope creep, and
+   confirming the PR actually merged.
 2. Real merge conflict: STOP and read the conflicting main commits first
    (`git log <merge-base>..origin/main -- <paths>`, full bodies). If a
    structural decision killed the task's premise (an ADR, a format
@@ -252,6 +318,17 @@ landed: <merge-sha> <merge-sha2>; main=<sha>; closed #103 #106
 
 ## Resume after a dropped session
 
+0. `scripts/epic-orchestrator.sh reconcile <epic>` first. It rewrites
+   `.claude/epic-state/<epic>.json` from live GitHub state and exits 65 on
+   any drift that must be fixed before the next dispatch, including a task
+   the local index knows about that never reached the issue body. A task
+   with a start ref and no result ref comes back UNRESOLVED, not running:
+   only `fleet_status` separates RUNNING from LOST, and calling it running
+   is how a dead task's ticket sits unfixed for the rest of the session.
+   `resume-get <epic>` says whether an interruption is parked and how long
+   the backoff has to run; a rate limit, a 5xx or a session limit is parked
+   with `resume-set --reason`, which exits 69 with the delay to pass to
+   ScheduleWakeup, or 75 when the error is fatal or the budget is spent.
 1. Read the epic issue ledger; find the last wave block and its status.
 2. Any task_id without a terminal ledger line: `fleet_status` it, verify
    its result ref with `git ls-remote`, resume that stage's procedure.
@@ -279,6 +356,14 @@ Never re-dispatch a task whose result ref exists; merge it.
   Asking mid-flight strands the epic (unattended rule).
 - "I'll record the task_ids after they finish" - ledger before watch,
   always.
+- "I'll just call `fleet_dispatch` directly, I already checked" - the
+  intent script is where the stale-ref, dangling-intent and duplicate-work
+  guards run. A dispatch that skips it has skipped all three, and the
+  check you did in your head is not on the ticket for the next session.
+- "The duplicate guard refused, I'll set DISPATCH_SKIP_DUPLICATE_CHECK=1"
+  - read what it named first. That flag is for a deliberate second task on
+  one ticket, and using it to get past a refusal once makes using it the
+  next time easier; a guard routinely worked around has stopped being one.
 - "I'll clean up all the wave worktrees at the end" - remove each one at
   the end of its own wave (Stage 5 step 5); waiting compounds disk use
   across every wave still to come.

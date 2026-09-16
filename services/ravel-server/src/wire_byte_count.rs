@@ -98,6 +98,17 @@ impl WireByteCounter {
     pub fn pop_message_bytes(&self) -> Option<u64> {
         self.pop_frame().map(|frame| frame.wire_bytes)
     }
+
+    /// Builds a counter with one message already queued, for another
+    /// module's unit test that calls a handler directly (bypassing
+    /// [`WireByteCountLayer`]) and must still satisfy [`wire_request_bytes`].
+    /// Test-only: not reachable from production code.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_message(compressed: bool, total_bytes: u64) -> Self {
+        let counter = Self::new();
+        counter.push_message(compressed, total_bytes);
+        counter
+    }
 }
 
 /// The admission accounting for a unary gRPC request's one message

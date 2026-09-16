@@ -7,8 +7,13 @@
 //!   every `IngestState` like the recovery-manifest writer), which pins the
 //!   configured `shard_count` in the record as a tenant's data first lands, and
 //! - the startup static-tenant check ([`validate_static_provisioning`]), which
-//!   refuses to start when a statically-known tenant's record disagrees with
-//!   the configured value.
+//!   refuses to start only when a statically-known tenant's record is
+//!   unreadable, has a structurally invalid generation history
+//!   ([`ProvisioningError::CorruptGenerations`]), or when adopting the
+//!   configured value would hide pre-ADR data. A decodable record with a valid
+//!   history whose recorded `shard_count` differs from the live `--shards`
+//!   default is tolerated: routing uses the record's own generation history
+//!   (ADR-0082).
 //!
 //! The catalog resolve consumer is wired in `ravel_catalog` itself
 //! (`Catalog::with_provisioning_enforcement`); the maintain per-tenant loop is
@@ -20,8 +25,11 @@
 //! check uses [`AbsentPolicy::AdoptIfData`], which returns
 //! [`ProvisioningCheck::FreshNoData`] for a (tenant, signal) with no record and
 //! no data, so an operator-managed cluster that starts with zero data and
-//! configured tenant tokens passes through cleanly; only a *present* record
-//! that disagrees, or pre-ADR data a lower `shard_count` would hide, refuses.
+//! configured tenant tokens passes through cleanly; only pre-ADR data a lower
+//! `shard_count` would hide, an unreadable record, or a record with a
+//! structurally invalid generation history, refuses. A decodable record with
+//! a valid history whose recorded `shard_count` differs from the live default
+//! is tolerated (ADR-0082).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -38,12 +46,14 @@ use ravel_types::{Signal, TenantHash, TenantId};
 /// known tenant across exactly these.
 pub const PROVISIONED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
 
-/// Count of dynamic-tenant first-touch `shard_count` mismatches (a record that
-/// disagrees with runtime config, or pre-ADR data a lower value would hide),
-/// rendered at `/metrics` as `ravel_provisioning_shard_count_mismatch_total`.
-/// Process-global with a single source and no labels, mirroring
-/// [`crate::tenancy::v1_unkeyed_adoption_count`]. A static tenant's mismatch
-/// refuses startup instead and never reaches here.
+/// Count of dynamic-tenant first-touch hard provisioning failures: an
+/// unreadable record (`UnsupportedVersion`, `CorruptRecord`, `Decode`) or
+/// pre-ADR data a lower value would hide (`AdoptionWouldHideData`), rendered at
+/// `/metrics` as `ravel_provisioning_shard_count_mismatch_total`. A recorded
+/// `shard_count` that merely differs from the live default is no longer a
+/// failure (ADR-0082): that drift is tolerated and counted separately by
+/// `ravel_catalog::shard_count_drift_count`. Process-global with a single
+/// source and no labels, mirroring [`crate::tenancy::v1_unkeyed_adoption_count`].
 static SHARD_COUNT_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// The dynamic-mismatch count for the `/metrics` renderer.
@@ -53,23 +63,31 @@ pub fn shard_count_mismatch_count() -> u64 {
 
 /// Whether a provisioning failure must fail the touch that raised it rather
 /// than be logged-and-ignored. A `Store` error is the one fail-open case: it is
-/// transient and retry-friendly, so a store blip never blocks all ingest. Every
-/// other variant means the tenant's true `shard_count` is unknown or provably
-/// disagrees with config -- a `ShardCountMismatch`/`AdoptionWouldHideData`
-/// disagreement, or an unreadable record (`UnsupportedVersion`, `CorruptRecord`,
-/// `Decode`) whose recorded `shard_count` cannot be trusted. Proceeding with
-/// ingest under an unknown `shard_count` is exactly the silent-data-hiding this
-/// record exists to prevent (ADR-0050 section 5), so those all fail hard: the
-/// version guard refuses "rather than misread a future record format", and a
-/// fail-open here would defeat that guard's own stated purpose.
+/// transient and retry-friendly, so a store blip never blocks all ingest. A
+/// recorded `shard_count` that differs from the live default is no longer a
+/// failure at all (ADR-0082): it is tolerated and never reaches here. Every
+/// remaining variant means the tenant's true `shard_count` is unknown or
+/// adopting the live value would hide data -- an `AdoptionWouldHideData`
+/// refusal, an unreadable record (`UnsupportedVersion`, `CorruptRecord`,
+/// `Decode`), or a decodable record whose generation history fails its
+/// structural invariants (`CorruptGenerations`) -- whose recorded
+/// `shard_count` cannot be trusted. Proceeding with ingest under an unknown
+/// `shard_count` is exactly the silent-data-hiding this record exists to
+/// prevent (ADR-0050 section 5), so those all fail hard: the version guard
+/// refuses "rather than misread a future record format", and a fail-open here
+/// would defeat that guard's own stated purpose. `CorruptGenerations` must fail
+/// hard for the same reason: `Catalog::enforce_provisioning_once` rejects the
+/// identical record via the same `validate_or_adopt` call, so failing open
+/// here would let the ingest router route a write the catalog refuses to
+/// resolve.
 fn is_hard_failure(err: &ProvisioningError) -> bool {
     matches!(
         err,
-        ProvisioningError::ShardCountMismatch { .. }
-            | ProvisioningError::AdoptionWouldHideData { .. }
+        ProvisioningError::AdoptionWouldHideData { .. }
             | ProvisioningError::UnsupportedVersion { .. }
             | ProvisioningError::CorruptRecord { .. }
             | ProvisioningError::Decode { .. }
+            | ProvisioningError::CorruptGenerations { .. }
     )
 }
 
@@ -180,10 +198,10 @@ pub async fn ensure_provisioning_record(
 
 /// Validate the configured `shard_count` for every statically-known tenant at
 /// startup (ADR-0050 section 5), refusing to start on the first disagreement.
-/// The static tenant set is the union of `--tenant-token` and
-/// `--maintain-tenant` (already hashed), so an OIDC/mTLS deployment with no
-/// static tenants (an empty set) has nothing to validate here and every dynamic
-/// tenant is validated at first touch instead.
+/// The static tenant set is the union of `--tenant-token` (or
+/// `--tenant-token-file`) and `--maintain-tenant` (already hashed), so an
+/// OIDC/mTLS deployment with no static tenants (an empty set) has nothing to
+/// validate here and every dynamic tenant is validated at first touch instead.
 ///
 /// Uses [`AbsentPolicy::AdoptIfData`]: a (tenant, signal) with no record and no
 /// data passes through without refusing (the fresh-deployment case), a
@@ -289,47 +307,36 @@ mod tests {
         );
     }
 
-    /// A statically-known tenant whose record disagrees refuses startup with a
-    /// typed `ShardCountMismatch` (the acceptance shape at the unit
-    /// level).
+    /// ADR-0082: a statically-known tenant whose recorded `shard_count` (4)
+    /// differs from the live `--shards` default (2) no longer refuses startup.
+    /// Before this change `validate_static_provisioning` returned
+    /// `ProvisioningError::ShardCountMismatch` and the `.expect(...)` below
+    /// panicked; now the drift is tolerated and startup proceeds.
     #[tokio::test]
-    async fn static_tenant_mismatch_refuses_startup() {
+    async fn static_tenant_drift_does_not_refuse_startup() {
         let store = store();
         let th = TenantId::new("acme").hash();
         seed_record(store.as_ref(), &th, Signal::Metrics, 4).await;
-        let err = validate_static_provisioning(store.as_ref(), &[th], 2, 1_000)
+        validate_static_provisioning(store.as_ref(), &[th], 2, 1_000)
             .await
-            .expect_err("a lower configured shard_count must refuse startup");
-        assert!(
-            matches!(err, ProvisioningError::ShardCountMismatch { .. }),
-            "got: {err}"
-        );
+            .expect("a recorded shard_count above the live default is tolerated (ADR-0082)");
     }
 
-    /// The dynamic path: a first-touch mismatch returns a typed error for that
-    /// one request, increments the counter, and does not affect another
-    /// tenant, which provisions cleanly.
+    /// ADR-0082 on the dynamic path: a first-touch drift (recorded 4, live
+    /// default 2) succeeds rather than failing that one request. Before this
+    /// change `ensure` returned `ProvisioningError::ShardCountMismatch` and the
+    /// `.expect(...)` below panicked.
     #[tokio::test]
-    async fn dynamic_first_touch_mismatch_fails_one_request_only() {
+    async fn dynamic_first_touch_drift_succeeds() {
         let store = store();
-        let before = shard_count_mismatch_count();
-        let mismatched = TenantId::new("acme").hash();
-        seed_record(store.as_ref(), &mismatched, Signal::Metrics, 4).await;
+        let drifted = TenantId::new("acme").hash();
+        seed_record(store.as_ref(), &drifted, Signal::Metrics, 4).await;
         let writer = Arc::new(ProvisioningRecordWriter::new(store.clone(), 2));
 
-        let err = writer
-            .ensure(&mismatched, Signal::Metrics, 1_000)
+        writer
+            .ensure(&drifted, Signal::Metrics, 1_000)
             .await
-            .expect_err("a mismatched dynamic tenant fails its own request");
-        assert!(matches!(err, ProvisioningError::ShardCountMismatch { .. }));
-        // The counter is a process-global static shared with every other test in
-        // this binary; asserting an exact `before + 1` delta races with any
-        // concurrent hard-failure test. The counter only ever increments, so a
-        // strict increase is the race-safe assertion that it fired for us.
-        assert!(
-            shard_count_mismatch_count() > before,
-            "the dynamic-mismatch counter must have incremented"
-        );
+            .expect("a drifted dynamic tenant is tolerated on first touch (ADR-0082)");
 
         // A different tenant is unaffected: it provisions cleanly.
         let other = TenantId::new("globex").hash();
@@ -337,6 +344,36 @@ mod tests {
             .ensure(&other, Signal::Metrics, 1_000)
             .await
             .expect("an unrelated tenant provisions cleanly");
+    }
+
+    /// ADR-0082 maintain gate: the per-tenant loop's provisioning gate goes
+    /// through `validate_or_adopt(.., AdoptIfData)`, exactly as
+    /// [`crate::maintain`] calls it. A drifted record (recorded 4, live default
+    /// 2) reports the tenant eligible (returns `RecordPresent`) rather than a
+    /// hard failure that would skip its maintain tick. Before this change it
+    /// returned `ProvisioningError::ShardCountMismatch` and the `.expect(...)`
+    /// below panicked.
+    #[tokio::test]
+    async fn maintain_gate_tolerates_drift_reports_eligible() {
+        let store = store();
+        let th = TenantId::new("acme").hash();
+        seed_record(store.as_ref(), &th, Signal::Metrics, 4).await;
+        let check = validate_or_adopt(
+            store.as_ref(),
+            &th,
+            Signal::Metrics,
+            2,
+            1_000,
+            AbsentPolicy::AdoptIfData,
+        )
+        .await
+        .expect("the maintain gate tolerates drift and reports the tenant eligible (ADR-0082)");
+        assert_eq!(
+            check,
+            ProvisioningCheck::RecordPresent {
+                recorded_shard_count: 4
+            }
+        );
     }
 
     /// A future-version record on a dynamic tenant's
@@ -408,6 +445,59 @@ mod tests {
         assert!(
             matches!(err, ProvisioningError::Decode { .. }),
             "got: {err}"
+        );
+    }
+
+    /// A record with a corrupt generation history on a dynamic tenant's
+    /// first-touch path must fail that request with a typed
+    /// `CorruptGenerations` error and increment the mismatch counter, rather
+    /// than being logged and letting ingest proceed and the router cache a
+    /// tenant `Catalog::enforce_provisioning_once` would reject the same
+    /// record for (split-brain between the ingest router's and the catalog's
+    /// view of the record). Before the fix, `is_hard_failure` (this file, the
+    /// `matches!` in `is_hard_failure` above) omitted
+    /// `ProvisioningError::CorruptGenerations`, so `ensure` fell into the
+    /// fail-open `Err(err) => ... Ok(())` arm and this `expect_err` panicked.
+    #[tokio::test]
+    async fn dynamic_first_touch_corrupt_generations_fails_request() {
+        let store = store();
+        let th = TenantId::new("acme").hash();
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: th.0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 1,
+            // ScalarMismatch: generations[0].shard_count (8) != scalar shard_count (4).
+            generations: vec![sysproto::ShardGeneration {
+                generation: 0,
+                shard_count: 8,
+                activation_hour: 0,
+                appended_unix_ns: 0,
+            }],
+            format_floors: Vec::new(),
+        };
+        store
+            .put(
+                &provisioning_key(&th, Signal::Metrics),
+                record.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed corrupt-generations record");
+        let before = shard_count_mismatch_count();
+        let writer = Arc::new(ProvisioningRecordWriter::new(store.clone(), 4));
+        let err = writer
+            .ensure(&th, Signal::Metrics, 1_000)
+            .await
+            .expect_err("a corrupt generation history must fail the request, not fail-open");
+        assert!(
+            matches!(err, ProvisioningError::CorruptGenerations { .. }),
+            "got: {err}"
+        );
+        assert!(
+            shard_count_mismatch_count() > before,
+            "a hard provisioning failure must increment the counter"
         );
     }
 

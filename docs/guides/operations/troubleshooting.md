@@ -111,14 +111,22 @@ next non-tripping pass, including one that stopped tripping through dilution.
 
 | Symptom | Likely cause | How to confirm | Corrective action |
 |---|---|---|---|
-| Data that was written is invisible to queries, and the orphan breaker tripped or `ravel_maintain_orphans_present` is nonzero. | Commit records for a shard were removed outside Ravel: an accidental delete, a lifecycle rule on the wrong prefix, a mistyped prefix delete. | `ravel-cli maintain sweep --tenant <t> --signal <s> --shard <n> --dry-run` lists the record-less data objects as orphan candidates. `ravel-cli catalog list --tenant <t> --shards <n>` shows what the catalog still resolves. | Follow the four steps below, in order. Step 1 is not optional. |
+| Data that was written is invisible to queries, and the orphan breaker tripped or `ravel_maintain_orphans_present` is nonzero. | Commit records for a shard were removed outside Ravel: an accidental delete, a lifecycle rule on the wrong prefix, a mistyped prefix delete. | `ravel-cli maintain sweep --tenant <t> --signal <s> --shard <n> --dry-run` lists the record-less data objects as orphan candidates. `ravel-cli catalog list --tenant <t> --shards <n>` shows what the catalog still resolves. | Follow the five steps below, in order. Step 1 is not optional. |
 
-The data objects those records named are invisible to readers and, once past the
-orphan grace horizon, will be physically deleted by the sweeper. The recovery is
-`ravel-cli commit reconstruct`, which rebuilds each record-less L0 data object's
-commit record from the object's own footer. **Stop maintenance first**, or the
-sweeper's orphan rule deletes the very objects you are trying to reattach while
-you reattach them.
+The data objects those records named are invisible to readers. Once past the
+orphan grace horizon the sweeper moves them out of the live keyspace to a
+`quarantine/` prefix rather than deleting them, and a second reaper deletes the
+quarantine copy once it is older than `quarantine_horizon_ns` (default 7 days).
+So there are two clocks to beat, not one: after the grace horizon the object is
+no longer where `commit reconstruct` looks for it, and after the quarantine
+horizon it is gone for good.
+
+The recovery is `ravel-cli commit reconstruct`, which rebuilds each record-less
+L0 data object's commit record from the object's own footer. It reads the live
+L0 prefix only, so anything already quarantined has to be copied back first
+(step 2 below). **Stop maintenance first**, or the sweeper's orphan rule
+quarantines the very objects you are trying to reattach while you reattach
+them.
 
 1. **Stop maintenance for the tenant.** Stop the `--mode maintain` process
    entirely. This is the one method that reliably protects a tenant under repair
@@ -128,7 +136,26 @@ you reattach them.
    tenants will not keep the sweeper off it. Do not rely on the orphan breaker
    to hold the shard open either: see the entry above.
 
-2. **Reconstruct the missing records**, one shard at a time:
+2. **Restore anything already quarantined.** List the tenant's quarantine
+   prefix and compare it against what the sweep reported as orphan candidates:
+
+   ```sh
+   aws s3 ls --recursive s3://<bucket>/quarantine/t/<tenant_hash>/
+   ```
+
+   Each entry is `quarantine/<original key>/q<quarantined_at_ns>`. Recover the
+   live key by stripping the `quarantine/` prefix and the trailing `/q<ns>`
+   segment, then copy the object back to it. The original key is preserved
+   verbatim in between, so the transform is textual and needs no lookup. Copy,
+   do not move, until step 4 has passed: the quarantine copy is the only other
+   copy that exists.
+
+   There is no `ravel-cli` command for this yet, so it is an object-store
+   operation against whatever tooling the bucket takes. Objects whose
+   quarantine timestamp is older than `quarantine_horizon_ns` are already gone
+   and are not recoverable from here.
+
+3. **Reconstruct the missing records**, one shard at a time:
 
    ```sh
    ravel-cli commit reconstruct --tenant <name> --signal <metrics|logs> --shard <n>
@@ -140,7 +167,7 @@ you reattach them.
    reconstructed, already-present and failed, and exits nonzero if any candidate
    failed. Repeat per shard across the affected range.
 
-3. **Verify custody and catalog state** before resuming maintenance:
+4. **Verify custody and catalog state** before resuming maintenance:
 
    ```sh
    ravel-cli maintain verify-custody --tenant <name>
@@ -153,8 +180,10 @@ you reattach them.
    names, defaulting to metrics, so run it once per signal the tenant writes.
    Both must exit zero before you trust the repair.
 
-4. **Resume maintenance.** Restart the `--mode maintain` process. The sweeper now
+5. **Resume maintenance.** Restart the `--mode maintain` process. The sweeper now
    sees the reconstructed records and treats their data objects as referenced.
+   Once it does, delete the quarantine copies you restored from in step 2; the
+   reaper leaves them until their own horizon otherwise.
 
 Two fields are rebuilt as honest approximations rather than exact copies: the
 record's creation time, taken from the data object's own last-modified time
@@ -200,12 +229,17 @@ changed. See
 ## A process refuses to start
 
 Every refusal below is a hard error before any listener binds. None of them is
-transient and none clears on restart, because in each case object storage
-records the true value and the process configuration disagrees with it.
+transient and none clears on restart. Most are a disagreement between the
+process configuration and what object storage records as true, but not all:
+a statically-known tenant's provisioning record with a structurally invalid
+generation history (`CorruptGenerations`) refuses startup on its own, with no
+configuration value to disagree with -- the record itself cannot be trusted
+to route on.
 
 | Symptom | Likely cause | How to confirm | Corrective action |
 |---|---|---|---|
-| Startup error naming a tenant, a signal, and an expected and actual shard count. | This process was configured with a different `--shards` than that tenant's data was written under. | The error text names all four values. `ravel-cli catalog list --tenant <t> --shards <n>` against the recorded value resolves records; against the wrong one it does not. | Set `--shards` back to the recorded value. Never lower it below what a tenant already used: resolution iterates `0..N`, so a lower value hides every series in the missing shards, which is why it is refused. |
+| Startup error that adopting a tenant's data would hide it, naming a tenant, a signal, and an observed shard index at or above the configured `--shards`. | This process was configured with a lower `--shards` than a tenant's pre-record data already used, so writing a record at the configured value would leave existing series in higher shards unroutable. | The error names the observed index and the configured value. `ravel-cli catalog list --tenant <t> --shards <n>` against the higher value resolves those records. | Raise `--shards` to cover every observed shard index for that tenant, or run `ravel-cli provision adopt` at the correct value first. A plain difference between the live default and an already-provisioned tenant's recorded count no longer refuses startup: that tenant keeps its recorded count and routes over it. |
+| Startup error `CorruptGenerations`, naming a tenant, a signal, and the specific structural defect (for example `ScalarMismatch` or `FirstActivationNonzero`). | A statically-known tenant's provisioning record decoded, but its `generations` history fails a structural invariant: the scalar `shard_count` disagrees with generation 0's count, generation 0 is not at `activation_hour` 0, the history is not dense or not activation-increasing, or a generation's count is out of range or a no-op repeat. `validate_static_provisioning` propagates the error before any listener binds; the same defect fails a dynamic tenant's first ingest touch and increments `ravel_provisioning_shard_count_mismatch_total`, and it skips that tenant's maintenance tick if the maintain loop hits it first. | The error names the tenant, signal, and defect variant. | The record needs manual repair or the tenant needs re-provisioning; there is no live-configuration flag that fixes this. Restore a valid `generations` history for that (tenant, signal) object, or delete the record and re-run `ravel-cli provision adopt` if it is safe to re-derive shard_count from currently observed data. |
 | Startup error naming a configured and a stored garbage-collection value and the rule violated. | A `--gc-*` flag disagrees with the durable `sys/gc` object. In maintain mode the horizon and grace must be equal to the stored values, not merely satisfy the inequality. | `ravel-cli gc-config show` prints the stored values and whether the bucket is bootstrapped. | Align the flags with the stored object, or change the object deliberately with `ravel-cli gc-config set` and then bring every mode's flags into line. A query deadline above the stored maximum is rejected, never clamped. |
 | Startup error saying the store is not qualified, or that its qualification is stale. | A fresh bucket has never been qualified, or its record predates this binary's required suite floor. | The two conditions are distinct named errors in the startup output. | Run `ravel-cli store qualify --store s3 ...` against the bucket, then start the server. On a stale record, re-run it with a current build. |
 | Startup error that a fresh bucket needs a tenant-hash key. | A fresh bucket was started with neither `--tenant-hash-key-file` nor `--tenant-hash-unkeyed`. Keyed is the default and the choice is permanent for the bucket. | The error names both flags. | Pass the key file, or pass `--tenant-hash-unkeyed` if you intend the unkeyed scheme. Decide deliberately: there is no migration between the two. |
@@ -223,11 +257,12 @@ records the true value and the process configuration disagrees with it.
 |---|---|---|---|
 | `/readyz` returns 503 across the fleet and the load balancer has taken it out. | The background store probe has failed four consecutive reads of `sys/tenancy`. | `ravel_store_reachable == 0` on `/metrics`, and `ravel_store_probe_failures_total` rising. `curl -sS -o /dev/null -w '%{http_code}' http://<host>/readyz` returns 503 with no store call of its own. | Fix the store or the credential. Readiness recovers on the first successful probe, without a restart. Do not lower the threshold: it is a fixed constant precisely so a single blip cannot eject a fleet. Liveness is deliberately unaffected, so processes are not being restarted under you. |
 | A deployment gated on readiness has halted mid-roll. | The same condition. Readiness now reflects store reachability, so a rollout correctly stops while the store is unreachable. | As above. | Resolve the store outage; the roll resumes. |
+| A single process reports `/readyz` 503 while the store is reachable and the fleet is otherwise healthy. | An ingest shard actor on that process exhausted its respawn budget (`MAX_SHARD_RESPAWNS`, 3 deaths within one decay window) and was condemned: a flush kept panicking, most often a poison-pill input for one shard, not a transient fault. A condemned shard cannot recover in-process. | `shards_condemned > 0` on `/metrics` for that process, with `ravel_store_reachable == 1`. `shard_deaths` will have climbed to at least the respawn budget on that shard first. Writes to the condemned shard return the typed shard-unavailable error. | Nothing replaces the process on its own: a 503 at `/readyz` only removes the pod from its Service endpoints, and `/healthz` stays 200 by design, so the pod is not restarted or rescheduled and will sit condemned indefinitely. Roll it yourself: first capture the panicking flush from that shard's error logs (if one tenant or series is the poison pill, a replacement condemns just as fast), then `kubectl delete pod <pod>` (or `kubectl rollout restart deployment/<name>` for the whole set). A fresh process starts with all shards live. `shard_deaths` alone (with `shards_condemned == 0`) is transient recovery, not a page. |
 | `ravel_bucket_protection_unknown == 1`. | `--require-bucket-protection` is on and the backend cannot answer the Object Lock and versioning query. Every backend reachable only through the object-store contract reports this. | The gauge, plus the single startup warning that accompanies it. | Not necessarily a misconfiguration, but the platform cannot see the protection it depends on. Confirm the bucket settings out of band, at the provider console or with the provider CLI. |
-| `multipart_abort_failures` or `multipart_uploads_unreaped` rising. | Multipart uploads are ending without a confirmed abort, so orphaned parts may be accumulating and billed. | The two store counters on `/metrics`. | Confirm the bucket has an `AbortIncompleteMultipartUpload` lifecycle rule with a cleanup period of seven days or less. Nothing in Ravel reaps those parts, so that rule is the only thing bounding the cost. |
+| Orphaned multipart uploads accumulating in the bucket. | Multipart uploads are ending without a confirmed abort, so parts may be left behind and billed. Ravel tracks this internally but does not yet export it on `/metrics`. | List multipart uploads directly against the bucket, for example `aws s3api list-multipart-uploads --bucket <bucket>`, or your provider's storage console. | Confirm the bucket has an **enabled** `AbortIncompleteMultipartUpload` lifecycle rule with a cleanup period of seven days or less, and that its scope actually covers Ravel's uploads: an empty prefix so the rule applies to the whole bucket, or a set of prefixes that together cover every `t/` prefix. A rule that is present but disabled, or scoped to a prefix Ravel never writes, passes a "does a rule exist" check while reaping nothing, and the parts keep accumulating and keep being billed. Nothing in Ravel reaps those parts, so that rule is the only thing bounding the cost. The [disaster recovery](../disaster-recovery.md) guide's platform-CLI checklist gives the exact `get-bucket-lifecycle-configuration` query, gated on `Status==Enabled` and that same whole-bucket-or-every-`t/`-prefix scope. |
 | `increase(ravel_durable_auth_refresh_failures_total[15m]) > 0`. <a id="durable-auth-refresh-is-failing"></a> | The background refresh cannot read or decode `sys/auth`: most often the storage credential broke or lost read on that key, or the object is corrupt or was written under a different deployment key. | The counter, labeled by mode, on `/metrics`. The cached map is still serving, so requests are not failing yet. | Fix the credential or the object now. This is the early warning: the staleness gate is not advancing, and token resolution fails closed once the hard-stale horizon passes. |
 | `increase(ravel_durable_auth_stale_fail_closed_total[5m]) > 0`. | The cached token map is already past the hard-stale bound and durable tokens are being refused. | The counter on `/metrics`, and clients receiving authentication failures for tokens that used to work. | This is the cliff the previous row exists to keep you off. Restore `sys/auth` readability; resolution recovers on the first successful refresh. |
-| `increase(ravel_provisioning_shard_count_mismatch_total[5m]) > 0`. | A dynamically resolved tenant, from OIDC or mTLS, failed its provisioning check: either a real shard-count disagreement against the durable record, or an unreadable record caught on the maintenance loop, which skips that tenant's tick. | The counter on `/metrics`. Unlike a statically known tenant, this does not take the process down: the one request fails with a typed error. | Reconcile the configuration against the durable record for that tenant. Any nonzero increase is a configuration-against-data problem, not a rate to threshold. |
+| `increase(ravel_provisioning_shard_count_mismatch_total[5m]) > 0`. | A tenant failed its provisioning check hard: an unreadable record (corrupt or a future format version), a decodable record whose generation history fails its structural invariants (`CorruptGenerations`, see "A process refuses to start" above), or pre-ADR data a lower `shard_count` would hide. Caught on a dynamic tenant's first touch, or on the maintenance loop's per-tenant gate. A recorded count that merely differs from the live `--shards` default is no longer counted here; it is tolerated and tallied by `ravel_provisioning_shard_count_drift_total` instead. | The counter on `/metrics`. The two sources have different blast radii and neither takes the process down: a first-touch failure fails only the triggering request (a query resolving the tenant or an ingest write) with a typed error; a maintenance-loop failure fails no request at all, but skips that tenant's maintenance tick for the cycle. Correlate against ingest error logs versus `ravel_maintain_units_stalled` and the maintain pass log to tell which source fired. | Read the durable record for that tenant. The remedy depends on which failure it was: a future-format record needs the binary upgraded to one that reads that version; a corrupt record, or one whose generation history fails its structural invariants, needs the record restored from a known-good copy or the tenant safely re-provisioned (an upgrade does not repair persisted history); a would-hide-data case needs `--shards` raised to cover the tenant's observed shards. Any nonzero increase is a real problem, not a rate to threshold. If the source was the maintenance loop, do not assume maintenance continues for that tenant while the record is broken: retention, compaction, and everything else the loop drives are paused for it until the record is fixed. |
 | `ravel_tenancy_v1_unkeyed_adoptions_total` incremented unexpectedly. | A bucket with data and no tenancy marker was adopted as unkeyed, permanently. | The counter, and the accompanying log line naming the adoption. | If that bucket was meant to be keyed, stop: the adoption is permanent and there is no migration. Start a fresh keyed bucket and drain into it. |
 
 ## Maintenance is not running, or not finishing
@@ -242,6 +277,7 @@ records the true value and the process configuration disagrees with it.
 | `increase(ravel_maintain_conservation_aborts_total[15m]) > 0`. | A compaction publish was refused because input and output record counts disagreed. Nothing was written. | The counter, labeled by signal, on `/metrics`. `ravel-cli maintain compact-bucket --tenant <t> --signal <s> --shard <n> --hour <n> --dry-run` recomputes the same plan without writing. | A bucket stuck retrying every tick without ever compacting needs an operator rather than another retry. |
 | `increase(ravel_maintain_legal_hold_refresh_failures_total[15m]) > 0`. | The maintenance loop could not read the hold records, so it skipped that tenant's tick entirely. | The counter on `/metrics`. `ravel-cli hold list --tenant <id>` reads the same records from the CLI. | A sustained failure means a tenant is silently receiving no maintenance at all. Fix the read path before anything else, because the skip is the fail-closed behavior working as intended. |
 | A legal hold was set but data was still deleted. | The hold was set after the current tick's snapshot refresh. Each tick refreshes its hold snapshot once, before its destructive pass. | `ravel-cli hold list --tenant <id>` shows whether the scope is recorded. | Confirm with `hold list` after every urgent `hold set`. `hold set` returning success means the record was written, not that a pass has picked it up. The exposure window is one maintenance interval. |
+| The `RavelCatalogFoldStalled` alert fires: for the signal the alert names, no live folding process has advanced `ravel_catalog_fold_last_success_timestamp_seconds` within the unsealed ingest span the configuration allows. The exact expression, its threshold, and its state-by-state behaviour live with the rule; see the corrective-action cell. | No process has completed a catalog fold of that signal for longer than the unsealed ingest span the configuration implies. Each signal is folded by its own task, so one signal alarming while the others stay fresh is that one task dead. All signals alarming together is the process gone, its store credentials no longer working, or tenant discovery failing every cycle. | The gauge on `/metrics`, read per `signal`, plus `ravel_catalog_fold_failures_total` for the same signal to tell a fold that is running and failing from one that is not running at all. The fold task logs the underlying error per tenant at `warn`. | Time-bounded, not cosmetic: the unsealed span grows for as long as this holds, and a cold recent-window query over a wide enough span is refused for exceeding its object-store request budget. [The observability guide](../observability.md#the-fold-stalled-alert) carries the rule, the arithmetic behind the 4800, and the two limits on what the gauge can see. |
 | `ravel_scrub_cursor_position` stuck near 0 for longer than the scrub period. | The scrubber is not keeping pace with `--scrub-period`, so the effective staleness bound is no longer that period. | The gauge, per signal, on the maintain process's `/metrics`. | Lengthen `--scrub-period`, or give the maintain process more read bandwidth. Sustained scrub bandwidth is the corpus size divided by the period. |
 
 ## Data integrity and correctness alarms

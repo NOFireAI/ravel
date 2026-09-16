@@ -77,6 +77,21 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
      histogram monotonicity fixup is an info.)
 ```
 
+### Log selectors
+
+A log selector -- exact `__name__` equality on `ravel_log_lines` or
+`ravel_log_bytes` (ADR-1103) -- is planned by the same `plan_selectors` walk
+above and shares the query's total budgets with every metrics selector in
+the same query, but resolves against the tenant's log catalog instead of the
+metrics one, and only against this coordinator's own local view: log
+selectors are never federated (ADR-1103 decision 5), so a
+`--distributed-query` deployment still answers one from local segments only,
+never a cluster-wide merge. Its decoded per-record samples (one
+`ravel_log_lines`/`ravel_log_bytes` sample per log line, labels derived per
+[query.md](guides/query.md#promql-over-logs)) join the same query-wide
+pooled merge a metrics selector's runs join, so a query mixing a metrics and
+a log selector still evaluates over one merged, sorted series set.
+
 `padded_range`: the union, over every selector `plan_selectors` reports, of
 that selector's own fetch window (its lookback or matrix range, plus its
 own offset, anchored per `PlanAnchor::Window`/`Pinned`), so lookback never
@@ -231,9 +246,16 @@ Two carriers feed it, unioned per segment and per column (ADR-0873 decision
   snapshot entry (field 15) that resolution already reads. Because it rides
   those records, it covers the live tail above the fold watermark and
   token-resolved segments, which no fold-built sibling object can;
-- the ADR-0850/0942 `.cstat` entry, joined by segment identity, which is the
-  carrier for pre-stamp sealed history and the only carrier for `Str`/`Bytes`
-  extrema.
+- the ADR-0850/0942/1413 `.cstat` entry, joined by the segment's content hash
+  first (`SegmentRef::content_hash`, the ADR-0942/1413 keying scheme for v2
+  whole-tenant and v3 per-part records) and falling back to the entry
+  identity (ingest hour bucket, shard, writer id, writer epoch, writer
+  sequence, the ADR-0850 v1 keying scheme) when no content-hash entry
+  matches, which is the carrier for pre-stamp sealed history and the only
+  carrier for `Bytes` extrema. A declared `Str` column is declined before
+  either carrier is read, since it is projected as a dictionary-encoded
+  string with no scalar form on this path, so `MIN`/`MAX` over one is always
+  answered by the scan.
 
 **The write side of the stamp carrier does not exist.** Nothing in the
 flush or compaction path calls the stamp writers in
@@ -263,18 +285,24 @@ of the `stats_are_exact` gate above:
 - an entry either carrier's reader refuses: a stamp of an ineligible type, a
   stamp whose type disagrees with the tenant's declaration, a duplicated
   entry name (ADR-0873 clause 6 drops every occurrence, so a duplicate never
-  reaches a reader as coverage), or a `.cstat` entry whose extrema presence
-  disagrees with its `non_null_count`;
+  reaches a reader as coverage), a `.cstat` entry whose extrema presence
+  disagrees with its `non_null_count`, or a `.cstat` entry whose row
+  accounting (`non_null_count + null_count`) does not reconcile against the
+  joined `SegmentRef::sample_count`;
 - the two carriers disagreeing about one segment in `min`, `max`, or
   `null_count`. Nothing is ever combined across carriers: both claim to
   describe the same rows of one immutable object exactly, so a disagreement
   means one of them is wrong and no answer is safe.
 
-A `null_count` is reported `Exact` only when every covering carrier proved it,
-which means the stamp: a `.cstat` entry's row accounting is not reconciled
-against the joined `SegmentRef::sample_count` on this path, and an unreconciled
-figure would answer `COUNT(col)` from something nothing checked. The extrema are
-exact either way.
+A `.cstat` entry's row accounting is reconciled against the joined
+`SegmentRef::sample_count` before the entry grants anything, and the refusal
+covers the whole entry, extrema included: an entry whose counts do not add up
+to the segment's rows describes rows the object does not have, so no figure it
+carries describes the object the query reads. A `null_count` is reported
+`Exact` only when every covering carrier proved its figure, which means the
+stamp: reconciliation is a fail-closed gate on what a `.cstat` entry may grant,
+not a promotion of its NULL count to a proven one, so a `.cstat`-only column
+answers `MIN`/`MAX` exactly and leaves `COUNT(col)` to the scan.
 
 One statistics shape is exact and still does not shortcut the query. A declared
 column that reads NULL in every touched row has an exactly-NULL extremum, and
@@ -295,9 +323,11 @@ the numbers may be read.
 statistics entries a reader dropped, one per dropped entry, labelled by the
 carrier that was read: `commit-record`, `compaction-part`, `snapshot-entry`, and
 `cstat`. The first three are the stamp reads in `ravel-commit`; the `cstat`
-label is reported by `ravel-sql`'s `.cstat` reader, which counts exactly two
-refusals as defects (a duplicated column name, and extrema presence that
-contradicts the row accounting) and treats a missing object, segment, or column
+label is reported by `ravel-sql`'s `.cstat` reader, which counts exactly three
+refusals as defects (a duplicated column name, extrema presence that
+contradicts the row accounting, and row accounting that does not reconcile
+against the joined `SegmentRef::sample_count`) and treats a missing object,
+segment, or column
 entry as the ordinary uncovered state. Each READ of a defective carrier
 increments the label again: there is no per-entry deduplication, because it
 would need unbounded state keyed by (object, column) on a path walked once per
@@ -450,6 +480,26 @@ segment at or below the block-range threshold counts there too: the fetch reads
 such an object whole in one GET regardless, so planning it from the skip index
 would cost a second read rather than save one.
 
+That plan-phase whole-object read is now carried forward into
+the scan (`ravel_query::CarriedWholeObject`) instead of being thrown away,
+for the first `plan_concurrency` segments whose plan completes: those
+objects cross the wire once. Every other relevant segment is re-fetched by
+the scan exactly as before, and the peak retained bytes are bounded by the
+plan fan-out times object size, not by corpus size. Removing the remaining
+duplicate reads needs the plan carry to stream per partition instead of
+being held at the plan barrier; that redesign is tracked separately. Before
+the fix, only a cache large enough to still hold the object by the time the
+scan reached it turned the second read into a hit instead of a real GET, so
+a corpus larger than the cache paid the full double read on every such
+statement. Reuse needs no etag re-check: the plan and scan of one statement
+share the same immutable `SegmentRef` out of one resolved snapshot, and the
+whole-object cache key is already keyed on `seg_ref.content_hash`, so there
+is no live GET spanning the gap between the two reads for a changed object
+to be missed by. The one `plan_full_reads` GET remains the true cost; the
+reused bytes are charged to `QueryAccounting::add_bytes_reused`, not folded
+into the GET-bytes figure the plan phase already recorded, so a report
+distinguishes a genuine wire GET from a carried reuse.
+
 ### Requests per object on a version-4 object
 
 A version-4 RLOG object (ADR-0699) stores each row group's pages column-major
@@ -582,6 +632,69 @@ conservatively (256 KiB: above the four fixed 64 KiB suffix/gap probes, far
 below any real compacted sparse L1 segment) rather than fit to a measured point.
 The within-segment GET/byte model is the `selective_read_accounting` bench.
 
+## Fetch-layer memory reservations
+
+The fetch layer reserves the bytes a GET will materialize on a shared
+`MemoryBudget` (crate `ravel-memory`) before it issues the GET, and owns that
+reservation for as long as the fetched buffer lives. `QueryEngine` holds one
+`Arc<MemoryBudget>` and, through `QueryEngine::with_memory_budget`, wires it to
+the two fetchers it owns: the RSEG metrics fetcher (`fetcher`) and the RLOG log
+fetcher (`log_fetcher`), exactly as it shares one `GetLimiter`. Two fetch paths
+draw on their own default budget, not this shared one, and so are not yet
+bounded by a finite process budget:
+
+- **RSPAN.** `QueryEngine` owns no span fetcher, so `with_memory_budget` reaches
+  none; each `SpanSegmentFetcher` reserves against its own
+  `MemoryBudget::unlimited()`.
+- **The SQL query path.** `build_sql_state` (`services/ravel-server/src/query.rs`)
+  constructs its metrics, logs, and span fetchers with `with_get_limiter` but
+  not `with_memory_budget`, so they reserve against their default unlimited
+  budgets too.
+
+The default is `MemoryBudget::unlimited()`, and no server task installs a finite
+budget yet, so the accounting is inert everywhere today. Wiring a finite,
+process-shared budget into both the PromQL `AppState` builder and `build_sql_state`
+(the seam `with_memory_budget` exists for) is the follow-up that makes it
+enforcing; until then the reservations below run but never refuse.
+
+Reservation sites, each taken **before** its GET, with the guard's lifetime
+tied to the buffer it accounts for:
+
+- **RSEG range fetch** (`SegmentFetcher::ensure_ranges`): the sum of the
+  coalesced run lengths, reserved once ahead of the concurrent GETs. The guard
+  is held by the `FetchedRegions` the runs fill, so it releases when those
+  region bytes drop.
+- **RLOG block-range fetch** (`BlockRangeFetcher`): the object size at the
+  `ObjectAssembler` that reassembles a covering read (the guard travels with
+  the assembled `Bytes`), and the summed range lengths ahead of the concurrent
+  GETs in `fetch_blocks` and `fetch_chunk_ranges`.
+- **RLOG / RSPAN whole-object fetch** (`whole_object_bytes`, and the RSPAN
+  `fetch`): the object size, with the guard attached to the returned `Bytes`.
+
+The guard is never released because a GET completed; it releases only when the
+buffer it accounts for drops.
+
+**Handoff.** When a fetched buffer is admitted to the read cache -- a consumer
+with its own byte ledger -- the reservation is marked handed off
+(`Reservation::mark_handed_off`) rather than released, so the transient overlap
+(both ledgers holding the same bytes) stays visible until this guard drops.
+Buffers returned across the crate boundary to a consumer that reserves under its
+own ledger (the SQL scan's `try_grow`) instead carry their guard inside the
+returned `Bytes`; that guard releases when the consumer drops the bytes, so the
+fetch reservation and the consumer's reservation coexist for the buffer's life
+with no double-free.
+
+**Refusal.** When the budget cannot cover a reservation the fetch fails with a
+typed `FetchMemoryExhausted { requested, reserved, limit }` (on each fetcher's
+error enum), mapped onto the query error path. The refusal carries only byte
+counts -- never an object key or tenant identity -- and is never a smaller fetch
+or a partial result: no GET is issued for the refused bytes, and the budget is
+left unchanged. This holds before any GET for the RSEG range, whole-object, and
+block-range object-assembly reservations. The transient summed-run
+reservations in `fetch_blocks`/`fetch_chunk_ranges` are taken after the probe
+and directory-section GETs, so a refusal there aborts a read that has already
+issued those GETs.
+
 ## Endpoints (Prometheus compatibility subset)
 
 - `POST/GET /api/v1/query` (params: query, time, timeout) instant.
@@ -657,6 +770,252 @@ resolution limit), wall deadline (server maximum, default
 server maximum are clamped to it. Exceeding a budget returns a
 Prometheus-style error, never a partial silent result.
 
+### Process-wide memory budget (ADR-1170)
+
+`ravel-server` derives one process-wide ceiling, `memory_budget_bytes`, at
+startup: cgroup-capped effective memory (`/proc/meminfo`'s `MemTotal`, capped
+by the cgroup v2 `memory.max` or v1 `memory.limit_in_bytes` when the process
+runs under a finite one) minus a fixed 2 GiB overhead reserve for the
+allocator, thread stacks, and everything outside this accounting. It is
+`u64::MAX` (unlimited, source `fallback`) when memory cannot be read, never
+`0`: "we could not measure the host" means no trustworthy ceiling can be
+derived, which is unlimited, not the tightest possible ceiling (see
+ADR-1170's 2026-09-07 amendment). A `0` budget here would build a
+`MemoryBudget::new(0)` that refuses every real reservation while a no-op
+query still answers, so the process looks healthy and then fails every
+non-trivial query permanently.
+
+Two things are carved from `memory_budget_bytes`, not from raw effective
+memory: the fetcher (RSEG) read cache takes 25%, and the catalog byte cache
+takes a separate 5%. Rebasing both onto the budget instead of raw memory
+keeps the percentages meaningful once the reserve is subtracted; deriving
+25% of raw `MemTotal` on a host that is mostly cgroup-limited would size the
+cache against memory the process can never actually use. Neither percentage
+is taken on the unmeasured-memory path: a share of an unknown total is not a
+number, so when memory cannot be read each cache falls back to a flat
+compiled-in 256 MiB (`268435456`) rather than carving from the `u64::MAX`
+budget above. An explicit `--cache-max-bytes` bounds both caches at that one
+value on either path. Whatever remains
+after both carves (`memory_budget_bytes` minus the sum of the two resolved
+cache ceilings) sizes a single shared `ravel_memory::MemoryBudget`
+accountant, one instance per process, that the SQL executor's per-tenant
+memory accountants all reserve against. Startup **refuses** to start, rather
+than silently clamping, when the two resolved hard caps together leave no
+strictly positive remainder of `memory_budget_bytes` -- caps at or above the
+budget, not only strictly above it (see ADR-1170's 2026-09-07 amendment): a
+remainder of exactly `0` is exactly as unusable as a negative one, since it
+builds the same refuse-everything `MemoryBudget::new(0)`. A typed
+`MemoryBudgetExceeded` error names both figures so the fix is in the error
+message: lower `--cache-max-bytes`, or, when the budget itself derived to
+`0` (the host's effective memory is at or below the overhead reserve, and no
+value of that flag can satisfy the check), give the process more memory or
+raise its cgroup memory limit.
+
+`--disable-cache` is outside that check entirely. It builds neither cache, so
+neither resolved ceiling holds any memory: the hard-caps figure is `0`
+regardless of `--cache-max-bytes`, the remainder is the whole budget, and
+startup never refuses. That is what keeps the flag usable as the remedy the
+caching guide names it as, and it is the one path that can start with a
+remainder of `0`: a container whose effective memory is at or below the 2 GiB
+overhead reserve derives a `0` budget, which no flag can raise. Startup logs a
+WARN there rather than refusing, because such a process still ingests; every
+query that reserves memory is refused for as long as it runs that way.
+
+This derivation runs once, at process startup, from the host profile
+observed at that moment. There is no runtime budget re-derivation: the
+ceiling never grows to match a host whose memory changed, and a reservation
+refused against it is never retried against a larger budget computed later.
+What a breach does depends on which of the two reservation paths took it.
+`try_reserve` is fallible: a reservation that would push the counter past the
+ceiling is refused and the caller handles the error. DataFusion's own memory
+pool `grow` is infallible and maps onto `reserve_unchecked`, which adds to
+the counter without checking it against the ceiling, so that path can
+allocate past the budget before the next `try_reserve` reports the breach;
+what bounds it is the overhead reserve, not a refusal. If the container's
+cgroup limit changes while the process is running, the process does not
+notice; only a restart re-derives the budget.
+
+The ceiling is process-wide, not per-tenant, so a breach cascades across
+tenants: once any one tenant's infallible `grow` (DataFusion's own memory
+pool, adapted onto the same counter) pushes the shared counter above the
+ceiling, every OTHER tenant's next reservation -- including a 1-byte one --
+is also refused, until the first tenant releases enough for the counter to
+fall back under the ceiling. This is faithful to the design (one shared
+counter, one infallible `grow` path), not a separate defect; see ADR-1170's
+2026-09-07 amendment for the full mechanism and its acceptance-measurement
+consequence.
+
+The `/metrics` endpoint exposes the budget's current state as three gauges,
+unconditionally in every mode: `ravel_memory_budget_bytes`,
+`ravel_memory_reserved_bytes{component="sql"|"fetch"}`
+(bytes currently reserved against the budget, split by which side reserved
+them), and `ravel_memory_handoff_overlap_bytes` (the bytes a handoff between
+components would double-count in the budget's accounting window; inactive,
+always `0`, until fetch handoff accounting reaches this budget).
+
+`ravel_memory_budget_bytes` is the ceiling of the shared accountant, which is
+the POST-carve remainder: the startup log's `memory_remainder_bytes`, not the
+`memory_budget_bytes` it is named after. Both figures appear in that log, and
+on the 30 GiB reference host they differ by 9.0 GB, so a dashboard comparing
+the gauge against the pre-carve line will find bytes it cannot account for.
+The gauge reads `u64::MAX` (unlimited) on the fallback path, which is any host
+where memory could not be read, whatever `--cache-max-bytes` was set to: that
+clamp keys off the budget's source alone, so an explicit cap on an unmeasured
+host still renders unlimited here while the real ceiling behind it is
+`u64::MAX` minus the two caps.
+
+`component="fetch"` always reads `0` today: only the SQL
+executor's per-tenant accountants reserve against this budget. The fetchers
+do have their own reservation and handoff accounting, but the server wires
+none of them to this instance, so neither gauge can move until that wiring
+lands. `component="sql"` is correspondingly the budget's whole reserved
+total rather than a component's share of it; the two coincide only while SQL
+is the sole reserver, and the split becomes real, rather than a relabelling,
+when decision 2 lands. Both are an honest gap rather than a bug: they exist now so a
+dashboard built against them does not need to change shape once the fetch
+layer starts reserving here.
+
+### Catalog resolve GET concurrency
+
+Before a query can fetch a single segment, the catalog must resolve which
+segments exist for the requested tenant, signal, and time range:
+`Catalog::resolve_impl` lists shard-hour prefixes and then GETs the
+commit/compaction records those listings name. This is a separate phase
+from, and a separate knob from, the fetch-phase `GetLimiter` described
+below: resolve happens first and touches catalog metadata, fetch happens
+second and touches segment data.
+
+`CatalogConfig::resolve_get_concurrency` bounds how many of these listing
+and record-GET requests one `Catalog` instance keeps in flight at once, via
+a per-instance `tokio::sync::Semaphore`. It defaults to 128 and is rejected
+at construction time (a typed `CatalogError::InvalidConfig`, never a silent
+clamp to 1) if configured to `0`, since a zero-permit semaphore would
+deadlock every resolve, or above `MAX_RESOLVE_GET_CONCURRENCY` (4096), because
+nothing past that is a sane operator value: at roughly 30 ms per round it is
+about 136,000 GET/s, twenty-five times S3's per-prefix guidance, so a larger
+number is a typo, not a setting. Tokio's own ceiling
+(`Semaphore::MAX_PERMITS`, `usize::MAX >> 3`) is far above it and is not what
+the bound exists for. `ravel-server`
+exposes it as
+`--catalog-resolve-concurrency`; unset, the catalog's own default applies.
+
+The default was raised from a fixed 16 after measuring against real S3 on a
+10,000-record unsealed tail (one cold resolve each; every level below
+issues the same 10,001 GETs and 13 LISTs, so the difference is entirely
+concurrency, not request count):
+
+| Concurrency | Wall time |
+|---|---|
+| 16  | 23.157s |
+| 64  | 4.374s  |
+| 128 | 2.341s  |
+
+The basis for 128: a measured S3 GET round trip of about 30ms means 128
+requests in flight sustain roughly 128 / 0.030s ~= 4,300 GET/s, comfortably
+under S3's published guidance of about 5,500 GET/s per prefix, and every
+request this phase issues lands under one `m/c/<shard>/<hour>/` prefix per
+shard-hour.
+
+This bounds one `Catalog` instance, not the process: `ravel-server` builds
+exactly one `Catalog` and shares it (an `Arc` clone per request, one
+underlying `request_semaphore`), so N concurrent queries against that
+instance are capped at 128 in flight TOTAL, not `N * 128`. `N * 128` in flight
+holds only across N distinct `Catalog` instances (separate CLI invocations
+or tests), never within one running server. A process-wide cap across
+instances is not implemented and is tracked as a follow-up.
+
+### GET concurrency (ADR-1195)
+
+The "max concurrent GETs (8, ...)" figure above is the ceiling for the
+fetchers one `QueryEngine` owns, not a per-selector one. Inside an engine the
+RSEG `SegmentFetcher`, RLOG's `LogSegmentFetcher` (both its own whole-object
+funnel and the `BlockRangeFetcher` it delegates to above the block-range
+threshold), and the RSPAN `SpanSegmentFetcher` draw their GET permits from
+one shared `ravel_query::GetLimiter`, an `Arc`-based wrapper over a
+`tokio::Semaphore`. `QueryEngine::new` builds this limiter once and hands
+the same `Arc` to the fetchers it owns; `QueryEngine::with_get_limiter`
+replaces it on all of them at once, so a process can share one ceiling
+across several engines.
+
+Every RLOG GET a `LogSegmentFetcher` issues takes a permit, on both paths.
+The fetcher holds its own `GetLimiter` for its whole-object funnel
+(`fetch_accounted` and `whole_object_bytes`, taken by every object at or
+below the block-range threshold) in addition to the one it hands to its
+internal `BlockRangeFetcher`; `with_get_limiter` sets both to the same
+`Arc`, and `with_block_range` re-applies the fetcher's current limiter to a
+replacement `BlockRangeFetcher` so builder order cannot drop it. For a
+standalone fetcher (one that no `QueryEngine` owns), `with_max_concurrent_gets(n)`
+builds exactly this dual-path arrangement itself: one private `GetLimiter` of
+`n` permits, shared by the whole-object and block-range paths, bounding both
+until a later `with_get_limiter` call replaces it. Which limiter that is
+depends on who built the fetcher: the RLOG fetcher a `QueryEngine` owns
+draws from the engine's shared limiter, sized by `store_get_concurrency()`;
+a standalone one keeps its private limiter until `with_get_limiter` replaces
+it. `ravel-server` makes that replacement on every fetcher it builds,
+including the standalone RLOG fetcher of its SQL path (`build_sql_state`),
+so inside the server process every RLOG GET, whole-object or ranged, draws
+from the one process-wide limiter described next. The stock ClickBench path
+runs through that SQL fetcher and is therefore bounded by
+`--store-get-concurrency`.
+
+Before ADR-1195, each fetcher held its own independent semaphore, so N
+fetchers each configured to "8 concurrent GETs" could together put 8N GETs
+in flight against the store; the shared limiter closes that multiplication
+for the fetchers it reaches.
+`SpanSegmentFetcher` previously had no GET bound at all -- constructing one
+directly now gives it a private limiter sized to the fetcher module's
+default concurrent-GET constant, its first-ever concurrency bound, unless
+`with_get_limiter` wires it to the shared one instead.
+
+The ceiling is process-wide, not per engine: `ravel-server` builds exactly
+one `Arc<GetLimiter>` where it assembles its shared state and hands that same
+`Arc` to every fetcher- and engine-construction site in the process (the
+PromQL query path, the SQL executor's three fetchers, the distributed
+fragment path, cache warming, exemplars, and alerting), via `with_get_limiter`
+on each. No fetcher in the server process owns a private limiter.
+
+`EngineConfig::fetch_concurrency` remains the legacy uniform knob: a bare
+`EngineConfig::default()` (or any config that leaves the three knobs below
+unset) resolves to the same numeric values as before ADR-1195, because
+splitting the knob changes which lever an operator turns, not the numbers an
+untouched deployment resolves. What does change for an untouched deployment
+is the aggregate: the fetchers now draw on one process-wide limiter where
+each used to hold its own, so the in-flight GET ceiling is one value for the
+process rather than that value per fetcher (the CHANGELOG entry for ADR-1195
+names the two paths whose behaviour this moves). Three `Option<usize>`
+overrides on `EngineConfig` take precedence
+over it when set, each resolved through a same-named accessor method:
+
+- `store_get_concurrency` / `store_get_concurrency()` -- the resolved
+  permit count for the one shared `GetLimiter` described above.
+- `sql_partition_count` / `sql_partition_count()` -- DataFusion
+  `target_partitions`, read at `crates/ravel-sql/src/session.rs`.
+- `promql_fetch_fanout` / `promql_fetch_fanout()` -- the `buffer_unordered`
+  fan-out width PromQL's per-selector fetch streams use.
+
+`ravel-server` exposes these as `--store-get-concurrency`,
+`--sql-partition-count`, and `--promql-fetch-fanout` (each unset derives from
+host cores like `--fetch-concurrency` always has). `--fetch-concurrency`
+still sets all three together (source `legacy-flag` in the startup log);
+combining it with any of the three, or passing `0` to any of the four, is a
+startup error naming the offending flag(s), raised before any fetcher,
+engine, or SQL session is constructed. See
+`docs/guides/operations/configuration.md` for the operator-facing flag
+reference.
+
+The permit bounds GETs in flight, not fetch tasks in flight. An RLOG
+block-range read builds its object assembler (charged to the assembly pool)
+before its first extent asks the limiter for a permit, so when
+`promql_fetch_fanout` or `sql_partition_count` exceeds `store_get_concurrency`,
+up to that many object-sized assemblies can wait behind the limiter at once.
+Peak assembly memory therefore follows the fan-out setting, and an operator
+who raises fan-out without raising GET concurrency trades store pressure for
+memory, not for nothing.
+
+`EngineConfig::validate` rejects zero on `fetch_concurrency` and on each
+knob's resolved value (an explicit override of `0`, not just an unset one),
+naming the specific knob in the returned `EngineConfigError`.
+
 ### Segment admission (ADR-0073)
 
 `max_segments` no longer counts every segment in the resolved snapshot. A
@@ -665,9 +1024,17 @@ token-resolved via an explicit `min_commit_token`) and `max_segments` applies
 to the sealed count only; recent and token-resolved segments are exempt, so a
 hot tenant's open hour and a read-your-write query no longer 422 on count.
 Their cost is bounded instead by a per-query S3 request budget
-(`EngineConfig::max_s3_requests`, default 25,000), checked incrementally at
-the same points `max_bytes_scanned` already is, and reported as
-`RequestBudgetExceeded` (HTTP 422) when tripped.
+(`EngineConfig::max_s3_requests`, derived from the deployment's shard count
+and ingest flush cadence by `derive_max_s3_requests` rather than a flat
+constant -- ADR-0075 decisions 1-2; the derived default is 15,800 at the
+default 4 shards and the 2s flush cadence ADR-0076 decision 4 sets), checked
+incrementally at the same points `max_bytes_scanned` already is, and reported
+as `RequestBudgetExceeded` (HTTP 422) when tripped. A running server does not
+use the `DEFAULT_BUDGET_REFERENCE_SHARDS` (4) and
+`DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY` (500ms) reference pair that
+`EngineConfig::default` carries for context-free callers (tests, alerting,
+other non-server callers); that pair derives 48,200, which is not the
+deployment default.
 
 `crates/ravel-query/src/segment_admission.rs` is the one seam both checks go
 through: `admit(&snapshot, &origins, &config)` for the sealed-count check,
@@ -824,6 +1191,145 @@ output size: every matched series in every matched segment is still fully
 fetched and SoA-decoded before the merge runs, so peak fetch/decode memory
 scales with the query's matched input, not with `max_samples`.
 
+## Per-request budgets (ADR-1374)
+
+Every budget above is a server ceiling, configured once at startup and the
+same for every request. A caller that knows its own query is cheap, or that
+wants a cheap query to fail fast rather than run long, can tighten those
+ceilings for one request through `ravel_query::RequestBudgets`:
+
+```rust
+pub struct RequestBudgets {
+    pub max_bytes_scanned: Option<ByteLimit>,
+    pub max_store_requests: Option<RequestLimit>,
+    pub max_segments: Option<usize>,
+}
+```
+
+`RequestBudgets::clamp(&EngineConfig)` returns the `EffectiveBudgets` a
+request actually runs under. It can only lower: a value above the server
+ceiling yields the ceiling, `Unlimited` cannot lift a bounded ceiling, and
+`None` (for one field or for the whole struct) yields the ceiling unchanged.
+This is the same rule the `timeout` parameter already follows for the wall
+deadline, and it is what makes the budgets safe to accept from a request
+body: the worst a caller can do to the server is ask for less.
+
+`max_store_requests` is the wire name for the ceiling
+`EngineConfig::max_s3_requests` holds. The two names differ deliberately.
+The config field keeps its name because renaming a frozen operator-facing
+knob is a breaking change with no benefit; the wire name drops the `s3`
+because a caller of a request API is not addressing a specific object-store
+implementation, and the field name is a contract a client can hard-code. A
+serde test pins the three serialized names, so a rename fails there rather
+than at a client.
+
+Enforcement adds no new check. The three effective values are substituted
+into a scoped copy of the engine configuration, so `segment_admission::admit`,
+`request_budget_exceeded`, and the three bytes-scanned check sites read the
+lowered numbers through the same fields they already read. A tripped
+per-request budget is the same typed error as a tripped server ceiling
+(`TooManySegments`, `RequestBudgetExceeded`, `TooManyBytesScanned`, all HTTP
+422), never a truncated result. The store-request budget is checked once
+right after catalog resolution and then again at every fetch boundary, so a
+resolve alone can trip a lowered budget even when the resolved snapshot has
+no segments left to fetch.
+
+On the PromQL side, `QueryEngine::instant_with_budgets`,
+`range_hist_with_budgets`, and `resolve_series_with_budgets` are the entry
+points that take `Option<&RequestBudgets>`; passing `None` is exactly the
+pre-existing method. On the SQL side, `SqlRequest::budgets` carries them.
+
+Enforcement on the SQL side is not yet uniform across the five tables, and a
+caller has to know which knob binds where. The effective `max_store_requests`
+ceiling IS checked for every target signal, once, immediately after
+`resolve_admitted`'s catalog resolve: a caller cannot finish a query above a
+lowered request budget on any of the five tables merely because its snapshot
+resolved empty. `max_segments` is enforced the same way, on the same shared
+resolve, via `segment_admission::admit`.
+
+What is not yet uniform is INCREMENTAL, scan-time enforcement. Only the
+`samples` (metrics) provider re-checks the running total against
+`max_bytes_scanned` and `max_store_requests` as it fetches segments (scan.rs);
+the `logs`, `spans`, `alerts`, and `audit` providers do not. A lowered request
+budget on one of those four tables therefore only ever traps once, at resolve,
+never again as the scan itself keeps issuing GETs. The byte budget fares
+worse: `max_bytes_scanned` is not consulted at all for those four tables,
+neither at resolve nor during the scan. This is a pre-existing gap in the
+providers, not something the per-request budgets introduced; enforcing the
+lowered byte budget, and the request budget's incremental scan-time re-check,
+on the `logs`, `spans`, `alerts`, and `audit` providers is tracked as
+follow-up work and is not implemented yet, and is out of scope here.
+
+### The agent query knobs on `SqlRequest` (ADR-1374)
+
+Three request fields exist for a caller that composes SQL on someone else's
+behalf. All three default to the values that reproduce the shipped behavior,
+and the HTTP surface (`ravel-server`'s `build_request`) sets exactly those
+defaults, so an HTTP query is unaffected by any of them.
+
+`row_window: bool` applies the request's own time window as a row filter,
+not only as the segment-listing bound. Segment pruning is widen-only, so a
+segment overlapping the window contributes every row it holds; a statement
+that carries no time predicate of its own therefore returns rows outside the
+window the caller asked for. With `row_window` set, the executor inserts
+`<ts_col> >= window.start_ns AND <ts_col> < window.end_ns` directly above
+each table scan in the unoptimized logical plan, on that table's event-time
+column: `ts` for `samples` and `logs`, `start_ts` for `spans`, `ts_ns` for
+`alerts` and `audit`. The rewrite happens before optimization, where the
+scan carries no projection, so the column is always in scope, and `Filter`
+preserves the schema, so the result schema is unchanged. The rewrite runs
+inside the attempt, so it survives the snapshot retry.
+
+The two bounds the one `window` drives are deliberately different.
+`ravel_types::TimeRange` is **closed**, `[start_ns, end_ns]`, and that is the
+bound `Catalog::resolve` prunes segments on; a listing bound may only widen,
+so an inclusive end can never drop a segment that holds a matching row. The
+row window is **half-open**, `[start_ns, end_ns)`, per ADR-1374 decision 4,
+because a row bound must be exact and adjacent windows must not both claim
+the instant on their shared edge. One consequence follows directly and is
+not a defect: a request whose `start_ns` equals its `end_ns` lists the
+segments covering that instant and, under `row_window`, returns zero rows.
+
+The traversal that plants the filter descends into subqueries embedded in
+expressions (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`) as
+well as into plan children, so every `TableScan` in the statement is
+filtered, including the scans of CTEs, set operations, self-joins, and a
+`WHERE` clause's own `SELECT`. Filtering only the outer scan would answer
+`SELECT ... WHERE value > (SELECT avg(value) FROM samples)` from an average
+over rows the caller excluded.
+
+The optimizer then pushes the injected predicate down exactly as it pushes
+one the statement itself carried, so **pruning tightens**: the provider is
+offered a filter it would not otherwise have seen, and it may skip segments
+and blocks the bare statement would have read. That is sound rather than a
+correctness risk because every provider reports `Inexact` for the filters it
+accepts, so DataFusion re-applies the predicate above the scan; a segment
+straddling the window is still read whole and cut by row. `SqlStats::
+window_predicate` reports the applied predicate as the display of the
+expression that was actually planted, so the reported text cannot describe a
+different filter than the one that ran.
+
+`max_rows: Option<usize>` stops the stream once `max_rows + 1` rows have
+been emitted. The extra row is deliberate: it is what distinguishes "this is
+the whole result" from "this result was cut", reported as
+`SqlStats::row_cap_hit`. The service layer above trims it. Stopping early
+drops the inner stream on the existing cancellation path, so memory
+reservations release exactly as they do at a normal end of stream.
+
+`SqlExecutor::explain` validates, resolves, admits, computes the effective
+schema (declared typed columns included), runs the cost estimator, and
+renders the physical plan, without opening a single data object. It reports
+the target table, that schema, the resolved/admitted/recent-exempt segment
+counts, the `CostEstimate`, the row-window predicate it would apply, and the
+plan text. Where the estimator cannot bound a component for the target it
+names that component in `unbounded_components` rather than reporting a
+structural zero a caller would read as a real estimate of zero:
+`estimated_decompressed_bytes` is unbounded for the RLOG- and RSPAN-backed
+tables, whose funnels never call the decompressor the metrics estimate
+counts. The plan is physical, not logical, because the shapes worth linting
+(which columns a TopK's input scan decodes, whether a repartition fans the
+final aggregate out) exist only after physical planning.
+
 ## Intra-cluster read fan-out (ADR-0071)
 
 Within one cluster, a read can be spread across peer query nodes so more than
@@ -962,9 +1468,13 @@ absence-of-output-sample contract the raw path already has.
 This is the engine-level (queryfrag) fetch, merge, and federation machinery for
 all five signals, shipped and covered by the per-signal differential, erasure,
 skew, and federation tests. The coordinator caller that actually dispatches a
-Logs/Alerts/Audit/Spans distributed *search* is the SQL surface (log and trace
-search runs through the `logs`/`alerts`/`audit`/`spans` tables, not PromQL); the
-PromQL engine's own fetch/federation flow drives `Signal::Metrics` only today.
+Alerts/Audit/Spans distributed *search* is the SQL surface (trace search runs
+through the `alerts`/`audit`/`spans` tables, not PromQL); logs are reachable
+both ways, through the `logs` SQL table and, since ADR-1103, through the
+PromQL engine's own fetch flow (see "Log selectors" above) -- but that PromQL
+log lane is coordinator-local only. The PromQL engine's federation half still
+drives `Signal::Metrics` only today: a log selector is never federated
+(ADR-1103 decision 5).
 The SQL-lane distributed scan that drives that log and trace search is a
 separate step, and it exists only in a `flight-sql` build, which the published
 image is; see "The SQL-lane distributed scan" below.
@@ -1052,6 +1562,47 @@ that flag the service runs every statement whole-set on the coordinator.
 
 The whole seam sits behind the `flight-sql` cargo feature. The published image
 builds that feature; a source build reaches this code only by asking for it.
+
+#### The metrics SQL lane's failure sequence
+
+This part is the metrics SQL scan (`DistributedScanExec`,
+`crates/ravel-sql/src/distributed.rs`), not the `DistributedSliceScanExec` the
+rest of this section describes: the log/trace scan still propagates a worker
+error straight out of its partition stream.
+
+A heartbeat live-set keeps a dead worker registered for `3 * H`, so a slice can
+be assigned to a location whose process is gone. Each metrics slice therefore
+runs the same three steps the queryfrag lane runs
+(`DistributedScanExec::execute`): the
+assigned worker, EXACTLY ONE re-dispatch to another location in the endpoint
+list, a coordinator-local read of the same slice ticket, then a typed
+`SqlError::Execution` naming the last cause. Never a partial merge.
+
+The local step runs `RavelTableProvider::worker_fragment` over the ticket's
+pinned segments -- the same plan `SqlExecutor::worker_fragment_stream` serves a
+remote fetch from, against the same object store -- so a successful local read
+is byte-identical to the remote result it replaces. Its store spend is folded
+into the query's own phase accounting by the scan, not counted a second time as
+wire bytes.
+
+A step is taken when the previous one fails either at construction
+(`WorkerSliceClient::fetch_slice` returns `Err`) or on the FIRST POLL of its
+stream, which is where a lazily-dialed channel surfaces a refused or reset
+connection and therefore where a dead worker usually appears. Every attempt is
+probed for its first batch before the partition emits anything, so both shapes
+are caught; a failure *after* the first batch is not re-dispatchable and
+surfaces typed, because restarting the slice would feed the coordinator's
+`SortPreservingMergeExec` a second, out-of-order run of the same rows.
+`SliceFallbackCounters` counts the steps per query, split so a re-dispatch to
+another worker and a coordinator-local read are never pooled into one figure.
+
+Two things this lane does not have, and the queryfrag lane does: rendezvous
+placement (slice `k` goes to roster entry `k % len`) and a quarantine map (a
+dead location is retried by the next statement rather than skipped). Both need
+state shared with the PromQL router. The roster itself already excludes the
+coordinator's own endpoint, which the fleet live-set otherwise always contains:
+the coordinator serves its own slices through the local path, so dispatching one
+to itself over Flight would be a wasted hop.
 
 ### Budgets and the fault matrix
 
@@ -1156,6 +1707,26 @@ service, and the distinction is a security invariant, not an optimization:
 
 `RemoteClusterConfig`'s `Debug` is hand-written to print `credential:
 <redacted>` so a config dump never leaks the operator secret.
+
+The `Resolve` credential authorizes one tenant's data on the remote, so it
+belongs to **one local tenant**: `RemoteClusterConfig::tenant` names it, and
+`Federation::fetch` selects a remote by the caller's `TenantHash` before
+dispatching anything. A query from any other local tenant presents no
+credential and receives no remote series; a local tenant no remote names runs a
+fully local query, reported complete rather than partial, because a remote it
+holds no credential for is outside its query rather than missing from it. Two
+local tenants sharing a remote endpoint is two `RemoteCluster` entries, each
+with its own credential.
+
+An entry with `tenant: None` is unkeyed and reachable by every local tenant.
+That is the shape of a deployment written before the mapping existed, and it is
+safe only where the coordinator runs queries for one local tenant, so
+`ravel-server` refuses one at startup whenever it runs queries for more than
+one. That covers a second `--tenant-token` tenant, a dynamic resolver, and an
+`--alert-rules-file` naming a tenant no token does, because the alert evaluator
+queries the same federated engine. The operator guide states which
+configurations that covers:
+docs/guides/distributed-query.md.
 
 ### Partial coverage is always surfaced, never silent
 
@@ -1266,11 +1837,12 @@ It is recorded at existing funnels only, never at scattered call sites:
   `series_matched`.
 - `LogSegmentFetcher::fetch_accounted` (crates/ravel-query/src/
   log_fetcher.rs), so the log path is accounted like the metric path
-  instead of being silently free. `engine.rs` references
-  `LogSegmentFetcher` nowhere; the production callers are ravel-sql's, and
-  they take the accounted funnels: `logs_scan` through
-  `scan_accounted_with_tenant` and `scan_accounted_with_tenant_subset`,
-  `alerts_scan` and `audit_scan` through `fetch_accounted_with_tenant`.
+  instead of being silently free. `QueryEngine::new` (engine.rs) builds
+  the `LogSegmentFetcher` it owns and wires it to the engine's shared
+  `GetLimiter`; the production SQL callers reach the tenant-aware accounted
+  funnels: `logs_scan` through `scan_accounted_with_tenant` and
+  `scan_accounted_with_tenant_subset`, `alerts_scan` and `audit_scan`
+  through `fetch_accounted_with_tenant`.
   The plain `fetch` remains for callers that pass no accounting handle.
 - `Catalog::guarded_get`/`guarded_list_all` (crates/ravel-catalog), for
   every catalog-side store call `Catalog::resolve` makes on the query's
@@ -1349,10 +1921,15 @@ change outside this crate:
   writes, so these three keep taking a plain `&QueryAccounting` and are
   `scan` phase by construction instead, documented at each call site.
 
-`ravel-sql`'s `SqlExecutor` builds its own `QueryAccounting` per attempt
-(`SqlOutcome.accounting`) entirely inside that crate, so the phase split
-does not reach `ravel-bench`'s `sql_latency_bench` report: doing so needs
-a `ravel-sql` change outside this crate.
+`ravel-sql`'s `SqlExecutor` builds its own `PhaseAccounting` per attempt
+too: `SqlOutcome.phase_accounting` is the same split,
+`SqlOutcome.accounting` its `.pooled()` counterpart, and `SqlOutcome.io_shape`
+the SQL-side `QueryIoShape` (`sql_io_shape`, `executor.rs`). It is rendered
+on `/api/v1/sql`'s JSON response the same way (see "JSON response shape"
+below), but the split still does not reach `ravel-bench`'s
+`sql_latency_bench` report, which reads only the pooled totals; wiring the
+bench report to the split would need a `ravel-bench` change outside the
+scope that added the rendering.
 
 ### Pre-execution cost estimate
 
@@ -1510,6 +2087,38 @@ sequence issued (probe, directory sections, coalesced candidate-block
 ranges) and the bytes they moved, again zero when every extent was a cache
 hit.
 
+On the log-signal path `decompressed_bytes` is the bytes zstd produced on
+the RLOG scan and plan paths, both whole-object and ranged: the directory
+sections the scan reader opens (`RlogReader::new` over STREAM_DIR, FIELD_DIR,
+SKIP_IDX, PAGE_DIR) plus every block page the scan decodes plus, for a
+postings-eligible arm, the one POSTINGS term block
+`PostingsSection::probe_accounted` decompresses to resolve it, and, on the
+plan path, the SKIP_IDX/FIELD_DIR a selective query decompresses to count
+survivors. A section stored raw contributes nothing; a zstd one contributes
+its decompressed output's actual length. It is zero on a query that opens no
+RLOG section, and, unlike the wire-byte counters, it does not fall to zero on
+a warm cache: a scan served entirely from the fetcher cache still decompresses
+what it decodes, which is what makes this the figure that attributes a warm
+run's engine time.
+
+A decode charges no phase tag of its own: it adds to whichever
+`QueryAccounting` handle its caller passed in, the same handle that read's
+wire bytes are already charged against. The scan reader's own directory
+decode lands on the `scan` phase handle (folded once at scan exhaustion by
+`LogSegmentScan::finish`); a plan-phase survivor-count decode lands on the
+`plan` handle. An above-threshold ranged fetch decodes SKIP_IDX itself (and,
+on a version-4 object, PAGE_DIR) to resolve candidate blocks and their pages
+before the scan reader opens the fetched buffer and decodes every directory
+section again to build its own indices, so the ranged path's figure counts
+SKIP_IDX and PAGE_DIR twice: once for locating the blocks before the buffer
+exists, once for opening the reader over what was fetched. Both decodes are
+real zstd work the query paid for. The whole-object path never separately
+decodes a directory section before the scan reader opens it, so it carries no
+such double count. A stream-attribute-equality query's STREAM_DIR resolution
+(`LogSegmentFetcher::matching_streams`/`fetch_stream_dir`) decompresses the
+same way, on whichever handle its own caller passed in. Spans (RSPAN) do not
+yet report decompressed bytes.
+
 Span fields otherwise carry only bounded values: `tenant_hash` as a hex
 string, `object_size`, matcher/series counts, and fixed-set kind strings
 (`page_kind`, `eval_kind`), never query text, label values, object keys,
@@ -1527,10 +2136,13 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `cacheMisses`/`cacheBytes`, `decompressedBytes`, `segmentsOpened`,
   `seriesMatched`, `bytesReused`, `peakIntermediateBytes`, and the
   pre-existing per-run `rawF64Pages`/`rawF64Bytes`. No `segmentsPruned`
-  here: `stats.segmentsPruned` (below) is the sole source, sourced from
-  `Catalog::resolve`'s own count; `QueryAccounting`'s own
-  `segments_pruned` counter has no caller in `ravel-query` or
-  `ravel-catalog` and would only ever render 0.
+  here: `stats.segmentsPruned` (below) is the sole source. For the metrics
+  lane it is `Catalog::resolve`'s own postings-pruning count. For the log
+  lane it comes from the lane itself: a segment that any plan fetched (it
+  passed the time-window and stream-directory checks) counts once as
+  fetched, and `segmentsPruned` is the rest of the resolved snapshot. The
+  log lane's catalog resolve passes no name filter, so it prunes nothing
+  of its own.
 - `stats.estimate`: the `CostEstimate`, carrying `estimatedRequests`,
   `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
   `series`.
@@ -1564,6 +2176,257 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   read as a measurement rather than an absence (ADR-0927 decision 7):
   `s3HeadRequests`/`s3HeadBytes`, `s3ListBytes`, and
   `peakIntermediateBytes` (SQL executor only).
+
+**`/api/v1/sql`'s JSON response** carries `stats.phases` and
+`stats.io` alongside its own pre-existing `stats.accounting`/`stats.estimate`,
+with the identical field names, `QueryPhase::ALL` ordering, and
+per-phase/per-figure semantics described above, populated from
+`SqlOutcome::phase_accounting`/`SqlOutcome::io_shape`. The rendering itself
+(`crates/ravel-sql/src/stats_json.rs`) is independently built from the same
+public `phase_accounting`/`io_shape` types rather than reusing this crate's
+`http::json` module, which is private to it. The Arrow-IPC encoding of
+`/api/v1/sql` carries no `stats` object at all (unchanged: it never carried
+`stats.accounting`/`stats.estimate` either), and Flight SQL constructs no
+`SqlOutcome` and has no stats envelope to extend, so neither surface renders
+`stats.phases`/`stats.io`.
+
+### I/O dependency shape
+
+`stats.phases` above answers "how many requests and bytes did each phase
+spend." It cannot answer a different question: how many of those requests
+had to run one after another because a later stage needed an earlier
+stage's bytes to know its own keys, versus how many ran in one concurrent
+round. **Dependency depth and phase cost are different dimensions**: a
+query can be cheap by `stats.phases` (few requests, few bytes) and still be
+slow because its requests chain, and a query can be expensive by request
+count and still be fast because every request ran at depth 1. Neither
+number predicts the other.
+
+`crates/ravel-query/src/io_shape.rs`'s `QueryIoShape` is recorded per query
+and rendered as `stats.io`, additive beside `stats.phases`:
+
+- `dependencyDepth`: the longest chain of object-store stages, across every
+  segment the query opened, where a stage needed a previous stage's bytes to
+  know its own keys. Four independent segment GETs report depth 1; a
+  footer-tail read that may need a dependent catalog fetch and a dependent
+  page fetch reports depth 4, an upper bound, not a single true value: this
+  crate cannot tell from `object_size` alone whether the footer-tail guess
+  covered the real footer in one GET or needed a `FooterOutcome::NeedRange`
+  chase for another GET before the dependent catalog and page fetches, so it
+  reports the worst case rather than risk understating the chain. Classified
+  structurally from each
+  segment's `object_size` against the fetcher's whole-object threshold (the
+  same size test `SegmentFetcher::open_segment` itself branches on), not
+  from a live per-request trace, matching `CostEstimate`'s existing
+  upper-envelope convention: a fully-cached large segment still reports its
+  structural depth, because the plan has that many dependent stages even
+  when a cache absorbs one. A segment with unknown size (`object_size == 0`)
+  also takes the footer-tail path, not the whole-object path, and reports
+  the same upper bound.
+- `listPageDepth`: serial LIST pages, recorded independently of
+  `dependencyDepth` because pagination (`Catalog::list_shard_hours`) and the
+  GET dependency chain are different object-store mechanisms with different
+  causes. Reported as the resolve phase's total LIST request count, an
+  upper-bound serial depth: this crate cannot see from here whether two
+  shards' LIST pages ran concurrently with each other or one after another,
+  only that they happened (`ravel-catalog` owns that fan-out; out of this
+  task's scope to change).
+- `serviceBatches`: a deterministic model figure for the serial service
+  rounds this query's per-segment fan-out needs, under a wave-synchronous
+  model of the nested fan-out. The metrics fetch is a NESTED fan-out with three levels of
+  admission, all of which bound the round count: an OUTER
+  `buffer_unordered(promql_fetch_fanout)` over distinct matcher plans
+  (`distinct_plans_by_matcher` in `crates/ravel-query/src/engine.rs`), which
+  admits at most `promql_fetch_fanout` plans at once, however many distinct
+  matcher sets the query has; each admitted plan's own INNER
+  `buffer_unordered(promql_fetch_fanout)` over that plan's segments
+  (`prefetch_metric_plans`/`fetch_all_samples_and_histograms`); and the one
+  shared `GetLimiter` described under "GET concurrency (ADR-1195)" above,
+  whose permit count is the resolved `store_get_concurrency` and which every
+  GET from every plan passes through regardless of which level admitted it.
+  In `ravel-server` that limiter is process-wide (one `Arc` shared by every
+  engine and fetcher), but this figure models only the PromQL plans of one
+  query: GETs that other queries, the SQL path, or the RLOG whole-object
+  funnel (which takes a permit too since ADR-1195) issue at the same time
+  compete for the same permits and are not counted here.
+  Within a single wave, that wave's own `batches_w` (defined below) is a
+  true lower bound: the OUTER `buffer_unordered`'s binding capacity for
+  that wave cannot service more than `capacity_w` requests per round, so
+  the wave cannot finish in fewer than `batches_w` rounds. But
+  `serviceBatches` sums `batches_w` across waves, and that sum is a model
+  figure, not a bound in either direction, because the OUTER
+  `buffer_unordered` is a SLIDING window, not a wave-synchronous one: as
+  soon as one admitted plan finishes, the next plan is admitted
+  immediately, without waiting for its siblings, so a later wave's work
+  can start -- and finish -- before an earlier wave's is done. Concretely, in the formula's own
+inputs: 18 distinct matcher plans of one segment each, an outer fan-out width
+of 17, and 16 shared permits. Wave 0 admits 17 plans, 17 requests against a
+capacity of `min(17 * 17, 16) = 16`, so `ceil(17 / 16) = 2` batches; wave 1
+admits the last plan, 1 request, 1 batch; the summed model reports 3. The real
+scheduler drains all 18 requests through the 16 permits in two rounds, because
+the last plan's request is admitted into the round that clears wave 0's one
+leftover request, so the model is one round too many. The same sliding
+  window can also undercount: modeling the whole query as wave-synchronous
+  in one shot -- one binding concurrency (`min(promql_fetch_fanout *
+  min(distinctMatcherSets, promql_fetch_fanout), sharedGetPermits)`)
+  dividing the total work (`segment_count * distinctMatcherSets` GETs) in a
+  single division -- undercounts whenever the outer window is not full for
+  the query's whole duration: 3 distinct matcher sets, 1 segment each,
+  `promql_fetch_fanout` 2, and 1000 shared permits gives peak capacity
+  `min(2 * 2, 1000) = 4`, so that single division reports `ceil(3 / 4) = 1`
+  round, but plans 1 and 2 admit together in the first round and plan 3
+  only after one of them finishes, in a second round -- the real schedule
+  So this figure is computed per WAVE of the outer fan-out instead: `waves
+  = ceil(distinctMatcherSets / promql_fetch_fanout)`; for 0-based wave `w`,
+  `active_w = min(promql_fetch_fanout, distinctMatcherSets - w *
+  promql_fetch_fanout)` plans are admitted, `capacity_w =
+  min(promql_fetch_fanout * active_w, sharedGetPermits)` is that wave's
+  binding concurrency, and `batches_w = ceil(segment_count * active_w /
+  capacity_w)` is its own serial round count, a true lower bound on that
+  wave in isolation; `serviceBatches` sums `batches_w` over every wave
+  (distinct matcher sets, not the raw plan count `stats.estimate` scales
+  by -- a query naming two `SelectorPlan`s that share one matcher set, `up + up offset 5m`, is fetched in one pass, so its `serviceBatches` does not
+  double). This sum is a deterministic model, not a bound: identical work
+  always produces the same number, which makes it comparable across
+  queries and useful for spotting a fan-out or permit-sizing regression,
+  but once more than one wave is involved the sum is neither an upper nor
+  a lower bound on the real scheduler's round count (see the 17-plus-1
+  counterexample above). 64 segments,
+  `promql_fetch_fanout` 8, two distinct matcher sets, and 16 shared permits:
+  one wave, `active_0 = 2`, `capacity_0 = min(16, 16) = 16`, `batches_0 =
+  ceil(128 / 16) = 8`. `promql_fetch_fanout` 1 with three distinct matcher
+  sets, 20 segments, and 1000 shared permits: three waves, each `active_w =
+  1`, `capacity_w = min(1, 1000) = 1`, `batches_w = ceil(20 / 1) = 20`,
+  summing to 60 -- not the 20 a single `min(1 * 3, 1000) = 3`-capacity
+  division would report, which would silently assume all 3 plans ran at
+  once when the outer stream never admits more than 1. A single-plan query
+  always has exactly one wave with `active_0 = 1`, reducing to
+  `ceil(segment_count / promql_fetch_fanout)`, since `min(promql_fetch_fanout,
+  sharedGetPermits)` is the fan-out width whenever the shared pool is at
+  least as large as one plan's own fan-out bound, as it is for any config
+  that leaves both ADR-1195 knobs unset (both then resolve to
+  `fetch_concurrency`). Lower `--store-get-concurrency` below
+  `--promql-fetch-fanout` and the limiter binds instead, for a single-plan
+  query too; this figure follows whichever bound is smaller.
+
+  `ravel-sql`'s `SqlExecutor::sql_io_shape` computes the identical
+  single-plan reduction, `ceil(segment_count / min(sql_partition_count,
+  sharedGetPermits))`, reading `sharedGetPermits` off the same process-wide
+  `GetLimiter` its three fetchers share with the PromQL path (`services/
+  ravel-server/src/query.rs` wires one `Arc<GetLimiter>` into all of them).
+  A SQL query resolves exactly one target signal per statement, so there is
+  no `distinct_plans`/wave concept to sum over here, only the single-plan
+  case above with `sql_partition_count` in place of `promql_fetch_fanout`.
+- `unfoldedSegmentsResolved`: the EXACT (never estimated) count of segments
+  this query's resolve took from the recent (unfolded) listing path rather
+  than a folded snapshot part (`SegmentOrigin::Recent`, ADR-0073 decision 1).
+  Exact because it gates a downstream fold-benefit decision an approximation
+  would silently corrupt. A SEGMENT count, not a commit-record count:
+  `SegmentOrigin` is parallel to `Snapshot::segments` (one entry per resolved
+  `SegmentRef`), and a multi-part L1 compaction record contributes one
+  `Recent` entry per part, so this figure counts every part, not the single
+  underlying compaction record. `ravel-query` cannot recover the record
+  count from `SegmentOrigin` alone, so the field is named for the quantity
+  it actually counts. Excludes `SegmentOrigin::TokenResolved`: a
+  read-your-write token match always costs its own GET by explicit key,
+  whether or not a fold has run, so folding can never remove that cost and
+  counting it here would overstate the fold benefit.
+- `unfoldedRecordsServedFromCache`: the EXACT count of COMMIT RECORDS this
+  query's resolve found already resident during its listing prewarm pass,
+  read straight from accounting
+  (`QueryAccountingSnapshot::commit_record_cache_hits`) rather than inferred
+  from any pooled cache counter. The prewarm pass is the whole of it: a
+  record served afterwards through a read-your-write token lookup is not
+  counted, and neither are the records an attempt abandoned to a snapshot
+  invalidation had warmed. A RECORD count, not a segment count, diverging
+  from `unfoldedSegmentsResolved` by its own mechanism and in the opposite
+  direction to the compaction-part expansion described above: the listing
+  window is padded by `max_ingest_lag_ns` and
+  runs to the current hour regardless of the query's end, so a resolve
+  prewarms commit-record buckets its range never touches and
+  `include_l0_if_overlaps` drops those records afterwards -- on a live
+  tenant a narrow range counts records from hours that contribute no segment
+  at all. The figure exists to be the numerator of a cold-resolve fraction
+  (records served from cache over records the resolve touched), not a
+  segment total.
+- `planClass`: `metadata_only` (a labels/label-values/series discovery query
+  that never reaches a page fetch), `selective_indexed` (the resolve's
+  postings-based pruning excluded at least one snapshot-sourced segment),
+  `exhaustive_scan` (every listed segment in the resolved window was
+  opened), or `unclassified` (the lane's own resolve carries no signal this
+  crate can use to tell a pruned fetch from a full scan). The log lane
+  always reports `unclassified`: `resolve_bounded` always resolves
+  `Signal::Logs` with `name_filter: None` (ADR-1103's log discovery has no
+  name-postings filter to prune against), so `Snapshot::segments_pruned` is
+  structurally always 0 for that lane no matter how narrow the resolved
+  window actually is, and reporting `exhaustive_scan` on that basis alone
+  would be a fabricated severity this crate cannot back up. Decided before
+  any segment is opened, from the query's shape and the resolve's own
+  pruning outcome, not from the fetch's actual cost.
+
+  `ravel-sql`'s `sql_io_shape` reports the same `unclassified` value on its
+  `Logs`/`Spans`/`Alerts`/`Audit` targets, for the same structural reason (see
+  `ravel_query::io_shape::PlanClass::Unclassified`'s own doc comment for the
+  full rationale). Only a `Metrics` target's resolve carries a real
+  name-postings filter, so only `Metrics` distinguishes `selective_indexed`
+  from `exhaustive_scan` on the SQL side.
+  This does not yet cover SQL's metadata-only fast paths (a predicate-free
+  `SELECT COUNT(*)` answered from partition statistics, or a declared-column
+  min/max/count answered from ingest stamps, both with no scan node in the
+  plan): `sql_io_shape` has no signal for "the optimizer removed the scan
+  node entirely," so those queries still report `selective_indexed`,
+  `exhaustive_scan`, or `unclassified` rather than `metadata_only`; adding
+  that signal is out of scope for the change that added SQL's `unclassified`
+  handling.
+
+What is knowable from `ravel-query`, and what is not: the per-segment fetch
+pipeline this crate owns is visible here, so `dependencyDepth` reflects it
+directly. What is NOT knowable from this crate: the catalog snapshot
+resolve's own internal dependency chain
+(`Catalog::resolve_pruned_with_generations` and any HEAD-then-part-GET
+sequence it takes) lives entirely inside `ravel-catalog`; `dependencyDepth`
+therefore reports only the segment-fetch chain's depth, and the true
+end-to-end depth (resolve's own chain, however deep, prefixed to the
+segment-fetch chain) can only be equal to or greater than what is reported.
+A federated query (a metrics lane and a log lane) folds both lanes'
+contributions together. The two lanes run STRICTLY SERIALLY -- the log
+lane's resolve is only reached after the metrics lane has already been
+awaited to completion, never alongside it -- and each field's combining
+rule follows from one criterion, not from the same criterion applied
+loosely three times:
+`listPageDepth` and `serviceBatches` are both SERIALIZATION-ROUND figures,
+and ADD across lanes for that reason: because the lanes never overlap, a
+query's end-to-end figure is one lane's followed by the other's. They differ
+in what the per-lane figure is. `listPageDepth` counts pages the lane really
+paginated through, so a query whose metrics lane paginated 4 LIST pages and
+whose log lane paginated 2 more paginated 6 serial pages, not 4.
+`serviceBatches` is a deterministic MODEL of a lane's rounds, not a count of
+rounds it waited through (see the field's own description above: within one
+wave it is a lower bound, and the cross-wave sum can overcount or undercount
+the real sliding-window scheduler). Adding the lanes therefore adds two model
+figures: a query whose metrics lane models 3 batches and whose log lane
+models 2 reports 5, not `max(3, 2)`, and that 5 carries the same
+model-versus-scheduler caveat each lane's figure does.
+`dependencyDepth` uses a DIFFERENT criterion -- DATA independence, not
+serialization order -- and stays max-based across lanes: the log lane's
+fetch chain has no DATA dependency on the metrics lane's bytes, so the two
+chains are independent chains that happen to run one after the other, and
+the reported figure is the longest independent chain, not their sum.
+`unfoldedSegmentsResolved` sums across lanes (an exact total count, with no
+ambiguity about how the two lanes' costs compose).
+`unfoldedRecordsServedFromCache` follows the same rule for the same reason:
+it is an exact count of commit records served from cache during each lane's
+own resolve, and the two lanes' resolves are distinct resolves against
+(possibly) distinct commit records, so the query's total is the sum, not a
+max. `planClass` takes
+the more severe of the two (`exhaustive_scan` outranks `selective_indexed`
+outranks `unclassified` outranks `metadata_only`), so a lane that never ran
+cannot understate a lane that did, and the log lane's `unclassified` result
+cannot fabricate a worse classification than a metrics lane that pruned
+correctly.
+
+`stats.io` carries no object keys, field values, predicates, or index
+terms: every figure is a structural count.
 
 ## PromQL conformance (ADR-0035)
 
@@ -1612,6 +2475,84 @@ surface. `ravel-promql`'s aggregation dispatch rejects both with a typed
 surface (they are not part of the stable language), and are not implemented;
 the clean rejection is what the guarantee requires.
 
+The same state-2 guarantee applies below the scored surface too, at the
+evaluator's own internal dispatch arms. `ravel-promql` used to defend several
+of these with `unreachable!()`, on the assumption that promql-parser's AST
+could never carry a shape those arms didn't expect. Nine of them -- an
+unknown aggregator token, an aggregate whose inner expression
+evaluates to a non-vector, a missing or wrongly-typed
+`limitk`/`count_values` parameter, a binary operator whose operands are
+neither both scalar nor both vector, a `ManyToMany` vector match on a non-set
+operator, and a matrix-typed function argument that is not a matrix node --
+had no protection beyond promql-parser's own `check_ast`. Under
+promql-parser 0.10 no parsed query actually reaches them, so the defect is
+not a live panic: it is that the guarantee lives in a third-party crate on a
+caret version range, where a minor upgrade can relax a check without any
+signal here. Each was converted to a typed `Error::Unsupported` naming the
+operator or type, so Ravel's own evaluator refuses the shape rather than
+inheriting the refusal.
+
+The arms that remain `unreachable!()` are the ones an exhaustive prior match
+inside `ravel-promql` already narrows out of reach before they run. For
+example, `apply_arith`'s fallback is narrowed by `eval_binary`'s
+operator-class check, which refuses any token that is neither arithmetic nor
+a comparison, and refuses a set operator (`and`/`or`/`unless`) on a
+Scalar/Scalar or Scalar/Vector operand pair, before `eval_scalar_scalar` or
+`eval_scalar_vector` runs. That check is Ravel's, not the parser's: the
+operand-type dispatch in `eval_binary` never looked at the operator class, so
+without the check a set operator on scalar operands reached `apply_arith` and
+aborted the process. Each remaining arm carries a one-line comment naming the
+arm that rejects first. `scripts/guards/check-promql-unreachable.sh`
+keeps this from regressing: every `unreachable!()` under
+`crates/ravel-promql/src` must carry that comment, so a new defensive arm
+added without one fails the gate instead of becoming the next reachable
+panic.
+
+Binary operators over native histograms compute a specific subset and drop
+the rest, matching the pinned Prometheus v3.13.1 binary rather than refusing
+the query. Seven pairings compute: `h + h` and `h - h` (a histogram), `h * f`,
+`f * h` and `h / f` (a scaled histogram), and `h == h` and `h != h` (filter
+mode passes the surviving histogram through, `bool` mode answers 1 or 0).
+Every other pairing carrying a histogram operand drops the sample and raises
+one info annotation on the response's `infos` channel: arithmetic between a
+histogram and a float other than those three scaling forms, `h * h`, `h / h`,
+every `%`, `^` and `atan2` pairing, any ordering comparison (`<`, `>`, `<=`,
+`>=`) involving a histogram, and `==`/`!=` between a histogram and a float. A
+filter-mode comparison that is supported but does not hold drops with no
+annotation, as it does for floats. The set operators (`and`, `or`, `unless`)
+pass matched samples through without combining values, so they carry
+histograms unchanged and are outside this split.
+
+`h + h` and `h - h` align their two operands before merging buckets, and only
+one shape has no common layout at all. An exponential-schema histogram paired
+with a custom-buckets (NHCB) one cannot be combined: the sample drops with one
+warning annotation on the response's `warnings` channel, reading `incompatible
+bucket layout encountered for binary operator <op>`, matching Prometheus, which
+catches `ErrHistogramsIncompatibleSchema` from `FloatHistogram.Add`/`Sub` and
+raises `NewIncompatibleBucketLayoutInBinOpWarning`.
+
+Every other layout difference reconciles rather than dropping. Two
+custom-buckets histograms with different bounds are each re-bucketed onto the
+intersection of their two boundary sets and then merged (Prometheus'
+`addCustomBucketsWithMismatches`); the result carries one info annotation,
+`mismatched custom buckets were reconciled during addition` (or `during
+subtraction`). There is no `ErrHistogramsIncompatibleBounds` in v3.13.1;
+differing bounds are not an error. Two exponential histograms at different
+schemas are both down-converted to the coarser one first, so each bucket index
+means the same value range on both sides, and the result carries the coarser
+schema. Two exponential histograms with different zero thresholds have the
+narrower threshold widened to the larger, folding the regular buckets that now
+fall inside it into the zero count before the merge (Prometheus'
+`reconcileZeroBuckets`). None of these is a corner case: RSEG down-converts a
+flush whose bucket count exceeds its limit, so two flushes of one series can
+persist at different schemas.
+
+One more difference is carried through as a warning without blocking the merge.
+When the two operands disagree on their counter-reset hint (one `CounterReset`,
+one `NotCounterReset`), the buckets still combine but the result carries the
+warning `conflicting counter resets during histogram <op>`, matching
+Prometheus' `NewHistogramCounterResetCollisionWarning`.
+
 The table below is generated from a run, not hand-maintained: the state
 column is recomputed from which corpus entries actually exercise each
 construct and whether they actually passed, so a regression appears as a diff
@@ -1625,23 +2566,23 @@ conformance_table`; regenerate that same command with
 `RAVEL_UPDATE_CONFORMANCE_TABLE=1`. Do not edit the block between
 the markers by hand.
 
-Surface: 133 constructs over 242 corpus entries in 10 corpus files.
+Surface: 132 constructs over 265 corpus entries in 10 corpus files.
 
 | State | Constructs |
 | --- | --- |
 | supported | 124 |
-| intentionally rejected | 7 |
+| intentionally rejected | 6 |
 | accepted divergence | 2 |
 | unclassified | 0 |
-| **score** (supported + intentionally rejected + accepted divergence / total) | **133/133 = 100%** |
+| **score** (supported + intentionally rejected + accepted divergence / total) | **132/132 = 100%** |
 
 | Construct | Category | State | Evidence |
 | --- | --- | --- | --- |
 | aggregate expression | ast node | supported | `corpus/aggregate.txt`, 20 entries |
-| binary expression | ast node | supported | `corpus/binop.txt`, 31 entries |
+| binary expression | ast node | supported | `corpus/binop.txt`, 54 entries |
 | function call | ast node | supported | `corpus/transform.txt`, 59 entries |
 | matrix selector | ast node | supported | `corpus/selectors.txt`, 4 entries |
-| number literal | ast node | supported | `corpus/binop.txt`, 16 entries |
+| number literal | ast node | supported | `corpus/binop.txt`, 29 entries |
 | paren expression | ast node | supported | `corpus/selectors.txt`, 2 entries |
 | string literal | ast node | supported | `corpus/transform.txt`, 6 entries |
 | `subquery` | ast node | supported | `corpus/subquery.txt`, 11 entries |
@@ -1650,8 +2591,7 @@ Surface: 133 constructs over 242 corpus entries in 10 corpus files.
 | @ <timestamp> | modifier | supported | `corpus/selectors.txt`, 2 entries |
 | @ end() | modifier | supported | `corpus/selectors.txt`, 1 entry |
 | @ start() | modifier | supported | `corpus/selectors.txt`, 1 entry |
-| binary operator over native histograms | modifier | intentionally rejected | `Unsupported: binary operator over native histograms (422 execution)`; rejection verified; the binop evaluator (`combine_value` and its callers) only ever reads a sample's plain float `value`, which is a meaningless 0.0 placeholder for a histogram element (issue #524); guarded before any value combination so the fabricated-zero result is never produced. `corpus/binop.txt`'s `error_*_over_histogram` entries (mode: ravel_error_prom_success) additionally pin that Prometheus itself succeeds here, so this is a real capability gap, not a shared limitation |
-| `bool` | modifier | supported | `corpus/binop.txt`, 7 entries |
+| `bool` | modifier | supported | `corpus/binop.txt`, 10 entries |
 | `by` | modifier | supported | `corpus/aggregate.txt`, 11 entries |
 | `group_left` | modifier | supported | `corpus/binop.txt`, 2 entries |
 | `group_right` | modifier | supported | `corpus/binop.txt`, 1 entry |
@@ -1668,20 +2608,20 @@ Surface: 133 constructs over 242 corpus entries in 10 corpus files.
 | subquery over native histograms | modifier | intentionally rejected | `Unsupported: subquery over native histograms (422 execution)`; rejection verified; the subquery grid reducer keeps only each step's float value, so a histogram element would be silently dropped; the trigger is matched histogram data, not the syntactic shape |
 | vector matching fill values | modifier | intentionally rejected | `Unsupported: vector matching fill-in values (422 execution)`; rejection verified; `fill`/`fill_left`/`fill_right` are a promql-parser dialect extension with no Prometheus counterpart; ravel-promql's `binop` refuses the modifier rather than evaluating it as plain matching |
 | `without` | modifier | supported | `corpus/aggregate.txt`, 1 entry |
-| `!=` | binary operator | supported | `corpus/binop.txt`, 2 entries |
-| `%` | binary operator | supported | `corpus/binop.txt`, 1 entry |
-| `*` | binary operator | supported | `corpus/binop.txt`, 6 entries |
-| `+` | binary operator | supported | `corpus/binop.txt`, 5 entries |
-| `-` | binary operator | supported | `corpus/binop.txt`, 1 entry |
-| `/` | binary operator | supported | no difftest corpus entry; proven by `ravel-promql`'s `scalar_scalar_arithmetic_and_bool_comparison` |
+| `!=` | binary operator | supported | `corpus/binop.txt`, 4 entries |
+| `%` | binary operator | supported | `corpus/binop.txt`, 2 entries |
+| `*` | binary operator | supported | `corpus/binop.txt`, 9 entries |
+| `+` | binary operator | supported | `corpus/binop.txt`, 7 entries |
+| `-` | binary operator | supported | `corpus/binop.txt`, 4 entries |
+| `/` | binary operator | supported | `corpus/binop.txt`, 5 entries |
 | `<` | binary operator | supported | no difftest corpus entry; proven by `ravel-promql`'s `scalar_vector_filter_and_bool_both_directions` |
 | `<=` | binary operator | supported | `corpus/binop.txt`, 2 entries |
-| `==` | binary operator | supported | `corpus/binop.txt`, 2 entries |
-| `>` | binary operator | supported | `corpus/binop.txt`, 4 entries |
+| `==` | binary operator | supported | `corpus/binop.txt`, 5 entries |
+| `>` | binary operator | supported | `corpus/binop.txt`, 6 entries |
 | `>=` | binary operator | supported | `corpus/binop.txt`, 1 entry |
-| `^` | binary operator | supported | `corpus/binop.txt`, 2 entries |
+| `^` | binary operator | supported | `corpus/binop.txt`, 3 entries |
 | `and` | binary operator | supported | `corpus/binop.txt`, 1 entry |
-| `atan2` | binary operator | supported | `corpus/binop.txt`, 2 entries |
+| `atan2` | binary operator | supported | `corpus/binop.txt`, 3 entries |
 | `or` | binary operator | supported | `corpus/binop.txt`, 1 entry |
 | `unless` | binary operator | supported | `corpus/binop.txt`, 1 entry |
 | `avg` | aggregation operator | supported | `corpus/aggregate.txt`, 1 entry |
@@ -1772,11 +2712,77 @@ Surface: 133 constructs over 242 corpus entries in 10 corpus files.
 | subquery per-node point cap | accepted divergence | accepted divergence | ADR-0030, 2 corpus entries; Ravel's per-subquery-node 11,000-point budget has no Prometheus counterpart, so Ravel rejects by design where Prometheus accepts; the comparator asserts exactly that shape |
 <!-- END GENERATED PROMQL CONFORMANCE TABLE -->
 
+## SQL statement complexity gate
+
+`ravel_sql::validate` is the single gate every SQL surface reaches: the
+`POST /api/v1/sql` handler, Flight SQL's `get_flight_info_statement` and
+`do_get_statement`, and the page plan. Its first step, before the text is
+parsed at all, is a structural-complexity check over the raw statement
+(`ravel_sql::complexity_guard`). A statement over the bound is rejected with
+HTTP 400 (`InvalidArgument` on the Flight surface), and the message carries
+the measured count and the maximum and nothing else of the caller's input.
+
+The check exists because a flat operator chain (`SELECT 1+1+1+...`) parses at
+a nesting depth of one while building a tree one level deep per operator: the
+parser consumes same-precedence infix operators in a loop, so its own
+recursion limit never sees them. Every later walk over that tree -- the
+read-only and excluded-function visitors here, the page-plan rewrites,
+DataFusion's SQL-to-`LogicalPlan` conversion, and the tree's `Drop` -- then
+recurses once per level, and a stack overflow on a tokio worker's 2 MiB stack
+aborts the process rather than raising a catchable panic, taking every other
+tenant on the node with it.
+
+What is bounded is not nesting depth but a sound invariant: a
+recursive-descent parser cannot produce more tree levels than it has tokens
+to consume. The count is of tokens outside literals and comments, so a long
+`LIKE` pattern, an embedded JSON document, a long identifier, or a long
+comment costs nothing beyond the one token itself, while every construct that
+can deepen a tree is bounded, including ones nobody has tested. Counting
+tokens rather than characters is what keeps the bound independent of quoting:
+a bare identifier and a quoted one cost the same.
+
+Three numbers, one decision:
+
+- `ravel_sql::MAX_STATEMENT_COMPLEXITY` is 1,000 tokens. On a 2 MiB stack in
+  a release build, DataFusion's SQL-to-`LogicalPlan` conversion survives
+  1,807 units of a binary-operator chain and aborts at 1,907, about 950 tree
+  levels. (The validation walk itself survives 50,007 and aborts at 60,007,
+  so the planner, not the gate's own caller, is the binding consumer.) No
+  construct costs fewer than two tokens per tree level, so an admitted
+  statement cannot exceed 500 levels against those 950. (Two constructs sit
+  below that floor and are excluded for the same reason: a prefix unary chain
+  such as `SELECT NOT NOT ... TRUE` or `SELECT - - - ... 1` adds one level per
+  token, and parenthesis nesting costs two, but all three descend through
+  `parse_subexpr` and the pinned recursion limit below refuses them long
+  before the token bound bites.) The bound is not
+  lower because a lower one refuses real analytic SQL: the whole ClickBench
+  corpus in `benchmarks/clickbench/hits.corpus.json` is pinned as accepted in
+  `crates/ravel-sql/tests/statement_complexity.rs`.
+- The parser recursion limit is pinned at 50 rather than inherited from
+  `datafusion-sql`'s default. It is a second, independent bound: it catches
+  nested constructs (parentheses, subqueries) that the complexity count would
+  otherwise let through, and the complexity count catches the flat chains it
+  cannot see.
+- `POST /api/v1/sql` caps the request body at 64 KiB, down from 1 MiB. A
+  statement at the complexity bound fits in it many times over, with room for
+  whitespace, string literals, and `min_commit_token` values.
+
+The check is not a call each parse site is expected to remember. It is part of
+the parse: `ravel_sql::complexity_guard::parse_guarded` runs the check and then
+builds the parser with the pinned recursion limit, and it is the only parse of
+caller text in the crate. `validate`, the audit redactor, and the page plan all
+go through it. The convention form of the rule failed the first time it was
+tested, on both of the sites that were not `validate`, so
+`scripts/guards/check-guarded-sql-parse.sh` refuses any other mention of a
+parser front end under `crates/ravel-sql/src/` and runs in `scripts/gates.sh`
+and in CI. Test code that needs a raw parse carries a `guarded-parse-allow:`
+marker with its reason.
+
 ## SQL over logs (the `logs` table, ADR-0033)
 
-`POST /api/v1/sql` serves two tables from one endpoint: `samples`
-(`Signal::Metrics`) and `logs` (`Signal::Logs`). There is no separate logs
-endpoint and no protocol change. DataFusion does not choose between two
+`POST /api/v1/sql` serves five tables from one endpoint, of which this section
+covers two: `samples` (`Signal::Metrics`) and `logs` (`Signal::Logs`). There is
+no separate logs endpoint and no protocol change. DataFusion does not choose between two
 registered tables: `SqlExecutor` decides which single table a query targets by
 parsing its `FROM` clause *before* planning (through the same parser the
 read-only gate uses, never a raw-text scan), resolves a snapshot for that one
@@ -1785,9 +2791,10 @@ signal, and registers exactly that one table in the per-query `SessionContext`
 otherwise. A `WITH <name> AS (...)` CTE that happens to be named `logs` or
 `samples` is a query-local name, not a base-table reference, and does not
 change the target (`WITH logs AS (SELECT value FROM samples) SELECT count(*)
-FROM logs` is a metrics-only query). A query naming both real tables is
-rejected before any catalog listing (HTTP 400): v1 admits one signal per
-query, and no query needs to scan or join metrics and logs together.
+FROM logs` is a metrics-only query). A query naming two real tables, these two
+or any other pair of the five, is rejected before any catalog listing (HTTP
+400): v1 admits one signal per query, and no query needs to scan or join two
+signals together.
 
 Schema (fixed columns plus one map):
 
@@ -2197,6 +3204,68 @@ its 16-block, 41-column fixture phase 1 decodes 3 pages per block against the
 single-phase plan's 39 over the same 16 blocks, and un-cached, a `k = 10`
 statement moves 103,606 bytes in 14 GETs against a single pass's 29,645 in 4.
 
+#### Bounded top-k grouped aggregation
+
+`BoundedTopKAggregate` is a physical optimizer rule (installed by
+`build_session` when `SqlConfig::bounded_topk_max_limit` is `Some`) that stops
+a `GROUP BY <high-cardinality key> ... ORDER BY <aggregate> LIMIT k` from
+materialising one accumulator per distinct group to return `k` rows. It fires
+only when every one of these holds: the plan is a single-stream `SortExec` with
+a `fetch` at or below the configured limit, ordering by exactly one column;
+every node between that sort and the aggregate is a coalesce, a repartition, a
+cooperative wrapper, or a renaming projection (a `HAVING` filter refuses, since
+it decides which groups reach the sort); the aggregate has exactly one group
+key, no `FILTER` clause, and exactly one aggregate expression; that aggregate is
+`max` under a descending sort or `min` under an ascending one; its input type
+is not floating point; and its input is a plain column that the input schema
+marks non-nullable. Under those conditions the aggregate is rebuilt with
+DataFusion's `LimitOptions`, which executes it as a bounded priority map of `k`
+groups. Outside them the plan is byte-identical to the one the uninstalled rule
+produces, which `crates/ravel-sql/tests/bounded_topk_aggregate.rs` asserts for
+every conjunct by comparing the rendered physical plans rather than the answers.
+
+The rule is exact, and the gate is what makes it exact. A `max`/`min` group's
+result is the extreme of independently contributed row values, so the priority
+map drops a group only when its best value so far loses to the current k-th
+best, and that k-th best only tightens; a group whose true extreme beats the
+final k-th therefore beat every earlier threshold too, was admitted the moment
+that value arrived, and carries exactly that value. `count` and `sum` do NOT get
+this treatment even though they are monotone non-decreasing, because
+monotonicity makes a running value a *lower* bound on the final one and pruning
+needs an upper bound: `ORDER BY count(*) DESC LIMIT 1` over the row sequence
+`A, B, B, B` would evict `B` three times at a running count of 1 and answer `A`
+with 1 instead of `B` with 3. The float exclusion keeps the answer provably
+ravel's: the priority map's heap orders floats with `total_cmp`, the same
+comparison ADR-0023 mandates, but its worse-than pre-check compares with
+`PartialOrd` instead, so whether `-0.0` against `0.0` and NaN payloads end up
+ordered the way ADR-0023 requires is not something this rule can prove.
+DataFusion's own `TopKAggregation` rule, which admits float input (and an
+unbounded `LIMIT`), defaults on and is turned off in `session_config` for
+exactly this reason.
+
+The ordering-input nullability conjunct closes a separate hole: DataFusion's
+priority map never admits a group whose ordering value is NULL, so under the
+default `NULLS FIRST` such a group belongs first in the unbounded answer, and
+under `NULLS LAST` it still belongs whenever fewer than `k` non-null groups
+exist. A plain column the input schema marks non-nullable is the only input
+this rule can prove the map's NULL-blind admission exact for. Every typed
+attribute column is nullable by construction
+(`crates/ravel-sql/src/logs_schema.rs`), so today the conjunct only admits a
+fixed column such as `ts`, `severity_num`, or `flags`; widening it to a typed
+attribute column needs a statistics-derived proof that the column holds no
+NULLs, which is a separate change. At a tie on the k-th value the bounded map
+keeps the later-arriving group, and the unbounded sort's own tie-break is
+arrival-order dependent too; SQL leaves that order unspecified.
+
+On the test fixture (200,000 distinct keys, `ORDER BY max(ts) DESC LIMIT 10`)
+`peakIntermediateBytes` is 1,706,120 with the rule installed against 10,748,928
+without it. Across a tenfold increase in distinct keys the rule-off figure grows
+9.4x and the rule-on figure 1.62x, and the residual growth on the rule-on side
+is the scan's own batches rather than aggregate state. The statement orders by
+`ts`, a fixed non-nullable column, rather than a typed attribute column: a
+typed attribute column is always nullable and the ordering-input conjunct
+above refuses it regardless of whether any row's value is actually NULL.
+
 Both gaps ADR-0033 recorded are now closed. Both were deliberate, not
 oversights.
 
@@ -2273,8 +3342,9 @@ oversights.
 
 ## SQL over spans (the `spans` table, ADR-0045)
 
-`POST /api/v1/sql` serves a third table alongside `samples` and `logs`:
-`spans` (`Signal::Spans`). It follows the same one-signal-per-query rule the
+`POST /api/v1/sql` serves `spans` (`Signal::Spans`) alongside `samples` and
+`logs`, and alongside the `alerts` and `audit` tables the next section covers.
+It follows the same one-signal-per-query rule the
 logs table established. `SqlExecutor` decides the target table from the `FROM`
 clause before planning, resolves a snapshot for that one signal, and registers
 exactly the one table in the per-query `SessionContext`. A query naming two real
@@ -2389,6 +3459,137 @@ The page-byte counters on `QueryAccounting` (`page_bytes_fetched` /
 they do for logs. They are the byte-weighted view of the same decode: page
 counts weight every page equally, while an attribute or event page usually
 carries far more bytes than a fixed-width one.
+
+## SQL over alerts and audit (the `alerts` and `audit` tables, ADR-1101)
+
+`POST /api/v1/sql` and Flight SQL serve `alerts` (`Signal::Alerts`) and `audit`
+(`Signal::Audit`) as the fourth and fifth tables, on the same terms as the three
+above. `SqlExecutor` reads the target from the `FROM` clause before planning,
+counts five names, and rejects a query that names two of them with
+`CrossSignalQuery` before any catalog listing (HTTP 400). It then resolves a
+snapshot for that one signal and registers exactly one table in the per-query
+`SessionContext`, as it does for every other target; a CTE named `alerts` or
+`audit` is a query-local name and does not change the target. Flight SQL's
+`CommandGetTables` lists all five tables with their public schemas: that is
+static catalog metadata built from the five schema functions, independent of the
+per-query session, which still registers one table.
+
+Both tables are built on the logs table's machinery. An alert record and an
+audit record are RLOG records (ADR-0040), so both providers scan through the
+same `LogSegmentFetcher` the `logs` table reads through, with the query's tenant
+hash, the same cache attachment, the same erasure filtering, and the same
+`QueryAccounting` handle. Cost estimation reuses the logs estimator rather than a
+renamed copy: the fetch funnel is identical, so the estimate is identical, and
+two estimators over one funnel would only drift.
+
+Schemas (`crates/ravel-sql/src/alerts_schema.rs`,
+`crates/ravel-sql/src/audit_schema.rs`):
+
+- `alerts`: `ts_ns` (`Timestamp(Nanosecond, None)`, non-null); `alert_id`,
+  `rule_id`, `state` (`Utf8`, nullable) and `generation` (`Int64`, nullable),
+  the four promoted scalar attributes every well-formed alert record carries;
+  `writer_id` (`Utf8`), `writer_epoch` (`UInt64`) and `writer_seq` (`UInt64`),
+  non-null, stamped from the commit record of the object the row was read from;
+  and `attrs` (`Map(Utf8, Utf8)`), the whole merged attribute map, including the
+  promoted keys and the open-ended `label.<name>` and `annotation.<name>` sets.
+- `audit`: `ts_ns` (`Timestamp(Nanosecond, None)`), `severity_text` and `body`
+  (`Utf8`), all non-null, and `attrs` (`Map(Utf8, Utf8)`). No record-specific
+  field is promoted, because the record kinds differ (`kind = query`,
+  `legal_hold`, `reshard`) and a later kind must not need a schema change.
+
+Row contract. `alerts` exposes raw history: one row per state transition, never
+a folded current-state row. The three write-identity columns exist because
+`ts_ns` alone is not a total order over that history. Two evaluators can overlap
+briefly at a lease handover and write the same `alert_id` at the same `ts_ns`;
+the evaluator's own fold breaks that tie with the record's epoch and sequence,
+and the table exposes the same keys plus `writer_id` so a SQL fold has a total
+order and can never return two current rows for one alert. Current state is the
+row that sorts first per `alert_id` under `ts_ns DESC, writer_epoch DESC,
+writer_seq DESC, writer_id DESC`.
+
+The key is a tie-break, not a causal order between evaluators. `writer_epoch`
+is stamped from `ALERT_WRITER_EPOCH`, a constant rather than a lease term, and
+each evaluator task mints a fresh `writer_id` and restarts `writer_seq` at 1,
+so at a handover the departing evaluator's higher sequence sorts first. What
+the key guarantees is that exactly one row wins, deterministically, and that it
+is the same row `load_latest_records` picks, so the SQL surface never diverges
+from the evaluator's own view. Making the epoch a real fencing term is the
+change that would turn this into handover ordering.
+
+```sql
+SELECT *
+FROM (
+  SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY alert_id
+           ORDER BY ts_ns DESC, writer_epoch DESC, writer_seq DESC,
+                    writer_id DESC
+         ) AS rn
+  FROM alerts
+)
+WHERE rn = 1;
+```
+
+`row_number` is an admitted window function. A rule that reads
+`SELECT * FROM alerts` (alerts-on-alerts, ADR-0043) would see every transition,
+which is what the generation guard in ADR-0040 is meant to count over. That
+path is not live: the evaluator passes an empty consumed-generation set to
+`compute_generation`, so every record such a rule produced sits at generation 1
+and the `max_alert_generation` breaker cannot trip. The table is queryable from
+the SQL endpoint; only the evaluator's side of the loop is missing. `audit`
+likewise exposes one row per record.
+
+Supported predicates (widen-only on both tables; `supports_filters_pushdown`
+returns `Inexact` for every filter, so DataFusion re-applies the originals above
+the scan):
+
+- `ts_ns` range comparisons (`>=`, `>`, `<`, `<=`, `=`, and `BETWEEN`) on both
+  tables, folded into one inclusive window that feeds segment-level pruning and
+  the fetch's `LogQuery` bounds.
+- On `alerts` only, `alert_id = '<literal>'` and `rule_id = '<literal>'`
+  equality, compiled to a `Predicate::Equals` on the corresponding record
+  attribute and handed to the RLOG reader, which prunes blocks by the attribute
+  bloom and re-checks each surviving row. Unlike the `logs` table's
+  stream-attribute equalities, these are genuine per-record attributes, so the
+  push narrows correctly.
+- Nothing else on either table. Every other predicate, `attrs['k'] = 'v'`
+  included, contributes no prune and is evaluated as a residual. Neither table
+  registers a scalar UDF: every shape their extractors accept is a plain column
+  comparison or a map subscript the existing planner already serves.
+
+Fixed-shard signals and the read-side floor (ADR-1101 decision 2). Alerts and
+audit are the two signals whose writers pin their shard by constant: alert
+records on shard 0, legal-hold and reshard records on shard 0 of the audit
+prefix, and query-audit records on its shard 1. The floor covers shard 1
+whether or not anything writes there: a stock build installs no audit pipeline,
+so it emits no `kind = query` record at all, and an empty query-audit stream is
+evidence of that missing install rather than of a quiet cluster. `Catalog::resolve` derives a
+scan set from the (tenant, signal) shard-generation history, and neither signal
+is ever provisioned, so both take the implicit generation 0 at the process
+`--shards` value. `Signal::fixed_read_shards` is the floor under that
+derivation: 1 for `Alerts`, 2 for `Audit`, 0 for every other signal. The three
+scan-set derivations in `ravel-catalog` take the maximum of the history-derived
+count and that floor through one shared helper, so a `--shards 1` deployment
+still lists the query-audit shard instead of returning an exact-looking answer
+with every statement missing. The writer constants pin themselves to the floor
+with compile-time assertions, so moving a writer to a shard the reader would not
+scan fails the build rather than the query. It is a floor and never a cap: a
+provisioning record or a wider `--shards` widens the scan exactly as it does for
+any other signal.
+
+Cost. Neither signal is folded into the catalog or maintained by the compaction
+loop, so a query lists commit records live for its window, one bounded LIST per
+shard in the scan set, which is the recent-hours cost a `logs` query already
+pays. The query-audit shard keeps its own separate compaction and 90-day sweep.
+The bounds a `logs` query runs under hold here unchanged: segment admission caps
+the resolved snapshot, every emitted batch grows the query's memory reservation
+so an over-budget scan fails with `ResourcesExhausted` at the tenant's pool
+ceiling, and the request deadline bounds wall time. The bytes-scanned budget and
+the LIMIT fetch-stop hint that the RLOG and RSPAN scan loops still lack apply
+here too, and these two tables add two more callers without changing that scope.
+
+The operator-facing pages are [docs/guides/alerting.md](guides/alerting.md) for
+alert history and [docs/guides/audit.md](guides/audit.md) for the audit trail.
 
 ## Parallel final aggregation for exact-typed queries (ADR-0094)
 

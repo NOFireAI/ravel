@@ -449,7 +449,10 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   ranged read; `byte-minimal` uses ranged reads wherever they save more bytes
   than a request costs; `cost-based` (the default, as on the server) derives the
   choice from the pass's store cost profile, which at the shipped reference
-  intra-region profile resolves to request-minimal behaviour. So a bench run at
+  intra-region profile resolves to request-minimal behaviour; `latency-first`
+  resolves the byte-minimizing quantities as an intent rather than from prices,
+  and pays off only at the concurrency its trade was measured at, which a pass
+  sets with `--fetch-concurrency`. So a bench run at
   default flags measures the shape a stock server produces: roughly one GET per
   object for a full-scan statement, not one per block. Before the flag existed
   the bench routed at a fixed 512 KiB threshold, which range-read every larger
@@ -709,40 +712,66 @@ cargo run -p ravel-server --features flight-sql --bin ravel-server -- \
   --store s3 \
   --listen-grpc 127.0.0.1:4317 \
   --tenant-token "$RAVEL_FLIGHT_TOKEN=clickbench" \
-  --shards 4 \
-  --fetch-concurrency 8 \
-  --sql-max-query-bytes 1073741824 \
-  --sql-tenant-max-bytes 2147483648 \
-  --max-segments 1000000 \
-  --cache-max-bytes 25769803776
+  --shards 4
 ```
 
-`--max-segments 1000000` and `--cache-max-bytes 25769803776` match the
-`--sql-max-segments` and `--cache-bytes` values the in-process command in
-step 5 passes, so the two tables are comparable: a folded ClickBench tenant
-sits far above the 1024 default sealed-segment ceiling, so the server must
-raise it or every statement fails with `8424 exceeds max 1024`; and the cache
-must exceed the ~12 GB corpus (`25769803776` is 24 GiB) or every run is cold
-and there is no hot column to compare. Both settings live on the server only
-in this lane. The bench's
-`--cache-bytes` and `--sql-max-segments` configure the in-process fetcher and
-engine, which the Flight lane never builds, so neither flag reaches the
-server; leave them off the bench command, or the report header claims a
-client-side cache that took part in nothing.
+No performance flags. Since #1141 the server derives all six of them from the
+host at startup. Two are host-independent and match a published entry exactly:
+a 1,000,000 sealed-segment cap and an 11-minute engine deadline. Fetch
+concurrency is CPU-derived and also matches on this box: 32, two per core on
+16 cores. The three memory-derived settings are computed from this box's own
+`MemTotal` (capped by the cgroup limit when the server runs in a container,
+which the reference box does not), which Linux reports as
+32,909,025,280 bytes here, so they land within 2.2% of the published figures
+rather than on them: a 25% read cache and a 25% per-query SQL pool, each
+8,227,256,320 bytes here against the published 8,053,063,680, and a 50%
+per-tenant pool of 16,454,512,640 against 16,106,127,360. The catalog byte
+cache derives to a separate 5% ceiling,
+1,645,451,264 bytes (#1141). Do not assume the resolved values: record the
+server's own startup log lines (below) with the entry. Both of the two settings
+that used to be mandatory here are among the derived six: a folded ClickBench
+tenant sits far above the old 1024 sealed-segment ceiling, so an un-derived
+server failed every statement with `8424 exceeds max 1024`, and the cache must
+exceed the ~12 GB corpus or every run is cold and there is no hot column to
+compare.
 
-The flags that must mirror the bench's, or the two tables are not comparable:
+Read the resolved values off the server's own startup log rather than assuming
+them, and record them with the entry (the values below are the reference-host
+32,212,254,720-byte derivation used throughout this repo; the real box's
+32,909,025,280-byte total shifts the memory-derived lines as noted above):
+
+```
+INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=8053063680 source="derived"
+INFO performance default resolved setting="catalog_cache_max_bytes" value=1610612736 source="derived"
+```
+
+Pass a flag only to measure a setting other than the derived one; a flag logs
+`source="flag"`, which is what an entry's record must show if it was not run at
+the defaults. The bench's `--cache-bytes` and `--sql-max-segments` configure the
+in-process fetcher and engine, which the Flight lane never builds, so neither
+reaches the server; leave them off the bench command, or the report header
+claims a client-side cache that took part in nothing.
+
+The bench-side flags must mirror what the server resolved, or the two tables are
+not comparable:
 
 - `--fetch-concurrency` is the same ADR-0088 knob as the bench's flag of the
   same name (logs scan partitions and in-flight segment fetches per query). This
-  is the one that moves a cold full scan the most; set both sides to the same
-  value and record it.
+  is the one that moves a cold full scan the most; set the bench's to the value
+  the server logged, and record it.
 - `--sql-max-query-bytes` is the per-query DataFusion memory-pool ceiling. A
   statement that fits the bench's budget and not the server's aborts on the
   server with `query memory budget exhausted` and lands in `failed`.
-- `--sql-tenant-max-bytes` has no bench counterpart: it is the server's
-  per-tenant ceiling across concurrent queries, which an in-process lane running
-  one statement at a time never reaches. Set it above
-  `--sql-max-query-bytes` so it is not the binding limit for a serial run.
+- `--sql-tenant-max-bytes`: the bench exposes a flag of that name, but it
+  configures only the in-process executor; on the Flight lane the client sends
+  the SQL statement alone, so the flag never reaches the server, and the
+  server's own `--sql-tenant-max-bytes` (or its derived value) governs. It is
+  the server's per-tenant ceiling across concurrent queries, which a lane
+  running one statement at a time never reaches. The derived value is twice
+  the derived per-query pool, so it is not the binding limit for a serial run;
+  an explicit value below the per-query pool clamps the per-query pool down to
+  it, and the server warns when it does.
 - Cache flags: the bench's `--cache-bytes` attaches an ADR-0046 read cache to
   its own fetcher; the server's equivalent is `--cache-max-bytes` (plus
   `--cache-dir` for the disk tier, and `--disable-cache` to turn it off). To
@@ -759,8 +788,13 @@ cargo run -p ravel-bench --features sql-latency,flight-lane --bin sql_latency_be
   --tenant clickbench --store s3 --flight 127.0.0.1:4317 \
   --corpus benchmarks/clickbench/hits.corpus.json \
   --runs 3 --compaction pre --window-hours 200000 \
-  --fetch-concurrency 8 --sql-max-query-bytes 1073741824
+  --fetch-concurrency 32 --sql-max-query-bytes 8053063680
 ```
+
+The two bench-side values are the reference host's resolved defaults, so the
+report's provenance matches the server's startup log; substitute the values
+your server logged. On the Flight lane they are recorded, not enforced: the
+server's own resolution governs every statement.
 
 - `--flight <host:port>` is the server's `--listen-grpc` address. It needs the
   `flight-lane` build feature; without it the run fails with an error naming the

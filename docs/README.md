@@ -47,8 +47,9 @@ The mental model, in the order it makes sense.
   rejection a client can see, and commit tokens. Read this to write data
   into Ravel.
 - [guides/query.md](guides/query.md): the query routes, PromQL support and
-  its rejected constructs, budgets, SQL over the `samples`, `logs` and
-  `spans` tables, and the HTTP status codes. Read this to read data back.
+  its rejected constructs, budgets, SQL over the `samples`, `logs`, `spans`,
+  `alerts` and `audit` tables, and the HTTP status codes. Read this to read
+  data back.
 - [guides/traces.md](guides/traces.md): querying spans over the `spans`
   table, why one trace is a bounded read, which predicates prune, and what
   an incomplete trace is.
@@ -57,11 +58,20 @@ The mental model, in the order it makes sense.
   exemplar query and the Grafana link.
 - [guides/alerting.md](guides/alerting.md): writing a rules file, which
   process modes evaluate it, the interval and lookback settings, and the
-  four sink kinds. Alert history is written durably and no shipped surface
-  reads it back; the page says so up front.
+  four sink kinds. Alert history is queryable through the `alerts` table:
+  the page has the columns, the predicates that prune, and the query that
+  folds the history to current state per alert.
+- [guides/audit.md](guides/audit.md): what Ravel records for every executed
+  statement, every legal hold and every reshard, who writes those records
+  and how long each shard keeps them, and the `audit` table that reads them
+  back, including the note that reading the trail is itself audited.
 - [guides/inspecting-data.md](guides/inspecting-data.md): `ravel-cli`
   worked examples that read segments, commit records and catalog listings
   straight from the bucket. Read this to see what is actually stored.
+- [guides/agents.md](guides/agents.md): the MCP surface for an AI agent
+  host, how to connect, the nine tools grouped by task, the result
+  envelope field by field, budgets and cursors, and what an empty result
+  means.
 
 ## Operate
 
@@ -116,6 +126,9 @@ The mental model, in the order it makes sense.
   codes, whether it needs a bearer token, which modes serve it, and its
   cargo feature gate where it has one. Derived from the router, not from
   another page.
+- [reference/mcp.md](reference/mcp.md): every MCP tool, its inputs, the
+  envelope blocks it uses, its bounds, and its failure classes, plus the
+  shared envelope, cursor, budget, and protocol-header contracts.
 - [reference/ravel-server-flags.md](reference/ravel-server-flags.md):
   every `ravel-server` flag, its environment variable and its default,
   generated from the binary's own definition and checked by a test.
@@ -176,9 +189,16 @@ else, and indexed here so nothing is reachable from nowhere.
 - [internal/clickbench-aws-runbook.md](internal/clickbench-aws-runbook.md):
   the same workload end to end on AWS, from an empty account to a measured
   pass.
-- [internal/coderabbit-runbook.md](internal/coderabbit-runbook.md):
-  operating the maintainer-gated code review integration, including the
-  controls that live outside this repository.
 - [internal/diagrams.md](internal/diagrams.md): what each diagram under
   `diagrams/` shows, which page it illustrates, and the visual language
   they share.
+- [guides/formal-verification.md](guides/formal-verification.md): what the
+  TLA+ suite under `formal/tla/` checks, what it does not establish, and
+  how to run it, read its results, and add a model.
+- [../formal/tla/README.md](../formal/tla/README.md): machine-checked models
+  of the commit, catalog, lifecycle, resharding, and maintenance protocols,
+  and the harness that runs them. See
+  [../formal/tla/REPORT.md](../formal/tla/REPORT.md) there for the
+  suite-wide report and
+  [../formal/tla/TRACEABILITY.md](../formal/tla/TRACEABILITY.md) for the
+  index into each area's Rust traceability table.

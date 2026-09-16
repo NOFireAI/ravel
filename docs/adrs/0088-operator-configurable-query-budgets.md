@@ -1,6 +1,6 @@
 # ADR-0088: operator-configurable query budgets
 
-Status: Accepted
+Status: Accepted (amended 2026-09-02, see "Amended 2026-09-02" below)
 
 ## Context
 
@@ -66,6 +66,9 @@ measurement-backed follow-up once real workload data exists — this ADR is
 about giving operators a lever, not about deciding where the lever should
 default to for workloads nobody has measured yet.
 
+(Superseded by the amendment below: that follow-up is issue #1141, and
+the measurement is #968.)
+
 ```mermaid
 flowchart TD
     subgraph today
@@ -126,4 +129,65 @@ flowchart TD
   `docs/guides/admission-limits.md` gain the new flags and the
   `--max-s3-requests` sizing guidance.
 - No behavior change at default flag values: every default matches
-  today's compiled-in constant exactly.
+  today's compiled-in constant exactly. (Amended below: an unset flag is
+  now derived from the host.)
+
+## Amended 2026-09-02: unset means derive (issue #1141)
+
+The follow-up this ADR deferred ("Changing the default is a separate,
+measurement-backed follow-up once real workload data exists") is now
+done. The measurement is the ClickBench result on issue #968, run on a
+16-core, 30 GB host. Every setting that run needed had to be typed on the
+command line, because each default was sized for a laptop; a deployment
+that did not read that runbook got a server that could not complete the
+workload at all. An unset flag now means DERIVE from the host, and an
+explicit flag still wins, verbatim and unchanged in meaning.
+
+The six rules, and what each is measured against on #968:
+
+| Setting | Derived default | #968 measurement |
+|---|---|---|
+| `--fetch-concurrency` | `max(8, 2 x cores)` | 32 on the 16-core host; this is the knob that moved a cold full scan the most, and it also sets the SQL scan partition count |
+| `--cache-max-bytes` (fetcher cache) | 80% of `MemTotal` | ~24 GiB, chosen to exceed the ~12 GB corpus so a warm run has a hot column to report |
+| catalog byte cache | 5% of `MemTotal` (a separate ceiling, resolved as `catalog_cache_max_bytes`) | ~1.5 GiB; the fetcher cache and the catalog byte cache are two independent LRU caches, so deriving both at 80% would commit 160% of `MemTotal`. An explicit `--cache-max-bytes` still bounds both at that one value |
+| `--sql-max-query-bytes` | 25% of `MemTotal` | ~8 GiB, an order of magnitude above the largest value the in-process lane had been run at; this is the pool an `ORDER BY` or high-cardinality `GROUP BY` exhausts with `query memory budget exhausted` |
+| `--sql-tenant-max-bytes` | 50% of `MemTotal` | ~16 GiB, twice the per-query pool so a serial run never binds on the isolation ceiling |
+| `--max-segments` | 1,000,000 | a folded ClickBench tenant resolves ~8,400 sealed segments, so the old 1024 cap failed every statement with `8424 exceeds max 1024` |
+| `--gc-max-query-duration` | 11 minutes | the deadline the run was configured with, well above the 30s compiled-in engine default its longest statements would have hit, and well under the durable `sys/gc` `max_query_duration` default of 1h that query-mode startup validates against |
+
+Consequences of the amendment:
+
+- The host is read once at startup (`HostProfile`: cores from
+  `std::thread::available_parallelism`, memory from `/proc/meminfo`'s
+  `MemTotal` on Linux) and every consumer takes the resolved value.
+  `resolve_performance_defaults` is pure and takes the profile as a
+  parameter, so no test reads the machine it runs on.
+- A host whose memory cannot be read (a non-Linux target, an unreadable
+  `/proc/meminfo`) falls back to the exact constants this ADR shipped:
+  256 MiB, 1 GiB, 256 MiB cache. A percentage of an unknown total is not
+  a number, and assuming one would size a 24 GiB cache on a 2 GB box.
+- The per-query SQL pool and the per-tenant ceiling are reconciled so
+  `sql_max_query_bytes <= sql_tenant_max_bytes` always holds, and which
+  side gives depends on which was set explicitly (issue #1141 refinement).
+  An explicit `--sql-max-query-bytes` over a non-explicit (derived or
+  fallback) tenant ceiling RAISES the ceiling to the per-query flag, so an
+  operator who typed a per-query pool on a host whose `MemTotal` was
+  unknown is not silently cut to the 1 GiB fallback tenant ceiling they
+  never set. Any other crossing (an explicit tenant ceiling, or a
+  non-explicit per-query value) CLAMPS the per-query pool down and warns:
+  lowering the multi-tenant isolation bound an operator explicitly set is
+  the one direction this ADR's "Rejected alternatives" defends against.
+  Both events are logged at startup (`sql_tenant_max_bytes_raised` /
+  `sql_max_query_bytes_clamped`).
+- The amendment answers this ADR's "Auto-tune budgets from host resources
+  at startup", rejected above as hiding the actual bound in play from
+  whoever reads the startup flags. That objection is met by making the
+  resolution visible rather than by not deriving: startup logs one line
+  per setting with its value and its source (`derived`, `flag`, or
+  `fallback`), which is a stronger audit surface than a flag list, since
+  it reports the number in force rather than the number requested.
+- Percentages are integer arithmetic with truncation, computed in `u128`,
+  so a resolved figure is reproducible from `MemTotal` by hand.
+- The reachability criterion above is unchanged and extended: the derived
+  value, not just the flag value, is proven to arrive at the
+  `EngineConfig`/`SqlConfig`/cache the process actually uses.

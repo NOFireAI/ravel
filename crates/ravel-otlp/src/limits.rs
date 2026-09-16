@@ -39,6 +39,19 @@ pub struct IngestLimits {
     pub max_data_points_per_request: usize,
     /// Attributes on a single data point.
     pub max_attributes_per_point: usize,
+    /// Explicit bounds on a single classic `Histogram` data point (ADR-0016).
+    /// A security control, not a tuning knob, for the same reason the
+    /// exemplar cap below is one: a classic histogram explodes into one
+    /// series per bound plus `+Inf`/`_sum`/`_count`, each carrying its own
+    /// copy of the base label set, so an uncapped bound list lets one data
+    /// point multiply in-process allocation at will, and nothing else in the
+    /// request bounds it (`max_data_points_per_request` counts wire data
+    /// points, of which such a request needs only a handful). Default 160,
+    /// an order of magnitude above the widest bound list a real exporter
+    /// emits: the Prometheus Go client's `DefBuckets` is 11 bounds and the
+    /// OpenTelemetry SDK's default explicit-bucket boundaries are 15, and
+    /// hand-configured exponential ladders top out in the tens.
+    pub max_histogram_buckets: usize,
     /// Bytes in a label name, checked after sanitization.
     pub max_label_name_len: usize,
     /// Bytes in a label value.
@@ -77,6 +90,7 @@ impl Default for IngestLimits {
         IngestLimits {
             max_data_points_per_request: 100_000,
             max_attributes_per_point: 64,
+            max_histogram_buckets: 160,
             max_label_name_len: 256,
             max_label_value_len: 4096,
             max_metric_name_len: 512,
@@ -113,6 +127,20 @@ pub fn default_resource_attribute_allowlist() -> Vec<String> {
 pub enum Rejection {
     #[error("request has {count} data points, more than the per-request limit of {max}")]
     TooManyDataPoints { count: usize, max: usize },
+
+    /// The request's wire data-point count fits `max_data_points_per_request`,
+    /// but the normalized points its classic histograms and summaries explode
+    /// into (ADR-0016) do not. `count` stays the wire data-point count, which
+    /// is the unit ADR-0016 keeps the sender-facing rejected total in;
+    /// `exploded` is the figure that breached the limit.
+    #[error(
+        "request expands to {exploded} normalized points from {count} data points, more than the per-request limit of {max}"
+    )]
+    TooManyExplodedPoints {
+        exploded: usize,
+        count: usize,
+        max: usize,
+    },
 
     #[error(
         "resource has more attributes than the limit of {max}; rejecting {count} data points under it"
@@ -151,15 +179,13 @@ pub enum Rejection {
     #[error("data point has neither an int nor a double value set")]
     MissingValue,
 
-    #[error("metric type {metric_type} is not supported in phase 1; rejecting {count} data points")]
+    #[error("metric type {metric_type} is not supported; rejecting {count} data points")]
     UnsupportedMetricType {
         metric_type: &'static str,
         count: usize,
     },
 
-    #[error(
-        "only cumulative-temporality sums are supported in phase 1; rejecting {count} data points"
-    )]
+    #[error("only cumulative-temporality sums are supported; rejecting {count} data points")]
     UnsupportedTemporality { count: usize },
 
     #[error("event timestamp is zero")]
@@ -186,6 +212,9 @@ pub enum Rejection {
         buckets: usize,
         expected: usize,
     },
+
+    #[error("histogram has {bounds} explicit bounds, more than the per-point limit of {max}")]
+    TooManyHistogramBuckets { bounds: usize, max: usize },
 
     #[error("histogram explicit_bounds contains a NaN or infinite value")]
     NonFiniteHistogramBound,
@@ -261,13 +290,154 @@ pub enum Rejection {
     },
 }
 
+/// Which admission `reason` a normalization-layer rejection is counted under
+/// (ADR-0051 section 3 layer 3, section 6).
+///
+/// Layer 3 is "structural and event-time bounds, in normalization, per point /
+/// record / span". Those are the only two reasons the layer can produce, so
+/// the classification is total over every rejection that costs the sender a
+/// point, record, or span:
+///
+/// * [`AdmissionClass::Skew`] is the event-time arm: the sender's timestamp
+///   could not be placed in the admission window around ingest time.
+/// * [`AdmissionClass::Structural`] is everything else the layer refuses:
+///   a shape, a type, a limit, or a value the storage format cannot represent.
+///
+/// A rejection that costs the sender nothing (an informational drop of a
+/// histogram `min`/`max`, an exemplar, or a single attribute of an otherwise
+/// admitted record) has no class: it is not an admission rejection and must
+/// never move a rejected counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionClass {
+    Skew,
+    Structural,
+}
+
+/// Rejected points, records, or spans totalled per [`AdmissionClass`] over one
+/// normalization pass, ready to be recorded against the `reason` label on
+/// `ravel_admission_rejected_total`.
+///
+/// Each unit is counted once, with the same `rejected_count()` multiplier the
+/// OTLP partial-success response reports, so the counter and the response
+/// cannot disagree about how many units a request lost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NormalizeRejectCounts {
+    pub skew: usize,
+    pub structural: usize,
+}
+
+impl NormalizeRejectCounts {
+    /// Whether anything at all was rejected, so a caller can skip taking a
+    /// counter lock on the (overwhelmingly common) clean request.
+    pub fn is_empty(&self) -> bool {
+        self.skew == 0 && self.structural == 0
+    }
+
+    pub fn add(&mut self, class: Option<AdmissionClass>, count: usize) {
+        match class {
+            Some(AdmissionClass::Skew) => self.skew += count,
+            Some(AdmissionClass::Structural) => self.structural += count,
+            None => {}
+        }
+    }
+
+    /// Total the metric path's rejections by class.
+    pub fn from_metric_rejections(rejected: &[Rejection]) -> Self {
+        let mut counts = Self::default();
+        for rejection in rejected {
+            counts.add(rejection.admission_class(), rejection.rejected_count());
+        }
+        counts
+    }
+
+    /// Total the log path's rejections by class.
+    pub fn from_log_rejections(rejected: &[crate::logs_limits::LogRejection]) -> Self {
+        let mut counts = Self::default();
+        for rejection in rejected {
+            counts.add(rejection.admission_class(), rejection.rejected_count());
+        }
+        counts
+    }
+
+    /// Total the trace path's rejections by class.
+    pub fn from_span_rejections(rejected: &[crate::traces_limits::SpanRejection]) -> Self {
+        let mut counts = Self::default();
+        for rejection in rejected {
+            counts.add(rejection.admission_class(), rejection.rejected_count());
+        }
+        counts
+    }
+}
+
 impl Rejection {
+    /// The admission `reason` this rejection is counted under, or `None` when
+    /// it costs the sender no data point (the informational variants, whose
+    /// [`Rejection::rejected_count`] is 0).
+    ///
+    /// Exhaustive on purpose: a new variant does not compile until it has been
+    /// classified, so a normalize-layer rejection cannot be added and then
+    /// silently go uncounted.
+    pub fn admission_class(&self) -> Option<AdmissionClass> {
+        match self {
+            // Event-time arm. `ZeroTimestamp` belongs here with the two bound
+            // breaches: all three come out of the event-time check, and a zero
+            // event time is unbounded lag against any plausible ingest clock.
+            Rejection::ZeroTimestamp | Rejection::FutureSkew { .. } | Rejection::TooOld { .. } => {
+                Some(AdmissionClass::Skew)
+            }
+
+            // Structural arm: a shape, type, limit, or value the storage
+            // format cannot represent.
+            Rejection::TooManyDataPoints { .. }
+            | Rejection::TooManyExplodedPoints { .. }
+            | Rejection::TooManyResourceAttributes { .. }
+            | Rejection::MetricNameTooLong { .. }
+            | Rejection::EmptyMetricName { .. }
+            | Rejection::TooManyAttributes { .. }
+            | Rejection::LabelNameTooLong { .. }
+            | Rejection::LabelValueTooLong { .. }
+            | Rejection::DuplicateLabelName(_)
+            | Rejection::ComplexAttributeValue
+            | Rejection::MissingValue
+            | Rejection::UnsupportedMetricType { .. }
+            | Rejection::UnsupportedTemporality { .. }
+            | Rejection::OversizedSeriesComponent
+            | Rejection::HistogramBucketCountMismatch { .. }
+            | Rejection::TooManyHistogramBuckets { .. }
+            | Rejection::NonFiniteHistogramBound
+            | Rejection::HistogramBoundsNotIncreasing
+            | Rejection::HistogramCountOverflow
+            | Rejection::NativeHistogramScaleUnsupported { .. }
+            | Rejection::NativeHistogramCountInconsistent
+            | Rejection::NativeHistogramCountOverflow
+            | Rejection::NonFiniteQuantile
+            | Rejection::DuplicateQuantile => Some(AdmissionClass::Structural),
+
+            // Informational: the point was admitted and stored.
+            Rejection::HistogramMinMaxDropped { .. }
+            | Rejection::HistogramExemplarsDropped { .. }
+            | Rejection::IntegerValuePrecisionLoss { .. } => None,
+
+            // A grouped rejection carries its own point count; the class is
+            // the shared reason's. Delegating is safe only because the metrics
+            // path groups nothing but a `build_resource_labels` failure
+            // (`crate::normalize`), whose reasons are all in the structural arm
+            // above: `LabelNameTooLong`, `LabelValueTooLong`, and
+            // `ComplexAttributeValue`. Grouping a reason that classes `None`
+            // needs this arm to classify the group instead, the way
+            // `crate::logs_limits::LogRejection::admission_class` does, or the
+            // whole-resource loss goes uncounted.
+            Rejection::Grouped { reason, .. } => reason.admission_class(),
+        }
+    }
+
     /// Number of underlying OTLP data points this rejection accounts for.
     /// Summing this over [`crate::normalize::NormalizeOutput::rejected`]
     /// gives the count to report in an OTLP `rejected_data_points` field.
     pub fn rejected_count(&self) -> usize {
         match self {
             Rejection::TooManyDataPoints { count, .. }
+            | Rejection::TooManyExplodedPoints { count, .. }
             | Rejection::TooManyResourceAttributes { count, .. }
             | Rejection::MetricNameTooLong { count, .. }
             | Rejection::EmptyMetricName { count }
@@ -292,6 +462,7 @@ mod tests {
         let limits = IngestLimits::default();
         assert_eq!(limits.max_data_points_per_request, 100_000);
         assert_eq!(limits.max_attributes_per_point, 64);
+        assert_eq!(limits.max_histogram_buckets, 160);
         assert_eq!(limits.max_label_name_len, 256);
         assert_eq!(limits.max_label_value_len, 4096);
         assert_eq!(limits.max_metric_name_len, 512);
@@ -339,5 +510,199 @@ mod tests {
         };
         assert_eq!(r.rejected_count(), 100_000);
         assert!(r.to_string().contains("100000"));
+    }
+
+    /// Every [`Rejection`] variant's admission class, one case per variant.
+    ///
+    /// The `match` is exhaustive so a variant added to the enum does not
+    /// compile until it has been given an expected class here, which is what
+    /// stops a new metric-path rejection from going silently unclassified.
+    /// Before this test, `Rejection::admission_class` was covered only by two
+    /// ravel-server integration tests pinning `UnsupportedTemporality` and
+    /// `TooOld`, so every other variant could change arm unnoticed.
+    ///
+    /// `ZeroTimestamp` is the judgement call and is named explicitly below: a
+    /// zero event time is classified as skew, not structural, because it
+    /// comes out of the event-time check and is unbounded lag against any
+    /// plausible ingest clock. Moving it to the structural arm is a change to
+    /// what `ravel_admission_rejected_total{reason=...}` reports, and it
+    /// fails here.
+    #[test]
+    fn every_rejection_variant_has_its_expected_admission_class() {
+        fn expected(rejection: &Rejection) -> Option<AdmissionClass> {
+            let skew = Some(AdmissionClass::Skew);
+            let structural = Some(AdmissionClass::Structural);
+            match rejection {
+                Rejection::ZeroTimestamp => skew,
+                Rejection::FutureSkew { .. } => skew,
+                Rejection::TooOld { .. } => skew,
+
+                Rejection::TooManyDataPoints { .. } => structural,
+                Rejection::TooManyExplodedPoints { .. } => structural,
+                Rejection::TooManyResourceAttributes { .. } => structural,
+                Rejection::MetricNameTooLong { .. } => structural,
+                Rejection::EmptyMetricName { .. } => structural,
+                Rejection::TooManyAttributes { .. } => structural,
+                Rejection::LabelNameTooLong { .. } => structural,
+                Rejection::LabelValueTooLong { .. } => structural,
+                Rejection::DuplicateLabelName(_) => structural,
+                Rejection::ComplexAttributeValue => structural,
+                Rejection::MissingValue => structural,
+                Rejection::UnsupportedMetricType { .. } => structural,
+                Rejection::UnsupportedTemporality { .. } => structural,
+                Rejection::OversizedSeriesComponent => structural,
+                Rejection::HistogramBucketCountMismatch { .. } => structural,
+                Rejection::TooManyHistogramBuckets { .. } => structural,
+                Rejection::NonFiniteHistogramBound => structural,
+                Rejection::HistogramBoundsNotIncreasing => structural,
+                Rejection::HistogramCountOverflow => structural,
+                Rejection::NativeHistogramScaleUnsupported { .. } => structural,
+                Rejection::NativeHistogramCountInconsistent => structural,
+                Rejection::NativeHistogramCountOverflow => structural,
+                Rejection::NonFiniteQuantile => structural,
+                Rejection::DuplicateQuantile => structural,
+
+                // Informational: the point was admitted and stored, so it
+                // costs the sender nothing and must move no counter.
+                Rejection::HistogramMinMaxDropped { .. } => None,
+                Rejection::HistogramExemplarsDropped { .. } => None,
+                Rejection::IntegerValuePrecisionLoss { .. } => None,
+
+                // Carries its reason's class, whatever that reason is.
+                Rejection::Grouped { reason, .. } => expected(reason),
+            }
+        }
+
+        // One value per variant. The `match` above does not compile with a
+        // variant missing; this list is what makes each case run.
+        let variants = [
+            Rejection::TooManyDataPoints {
+                count: 1,
+                max: 100_000,
+            },
+            Rejection::TooManyExplodedPoints {
+                exploded: 200_003,
+                count: 1,
+                max: 100_000,
+            },
+            Rejection::TooManyResourceAttributes { count: 1, max: 128 },
+            Rejection::MetricNameTooLong {
+                len: 600,
+                max: 512,
+                count: 1,
+            },
+            Rejection::EmptyMetricName { count: 1 },
+            Rejection::TooManyAttributes {
+                attribute_count: 65,
+                max: 64,
+            },
+            Rejection::LabelNameTooLong { len: 300, max: 256 },
+            Rejection::LabelValueTooLong {
+                len: 5000,
+                max: 4096,
+            },
+            Rejection::DuplicateLabelName("x".to_string()),
+            Rejection::ComplexAttributeValue,
+            Rejection::MissingValue,
+            Rejection::UnsupportedMetricType {
+                metric_type: "histogram",
+                count: 1,
+            },
+            Rejection::UnsupportedTemporality { count: 1 },
+            Rejection::ZeroTimestamp,
+            Rejection::FutureSkew {
+                skew_ns: 1,
+                max_ns: 0,
+            },
+            Rejection::TooOld {
+                lag_ns: 1,
+                max_ns: 0,
+            },
+            Rejection::OversizedSeriesComponent,
+            Rejection::HistogramBucketCountMismatch {
+                bounds: 1,
+                buckets: 1,
+                expected: 2,
+            },
+            Rejection::TooManyHistogramBuckets {
+                bounds: 161,
+                max: 160,
+            },
+            Rejection::NonFiniteHistogramBound,
+            Rejection::HistogramBoundsNotIncreasing,
+            Rejection::HistogramCountOverflow,
+            Rejection::NativeHistogramScaleUnsupported { scale: -54 },
+            Rejection::NativeHistogramCountInconsistent,
+            Rejection::NativeHistogramCountOverflow,
+            Rejection::NonFiniteQuantile,
+            Rejection::DuplicateQuantile,
+            Rejection::HistogramMinMaxDropped { count: 1 },
+            Rejection::HistogramExemplarsDropped { count: 1 },
+            Rejection::IntegerValuePrecisionLoss { value: i64::MAX },
+            Rejection::Grouped {
+                reason: Box::new(Rejection::ComplexAttributeValue),
+                count: 3,
+            },
+        ];
+
+        // One entry per variant, each a distinct one, so no variant is
+        // covered twice while another is missing.
+        assert_eq!(variants.len(), 31);
+        for (i, a) in variants.iter().enumerate() {
+            for b in &variants[i + 1..] {
+                assert_ne!(
+                    std::mem::discriminant(a),
+                    std::mem::discriminant(b),
+                    "{a} and {b} are the same variant"
+                );
+            }
+        }
+
+        for rejection in &variants {
+            assert_eq!(
+                rejection.admission_class(),
+                expected(rejection),
+                "{rejection}"
+            );
+        }
+
+        // `ZeroTimestamp` by name, so the judgement call is pinned where a
+        // reader looking for it will find it and not only inside the loop.
+        assert_eq!(
+            Rejection::ZeroTimestamp.admission_class(),
+            Some(AdmissionClass::Skew)
+        );
+
+        // A grouped rejection takes its inner reason's class, including the
+        // skew arm, so the wrapper cannot silently reclassify.
+        assert_eq!(
+            Rejection::Grouped {
+                reason: Box::new(Rejection::ZeroTimestamp),
+                count: 4,
+            }
+            .admission_class(),
+            Some(AdmissionClass::Skew)
+        );
+    }
+
+    /// `add` routes each class to its own field and leaves the other
+    /// untouched, and `None` moves neither. Pinned in this crate because a
+    /// crate-scoped gate here otherwise cannot catch an arm swap: only the
+    /// server crate exercised this arithmetic before.
+    #[test]
+    fn add_routes_each_class_to_its_own_field() {
+        let mut counts = NormalizeRejectCounts::default();
+        counts.add(Some(AdmissionClass::Skew), 3);
+        assert_eq!(counts.skew, 3);
+        assert_eq!(counts.structural, 0);
+
+        counts.add(Some(AdmissionClass::Structural), 5);
+        assert_eq!(counts.skew, 3);
+        assert_eq!(counts.structural, 5);
+
+        counts.add(None, 100);
+        assert_eq!(counts.skew, 3);
+        assert_eq!(counts.structural, 5);
+        assert!(!counts.is_empty());
     }
 }

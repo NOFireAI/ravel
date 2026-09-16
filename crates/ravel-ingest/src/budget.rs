@@ -1,10 +1,15 @@
 //! Process-wide ingest buffer byte budget (ADR-0069 decision 1).
 //!
 //! Ravel's memory model is configuration-bounded per tenant and per query, but
-//! nothing bounded the *sum* of buffered ingest state across tenants: the
-//! per-(tenant, shard, signal) buffer cap is ~8 MiB, so the worst case grows
+//! nothing bounded the *sum* of buffered ingest state across tenants: each
+//! per-(tenant, shard, signal) buffer may hold up to the memory backstop
+//! ([`crate::config::buffer_memory_backstop_bytes`]: an eighth of this ceiling,
+//! capped at 64 MiB and never below `target_bytes`), so the worst case grows
 //! with active-tenant count and can exceed an 8 GB host's RAM before any
-//! per-tenant limit trips (ADR-0069 Context). [`IngestByteBudget`] is the one
+//! per-tenant limit trips (ADR-0069 Context). The backstop is derived from the
+//! ceiling configured here, so raising or lowering `--max-ingest-buffer-bytes`
+//! moves the per-buffer bound with it and no single buffer can take a large
+//! share of the budget. [`IngestByteBudget`] is the one
 //! process-wide gauge that bounds it: a request's estimated buffered bytes are
 //! charged at admission (after decode, before buffering), and refunded when the
 //! flush that held them completes or fails.
@@ -143,6 +148,15 @@ impl IngestByteBudget {
         self.limit
     }
 
+    /// The configured ceiling in the form the callers configured it, for a
+    /// router to publish to its shard actors via [`BufferBudgetCeiling`].
+    pub(crate) fn limit(&self) -> IngestByteBudgetLimit {
+        match self.limit {
+            Some(n) => IngestByteBudgetLimit::Bounded(n),
+            None => IngestByteBudgetLimit::Unlimited,
+        }
+    }
+
     /// Cumulative requests shed at the ceiling since process start, for the
     /// `ravel_ingest_buffer_shed_total` counter on `/metrics`.
     pub fn shed_total(&self) -> u64 {
@@ -173,6 +187,49 @@ impl IngestByteBudget {
                 Ok(_) => break,
                 Err(observed) => current = observed,
             }
+        }
+    }
+}
+
+/// The configured ceiling, shared live with every shard actor of one router so
+/// the per-buffer memory backstop
+/// ([`crate::config::buffer_memory_backstop_bytes`]) can be a fraction of the
+/// limit an operator actually set rather than of the default.
+///
+/// It is a shared cell rather than a plain value because the budget arrives
+/// after the actors exist: [`crate::IngestRouter::new`] spawns the shard-actor
+/// factory, and `services/ravel-server` installs the configured budget
+/// afterwards with `with_budget`. Every actor clones this cell and reads it at
+/// trigger time, so the install order does not matter and a later generation's
+/// actors see the same value.
+///
+/// `u64::MAX` encodes [`IngestByteBudgetLimit::Unlimited`]. That makes
+/// `Bounded(u64::MAX)` indistinguishable from `Unlimited`, which costs nothing:
+/// the backstop is capped well below an eighth of `u64::MAX`, so both spellings
+/// derive the identical backstop.
+#[derive(Debug, Clone)]
+pub(crate) struct BufferBudgetCeiling(Arc<AtomicU64>);
+
+/// The `Unlimited` encoding for [`BufferBudgetCeiling`].
+const CEILING_UNLIMITED: u64 = u64::MAX;
+
+impl BufferBudgetCeiling {
+    pub(crate) fn unlimited() -> Self {
+        BufferBudgetCeiling(Arc::new(AtomicU64::new(CEILING_UNLIMITED)))
+    }
+
+    pub(crate) fn set(&self, limit: IngestByteBudgetLimit) {
+        let encoded = match limit {
+            IngestByteBudgetLimit::Bounded(n) => n,
+            IngestByteBudgetLimit::Unlimited => CEILING_UNLIMITED,
+        };
+        self.0.store(encoded, Ordering::Relaxed);
+    }
+
+    pub(crate) fn get(&self) -> IngestByteBudgetLimit {
+        match self.0.load(Ordering::Relaxed) {
+            CEILING_UNLIMITED => IngestByteBudgetLimit::Unlimited,
+            n => IngestByteBudgetLimit::Bounded(n),
         }
     }
 }

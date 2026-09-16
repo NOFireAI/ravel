@@ -27,7 +27,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{ByteLimit, EngineConfig, RequestLimit, SegmentFetcher};
+use ravel_query::{ByteLimit, EngineConfig, PhaseAccounting, RequestLimit, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{RavelTableProvider, SqlConfig, TenantMemoryAccountant};
 use ravel_types::accounting::QueryAccounting;
@@ -245,7 +245,7 @@ async fn max_series_rejects_before_every_segment_is_fetched() {
         TENANT,
         baseline_fetcher,
         baseline_config,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let baseline_plan = baseline_provider.plan(1).expect("plan");
     collect(baseline_plan, Arc::new(TaskContext::default()))
@@ -273,7 +273,7 @@ async fn max_series_rejects_before_every_segment_is_fetched() {
         TENANT,
         capped_fetcher,
         capped_config,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let capped_plan = capped_provider.plan(1).expect("plan");
     let err = collect(capped_plan, Arc::new(TaskContext::default()))
@@ -325,7 +325,7 @@ async fn max_bytes_scanned_rejects_before_every_segment_is_fetched() {
         TENANT,
         baseline_fetcher,
         baseline_config,
-        baseline_acc.clone(),
+        PhaseAccounting::pooled_over(&baseline_acc),
     );
     let baseline_plan = baseline_provider.plan(1).expect("plan");
     collect(baseline_plan, Arc::new(TaskContext::default()))
@@ -354,7 +354,7 @@ async fn max_bytes_scanned_rejects_before_every_segment_is_fetched() {
         TENANT,
         capped_fetcher,
         capped_config,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let capped_plan = capped_provider.plan(1).expect("plan");
     let err = collect(capped_plan, Arc::new(TaskContext::default()))
@@ -391,7 +391,7 @@ async fn unlimited_bytes_scanned_matches_prior_behavior() {
         ..EngineConfig::default()
     };
     let provider =
-        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, PhaseAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let batches = collect(plan, Arc::new(TaskContext::default()))
         .await
@@ -437,7 +437,7 @@ async fn max_s3_requests_rejects_before_every_segment_is_fetched() {
         TENANT,
         baseline_fetcher,
         baseline_config,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let baseline_plan = baseline_provider.plan(1).expect("plan");
     collect(baseline_plan, Arc::new(TaskContext::default()))
@@ -461,7 +461,7 @@ async fn max_s3_requests_rejects_before_every_segment_is_fetched() {
         TENANT,
         capped_fetcher,
         capped_config,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let capped_plan = capped_provider.plan(1).expect("plan");
     let err = collect(capped_plan, Arc::new(TaskContext::default()))
@@ -478,6 +478,172 @@ async fn max_s3_requests_rejects_before_every_segment_is_fetched() {
     );
 }
 
+/// A `PhaseAccounting` built by `pooled_over` has four phases that are clones
+/// of one shared `QueryAccounting`, so reducing its snapshot with
+/// `.pooled()` reads that one counter four times and reports 4x the real
+/// total. `RsegScanExec`'s S3-request budget check must cost an aliased
+/// handle exactly like an independent one: the real GET count cannot depend
+/// on which `PhaseAccounting` constructor built the handle it was given.
+/// This fixture issues exactly one GET per segment (confirmed by
+/// `max_s3_requests_rejects_before_every_segment_is_fetched` above), so a
+/// budget of 6 comfortably fits the 5 real GETs both handles must issue;
+/// pre-fix, the aliased handle's 4x-inflated reduction reports 8 after only
+/// 2 real GETs and trips early.
+#[tokio::test]
+async fn pooled_over_handle_does_not_quadruple_count_the_request_budget() {
+    let specs = five_segments_two_series_each();
+    let raw_store = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(raw_store.as_ref(), &specs).await;
+
+    let split_store = CountingStore::wrap(raw_store.clone());
+    let split_fetcher =
+        SegmentFetcher::new(Arc::clone(&split_store) as Arc<dyn ObjectStoreBackend>);
+    let split_provider = RavelTableProvider::new(
+        snapshot.clone(),
+        TENANT,
+        split_fetcher,
+        EngineConfig {
+            max_s3_requests: RequestLimit::Bounded(6),
+            ..EngineConfig::default()
+        },
+        PhaseAccounting::new(),
+    );
+    let split_plan = split_provider.plan(1).expect("plan");
+    collect(split_plan, Arc::new(TaskContext::default()))
+        .await
+        .expect("an independent per-phase handle must fit 5 real GETs under a budget of 6");
+    assert_eq!(
+        split_store.gets(),
+        5,
+        "the split handle must fetch every one of the 5 segments"
+    );
+
+    let pooled_store = CountingStore::wrap(raw_store.clone());
+    let pooled_fetcher =
+        SegmentFetcher::new(Arc::clone(&pooled_store) as Arc<dyn ObjectStoreBackend>);
+    let acc = QueryAccounting::new();
+    let pooled_provider = RavelTableProvider::new(
+        snapshot,
+        TENANT,
+        pooled_fetcher,
+        EngineConfig {
+            max_s3_requests: RequestLimit::Bounded(6),
+            ..EngineConfig::default()
+        },
+        PhaseAccounting::pooled_over(&acc),
+    );
+    let pooled_plan = pooled_provider.plan(1).expect("plan");
+    collect(pooled_plan, Arc::new(TaskContext::default()))
+        .await
+        .expect(
+            "an aliased pooled_over handle must cost the same real budget as an \
+             independent one: 5 real GETs must still fit under 6",
+        );
+    assert_eq!(
+        pooled_store.gets(),
+        5,
+        "the aliased handle must fetch every one of the 5 segments too, matching \
+         the split handle exactly"
+    );
+    assert_eq!(
+        acc.snapshot().total_s3_requests(),
+        5,
+        "the real, non-aliased request total behind the aliased handle must equal \
+         the split handle's real total (5), not 4x it (20)"
+    );
+}
+
+/// Same regression as
+/// [`pooled_over_handle_does_not_quadruple_count_the_request_budget`], for the
+/// bytes-scanned budget check (`scan.rs`'s other affected line).
+#[tokio::test]
+async fn pooled_over_handle_does_not_quadruple_count_the_bytes_scanned_budget() {
+    let specs = five_segments_two_series_each();
+    let raw_store = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(raw_store.as_ref(), &specs).await;
+
+    // Learn the real total bytes scanned across all 5 segments, the same way
+    // `max_bytes_scanned_rejects_before_every_segment_is_fetched` sizes its
+    // cap, then use that exact total as the budget: not exceeded by the real
+    // total, but exceeded by a 4x-inflated pooled reduction partway through.
+    let probe_store = CountingStore::wrap(raw_store.clone());
+    let probe_fetcher =
+        SegmentFetcher::new(Arc::clone(&probe_store) as Arc<dyn ObjectStoreBackend>);
+    let probe_acc = QueryAccounting::new();
+    let probe_provider = RavelTableProvider::new(
+        snapshot.clone(),
+        TENANT,
+        probe_fetcher,
+        EngineConfig {
+            max_bytes_scanned: ByteLimit::Unlimited,
+            ..EngineConfig::default()
+        },
+        PhaseAccounting::pooled_over(&probe_acc),
+    );
+    let probe_plan = probe_provider.plan(1).expect("plan");
+    collect(probe_plan, Arc::new(TaskContext::default()))
+        .await
+        .expect("Unlimited must not trip");
+    let total_bytes = probe_acc.snapshot().total_s3_bytes();
+    assert!(total_bytes > 0, "the probe must have scanned some bytes");
+
+    let split_store = CountingStore::wrap(raw_store.clone());
+    let split_fetcher =
+        SegmentFetcher::new(Arc::clone(&split_store) as Arc<dyn ObjectStoreBackend>);
+    let split_provider = RavelTableProvider::new(
+        snapshot.clone(),
+        TENANT,
+        split_fetcher,
+        EngineConfig {
+            max_bytes_scanned: ByteLimit::Bounded(total_bytes),
+            ..EngineConfig::default()
+        },
+        PhaseAccounting::new(),
+    );
+    let split_plan = split_provider.plan(1).expect("plan");
+    collect(split_plan, Arc::new(TaskContext::default()))
+        .await
+        .expect("an independent per-phase handle at exactly the real total must not trip");
+    assert_eq!(
+        split_store.gets(),
+        5,
+        "the split handle must fetch every one of the 5 segments"
+    );
+
+    let pooled_store = CountingStore::wrap(raw_store.clone());
+    let pooled_fetcher =
+        SegmentFetcher::new(Arc::clone(&pooled_store) as Arc<dyn ObjectStoreBackend>);
+    let acc = QueryAccounting::new();
+    let pooled_provider = RavelTableProvider::new(
+        snapshot,
+        TENANT,
+        pooled_fetcher,
+        EngineConfig {
+            max_bytes_scanned: ByteLimit::Bounded(total_bytes),
+            ..EngineConfig::default()
+        },
+        PhaseAccounting::pooled_over(&acc),
+    );
+    let pooled_plan = pooled_provider.plan(1).expect("plan");
+    collect(pooled_plan, Arc::new(TaskContext::default()))
+        .await
+        .expect(
+            "an aliased pooled_over handle must cost the same real byte budget as an \
+             independent one: the real total never exceeds the budget",
+        );
+    assert_eq!(
+        pooled_store.gets(),
+        5,
+        "the aliased handle must fetch every one of the 5 segments too"
+    );
+    assert_eq!(
+        acc.snapshot().total_s3_bytes(),
+        total_bytes,
+        "the real byte total behind the aliased handle must equal the split \
+         handle's real total, not 4x it"
+    );
+}
+
 fn task_ctx_with_query_bytes(max_query_bytes: usize) -> Arc<TaskContext> {
     let config = SqlConfig {
         engine: EngineConfig::default(),
@@ -489,8 +655,13 @@ fn task_ctx_with_query_bytes(max_query_bytes: usize) -> Arc<TaskContext> {
         // Named explicitly rather than spread from the default so a new field
         // keeps failing this initializer closed.
         late_materialization_extra_columns: None,
+        // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
+        // default, since none of these fixtures plans a grouped top-k.
+        bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
+        // Issue #913: the per-segment timeline off, as on the shipped default.
+        segment_timing: false,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
@@ -537,7 +708,7 @@ async fn byte_budget_rejects_during_fetch_decode_not_only_after_batches() {
         TENANT,
         fetcher,
         EngineConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let plan = provider.plan(1).expect("plan");
     let mut stream = plan.execute(0, task_ctx).expect("execute");

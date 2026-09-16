@@ -270,6 +270,9 @@ pub fn request(sql: &str) -> SqlRequest {
         min_tokens: Vec::new(),
         now_ns: NOW_NS,
         deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     }
 }
 

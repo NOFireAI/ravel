@@ -43,7 +43,7 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue, DictEntry};
-use ravel_query::LogSegmentFetcher;
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision, SqlConfig,
     TenantMemoryAccountant, build_session,
@@ -227,6 +227,7 @@ fn loaded_stats(entries: Vec<(&SegmentRef, ColumnStatsSegment)>) -> Arc<LoadedCo
     }
     Arc::new(LoadedColumnStats {
         segments,
+        by_content_hash: HashMap::new(),
         part_blake3: Vec::new(),
     })
 }
@@ -283,7 +284,7 @@ fn provider(
         snapshot,
         TENANT,
         LogSegmentFetcher::new(backend),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_declared_columns(declared)
     .with_column_stats(stats)

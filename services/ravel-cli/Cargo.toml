@@ -109,11 +109,14 @@ tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 # `LogsTableProvider` logs path is in ravel-sql's default build (the
 # `flight-sql` feature only gates the Flight transport), so no feature is
 # needed here.
-ravel-sql = { path = "../../crates/ravel-sql", version = "0.12.0" }
+ravel-sql = { path = "../../crates/ravel-sql", version = "0.15.0" }
 # The reachability test builds a SqlExecutor's segment fetchers from ravel-query
 # (SegmentFetcher/LogSegmentFetcher/SpanSegmentFetcher); ravel-catalog is
 # already a normal dependency. Workspace pin, test construction only.
 ravel-query = { workspace = true }
+# build_sql_state's process_memory_budget argument (ADR-1170) needs an
+# Arc<MemoryBudget> at test call sites. Workspace pin, test construction only.
+ravel-memory = { workspace = true }
 # Implementing a small `ObjectStoreBackend` test wrapper (hide one key from
 # LIST) needs the same async-trait the trait itself uses. Already a workspace
 # pin; adds no new external crate.
@@ -126,7 +129,7 @@ async-trait = { workspace = true }
 # ravel-server is a workspace path crate not listed in
 # `[workspace.dependencies]`, so it is named by path with a pinned version here,
 # exactly as ravel-sql above is; no new external crate enters Cargo.lock.
-ravel-server = { path = "../ravel-server", version = "0.12.0", features = ["sql"] }
+ravel-server = { path = "../ravel-server", version = "0.15.0", features = ["sql"] }
 # The reachability test's axum request/response plumbing (the same shape
 # ravel-server's own endpoint tests use). Already resolved in this workspace's
 # dependency graph; test-only.

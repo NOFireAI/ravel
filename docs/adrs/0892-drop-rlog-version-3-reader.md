@@ -1,25 +1,44 @@
 # ADR-0892: Drop the RLOG version-3 reader
 
-Status: Proposed
+Status: Accepted
+
+Implemented 2026-09-07. `crates/ravel-logseg/src/footer.rs` now declares
+`SUPPORTED_VERSIONS` as `SupportedVersions::single(VERSION)`, pinned by an
+exclusivity test naming this ADR; the pre-filter from decision 4 is
+`refuse_unreadable_version` in `crates/ravel-sql/src/logs_scan.rs`, citing
+"ADR-0892 decision 4" by name in its own doc comment; and the routing test
+from decision 5 is rewritten in
+`crates/ravel-sql/tests/logs_fast_path_projection_routing.rs` as
+`narrow_projection_over_v3_segment_is_refused_before_any_request` and
+`plan_path_over_v3_segment_is_refused_before_any_request`. The Context below
+describes the state this ADR changed, not the state of current `main`.
 
 Refs: issue #892. Applies ADR-0027 decision 7 and ADR-0066 decision 1 (the
 single-version regime that holds until first public release); removes the
 version gate added by #887; removes the defect class behind #891.
 
+> The meaning of "first public release" throughout this ADR is disambiguated by
+> ADR-0531 (proposed): it denotes a not-yet-reached format-lifecycle activation
+> milestone, distinct from the software's first public release at 0.9.0. Under
+> that reading, the question this ADR raises under "Rejected alternatives", of
+> whether the N/N-1 window should begin before first release, is still open and
+> the window is still staged. The two-version reader this ADR removes was an
+> unretired predecessor, not that window opening early.
+
 ## Context
 
-RLOG's reader accepts two format versions. `crates/ravel-logseg/src/footer.rs`
-declares:
+Before this change, RLOG's reader accepted two format versions.
+`crates/ravel-logseg/src/footer.rs` declared:
 
 ```rust
 pub const VERSION: u16 = 4;
 pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::n_and_prev(VERSION);
 ```
 
-so a reader on current `main` accepts both version 3 and version 4. The other
-two bulk data formats do not:
+so a reader on `main` at the time accepted both version 3 and version 4. The
+other two bulk data formats did not:
 
-| Format | Crate | Window |
+| Format | Crate | Window (before this ADR) |
 |---|---|---|
 | RSPAN | `ravel-rspan` | `SupportedVersions::single(VERSION)` |
 | RSEG | `ravel-segment` | `SupportedVersions::single(VERSION_V7)` |

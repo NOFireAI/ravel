@@ -133,6 +133,33 @@ mod tests {
         assert_eq!(all.len(), 3);
     }
 
+    /// `write_memo_snapshot` uses `PutMode::Overwrite`, never a conditional
+    /// mode: a second write to the same process's key with different bytes
+    /// succeeds unconditionally (a `CreateIfAbsent` would refuse it outright,
+    /// a `CasVersion` would need the first write's version), and the stored
+    /// content becomes the second payload, not the first.
+    #[tokio::test]
+    async fn memo_snapshot_write_uses_overwrite_not_cas() {
+        let store = MemoryStore::new();
+        let id = Uuid::from_u128(99);
+        let first = vec![1u8, 2, 3];
+        let second = vec![9u8, 9, 9, 9];
+
+        write_memo_snapshot(&store, &id, first)
+            .await
+            .expect("first write");
+        write_memo_snapshot(&store, &id, second.clone())
+            .await
+            .expect("a second write to the same key succeeds unconditionally under Overwrite");
+
+        let all = read_all_memo_snapshots(&store).await.expect("read");
+        assert_eq!(
+            all,
+            vec![second],
+            "the second write's bytes are what's stored"
+        );
+    }
+
     /// An empty prefix reads back as an empty set, not an error.
     #[tokio::test]
     async fn read_all_over_empty_prefix_is_empty() {

@@ -1,6 +1,10 @@
 # ADR-0067: Pipelined ingest flushes with adaptive flush delay
 
-Status: Accepted
+Status: Accepted. Decision 2 superseded (2026-09-12) by
+[ADR-1642](1642-flush-permit-acquired-in-the-flush-task.md), which moves the
+`max_inflight_flushes` acquire off the actor and into the spawned flush task.
+Decision 3's delay figures were superseded earlier by
+[ADR-0076](0076-reducing-s3-request-cost.md). The rest stands.
 
 ## Context
 
@@ -50,6 +54,11 @@ flush, not per actor.
    memory, and ack-tail effects). When the bound is reached the actor's
    flush trigger blocks, and backpressure propagates through the bounded
    channel exactly as today.
+
+   Superseded by [ADR-1642](1642-flush-permit-acquired-in-the-flush-task.md):
+   the bound itself stands, but the acquire runs inside the spawned flush
+   task, so at the bound the flush task parks and the actor keeps draining.
+   Backpressure propagates through the ADR-0069 byte budget instead.
 3. **Adaptive flush delay per (shard, tenant).** The age trigger adapts to
    observed arrival rate within an explicit corridor:
    floor = current 500 ms behavior (bursty tenants keep today's latency);
@@ -105,6 +114,11 @@ flowchart LR
 - Memory per (shard, tenant) rises by up to (max_inflight_flushes - 1)
   flush windows; bounded and reported via a new in-flight gauge. Interacts
   with ADR-0069's global byte budget (charged until flush completion).
+  Widened by [ADR-1642](1642-flush-permit-acquired-in-the-flush-task.md):
+  flushes are spawned at the trigger rather than at permit grant, so the
+  count of flush windows held is not bounded by `max_inflight_flushes` and
+  the ADR-0069 byte budget is the bound. The in-flight gauge counts
+  permit-waiting flushes and can read above `max_inflight_flushes`.
 - The crash matrix is re-verified with FaultStore hold/release gates at
   depths 1 and 3 (interleaved flush failures, abandoned-flush interlock,
   duplicate-delivery on retry).

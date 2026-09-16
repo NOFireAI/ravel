@@ -1,0 +1,121 @@
+name: bench-compare
+
+# ADR-0070 tier B: a criterion smoke compare of the pure-CPU bench set against
+# the committed baseline under bench/baselines/, posting a PR comment.
+#
+# Two things about this lane, both from ADR-0070 decision 3:
+#
+#  - It runs ONLY on the self-hosted reference runner where the baseline was
+#    recorded (label `ravel-reference`). A criterion timing number is only
+#    comparable to a baseline taken on the same hardware; on a GitHub-hosted
+#    runner the comparison would be noise. When the runner is offline the job
+#    stays queued until a runner picks it up or GitHub times the queue out; it
+#    is not skipped.
+#  - It is ADVISORY by default: `bench-tier-b.sh compare` without `--enforce`
+#    exits 0 regardless of the result, so this lane never blocks a merge. It
+#    posts a comment and stops there.
+#
+# The machinery to BLOCK exists and is reachable: a manual dispatch with
+# `enforce=true` runs the compare with `--enforce`, which fails the job on a
+# regression past the threshold. Per ADR-0070 that enforcing mode is gated on a
+# probation window (see the ADR amendment for issue #533) and must not be wired
+# onto the pull_request trigger without an owner's decision. This file
+# deliberately keeps the automatic path advisory.
+#
+# CARGO_TERM_COLOR is intentionally NOT set to always here (unlike the other
+# bench lanes): the compare reads criterion JSON, and a colored terminal would
+# only risk leaking ANSI codes into logs. The compare never greps stdout.
+
+# The pull_request trigger is deliberately absent until a runner carrying the
+# ravel-reference label is registered on this repository. GitHub does not skip a
+# job whose labels match no online runner: it queues it, holds it for about 24
+# hours, and then fails it. With no such runner registered, a pull_request
+# trigger would put a permanently pending check on every pull request in the
+# repository, not only on bench changes. Restore it as
+#
+#   on:
+#     pull_request:
+#
+# in the same change that registers the runner, and the same-repository guard on
+# the job below is what makes that safe on a public repository with forks.
+on:
+  workflow_dispatch:
+    inputs:
+      enforce:
+        description: "Fail the job on a regression past the threshold (probation only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-compare-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench-compare:
+    # Same-repository pull requests only. This repository is public, so a fork
+    # can open a pull request, and this job checks out the head and runs cargo
+    # bench from it on a persistent self-hosted box that holds a rust toolchain,
+    # a cargo cache, and a token with pull-requests: write. Running fork code
+    # there is arbitrary code execution on that hardware. A workflow_dispatch
+    # run has no head repository to compare and is always allowed: only a
+    # collaborator can start one.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    # Self-hosted reference runner only (ADR-0070 decision 3). With no such
+    # runner online the job stays queued until one appears or GitHub times the
+    # queue out; it is not skipped.
+    runs-on: [self-hosted, ravel-reference]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This job holds pull-requests: write for the comment it posts, and
+          # `gh pr comment` reads GH_TOKEN from the environment rather than
+          # .git/config. The bench build runs dependency build scripts, so the
+          # token must not be readable on disk while they run.
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Run the tier B compare (advisory unless dispatched with enforce)
+        id: compare
+        env:
+          # Only a manual dispatch can enforce; the pull_request path is always
+          # advisory. github.event.inputs.enforce is empty on non-dispatch runs.
+          ENFORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.enforce == true }}
+          # Pinned, not left to the script defaults. RAVEL_BENCH_MAX_SERIES is
+          # part of the segment_encode bench id, so a compare run at a different
+          # cardinality than the baseline was recorded at produces a bench id
+          # that matches nothing: the arm reads as MISSING on one side and as an
+          # ignored extra on the other, and drops out of the comparison without
+          # failing anything. These must equal the values in the baseline's
+          # _meta.knobs.
+          BENCH_SAMPLE_SIZE: "10"
+          BENCH_WARMUP: "1"
+          BENCH_MEASURE: "3"
+          RAVEL_BENCH_MAX_SERIES: "2000"
+        run: |
+          if [ "$ENFORCE" = "true" ]; then
+            scripts/bench-tier-b.sh compare bench/baselines/tier-b.json --enforce
+          else
+            scripts/bench-tier-b.sh compare bench/baselines/tier-b.json
+          fi
+      - name: Post the comparison as a PR comment
+        # Only on pull_request events, and even if an enforcing run failed, so
+        # the numbers are always visible.
+        if: ${{ always() && github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -f .gate-logs/bench-compare.md ]; then
+            gh pr comment "$PR_NUMBER" --body-file .gate-logs/bench-compare.md
+          else
+            echo "::warning::no bench-compare.md produced; the compare step did not run to completion"
+          fi

@@ -405,6 +405,28 @@ pub enum StoreError {
     Transient(String),
     #[error("permanent error: {0}")]
     Permanent(String),
+    /// A paged listing drain saw the same continuation token twice: the backend
+    /// reports "another page" while making no progress. Draining returns this
+    /// rather than spinning forever. Never retryable.
+    #[error("listing under {prefix:?} repeated its continuation token; refusing to spin")]
+    ListRepeatedToken { prefix: String },
+    /// A paged listing drain passed its page ceiling: a continuation token that
+    /// keeps changing without ever ending. Never retryable.
+    #[error("listing under {prefix:?} exceeded the {ceiling}-page listing ceiling")]
+    ListPageCeiling { prefix: String, ceiling: usize },
+    /// A paged listing delivered a key strictly below one already delivered,
+    /// breaking the contract's lexicographic-order guarantee. Folding out of
+    /// order is wrong, so draining returns this rather than silently
+    /// reordering. Never retryable.
+    #[error(
+        "listing under {prefix:?} delivered {offending:?} after {previous:?}, \
+         out of lexicographic order"
+    )]
+    ListOrderViolation {
+        prefix: String,
+        previous: String,
+        offending: String,
+    },
 }
 
 impl StoreError {
@@ -553,26 +575,544 @@ impl<T: ObjectStoreBackend + ?Sized> ObjectStoreBackend for Arc<T> {
     }
 }
 
-/// Drain every page of a listing, deduplicating by key per the cross-page
-/// guarantee. Convenience for callers with bounded prefixes.
+/// Page ceiling for a single [`list_all`] or [`drain_pages`] drain.
+///
+/// At the contract's 1000-key page size (docs/object-store-contract.md,
+/// "Listing"), 100 000 pages bounds one drain to 100 million keys, far above
+/// any prefix a caller drains: the widest is a whole-tenant or whole-store
+/// prefix during maintenance and benchmarks, orders of magnitude below this.
+/// It only ever trips on a backend that never terminates. The repeated-token
+/// guard below catches the common spin (a backend handing back the same
+/// continuation token); this ceiling is the backstop for a token that keeps
+/// changing without advancing.
+pub const MAX_LIST_PAGES: usize = 100_000;
+
+/// What a [`drain_pages`] key hook wants the drain to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainStep {
+    /// Keep going: finish this page, then request the next one if the backend
+    /// offers a continuation token.
+    Continue,
+    /// Stop the drain now, without visiting the rest of this page and without
+    /// requesting another page. For a caller whose keys sort past the range it
+    /// wants: the listing is ordered, so every later key is past it too.
+    Stop,
+}
+
+/// Drain a paged listing under `prefix` (resuming after `start_after`, when
+/// given), bounded, for every caller that pages a prefix.
+///
+/// The caller supplies the two hooks the drain has no business owning:
+///
+/// - `fetch` issues one page. It receives `start_after` and the continuation
+///   token to use, and is where the per-page work lives: an in-flight permit
+///   held across the request, request accounting, a caller's own request
+///   ceiling, and the choice of [`ObjectStoreBackend::list`] or
+///   [`ObjectStoreBackend::list_after`]. The permit is the reason the listing
+///   call sits here rather than inside the drain: it is acquired and released
+///   per page, so it has to wrap the request itself. It is a plain `FnMut`
+///   returning a future, and takes `start_after` owned, rather than an async
+///   closure over a borrow: both keep the future the drain builds free of
+///   higher-ranked lifetimes, so a caller whose own future is `tokio::spawn`ed
+///   stays `Send`. Anything the fetch hook must mutate across pages (a request
+///   counter) goes through a shared cell the future can hold by reference, such
+///   as an [`std::sync::atomic::AtomicU64`], since the future cannot borrow
+///   from the closure and must itself stay `Send`.
+/// - `keys` receives each key that survives the dedup, in delivery order. It
+///   returns [`DrainStep::Stop`] to end the drain early, or a caller error (a
+///   tenant-prefix isolation assertion, a malformed key).
+///
+/// What the drain owns is the bound and the contract's listing rules
+/// (docs/object-store-contract.md, "Listing"):
+///
+/// - The raw delivery sequence is non-decreasing, and a repeat re-delivers the
+///   last key already delivered, so the dedup holds only that last key rather
+///   than a set of every key: an equal key is dropped, a strictly smaller key
+///   breaks the order guarantee and becomes
+///   [`StoreError::ListOrderViolation`], and a larger key is passed to `keys`.
+///   That is constant extra memory whatever the prefix holds.
+/// - A backend that never terminates is a typed error, never a spin: a
+///   repeated continuation token is [`StoreError::ListRepeatedToken`], and a
+///   token that keeps changing without ending trips `max_pages` as
+///   [`StoreError::ListPageCeiling`]. Pass [`MAX_LIST_PAGES`] unless a test
+///   needs a smaller ceiling.
+pub async fn drain_pages<E, Fetch, Fut, Keys>(
+    prefix: &str,
+    start_after: Option<&str>,
+    max_pages: usize,
+    mut fetch: Fetch,
+    mut keys: Keys,
+) -> Result<(), E>
+where
+    E: From<StoreError>,
+    Fetch: FnMut(Option<String>, Option<PageToken>) -> Fut,
+    Fut: std::future::Future<Output = Result<ListPage, E>>,
+    Keys: FnMut(ObjectMeta) -> Result<DrainStep, E>,
+{
+    let start_after = start_after.map(str::to_string);
+    let mut last_key: Option<String> = None;
+    let mut page_token: Option<PageToken> = None;
+    let mut prev_token: Option<PageToken> = None;
+    let mut pages = 0usize;
+    loop {
+        if pages >= max_pages {
+            return Err(StoreError::ListPageCeiling {
+                prefix: prefix.to_string(),
+                ceiling: max_pages,
+            }
+            .into());
+        }
+        pages += 1;
+        let page = fetch(start_after.clone(), page_token).await?;
+        for meta in page.objects {
+            match last_key.as_deref() {
+                // The raw delivery sequence never decreases and a repeat
+                // re-delivers the last key, so a key at or below the last
+                // delivered one is either that same key again (dropped) or a
+                // backend that broke ordering (a typed error).
+                Some(last) if meta.key.as_str() < last => {
+                    return Err(StoreError::ListOrderViolation {
+                        prefix: prefix.to_string(),
+                        previous: last.to_string(),
+                        offending: meta.key,
+                    }
+                    .into());
+                }
+                Some(last) if meta.key.as_str() == last => {}
+                _ => {
+                    last_key = Some(meta.key.clone());
+                    if keys(meta)? == DrainStep::Stop {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        match page.next {
+            Some(next) => {
+                if prev_token.as_ref() == Some(&next) {
+                    return Err(StoreError::ListRepeatedToken {
+                        prefix: prefix.to_string(),
+                    }
+                    .into());
+                }
+                prev_token = Some(next.clone());
+                page_token = Some(next);
+            }
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Drain every page of a [`ObjectStoreBackend::list`], deduplicating by key
+/// per the cross-page guarantee. Convenience for callers with bounded prefixes
+/// that need no per-page hook: [`drain_pages`] holds the bound and the listing
+/// rules, and this adds only "collect every key".
 pub async fn list_all(
     store: &dyn ObjectStoreBackend,
     prefix: &str,
 ) -> Result<Vec<ObjectMeta>, StoreError> {
+    drain_list(store, prefix, MAX_LIST_PAGES).await
+}
+
+/// [`list_all`] with an explicit page ceiling, so a test can exercise the
+/// [`StoreError::ListPageCeiling`] path without draining 100 000 pages.
+async fn drain_list(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    max_pages: usize,
+) -> Result<Vec<ObjectMeta>, StoreError> {
     let mut out: Vec<ObjectMeta> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut page_token = None;
-    loop {
-        let page = store.list(prefix, page_token).await?;
-        for meta in page.objects {
-            if seen.insert(meta.key.clone()) {
-                out.push(meta);
+    drain_pages(
+        prefix,
+        None,
+        max_pages,
+        |_start_after, token| async move { store.list(prefix, token).await },
+        |meta| {
+            out.push(meta);
+            Ok(DrainStep::Continue)
+        },
+    )
+    .await?;
+    Ok(out)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod list_all_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::memory::MemoryStore;
+
+    /// A backend that never signals a last page: it always reports another page.
+    /// With `distinct` it hands back a fresh continuation token each call
+    /// (exercising the page ceiling); otherwise it repeats one token (exercising
+    /// the repeated-token guard). Every `list` call is counted.
+    struct NeverEndingList {
+        calls: AtomicUsize,
+        distinct: bool,
+    }
+
+    impl NeverEndingList {
+        fn new(distinct: bool) -> Self {
+            NeverEndingList {
+                calls: AtomicUsize::new(0),
+                distinct,
             }
         }
-        match page.next {
-            Some(next) => page_token = Some(next),
-            None => break,
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
         }
     }
-    Ok(out)
+
+    #[async_trait]
+    impl ObjectStoreBackend for NeverEndingList {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: Bytes,
+            _opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            unreachable!("NeverEndingList is list-only")
+        }
+
+        async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
+            unreachable!("NeverEndingList is list-only")
+        }
+
+        async fn head(&self, _key: &str) -> Result<ObjectMeta, StoreError> {
+            unreachable!("NeverEndingList is list-only")
+        }
+
+        async fn list(
+            &self,
+            _prefix: &str,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let token = if self.distinct {
+                PageToken(format!("tok-{n}"))
+            } else {
+                PageToken("stuck".to_string())
+            };
+            Ok(ListPage {
+                objects: Vec::new(),
+                next: Some(token),
+            })
+        }
+
+        async fn list_delimited(&self, _prefix: &str) -> Result<DelimitedList, StoreError> {
+            unreachable!("NeverEndingList is list-only")
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            unreachable!("NeverEndingList is list-only")
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::mandatory()
+        }
+    }
+
+    /// A backend that replays a fixed script of pages, so a test can place an
+    /// exact key sequence across page boundaries: a contract-permitted repeat,
+    /// or a contract-violating backward key. `MemoryStore` cannot repeat a key,
+    /// so the dedup and order paths need a driver that can. Every `list` call is
+    /// counted; the last scripted page ends the listing (`next == None`).
+    struct ScriptedList {
+        pages: Vec<Vec<String>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedList {
+        fn new(pages: &[&[&str]]) -> Self {
+            ScriptedList {
+                pages: pages
+                    .iter()
+                    .map(|page| page.iter().map(|k| k.to_string()).collect())
+                    .collect(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn meta(key: &str) -> ObjectMeta {
+            ObjectMeta {
+                key: key.to_string(),
+                size: 1,
+                etag: Etag("e".to_string()),
+                version: Version("v".to_string()),
+                last_modified_unix_ms: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for ScriptedList {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: Bytes,
+            _opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn head(&self, _key: &str) -> Result<ObjectMeta, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn list(
+            &self,
+            _prefix: &str,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let objects = self.pages[n].iter().map(|k| Self::meta(k)).collect();
+            let next = if n + 1 < self.pages.len() {
+                Some(PageToken(format!("tok-{n}")))
+            } else {
+                None
+            };
+            Ok(ListPage { objects, next })
+        }
+
+        async fn list_delimited(&self, _prefix: &str) -> Result<DelimitedList, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::mandatory()
+        }
+    }
+
+    /// A backend that repeats one continuation token is a typed error on the
+    /// second page, never an infinite loop.
+    #[tokio::test]
+    async fn a_repeated_continuation_token_is_a_typed_error_after_two_pages() {
+        let store = NeverEndingList::new(false);
+        let err = drain_list(&store, "p/", MAX_LIST_PAGES)
+            .await
+            .expect_err("a repeated token must not spin");
+        assert!(
+            matches!(err, StoreError::ListRepeatedToken { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            2,
+            "the repeat is detected on exactly the second page"
+        );
+    }
+
+    /// A backend whose token keeps changing without ever ending trips the page
+    /// ceiling at exactly `max_pages` pages.
+    #[tokio::test]
+    async fn an_ever_advancing_token_trips_the_page_ceiling_exactly() {
+        let store = NeverEndingList::new(true);
+        let err = drain_list(&store, "p/", 3)
+            .await
+            .expect_err("an unbounded listing must stop at the ceiling");
+        assert!(
+            matches!(err, StoreError::ListPageCeiling { ceiling: 3, .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            3,
+            "exactly three pages are drained before the ceiling fires"
+        );
+    }
+
+    /// The object-store contract permits a key to appear more than once across
+    /// pages. When the last key of one page repeats as the first key of the
+    /// next, the fold keeps it exactly once.
+    #[tokio::test]
+    async fn a_repeat_at_a_page_boundary_is_folded_once() {
+        let store = ScriptedList::new(&[&["p/a", "p/b"], &["p/b", "p/c"]]);
+        let keys: Vec<String> = drain_list(&store, "p/", MAX_LIST_PAGES)
+            .await
+            .expect("a permitted repeat must not error")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["p/a", "p/b", "p/c"],
+            "the boundary repeat of p/b is folded once, not twice"
+        );
+        assert_eq!(store.call_count(), 2, "both scripted pages are drained");
+    }
+
+    /// A page that overlaps its predecessor by more than one key is where the
+    /// two readings of the cross-page guarantee part. Under the contract's
+    /// rule (the raw sequence never decreases, and a repeat re-delivers the
+    /// last key delivered) the `p/b` after `p/c` is out of order and the drain
+    /// says so; under a looser "any key may repeat" reading it would be
+    /// dropped by a set dedup and the drain would return four keys. The
+    /// conformance suite certifies the same rule, so no backend it qualifies
+    /// reaches this error.
+    #[tokio::test]
+    async fn a_multi_key_page_overlap_is_a_typed_order_violation() {
+        let store = ScriptedList::new(&[&["p/a", "p/b", "p/c"], &["p/b", "p/c", "p/d"]]);
+        let err = drain_list(&store, "p/", MAX_LIST_PAGES)
+            .await
+            .expect_err("an overlap that re-delivers more than the last key must be rejected");
+        assert!(
+            matches!(
+                &err,
+                StoreError::ListOrderViolation {
+                    previous,
+                    offending,
+                    ..
+                } if previous == "p/c" && offending == "p/b"
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            2,
+            "the violation is detected on the second page, after both are fetched"
+        );
+    }
+
+    /// A key strictly below the last delivered one breaks the contract's
+    /// lexicographic-order guarantee. Folding out of order is wrong, so the
+    /// drain returns a typed error rather than reordering.
+    #[tokio::test]
+    async fn a_backward_key_is_a_typed_order_violation() {
+        let store = ScriptedList::new(&[&["p/a", "p/c"], &["p/b"]]);
+        let err = drain_list(&store, "p/", MAX_LIST_PAGES)
+            .await
+            .expect_err("a backward key must be rejected");
+        assert!(
+            matches!(
+                &err,
+                StoreError::ListOrderViolation {
+                    previous,
+                    offending,
+                    ..
+                } if previous == "p/c" && offending == "p/b"
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            2,
+            "the violation is detected on the second page, after both are fetched"
+        );
+    }
+
+    /// Counts `list` calls while delegating everything to the pagination
+    /// oracle, so a test can assert the exact number of pages a drain issued
+    /// rather than claim it in a comment.
+    struct CountingList {
+        inner: MemoryStore,
+        list_calls: AtomicUsize,
+    }
+
+    impl CountingList {
+        fn with_page_size(page_size: usize) -> Self {
+            CountingList {
+                inner: MemoryStore::with_page_size(page_size),
+                list_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn list_call_count(&self) -> usize {
+            self.list_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for CountingList {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A compliant backend drained over several real pages returns every key
+    /// once, in lexicographic order, identical to the pre-bound behavior. Page
+    /// size 2 over five keys really is a multi-page drain: exactly three pages,
+    /// counted at the store.
+    #[tokio::test]
+    async fn a_compliant_backend_returns_every_key_once_in_order() {
+        let store = CountingList::with_page_size(2);
+        for key in ["p/a", "p/b", "p/c", "p/d", "p/e"] {
+            store
+                .put(
+                    key,
+                    Bytes::from_static(b"x"),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("seed key");
+        }
+
+        let keys: Vec<String> = list_all(&store, "p/")
+            .await
+            .expect("full drain")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["p/a", "p/b", "p/c", "p/d", "p/e"],
+            "the drain returns every key once, in order"
+        );
+        assert_eq!(
+            store.list_call_count(),
+            3,
+            "five keys at page size 2 is exactly three pages"
+        );
+    }
 }

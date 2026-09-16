@@ -91,7 +91,12 @@ impl FoldTasks {
 /// cost described below (an `.rspan` object carries signal=3, so the
 /// RSEG-specific postings build fails to decode it and skips writing a
 /// postings ref, same as logs' signal=2).
-const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+///
+/// `pub(crate)` so `crate::metrics` renders exactly one fold-liveness series
+/// per entry: the series set at `/metrics` is then the set of loops that are
+/// supposed to be alive, and a loop that dies leaves its own series standing
+/// and going stale rather than hiding behind its siblings.
+pub(crate) const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
 
 /// Spawns one fold loop per signal in [`FOLD_SIGNALS`], not one per tenant:
 /// each tick re-derives the tenant set from storage. [`run_loop`] is
@@ -112,7 +117,8 @@ const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans]
 /// mean a signal-aware short-circuit inside `ravel-catalog`, deliberately out
 /// of scope here.
 ///
-/// `fallback_allow` is the merged `--tenant-token`/`--maintain-tenant` set:
+/// `fallback_allow` is the merged static tenant set (`--tenant-token` or
+/// `--tenant-token-file`, plus `--maintain-tenant`):
 /// empty means unconfigured, and it otherwise governs only tenants with no
 /// durable config record (ADR-0048 decision 3, ADR-0066 decision 6). A tenant
 /// carrying a config record is maintained unconditionally, so no flag can

@@ -12,6 +12,9 @@ ravel-cache = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-maintain = { workspace = true }
+# ADR-1170 process-wide memory accountant: shared by MetricsState (every
+# build, unconditionally) and, when the `sql` feature is on, SqlExecutor.
+ravel-memory = { workspace = true }
 # Query-worker registration/liveness and rendezvous slice ownership for the
 # ADR-0071 distributed read fan-out: sys/query/workers heartbeats
 # (ravel_fleet::query_workers) and highest-random-weight slice ownership
@@ -136,6 +139,13 @@ bytes = { workspace = true }
 # for its `MultiGzDecoder`, which decodes concatenated multi-member streams
 # under one capped reader.
 flate2 = { workspace = true }
+# Snappy block-format header parsing for the Remote Write ingest byte charge
+# (ADR-0069 amendment, issue #1419). Used only for `raw::decompress_len`, which
+# reads the varint header to report the decompressed size without allocating,
+# so the charge is taken before `ravel-remote-write` allocates the output
+# buffer. Already resolved in Cargo.lock through ravel-remote-write; the same
+# workspace pin, not a new external crate.
+snap = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
 # The alert evaluator hashes the RLOG object it writes to build the commit
@@ -154,14 +164,25 @@ reqwest = { version = "0.13", features = ["json"] }
 # ravel-rspan below are: the workspace root Cargo.toml is outside this task's
 # scope. The pin keeps cargo-deny from counting it as a wildcard path
 # dependency.
-ravel-alerting = { path = "../../crates/ravel-alerting", version = "0.12.0" }
+ravel-alerting = { path = "../../crates/ravel-alerting", version = "0.15.0" }
 
 # ravel-sql is declared here as a path dependency rather than through
 # `[workspace.dependencies]` because the workspace root Cargo.toml is outside
 # this task's scope. The version is pinned so cargo-deny does not count it as
 # a wildcard path dependency, matching how every other
 # internal crate is pinned.
-ravel-sql = { path = "../../crates/ravel-sql", version = "0.12.0", optional = true }
+ravel-sql = { path = "../../crates/ravel-sql", version = "0.15.0", optional = true }
+
+# The transport-independent MCP tool layer (ADR-1374): the envelope, the
+# cursor codec, the budget clamp, the compact renderer, the tool catalog, and
+# the dispatch this crate's adapter calls into. A path dependency pinned to a
+# version for the same reason ravel-sql above is.
+ravel-mcp = { path = "../../crates/ravel-mcp", version = "0.15.0", optional = true }
+
+# The MCP protocol crate. Only the `mcp` feature links it, and only for its
+# Streamable HTTP server transport and its `tower_service::Service` adapter;
+# the tool catalog's own rmcp types come through ravel-mcp.
+rmcp = { workspace = true, optional = true }
 
 # Flight service codegen for the `flight-sql` feature. This is arrow 58's
 # arrow-flight, a different arrow major than the `arrow` dev-dependency below;
@@ -174,12 +195,13 @@ arrow-flight = { workspace = true, optional = true }
 # src/main.rs, a binary root, never in a library crate.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true }
-
-[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
-# Honest runtime check that the binary is actually running under jemalloc: the
-# smoke test in main.rs reads jemalloc's own allocated-bytes stat. Pinned
-# directly (not via [workspace.dependencies]) matching this crate's convention
-# for deps the single authorized root line does not cover.
+# Reads jemalloc's own allocated/active/resident stats at runtime (#1170): the
+# `/metrics` allocator gauges (`src/mem_stats.rs`) and the smoke test in
+# main.rs both call this. Pinned directly (not via [workspace.dependencies]),
+# matching this crate's convention for deps the single authorized root line
+# does not cover. Promoted from a dev-dependency (issue #972's original
+# jemalloc-is-configured smoke test) to a regular dependency because the
+# `/metrics` handler now reads these stats in production, not only in tests.
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 
 [features]
@@ -203,7 +225,28 @@ sql = ["dep:ravel-sql"]
 # `flight` module, and the prepared-statement methods answer UNIMPLEMENTED.
 flight-sql = ["sql", "ravel-sql/flight-sql", "dep:arrow-flight"]
 
+# The native MCP adapter at `POST /mcp` (ADR-1374 decision 9). Implies `sql`:
+# four of the nine tools execute SQL through the query service, so there is no
+# deployment that wants the MCP surface without it. Off by default, and
+# `--mcp` is a second, runtime opt-in on top.
+mcp = [
+    "sql",
+    "dep:ravel-mcp",
+    "dep:rmcp",
+    "rmcp/transport-streamable-http-server",
+    "rmcp/tower",
+]
+
 [dev-dependencies]
+# Test-only: the MCP end-to-end tests drive the mounted route with a real MCP
+# client rather than a hand-rolled JSON-RPC body, so the negotiation the
+# protocol requires is exercised by an implementation that is not ours.
+# Cargo does not allow an optional dev-dependency, so this builds in the
+# default feature set too; the tests that use it are behind `feature = "mcp"`.
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
 # `query` on top of the normal dependency's `json`: the test client builds
 # query strings the server binary itself never needs to.
 reqwest = { version = "0.13", features = ["json", "query"] }
@@ -221,7 +264,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # listed in the workspace [workspace.dependencies]; the root Cargo.toml is out
 # of this task's scope, so this is a version-pinned path dependency (the pin
 # keeps cargo-deny from counting it as a wildcard).
-ravel-rspan = { path = "../../crates/ravel-rspan", version = "0.12.0" }
+ravel-rspan = { path = "../../crates/ravel-rspan", version = "0.15.0" }
 uuid = { workspace = true }
 # Real-authn end-to-end test (tests/real_authn_e2e.rs): mint a JWT and build a
 # local oct (HMAC) JWKS so the OIDC resolver runs through a real HTTP request

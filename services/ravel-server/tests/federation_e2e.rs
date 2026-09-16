@@ -24,6 +24,14 @@
 //!   result equals the union a single store holding both datasets computes
 //!   locally (f64 compared as bits), and a tight `max_bytes_scanned` the
 //!   local-only fetch clears trips typed on the combined local+remote frames.
+//!
+//! Plus the two-local-tenant pair at the end of the file, which is the only
+//! coverage here with more than one LOCAL tenant. Everything above uses one
+//! canonical tenant on both sides, so nothing above can distinguish a remote
+//! reached by the tenant it belongs to from one reached by every tenant:
+//!
+//! - `an_unmapped_local_tenant_gets_no_remote_series_from_a_query`
+//! - `an_unmapped_local_tenant_sees_no_remote_label_namespace`
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -289,7 +297,7 @@ async fn spawn_remote(
     credential: &str,
     tenant: &TenantId,
 ) -> Remote {
-    let catalog = build_catalog(store.clone(), 1, true, 0, None).expect("catalog");
+    let catalog = build_catalog(store.clone(), 1, true, 0, None, None, None).expect("catalog");
     let metrics = Arc::new(FragmentMetrics::new());
     let admission = FragmentAdmission::new(8, metrics.clone());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -306,6 +314,7 @@ async fn spawn_remote(
         None,
         clock,
         metrics,
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
     );
 
     let seen_auth = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -357,11 +366,17 @@ async fn dead_endpoint() -> String {
 
 /// Build a coordinator-side [`RemoteCluster`] dialed by the production
 /// [`FederationSliceFetcher`], carrying `credential` as the ONLY principal the
-/// remote will see.
+/// remote will see and mapped to `tenant` (`None` = unkeyed, reachable by every
+/// local tenant, the shape a single-tenant coordinator writes).
+///
+/// The mapping is threaded through the real [`RemoteClusterConfig`] and hashed
+/// the way `ravel_server::start` hashes it, so a test exercises the production
+/// `TenantId` -> `TenantHash` derivation rather than a stand-in.
 fn make_remote_cluster(
     name: &str,
     endpoint: &str,
     credential: &str,
+    tenant: Option<&TenantId>,
     skip_unavailable: bool,
     soft_timeout: Duration,
 ) -> RemoteCluster {
@@ -369,6 +384,7 @@ fn make_remote_cluster(
         name: name.to_string(),
         endpoint: endpoint.to_string(),
         credential: credential.to_string(),
+        tenant: tenant.cloned(),
         tls: false,
         tls_ca_file: None,
         skip_unavailable,
@@ -379,6 +395,7 @@ fn make_remote_cluster(
     RemoteCluster {
         name: name.to_string(),
         fetcher: Arc::new(fetcher),
+        tenant: config.tenant.as_ref().map(TenantId::hash),
         skip_unavailable,
         soft_timeout,
     }
@@ -472,6 +489,7 @@ async fn federated_series_discovery_returns_union_and_warns_on_skip() {
             "east",
             &east.endpoint,
             OPERATOR_CRED,
+            None,
             true,
             Duration::from_secs(5),
         ),
@@ -479,11 +497,13 @@ async fn federated_series_discovery_returns_union_and_warns_on_skip() {
             "west",
             &west_endpoint,
             OPERATOR_CRED,
+            None,
             true,
             Duration::from_secs(3),
         ),
     ];
-    let catalog = build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog");
+    let catalog =
+        build_catalog(local_store.clone(), 1, true, 0, None, None, None).expect("catalog");
     let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
         .with_federation(Arc::new(Federation::new(clusters)));
 
@@ -563,10 +583,12 @@ async fn federated_series_discovery_fails_without_skip() {
         "east",
         &endpoint,
         OPERATOR_CRED,
+        None,
         false,
         Duration::from_secs(3),
     );
-    let catalog = build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog");
+    let catalog =
+        build_catalog(local_store.clone(), 1, true, 0, None, None, None).expect("catalog");
     let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
         .with_federation(Arc::new(Federation::new(vec![cluster])));
 
@@ -615,10 +637,12 @@ async fn remote_failure_fails_query_by_default() {
         "east",
         &endpoint,
         OPERATOR_CRED,
+        None,
         false,
         Duration::from_secs(3),
     );
-    let catalog = build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog");
+    let catalog =
+        build_catalog(local_store.clone(), 1, true, 0, None, None, None).expect("catalog");
     let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
         .with_federation(Arc::new(Federation::new(vec![cluster])));
 
@@ -664,6 +688,7 @@ async fn federated_query_marks_skipped_cluster_in_warnings() {
             "east",
             &east.endpoint,
             OPERATOR_CRED,
+            None,
             true,
             Duration::from_secs(5),
         ),
@@ -671,11 +696,13 @@ async fn federated_query_marks_skipped_cluster_in_warnings() {
             "west",
             &west_endpoint,
             OPERATOR_CRED,
+            None,
             true,
             Duration::from_secs(3),
         ),
     ];
-    let catalog = build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog");
+    let catalog =
+        build_catalog(local_store.clone(), 1, true, 0, None, None, None).expect("catalog");
     let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
         .with_federation(Arc::new(Federation::new(clusters)));
 
@@ -751,7 +778,7 @@ async fn federated_query_merges_remote_series() {
     publish_series(oracle_store.as_ref(), &acme, base, "local", 10.0, 1).await;
     publish_series(oracle_store.as_ref(), &acme, base, "remote", 20.0, 2).await;
     let oracle_engine = QueryEngine::new(
-        build_catalog(oracle_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(oracle_store.clone(), 1, true, 0, None, None, None).expect("catalog"),
         oracle_store,
         EngineConfig::default(),
     );
@@ -762,7 +789,7 @@ async fn federated_query_merges_remote_series() {
 
     // Federated: local store + one healthy remote.
     let fed_engine = QueryEngine::new(
-        build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(local_store.clone(), 1, true, 0, None, None, None).expect("catalog"),
         local_store.clone(),
         EngineConfig::default(),
     )
@@ -770,6 +797,7 @@ async fn federated_query_merges_remote_series() {
         "east",
         &remote.endpoint,
         OPERATOR_CRED,
+        None,
         false,
         Duration::from_secs(10),
     )])));
@@ -795,7 +823,7 @@ async fn federated_query_merges_remote_series() {
     // Budget: the combined frames trip a cap the local-only fetch clears.
     let combined_bytes = fed_stats.accounting.total_s3_bytes();
     let local_engine = QueryEngine::new(
-        build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(local_store.clone(), 1, true, 0, None, None, None).expect("catalog"),
         local_store.clone(),
         EngineConfig::default(),
     );
@@ -817,7 +845,7 @@ async fn federated_query_merges_remote_series() {
         ..EngineConfig::default()
     };
     let local_capped = QueryEngine::new(
-        build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(local_store.clone(), 1, true, 0, None, None, None).expect("catalog"),
         local_store.clone(),
         capped,
     );
@@ -827,7 +855,7 @@ async fn federated_query_merges_remote_series() {
         .expect("the local-only fetch clears the cap");
 
     let fed_capped = QueryEngine::new(
-        build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(local_store.clone(), 1, true, 0, None, None, None).expect("catalog"),
         local_store.clone(),
         capped,
     )
@@ -835,6 +863,7 @@ async fn federated_query_merges_remote_series() {
         "east",
         &remote.endpoint,
         OPERATOR_CRED,
+        None,
         false,
         Duration::from_secs(10),
     )])));
@@ -893,7 +922,7 @@ async fn federated_query_merges_remote_histogram_series() {
     publish_histogram_series(oracle_store.as_ref(), &acme, base, "local", 1.0, 1, 1).await;
     publish_histogram_series(oracle_store.as_ref(), &acme, base, "remote", 2.5, 3, 2).await;
     let oracle_engine = QueryEngine::new(
-        build_catalog(oracle_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(oracle_store.clone(), 1, true, 0, None, None, None).expect("catalog"),
         oracle_store,
         EngineConfig::default(),
     );
@@ -904,7 +933,7 @@ async fn federated_query_merges_remote_histogram_series() {
 
     // Federated: local store + one healthy histogram-serving remote.
     let fed_engine = QueryEngine::new(
-        build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(local_store.clone(), 1, true, 0, None, None, None).expect("catalog"),
         local_store.clone(),
         EngineConfig::default(),
     )
@@ -912,6 +941,7 @@ async fn federated_query_merges_remote_histogram_series() {
         "east",
         &remote.endpoint,
         OPERATOR_CRED,
+        None,
         false,
         Duration::from_secs(10),
     )])));
@@ -944,6 +974,242 @@ async fn federated_query_merges_remote_histogram_series() {
     assert!(
         fed_bits.iter().any(|(k, _)| k.contains("instance=remote")),
         "the remote's histogram series must be merged into the result: {fed_bits:?}"
+    );
+
+    remote.stop().await;
+}
+
+/// The local tenant the remote cluster's credential is mapped to.
+const MAPPED_TENANT: &str = "acme";
+/// A second local tenant on the same coordinator, mapped to no remote.
+const UNMAPPED_TENANT: &str = "beta";
+/// The `instance` label only the remote cluster's series carries. Its presence
+/// in a local tenant's result is the remote tenant's data having crossed to it.
+const REMOTE_ONLY_INSTANCE: &str = "remote-east";
+
+/// The exposure, query half: on a coordinator serving two local tenants, a
+/// metric selector from the tenant the remote credential is NOT mapped to must
+/// return local data only.
+///
+/// One coordinator holds ONE credential for the remote, and that credential
+/// authorizes one tenant's data there, so it belongs to one local tenant.
+/// `make_remote_cluster` maps it to `acme`; `beta` shares the coordinator and
+/// maps to nothing. The two queries below differ in the tenant and in nothing
+/// else: same engine, same federation, same selector, same window.
+///
+/// Both local tenants hold their own series under the same metric name, so an
+/// empty result would not prove isolation (it would prove the query broke). The
+/// assertion is on the `instance` label: `beta` sees only `local-beta` and never
+/// `remote-east`, while `acme` does see `remote-east`, which is what shows the
+/// remote was reachable and answering throughout.
+#[tokio::test]
+async fn an_unmapped_local_tenant_gets_no_remote_series_from_a_query() {
+    let base = now_ns() - 10 * NS_PER_MIN;
+    let t_ms = (base + NS_PER_MIN) / NS_PER_MS;
+    let now = now_ns();
+    let acme = TenantId::new(MAPPED_TENANT);
+    let beta = TenantId::new(UNMAPPED_TENANT);
+
+    // One local store serving both local tenants, each with its own series.
+    let local_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_series(local_store.as_ref(), &acme, base, "local-acme", 1.0, 1).await;
+    publish_series(local_store.as_ref(), &beta, base, "local-beta", 2.0, 2).await;
+
+    // The remote cluster, over its own store, holding a tenant of its own. The
+    // remote resolves that tenant from the presented credential and overwrites
+    // the wire tenant with it, so what comes back is the remote tenant's data
+    // regardless of which local tenant asked. That is correct on the remote's
+    // side; what decides who may ask is the coordinator-side mapping.
+    let remote_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let remote_tenant = TenantId::new("remote-side-tenant");
+    publish_series(
+        remote_store.as_ref(),
+        &remote_tenant,
+        base,
+        REMOTE_ONLY_INSTANCE,
+        3.0,
+        1,
+    )
+    .await;
+    let remote = spawn_remote(remote_store, OPERATOR_CRED, &remote_tenant).await;
+
+    let engine = QueryEngine::new(
+        build_catalog(local_store.clone(), 1, true, 0, None, None, None).expect("catalog"),
+        local_store.clone(),
+        EngineConfig::default(),
+    )
+    .with_federation(Arc::new(Federation::new(vec![make_remote_cluster(
+        "east",
+        &remote.endpoint,
+        OPERATOR_CRED,
+        Some(&acme),
+        false,
+        Duration::from_secs(10),
+    )])));
+
+    // The mapped tenant first: the remote is reachable, answering, and its
+    // series merge. Asserted before the isolation check so a dead remote fails
+    // here instead of making that check pass for the wrong reason.
+    let (acme_value, acme_stats) = engine
+        .instant_with_stats(acme.hash(), METRIC, t_ms, &[], now, DEADLINE)
+        .await
+        .expect("the mapped tenant's federated query");
+    let acme_keys: Vec<String> = vector_bits(&acme_value)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert!(
+        acme_keys
+            .iter()
+            .any(|k| k.contains(&format!("instance={REMOTE_ONLY_INSTANCE}"))),
+        "the mapped tenant must receive the remote's series, or this test proves nothing \
+         about the unmapped one: {acme_keys:?}"
+    );
+    assert!(
+        !acme_stats.partial,
+        "the remote is healthy and mapped: coverage is complete"
+    );
+
+    // The unmapped tenant: local data only.
+    let (beta_value, beta_stats) = engine
+        .instant_with_stats(beta.hash(), METRIC, t_ms, &[], now, DEADLINE)
+        .await
+        .expect("the unmapped tenant's query is answered locally, not refused");
+    let beta_keys: Vec<String> = vector_bits(&beta_value)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert!(
+        !beta_keys
+            .iter()
+            .any(|k| k.contains(&format!("instance={REMOTE_ONLY_INSTANCE}"))),
+        "the unmapped local tenant received the remote tenant's series: {beta_keys:?}"
+    );
+    assert_eq!(
+        beta_keys.len(),
+        1,
+        "the unmapped tenant must still get its own local series, and only that: {beta_keys:?}"
+    );
+    assert!(
+        beta_keys[0].contains("instance=local-beta"),
+        "the unmapped tenant's one series must be its own: {beta_keys:?}"
+    );
+
+    // Local-only is a COMPLETE answer for a tenant holding no credential for the
+    // remote, not partial coverage: a remote outside its query is not missing
+    // from it. Marking it partial would degrade every non-federating tenant's
+    // response permanently.
+    assert!(
+        !beta_stats.partial,
+        "an unmapped tenant's local-only result is complete, not partial coverage"
+    );
+    assert!(
+        beta_stats.warnings.is_empty(),
+        "an unmapped tenant gets no federation warning: {:?}",
+        beta_stats.warnings
+    );
+
+    // The credential was never presented on the unmapped tenant's behalf:
+    // filtering happens before dispatch, so its query dials nothing. Counted as
+    // a delta across one more unmapped query, which is independent of how many
+    // times the mapped query above dialed.
+    let dials_before = remote.seen_auth.lock().len();
+    engine
+        .instant_with_stats(beta.hash(), METRIC, t_ms, &[], now, DEADLINE)
+        .await
+        .expect("a second unmapped query");
+    assert_eq!(
+        remote.seen_auth.lock().len(),
+        dials_before,
+        "an unmapped tenant's query must not dial the remote at all"
+    );
+
+    remote.stop().await;
+}
+
+/// The exposure, discovery half: `/api/v1/series`, `/api/v1/labels` and
+/// `/api/v1/label/<name>/values` all resolve through
+/// `resolve_series_with_stats`, so the remote tenant's label namespace reaches a
+/// local tenant through them exactly as its samples do through a query.
+///
+/// Same two local tenants, same single mapped remote. [`instances`] projects the
+/// resolved series onto the `instance` label, which is what
+/// `/api/v1/label/instance/values` enumerates and what `/api/v1/series` returns
+/// whole; asserting on it covers all three endpoints at the seam they share.
+#[tokio::test]
+async fn an_unmapped_local_tenant_sees_no_remote_label_namespace() {
+    let base = now_ns() - 10 * NS_PER_MIN;
+    let now = now_ns();
+    let acme = TenantId::new(MAPPED_TENANT);
+    let beta = TenantId::new(UNMAPPED_TENANT);
+
+    let local_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_series(local_store.as_ref(), &acme, base, "local-acme", 1.0, 1).await;
+    publish_series(local_store.as_ref(), &beta, base, "local-beta", 2.0, 2).await;
+
+    let remote_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let remote_tenant = TenantId::new("remote-side-tenant");
+    publish_series(
+        remote_store.as_ref(),
+        &remote_tenant,
+        base,
+        REMOTE_ONLY_INSTANCE,
+        3.0,
+        1,
+    )
+    .await;
+    let remote = spawn_remote(remote_store, OPERATOR_CRED, &remote_tenant).await;
+
+    let engine = QueryEngine::new(
+        build_catalog(local_store.clone(), 1, true, 0, None, None, None).expect("catalog"),
+        local_store.clone(),
+        EngineConfig::default(),
+    )
+    .with_federation(Arc::new(Federation::new(vec![make_remote_cluster(
+        "east",
+        &remote.endpoint,
+        OPERATOR_CRED,
+        Some(&acme),
+        false,
+        Duration::from_secs(10),
+    )])));
+
+    let window = TimeRange {
+        start_ns: base - NS_PER_HOUR,
+        end_ns: now_ns(),
+    };
+
+    // Mapped tenant first: discovery really does reach the remote, so the
+    // unmapped tenant's local-only enumeration below is the mapping and not a
+    // dead remote or an unresolved window.
+    let (acme_series, _) = engine
+        .resolve_series_with_stats(acme.hash(), &[name_matcher()], window, &[], now, DEADLINE)
+        .await
+        .expect("the mapped tenant's federated discovery");
+    assert_eq!(
+        instances(&acme_series),
+        vec!["local-acme".to_string(), REMOTE_ONLY_INSTANCE.to_string()],
+        "the mapped tenant must enumerate the remote's label namespace too"
+    );
+
+    let (beta_series, beta_stats) = engine
+        .resolve_series_with_stats(beta.hash(), &[name_matcher()], window, &[], now, DEADLINE)
+        .await
+        .expect("the unmapped tenant's discovery is answered locally, not refused");
+    assert_eq!(
+        instances(&beta_series),
+        vec!["local-beta".to_string()],
+        "the unmapped local tenant enumerated the remote tenant's label namespace through the \
+         /api/v1/series, /api/v1/labels and /api/v1/label/<name>/values seam"
+    );
+    assert!(
+        !beta_stats.partial,
+        "an unmapped tenant's local-only discovery is complete, not partial coverage"
+    );
+    assert!(
+        beta_stats.warnings.is_empty(),
+        "an unmapped tenant gets no federation warning on discovery: {:?}",
+        beta_stats.warnings
     );
 
     remote.stop().await;

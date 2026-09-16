@@ -42,6 +42,23 @@ pub const DEFAULT_MAX_QUERY_BYTES: usize = 256 * 1024 * 1024;
 /// 105 columns and sorts and filters on two, i.e. 103 surplus columns.
 pub const DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS: usize = 8;
 
+/// Default `LIMIT` ceiling for bounded top-k grouped aggregation (issue
+/// #1402): a `GROUP BY ... ORDER BY max(col) DESC LIMIT k` keeps its aggregate
+/// state bounded by `k` only while `k` is at or below this.
+///
+/// The rewrite replaces one accumulator per distinct group with a priority map
+/// of `k` groups per aggregate stage, so the state it retains is `k` times the
+/// per-group state times the number of stages (a partial per scan partition
+/// plus one final). At 1,024 that is a few tens of thousands of retained
+/// groups against a group table that the statements this exists for grow to
+/// 10^8, which is the ratio the bound is worth having. Above it the priority
+/// map stops being a bound and becomes the group table with a heap bolted on,
+/// and its per-row comparison against the k-th best is pure overhead. The
+/// number is a ceiling on where the trade stays clearly positive, not a tuned
+/// optimum: the measured statement asks for `LIMIT 10`, three orders of
+/// magnitude below it.
+pub const DEFAULT_BOUNDED_TOPK_MAX_LIMIT: usize = 1024;
+
 /// Under-count of DataFusion 54's `GroupValues::size()` against the real
 /// hashbrown allocation of the group-key table (issue #740, finding 2).
 /// `size()` charges `capacity() * entry_size`, where `capacity()` is the
@@ -250,6 +267,22 @@ pub struct SqlConfig {
     /// surviving rows instead of for every row. So this is a cost knob, never
     /// a correctness one.
     pub late_materialization_extra_columns: Option<usize>,
+    /// `LIMIT` ceiling for bounded top-k grouped aggregation (issue #1402).
+    /// `Some(k)` installs [`crate::BoundedTopKAggregate`] and lets it bound a
+    /// grouped aggregate whose only consumer is a top-k sort of at most `k`
+    /// rows; `None` does not install the rule at all, which is the operator
+    /// opt-out and the "before" side of `tests/bounded_topk_aggregate.rs`.
+    ///
+    /// Default [`DEFAULT_BOUNDED_TOPK_MAX_LIMIT`]. Set once at server startup,
+    /// like every other field here.
+    ///
+    /// The rewrite is invisible to results, and narrowly so: it fires only for
+    /// a value-selective ordering aggregate (`max` descending, `min`
+    /// ascending) over a non-float input, where a group the bounded map evicts
+    /// provably could not have been in the answer. It does NOT fire for
+    /// `count` or `sum`, which cannot be pruned exactly at all; see the
+    /// `crate::bounded_topk` module docs for the counterexample.
+    pub bounded_topk_max_limit: Option<usize>,
     /// Bounded ephemeral spill scratch (ADR-0954). `None`, the default, means
     /// the disk manager stays
     /// [`Disabled`](datafusion::execution::disk_manager::DiskManagerMode::Disabled)
@@ -276,6 +309,19 @@ pub struct SqlConfig {
     /// still `None`, so an explicit setting is never overridden by the
     /// environment.
     pub spill: Option<SpillConfig>,
+    /// Whether a logs scan publishes its per-segment scan timeline
+    /// (`seg_open_start_offset`/`seg_open_ready_offset`/`seg_done_offset`,
+    /// folded into `SqlStats.scan_timing.segments`). Default `false`.
+    ///
+    /// The timeline is O(segments scanned): a new labelled metric per
+    /// segment per partition, at three points each, on top of the O(1) sums
+    /// and counts (`open_elapsed`, `decode_build_elapsed`, `segments_opened`,
+    /// the min/max pairs) that stay unconditional regardless of this flag. A
+    /// production logs query over thousands of segments has no reader for the
+    /// per-segment rows, so this is off by default; `ravel-bench`'s
+    /// `sql_latency` reporter is the one caller that turns it on. Set once at
+    /// server startup, like every other field here.
+    pub segment_timing: bool,
 }
 
 impl Default for SqlConfig {
@@ -286,10 +332,12 @@ impl Default for SqlConfig {
             parallel_final_aggregation: true,
             skip_partial_aggregation: true,
             late_materialization_extra_columns: Some(DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS),
+            bounded_topk_max_limit: Some(DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
             // Spill off. See the field doc: this is requirement 9 of #954 (a
             // no-spill deployment profile) and it is what makes enabling spill
             // an operator decision rather than a version upgrade.
             spill: None,
+            segment_timing: false,
         }
     }
 }
@@ -434,5 +482,14 @@ mod tests {
             Some(8)
         );
         assert_eq!(DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, 8);
+    }
+
+    /// Issue #1402: the rule ships installed, with a `LIMIT` ceiling. Both
+    /// halves are pinned, so neither the default nor the constant can drift
+    /// without this failing.
+    #[test]
+    fn bounded_topk_defaults_to_a_limit_of_1024() {
+        assert_eq!(SqlConfig::default().bounded_topk_max_limit, Some(1024));
+        assert_eq!(DEFAULT_BOUNDED_TOPK_MAX_LIMIT, 1024);
     }
 }

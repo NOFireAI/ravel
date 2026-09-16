@@ -19,7 +19,11 @@ retention tombstone, a compaction record, or a rewrite record), then logical
 exclusion from new snapshots, then physical removal via a sweeper. Orphan
 collection, which removes objects no commit record ever published, has no
 record to anchor on and is gated by age and a fresh re-listing instead (the
-first rule below). One sweeper component implements all rules below; all are
+first rule below). Orphan collection does not delete the object outright: it
+moves it to a `quarantine/` prefix for a second horizon and a reaper deletes it
+only after that, so a small out-of-band commit-record loss below the
+mass-orphan breaker's thresholds is recoverable rather than permanent
+(ADR-0058 amendment; see the orphan-GC section below). One sweeper component implements all rules below; all are
 stateless per pass and restartable from zero, and every delete is
 idempotent. Reader leases are not implemented: the "not lease-protected"
 precondition holds trivially everywhere below, because the `LeaseCheck`
@@ -110,7 +114,8 @@ own parameters, not gaps a correctly declared config leaves open.
 
 | rule | targets | preconditions (ALL must hold) | anchor |
 |---|---|---|---|
-| orphan (first implementation, ADR-0010 §11; batched re-verify and breaker, ADR-0048 decisions 4-5) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified by one fresh LIST shared by every candidate in the pass; the mass-orphan circuit breaker not tripped (or deliberately overridden) | object last_modified |
+| orphan (first implementation, ADR-0010 §11; batched re-verify and breaker, ADR-0048 decisions 4-5; quarantine, ADR-0058 amendment) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified by one fresh LIST shared by every candidate in the pass; the mass-orphan circuit breaker not tripped (or deliberately overridden). A candidate that clears these is moved to `quarantine/`, not deleted | object last_modified |
+| quarantine reaper (ADR-0058 amendment) | a `quarantine/<original key>/q<ns>` object an orphan pass moved out of the live keyspace | age since the quarantine timestamp embedded in the key > quarantine_horizon (default 7 days); a key whose `/q<ns>` segment does not parse is skipped, never deleted | quarantine key's own `/q<ns>` timestamp |
 | superseded input (ADR-0018, HEAD-reachability gate ADR-0020) | L0 commit records + data objects named in a compaction or rewrite record's input list, or a whole superseded predecessor record together with the parts it names | now >= record.created_unix_ns + protection_horizon; the live catalog HEAD snapshot names none of the objects the delete would remove (delete blocker, see below) | compaction or rewrite record created_unix_ns |
 | unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
 | retention (ADR-0019, HEAD-reachability gate ADR-0020) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; the live catalog HEAD snapshot names no object inside the bucket (delete blocker, see below); bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
@@ -195,8 +200,10 @@ window would still call a Hit.
   that same commit prefix, shared by every surviving candidate, dropping
   any whose identity now appears (the batched re-verify, ADR-0048 decision
   5, one extra LIST per pass, not one per candidate); then the
-  mass-orphan circuit breaker gate below. Deletes are all-or-nothing: a
-  tripped, non-overridden breaker deletes zero candidates that pass.
+  mass-orphan circuit breaker gate below; then, for every surviving
+  candidate, a move to quarantine (see "Quarantine and the second horizon"
+  below), never a direct delete. The breaker is all-or-nothing: a
+  tripped, non-overridden breaker quarantines zero candidates that pass.
 - The mass-orphan circuit breaker (ADR-0048 decision 4) trips when a
   pass's surviving candidate count is at least `orphan_breaker_min_count`
   (default 50) AND exceeds `orphan_breaker_max_ratio` (default 0.10) of
@@ -240,6 +247,78 @@ window would still call a Hit.
   never sets. The other two sweep rules are unaffected by a tripped
   orphan breaker and still run, since they are anchored on durable records
   an operator or compactor deliberately wrote, never on record absence.
+
+### Quarantine and the second horizon (ADR-0058 amendment)
+
+The breaker catches mass loss but, by design, lets small or thinly-spread
+loss through: fewer than `orphan_breaker_min_count` candidates, or a count
+under `orphan_breaker_max_ratio` of a large shard, does not trip it (the
+three scope limits above). Before this amendment those candidates were
+deleted permanently at the first horizon, so an out-of-band commit-record
+loss below the thresholds became permanent data loss with no recovery
+window and nothing paging. Orphan GC therefore no longer deletes a
+candidate at all. It moves each surviving candidate to a `quarantine/`
+prefix and a separate reaper deletes it only after a second horizon:
+
+- **The move is copy-first, delete-second.** An object store has no atomic
+  rename, so the move is a copy (`get` the bytes, `put` them under
+  `quarantine/<original key>/q<quarantined_at_ns>`) followed by a delete of
+  the live key. The copy always precedes the delete, so a crash or a store
+  fault between the two leaves the bytes in at least one location, never
+  none. A candidate whose copy fails is left live and counted as refused
+  (`ravel_maintain_orphans_quarantine_refused`), and the live delete never
+  runs for it; the candidate is retried on the next pass. The `put` is an
+  overwrite, which makes a retry idempotent within one pass. It is not
+  idempotent across passes: the destination key embeds that pass's timestamp,
+  so a crash between the copy and the live delete leaves the object live and
+  the next pass writes a second copy under a different `/q<ns>`. That
+  duplicate is self-cleaning, because the reaper collects each copy on its own
+  horizon, and the live object is never deleted while no copy of it exists.
+- **The quarantine key carries its own timestamp.** The trailing `/q<ns>`
+  segment records when the object was quarantined, taken from the injected
+  clock. The reaper reads the second horizon from that segment, not from the
+  copy's store `last_modified`, so the horizon is deterministic and does not
+  depend on the store preserving a copy's modification time. The whole
+  original key is preserved verbatim (strip the `quarantine/` prefix and the
+  `/q<ns>` segment) so an operator can copy the bytes back to their original
+  key to recover.
+- **The reaper is the only place orphan-GC'd data is physically deleted.**
+  It lists `quarantine/t/<tenant_hash>/<signal>/l0/<shard>/`, and for each
+  object whose embedded timestamp is more than `quarantine_horizon_ns`
+  (default 7 days) behind the clock, deletes it. A key whose `/q<ns>`
+  segment cannot be parsed is skipped, never deleted (fail-closed: an
+  unreadable age is treated as not-yet-expired). It runs on the same
+  maintain tick as the sweep, whole-shard like orphan GC itself (quarantine
+  keys are not hour-bucketed), and is stateless and idempotent.
+- **A tripped breaker holds the reaper.** A pass whose mass-orphan breaker
+  tripped reaps nothing, whatever the quarantine ages say. A loss that grows
+  over time reaches the breaker's thresholds days after it started, so
+  reaping on such a pass deletes the copies taken while it was still small.
+  The two horizons are therefore chained, not independent. A
+  `force_orphan_gc` override is not a trip and still reclaims.
+- **The event is visible in the logs, not yet on `/metrics`.** A pass counts
+  objects quarantined (equal to the retained `orphans_deleted` count of
+  candidates removed from the live set), refused, and reaped, and emits a
+  `warn`-level tracing event for each nonzero count. Today that tracing event
+  is the only operator-facing signal. The counter names
+  `ravel_maintain_orphans_quarantined` and
+  `ravel_maintain_orphans_quarantine_refused` are **not rendered on
+  `/metrics`** yet, so an alert rule written on either name can never fire.
+  Alert on `ravel_maintain_orphans_present` and on the tracing events
+  instead. `docs/observability.md` lists what `/metrics` actually exposes.
+
+The cost is storage plus transfer. A quarantined object occupies the bucket
+for the second horizon before it is reclaimed, and the `quarantine/` prefix
+would leak without the reaper, which is why the reaper is part of the
+mechanism, not a follow-up. The request cost changed shape too: orphan GC
+went from one DELETE per candidate to a full-object GET plus a full PUT per
+candidate, run serially with no cap on candidates per pass, and the reaper
+adds one unconditional LIST per swept unit per tick. The thin-spread record
+loss this feature exists for is also the expensive case, because it moves
+those bytes twice through a single maintain tick. The per-pass
+unboundedness is an acknowledged open item, not a property anything
+enforces. `force_orphan_gc` (the breaker override) still quarantines rather
+than deletes, so even a forced pass keeps the recovery window.
 
 ## Superseded input and unreferenced part
 
@@ -305,6 +384,19 @@ window would still call a Hit.
   max(max_event_ts) across both.
 - Observing a tombstone invalidates that bucket's cached commit and
   compaction records (the trigger ADR-0010 §10 promises).
+- The retention window a sweep applies to a bucket is resolved by a single
+  precedence, the same one the fold applies (ADR-0078): the durable per-tenant
+  retention window wins when set, otherwise the deployment default, where the
+  deployment default is the per-tenant deployment override if one is configured
+  and the deployment-wide default otherwise. So a durable per-tenant record
+  overrides both deployment settings. The sweep reads that durable record from
+  object storage under the same key and through the same decoder the fold uses,
+  so the sweep and the fold always resolve the same window for a tenant. This
+  agreement is required, not incidental: the two passes run independently, and a
+  sweep using a shorter window than the fold would tombstone an hour the fold's
+  snapshot still names and whose retention-frontier reconcile never drops,
+  leaving the physical sweep blocked on the HEAD-referenced-snapshot delete
+  blocker on every pass.
 - Retention is durable and irreversible: raising a tenant's retention
   window after a bucket is tombstoned never resurrects it. A token whose
   bucket is tombstoned resolves as satisfied with zero segments, not as
@@ -367,8 +459,27 @@ every bound is measured.
   for a request's
   predicate until its `.dreq` is removed, which by construction happens only
   after no resolvable snapshot can still reference a pre-rewrite input.
-  Correctness never depends on the per-bucket compaction/rewrite
-  serialization; that serialization is an efficiency measure.
+
+- **Compaction and format migration refuse a bucket that already holds a live
+  rewrite record.** This is the producer-side half of the same rule, and it is
+  a correctness requirement rather than an optimization: because overlap
+  harmlessness does not hold for a rewrite, a compaction (or migration) record
+  published over the same inputs leaves one bucket serving two record sets,
+  and a snapshot naming both resurrects the erased records through query-time
+  dedup. `compact_bucket` and `migrate_bucket_format` therefore gate on the
+  bucket's rewrite records exactly as they gate on its compaction records, and
+  report `RewritePresent`: the bucket is left untouched, its L0 inputs stay
+  live behind the rewrite record, and the maintenance pass memoizes the
+  refusal as terminal. The query-time filter (Query exclusion, above) remains
+  the guarantee that covers the window before a rewrite lands. This refusal
+  closes the case where the rewrite record is already durable when the
+  compactor lists the bucket; it does not close the concurrent case, where
+  compaction and the rewrite pass each list before the other publishes and
+  neither can see the other's record yet. The maintenance driver's per-bucket
+  serialization of compaction and rewrite is what covers that case today, and
+  it remains load-bearing -- not an optimization this refusal makes
+  unnecessary. Closing the residual window needs a compare-and-swap or an
+  explicit claim on the bucket; this change does not add one.
 
 - **The 72 h rewrite bound derives from the maintenance ownership cadence
   (ADR-0065).** The rewrite pass runs on the Maintain worker that owns each
@@ -533,6 +644,44 @@ into them. An operator with erasure obligations must budget them deliberately.
   operators with erasure obligations to prefer scoped legal holds over
   blanket default retention, or to keep `D` inside their erasure SLA.
 
+- **`+R`, scoped per-object compliance retention on commit records
+  (`t/*/*/c/*`).** Under the scoped posture (bucket default retention OFF,
+  an operator-run mechanism applying per-object retention instead;
+  docs/object-store-contract.md "Required bucket configuration", ADR-0072
+  decision 3), a superseded commit record still under its retention period
+  `R` refuses the same sweep delete `+D` describes. `sweep_superseded` runs
+  three delete loops in order over every cleared chain: every chain's input
+  commit records first, then every chain's input data objects, then every
+  chain's own compaction or rewrite records last. A lock on a chain's input
+  commit record aborts the pass at the first loop, so the data-delete loop
+  never runs for any chain in that pass and the physical-removal bound stays
+  at `max(bound, R)` until `R` elapses. A lock on a chain's own compaction or
+  rewrite record instead aborts the pass at the third loop, after that
+  chain's input records and their data are already gone: it holds only that
+  record at `max(bound, R)`, and the chain survives the retention period for
+  the next pass to retry. `sys/*`, `t/*/*/prov`, and
+  `t/*/catalog/*/*` carry the same scoped retention but are never targets
+  of supersession GC, ADR-0019 retention deletion, or ADR-0064 erasure.
+  That is a statement about those three mechanisms and nothing wider: the
+  catalog family is swept by a fourth one, the unreferenced-catalog sweep,
+  which carries its own `+R` erasure bound for some tenants (below). Keep
+  `R` inside `protection_horizon` (about 25 h with defaults) so the sweep
+  keeps making progress on superseded chains.
+
+- **`+R` again, scoped per-object compliance retention on the catalog
+  keyspace (`t/*/catalog/*/*`).** A compliance lock on this keyspace
+  costs an erasure obligation, not only reclamation. The unreferenced-catalog
+  sweep deletes the snapshot and index objects the current HEAD no longer
+  names, and for a tenant with a `STR` or `BYTES` typed attribute column a
+  per-part `.cstat` index object among them holds that subject's own column
+  value; a lock over the keyspace delays that delete, and the erased value
+  persists until the fold reconciles the hour and then a further `R`. Under
+  the shipped Maintain IAM policy the delete is denied outright, so the
+  bound is open-ended until that policy changes. The four-step mechanism,
+  the exact bound, the IAM ceiling, and the HEAD-scoping advice are in
+  docs/object-store-contract.md's "Required bucket configuration" section,
+  "A lock on the catalog family".
+
 - **`+E_v`, bucket versioning.** On a versioned bucket every physical delete
   becomes a soft delete, and the noncurrent version survives until the
   operator's required `NoncurrentDays = E_v` expiration rule reaps it. Every
@@ -580,18 +729,31 @@ into them. An operator with erasure obligations must budget them deliberately.
 
 ### Scope and interactions
 
-- **Why the `.done` guarantee needs only the commit-record pass.** The
+- **What the `.done` pass verifies, and the one object it does not.** The
   completion pass walks `c/<shard>/<hour>/` commit records and verifies the
   segment data a snapshot resolves is subject-free. It does NOT separately
-  walk index objects or analytics, and it does not need to, because neither
-  can hold a record matching an erasure subject:
-  - **Index objects carry no subject values.** `SnapshotEntry`,
-    `SnapshotPartHeader`, and name postings hold identities, hashes, counts,
-    and metric names, never label/attribute *values*. So the deny-deleted
-    `catalog/`, `prov`, and `sys/*` prefixes are disjoint from subject
-    erasure by construction. This holds *only if* subject identifiers appear
-    as label/attribute values and never inside metric names (a documented
-    requirement; see docs/object-store-contract.md "Required bucket
+  walk index objects or analytics. For analytics that is sound (below); for
+  the catalog family it is sound for three of its four object kinds and not
+  for the fourth:
+  - **Three index object kinds hold no value, and `.cstat` is the
+    exception.** `SnapshotEntry`, `SnapshotPartHeader`, and name postings
+    hold identities, hashes, counts, and metric names, never label/attribute
+    *values*, and a snapshot entry's own typed-column stamp is restricted to
+    `I64` and `BOOL` extrema (proto/ravel/commit.proto,
+    `DeclaredColumnStatValue`), which cannot represent a `STR` or `BYTES`
+    value either. The per-part `.cstat` column-statistics objects are the
+    exception the `+R` modifier above sets out: for a tenant with a `STR` or
+    `BYTES` typed attribute column they hold that column's exact min, max,
+    and distinct-value dictionary (the dictionary only up to a fixed entry
+    cap; the min and max always), so an erased subject's own value can sit
+    in one verbatim. So the deny-deleted `prov` and `sys/*` prefixes hold
+    nothing an erasure subject can match, while the `catalog/` prefix does:
+    the deny list's "disjoint by construction" claim no longer holds for the
+    catalog family. ADR-0064's Decision still states the wider form;
+    amending it is tracked separately. The three value-free kinds are
+    value-free *only if* subject identifiers appear as label/attribute
+    values and never inside metric names (a documented requirement; see
+    docs/object-store-contract.md "Required bucket
     configuration" point 5). A snapshot entry whose object a rewrite
     superseded is refreshed only when the fold reconciles that hour, through
     the fixed window or the retention-frontier band (docs/catalog-and-mvcc.md,
@@ -605,11 +767,11 @@ into them. An operator with erasure obligations must budget them deliberately.
     still resolve one. That holds however many rewrite generations the hour has
     accumulated: each rewrite record stays in place behind the inputs it
     superseded, and each request's filter stays live behind the whole chain,
-    not just behind the one generation that applied it. The cost is the held
-    storage, not a failed query, and it ends when the fold reconciles the hour
-    or an operator rebuilds HEAD: the next sweep deletes the inputs, then the
-    records that superseded them, and the requests become removable behind
-    both.
+    not just behind the one generation that applied it. The cost of the held
+    inputs is storage, not a failed query, and it ends when the fold
+    reconciles the hour or an operator rebuilds HEAD: the next sweep deletes
+    the inputs, then the records that superseded them, and the requests
+    become removable behind both.
   - **ADR-0028 analytics/derived datasets are a pure query-time stage, not a
     persisted store.** `ravel-analytics` carries no clock, IO, object-store,
     or catalog (docs/analytics.md): every analytic runs in memory over query
@@ -620,9 +782,20 @@ into them. An operator with erasure obligations must budget them deliberately.
     analytics-adjacent store that can retain subject values is the
     query-audit keyspace, covered next.
 
-  Because index and derived state hold no subject values, the pass verifying
-  only commit-record segments is not under-asserting the `.done` guarantee;
-  it verifies the only place a subject physically lives.
+  So the pass's commit-record scope covers the data objects a snapshot
+  resolves and the three value-free index kinds, and it covers no `.cstat`:
+  a stale column-statistics object the live HEAD still names sits outside
+  everything the pass verifies. What covers that gap is not the pass and
+  not the row-level exclusion filter (no row is ever sourced from a
+  `.cstat`) but the statistics gate named below, which declines every
+  metadata-only answer while an erasure predicate is pending; the filter
+  covers the held inputs. The filter cannot retire while the
+  superseded-input sweep still holds an input this request's rewrites
+  superseded (`crates/ravel-maintain/src/sweep.rs`), which is the same
+  condition under which the stale `.cstat` is still HEAD-referenced, and a
+  metadata-only answer read from typed-column statistics is refused
+  outright while any erasure predicate is pending
+  (`crates/ravel-sql/src/logs_scan.rs`).
 
 - **The query-audit keyspace is the one excluded derived store.** It may
   retain matcher values from audited query text, and it is deny-deleted

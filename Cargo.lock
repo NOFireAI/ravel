@@ -674,9 +674,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.3"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "untrusted 0.7.1",
@@ -685,9 +685,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.43.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
@@ -1309,8 +1309,18 @@ version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
 dependencies = [
- "darling_core",
- "darling_macro",
+ "darling_core 0.23.0",
+ "darling_macro 0.23.0",
+]
+
+[[package]]
+name = "darling"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed17f5901b6630b993ca003def43f2f8ef4014fc13b047b57aad617ff32bc2ec"
+dependencies = [
+ "darling_core 0.24.1",
+ "darling_macro 0.24.1",
 ]
 
 [[package]]
@@ -1327,14 +1337,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "darling_core"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6837e2cf7485aaae18f86181d2f0e9a7ed297a025e220aeabf63fdebd3a2ddff"
+dependencies = [
+ "ident_case",
+ "proc-macro2",
+ "quote",
+ "strsim",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "darling_macro"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
 dependencies = [
- "darling_core",
+ "darling_core 0.23.0",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "darling_macro"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ac7135c3ef02b2f7833bbeb1be5ba7f966dcde8a87c6b87f65a778d71a02785"
+dependencies = [
+ "darling_core 0.24.1",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -2828,6 +2862,8 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -3148,7 +3184,7 @@ version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92141c19e1fa83bf91633c1234c66b03375c29aa8ca5486331ddb47e3a3da9c0"
 dependencies = [
- "darling",
+ "darling 0.23.0",
  "proc-macro2",
  "quote",
  "serde",
@@ -3908,6 +3944,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4468,14 +4510,14 @@ dependencies = [
 
 [[package]]
 name = "ravel-affinity"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
 ]
 
 [[package]]
 name = "ravel-alerting"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "hex",
@@ -4487,14 +4529,14 @@ dependencies = [
 
 [[package]]
 name = "ravel-analytics"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "ravel-bench"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "arrow 59.1.0",
  "arrow-flight",
@@ -4547,7 +4589,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-cache"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "bytes",
  "crc32c",
@@ -4558,7 +4600,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-catalog"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4576,16 +4618,18 @@ dependencies = [
  "ravel-proto",
  "ravel-segment",
  "ravel-types",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "zstd",
 ]
 
 [[package]]
 name = "ravel-cli"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "arrow 59.1.0",
@@ -4607,6 +4651,7 @@ dependencies = [
  "ravel-ingest",
  "ravel-logseg",
  "ravel-maintain",
+ "ravel-memory",
  "ravel-object-store",
  "ravel-otlp",
  "ravel-proto",
@@ -4630,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-codec"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -4640,7 +4685,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-commit"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -4662,7 +4707,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-failure-tests"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "bytes",
  "futures",
@@ -4671,10 +4716,12 @@ dependencies = [
  "ravel-catalog",
  "ravel-commit",
  "ravel-ingest",
+ "ravel-logseg",
  "ravel-object-store",
  "ravel-otlp",
  "ravel-promql",
  "ravel-query",
+ "ravel-rspan",
  "ravel-segment",
  "ravel-types",
  "tokio",
@@ -4683,7 +4730,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-fleet"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "futures",
@@ -4702,7 +4749,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-ingest"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4734,7 +4781,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-ingest-router"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4761,7 +4808,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-logseg"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -4778,7 +4825,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-maintain"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4805,8 +4852,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-mcp"
+version = "0.15.0"
+dependencies = [
+ "base64 0.23.0",
+ "blake3",
+ "proptest",
+ "ravel-query",
+ "ravel-sql",
+ "ravel-types",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "ravel-memory"
+version = "0.15.0"
+
+[[package]]
 name = "ravel-object-store"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4827,8 +4896,9 @@ dependencies = [
 
 [[package]]
 name = "ravel-operator"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
+ "blake3",
  "clap",
  "futures",
  "hex",
@@ -4852,7 +4922,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-otap"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "arrow 59.1.0",
  "arrow-ipc 59.1.0",
@@ -4878,7 +4948,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-otlp"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "criterion",
@@ -4897,7 +4967,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-promql"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "promql-parser",
@@ -4910,7 +4980,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-promql-difftest"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "axum",
  "bytes",
@@ -4938,7 +5008,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-proto"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -4947,7 +5017,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-query"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4967,6 +5037,7 @@ dependencies = [
  "ravel-commit",
  "ravel-logseg",
  "ravel-maintain",
+ "ravel-memory",
  "ravel-object-store",
  "ravel-promql",
  "ravel-proto",
@@ -4986,11 +5057,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
 name = "ravel-remote-write"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "bytes",
  "hex",
@@ -5008,7 +5080,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-rspan"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "crc32c",
  "proptest",
@@ -5022,7 +5094,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-segment"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -5041,7 +5113,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-server"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "arrow 59.1.0",
@@ -5072,6 +5144,8 @@ dependencies = [
  "ravel-ingest",
  "ravel-logseg",
  "ravel-maintain",
+ "ravel-mcp",
+ "ravel-memory",
  "ravel-object-store",
  "ravel-otap",
  "ravel-otlp",
@@ -5087,6 +5161,7 @@ dependencies = [
  "ravel-types",
  "reqwest 0.13.4",
  "ring",
+ "rmcp",
  "rustls",
  "serde",
  "serde_json",
@@ -5107,7 +5182,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-sim"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5128,7 +5203,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-sql"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -5149,6 +5224,7 @@ dependencies = [
  "ravel-commit",
  "ravel-logseg",
  "ravel-maintain",
+ "ravel-memory",
  "ravel-object-store",
  "ravel-promql",
  "ravel-proto",
@@ -5170,7 +5246,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-tenant-resolve"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "axum",
  "base64 0.23.0",
@@ -5185,7 +5261,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-tracing-export"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -5201,7 +5277,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-types"
-version = "0.12.0"
+version = "0.15.0"
 dependencies = [
  "base64 0.23.0",
  "blake3",
@@ -5402,6 +5478,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmcp"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42b6914fac0be956fe704a38239c3f44a9f841d1b06a5713d2f638065593f5b5"
+dependencies = [
+ "async-trait",
+ "base64 0.23.0",
+ "bytes",
+ "chrono",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "indexmap",
+ "pastey",
+ "pin-project-lite",
+ "rand 0.10.2",
+ "reqwest 0.13.4",
+ "rmcp-macros",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sse-stream",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower-service",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rmcp-macros"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdf1c49bd4d52014b94db0877410db273c2008f01628b0252a2e9460ad9b7fda"
+dependencies = [
+ "darling 0.24.1",
+ "proc-macro2",
+ "quote",
+ "serde_json",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5437,9 +5559,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -5502,9 +5624,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -5560,6 +5682,7 @@ version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
 dependencies = [
+ "chrono",
  "dyn-clone",
  "ref-cast",
  "schemars_derive",
@@ -5889,6 +6012,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sse-stream"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c25ac7aff0abd1dbc474536e40416e1102c7dd9bfba0b9861c6d357f835dcfb4"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6017,7 +6153,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

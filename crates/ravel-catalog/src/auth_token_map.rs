@@ -41,18 +41,37 @@ use ravel_proto::sys::v1::TokenHashEntry as ProtoTokenHashEntry;
 /// never under a tenant prefix.
 pub const AUTH_KEY: &str = "sys/auth";
 
-/// Format version written into every `sys/auth` object this module emits, and
-/// the highest version it reads. A future version is refused rather than misread
-/// under the v1 layout, matching the `prov` / `enc` / `t/<hash>/config` records'
-/// fail-closed-on-newer guard (each uses its own comparison operator; see each
-/// module for its exact check).
+/// Format version written into every `sys/auth` object this module emits. The
+/// versions it READS are the closed set
+/// [`AUTH_TOKEN_MAP_MIN_READ_VERSION`]`..=`[`AUTH_TOKEN_MAP_MAX_READ_VERSION`],
+/// which today equals `{1, 2}`; anything outside it is refused rather than
+/// misread, matching the `prov` / `enc` / `t/<hash>/config` records' gates.
 ///
 /// Bumped 1 -> 2 for the `managed_by` ownership marker (ADR-0072 decision 4
 /// amendment): `TokenHashEntry.managed_by` is `optional` and additive,
 /// so the bump is a floor signal, not a wire necessity. This build accepts a
-/// stored 1 or 2 unconditionally -- an absent `managed_by` decodes the same
-/// way under either version, as unmanaged -- and always writes 2.
+/// stored 1 or 2 -- an absent `managed_by` decodes the same way under either
+/// version, as unmanaged -- and always writes 2.
 pub const AUTH_TOKEN_MAP_FORMAT_VERSION: u32 = 2;
+
+/// Lowest `format_version` this build reads for `sys/auth`.
+///
+/// A supported set has a floor as well as a ceiling (ADR-0066 decision 4). Before
+/// this constant the gate was ceiling-only, so version 0 -- an unstamped record,
+/// which is also what an empty or truncated-to-defaults decode produces -- was
+/// admitted, decoded, and then rewritten under CAS by [`upsert_token`] and its
+/// siblings as a version-2 record. A record no supported writer ever produced now
+/// fails closed with [`AuthTokenMapError::VersionBelowFloor`], whose remediation
+/// is the opposite of the above-ceiling one: investigate the record's origin
+/// rather than upgrade this binary.
+pub const AUTH_TOKEN_MAP_MIN_READ_VERSION: u32 = 1;
+
+/// Highest `format_version` this build reads for `sys/auth`. Equal to
+/// [`AUTH_TOKEN_MAP_FORMAT_VERSION`]: this record is not mid-rollout, so the
+/// reader's ceiling and the writer's stamp are the same number. They part only
+/// while a readers-before-writers sequence is in flight, as ADR-0066 R1 did for
+/// the three records this crate rolls forward.
+pub const AUTH_TOKEN_MAP_MAX_READ_VERSION: u32 = AUTH_TOKEN_MAP_FORMAT_VERSION;
 
 /// [`TokenEntry::managed_by`] value the operator's reconcile loop stamps on
 /// every entry it writes from a `tenantTokensSecretRef` Secret (ADR-0072
@@ -218,11 +237,27 @@ pub enum AuthTokenMapError {
         #[source]
         source: prost::DecodeError,
     },
+    /// The stored map declares a version above this build's read ceiling: a newer
+    /// writer produced it. Distinct from [`Self::VersionBelowFloor`] because the
+    /// remediations are opposite; see that variant.
     #[error(
-        "auth map {AUTH_KEY:?} declares format_version {got}, but this build only understands \
-         version {AUTH_TOKEN_MAP_FORMAT_VERSION}: refusing rather than misread a future format"
+        "auth map {AUTH_KEY:?} declares format_version {got}, above the highest version this build \
+         reads ({ceiling}): a newer writer produced it, so refusing rather than misread it. \
+         Upgrade this binary to one whose reader accepts version {got}"
     )]
-    UnsupportedVersion { got: u32 },
+    UnsupportedVersion { got: u32, ceiling: u32 },
+    /// The stored map declares a version below this build's read floor: an
+    /// unstamped record, or one predating the supported floor. Reported
+    /// separately from [`Self::UnsupportedVersion`] because an operator told "a
+    /// future format" for a version-0 record goes looking for a newer writer that
+    /// does not exist, when the actual question is where a record no supported
+    /// writer produced came from.
+    #[error(
+        "auth map {AUTH_KEY:?} declares format_version {got}, below the lowest version this build \
+         reads ({floor}): the record is unstamped or predates the supported floor, not a future \
+         format. Refusing rather than admit a record no supported writer produced"
+    )]
+    VersionBelowFloor { got: u32, floor: u32 },
     #[error("auth map {AUTH_KEY:?} is corrupt: {defect} (ADR-0066 decision 6)")]
     Corrupt { defect: AuthMapDefect },
     /// The stored map's `key_fingerprint` disagrees with the configured
@@ -272,19 +307,44 @@ pub enum AuthTokenMapError {
     },
 }
 
+/// The auth map's read gate: accept exactly the closed set
+/// `min_read_version..=max_read_version`, and report which side of it a refused
+/// record fell on. The bounds are parameters rather than the constants read
+/// directly so a test can instantiate the gate another release of this code
+/// carries.
+fn check_read_version(
+    format_version: u32,
+    min_read_version: u32,
+    max_read_version: u32,
+) -> Result<(), AuthTokenMapError> {
+    if format_version < min_read_version {
+        return Err(AuthTokenMapError::VersionBelowFloor {
+            got: format_version,
+            floor: min_read_version,
+        });
+    }
+    if format_version > max_read_version {
+        return Err(AuthTokenMapError::UnsupportedVersion {
+            got: format_version,
+            ceiling: max_read_version,
+        });
+    }
+    Ok(())
+}
+
 /// Decode and validate a proto auth map, checking the version, the deployment-key
-/// fingerprint, and the structural invariants fail-closed. A future format, a map
-/// under the wrong deployment key, a bad hash length, an empty tenant id, or a
-/// duplicate hash is refused rather than read.
+/// fingerprint, and the structural invariants fail-closed. A version outside the
+/// supported read set, a map under the wrong deployment key, a bad hash length, an
+/// empty tenant id, or a duplicate hash is refused rather than read.
 fn decode_map(
     proto: &ProtoAuthTokenMap,
     deployment_key: &[u8; 32],
 ) -> Result<AuthTokenMap, AuthTokenMapError> {
-    if proto.format_version > AUTH_TOKEN_MAP_FORMAT_VERSION {
-        return Err(AuthTokenMapError::UnsupportedVersion {
-            got: proto.format_version,
-        });
-    }
+    check_read_version(
+        proto.format_version,
+        AUTH_TOKEN_MAP_MIN_READ_VERSION,
+        AUTH_TOKEN_MAP_MAX_READ_VERSION,
+    )?;
     if proto.key_fingerprint.len() != KEY_FINGERPRINT_LEN {
         return Err(AuthTokenMapError::Corrupt {
             defect: AuthMapDefect::BadFingerprintLength,
@@ -1138,12 +1198,12 @@ mod tests {
         );
     }
 
-    /// A future format_version is refused rather than misread.
-    #[tokio::test]
-    async fn read_rejects_future_format_version() {
-        let store = mem();
+    /// Seed `sys/auth` at an explicit `format_version`, bypassing the writer's
+    /// stamp, so a test can place exactly the object an older or newer writer
+    /// would have left.
+    async fn seed_at_version(store: &dyn ObjectStoreBackend, version: u32) {
         let proto = ProtoAuthTokenMap {
-            format_version: AUTH_TOKEN_MAP_FORMAT_VERSION + 1,
+            format_version: version,
             key_fingerprint: key_fingerprint(KEY).to_vec(),
             entries: vec![],
             updated_unix_ns: 1,
@@ -1155,13 +1215,81 @@ mod tests {
                 PutOptions::default(),
             )
             .await
-            .expect("seed future");
+            .expect("seed at an explicit version");
+    }
+
+    /// The read gate is the closed set {1, 2}, a floor AND a ceiling (ADR-0066
+    /// decision 4). Both versions in the set decode; version 0 (an unstamped
+    /// record) and version 3 (above the ceiling) are both refused, and with
+    /// DIFFERENT typed errors, because the two demand opposite remediation.
+    /// Before this the gate was ceiling-only and version 0 was admitted, then
+    /// rewritten as version 2 by the next CAS write.
+    #[tokio::test]
+    async fn read_accepts_the_supported_set_and_refuses_either_side_of_it() {
+        assert_eq!(AUTH_TOKEN_MAP_MIN_READ_VERSION, 1);
+        assert_eq!(AUTH_TOKEN_MAP_MAX_READ_VERSION, 2);
+        assert_eq!(AUTH_TOKEN_MAP_FORMAT_VERSION, 2);
+
+        for version in [1u32, 2u32] {
+            let store = mem();
+            seed_at_version(store.as_ref(), version).await;
+            let (map, _v) = read_auth_map(store.as_ref(), KEY)
+                .await
+                .unwrap_or_else(|e| panic!("version {version} must decode: {e}"))
+                .expect("a present object is Some");
+            assert!(
+                map.entries.is_empty(),
+                "version {version} decodes to the seeded (empty) entry set"
+            );
+        }
+
+        let store = mem();
+        seed_at_version(store.as_ref(), 3).await;
         let err = read_auth_map(store.as_ref(), KEY)
             .await
-            .expect_err("a future format_version must be refused");
+            .expect_err("a version above the ceiling must be refused");
         assert!(
-            matches!(err, AuthTokenMapError::UnsupportedVersion { .. }),
+            matches!(
+                err,
+                AuthTokenMapError::UnsupportedVersion { got: 3, ceiling: 2 }
+            ),
             "got: {err}"
+        );
+
+        let store = mem();
+        seed_at_version(store.as_ref(), 0).await;
+        let err = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect_err("a version below the floor must be refused");
+        assert!(
+            matches!(
+                err,
+                AuthTokenMapError::VersionBelowFloor { got: 0, floor: 1 }
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// The two version diagnostics say different things. An operator reading the
+    /// below-floor message must not be sent looking for a newer writer, and the
+    /// above-ceiling message must name the upgrade. Asserted on the rendered
+    /// strings because the message is the whole remediation signal.
+    #[test]
+    fn the_two_version_diagnostics_are_distinguishable() {
+        let above = check_read_version(3, 1, 2).expect_err("3 is above the ceiling");
+        let below = check_read_version(0, 1, 2).expect_err("0 is below the floor");
+        let above = above.to_string();
+        let below = below.to_string();
+        assert!(above.contains("above the highest version"), "got: {above}");
+        assert!(above.contains("Upgrade this binary"), "got: {above}");
+        assert!(below.contains("below the lowest version"), "got: {below}");
+        assert!(
+            below.contains("not a future format"),
+            "the below-floor message must not read as a future format: {below}"
+        );
+        assert!(
+            !below.contains("Upgrade this binary"),
+            "an unstamped record is not fixed by upgrading: {below}"
         );
     }
 

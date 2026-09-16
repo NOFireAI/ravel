@@ -12,7 +12,7 @@
 //! error; it never corrupts HEAD or leaves a torn snapshot visible.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -24,8 +24,8 @@ use ravel_object_store::{
     Version, list_all,
 };
 use ravel_proto::catalog::v1::{
-    ColumnStatsSegment, SnapshotColumnStatsPartRef, SnapshotColumnStatsRef, SnapshotEntry,
-    SnapshotHead, SnapshotPartRef, SnapshotPostingsRef,
+    ColumnStatsSegment, SnapshotColumnStatsPartRef, SnapshotEntry, SnapshotHead, SnapshotPartRef,
+    SnapshotPostingsRef,
 };
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord, RewriteRecord};
 use ravel_segment::{ExpectedIdentity, ReaderLimits, SegmentError};
@@ -41,6 +41,7 @@ use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
     self, HEAD_FORMAT_VERSION, NamePostings, PartLimits, SnapshotFormatError,
+    column_stats_segments_concat,
 };
 use crate::tenant_config::DeclaredTypedColumn;
 
@@ -95,8 +96,73 @@ pub struct Transaction {
     _private: (),
 }
 
+/// The ingest hours a caller wants this fold to re-list and reconcile, on top
+/// of the fold's own fixed reconcile window and retention-frontier band
+/// (ADR-0063 section 4). The receiving end of issue #526's re-fold half.
+///
+/// The fold cannot derive this set itself. An hour that received a late
+/// compaction or rewrite record is indistinguishable, from the snapshot
+/// entries alone, from an hour that did not: proving the difference needs a
+/// LIST of that hour's commit buckets, and the hours that could have received
+/// one are every hour the snapshot names, so a self-derived version would cost
+/// a full-history LIST fan-out on every fold. The fixed window bounds that by
+/// recency and the frontier band bounds it by the retention frontier; neither
+/// reaches a late record in the middle of a tenant's history, which is exactly
+/// the hour that leaks (the sweep's HEAD-reachability gate holds the
+/// pre-rewrite inputs because the snapshot still names them).
+///
+/// The maintain tier's superseded-input sweep already pays for those LISTs and
+/// already computes the answer: a bucket it holds on
+/// `SnapshotBlock::Named` is an hour whose snapshot entries still name inputs a
+/// published compaction or rewrite record superseded. Those hours are what
+/// belongs here.
+///
+/// Requesting an hour is a hint, never a durability dependency: an unrequested
+/// or dropped hour degrades to today's behavior (the hour keeps naming its
+/// pre-rewrite inputs until retention drops it), and the sweep's gate remains
+/// the delete blocker either way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefoldRequest {
+    /// Ascending and deduplicated, so a fold spends its cap oldest-first (the
+    /// hours whose held inputs have occupied storage longest).
+    hours: BTreeSet<u32>,
+}
+
+impl RefoldRequest {
+    /// An empty request: the fold behaves exactly as [`Catalog::fold`] does.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request a re-fold of one ingest hour.
+    pub fn insert(&mut self, ingest_hour_bucket: u32) {
+        self.hours.insert(ingest_hour_bucket);
+    }
+
+    /// Build a request from an hour iterator; duplicates collapse.
+    pub fn from_hours(hours: impl IntoIterator<Item = u32>) -> Self {
+        Self {
+            hours: hours.into_iter().collect(),
+        }
+    }
+
+    /// The requested hours, ascending.
+    pub fn hours(&self) -> impl Iterator<Item = u32> + '_ {
+        self.hours.iter().copied()
+    }
+
+    /// Number of distinct hours requested.
+    pub fn len(&self) -> usize {
+        self.hours.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hours.is_empty()
+    }
+}
+
 /// Outcome of one [`Catalog::fold`] call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FoldReport {
     /// HEAD's watermark_hour after this call. `None` only when no hour has
     /// ever been sealed for this (tenant, signal) yet.
@@ -130,6 +196,14 @@ pub struct FoldReport {
     pub parts_reused: u64,
     pub list_requests: u64,
     pub get_requests: u64,
+    /// Number of PUT requests this fold issued to the object store, counted
+    /// unconditionally at the point each request is issued -- an
+    /// `AlreadyExists` or another store-side error still counts, since the
+    /// store received the request and, on an ambiguous error, may have
+    /// durably written the object despite the client-visible failure (#1598).
+    /// This is a request-issued counter, not a request-succeeded one: a
+    /// build/PUT failure that leaves a `*_built` field `false` still counted
+    /// its attempt here.
     pub put_requests: u64,
     /// `true` if this fold successfully built and attached a name-postings
     /// index. `false` covers both "no
@@ -139,27 +213,26 @@ pub struct FoldReport {
     /// Encoded size of the postings object, in bytes. `0` when
     /// `postings_built` is `false`.
     pub postings_bytes: u64,
-    /// `true` if this fold successfully built and attached a column-statistics
-    /// object (ADR-0850). `false` covers "the tenant has no configured typed
-    /// attribute columns" (nothing to build), a no-op fold, and "the build
-    /// failed and the fold proceeded without a column-stats ref" -- exactly
-    /// the same three-way ambiguity `postings_built` already accepts.
-    pub column_stats_built: bool,
-    /// Encoded size of the column-stats object, in bytes. `0` when
-    /// `column_stats_built` is `false`.
-    pub column_stats_bytes: u64,
-    /// `true` if this fold successfully built and attached the part-hash-keyed
-    /// (v2) column-statistics object under `SnapshotHead.column_stats_part`
-    /// (field 13, ADR-0942). Covers L0 and L1 uniformly. `false` carries the
-    /// same three-way ambiguity as [`Self::column_stats_built`]: no configured
-    /// typed columns, a no-op fold, or a build/PUT failure the fold proceeded
-    /// past. Independent of [`Self::column_stats_built`]: during the
-    /// dual-publish window both the v1 (field 11) and v2 (field 13) objects are
-    /// written each fold.
-    pub column_stats_part_built: bool,
-    /// Encoded size of the v2 part-hash-keyed column-stats object, in bytes.
-    /// `0` when `column_stats_part_built` is `false`.
-    pub column_stats_part_bytes: u64,
+    /// Number of per-part (v3, ADR-1413) column-statistics objects this fold
+    /// built and PUT, one per newly written or rewritten part (never for a
+    /// part carried forward by reference: its existing
+    /// `SnapshotPartRef.column_stats` ref, if any, is forwarded unchanged).
+    /// `0` on a no-op fold or when the tenant has no configured typed
+    /// columns. A part whose statistics exceed the ceiling still gets an
+    /// object here (ADR-1413 decision 4, amended): the fold degrades it by
+    /// dropping dictionaries (see [`Self::column_stats_dictionaries_dropped`])
+    /// rather than skipping it, and only fails the whole fold when no
+    /// dictionary is left and it is still over ceiling.
+    pub column_stats_part_objects_built: u64,
+    /// Total (segment, column) dictionaries this fold dropped (largest
+    /// encoded size first, `dictionary_present` set to `false`) across every
+    /// per-part column-statistics object, to bring an over-ceiling part's
+    /// body under [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`]
+    /// (ADR-1413 decision 4, amended). `0` when every part's statistics
+    /// already fit the ceiling with every dictionary intact. min/max/count/sum
+    /// are never affected: only the dictionary is dropped, never truncated
+    /// (ADR-0850 decision 3's omit-never-truncate rule).
+    pub column_stats_dictionaries_dropped: u64,
     /// Number of commit-bucket entries this fold skipped rather than
     /// aborting on: an unrecognized bucket-key shape, or a commit record
     /// whose identity duplicates one already folded. Both are layout drift
@@ -240,14 +313,15 @@ impl HeadState {
     }
 }
 
-/// Orders v2 column-statistics records by their join key (the covered part's
-/// content hash, carried in `writer_id`) and collapses repeats.
+/// Orders per-part (v3) column-statistics records by their join key (the
+/// covered part's content hash, carried in `writer_id`) and collapses
+/// repeats.
 ///
-/// `encode_column_stats_v2` rejects a repeated key outright, and the fold
-/// treats that error as "no field 13 this time", so one repeat would strip the
-/// tenant's part-bound statistics on this and every later fold. A repeated key
-/// means two entries cover a byte-identical part, so their records carry the
-/// same statistics and keeping one is exact rather than a narrowing.
+/// `encode_column_stats_v3` rejects a repeated key outright, and the fold
+/// treats that error as "no field 7 ref for this part", so one repeat would
+/// strip the part's statistics. A repeated key means two entries cover a
+/// byte-identical part, so their records carry the same statistics and
+/// keeping one is exact rather than a narrowing.
 fn sort_and_dedup_part_segments(segments: &mut Vec<ColumnStatsSegment>) {
     segments.sort_by(|a, b| a.writer_id.cmp(&b.writer_id));
     segments.dedup_by(|a, b| a.writer_id == b.writer_id);
@@ -558,6 +632,72 @@ fn fold_shard_ceiling(generations: &[ShardGeneration], watermark_hour: u32) -> u
     crate::provisioning::shard_ceiling(generations, watermark_hour)
 }
 
+/// The number of bytes a protobuf varint encodes `v` in: 7 payload bits per
+/// byte, continuation bit set on every byte but the last. Used by the
+/// per-part column-stats degrade loop to track, without re-encoding, how a
+/// message's own length-delimiter width changes when its content shrinks.
+fn varint_len(v: u64) -> u64 {
+    let mut len = 1u64;
+    let mut rest = v >> 7;
+    while rest > 0 {
+        len += 1;
+        rest >>= 7;
+    }
+    len
+}
+
+// Test-only instrumentation for #1482: counts calls to
+// `column_stats_segments_concat` made by the per-part column-stats degrade
+// loop, so a regression test can pin the loop at measuring the body a
+// bounded number of times rather than once per dictionary dropped.
+#[cfg(test)]
+thread_local! {
+    static COLUMN_STATS_CONCAT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_column_stats_concat_call_for_test() {
+    COLUMN_STATS_CONCAT_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+fn column_stats_concat_calls_for_test() -> u64 {
+    COLUMN_STATS_CONCAT_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_column_stats_concat_calls_for_test() {
+    COLUMN_STATS_CONCAT_CALLS.with(|c| c.set(0));
+}
+
+// Test-only instrumentation for issue #526: the number of hours the targeted
+// re-fold pass actually re-listed on the last fold, so a bounded-work test can
+// pin that number exactly rather than inferring it from LIST arithmetic. It is
+// not a `FoldReport` field because every field of that struct must also be
+// rendered by `ravel-cli`'s human fold report
+// (services/ravel-cli/src/catalog.rs, pinned by
+// services/ravel-cli/tests/catalog_fold_report.rs), which is outside this
+// change's scope; see the follow-up named in the issue.
+#[cfg(test)]
+thread_local! {
+    static REFOLD_HOURS_RECONCILED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_refold_hours_for_test(hours: u64) {
+    REFOLD_HOURS_RECONCILED.with(|c| c.set(hours));
+}
+
+#[cfg(test)]
+fn refold_hours_reconciled_for_test() -> u64 {
+    REFOLD_HOURS_RECONCILED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_refold_hours_for_test() {
+    REFOLD_HOURS_RECONCILED.with(|c| c.set(0));
+}
+
 /// One part's span in the fully-sorted entry set: the `[start, end)` index
 /// range into `entries` and the `[min_hour, watermark_hour]` ingest-hour range
 /// those entries occupy (ADR-0063 section 1). Ranges are disjoint and
@@ -569,6 +709,19 @@ struct PartSpan {
     end: usize,
     min_hour: u32,
     watermark_hour: u32,
+}
+
+/// One span's part encoding, computed once and reused by both the
+/// `reused_old_part_hashes` baseline pass and the main per-span build loop,
+/// so a span is encoded and hashed once per fold. `min_hour`/`watermark` are
+/// this span's already-resolved
+/// part bounds (single-part/tail overrides applied), not the raw `PartSpan`
+/// values.
+struct SpanEncoding {
+    min_hour: u32,
+    watermark: u32,
+    bytes: Vec<u8>,
+    hash: blake3::Hash,
 }
 
 /// Partition the fully hour-major-sorted `entries` into hour-range parts under
@@ -753,11 +906,12 @@ fn retirement_frontier_hour(
 
 /// `(shard, hour)` pairs for an explicit, arbitrary set of ingest hours, one
 /// per shard in each hour's own `scan_count(h)` fan-out (ADR-0052 section 4).
-/// The retention-frontier reconcile (ADR-0020) needs the shard buckets for a
-/// sparse, non-contiguous hour set (the snapshot-named hours at or below the
-/// frontier), which [`hour_range_buckets`]' contiguous `[lo, hi]` range cannot
-/// express.
-fn frontier_hour_set_buckets(generations: &[ShardGeneration], hours: &[u32]) -> Vec<(u32, u32)> {
+/// Both sparse reconcile passes need this shape, which
+/// [`hour_range_buckets`]' contiguous `[lo, hi]` range cannot express: the
+/// retention-frontier reconcile (ADR-0020) over the snapshot-named hours at or
+/// below the frontier, and the targeted re-fold pass (issue #526) over the
+/// hours a [`RefoldRequest`] names.
+fn hour_set_buckets(generations: &[ShardGeneration], hours: &[u32]) -> Vec<(u32, u32)> {
     let mut buckets = Vec::new();
     for &hour in hours {
         let scan = scan_count(generations, hour, DEFAULT_SCAN_SLACK_HOURS);
@@ -826,8 +980,85 @@ impl Catalog {
         signal: Signal,
         folder_id: Uuid,
         now_ns: i64,
+        transactions: &[Transaction],
+        default_retention_ns: Option<i64>,
+    ) -> Result<FoldReport, CatalogError> {
+        self.fold_with_refold_request(
+            tenant,
+            signal,
+            folder_id,
+            now_ns,
+            transactions,
+            default_retention_ns,
+            &RefoldRequest::new(),
+        )
+        .await
+    }
+
+    /// [`Catalog::fold`], plus a targeted re-fold of the ingest hours
+    /// `refold_request` names (issue #526).
+    ///
+    /// The fixed reconcile window reaches only
+    /// `fold_reconcile_window_hours` behind the previous watermark and the
+    /// retention-frontier band reaches only the hours near the tenant's
+    /// retirement frontier. A compaction or rewrite record that lands in an
+    /// already-folded hour between those two bands is never observed by any
+    /// later fold, so the snapshot keeps naming that hour's pre-rewrite
+    /// inputs, the maintain tier's superseded-input sweep holds those objects
+    /// on its HEAD-reachability gate (ADR-0020), and they occupy storage until
+    /// retention drops the hour. This entry point is how the holder tells the
+    /// fold which hours to re-list; see [`RefoldRequest`] for why the fold
+    /// cannot derive that set itself.
+    ///
+    /// The requested hours are reconciled through exactly the same per-bucket
+    /// path as the other two passes, so a re-fold can only ever make the
+    /// snapshot agree with the commit layout. The pass is bounded by
+    /// `frontier_reconcile_max_hours`, skips hours the other two passes already
+    /// list, and skips hours the snapshot does not name (a re-fold of an hour
+    /// no part covers would be pure cost). It also inherits ADR-0063 section
+    /// 4's carve-outs: a first fold and a rebuild do no reconcile work at all,
+    /// so a request made against either is ignored rather than adding LISTs to
+    /// a fold that already derives every hour from the commit layout.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fold_with_refold_request(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        folder_id: Uuid,
+        now_ns: i64,
+        transactions: &[Transaction],
+        default_retention_ns: Option<i64>,
+        refold_request: &RefoldRequest,
+    ) -> Result<FoldReport, CatalogError> {
+        let result = self
+            .fold_inner(
+                tenant,
+                signal,
+                folder_id,
+                now_ns,
+                transactions,
+                default_retention_ns,
+                refold_request,
+            )
+            .await;
+        self.record_fold_outcome(signal, now_ns, result.is_ok());
+        result
+    }
+
+    /// The fold body. Wrapped by [`Catalog::fold`] rather than instrumented
+    /// in place because the body returns from a dozen points and through `?`,
+    /// and a counter maintained at each of those is a counter that a later
+    /// early return silently stops feeding.
+    #[allow(clippy::too_many_arguments)]
+    async fn fold_inner(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        folder_id: Uuid,
+        now_ns: i64,
         _transactions: &[Transaction],
         default_retention_ns: Option<i64>,
+        refold_request: &RefoldRequest,
     ) -> Result<FoldReport, CatalogError> {
         let head_key = head_object_key(tenant, signal);
         // Fold never runs on the query path (module docs above) and keeps
@@ -887,10 +1118,10 @@ impl Catalog {
                 None
             }
         };
-        let tenant_retention_ns: Option<i64> = tenant_config
-            .as_ref()
-            .and_then(|cfg| cfg.retention_ns)
-            .or(default_retention_ns);
+        let tenant_retention_ns: Option<i64> = crate::tenant_config::resolve_retention_window(
+            tenant_config.as_ref(),
+            default_retention_ns,
+        );
         // ADR-0850: the tenant's configured typed logs attribute columns, if
         // any. `None`/absent config/a read failure all mean "no configured
         // columns" -- unlike `retention_ns`, `typed_attr_columns` has no
@@ -1067,6 +1298,11 @@ impl Catalog {
             let mut dirty_hours: HashSet<u32> = HashSet::new();
             let mut frontier_hours_reconciled: u64 = 0;
             let mut frontier_hours_deferred: u64 = 0;
+            // Hours the retention-frontier pass listed this fold, so the
+            // targeted re-fold pass below does not list any of them a second
+            // time (issue #526).
+            let mut frontier_listed_hours: HashSet<u32> = HashSet::new();
+            let mut refold_hours_reconciled: u64 = 0;
             if let Some(watermark_hour_old) = reconcile_watermark {
                 let window = self.config().fold_reconcile_window_hours;
                 let lo = watermark_hour_old.saturating_sub(window);
@@ -1161,13 +1397,13 @@ impl Catalog {
                     frontier_hours_deferred = (candidate_hours.len() - take) as u64;
                     let frontier_hours = &candidate_hours[..take];
                     if !frontier_hours.is_empty() {
-                        let frontier_buckets =
-                            frontier_hour_set_buckets(&generations, frontier_hours);
+                        let frontier_buckets = hour_set_buckets(&generations, frontier_hours);
                         let frontier_listings = self
                             .discover_bucket_listings(tenant, signal, &frontier_buckets)
                             .await?;
                         counters.list_requests += frontier_buckets.len() as u64;
                         frontier_hours_reconciled = frontier_hours.len() as u64;
+                        frontier_listed_hours.extend(frontier_hours.iter().copied());
                         for (shard, hour, listing) in &frontier_listings {
                             self.reconcile_one_bucket(
                                 tenant,
@@ -1186,7 +1422,111 @@ impl Catalog {
                         }
                     }
                 }
+
+                // ---- Targeted re-fold pass (issue #526) ----
+                //
+                // The two passes above are bounded by recency and by the
+                // retention frontier. A compaction or rewrite record that
+                // lands in an already-folded hour between those bands is
+                // reached by neither, so the snapshot keeps naming that hour's
+                // pre-rewrite inputs; the superseded-input sweep's
+                // HEAD-reachability gate (ADR-0020) then holds those objects
+                // instead of deleting them, and they occupy storage until
+                // retention drops the hour. `refold_request` is how the holder
+                // names those hours (see `RefoldRequest` for why the fold
+                // cannot derive them itself), and this pass re-lists them
+                // through the same per-bucket reconcile the other two use.
+                //
+                // Three filters keep the pass targeted, and together they are
+                // what bounds its work to the hours that can actually be
+                // leaking:
+                //
+                // - `< lo` drops anything the fixed window already lists,
+                //   which also drops every hour at or above the old watermark
+                //   (the incremental range folds those fresh this cycle).
+                // - `!frontier_listed_hours` drops what the frontier pass just
+                //   listed, so no bucket is listed twice in one fold.
+                // - `named_hours` drops hours no snapshot entry covers. Such an
+                //   hour cannot be blocking a delete on HEAD reachability, so
+                //   listing it is pure cost.
+                //
+                // Whatever survives is capped oldest-first, so one caller
+                // reporting a large blocked set cannot turn a fold into an
+                // unbounded LIST fan-out.
+                //
+                // The cap is `frontier_reconcile_max_hours`, read from the
+                // runtime config rather than from its default, which is what
+                // makes "the two sparse passes share one cap" true for an
+                // operator who lowers it and not only for one who leaves it
+                // alone. The bound suits both for the same reason: it sits far
+                // above the steady-state set, so it only ever bounds a recovery
+                // case.
+                //
+                // The remainder is not tracked in the snapshot: the requester
+                // re-derives its blocked set each pass, so a still-blocked hour
+                // comes back on the next request.
+                if !refold_request.is_empty() {
+                    let named_hours: HashSet<u32> =
+                        entries.iter().map(|e| e.ingest_hour_bucket).collect();
+                    // `RefoldRequest` iterates ascending, so this is
+                    // oldest-first without a sort: the hours whose held inputs
+                    // have occupied storage longest are reconciled before the
+                    // cap is spent.
+                    let candidates: Vec<u32> = refold_request
+                        .hours()
+                        .filter(|hour| {
+                            *hour < lo
+                                && !frontier_listed_hours.contains(hour)
+                                && named_hours.contains(hour)
+                        })
+                        .collect();
+                    let cap = self.config().frontier_reconcile_max_hours as usize;
+                    let take = candidates.len().min(cap);
+                    if take < candidates.len() {
+                        tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            requested = candidates.len(),
+                            reconciled = take,
+                            "targeted re-fold request exceeds the per-fold cap; the remainder is \
+                             carried to whichever later fold the requester asks for it again"
+                        );
+                    }
+                    let refold_hours = &candidates[..take];
+                    if !refold_hours.is_empty() {
+                        let refold_buckets = hour_set_buckets(&generations, refold_hours);
+                        let refold_listings = self
+                            .discover_bucket_listings(tenant, signal, &refold_buckets)
+                            .await?;
+                        counters.list_requests += refold_buckets.len() as u64;
+                        refold_hours_reconciled = refold_hours.len() as u64;
+                        for (shard, hour, listing) in &refold_listings {
+                            self.reconcile_one_bucket(
+                                tenant,
+                                signal,
+                                *shard,
+                                *hour,
+                                listing,
+                                &accounting,
+                                &mut entries,
+                                &mut seen,
+                                &mut dirty_hours,
+                                &mut counters,
+                                &mut layout_drift_count,
+                            )
+                            .await?;
+                        }
+                    }
+                }
             }
+            if refold_hours_reconciled > 0 {
+                tracing::debug!(
+                    tenant = %tenant.to_hex(),
+                    hours = refold_hours_reconciled,
+                    "fold reconciled the ingest hours a re-fold request named"
+                );
+            }
+            #[cfg(test)]
+            record_refold_hours_for_test(refold_hours_reconciled);
             // A reconcile that changed any hour invalidates the append-only,
             // stable-ordinal assumption the forward postings merge relies on
             // (a superseded or removed entry shifts every later ordinal), so
@@ -1263,13 +1603,135 @@ impl Catalog {
                 _ => HashMap::new(),
             };
 
+            // An old part carried forward by reference below
+            // (`existing_by_blake3`) never touches `v3_content_baseline`: the
+            // per-span loop skips the v3 block for it. Only an old part this
+            // fold re-derives can use its prior per-segment statistics as a
+            // baseline, so precompute which old part hashes the spans
+            // reproduce byte-for-byte and fetch baselines for the rest only.
+            //
+            // Encoded once per span (kept in `span_encodings`, not discarded):
+            // the per-span build loop below consumes the same bytes and hash
+            // rather than re-running `encode_part_ranged` and `blake3::hash`
+            // a second time over identical input.
             let single_part = spans.len() == 1;
+            let span_encodings: Vec<Result<SpanEncoding, SnapshotFormatError>> = spans
+                .iter()
+                .enumerate()
+                .map(|(span_index, span)| {
+                    let is_tail = span_index + 1 == spans.len();
+                    let (min_hour, watermark) = if single_part {
+                        (0, watermark_hour)
+                    } else if is_tail {
+                        (span.min_hour, watermark_hour)
+                    } else {
+                        (span.min_hour, span.watermark_hour)
+                    };
+                    let part_entries = &entries[span.start..span.end];
+                    let bytes = snapshot_format::encode_part_ranged(
+                        tenant.0,
+                        signal_num,
+                        shard_ceiling,
+                        min_hour,
+                        watermark,
+                        part_entries,
+                    )?;
+                    let hash = blake3::hash(&bytes);
+                    Ok(SpanEncoding {
+                        min_hour,
+                        watermark,
+                        bytes,
+                        hash,
+                    })
+                })
+                .collect();
+            let reused_old_part_hashes: HashSet<[u8; 32]> = span_encodings
+                .iter()
+                .filter_map(|encoding| encoding.as_ref().ok())
+                .filter_map(|encoding| {
+                    let hash = *encoding.hash.as_bytes();
+                    existing_by_blake3
+                        .contains_key(hash.as_slice())
+                        .then_some(hash)
+                })
+                .collect();
+
+            // ADR-1413 decision 1 (v2 semantics): reuse the previous fold's
+            // per-part v3 column-stats objects the same way the field-13 (v2)
+            // baseline below reuses its own predecessor, so a part that grows
+            // (e.g. an appended hour) does not re-derive every entry it
+            // already covered. Keyed by content hash, exactly as the v2
+            // baseline is (both key on `entry.content_hash`, the same join
+            // key); merged across every old part still valid for reuse
+            // (excluded: a part covering a dirty hour, whose old statistics
+            // cannot be trusted forward, mirroring `existing_by_blake3`
+            // above; also excluded: a part this fold's spans reproduce
+            // byte-for-byte and will carry forward by reference, whose
+            // baseline would never be consulted).
+            let v3_content_baseline: HashMap<Vec<u8>, ColumnStatsSegment> = if typed_attr_columns
+                .is_empty()
+                || rebuilt
+            {
+                HashMap::new()
+            } else if let HeadState::Valid { head, .. } = &head_state {
+                let mut baseline = HashMap::new();
+                for old_part in head
+                    .parts
+                    .iter()
+                    .filter(|p| !part_covers_dirty_hour(p, &dirty_hours))
+                {
+                    let Some(stats_ref) = &old_part.column_stats else {
+                        continue;
+                    };
+                    let Ok(old_part_hash) = <[u8; 32]>::try_from(old_part.blake3.as_slice()) else {
+                        continue;
+                    };
+                    if reused_old_part_hashes.contains(&old_part_hash) {
+                        continue;
+                    }
+                    match self.store().get(&stats_ref.key, GetRange::Full).await {
+                        Ok(got) => {
+                            counters.get_requests += 1;
+                            match column_stats_build::decode_previous_column_stats(
+                                &got.data,
+                                &[old_part_hash],
+                                &crate::snapshot_format::ColumnStatsLimits::default(),
+                            ) {
+                                Ok(segments) => {
+                                    for segment in segments {
+                                        baseline.insert(segment.writer_id.clone(), segment);
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        tenant = %tenant.to_hex(),
+                                        "previous per-part column-stats object failed to decode or bind to its owning part; rebuilding every segment's statistics for parts that reuse it"
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                tenant = %tenant.to_hex(),
+                                "previous per-part column-stats object GET failed; rebuilding every segment's statistics for parts that reuse it"
+                            );
+                        }
+                    }
+                }
+                baseline
+            } else {
+                HashMap::new()
+            };
+
             let mut part_refs: Vec<SnapshotPartRef> = Vec::with_capacity(spans.len());
             let mut part_hashes: Vec<[u8; 32]> = Vec::with_capacity(spans.len());
             let mut total_part_bytes: u64 = 0;
             let mut parts_reused: u64 = 0;
-            for (span_index, span) in spans.iter().enumerate() {
-                let is_tail = span_index + 1 == spans.len();
+            let mut column_stats_part_objects_built: u64 = 0;
+            let mut column_stats_dictionaries_dropped: u64 = 0;
+            for (span, encoding) in spans.iter().zip(span_encodings) {
                 // Single-part fold keeps exact v1 semantics: min_hour 0 (the
                 // epoch floor) and the fold watermark, byte-identical to the
                 // legacy encode so existing single-part objects and their
@@ -1277,24 +1739,15 @@ impl Catalog {
                 // its real first hour as min_hour; sealed parts end at their
                 // last contained hour, and only the tail carries the fold
                 // watermark, so HEAD.watermark == max part watermark == fold
-                // watermark (the `validate_head` contract).
-                let (part_min_hour, part_watermark) = if single_part {
-                    (0, watermark_hour)
-                } else if is_tail {
-                    (span.min_hour, watermark_hour)
-                } else {
-                    (span.min_hour, span.watermark_hour)
-                };
+                // watermark (the `validate_head` contract). Both already
+                // resolved into `encoding` above.
+                let SpanEncoding {
+                    min_hour: part_min_hour,
+                    watermark: part_watermark,
+                    bytes: part_bytes,
+                    hash: part_hash,
+                } = encoding?;
                 let part_entries = &entries[span.start..span.end];
-                let part_bytes = snapshot_format::encode_part_ranged(
-                    tenant.0,
-                    signal_num,
-                    shard_ceiling,
-                    part_min_hour,
-                    part_watermark,
-                    part_entries,
-                )?;
-                let part_hash = blake3::hash(&part_bytes);
                 if let Some(existing) = existing_by_blake3.get(part_hash.as_bytes().as_slice()) {
                     // Carried by reference: the previous HEAD already names an
                     // object with these exact bytes, so no PUT is issued and
@@ -1310,7 +1763,246 @@ impl Catalog {
                 let part_crc = crc32c::crc32c(&part_bytes);
                 let hash16 = &part_hash.to_hex()[..16];
                 let part_key = part_object_key(tenant, signal, part_watermark, hash16);
-                match self
+
+                // ADR-1413: build (degrading dictionaries as needed to fit
+                // the ceiling) the per-part (v3) column-statistics object
+                // BEFORE writing the part's own `.csnap` object below. Unlike
+                // the v1/v2 builds below, a failure here (no dictionary left
+                // and still over ceiling) is never graceful: it must fail the
+                // whole fold rather than publish a truncated object or
+                // silently carry on without one (decision 4, amended).
+                // Deriving it first means that refusal happens before the
+                // part object is ever written, so a refused fold leaves no
+                // orphaned `.csnap` behind for a part that will never gain a
+                // HEAD entry.
+                let column_stats = if typed_attr_columns.is_empty() {
+                    None
+                } else {
+                    let mut v3_segments: Vec<ColumnStatsSegment> = Vec::new();
+                    for entry in part_entries.iter() {
+                        if let Some(existing) = v3_content_baseline.get(&entry.content_hash) {
+                            v3_segments.push(existing.clone());
+                            continue;
+                        }
+                        match column_stats_cache
+                            .segment_column_stats(self.store(), tenant, signal, entry)
+                            .await
+                        {
+                            Ok((mut segment, fetch)) => {
+                                if fetch == column_stats_build::StatsFetch::Issued {
+                                    counters.get_requests += 1;
+                                }
+                                // v2 semantics (ADR-1413): bind the record to
+                                // this part's content hash, uniform for L0 and
+                                // L1.
+                                segment.writer_id = entry.content_hash.clone();
+                                v3_segments.push(segment);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    tenant = %tenant.to_hex(),
+                                    ingest_hour_bucket = entry.ingest_hour_bucket,
+                                    shard = entry.shard,
+                                    level = entry.level,
+                                    "per-part column-stats build failed for one segment; it has no stats entry and queries over it fall back to scanning"
+                                );
+                            }
+                        }
+                    }
+                    sort_and_dedup_part_segments(&mut v3_segments);
+
+                    // ADR-1413 decision 4 (amended): degrade before refusing.
+                    // While the segments' uncompressed body -- measured
+                    // exactly as the encoder will measure it -- exceeds the
+                    // ceiling, drop the largest remaining dictionary (by its
+                    // own encoded size). min/max/count/sum are never touched:
+                    // only `dictionary_present`/`dictionary` are cleared, the
+                    // same omitted-dictionary shape ADR-0850 decision 3
+                    // already uses for the cardinality ceiling. Only once no
+                    // dictionary is left does `encode_column_stats_v3` below
+                    // refuse.
+                    //
+                    // The body is never re-concatenated per drop: a part can
+                    // need tens of thousands of drops against a
+                    // multi-gigabyte body. Every (segment, column) pair's
+                    // exact contribution to the body is measured once, kept
+                    // in a max-heap, and a running total is adjusted by
+                    // exactly the bytes each drop removes: the
+                    // `DictEntry` bytes and the `dictionary_present` flag,
+                    // plus any varint length-delimiter shrink on the
+                    // enclosing `ColumnStat` and on the segment's own
+                    // length-delimited framing (`encode_length_delimited_to_vec`,
+                    // per `column_stats_segments_concat`). Popping by
+                    // `(dict_size, seg_idx, col_idx)`'s natural tuple max
+                    // orders the drops: largest size first, then the highest
+                    // (seg_idx, col_idx).
+                    let ceiling = self.column_stats_part_ceiling();
+                    let mut segment_len: Vec<u64> = v3_segments
+                        .iter()
+                        .map(|seg| prost::Message::encoded_len(seg) as u64)
+                        .collect();
+                    #[cfg(test)]
+                    record_column_stats_concat_call_for_test();
+                    let mut running_total: u64 =
+                        column_stats_segments_concat(&v3_segments).len() as u64;
+                    let mut heap: BinaryHeap<(u64, usize, usize, u64)> = BinaryHeap::new();
+                    for (seg_idx, seg) in v3_segments.iter().enumerate() {
+                        for (col_idx, col) in seg.columns.iter().enumerate() {
+                            if !col.dictionary_present {
+                                continue;
+                            }
+                            let dict_size: u64 = col
+                                .dictionary
+                                .iter()
+                                .map(|e| prost::Message::encoded_len(e) as u64)
+                                .sum();
+                            // Bytes the `ColumnStat`'s own body shrinks by:
+                            // the `dictionary_present` flag (proto3 omits a
+                            // false bool, so tag + varint(true) = 2 bytes
+                            // recovered) plus each `DictEntry`'s own
+                            // tag + length-varint + content.
+                            let dict_content_shrink: u64 = 2 + col
+                                .dictionary
+                                .iter()
+                                .map(|e| {
+                                    let entry_len = prost::Message::encoded_len(e) as u64;
+                                    1 + varint_len(entry_len) + entry_len
+                                })
+                                .sum::<u64>();
+                            let col_len_before = prost::Message::encoded_len(col) as u64;
+                            let col_len_after = col_len_before.saturating_sub(dict_content_shrink);
+                            // The column's own embedding in `segment.columns`
+                            // (tag + length-varint + content): the content
+                            // shrink plus any varint-width drop in its own
+                            // length prefix.
+                            let seg_reduction = dict_content_shrink
+                                + (varint_len(col_len_before) - varint_len(col_len_after));
+                            heap.push((dict_size, seg_idx, col_idx, seg_reduction));
+                        }
+                    }
+
+                    let mut dropped_this_part: u64 = 0;
+                    while running_total > ceiling {
+                        let Some((_, seg_idx, col_idx, seg_reduction)) = heap.pop() else {
+                            break;
+                        };
+                        let seg_len_before = segment_len[seg_idx];
+                        let seg_len_after = seg_len_before.saturating_sub(seg_reduction);
+                        // Any varint-width drop in the segment's own
+                        // length-delimited framing shrinks the body by that
+                        // much more than the column's own contribution.
+                        let body_reduction = seg_reduction
+                            + (varint_len(seg_len_before) - varint_len(seg_len_after));
+                        // Saturating, like the two subtractions above: the
+                        // invariant makes these non-negative, and a broken
+                        // invariant must reach the drift check as a typed
+                        // error rather than wrap first.
+                        running_total = running_total.saturating_sub(body_reduction);
+                        segment_len[seg_idx] = seg_len_after;
+                        let col = &mut v3_segments[seg_idx].columns[col_idx];
+                        col.dictionary_present = false;
+                        col.dictionary.clear();
+                        dropped_this_part += 1;
+                    }
+                    if dropped_this_part > 0 {
+                        tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            part_key = %part_key,
+                            dropped = dropped_this_part,
+                            ceiling,
+                            "per-part column-stats degrade dropped dictionaries to fit the ceiling"
+                        );
+                        column_stats_dictionaries_dropped += dropped_this_part;
+                    }
+                    // The incremental accounting above must agree exactly
+                    // with what the encoder measures. Re-measuring once here
+                    // (not on every drop) turns a drift between the two into
+                    // an explicit refusal carrying both figures, rather than
+                    // either stopping early on a still-over-ceiling body or
+                    // silently publishing one.
+                    #[cfg(test)]
+                    record_column_stats_concat_call_for_test();
+                    let measured_total = column_stats_segments_concat(&v3_segments).len() as u64;
+                    if measured_total != running_total {
+                        return Err(CatalogError::FieldMismatch {
+                            key: part_key.clone(),
+                            field: "column_stats_degrade_running_total",
+                            expected: running_total.to_string(),
+                            actual: measured_total.to_string(),
+                        });
+                    }
+                    let stats_bytes = snapshot_format::encode_column_stats_v3(
+                        tenant.0,
+                        signal_num,
+                        *part_hash.as_bytes(),
+                        &v3_segments,
+                        ceiling,
+                    )
+                    .map_err(|err| match err {
+                        SnapshotFormatError::ColumnStatsPartOverBound { declared, ceiling } => {
+                            CatalogError::ColumnStatsPartOverBound {
+                                part_key: part_key.clone(),
+                                declared,
+                                ceiling,
+                            }
+                        }
+                        other => CatalogError::SnapshotFormat(other),
+                    })?;
+
+                    let stats_crc = crc32c::crc32c(&stats_bytes);
+                    let stats_hash = blake3::hash(&stats_bytes);
+                    // Keyed by the hash of the object's OWN bytes
+                    // (`stats_hash16`), the same derivation the field-13 (v2)
+                    // object uses, NOT by the part's hash (`hash16`): the
+                    // per-segment build has a warn-and-omit path
+                    // (column_stats_cache above), so two folds over the same
+                    // part can produce different statistics bytes. Keying by
+                    // the part's hash would let a second fold's PUT collide
+                    // with the first's under `AlreadyExists`, which this
+                    // code (like the part PUT above) treats as "bytes are
+                    // identical by construction" -- false here, leaving a
+                    // field-7 ref whose blake3 describes bytes that were
+                    // never stored. Content-addressing on the object's own
+                    // bytes makes that assumption true again: identical
+                    // bytes always collapse onto the same key, and differing
+                    // bytes always land on a different one.
+                    let stats_hash16 = &stats_hash.to_hex()[..16];
+                    let stats_key =
+                        column_stats_object_key(tenant, signal, part_watermark, stats_hash16);
+                    let size = stats_bytes.len() as u64;
+                    let segment_count = v3_segments.len() as u32;
+                    let put_result = self
+                        .store()
+                        .put(
+                            &stats_key,
+                            Bytes::from(stats_bytes),
+                            PutOptions::create_if_absent()
+                                .with_checksum(UploadChecksum::Crc32c(stats_crc)),
+                        )
+                        .await;
+                    // Counted unconditionally, before matching the outcome:
+                    // this is a request-issued counter, not a
+                    // request-succeeded one (#1598).
+                    counters.put_requests += 1;
+                    match put_result {
+                        Ok(_) => {}
+                        // Content-addressed under the object's own hash:
+                        // bytes really are identical by construction here.
+                        Err(StoreError::AlreadyExists) => {}
+                        Err(e) => return Err(CatalogError::Store(e)),
+                    }
+                    column_stats_part_objects_built += 1;
+                    Some(SnapshotColumnStatsPartRef {
+                        key: stats_key,
+                        blake3: stats_hash.as_bytes().to_vec(),
+                        size,
+                        segment_count,
+                        part_blake3: vec![part_hash.as_bytes().to_vec()],
+                    })
+                };
+
+                let put_result = self
                     .store()
                     .put(
                         &part_key,
@@ -1318,8 +2010,12 @@ impl Catalog {
                         PutOptions::create_if_absent()
                             .with_checksum(UploadChecksum::Crc32c(part_crc)),
                     )
-                    .await
-                {
+                    .await;
+                // Counted unconditionally, before matching the outcome: this
+                // is a request-issued counter, not a request-succeeded one
+                // (#1598).
+                counters.put_requests += 1;
+                match put_result {
                     Ok(_) => {}
                     // Content-addressed key: bytes are identical by
                     // construction, so a losing folder's part is as good as
@@ -1327,9 +2023,9 @@ impl Catalog {
                     Err(StoreError::AlreadyExists) => {}
                     Err(e) => return Err(CatalogError::Store(e)),
                 }
-                counters.put_requests += 1;
                 total_part_bytes += part_bytes_len;
                 part_hashes.push(*part_hash.as_bytes());
+
                 part_refs.push(SnapshotPartRef {
                     key: part_key,
                     blake3: part_hash.as_bytes().to_vec(),
@@ -1337,6 +2033,7 @@ impl Catalog {
                     entry_count: part_entries.len() as u64,
                     watermark_hour: part_watermark,
                     min_hour: part_min_hour,
+                    column_stats,
                 });
             }
 
@@ -1415,7 +2112,7 @@ impl Catalog {
                             postings_object_key(tenant, signal, watermark_hour, postings_hash16);
                         let size = postings_bytes.len() as u64;
                         let name_count = names.len() as u32;
-                        match self
+                        let put_result = self
                             .store()
                             .put(
                                 &postings_key,
@@ -1423,10 +2120,14 @@ impl Catalog {
                                 PutOptions::create_if_absent()
                                     .with_checksum(UploadChecksum::Crc32c(postings_crc)),
                             )
-                            .await
-                        {
+                            .await;
+                        // Counted unconditionally: a real (non-AlreadyExists)
+                        // Err here still means the store received a PUT
+                        // request, and may have durably written the object
+                        // despite the client-visible error (#1598).
+                        counters.put_requests += 1;
+                        match put_result {
                             Ok(_) | Err(StoreError::AlreadyExists) => {
-                                counters.put_requests += 1;
                                 postings_built = true;
                                 postings_size = size;
                                 Some(SnapshotPostingsRef {
@@ -1459,408 +2160,6 @@ impl Catalog {
                 None => None,
             };
 
-            // Column statistics (ADR-0850): exact per-object statistics for
-            // the tenant's configured typed logs attribute columns. Unlike
-            // postings, the baseline is joined by identity
-            // (`entry_identity`), not ordinal position: a segment's exact
-            // statistics never change once written, so any L0 entry present
-            // in both the previous fold's column-stats object and this
-            // fold's entry set is reused verbatim with no re-fetch, and only
-            // a genuinely new L0 entry is fetched and scanned. This also
-            // makes the `reconciled`/`rebuilt` ordinal-invalidation concern
-            // that forces postings to restart from scratch moot here: a
-            // selective-erasure rewrite or a compaction excludes its
-            // superseded L0 entries from `entries` entirely (replacing them
-            // with an L1 entry under an unrelated identity,
-            // `classify_bucket`'s supersession handling above), so an erased
-            // entry's identity simply stops appearing in `entries` and its
-            // stale baseline statistics are never carried forward -- not
-            // because this code checks for erasure, but because the entry it
-            // would apply to is no longer in the set being folded.
-            //
-            // This v1 publish is restricted to level-0 entries: an L1 entry's
-            // writer_id/writer_epoch slots are repurposed
-            // (`build_l1_snapshot_entry`) and carry no real writer identity, so
-            // the five-field tuple a v1 record keys by cannot address one. L1
-            // coverage is the v2 (field-13) publish below, which keys by the
-            // covered part's content hash instead.
-            //
-            // A single segment's fetch/decode/tally failure never aborts the
-            // whole column-stats artifact (`column_stats_build`'s module
-            // docs): that segment is simply absent from `column_segments`,
-            // which the query-time reader already treats as "no stats here,
-            // fall back to scanning."
-            //
-            // One tally per covered object serves BOTH publishes (#964): the
-            // two passes cover the same L0 entries, and each fetching and
-            // scanning the object for itself cost two reads per L0 part where
-            // one does. The cache itself is constructed before the retry
-            // loop, so a lost CAS keeps its tallies too.
-            let (column_stats_built, column_stats_size, column_stats_ref) = if typed_attr_columns
-                .is_empty()
-            {
-                (false, 0u64, None)
-            } else {
-                let baseline: HashMap<EntryIdentity, ColumnStatsSegment> = if rebuilt {
-                    HashMap::new()
-                } else if let HeadState::Valid { head, .. } = &head_state
-                    && let Some(stats_ref) = &head.column_stats
-                {
-                    match self.store().get(&stats_ref.key, GetRange::Full).await {
-                        Ok(got) => {
-                            counters.get_requests += 1;
-                            // The previous fold's `.cstat` header is bound to
-                            // the parts THAT fold recorded on this HEAD, not to
-                            // the parts this fold just encoded (`part_hashes`).
-                            // Any incremental fold that appends entries rewrites
-                            // at least the tail part's hash, so binding against
-                            // `part_hashes` would reject the baseline on every
-                            // append and recompute every L0 segment. Bind
-                            // against `head.parts`, exactly as
-                            // `load_previous_postings` does. A malformed part
-                            // blake3 (never for a validated HEAD) yields an
-                            // empty expected set, so the binding check below
-                            // fails and the baseline is dropped -- fail safe.
-                            let expected_part_blake3: Vec<[u8; 32]> = head
-                                .parts
-                                .iter()
-                                .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()))
-                                .collect::<Result<_, _>>()
-                                .unwrap_or_default();
-                            match column_stats_build::decode_previous_column_stats(
-                                &got.data,
-                                &expected_part_blake3,
-                                &crate::snapshot_format::ColumnStatsLimits::default(),
-                            ) {
-                                Ok(segments) => segments
-                                    .into_iter()
-                                    .map(|segment| {
-                                        let identity: EntryIdentity = (
-                                            segment.ingest_hour_bucket,
-                                            segment.shard,
-                                            segment.writer_id.clone(),
-                                            segment.writer_epoch,
-                                            segment.writer_seq,
-                                        );
-                                        (identity, segment)
-                                    })
-                                    .collect(),
-                                Err(err) => {
-                                    tracing::warn!(
-                                        error = %err,
-                                        tenant = %tenant.to_hex(),
-                                        "previous column-stats object failed to decode or bind to this fold's parts; rebuilding every segment's statistics"
-                                    );
-                                    HashMap::new()
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                tenant = %tenant.to_hex(),
-                                "previous column-stats object GET failed; rebuilding every segment's statistics"
-                            );
-                            HashMap::new()
-                        }
-                    }
-                } else {
-                    HashMap::new()
-                };
-
-                let mut column_segments: Vec<ColumnStatsSegment> = Vec::new();
-                for entry in entries.iter().filter(|e| e.level == 0) {
-                    let identity = entry_identity(entry);
-                    if let Some(existing) = baseline.get(&identity) {
-                        column_segments.push(existing.clone());
-                        continue;
-                    }
-                    match column_stats_cache
-                        .segment_column_stats(self.store(), tenant, signal, entry)
-                        .await
-                    {
-                        Ok((segment, fetch)) => {
-                            if fetch == column_stats_build::StatsFetch::Issued {
-                                counters.get_requests += 1;
-                            }
-                            column_segments.push(segment);
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                tenant = %tenant.to_hex(),
-                                ingest_hour_bucket = entry.ingest_hour_bucket,
-                                shard = entry.shard,
-                                "column-stats build failed for one segment; it has no stats entry and queries over it fall back to scanning"
-                            );
-                        }
-                    }
-                }
-                column_segments.sort_by(|a, b| {
-                    (
-                        a.ingest_hour_bucket,
-                        a.shard,
-                        a.writer_id.as_slice(),
-                        a.writer_epoch,
-                        a.writer_seq,
-                    )
-                        .cmp(&(
-                            b.ingest_hour_bucket,
-                            b.shard,
-                            b.writer_id.as_slice(),
-                            b.writer_epoch,
-                            b.writer_seq,
-                        ))
-                });
-
-                match snapshot_format::encode_column_stats(
-                    tenant.0,
-                    signal_num,
-                    part_hashes.iter().map(|h| h.to_vec()).collect(),
-                    &column_segments,
-                ) {
-                    Ok(stats_bytes) => {
-                        let stats_crc = crc32c::crc32c(&stats_bytes);
-                        let stats_hash = blake3::hash(&stats_bytes);
-                        let stats_hash16 = &stats_hash.to_hex()[..16];
-                        let stats_key =
-                            column_stats_object_key(tenant, signal, watermark_hour, stats_hash16);
-                        let size = stats_bytes.len() as u64;
-                        let segment_count = column_segments.len() as u32;
-                        match self
-                            .store()
-                            .put(
-                                &stats_key,
-                                Bytes::from(stats_bytes),
-                                PutOptions::create_if_absent()
-                                    .with_checksum(UploadChecksum::Crc32c(stats_crc)),
-                            )
-                            .await
-                        {
-                            Ok(_) | Err(StoreError::AlreadyExists) => {
-                                counters.put_requests += 1;
-                                (
-                                    true,
-                                    size,
-                                    Some(SnapshotColumnStatsRef {
-                                        key: stats_key,
-                                        blake3: stats_hash.as_bytes().to_vec(),
-                                        size,
-                                        segment_count,
-                                        part_blake3: part_hashes
-                                            .iter()
-                                            .map(|h| h.to_vec())
-                                            .collect(),
-                                    }),
-                                )
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    tenant = %tenant.to_hex(),
-                                    "column-stats PUT failed, folding without a column-stats ref"
-                                );
-                                (false, 0, None)
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            tenant = %tenant.to_hex(),
-                            "column-stats encode failed, folding without a column-stats ref"
-                        );
-                        (false, 0, None)
-                    }
-                }
-            };
-
-            // ADR-0942 part-hash-keyed column statistics (envelope v2, HEAD
-            // field 13). This is a DUAL PUBLISH, not a replacement: the v1
-            // (field-11) block above still runs and writes its L0-tuple-keyed
-            // object unchanged. This block additionally covers BOTH L0 and L1
-            // entries, binding each record to its covered part's `content_hash`
-            // so two L1 parts of one (shard, hour) bucket -- which collapse to
-            // one nil-writer tuple on the reader side -- get two distinct
-            // records. Retiring field 11 is a separate, floor-citing change
-            // (ADR-0066 decision 1); dropping it here would silently take L0
-            // coverage from any reader predating field 13.
-            //
-            // A v2 record carries its covered part's content hash in the
-            // writer_id slot (the join key; ADR-0942, the record shape is
-            // frozen so no new field is added). The baseline is joined by that
-            // content hash (a segment's exact statistics never change once its
-            // content-addressed object is written), reused from the previous
-            // fold's v2 object, and bound to the previous HEAD's parts exactly
-            // as the v1 baseline is. On the first upgraded fold there is no
-            // field-13 baseline, so every entry is tallied once; thereafter
-            // only genuinely new parts are. An L0 entry the v1 pass above
-            // already tallied costs no second read: both passes go through the
-            // same `column_stats_cache` (#964).
-            let (column_stats_part_built, column_stats_part_size, column_stats_part_ref) =
-                if typed_attr_columns.is_empty() {
-                    (false, 0u64, None)
-                } else {
-                    let v2_baseline: HashMap<Vec<u8>, ColumnStatsSegment> = if rebuilt {
-                        HashMap::new()
-                    } else if let HeadState::Valid { head, .. } = &head_state
-                        && let Some(stats_ref) = &head.column_stats_part
-                    {
-                        match self.store().get(&stats_ref.key, GetRange::Full).await {
-                            Ok(got) => {
-                                counters.get_requests += 1;
-                                let expected_part_blake3: Vec<[u8; 32]> = head
-                                    .parts
-                                    .iter()
-                                    .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()))
-                                    .collect::<Result<_, _>>()
-                                    .unwrap_or_default();
-                                match column_stats_build::decode_previous_column_stats(
-                                    &got.data,
-                                    &expected_part_blake3,
-                                    &crate::snapshot_format::ColumnStatsLimits::default(),
-                                ) {
-                                    Ok(segments) => segments
-                                        .into_iter()
-                                        // v2 records carry the part content hash
-                                        // in writer_id; key the reuse map by it.
-                                        .map(|segment| (segment.writer_id.clone(), segment))
-                                        .collect(),
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            error = %err,
-                                            tenant = %tenant.to_hex(),
-                                            "previous part-bound column-stats object failed to decode or bind to this fold's parts; rebuilding every segment's statistics"
-                                        );
-                                        HashMap::new()
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    tenant = %tenant.to_hex(),
-                                    "previous part-bound column-stats object GET failed; rebuilding every segment's statistics"
-                                );
-                                HashMap::new()
-                            }
-                        }
-                    } else {
-                        HashMap::new()
-                    };
-
-                    let mut part_segments: Vec<ColumnStatsSegment> = Vec::new();
-                    for entry in entries.iter() {
-                        if let Some(existing) = v2_baseline.get(&entry.content_hash) {
-                            part_segments.push(existing.clone());
-                            continue;
-                        }
-                        match column_stats_cache
-                            .segment_column_stats(self.store(), tenant, signal, entry)
-                            .await
-                        {
-                            Ok((mut segment, fetch)) => {
-                                if fetch == column_stats_build::StatsFetch::Issued {
-                                    counters.get_requests += 1;
-                                }
-                                // The v2 join key: bind the record to its
-                                // covered part's content hash (== the reader's
-                                // `SegmentRef.content_hash`), uniform for L0 and
-                                // L1 and unique per part, carried in writer_id.
-                                // This overwrites the tuple's writer_id, which
-                                // is only informational in a v2 record.
-                                segment.writer_id = entry.content_hash.clone();
-                                part_segments.push(segment);
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    tenant = %tenant.to_hex(),
-                                    ingest_hour_bucket = entry.ingest_hour_bucket,
-                                    shard = entry.shard,
-                                    level = entry.level,
-                                    "part-bound column-stats build failed for one segment; it has no stats entry and queries over it fall back to scanning"
-                                );
-                            }
-                        }
-                    }
-                    // v2 records sort by their content hash (in writer_id).
-                    // Two entries can carry the same content hash: one bucket
-                    // can hold compaction records with different input sets and
-                    // a rewrite record that all reference a byte-identical
-                    // output part. `encode_column_stats_v2` rejects the whole
-                    // artifact on a repeated key, which would drop field 13 for
-                    // the tenant on this and every later fold, so collapse the
-                    // repeats first. A shared content hash means a byte-identical
-                    // part, so the records are equal and keeping one is exact.
-                    sort_and_dedup_part_segments(&mut part_segments);
-
-                    match snapshot_format::encode_column_stats_v2(
-                        tenant.0,
-                        signal_num,
-                        part_hashes.iter().map(|h| h.to_vec()).collect(),
-                        &part_segments,
-                    ) {
-                        Ok(stats_bytes) => {
-                            let stats_crc = crc32c::crc32c(&stats_bytes);
-                            let stats_hash = blake3::hash(&stats_bytes);
-                            let stats_hash16 = &stats_hash.to_hex()[..16];
-                            let stats_key = column_stats_object_key(
-                                tenant,
-                                signal,
-                                watermark_hour,
-                                stats_hash16,
-                            );
-                            let size = stats_bytes.len() as u64;
-                            let segment_count = part_segments.len() as u32;
-                            match self
-                                .store()
-                                .put(
-                                    &stats_key,
-                                    Bytes::from(stats_bytes),
-                                    PutOptions::create_if_absent()
-                                        .with_checksum(UploadChecksum::Crc32c(stats_crc)),
-                                )
-                                .await
-                            {
-                                Ok(_) | Err(StoreError::AlreadyExists) => {
-                                    counters.put_requests += 1;
-                                    (
-                                        true,
-                                        size,
-                                        Some(SnapshotColumnStatsPartRef {
-                                            key: stats_key,
-                                            blake3: stats_hash.as_bytes().to_vec(),
-                                            size,
-                                            segment_count,
-                                            part_blake3: part_hashes
-                                                .iter()
-                                                .map(|h| h.to_vec())
-                                                .collect(),
-                                        }),
-                                    )
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        error = %err,
-                                        tenant = %tenant.to_hex(),
-                                        "part-bound column-stats PUT failed, folding without a field-13 ref"
-                                    );
-                                    (false, 0, None)
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                tenant = %tenant.to_hex(),
-                                "part-bound column-stats encode failed, folding without a field-13 ref"
-                            );
-                            (false, 0, None)
-                        }
-                    }
-                };
-
             let new_head = SnapshotHead {
                 format_version: HEAD_FORMAT_VERSION,
                 tenant_hash: tenant.0.to_vec(),
@@ -1874,12 +2173,6 @@ impl Catalog {
                 // `validate_head` enforces for a multi-part head.
                 parts: part_refs.clone(),
                 postings: postings_ref,
-                column_stats: column_stats_ref,
-                // ADR-0942 A2: the part-hash-keyed (v2) column-stats object,
-                // covering L0 and L1. Absent (None) when the tenant has no
-                // configured typed columns or the build/PUT failed; a reader
-                // treats absence as fall-back-to-scan, never an error.
-                column_stats_part: column_stats_part_ref,
                 folder_id: folder_id.into_bytes().to_vec(),
                 created_unix_ns: now_ns,
                 shard_generation_count,
@@ -1903,7 +2196,7 @@ impl Catalog {
                 }
             };
 
-            match self
+            let head_put_result = self
                 .store()
                 .put(
                     &head_key,
@@ -1913,10 +2206,12 @@ impl Catalog {
                         checksum: Some(UploadChecksum::Crc32c(head_crc)),
                     },
                 )
-                .await
-            {
+                .await;
+            // Counted unconditionally, before matching the outcome: this is
+            // a request-issued counter, not a request-succeeded one (#1598).
+            counters.put_requests += 1;
+            match head_put_result {
                 Ok(_) => {
-                    counters.put_requests += 1;
                     return Ok(FoldReport {
                         watermark_hour: Some(watermark_hour),
                         previous_watermark_hour: head_state.watermark_hour(),
@@ -1932,10 +2227,8 @@ impl Catalog {
                         put_requests: counters.put_requests,
                         postings_built,
                         postings_bytes: postings_size,
-                        column_stats_built,
-                        column_stats_bytes: column_stats_size,
-                        column_stats_part_built,
-                        column_stats_part_bytes: column_stats_part_size,
+                        column_stats_part_objects_built,
+                        column_stats_dictionaries_dropped,
                         layout_drift_count,
                         frontier_hours_reconciled,
                         frontier_hours_deferred,
@@ -1946,7 +2239,6 @@ impl Catalog {
                 // the top-of-loop no-op check stops cleanly; otherwise we
                 // rebase onto the winner's parts and retry.
                 Err(StoreError::PreconditionFailed) | Err(StoreError::AlreadyExists) => {
-                    counters.put_requests += 1;
                     attempt += 1;
                     if attempt >= MAX_HEAD_CAS_ATTEMPTS {
                         return Err(CatalogError::FoldCasRetriesExhausted {
@@ -2691,10 +2983,8 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         put_requests: counters.put_requests,
         postings_built: false,
         postings_bytes: 0,
-        column_stats_built: false,
-        column_stats_bytes: 0,
-        column_stats_part_built: false,
-        column_stats_part_bytes: 0,
+        column_stats_part_objects_built: 0,
+        column_stats_dictionaries_dropped: 0,
         layout_drift_count: 0,
         frontier_hours_reconciled: 0,
         frontier_hours_deferred: 0,
@@ -2708,14 +2998,15 @@ mod tests {
 
     use bytes::Bytes;
     use prost::Message;
+    use ravel_commit::erasure;
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::fault::{
-        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, PutOptions};
-    use ravel_proto::commit::v1::{CompactionInputIdentity, RetentionTombstone};
+    use ravel_proto::commit::v1::{CompactionInputIdentity, RetentionTombstone, RewriteDrop};
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
 
@@ -3075,8 +3366,8 @@ mod tests {
             .expect("first fold");
         assert!(first.rebuilt, "first fold rebuilds from the commit layout");
         assert!(
-            first.column_stats_built,
-            "the first fold builds column statistics over both hour-10 segments"
+            first.column_stats_part_objects_built > 0,
+            "the first fold builds per-part column statistics over the hour-10 segments"
         );
 
         // A new segment in a later hour, then an incremental second fold.
@@ -3097,8 +3388,8 @@ mod tests {
             .expect("second fold");
         assert!(!second.rebuilt, "the second fold is incremental");
         assert!(
-            second.column_stats_built,
-            "the second fold rebuilds the artifact"
+            second.column_stats_part_objects_built > 0,
+            "the second fold builds a per-part statistics object for the new part"
         );
 
         // The reuse assertion, by objects read. Segment B is the clean
@@ -3108,38 +3399,418 @@ mod tests {
         //
         // Segment A is read exactly once, by the name-postings pass, which
         // aborts on the first L0 entry because a logs RLOG object is not a
-        // metrics RSEG. Neither column-stats publish reads it: both the v1
-        // (tuple-keyed) and the v2 (content-hash-keyed) baselines cover it.
+        // metrics RSEG. The v3 (content-hash-keyed, per part) baseline
+        // covers it without a second read.
         assert_eq!(
             store.count_gets_of(&key_a),
             1,
-            "only the postings pass reads A; both publishes reuse its baseline record"
+            "only the postings pass reads A; the v3 publish reuses its baseline record"
         );
         assert_eq!(
             store.count_gets_of(&key_b),
             0,
             "segment B's stats were reused, not recomputed"
         );
-        // Issue #964: the one genuinely new segment is read ONCE for both
-        // publishes. Against the pre-fix two-fetch code this is 2.
+        // Issue #964: the one genuinely new segment is read ONCE.
         assert_eq!(
             store.count_gets_of(&key_c),
             1,
-            "the new hour-11 segment is fetched once, for both publishes"
+            "the new hour-11 segment is fetched once"
         );
 
-        // Reuse still produced a complete artifact covering all three segments.
+        // Reuse still produced a complete artifact covering all three
+        // segments. Since ADR-1413 the per-part v3 object answers this load
+        // and its records are content-hash keyed, so they land in
+        // `by_content_hash`, not the always-empty `segments` map.
+        store.clear_gets();
         let acc = QueryAccounting::new();
         let loaded = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &acc)
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                ravel_types::TimeRange {
+                    start_ns: 0,
+                    end_ns: 50 * NS_PER_HOUR,
+                },
+                50 * NS_PER_HOUR,
+                &acc,
+            )
             .await
             .expect("load ok")
             .expect("stats present");
         assert_eq!(
-            loaded.segments.len(),
+            loaded.by_content_hash.len(),
             3,
             "the reused baseline plus the new segment cover all three"
         );
+    }
+
+    /// Issue #1482 finding 4: `v3_content_baseline` must fetch a previous
+    /// per-part stats object only for an old part this fold is actually about
+    /// to re-derive, never for one about to be carried forward by reference.
+    /// `snapshot_part_max_entries = 1` seals every hour into its own part, so
+    /// the first fold over hours 10-12 produces three parts: two sealed
+    /// (hour 10, hour 11) whose `(min_hour, watermark_hour)` come from their
+    /// own entries and never change again, and one tail (hour 12) whose
+    /// watermark is overridden to the fold's overall watermark. The first
+    /// fold seals at hour 15 (`now_at_seal(15)`) even though entries only
+    /// reach hour 12, so that override tuple is `(12, 15)` -- deliberately
+    /// different from what hour 12 encodes to once it seals for real, so the
+    /// second fold's reseal is a genuine content change, not a coincidental
+    /// hash match.
+    ///
+    /// The second fold appends an hour-13 entry: hours 10 and 11 stay
+    /// byte-identical and are carried by reference (untouched), while hour
+    /// 12 seals from tail to non-tail -- its tuple becomes `(12, 12)`, so it
+    /// genuinely re-derives even though its one entry's content is
+    /// unchanged, and reuses that entry's segment statistics from the first
+    /// fold's baseline. Pre-fix, all three non-dirty old parts get their
+    /// stats object GET regardless of reuse; post-fix, only hour 12's does.
+    #[tokio::test]
+    async fn incremental_fold_bounds_baseline_gets_to_parts_actually_rederived() {
+        let store = Arc::new(RecordingStore::new());
+        set_status_column_config(store.as_ref()).await;
+
+        publish_logs_segment(store.as_ref(), 1, 10, &[200]).await;
+        publish_logs_segment(store.as_ref(), 2, 11, &[404]).await;
+        publish_logs_segment(store.as_ref(), 3, 12, &[500]).await;
+
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(15),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt, "first fold rebuilds from the commit layout");
+        assert_eq!(first.parts_total, 3, "one part per hour under a cap of 1");
+
+        let head_1 = read_logs_head(store.as_ref()).await;
+        let stats_key_of = |hour: u32| {
+            head_1
+                .parts
+                .iter()
+                .find(|p| p.min_hour == hour)
+                .unwrap_or_else(|| panic!("part for hour {hour}"))
+                .column_stats
+                .clone()
+                .unwrap_or_else(|| panic!("v3 object for hour {hour}"))
+                .key
+        };
+        let stats_key_10 = stats_key_of(10);
+        let stats_key_11 = stats_key_of(11);
+        let stats_key_12 = stats_key_of(12);
+
+        publish_logs_segment(store.as_ref(), 4, 13, &[200]).await;
+
+        store.clear_gets();
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(16),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt, "the second fold is incremental");
+
+        let head_2 = read_logs_head(store.as_ref()).await;
+        let part_10 = head_2
+            .parts
+            .iter()
+            .find(|p| p.min_hour == 10)
+            .expect("hour 10 part survives");
+        let part_11 = head_2
+            .parts
+            .iter()
+            .find(|p| p.min_hour == 11)
+            .expect("hour 11 part survives");
+        let part_12 = head_2
+            .parts
+            .iter()
+            .find(|p| p.min_hour == 12)
+            .expect("hour 12 part survives, now sealed");
+        assert_eq!(
+            part_10.column_stats.as_ref().map(|r| &r.key),
+            Some(&stats_key_10),
+            "hour 10's v3 object is carried forward at its same key"
+        );
+        assert_eq!(
+            part_11.column_stats.as_ref().map(|r| &r.key),
+            Some(&stats_key_11),
+            "hour 11's v3 object is carried forward at its same key"
+        );
+        assert_ne!(
+            part_12.column_stats.as_ref().map(|r| &r.key),
+            Some(&stats_key_12),
+            "hour 12 reseals from tail to non-tail and gets a new v3 object"
+        );
+
+        // The bound this finding fixes: an untouched, carried-forward part's
+        // previous stats object must never be fetched as a baseline. Against
+        // the pre-fix code (baseline built from every non-dirty old part
+        // unconditionally) these are each 1.
+        assert_eq!(
+            store.count_gets_of(&stats_key_10),
+            0,
+            "hour 10 is carried by reference; its old stats object must not be fetched"
+        );
+        assert_eq!(
+            store.count_gets_of(&stats_key_11),
+            0,
+            "hour 11 is carried by reference; its old stats object must not be fetched"
+        );
+        // Hour 12 is genuinely re-derived (tail -> sealed), so its baseline
+        // fetch is legitimate work, not the bug: exactly one GET reuses its
+        // one entry's segment statistics instead of re-fetching the segment
+        // itself.
+        assert_eq!(
+            store.count_gets_of(&stats_key_12),
+            1,
+            "hour 12 is re-derived and its prior stats object is fetched once as a baseline"
+        );
+    }
+
+    /// Declare three I64 typed logs columns (`col_a`, `col_b`, `col_c`) so a
+    /// fold builds column statistics with three distinct-size dictionaries per
+    /// part, for the degrade-loop tests.
+    async fn set_three_column_config(store: &dyn ObjectStoreBackend) {
+        let cfg = crate::tenant_config::TenantConfig {
+            typed_attr_columns: Some(vec![
+                crate::tenant_config::DeclaredTypedColumn {
+                    key: "col_a".to_string(),
+                    ty: crate::tenant_config::DeclaredColumnType::I64,
+                },
+                crate::tenant_config::DeclaredTypedColumn {
+                    key: "col_b".to_string(),
+                    ty: crate::tenant_config::DeclaredColumnType::I64,
+                },
+                crate::tenant_config::DeclaredTypedColumn {
+                    key: "col_c".to_string(),
+                    ty: crate::tenant_config::DeclaredColumnType::I64,
+                },
+            ]),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store, &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+    }
+
+    /// Publish one L0 segment of `rows` entries, each carrying all three
+    /// `col_a`/`col_b`/`col_c` declared columns with deliberately distinct
+    /// cardinality (`col_a` all-distinct, `col_b` 30 distinct, `col_c` 3
+    /// distinct), so their per-column dictionaries encode to distinct sizes.
+    async fn publish_logs_segment_wide(
+        store: &dyn ObjectStoreBackend,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        rows: usize,
+    ) -> CommitRecord {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let writer_id = Uuid::from_u128(u128::from(writer_seq));
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let mut w = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant().0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+        );
+        let base_ts = i64::from(ingest_hour_bucket) * NS_PER_HOUR + 60_000_000_000;
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for i in 0..rows {
+            let ts = base_ts + i as i64;
+            min_ts = min_ts.min(ts);
+            max_ts = max_ts.max(ts);
+            w.push(LogRecord {
+                stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: format!("row {i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![
+                    ("col_a".to_string(), AttrValue::I64(i as i64)),
+                    ("col_b".to_string(), AttrValue::I64((i % 30) as i64)),
+                    ("col_c".to_string(), AttrValue::I64((i % 3) as i64)),
+                ],
+            })
+            .expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: rows as u64,
+            series_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: 1,
+            created_unix_ns: max_ts,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(bytes))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    /// Declare `n_columns` I64 typed columns (`c00`, `c01`, ...), all names
+    /// the same byte length so every column's `ColumnStat.name` field costs
+    /// the same number of bytes regardless of index.
+    async fn set_many_column_config(store: &dyn ObjectStoreBackend, n_columns: usize) {
+        let cfg = crate::tenant_config::TenantConfig {
+            typed_attr_columns: Some(
+                (0..n_columns)
+                    .map(|i| crate::tenant_config::DeclaredTypedColumn {
+                        key: format!("c{i:02}"),
+                        ty: crate::tenant_config::DeclaredColumnType::I64,
+                    })
+                    .collect(),
+            ),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store, &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+    }
+
+    /// Publish one L0 segment carrying all `n_columns` declared columns
+    /// (`c00`..`c{n_columns-1}`), every column given the same two distinct
+    /// values across `rows` entries, so every (segment, column) dictionary
+    /// encodes to the exact same size -- the fixture
+    /// `degrade_completes_a_part_needing_many_drops_with_one_concatenation`
+    /// needs a large, size-tied pair set so the drop order is decided purely
+    /// by the heap's `(seg_idx, col_idx)` tie-break, not by planted size
+    /// differences.
+    async fn publish_logs_segment_many_columns(
+        store: &dyn ObjectStoreBackend,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        n_columns: usize,
+        rows: usize,
+    ) -> CommitRecord {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let writer_id = Uuid::from_u128(u128::from(writer_seq));
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let mut w = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant().0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+        );
+        let base_ts = i64::from(ingest_hour_bucket) * NS_PER_HOUR + 60_000_000_000;
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for i in 0..rows {
+            let ts = base_ts + i as i64;
+            min_ts = min_ts.min(ts);
+            max_ts = max_ts.max(ts);
+            let attrs = (0..n_columns)
+                .map(|c| (format!("c{c:02}"), AttrValue::I64((i % 2) as i64)))
+                .collect();
+            w.push(LogRecord {
+                stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: format!("row {i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs,
+            })
+            .expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: rows as u64,
+            series_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: 1,
+            created_unix_ns: max_ts,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(bytes))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
     }
 
     /// Declare `status` as an I64 typed logs column so the fold builds column
@@ -3313,13 +3984,13 @@ mod tests {
         assert_eq!(col.sum, Some(sum));
     }
 
-    /// ADR-0942 (deliverables 1 & 3): a fold over an L1-COMPACTED fixture builds
-    /// part-bound (v2, field 13) records for the L1 entries, with EXACT expected
-    /// values, and two L1 parts of one (shard, hour) bucket -- the collision the
-    /// old five-field tuple key could not represent, because a reconstructed L1
-    /// SegmentRef carries writer_id nil / epoch 0 / seq 0 -- produce two DISTINCT
-    /// records keyed by their distinct content hashes, neither overwriting the
-    /// other.
+    /// ADR-1413: a fold over an L1-COMPACTED fixture builds the per-part (v3,
+    /// field 7) object over the L1 entries, with EXACT expected values, and
+    /// two L1 parts of one (shard, hour) bucket -- the collision the old
+    /// five-field tuple key could not represent, because a reconstructed L1
+    /// SegmentRef carries writer_id nil / epoch 0 / seq 0 -- produce two
+    /// DISTINCT records keyed by their distinct content hashes within that
+    /// one part's object, neither overwriting the other.
     #[tokio::test]
     async fn l1_compacted_fold_builds_part_bound_records_with_exact_values() {
         let store = Arc::new(MemoryStore::new());
@@ -3349,9 +4020,9 @@ mod tests {
             .expect("fold");
         assert!(report.rebuilt, "first fold rebuilds from the commit layout");
         assert_eq!(report.entry_count, 2, "two L1 parts folded");
-        assert!(
-            report.column_stats_part_built,
-            "the part-bound (field 13) object is built over the L1 entries"
+        assert_eq!(
+            report.column_stats_part_objects_built, 1,
+            "both L1 entries seal into one output part, so one v3 object is built"
         );
 
         let head = read_logs_head(store.as_ref()).await;
@@ -3359,23 +4030,28 @@ mod tests {
         let entries = collect_head_entries(store.as_ref(), &head).await;
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.level == 1), "genuinely L1 fixture");
+        assert_eq!(
+            head.parts.len(),
+            1,
+            "one output part covers both L1 entries"
+        );
 
-        let stats_ref = head
-            .column_stats_part
+        let stats_ref = head.parts[0]
+            .column_stats
             .clone()
-            .expect("field 13 present after folding L1 parts");
+            .expect("field 7 present after folding L1 parts");
         let got = store
             .get(&stats_ref.key, GetRange::Full)
             .await
-            .expect("v2 object present");
+            .expect("v3 object present");
         let decoded = snapshot_format::decode_column_stats(
             &got.data,
             &crate::snapshot_format::ColumnStatsLimits::default(),
         )
-        .expect("v2 decodes");
+        .expect("v3 decodes");
         assert_eq!(
-            decoded.header.format_version, 2,
-            "part-bound object is envelope v2"
+            decoded.header.format_version, 3,
+            "per-part object is envelope v3"
         );
         assert_eq!(
             decoded.segments.len(),
@@ -3400,6 +4076,700 @@ mod tests {
         // Neither collapsed onto the other: exact, per-part values.
         assert_status_column(rec0, 4, 0, 200, 500, &[(200, 2), (404, 1), (500, 1)], 1304);
         assert_status_column(rec1, 3, 0, 200, 500, &[(200, 1), (500, 2)], 1200);
+    }
+
+    async fn list_all_keys(store: &dyn ObjectStoreBackend, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut page_token = None;
+        loop {
+            let page = store.list(prefix, page_token).await.expect("list");
+            out.extend(page.objects.into_iter().map(|m| m.key));
+            match page.next {
+                Some(t) => page_token = Some(t),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// ADR-1413 decision 6 (#1600): a fold whose entry count crosses
+    /// `snapshot_part_max_entries` produces a multi-part HEAD, and EACH newly
+    /// written part gets its OWN v3 (field 7) column-statistics object, not
+    /// one shared whole-tenant object -- and no whole-tenant v1/v2 object is
+    /// published at all: the store holds EXACTLY one `.cstat` object per
+    /// part, never a whole-tenant one, at any size.
+    #[tokio::test]
+    async fn fold_over_two_parts_writes_exactly_two_cstat_objects_and_no_whole_object() {
+        let store = Arc::new(MemoryStore::new());
+        set_status_column_config(store.as_ref()).await;
+
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Two L0 segments in two distinct sealed hours: cap 1 seals hour 10
+        // into its own part and starts a fresh tail at hour 11.
+        publish_logs_segment(store.as_ref(), 0, 10, &[200, 404]).await;
+        publish_logs_segment(store.as_ref(), 1, 11, &[500, 500, 200]).await;
+
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(
+            report.parts_total, 2,
+            "crossing the cap splits into two parts"
+        );
+        assert_eq!(
+            report.column_stats_part_objects_built, 2,
+            "one v3 object per newly written part"
+        );
+
+        let head = read_logs_head(store.as_ref()).await;
+        assert_eq!(head.parts.len(), 2);
+        assert!(
+            head.parts.iter().all(|p| p.column_stats.is_some()),
+            "field 7 set on both parts"
+        );
+
+        let all_keys = list_all_keys(store.as_ref(), "").await;
+        let cstat_keys: Vec<&String> = all_keys.iter().filter(|k| k.ends_with(".cstat")).collect();
+        assert_eq!(
+            cstat_keys.len(),
+            2,
+            "exactly two .cstat objects in the store, one per part: {cstat_keys:?}"
+        );
+
+        for part in &head.parts {
+            let part_stats = part
+                .column_stats
+                .clone()
+                .expect("every newly written part carries its own field 7 ref");
+            assert_eq!(
+                part_stats.part_blake3,
+                vec![part.blake3.clone()],
+                "the v3 object's own part_blake3 names exactly this part"
+            );
+            assert_eq!(
+                part_stats.segment_count, 1,
+                "one entry per part in this fixture"
+            );
+
+            let got = store
+                .get(&part_stats.key, GetRange::Full)
+                .await
+                .expect("v3 object present at its declared key");
+            assert_eq!(got.data.len() as u64, part_stats.size);
+            assert_eq!(
+                blake3::hash(&got.data).as_bytes().to_vec(),
+                part_stats.blake3
+            );
+            let decoded = snapshot_format::decode_column_stats(
+                &got.data,
+                &crate::snapshot_format::ColumnStatsLimits::default(),
+            )
+            .expect("v3 decodes");
+            assert_eq!(
+                decoded.header.format_version, 3,
+                "per-part object is envelope v3"
+            );
+            assert_eq!(decoded.segments.len(), 1);
+            assert_eq!(
+                decoded.header.part_blake3,
+                vec![part.blake3.clone()],
+                "decoded header's part_blake3 matches the ref"
+            );
+        }
+    }
+
+    /// ADR-1413 decision 4 (amended): a part whose per-part column-statistics
+    /// body exceeds the ceiling degrades rather than refuses -- the fold
+    /// drops the largest remaining dictionary (by its own encoded size),
+    /// re-measures, and repeats until the part fits. Three declared columns
+    /// with deliberately distinct dictionary sizes (`col_a` all-distinct
+    /// across `rows` entries, `col_b` 30 distinct, `col_c` 3 distinct) let a
+    /// small injected ceiling force exactly the two largest (`col_a`,
+    /// `col_b`) to drop while `col_c`'s dictionary survives; min/max/count/sum
+    /// stay exact for all three regardless.
+    #[tokio::test]
+    async fn fold_drops_the_largest_dictionaries_until_a_part_fits_the_ceiling() {
+        let rows = 300;
+
+        // Reference fold at the real (unbounded-for-this-fixture) ceiling:
+        // every dictionary intact. Used only to measure, via the same
+        // `column_stats_segments_concat` the fold itself measures with, the
+        // exact post-drop body size -- so the injected ceiling below is
+        // derived from the encoder's own accounting rather than a guessed
+        // constant.
+        let reference_store = Arc::new(MemoryStore::new());
+        set_three_column_config(reference_store.as_ref()).await;
+        publish_logs_segment_wide(reference_store.as_ref(), 0, 10, rows).await;
+        let reference_catalog = Catalog::new(reference_store.clone(), config(1)).expect("catalog");
+        let reference_report = reference_catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("reference fold at the real ceiling never degrades");
+        assert_eq!(
+            reference_report.column_stats_dictionaries_dropped, 0,
+            "the real ceiling admits this small fixture with every dictionary intact"
+        );
+        let reference_head = read_logs_head(reference_store.as_ref()).await;
+        let reference_ref = reference_head.parts[0]
+            .column_stats
+            .clone()
+            .expect("v3 ref");
+        let reference_got = reference_store
+            .get(&reference_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let reference_decoded = snapshot_format::decode_column_stats(
+            &reference_got.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("v3 decodes");
+        assert_eq!(reference_decoded.segments.len(), 1);
+        let reference_columns = reference_decoded.segments[0].columns.clone();
+
+        let mut sizes: Vec<(usize, usize)> = reference_columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let size: usize = c.dictionary.iter().map(|e| e.encoded_len()).sum();
+                (i, size)
+            })
+            .collect();
+        sizes.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+        let largest_idx = sizes[0].0;
+        let second_idx = sizes[1].0;
+        let kept_idx = sizes[2].0;
+        assert_eq!(
+            reference_columns[largest_idx].name, "col_a",
+            "col_a has the most distinct values, so the largest dictionary"
+        );
+        assert_eq!(
+            reference_columns[second_idx].name, "col_b",
+            "col_b is the second-most distinct"
+        );
+        assert_eq!(
+            reference_columns[kept_idx].name, "col_c",
+            "col_c has the fewest distinct values, so the smallest dictionary"
+        );
+
+        let mut post_drop_segments = reference_decoded.segments.clone();
+        post_drop_segments[0].columns[largest_idx].dictionary_present = false;
+        post_drop_segments[0].columns[largest_idx]
+            .dictionary
+            .clear();
+        post_drop_segments[0].columns[second_idx].dictionary_present = false;
+        post_drop_segments[0].columns[second_idx].dictionary.clear();
+        let ceiling =
+            snapshot_format::column_stats_segments_concat(&post_drop_segments).len() as u64;
+
+        // Fresh store, byte-identical fixture, ceiling injected: dropping only
+        // the single largest dictionary still leaves `col_b`'s dictionary in
+        // the body, which is strictly larger than `ceiling` (built from
+        // dropping both), so the degrade loop must continue to a second drop.
+        let store = Arc::new(MemoryStore::new());
+        set_three_column_config(store.as_ref()).await;
+        publish_logs_segment_wide(store.as_ref(), 0, 10, rows).await;
+        let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog.set_column_stats_part_ceiling_for_test(ceiling);
+
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("an over-ceiling part degrades rather than refusing");
+        assert_eq!(
+            report.column_stats_dictionaries_dropped, 2,
+            "exactly the two largest dictionaries are dropped"
+        );
+
+        let head = read_logs_head(store.as_ref()).await;
+        let stats_ref = head.parts[0].column_stats.clone().expect("v3 ref");
+        let got = store
+            .get(&stats_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let limits = crate::snapshot_format::ColumnStatsLimits {
+            max_column_stats_bytes: ceiling,
+        };
+        let decoded = snapshot_format::decode_column_stats(&got.data, &limits)
+            .expect("the degraded object decodes under the injected ceiling");
+        let columns = &decoded.segments[0].columns;
+        assert!(
+            !columns[largest_idx].dictionary_present,
+            "col_a's dictionary (largest) was dropped"
+        );
+        assert!(
+            columns[largest_idx].dictionary.is_empty(),
+            "a dropped dictionary is empty, not truncated"
+        );
+        assert!(
+            !columns[second_idx].dictionary_present,
+            "col_b's dictionary (second-largest) was dropped"
+        );
+        assert!(columns[second_idx].dictionary.is_empty());
+        assert!(
+            columns[kept_idx].dictionary_present,
+            "col_c's dictionary (smallest) survives"
+        );
+        assert_eq!(
+            columns[kept_idx].dictionary, reference_columns[kept_idx].dictionary,
+            "the surviving dictionary is unchanged"
+        );
+        for i in 0..3 {
+            assert_eq!(
+                columns[i].non_null_count, reference_columns[i].non_null_count,
+                "column {i} non_null_count stays exact regardless of dictionary drop"
+            );
+            assert_eq!(
+                columns[i].min, reference_columns[i].min,
+                "column {i} min stays exact"
+            );
+            assert_eq!(
+                columns[i].max, reference_columns[i].max,
+                "column {i} max stays exact"
+            );
+            assert_eq!(
+                columns[i].sum, reference_columns[i].sum,
+                "column {i} sum stays exact"
+            );
+        }
+    }
+
+    /// ADR-1413 decision 4 (amended): the fold refuses a part ONLY once no
+    /// dictionary is left to drop and the dictionary-free body (fixed
+    /// fields: name, declared_type, non_null_count, null_count, min, max,
+    /// sum, plus the segment/header framing) is still over the ceiling. A
+    /// ceiling of 1 byte is below that fixed-field floor for any declared
+    /// column, so this never depends on dictionary cardinality at all.
+    #[tokio::test]
+    async fn fold_refuses_only_a_part_whose_dictionary_free_stats_exceed_the_ceiling() {
+        let store = Arc::new(MemoryStore::new());
+        set_status_column_config(store.as_ref()).await;
+        publish_logs_segment(store.as_ref(), 0, 10, &[200, 404, 200]).await;
+
+        let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog.set_column_stats_part_ceiling_for_test(1);
+
+        let err = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect_err("dictionary-free stats alone still exceed a 1-byte ceiling");
+        match err {
+            CatalogError::ColumnStatsPartOverBound {
+                part_key,
+                declared,
+                ceiling,
+            } => {
+                assert!(
+                    part_key.contains(".csnap"),
+                    "error names the part object's own key, got {part_key}"
+                );
+                assert_eq!(ceiling, 1);
+                assert!(
+                    declared > ceiling,
+                    "declared {declared} must exceed ceiling {ceiling} for this to be the refusal path"
+                );
+            }
+            other => panic!("expected ColumnStatsPartOverBound, got {other:?}"),
+        }
+
+        // No column-stats object of any version was ever published: the
+        // fold bailed out of the per-part loop before it could reach the
+        // whole-tenant v1/v2 builds that run after it.
+        let keys = list_all_keys(store.as_ref(), &format!("t/{}/", tenant().to_hex())).await;
+        assert!(
+            keys.iter().all(|k| !k.ends_with(".cstat")),
+            "no column-stats object of any version was written, got {keys:?}"
+        );
+        // The ceiling check runs before the part's own `.csnap` PUT, so a
+        // refused part never leaves an orphan part object behind either.
+        assert!(
+            keys.iter().all(|k| !k.ends_with(".csnap")),
+            "no part object was written for the refused part, got {keys:?}"
+        );
+        // HEAD was never written either: a failed fold must not publish any
+        // catalog state.
+        assert!(
+            store
+                .get(&head_object_key(&tenant(), Signal::Logs), GetRange::Full)
+                .await
+                .is_err(),
+            "HEAD must not exist after a fold that failed before publishing"
+        );
+    }
+
+    /// #1482: the pre-fix loop re-measured the WHOLE part's uncompressed
+    /// body (`column_stats_segments_concat`, a fresh multi-gigabyte `Vec`)
+    /// and re-summed every dictionary's `encoded_len` on every single drop,
+    /// so a part needing many drops never finished. This fixture forces
+    /// 1,500 drops across 2,000 (segment, column) pairs (100 segments x 20
+    /// columns each, every dictionary the same size so the drop order is
+    /// decided purely by the heap's `(seg_idx, col_idx)` tie-break) and
+    /// pins the fix at measuring the body exactly twice regardless of how
+    /// many drops it takes: once before the drop loop, once after.
+    ///
+    /// Reverting the fix's initial `running_total` computation in
+    /// `fold.rs` back to a per-iteration `column_stats_segments_concat`
+    /// call inside the `while running_total > ceiling` loop (the shape
+    /// `#1482` reports) flips this test's concatenation-count assertion
+    /// back to failing, since the counter would then read 1,501 instead of
+    /// 2 (1 before the loop that is no longer needed, plus 1500 in-loop,
+    /// plus the 1 after).
+    #[tokio::test]
+    async fn degrade_completes_a_part_needing_many_drops_with_one_concatenation() {
+        let n_columns = 20;
+        let n_segments = 100;
+        let rows = 4;
+
+        // Reference fold at the real (unbounded-for-this-fixture) ceiling:
+        // every dictionary intact. Used only to measure, via the same
+        // `column_stats_segments_concat` the fold itself measures with,
+        // the exact post-drop body size for an injected ceiling that
+        // forces exactly 1500 drops.
+        let reference_store = Arc::new(MemoryStore::new());
+        set_many_column_config(reference_store.as_ref(), n_columns).await;
+        for seq in 0..n_segments {
+            publish_logs_segment_many_columns(
+                reference_store.as_ref(),
+                seq as u64,
+                10,
+                n_columns,
+                rows,
+            )
+            .await;
+        }
+        let reference_catalog = Catalog::new(reference_store.clone(), config(1)).expect("catalog");
+        let reference_report = reference_catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("reference fold at the real ceiling never degrades");
+        assert_eq!(
+            reference_report.column_stats_dictionaries_dropped, 0,
+            "the real ceiling admits this fixture with every dictionary intact"
+        );
+        let reference_head = read_logs_head(reference_store.as_ref()).await;
+        let reference_ref = reference_head.parts[0]
+            .column_stats
+            .clone()
+            .expect("v3 ref");
+        let reference_got = reference_store
+            .get(&reference_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let reference_decoded = snapshot_format::decode_column_stats(
+            &reference_got.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("v3 decodes");
+        assert_eq!(reference_decoded.segments.len(), n_segments);
+        for seg in &reference_decoded.segments {
+            assert_eq!(seg.columns.len(), n_columns);
+        }
+
+        // Drop every dictionary in the LAST 75 segments (all 20 columns
+        // each = 1500 pairs). Every pair's dictionary is the same size, so
+        // this is exactly what the degrade loop's heap picks: with the
+        // primary (size) key tied across all 2000 pairs, the heap's
+        // `(size, seg_idx, col_idx, ...)` tuple order pops the highest
+        // seg_idx first, then within it the highest col_idx, reproducing
+        // the same "last maximum wins" tie-break the pre-fix
+        // `max_by_key`-based loop used.
+        let mut post_drop_segments = reference_decoded.segments.clone();
+        let dropped_seg_start = n_segments - 75;
+        for seg in &mut post_drop_segments[dropped_seg_start..] {
+            for col in &mut seg.columns {
+                col.dictionary_present = false;
+                col.dictionary.clear();
+            }
+        }
+        let ceiling =
+            snapshot_format::column_stats_segments_concat(&post_drop_segments).len() as u64;
+
+        // Fresh store, byte-identical fixture, ceiling injected.
+        let store = Arc::new(MemoryStore::new());
+        set_many_column_config(store.as_ref(), n_columns).await;
+        for seq in 0..n_segments {
+            publish_logs_segment_many_columns(store.as_ref(), seq as u64, 10, n_columns, rows)
+                .await;
+        }
+        let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog.set_column_stats_part_ceiling_for_test(ceiling);
+
+        reset_column_stats_concat_calls_for_test();
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("an over-ceiling part degrades rather than refusing");
+        assert_eq!(
+            report.column_stats_dictionaries_dropped, 1500,
+            "exactly the 1500 pairs in the last 75 segments are dropped"
+        );
+        assert_eq!(
+            column_stats_concat_calls_for_test(),
+            2,
+            "the degrade loop itself concatenates the part's body exactly twice \
+             (once before the drop loop, once after) no matter how many \
+             drops it takes -- not once per drop; the encoder's own passes \
+             are outside this count"
+        );
+
+        let head = read_logs_head(store.as_ref()).await;
+        let stats_ref = head.parts[0].column_stats.clone().expect("v3 ref");
+        let got = store
+            .get(&stats_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let limits = crate::snapshot_format::ColumnStatsLimits {
+            max_column_stats_bytes: ceiling,
+        };
+        snapshot_format::decode_column_stats(&got.data, &limits)
+            .expect("the degraded object decodes under the injected ceiling");
+    }
+
+    /// Issue #1482 finding 2: a v3 object keyed by the PART's own hash
+    /// (`hash16`, the pre-fix code) rather than the hash of its OWN bytes
+    /// collides across two folds that recompute the same byte-identical part
+    /// but derive different statistics for it. Here `snapshot_part_max_entries
+    /// = 2` seals hour 10's two segments (A, B) into a non-tail part on the
+    /// very first fold, alongside a separate tail part for hour 11's segment
+    /// (C); a non-tail part's `(min_hour, watermark_hour)` come from its own
+    /// entries, not the fold's overall watermark, so this part's `.csnap`
+    /// bytes -- and therefore its part hash -- never change no matter how far
+    /// later folds advance. A permanent fault on every `/snap/` GET forces the
+    /// second fold to rebuild from the commit layout (ADR-0063 section 4)
+    /// rather than forward the byte-identical part by reference, so it
+    /// genuinely re-derives that part's v3 statistics from the two segments a
+    /// second time. A `Sequence` scripted onto segment A's own data key lets
+    /// its first two reads (the first fold's v3 build, then the first fold's
+    /// name-postings pass, which aborts immediately because a logs RLOG
+    /// object is not a metrics RSEG) succeed normally, then fails the third
+    /// read -- the second fold's v3 build -- permanently. That is the
+    /// warn-and-omit path (fold.rs's per-entry v3 loop only logs and
+    /// continues on a fetch failure), and it drops A from the second fold's
+    /// v3 segments while B (a distinct key, never faulted) still succeeds:
+    /// the second fold's stats object for this part covers only B, genuinely
+    /// different bytes than the first fold's two-segment object for the exact
+    /// same part.
+    ///
+    /// Reverting the fix (`stats_hash16` back to the part's own `hash16`)
+    /// turns this from two objects at two keys into one: the second fold's
+    /// PUT collides under `AlreadyExists` with the first fold's object
+    /// already sitting at that part-hash-derived key, and the code (like the
+    /// legitimate content-addressed case) treats that as "bytes are
+    /// identical" and skips writing anything. The HEAD's field-7 ref still
+    /// gets the SECOND fold's `blake3` (computed directly off the just-built,
+    /// one-segment bytes, independent of where they landed), so the ref names
+    /// a hash that the object actually stored at its key does not have --
+    /// exactly the corruption this test's final assertion below would catch.
+    #[tokio::test]
+    async fn fold_keys_v3_object_by_its_own_content_hash_not_the_parts_hash() {
+        let inner = MemoryStore::new();
+        set_status_column_config(&inner).await;
+
+        let rec_a = publish_logs_segment(&inner, 1, 10, &[200, 404]).await;
+        let rec_b = publish_logs_segment(&inner, 2, 10, &[500]).await;
+        publish_logs_segment(&inner, 3, 11, &[200]).await;
+        let key_a = keys::reconstruct_data_key(&rec_a).expect("key a");
+
+        let plan = FaultPlan::empty()
+            .with_rule(
+                Rule::new(Op::Get, ScriptedFault::Permanent("part unreadable".into()))
+                    .with_key_contains("/snap/"),
+            )
+            .with_sequence(
+                Sequence::new(Op::Get)
+                    .with_key_contains(key_a.clone())
+                    .then_passthrough() // first fold's v3 build reads A
+                    .then_passthrough() // first fold's postings pass reads A, aborts (RLOG vs RSEG)
+                    .then_fault(ScriptedFault::Permanent(
+                        "segment A unreadable on rebuild".into(),
+                    )), // second fold's v3 build: warn-and-omit
+            );
+        let store = Arc::new(FaultStore::new(inner, plan));
+
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 2,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt, "first fold rebuilds from the commit layout");
+        assert_eq!(
+            first.parts_total, 2,
+            "hour 10 seals off from hour 11's tail"
+        );
+
+        let head_1 = read_logs_head(store.as_ref()).await;
+        let part_1 = head_1
+            .parts
+            .iter()
+            .find(|p| p.entry_count == 2)
+            .expect("the sealed two-entry part")
+            .clone();
+        let stats_ref_1 = part_1
+            .column_stats
+            .clone()
+            .expect("first fold's v3 object for the sealed part");
+        let stored_1 = store
+            .get(&stats_ref_1.key, GetRange::Full)
+            .await
+            .expect("first fold's v3 object present");
+        let decoded_1 = snapshot_format::decode_column_stats(
+            &stored_1.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("first fold's v3 object decodes");
+        assert_eq!(
+            decoded_1.segments.len(),
+            2,
+            "first fold covers both A and B"
+        );
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(12),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(
+            second.rebuilt,
+            "the /snap/ fault forces a rebuild from the commit layout"
+        );
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "at least one Permanent Get fault fired; this counter is aggregate \
+             across the /snap/ rule and the sequence, so it does not alone prove \
+             the sequence's third-read fault hit A -- decoded_2.segments below \
+             (len 1, surviving segment is B) is what proves that"
+        );
+
+        let head_2 = read_logs_head(store.as_ref()).await;
+        let part_2 = head_2
+            .parts
+            .iter()
+            .find(|p| p.entry_count == 2)
+            .expect("the same sealed two-entry part, rebuilt")
+            .clone();
+        assert_eq!(
+            part_2.blake3, part_1.blake3,
+            "byte-identical part: same entries, same non-tail (min_hour, watermark_hour)"
+        );
+        let stats_ref_2 = part_2
+            .column_stats
+            .clone()
+            .expect("second fold's v3 object for the same part");
+
+        // The bug this guards against: two different keys, not one collided
+        // key. With the fix, content-addressing guarantees this on its own;
+        // asserting it is what would catch a regression back to part-hash
+        // keying, since fold1 and fold2 share the same part hash.
+        assert_ne!(
+            stats_ref_2.key, stats_ref_1.key,
+            "different statistics bytes must land at different keys, even though \
+             both folds computed this from the exact same part"
+        );
+
+        // First fold's object at its own key is untouched.
+        let restored_1 = store
+            .get(&stats_ref_1.key, GetRange::Full)
+            .await
+            .expect("first fold's object still present, unmodified");
+        assert_eq!(
+            restored_1.data, stored_1.data,
+            "the first fold's v3 object must not be overwritten by the second"
+        );
+
+        // The core correctness property (issue #1482 finding 2): the field-7
+        // ref's blake3 must match what is actually stored at its key. Under
+        // the pre-fix part-hash keying this fails, because the second PUT is
+        // skipped on a false `AlreadyExists` against the first fold's bytes.
+        let stored_2 = store
+            .get(&stats_ref_2.key, GetRange::Full)
+            .await
+            .expect("second fold's v3 object present at its declared key");
+        assert_eq!(
+            blake3::hash(&stored_2.data).as_bytes().to_vec(),
+            stats_ref_2.blake3,
+            "the ref's blake3 must describe the bytes actually stored at its key"
+        );
+        let decoded_2 = snapshot_format::decode_column_stats(
+            &stored_2.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("second fold's v3 object decodes");
+        assert_eq!(
+            decoded_2.segments.len(),
+            1,
+            "A was dropped by the warn-and-omit path; only B survived"
+        );
+        assert_eq!(
+            decoded_2.segments[0].writer_id, rec_b.content_hash,
+            "the surviving segment is B's (entry.content_hash), not A's"
+        );
     }
 
     /// ADR-0942: one bucket can hold two entries that cover a byte-identical
@@ -3453,421 +4823,6 @@ mod tests {
             &segments,
         )
         .expect("encodes once the repeat is collapsed");
-    }
-
-    /// ADR-0942 (deliverable 2): the fold DUAL-PUBLISHES. After a fold over an
-    /// L0 fixture, HEAD carries both the v1 field-11 object and the v2 field-13
-    /// object, and the field-11 object is byte-for-byte identical to what the
-    /// pre-change fold wrote for the same input (reconstructed here from the
-    /// canonical v1 encoder over the same L0 segment stats).
-    #[tokio::test]
-    async fn fold_dual_publishes_v1_and_v2_and_v1_object_is_byte_identical() {
-        let store = Arc::new(MemoryStore::new());
-        set_status_column_config(store.as_ref()).await;
-
-        publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
-        publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
-
-        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
-        let report = catalog
-            .fold(
-                &tenant(),
-                Signal::Logs,
-                Uuid::new_v4(),
-                now_at_seal(10),
-                &[],
-                None,
-            )
-            .await
-            .expect("fold");
-        assert!(report.column_stats_built, "field 11 (v1) built");
-        assert!(report.column_stats_part_built, "field 13 (v2) built");
-
-        let head = read_logs_head(store.as_ref()).await;
-        let v1_ref = head.column_stats.clone().expect("field 11 present");
-        let v2_ref = head.column_stats_part.clone().expect("field 13 present");
-        assert_ne!(v1_ref.key, v2_ref.key, "v1 and v2 are distinct objects");
-
-        // Reconstruct the canonical v1 object over the same L0 segment stats and
-        // the same part set, exactly as the pre-change fold did.
-        let entries = collect_head_entries(store.as_ref(), &head).await;
-        let typed = vec![crate::tenant_config::DeclaredTypedColumn {
-            key: "status".to_string(),
-            ty: crate::tenant_config::DeclaredColumnType::I64,
-        }];
-        let mut l0: Vec<ColumnStatsSegment> = Vec::new();
-        for entry in entries.iter().filter(|e| e.level == 0) {
-            let seg = column_stats_build::fetch_segment_column_stats(
-                store.as_ref(),
-                &tenant(),
-                Signal::Logs,
-                entry,
-                &typed,
-            )
-            .await
-            .expect("l0 stats");
-            l0.push(seg);
-        }
-        l0.sort_by(|a, b| {
-            (
-                a.ingest_hour_bucket,
-                a.shard,
-                a.writer_id.as_slice(),
-                a.writer_epoch,
-                a.writer_seq,
-            )
-                .cmp(&(
-                    b.ingest_hour_bucket,
-                    b.shard,
-                    b.writer_id.as_slice(),
-                    b.writer_epoch,
-                    b.writer_seq,
-                ))
-        });
-        let part_blake3: Vec<Vec<u8>> = head.parts.iter().map(|p| p.blake3.clone()).collect();
-        let signal_num = signal::to_proto(Signal::Logs) as u32;
-        let expected_v1 =
-            snapshot_format::encode_column_stats(tenant().0, signal_num, part_blake3, &l0)
-                .expect("canonical v1 encodes");
-
-        let got_v1 = store
-            .get(&v1_ref.key, GetRange::Full)
-            .await
-            .expect("v1 object present")
-            .data;
-        assert_eq!(
-            got_v1.as_ref(),
-            expected_v1.as_slice(),
-            "field-11 v1 object is byte-identical to the canonical v1 encode"
-        );
-        assert_eq!(got_v1[4], 1, "field-11 object is envelope v1");
-
-        // The two objects differ only in keying: v1 records key by the tuple
-        // with a 16-byte writer_id uuid; v2 records key by the 32-byte part
-        // content hash carried in writer_id.
-        let limits = crate::snapshot_format::ColumnStatsLimits::default();
-        let dec_v1 = snapshot_format::decode_column_stats(&got_v1, &limits).expect("v1 decodes");
-        assert!(
-            dec_v1.segments.iter().all(|s| s.writer_id.len() == 16),
-            "v1 records carry the 16-byte writer uuid"
-        );
-        let got_v2 = store
-            .get(&v2_ref.key, GetRange::Full)
-            .await
-            .expect("v2 object present")
-            .data;
-        assert_eq!(got_v2[4], 2, "field-13 object is envelope v2");
-        let dec_v2 = snapshot_format::decode_column_stats(&got_v2, &limits).expect("v2 decodes");
-        assert_eq!(dec_v2.segments.len(), 2, "v2 covers both L0 segments");
-        assert!(
-            dec_v2.segments.iter().all(|s| s.writer_id.len() == 32),
-            "every v2 record is keyed by a 32-byte part content hash"
-        );
-        // Each v2 record's key is exactly the L0 entry's content hash.
-        let entry_hashes: std::collections::HashSet<Vec<u8>> = entries
-            .iter()
-            .filter(|e| e.level == 0)
-            .map(|e| e.content_hash.clone())
-            .collect();
-        assert!(
-            dec_v2
-                .segments
-                .iter()
-                .all(|s| entry_hashes.contains(&s.writer_id)),
-            "v2 keys are the covered L0 parts' content hashes"
-        );
-    }
-
-    /// The pre-#964 two-fetch dual publish, kept as the reference the
-    /// production single-fetch path is compared against: builds the v1
-    /// (field 11) and v2 (field 13) objects over a folded HEAD exactly as the
-    /// two independent passes did, each pass fetching every entry it covers on
-    /// its own. `fetch_segment_column_stats` is the per-entry, per-pass fetch
-    /// those passes called.
-    async fn reference_dual_publish_bytes(
-        store: &dyn ObjectStoreBackend,
-        head: &SnapshotHead,
-    ) -> (Vec<u8>, Vec<u8>) {
-        let entries = collect_head_entries(store, head).await;
-        let typed = vec![crate::tenant_config::DeclaredTypedColumn {
-            key: "status".to_string(),
-            ty: crate::tenant_config::DeclaredColumnType::I64,
-        }];
-        let part_blake3: Vec<Vec<u8>> = head.parts.iter().map(|p| p.blake3.clone()).collect();
-        let signal_num = signal::to_proto(Signal::Logs) as u32;
-
-        // v1 pass: L0 entries only, tuple-keyed, its own fetch per entry.
-        let mut l0: Vec<ColumnStatsSegment> = Vec::new();
-        for entry in entries.iter().filter(|e| e.level == 0) {
-            l0.push(
-                column_stats_build::fetch_segment_column_stats(
-                    store,
-                    &tenant(),
-                    Signal::Logs,
-                    entry,
-                    &typed,
-                )
-                .await
-                .expect("v1 pass stats"),
-            );
-        }
-        l0.sort_by(|a, b| {
-            (
-                a.ingest_hour_bucket,
-                a.shard,
-                a.writer_id.as_slice(),
-                a.writer_epoch,
-                a.writer_seq,
-            )
-                .cmp(&(
-                    b.ingest_hour_bucket,
-                    b.shard,
-                    b.writer_id.as_slice(),
-                    b.writer_epoch,
-                    b.writer_seq,
-                ))
-        });
-        let v1 =
-            snapshot_format::encode_column_stats(tenant().0, signal_num, part_blake3.clone(), &l0)
-                .expect("reference v1 encodes");
-
-        // v2 pass: every entry, a SECOND fetch for each L0 one, writer_id
-        // overwritten with the covered part's content hash, sorted and deduped.
-        let mut part_segments: Vec<ColumnStatsSegment> = Vec::new();
-        for entry in entries.iter() {
-            let mut seg = column_stats_build::fetch_segment_column_stats(
-                store,
-                &tenant(),
-                Signal::Logs,
-                entry,
-                &typed,
-            )
-            .await
-            .expect("v2 pass stats");
-            seg.writer_id = entry.content_hash.clone();
-            part_segments.push(seg);
-        }
-        sort_and_dedup_part_segments(&mut part_segments);
-        let v2 = snapshot_format::encode_column_stats_v2(
-            tenant().0,
-            signal_num,
-            part_blake3,
-            &part_segments,
-        )
-        .expect("reference v2 encodes");
-
-        (v1, v2)
-    }
-
-    /// Fold `store` at `seal_hour` and assert both published column-stats
-    /// objects are byte-identical to [`reference_dual_publish_bytes`], with the
-    /// record counts the fixture implies (so neither side can be vacuously
-    /// empty).
-    async fn assert_dual_publish_matches_reference(
-        store: &Arc<MemoryStore>,
-        seal_hour: u32,
-        l0_records: usize,
-        all_records: usize,
-        label: &str,
-    ) {
-        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
-        let report = catalog
-            .fold(
-                &tenant(),
-                Signal::Logs,
-                Uuid::new_v4(),
-                now_at_seal(seal_hour),
-                &[],
-                None,
-            )
-            .await
-            .expect("fold");
-        assert_eq!(
-            report.entry_count as usize, all_records,
-            "{label}: fixture entry count"
-        );
-        assert!(report.column_stats_built, "{label}: field 11 built");
-        assert!(report.column_stats_part_built, "{label}: field 13 built");
-
-        let head = read_logs_head(store.as_ref()).await;
-        let (want_v1, want_v2) = reference_dual_publish_bytes(store.as_ref(), &head).await;
-        let limits = crate::snapshot_format::ColumnStatsLimits::default();
-        assert_eq!(
-            snapshot_format::decode_column_stats(&want_v1, &limits)
-                .expect("reference v1 decodes")
-                .segments
-                .len(),
-            l0_records,
-            "{label}: reference v1 covers every L0 entry"
-        );
-        assert_eq!(
-            snapshot_format::decode_column_stats(&want_v2, &limits)
-                .expect("reference v2 decodes")
-                .segments
-                .len(),
-            all_records,
-            "{label}: reference v2 covers every entry"
-        );
-
-        let v1_key = head
-            .column_stats
-            .as_ref()
-            .expect("field 11 ref")
-            .key
-            .clone();
-        let v2_key = head
-            .column_stats_part
-            .as_ref()
-            .expect("field 13 ref")
-            .key
-            .clone();
-        let got_v1 = store
-            .get(&v1_key, GetRange::Full)
-            .await
-            .expect("v1 object present")
-            .data;
-        let got_v2 = store
-            .get(&v2_key, GetRange::Full)
-            .await
-            .expect("v2 object present")
-            .data;
-        assert_eq!(
-            got_v1.as_ref(),
-            want_v1.as_slice(),
-            "{label}: field-11 object bytes"
-        );
-        assert_eq!(
-            got_v2.as_ref(),
-            want_v2.as_slice(),
-            "{label}: field-13 object bytes"
-        );
-    }
-
-    /// Issue #964: folding each covered object ONCE for both publishes is a
-    /// request-count change, never a content change. Both published objects
-    /// stay byte-identical to what the two independent per-pass fetches
-    /// produced, over an L0-only, an L1-only, and a mixed fold.
-    ///
-    /// FLIP (demonstrated): tallying with the wrong declared columns --
-    /// `SegmentColumnStatsCache::segment_column_stats` passing
-    /// `&self.typed_columns[..0]` instead of `self.typed_columns` -- keeps both
-    /// objects publishable but empties every record's `columns`, and the
-    /// "L0 only: field-11 object bytes" `assert_eq!` fails on 93 bytes against
-    /// 178. Mis-keying a record is caught one assertion earlier: dropping
-    /// `segment.writer_id = entry.content_hash.clone()` from the v2 publish, or
-    /// applying it to the v1 record, makes that publish's encoder reject the
-    /// artifact and the `column_stats_part_built` / `column_stats_built`
-    /// assertion fails.
-    #[tokio::test]
-    async fn dual_publish_objects_are_byte_identical_to_the_two_fetch_reference() {
-        // L0 only.
-        let store = Arc::new(MemoryStore::new());
-        set_status_column_config(store.as_ref()).await;
-        publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
-        publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
-        assert_dual_publish_matches_reference(&store, 10, 2, 2, "L0 only").await;
-
-        // L1 only: no L0 entry at all, so the v1 object covers nothing while
-        // the v2 object covers both parts.
-        let store = Arc::new(MemoryStore::new());
-        set_status_column_config(store.as_ref()).await;
-        publish_logs_l1(
-            store.as_ref(),
-            0,
-            10,
-            "input-set-seed",
-            &[&[200, 404, 200, 500], &[500, 500, 200]],
-        )
-        .await;
-        assert_dual_publish_matches_reference(&store, 10, 0, 2, "L1 only").await;
-
-        // Mixed: two L0 entries in hour 10, two L1 parts in hour 11. The
-        // compaction is in a different bucket, so it supersedes neither L0
-        // entry and the fold covers all four parts.
-        let store = Arc::new(MemoryStore::new());
-        set_status_column_config(store.as_ref()).await;
-        publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
-        publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
-        publish_logs_l1(
-            store.as_ref(),
-            0,
-            11,
-            "input-set-seed",
-            &[&[200, 404], &[500]],
-        )
-        .await;
-        assert_dual_publish_matches_reference(&store, 11, 2, 4, "mixed L0 and L1").await;
-    }
-
-    /// Issue #964: a dual-publishing fold reads each covered object EXACTLY
-    /// ONCE. The v1 (field 11) pass covers the L0 entries and the v2 (field 13)
-    /// pass covers the same L0 entries plus the L1 ones, and each pass used to
-    /// fetch and scan the object itself, so every L0 part cost two GETs.
-    ///
-    /// Counted per object key on a RecordingStore over a no-baseline (rebuild)
-    /// fold of n = 2 L0 entries and m = 2 L1 parts: 4 stats reads, plus the one
-    /// GET the name-postings pass spends before it aborts on the first entry (a
-    /// logs RLOG object is not a metrics RSEG), for 5 in total.
-    ///
-    /// FLIP (pre-fix figures): with each pass fetching for itself the total is
-    /// 2n + m + 1 = 7, with segment A read 3 times and segment B twice.
-    #[tokio::test]
-    async fn dual_publish_reads_each_covered_object_once() {
-        let store = Arc::new(RecordingStore::new());
-        set_status_column_config(store.as_ref()).await;
-
-        let rec_a = publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
-        let rec_b = publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
-        let l1 = publish_logs_l1(
-            store.as_ref(),
-            0,
-            11,
-            "input-set-seed",
-            &[&[200, 404], &[500]],
-        )
-        .await;
-        let key_a = keys::reconstruct_data_key(&rec_a).expect("key a");
-        let key_b = keys::reconstruct_data_key(&rec_b).expect("key b");
-        let key_p0 = keys::reconstruct_l1_part_key(&l1, &l1.parts[0]).expect("key p0");
-        let key_p1 = keys::reconstruct_l1_part_key(&l1, &l1.parts[1]).expect("key p1");
-
-        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
-        store.clear_gets();
-        let report = catalog
-            .fold(
-                &tenant(),
-                Signal::Logs,
-                Uuid::new_v4(),
-                now_at_seal(11),
-                &[],
-                None,
-            )
-            .await
-            .expect("fold");
-        assert!(report.rebuilt, "first fold rebuilds from the commit layout");
-        assert_eq!(report.entry_count, 4, "two L0 entries and two L1 parts");
-        assert!(report.column_stats_built, "field 11 built");
-        assert!(report.column_stats_part_built, "field 13 built");
-
-        // Segment A is the first entry in fold order, so it also carries the
-        // name-postings pass's single GET before that pass aborts.
-        let counts = [
-            store.count_gets_of(&key_a),
-            store.count_gets_of(&key_b),
-            store.count_gets_of(&key_p0),
-            store.count_gets_of(&key_p1),
-        ];
-        assert_eq!(
-            counts,
-            [2, 1, 1, 1],
-            "one column-stats read per part (A also carries the postings read); \
-             the two-fetch path reads [3, 2, 1, 1]"
-        );
-        assert_eq!(
-            counts.iter().sum::<usize>(),
-            5,
-            "n + m stats reads plus the one postings read (the two-fetch path: 2n + m + 1 = 7)"
-        );
     }
 
     #[test]
@@ -5159,6 +6114,125 @@ mod tests {
         );
     }
 
+    /// Test debt (formal/tla/TRACEABILITY.md, catalog row 1, `DoFoldCas`
+    /// fold-lifetime bound / `DoFoldRebase`): a fold that LISTs a bucket
+    /// before a compaction supersedes one of its L0 inputs, and whose own
+    /// publishing CAS lands only after that input's superseded-sweep horizon
+    /// has passed (so a real deployment's maintenance process would already
+    /// have physically deleted it), must never publish a snapshot that names
+    /// the swept input. Nothing inside `Catalog::fold` samples a clock or
+    /// times its own duration (module docs above: "this crate never reads a
+    /// clock"); the guarantee comes from `DoFoldRebase`, the HEAD CAS retry
+    /// loop's `PreconditionFailed`/`AlreadyExists` branch: a delayed fold's
+    /// CAS loses to whichever fold's fresher listing published first, and the
+    /// loser re-reads HEAD and takes the no-op path instead of ever
+    /// publishing its own stale listing. A `FaultStore` hold on the delayed
+    /// fold's HEAD PUT freezes it after its LIST and before its CAS so a
+    /// second, unheld fold can win the race while the compaction and the
+    /// sweep both land in between.
+    #[tokio::test]
+    async fn fold_that_lists_before_a_compaction_and_cas_after_the_sweep_horizon_does_not_name_a_swept_input()
+     {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Arc::new(Catalog::new(store.clone(), cfg).expect("catalog"));
+
+        // Hour 10 seals into its own part; hour 11 is the tail. Fold A's LIST
+        // of hour 10 sees only the raw L0 segment: no compaction exists yet.
+        let now_1 = now_at_seal(11);
+        let writer_a = Uuid::new_v4();
+        let seg_a =
+            publish_segment(store.inner(), 0, writer_a, 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+
+        // Hold fold A's HEAD PUT: HEAD is absent, so this is the very first
+        // (and only, until released) call that matches. Fold A's LIST has
+        // already completed by the time its PUT is attempted, so the hold
+        // freezes it exactly after LIST and before CAS.
+        let gate = store.hold(Op::Put, Some("HEAD".to_string()), Occurrence::Nth(1));
+        let cat_a = catalog.clone();
+        let fold_a = tokio::spawn(async move {
+            cat_a
+                .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+                .await
+        });
+        gate.wait_until_held(1).await;
+        assert_eq!(gate.held_count(), 1, "fold A is blocked on its HEAD CAS");
+
+        // A compaction lands while fold A is paused, superseding seg_a's L0
+        // with one L1 part.
+        publish_compaction(store.inner(), 0, 10, &[&seg_a], now_1).await;
+
+        // Simulate the superseded-input sweep: once `protection_horizon_ns`
+        // has elapsed past the compaction's own `created_unix_ns`, a real
+        // maintenance process would physically delete seg_a's commit record
+        // and data object (docs/deletion-and-gc.md's superseded-input sweep
+        // row; the delete blocker there is vacuous while HEAD is still
+        // absent, which is exactly fold A's paused state). Do that directly
+        // here (ravel-maintain is out of this task's scope) so fold B below
+        // runs, and fold A resumes, against a store where the swept input is
+        // already gone, not merely superseded.
+        let commit_key = keys::commit_key_for_record(&seg_a).expect("commit key");
+        let data_key = keys::reconstruct_data_key(&seg_a).expect("data key");
+        store
+            .inner()
+            .delete(&commit_key)
+            .await
+            .expect("delete swept commit record");
+        store
+            .inner()
+            .delete(&data_key)
+            .await
+            .expect("delete swept data object");
+
+        // Fold B: its own LIST of hour 10 sees the compaction directly (no
+        // reconcile pass needed, this is also a first/rebuild fold since HEAD
+        // is still absent while fold A is paused). Its CAS is not gated by
+        // the hold (`Occurrence::Nth(1)` matched only fold A's attempt), so
+        // it wins the race and publishes HEAD naming the L1 part, well past
+        // the sweep horizon.
+        let now_2 = now_1 + cfg.protection_horizon_ns + NS_PER_HOUR;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("fold B must not fail even though the swept input is already gone");
+        assert!(!second.no_op);
+        assert!(second.rebuilt, "HEAD was still absent when fold B listed");
+
+        // Release fold A: its own HEAD PUT now loses (`AlreadyExists`, HEAD
+        // was created by fold B while fold A was held), so it must rebase
+        // onto fold B's HEAD and take the no-op path rather than publish its
+        // own stale listing that still names seg_a.
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let first = fold_a
+            .await
+            .expect("join fold A")
+            .expect("fold A must rebase, not error");
+        assert!(
+            first.no_op,
+            "fold A must rebase onto fold B's HEAD, never publish its stale listing"
+        );
+
+        let head = read_head(store.inner()).await;
+        let entries = collect_head_entries(store.inner(), &head).await;
+        let hour10: Vec<&SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.ingest_hour_bucket == 10)
+            .collect();
+        assert_eq!(hour10.len(), 1, "hour 10 now has exactly the L1 part");
+        assert_eq!(hour10[0].level, 1, "hour 10's entry is the compaction L1");
+        assert!(
+            !entries.iter().any(|e| e.content_hash == seg_a.content_hash),
+            "the published fold must not name the swept input"
+        );
+    }
+
     /// Regression for issue #587: a fold used to skip postings entirely the
     /// moment any L1 (compacted) entry was present, because
     /// `fetch_segment_names` could only key and identity-check an L0 object.
@@ -5331,8 +6405,24 @@ mod tests {
     }
 
     /// A late record landing OUTSIDE the reconcile window (older than
-    /// `watermark_hour_old - fold_reconcile_window_hours`) is correctly NOT
-    /// picked up: the stated, bounded staleness this window accepts.
+    /// `watermark_hour_old - fold_reconcile_window_hours`) is still NOT picked
+    /// up by a fold that was not asked to look there.
+    ///
+    /// This is no longer an unconditional invariant, and the distinction is
+    /// the whole point of issue #526's re-fold half. What the window bounds is
+    /// what the fold discovers ON ITS OWN: it cannot tell which old hour
+    /// received a late record without listing that hour's buckets, and the
+    /// hours that could have received one are every hour the snapshot names,
+    /// so a self-derived pass would cost a full-history LIST fan-out per fold.
+    /// The bounded staleness this test pins is therefore the staleness of the
+    /// UNREQUESTED fold, and it is the reason a caller that DOES know (the
+    /// superseded-input sweep, which lists those buckets anyway and holds the
+    /// hour's pre-rewrite inputs on its HEAD-reachability gate) has
+    /// [`Catalog::fold_with_refold_request`] to say so.
+    ///
+    /// Held deliberately, not by omission: `refold_request_applies_out_of_
+    /// window_compaction` below is this exact scenario plus the request, and
+    /// it asserts the opposite outcome.
     #[tokio::test]
     async fn reconcile_ignores_late_record_outside_window() {
         let store = Arc::new(MemoryStore::new());
@@ -5384,6 +6474,610 @@ mod tests {
         assert_eq!(hour5.len(), 1);
         assert_eq!(hour5[0].level, 0, "hour 5 still holds the original L0");
         assert_eq!(hour5[0].content_hash, seg_x.content_hash);
+    }
+
+    // ---- issue #526: targeted re-fold of hours that received a late record ----
+
+    /// The object key a snapshot entry names, derived level-aware exactly as
+    /// [`fetch_segment_names`] derives it for a fetch. Lets a test assert the
+    /// exact set of objects a folded snapshot still names, rather than a count.
+    fn entry_object_key(entry: &SnapshotEntry) -> String {
+        if entry.level == 0 {
+            let writer_id: [u8; 16] = entry
+                .writer_id
+                .as_slice()
+                .try_into()
+                .expect("a level-0 entry carries a 16-byte writer id");
+            let content_hash: [u8; 32] = entry
+                .content_hash
+                .as_slice()
+                .try_into()
+                .expect("an entry carries a 32-byte content hash");
+            keys::data_key(
+                &tenant(),
+                Signal::Metrics,
+                entry.shard,
+                Uuid::from_bytes(writer_id),
+                entry.writer_epoch,
+                entry.writer_seq,
+                &content_hash,
+            )
+            .expect("data key")
+        } else {
+            keys::l1_part_key(
+                &tenant(),
+                Signal::Metrics,
+                entry.shard,
+                entry.ingest_hour_bucket,
+                &hex::encode(&entry.writer_id[..8]),
+                u32::try_from(entry.writer_epoch).expect("part index fits u32"),
+                &hex::encode(&entry.content_hash[..8]),
+            )
+            .expect("l1 part key")
+        }
+    }
+
+    /// Every object key the current HEAD's snapshot names, as a set.
+    async fn head_object_keys(store: &dyn ObjectStoreBackend) -> BTreeSet<String> {
+        collect_head_entries(store, &read_head(store).await)
+            .await
+            .iter()
+            .map(entry_object_key)
+            .collect()
+    }
+
+    /// Publish a selective-erasure rewrite record (ADR-0064 decision 3) into
+    /// `(shard, ingest_hour_bucket)` that supersedes the given L0 `inputs` and
+    /// contributes one L1 output part. Like `publish_compaction`, only the
+    /// record object is written: the fold reads the record, not the part.
+    async fn publish_rewrite(
+        store: &MemoryStore,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        inputs: &[&CommitRecord],
+        created_unix_ns: i64,
+    ) -> RewriteRecord {
+        let mut input_ids: Vec<CompactionInputIdentity> = inputs
+            .iter()
+            .map(|r| CompactionInputIdentity {
+                writer_id: r.writer_id.clone(),
+                writer_epoch: r.writer_epoch,
+                writer_seq: r.writer_seq,
+            })
+            .collect();
+        // `validate_rewrite` requires the inputs in this order and recomputes
+        // the input-set hash over them.
+        input_ids.sort_by(|a, b| {
+            (a.writer_id.as_str(), a.writer_epoch, a.writer_seq).cmp(&(
+                b.writer_id.as_str(),
+                b.writer_epoch,
+                b.writer_seq,
+            ))
+        });
+        let request_ids = vec![Uuid::new_v4().to_string()];
+        let input_set_hash =
+            erasure::compute_rewrite_input_set_hash(&input_ids, None, &request_ids).to_vec();
+        let part_payload = format!("rw-{shard}-{ingest_hour_bucket}").into_bytes();
+        let part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: blake3::hash(&part_payload).as_bytes().to_vec(),
+            object_size: part_payload.len() as u64,
+            sample_count: 1,
+            series_count: 1,
+            run_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            segment_format_version: 3,
+            declared_column_stats: Vec::new(),
+        };
+        let record = RewriteRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            shard,
+            ingest_hour_bucket,
+            inputs: input_ids,
+            input_set_hash,
+            parts: vec![part],
+            drops: request_ids
+                .iter()
+                .map(|request_id| RewriteDrop {
+                    request_id: request_id.clone(),
+                    dropped_count: 1,
+                })
+                .collect(),
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        let key = keys::rewrite_record_key_for(&record).expect("rewrite key");
+        store
+            .put(
+                &key,
+                erasure::encode_rewrite(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put rewrite record");
+        record
+    }
+
+    /// Deliverable 1: an hour that received a late COMPACTION record outside
+    /// the fixed reconcile window is re-folded when a request names it, and
+    /// the resulting snapshot stops naming that hour's pre-rewrite inputs.
+    /// Same setup as `reconcile_ignores_late_record_outside_window`, whose
+    /// unrequested fold leaves hour 5 naming the superseded L0.
+    ///
+    /// To watch this FAIL against the pre-fix behaviour, empty the targeted
+    /// pass's slice in `fold_inner`: `let refold_hours = &candidates[..0];`.
+    /// The pass then lists nothing, hour 5 keeps naming `seg_x`, and the exact
+    /// key-set assertion below fails. (`&candidates[..take]` is the shipped
+    /// line itself, so quoting that changes nothing and the test still
+    /// passes.)
+    #[tokio::test]
+    async fn refold_request_applies_out_of_window_compaction() {
+        let store = Arc::new(MemoryStore::new());
+        // Default window is 26 hours, so the fixed pass covers [14, 40] only.
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let seg_x = publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        let seg_recent = publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 2);
+
+        let compaction = publish_compaction(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
+
+        reset_refold_hours_for_test();
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                &RefoldRequest::from_hours([5]),
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.no_op, "the watermark advanced 40 -> 41");
+        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+
+        let expected: BTreeSet<String> = [
+            keys::reconstruct_l1_part_key(&compaction, &compaction.parts[0]).expect("l1 part key"),
+            keys::reconstruct_data_key(&seg_recent).expect("data key"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            head_object_keys(store.as_ref()).await,
+            expected,
+            "hour 5 must now name the compaction output, and no longer its superseded L0 input"
+        );
+        assert_eq!(refold_hours_reconciled_for_test(), 1);
+    }
+
+    /// Deliverable 1, the rewrite half: the same for a late selective-erasure
+    /// REWRITE record (ADR-0064 decision 3). This is the shape issue #526
+    /// names, because a rewrite always lands in an already-sealed bucket, so a
+    /// rewrite outside the window is never picked up by any later fold at all.
+    ///
+    /// Flip the same line as `refold_request_applies_out_of_window_compaction`
+    /// (`let refold_hours = &candidates[..0];`) to watch it fail: the snapshot
+    /// keeps naming the pre-erasure L0.
+    #[tokio::test]
+    async fn refold_request_applies_out_of_window_rewrite() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let seg_x = publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        let seg_recent = publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        let rewrite = publish_rewrite(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
+
+        reset_refold_hours_for_test();
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                &RefoldRequest::from_hours([5]),
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+
+        let expected: BTreeSet<String> = [
+            keys::reconstruct_rewrite_part_key(&rewrite, &rewrite.parts[0])
+                .expect("rewrite part key"),
+            keys::reconstruct_data_key(&seg_recent).expect("data key"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            head_object_keys(store.as_ref()).await,
+            expected,
+            "hour 5 must now name the rewrite output, and no longer its pre-erasure L0 input"
+        );
+        assert_eq!(refold_hours_reconciled_for_test(), 1);
+    }
+
+    /// ADR-0063 section 4 carve-out 1: a FIRST fold skips the reconcile pass
+    /// entirely (no previous watermark exists to anchor a window to). A
+    /// re-fold request must not make it do reconcile work anyway. The
+    /// requested hour is not even sealed-and-folded yet, so listing it would
+    /// be work the rebuild-shaped first fold already does.
+    #[tokio::test]
+    async fn refold_request_is_ignored_on_a_first_fold() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let seg_x = publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        publish_compaction(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
+
+        reset_refold_hours_for_test();
+        let first = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+                &RefoldRequest::from_hours([5]),
+            )
+            .await
+            .expect("first fold");
+        assert!(!first.no_op);
+        assert_eq!(
+            refold_hours_reconciled_for_test(),
+            0,
+            "a first fold does no reconcile work, requested or not"
+        );
+        assert_eq!(
+            first.frontier_hours_reconciled, 0,
+            "and no frontier work either, which the carve-out also covers"
+        );
+        // The first fold derives hour 5 from the commit layout, compaction
+        // record included, so the request had nothing to add.
+        assert_eq!(first.entry_count, 2);
+    }
+
+    /// ADR-0063 section 4 carve-out 2: a REBUILD skips the reconcile pass (it
+    /// re-derives every hour from the commit layout already). A re-fold
+    /// request must not add a second listing of hours the rebuild just read.
+    #[tokio::test]
+    async fn refold_request_is_ignored_on_a_rebuild() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let seg_x = publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        // Corrupt HEAD in place so the next fold rebuilds.
+        store
+            .put(
+                &head_object_key(&tenant(), Signal::Metrics),
+                Bytes::from_static(b"not a head"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite head with garbage");
+        publish_compaction(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
+
+        reset_refold_hours_for_test();
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                &RefoldRequest::from_hours([5]),
+            )
+            .await
+            .expect("fold after corruption");
+        assert!(second.rebuilt, "a rebuild, not an incremental fold");
+        assert_eq!(
+            refold_hours_reconciled_for_test(),
+            0,
+            "a rebuild does no reconcile work, requested or not"
+        );
+        // The rebuild picks the late compaction up on its own, from the same
+        // listing it performs for every hour.
+        let hour5: Vec<SnapshotEntry> =
+            collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await)
+                .await
+                .into_iter()
+                .filter(|e| e.ingest_hour_bucket == 5)
+                .collect();
+        assert_eq!(hour5.len(), 1);
+        assert_eq!(hour5[0].level, 1);
+    }
+
+    /// Bounded work: one late record means exactly ONE hour is re-folded, not
+    /// every hour the snapshot names, and not every hour on every later tick.
+    ///
+    /// The LIST arithmetic is asserted exactly, because the hour count alone
+    /// would not catch a pass that re-listed the whole history and then
+    /// reported only the hours it changed. For the second fold below
+    /// (`watermark_hour_old` 40, new watermark 41, one shard, no tenant
+    /// retention window so the frontier pass does not run): 1 incremental
+    /// bucket for hour 41, 27 for the fixed window `[14, 40]`, and 1 for the
+    /// requested hour 3.
+    /// The cap truncates oldest-first and carries the remainder, rather than
+    /// dropping it or deferring it into the snapshot. The requester re-derives
+    /// its blocked set each pass, so an hour the cap cut out comes back on the
+    /// next request.
+    ///
+    /// The cap is read from the runtime config, so this case sets it to 2 and
+    /// requests 4 hours rather than needing 169 of them. That is also what
+    /// makes the config read testable at all: with the previous hardcoded
+    /// const, reaching the branch meant building a 169-hour snapshot.
+    ///
+    /// Flip to watch it fail: drop the `.min(cap)` from `take`. All four
+    /// requested hours are then re-folded and the count below reads 4.
+    #[tokio::test]
+    async fn refold_request_is_capped_oldest_first_and_carries_the_remainder() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 1,
+                frontier_reconcile_max_hours: 2,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+
+        let mut old_segments = Vec::new();
+        for hour in [1u32, 2, 3, 5] {
+            old_segments.push(
+                publish_segment(
+                    &store,
+                    0,
+                    Uuid::new_v4(),
+                    1,
+                    hour,
+                    (i64::from(hour) + 1) * NS_PER_HOUR,
+                )
+                .await,
+            );
+        }
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        // Every one of the four old hours receives a late record, so all four
+        // are genuine candidates and the cap is what limits the pass.
+        for (i, hour) in [1u32, 2, 3, 5].iter().enumerate() {
+            publish_compaction(
+                &store,
+                0,
+                *hour,
+                &[&old_segments[i]],
+                (i64::from(*hour) + 1) * NS_PER_HOUR,
+            )
+            .await;
+        }
+
+        reset_refold_hours_for_test();
+        catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                &RefoldRequest::from_hours([1, 2, 3, 5]),
+            )
+            .await
+            .expect("capped fold");
+        assert_eq!(
+            refold_hours_reconciled_for_test(),
+            2,
+            "the cap of 2 bounds the pass, not the four requested hours"
+        );
+
+        // The remainder is not lost: requesting it again re-folds it, which is
+        // the property that lets the pass defer nothing into the snapshot.
+        reset_refold_hours_for_test();
+        catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(42),
+                &[],
+                None,
+                &RefoldRequest::from_hours([3, 5]),
+            )
+            .await
+            .expect("remainder fold");
+        assert_eq!(
+            refold_hours_reconciled_for_test(),
+            2,
+            "the hours the cap cut out are re-foldable on the next request"
+        );
+    }
+
+    #[tokio::test]
+    async fn refold_request_re_lists_only_the_requested_hours() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        // Five snapshot-named hours, all but hour 40 far outside the window.
+        let mut old_segments = Vec::new();
+        for hour in [1u32, 2, 3, 5] {
+            old_segments.push(
+                publish_segment(
+                    &store,
+                    0,
+                    Uuid::new_v4(),
+                    1,
+                    hour,
+                    (i64::from(hour) + 1) * NS_PER_HOUR,
+                )
+                .await,
+            );
+        }
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 5);
+
+        // Exactly one hour receives a late record.
+        publish_compaction(&store, 0, 3, &[&old_segments[2]], 4 * NS_PER_HOUR).await;
+
+        reset_refold_hours_for_test();
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                &RefoldRequest::from_hours([3]),
+            )
+            .await
+            .expect("second fold");
+        assert_eq!(
+            refold_hours_reconciled_for_test(),
+            1,
+            "exactly the one requested hour is re-folded"
+        );
+        assert_eq!(
+            second.list_requests,
+            1 + 27 + 1,
+            "hour 41 incrementally, the 27-hour fixed window [14, 40], and hour 3"
+        );
+
+        // A later tick with nothing to request re-lists no extra hour at all:
+        // the pass is driven by the request, never by the snapshot's size.
+        reset_refold_hours_for_test();
+        let third = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(42),
+                &[],
+                None,
+            )
+            .await
+            .expect("third fold");
+        assert_eq!(refold_hours_reconciled_for_test(), 0);
+        assert_eq!(
+            third.list_requests,
+            1 + 27,
+            "hour 42 incrementally plus the fixed window [15, 41]; no re-fold LISTs"
+        );
+    }
+
+    /// The pass declines the hours it cannot usefully re-fold: one inside the
+    /// fixed window (which lists it anyway), one above the old watermark
+    /// (which the incremental range folds fresh), and one no snapshot entry
+    /// names (which cannot be blocking a delete on HEAD reachability). A
+    /// request of only such hours costs no LIST at all.
+    #[tokio::test]
+    async fn refold_request_skips_hours_the_other_passes_cover() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 20, 21 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        reset_refold_hours_for_test();
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                // 20: inside the fixed window [14, 40]. 41: the incremental
+                // range. 4: no snapshot entry names it.
+                &RefoldRequest::from_hours([4, 20, 41]),
+            )
+            .await
+            .expect("second fold");
+        assert_eq!(refold_hours_reconciled_for_test(), 0);
+        assert_eq!(
+            second.list_requests,
+            1 + 27,
+            "hour 41 incrementally plus the fixed window [14, 40], and nothing more"
+        );
     }
 
     /// A late retention tombstone in an already-folded, in-window hour drops
@@ -5963,5 +7657,291 @@ mod tests {
             0,
             "each fold attempt performs exactly one HEAD CAS write"
         );
+    }
+
+    /// The fold-liveness gauge and cycle counter (issue #1306). A successful
+    /// fold stamps the caller's `now_ns` into `fold_last_success_unix_ns`
+    /// exactly, and counts exactly one cycle. Exact equality, not a band: the
+    /// value IS the injected clock reading the caller passed in, since this
+    /// crate reads no clock of its own.
+    #[tokio::test]
+    async fn successful_fold_stamps_last_success_and_counts_one_cycle() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 0);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 0);
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
+            0,
+            "no fold has succeeded yet, so the gauge is the zero sentinel"
+        );
+
+        let now_ns = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_ns - NS_PER_HOUR).await;
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold succeeds");
+        assert!(!report.no_op, "the fold folded the sealed hour");
+
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 1);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 0);
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
+            now_ns,
+            "the gauge is exactly the now_ns the caller folded at"
+        );
+
+        // A second successful fold at a later clock reading advances the gauge
+        // to that reading and counts a second cycle. This one is a no-op fold
+        // (nothing new has sealed), which is the healthy steady state: the
+        // gauge must move for it, or a quiet tenant reads as a stopped fold.
+        let later_ns = now_ns + 7_000_000_000;
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                later_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold succeeds");
+        assert!(second.no_op, "nothing newly sealed between the two folds");
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 2);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 0);
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Metrics), later_ns);
+    }
+
+    /// The other half of the same claim (issue #1306): a fold that returns
+    /// `Err` counts exactly one failure and leaves the liveness gauge where
+    /// the last SUCCESS left it. Without this half, a gauge that advanced on
+    /// every call regardless of outcome would pass the success test above and
+    /// still report a fold failing every cycle as healthy.
+    #[tokio::test]
+    async fn failing_fold_counts_a_failure_and_leaves_the_gauge_where_it_was() {
+        // Fail the second HEAD PUT: the first fold establishes a real HEAD and
+        // a real gauge value, the second fold's CAS write fails. No other PUT
+        // key contains "HEAD".
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("head cas failure".into()))
+                .with_key_contains("HEAD")
+                .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let first_ns = now_at_seal(11);
+        publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            11,
+            first_ns - NS_PER_HOUR,
+        )
+        .await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                first_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold succeeds");
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 1);
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Metrics), first_ns);
+
+        let failing_ns = now_at_seal(13);
+        publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            13,
+            failing_ns - NS_PER_HOUR,
+        )
+        .await;
+        let err = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                failing_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect_err("the HEAD CAS fault must surface as an error");
+        assert!(matches!(err, CatalogError::Store(_)), "got {err:?}");
+
+        // The fault fired exactly once, so exactly one fold failed.
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Permanent), 1);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 1);
+        assert_eq!(
+            catalog.fold_cycles(Signal::Metrics),
+            1,
+            "the failing fold is not a cycle: the cycle count is still the one successful fold"
+        );
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
+            first_ns,
+            "a failing fold must not advance the liveness gauge, even though its now_ns is later"
+        );
+    }
+
+    /// A plain `store`, not `fetch_max`: the liveness gauge holds the stamp of
+    /// the last fold to FINISH, even when that stamp is older than the one the
+    /// slot already carried. This pins the semantics deliberately.
+    ///
+    /// The two calls below model out-of-order completion, which is the way one
+    /// signal's slot goes backwards with no clock anomaly at all. Each stamp
+    /// is the `now_ns` read before its fold began, and folds of one signal
+    /// overlap in the server (the scheduled loop for that signal re-reads the
+    /// clock per tenant while an on-demand fold for another tenant of the same
+    /// signal runs against the same `Catalog`), so a fold that started later
+    /// and finished sooner is overwritten by the slower one completing behind
+    /// it. Calling `fold(ahead)` then `fold(behind)` is that completion order.
+    /// An NTP step back produces the same store.
+    ///
+    /// Under `fetch_max` the second store would be dropped and the gauge would
+    /// stay at `ahead_ns`, which is the assertion that fails below. That is
+    /// the failure mode being rejected: `fetch_max` latches a forward step and
+    /// masks a later genuine stall with no bound on how long.
+    #[tokio::test]
+    async fn an_out_of_order_fold_completion_lowers_the_last_success_gauge() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let ahead_ns = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, ahead_ns - NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                ahead_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold stamped at the later reading");
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Metrics), ahead_ns);
+
+        let behind_ns = ahead_ns - 60_000_000_000;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                behind_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold stamped at the earlier reading finishes second");
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
+            behind_ns,
+            "the gauge holds the stamp of the last fold to finish, even an older one"
+        );
+        assert_eq!(
+            catalog.fold_cycles(Signal::Metrics),
+            2,
+            "both folds are still cycles"
+        );
+    }
+
+    /// Per-signal keying (issue #1306): folding one signal moves that signal's
+    /// counters and gauge and leaves every other signal's exactly where they
+    /// were. Without this, the three families are process-global and one dead
+    /// fold loop out of three stays invisible behind the two that still run.
+    ///
+    /// `Signal::Profiles` is asserted alongside the two other folded signals
+    /// because the slot table covers every `Signal` variant, not just the
+    /// three the server folds, and an off-by-one there would alias two of them
+    /// onto one slot.
+    #[tokio::test]
+    async fn folding_one_signal_leaves_the_other_signals_untouched() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now_ns = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_ns - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Logs, Uuid::new_v4(), now_ns, &[], None)
+            .await
+            .expect("the logs fold succeeds");
+
+        assert_eq!(catalog.fold_cycles(Signal::Logs), 1);
+        assert_eq!(catalog.fold_failures(Signal::Logs), 0);
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Logs), now_ns);
+
+        for untouched in [Signal::Metrics, Signal::Spans, Signal::Profiles] {
+            assert_eq!(
+                catalog.fold_cycles(untouched),
+                0,
+                "{untouched:?} was never folded, so its cycle count is still 0"
+            );
+            assert_eq!(
+                catalog.fold_failures(untouched),
+                0,
+                "{untouched:?} was never folded, so its failure count is still 0"
+            );
+            assert_eq!(
+                catalog.fold_last_success_unix_ns(untouched),
+                0,
+                "{untouched:?} was never folded, so its gauge is still the zero sentinel"
+            );
+        }
+    }
+
+    /// The failure half of the per-signal claim: a fold that fails for one
+    /// signal leaves every other signal's failure counter at zero, so the
+    /// `RavelCatalogFoldFailing` rule attributes the failure to the signal
+    /// that produced it rather than to the process.
+    #[tokio::test]
+    async fn a_failing_fold_charges_only_its_own_signal() {
+        // Fail the first HEAD PUT. No other PUT key contains "HEAD".
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("head cas failure".into()))
+                .with_key_contains("HEAD")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        // No segment is published: a fold over an empty prefix still advances
+        // its watermark over the hours that held nothing and writes a first
+        // HEAD, which is the PUT the fault below intercepts.
+        let now_ns = now_at_seal(11);
+        let err = catalog
+            .fold(&tenant(), Signal::Spans, Uuid::new_v4(), now_ns, &[], None)
+            .await
+            .expect_err("the HEAD CAS fault must surface as an error");
+        assert!(matches!(err, CatalogError::Store(_)), "got {err:?}");
+
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Permanent), 1);
+        assert_eq!(catalog.fold_failures(Signal::Spans), 1);
+        for untouched in [Signal::Metrics, Signal::Logs] {
+            assert_eq!(
+                catalog.fold_failures(untouched),
+                0,
+                "{untouched:?} did not fail: only the folded signal is charged"
+            );
+            assert_eq!(catalog.fold_cycles(untouched), 0);
+        }
     }
 }

@@ -241,6 +241,7 @@ fn promql_app(
         build_resolver(tokens, false),
         None,
         engine_config,
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),
@@ -266,6 +267,7 @@ fn sql_app(
         build_resolver(tokens, false),
         None,
         engine_config,
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         ravel_server::query::DEFAULT_MAX_QUERY_BYTES,
         ravel_server::query::DEFAULT_MAX_TENANT_BYTES,
         false,
@@ -274,6 +276,7 @@ fn sql_app(
         )),
         QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
         None,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     )
     .expect("build_sql_state");
     ravel_server::sql::router(state)
@@ -532,6 +535,9 @@ async fn post_compaction_bits(
                 min_tokens: vec![],
                 now_ns: seal_now_ns,
                 deadline: Duration::from_secs(30),
+                row_window: false,
+                max_rows: None,
+                budgets: None,
             },
         )
         .await

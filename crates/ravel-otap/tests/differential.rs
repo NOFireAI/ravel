@@ -1027,8 +1027,16 @@ fn build_otap_summary_batch(
 
 #[allow(clippy::expect_used)]
 fn assert_histogram_paths_agree(workload: &[WorkloadHistogramMetric]) {
+    assert_histogram_paths_agree_with_limits(workload, &IngestLimits::default());
+}
+
+#[allow(clippy::expect_used)]
+fn assert_histogram_paths_agree_with_limits(
+    workload: &[WorkloadHistogramMetric],
+    limits: &IngestLimits,
+) {
     let tenant = TenantId::new("acme");
-    let limits = IngestLimits::default();
+    let limits = limits.clone();
 
     let otlp_out = normalize_metrics(
         &tenant,
@@ -1053,15 +1061,12 @@ fn assert_histogram_paths_agree(workload: &[WorkloadHistogramMetric]) {
     // Compare the rejection classes at the shared admission layer
     // (`*_with_exemplars`), not the wrapper outputs. All three wrappers discard
     // the exemplars the cap admits (nothing stores them yet) and count that
-    // discard into `HistogramExemplarsDropped`. They still disagree at the
-    // too-many-points return, where OTLP and Remote Write count the request's
-    // exemplars and OTAP cannot, having decoded none. That wrapper bookkeeping
-    // is not an admission decision;
-    // the ADR-0011 parity that matters is that the two paths make the SAME cap
-    // decisions, which is what the `_with_exemplars` outputs expose. Comparing
-    // here is future-proof: it stays correct whether or not either wrapper
-    // counts its discards, and it still asserts the cap-level
-    // `HistogramExemplarsDropped` counts agree byte for byte.
+    // discard into `HistogramExemplarsDropped`. Wrapper bookkeeping is not an
+    // admission decision; the ADR-0011 parity that matters is that the two
+    // paths make the SAME cap decisions, which is what the `_with_exemplars`
+    // outputs expose. Comparing here is future-proof: it stays correct whether
+    // or not either wrapper counts its discards, and it still asserts the
+    // cap-level `HistogramExemplarsDropped` counts agree byte for byte.
     let otlp_full = normalize_metrics_with_exemplars(
         &tenant,
         build_otlp_histogram_request(workload),
@@ -1301,6 +1306,248 @@ fn histogram_stale_marker_agrees() {
         temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
         points: vec![point],
     }]);
+}
+
+/// One classic histogram point with `bounds` ascending finite bounds and a
+/// matching `bounds + 1` bucket counts, so it clears the three validity checks
+/// that precede the bucket cap.
+fn wide_histogram_workload_point(bounds: usize) -> WorkloadHistogramPoint {
+    WorkloadHistogramPoint {
+        ts_offset_ns: 0,
+        count: bounds as u64 + 1,
+        sum: Some(1.0),
+        bucket_counts: vec![1; bounds + 1],
+        explicit_bounds: (0..bounds).map(|i| i as f64).collect(),
+        flags: 0,
+        min: None,
+        max: None,
+        exemplar_count: 0,
+        attrs: vec![],
+    }
+}
+
+/// Run the OTAP path alone (`encode -> decode -> normalize_decoded`) so a test
+/// can pin the exact rejection variant the surface returns, not only that it
+/// agrees with OTLP.
+#[allow(clippy::expect_used)]
+fn otap_histogram_normalize(
+    workload: &[WorkloadHistogramMetric],
+    limits: &IngestLimits,
+) -> NormalizeOutput {
+    let tenant = TenantId::new("acme");
+    let mut encoder =
+        MetricsStreamEncoder::new("differential-histogram-bound").expect("new encoder");
+    let raw_batch = build_otap_histogram_batch(workload, &mut encoder, 0);
+    let mut state = StreamState::new(StreamConfig::default());
+    let decoded = state.decode(raw_batch).expect("decode otap batch");
+    normalize_decoded(&tenant, &decoded, limits, INGEST_TS_NS)
+}
+
+/// A single classic histogram whose bound list is one over `max_histogram_buckets`
+/// is rejected on both surfaces with the identical `TooManyHistogramBuckets`.
+/// The OTAP output pins the variant's `bounds`/`max` fields exactly, and the
+/// rejected count stays at one wire data point.
+#[test]
+fn histogram_over_bucket_cap_agrees() {
+    let limits = IngestLimits::default();
+    let over = limits.max_histogram_buckets + 1;
+    let workload = vec![WorkloadHistogramMetric {
+        name: "latency".to_string(),
+        temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+        points: vec![wide_histogram_workload_point(over)],
+    }];
+
+    let otap_out = otap_histogram_normalize(&workload, &limits);
+    assert!(otap_out.points.is_empty());
+    assert_eq!(
+        otap_out.rejected,
+        vec![Rejection::TooManyHistogramBuckets {
+            bounds: over,
+            max: limits.max_histogram_buckets,
+        }]
+    );
+    // One OTAP data point in, one rejected data point reported out.
+    let rejected: usize = otap_out.rejected.iter().map(|r| r.rejected_count()).sum();
+    assert_eq!(rejected, 1);
+
+    assert_histogram_paths_agree_with_limits(&workload, &limits);
+}
+
+/// A single at-cap histogram (exactly `max_histogram_buckets` bounds) is
+/// admitted and produces `bounds + 3` points, the same figure OTLP pins: one
+/// `_bucket` per bound, the `+Inf` bucket, `_sum`, and `_count`.
+#[test]
+fn histogram_at_bucket_cap_is_admitted_with_pinned_point_count() {
+    let limits = IngestLimits::default();
+    let workload = vec![WorkloadHistogramMetric {
+        name: "latency".to_string(),
+        temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+        points: vec![wide_histogram_workload_point(limits.max_histogram_buckets)],
+    }];
+
+    let otap_out = otap_histogram_normalize(&workload, &limits);
+    assert_eq!(otap_out.rejected, vec![]);
+    assert_eq!(otap_out.points.len(), 163);
+    assert_eq!(otap_out.points.len(), limits.max_histogram_buckets + 3);
+
+    assert_histogram_paths_agree_with_limits(&workload, &limits);
+}
+
+/// Ten classic histograms of 20 bounds each explode into 230 points, over a
+/// `max_data_points_per_request` of 100. Both surfaces reject the whole request
+/// with `TooManyExplodedPoints`, and the rejected count stays in wire data
+/// points (ADR-0016), not exploded points.
+#[test]
+fn histogram_over_exploded_total_agrees() {
+    let limits = IngestLimits {
+        max_data_points_per_request: 100,
+        ..IngestLimits::default()
+    };
+    let workload = vec![WorkloadHistogramMetric {
+        name: "latency".to_string(),
+        temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+        points: (0..10).map(|_| wide_histogram_workload_point(20)).collect(),
+    }];
+
+    let otap_out = otap_histogram_normalize(&workload, &limits);
+    assert!(otap_out.points.is_empty());
+    assert_eq!(
+        otap_out.rejected,
+        // 20 bounds + `+Inf` + `_sum` + `_count` = 23 points each, ten points.
+        vec![Rejection::TooManyExplodedPoints {
+            exploded: 230,
+            count: 10,
+            max: 100,
+        }]
+    );
+    let rejected: usize = otap_out.rejected.iter().map(|r| r.rejected_count()).sum();
+    assert_eq!(rejected, 10);
+
+    assert_histogram_paths_agree_with_limits(&workload, &limits);
+}
+
+/// The exploded-points rejection counts the exemplars it drops, on BOTH
+/// surfaces, for the same input.
+///
+/// This is the case `histogram_over_exploded_total_agrees` cannot reach: its
+/// points carry `exemplar_count: 0`, so the suite never exercised a rejected
+/// request that was carrying exemplars. OTLP counts them at both early returns
+/// (ADR-0047 decision 2: the dropped-data counter must not read zero while data
+/// is lost), and OTAP decodes exemplars only BELOW the exploded check, so it
+/// counts them from the columnar row counts instead of from a decode.
+///
+/// Without that row count the two surfaces diverge on the same overload input,
+/// an OTAP-fronted deployment under-reporting dropped histogram exemplars
+/// against an OTLP-fronted one. Pinning it here is what stops the decode/check
+/// ordering regressing that back into a silent difference.
+///
+/// Flip to watch it fail: have `whole_request_rejection` ignore its
+/// `dropped_exemplars` argument. The OTAP rejection then carries only
+/// `TooManyExplodedPoints` and the exemplar assertion below fails.
+#[test]
+fn an_over_exploded_request_counts_its_dropped_exemplars_on_both_surfaces() {
+    let limits = IngestLimits {
+        max_data_points_per_request: 100,
+        ..IngestLimits::default()
+    };
+    // Ten points, each 20 bounds and carrying two exemplars: over the
+    // post-explosion total, and carrying data the rejection drops.
+    let workload = vec![WorkloadHistogramMetric {
+        name: "latency".to_string(),
+        temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+        points: (0..10)
+            .map(|_| {
+                let mut p = wide_histogram_workload_point(20);
+                p.exemplar_count = 2;
+                p
+            })
+            .collect(),
+    }];
+
+    let otap_out = otap_histogram_normalize(&workload, &limits);
+    assert!(otap_out.points.is_empty(), "the whole request is rejected");
+
+    let dropped: usize = otap_out
+        .rejected
+        .iter()
+        .filter_map(|r| match r {
+            Rejection::HistogramExemplarsDropped { count } => Some(*count),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        dropped, 20,
+        "ten points of two exemplars each must be counted as dropped, not lost \
+         silently: got {:?}",
+        otap_out.rejected
+    );
+
+    // And the two surfaces still return the same thing for this input, which
+    // is the property the reorder had to preserve.
+    assert_histogram_paths_agree_with_limits(&workload, &limits);
+}
+
+/// The wire-count rejection counts its dropped exemplars too, not only the
+/// exploded one.
+///
+/// Both OTAP early returns now carry the count, and only the exploded path was
+/// pinned. This sizes the request so the WIRE count trips first: 101 points
+/// against a limit of 100, each carrying one exemplar, so the rejection is
+/// `TooManyDataPoints` rather than `TooManyExplodedPoints` and the exemplars
+/// are still counted.
+///
+/// Flip to watch it fail: pass `0` instead of `dropped_exemplar_rows(batch)`
+/// at the `TooManyDataPoints` return. The rejection then carries only the
+/// count variant and the exemplar assertion below fails.
+#[test]
+fn an_over_wire_count_request_counts_its_dropped_exemplars() {
+    let limits = IngestLimits {
+        max_data_points_per_request: 100,
+        ..IngestLimits::default()
+    };
+    // 101 single-bound points: over the wire count before any explosion is
+    // considered, each carrying one exemplar.
+    let workload = vec![WorkloadHistogramMetric {
+        name: "latency".to_string(),
+        temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+        points: (0..101)
+            .map(|_| {
+                let mut p = wide_histogram_workload_point(1);
+                p.exemplar_count = 1;
+                p
+            })
+            .collect(),
+    }];
+
+    let otap_out = otap_histogram_normalize(&workload, &limits);
+    assert!(otap_out.points.is_empty(), "the whole request is rejected");
+    assert!(
+        otap_out.rejected.iter().any(|r| matches!(
+            r,
+            Rejection::TooManyDataPoints {
+                count: 101,
+                max: 100
+            }
+        )),
+        "the wire count must trip before the exploded one: {:?}",
+        otap_out.rejected
+    );
+
+    let dropped: usize = otap_out
+        .rejected
+        .iter()
+        .filter_map(|r| match r {
+            Rejection::HistogramExemplarsDropped { count } => Some(*count),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        dropped, 101,
+        "the wire-count return drops 101 exemplars and must count them: {:?}",
+        otap_out.rejected
+    );
+
+    assert_histogram_paths_agree_with_limits(&workload, &limits);
 }
 
 #[test]

@@ -7,6 +7,29 @@ reader accepts: ADR-0892 deleted the version-3 reader, and version 2 (which
 added the footer's compaction-identity fields) and version 1 (the format-only
 initial release) were retired the same way before it.
 
+<!-- reader-supported-versions: ravel_logseg = 4 -->
+<!-- Checked against ravel_logseg::footer::SUPPORTED_VERSIONS by
+     scripts/check_format_version_docs.py; keep it in step with the current
+     trailer version above when the reader window changes. -->
+
+**Upgrade and rollback posture at HEAD.** A trailer-version bump is a
+non-rollbackable, forward-only data-migration event: the reader admits exactly
+one version, so once any object at the new version exists, a build that predates
+the bump cannot read it. The irreversible step is the first write at the new
+version; before it, a rollback to the earlier build is safe. The N/N-1 window
+described below is staged for a future format-lifecycle activation milestone,
+distinct from the software's first public release at 0.9.0 and not yet reached
+(ADR-0531, proposed).
+
+RLOG is the one format with a released two-version reader behind it, so read
+the paragraph above as the posture at HEAD and not as a description of every
+bump this format has had. 0.11.0 shipped a reader accepting v3 and v4 while
+writers emitted v4, and a v3 store upgrading to 0.11.0 kept its objects
+readable. ADR-0892 closed that window in 0.12.0 and characterises it as an
+unretired predecessor reader rather than an N/N-1 policy in force. The
+irreversible boundary for a v3 store was 0.11.0 to 0.12.0, not 0.10.x to
+0.11.0.
+
 Version 4 changed the BLOCKS layout, deleted the per-block header, and
 redefined the SKIP_IDX level-0 block crc, so it was a versioned change rather
 than the additive kind ADR-0029's carve-out excepts -- whatever PAGE_DIR's own
@@ -23,12 +46,15 @@ v3.
 bulk data-object format. The supported-version window is single-sourced as
 `ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer, reader gate,
 `audit-versions`, `migrate`, and the compactor's output-version constant all
-read it. Until first public release the window holds exactly one version
-(ADR-0027 decision 7, ADR-0892): each bump deletes the previous version's
-reader in the same change, and a pre-1.0.0 development store holding older
-objects is wiped or re-ingested. The N/N-1 window ADR-0066 describes, rolled
-out readers-before-writers -- a release writing N+1 requires a fleet already
-reading N+1 -- opens at, and only at, that release.
+read it. Until the format-lifecycle activation milestone (ADR-0531, proposed:
+distinct from the software's 0.9.0 first public release and not yet reached) the
+window holds exactly one version (ADR-0027 decision 7, ADR-0892): a bump deletes
+the previous version's reader, and a pre-1.0.0 development store holding older
+objects is wiped or re-ingested. RLOG v3 to v4 in 0.11.0 is the one bump that
+did not do this in the same change; ADR-0892 removed the v3 reader in 0.12.0
+instead. The N/N-1 window ADR-0066 describes, rolled out readers-before-writers
+-- a release writing N+1 requires a fleet already reading N+1 -- opens at, and
+only at, that release.
 
 RLOG compaction already decodes every input's records and re-encodes them from
 scratch, so once the window is two versions wide an old-version object is
@@ -632,6 +658,17 @@ stat range cannot overlap a queried range holds no matching row. Under version
 2 the stats bounded the raw columnar occurrences instead, which could exclude
 the block holding the record a range query wanted; that is the defect version 3
 fixes, and it is why a v2 object cannot be read as a v3 one.
+
+An f64 range test carries one further condition: a reader must decline to
+prune any block whose stat has `has_nan` set, unconditionally, rather than
+testing the query arm against that stat's `[min, max]` as usual. `min`/`max`
+bound only the non-NaN resolved values (see above), but under the `total_cmp`
+order this format's f64 stats and range predicates share, a `+NaN` value
+sorts above every finite value and a `-NaN` value sorts below every finite
+value, so a NaN row in the block can satisfy a half-open arm the finite
+bounds alone would rule out. `has_nan` does not record which sign was
+present, so a reader cannot narrow the decline to just the arm shape that
+sign would satisfy; it must decline pruning on the whole stat instead.
 
 ### null_count at both levels (trailer version 3, normative)
 

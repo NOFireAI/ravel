@@ -13,25 +13,32 @@
 //! ## Exactness status (read this before trusting the numbers)
 //!
 //! ADR-0021 requires mirroring Prometheus' float algorithms operation-for-
-//! operation, verified by the differential gate. That differential gate
-//! cannot run yet: no native-histogram sample can reach Ravel's evaluator,
-//! because the query read path and the ingest path are still f64-only (see
-//! the `histogram_native` corpus header). Every
-//! algorithm here is therefore a structural port of Prometheus'
-//! `model/histogram` and `promql/quantile.go`/`functions.go`, checked
-//! against hand-computed fixtures rather than a live Prometheus. Two known
-//! residues, to be resolved to ADR-0025 allowlist entries or exact ports once
-//! the gate exists:
+//! operation, verified by the differential gate. That gate now runs: native
+//! histograms flow ingest -> storage -> query -> evaluator, and the
+//! `histogram_native` corpus diffs 32 native-histogram cells against the
+//! pinned Prometheus binary (its 33rd cell pins a deliberate divergence, a
+//! refused matrix selector), with the `binop.txt` histogram cells covering
+//! the binary operators on top. Algorithms without a corpus cell to cover them are
+//! still structural ports of Prometheus' `model/histogram` and
+//! `promql/quantile.go`/`functions.go` checked against hand-computed fixtures.
+//! One known residue, to be resolved to an ADR-0025 allowlist entry or an
+//! exact port:
 //!
 //! * `bucket_bound` computes `2^(idx * 2^-scale)` arithmetically. Prometheus
 //!   uses hard-coded `exponentialBounds` tables for `scale > 0` for bit-exact
 //!   bounds; the arithmetic form may differ by a ULP for fractional
-//!   exponents. `scale <= 0` bounds are exact powers of two and match.
-//! * Differing zero-thresholds between two operands of `add`/`sub` are not
-//!   reconciled (Prometheus' `reconcileZeroBuckets`); operands are required to
-//!   share a zero-threshold. Every native-histogram code path that combines histograms
-//!   (rate windows, aggregation groups) operates on one producer's series, so
-//!   this holds in practice, but it is not the general Prometheus behavior.
+//!   exponents. `scale <= 0` bounds are exact powers of two and match. No
+//!   corpus cell renders a `scale > 0` histogram's bucket bounds: the only
+//!   schema-1 samples (`diff_native_hist_schema`, samples 13 to 26) appear
+//!   under `resets` and `histogram_count(rate(...))`, which reduce to floats.
+//!
+//! Differing zero-thresholds between two exponential operands of `add`/`sub`
+//! ARE reconciled, matching Prometheus: [`FloatHistogram::combine`] widens the
+//! narrower zero bucket to the larger threshold and folds the regular buckets
+//! it swallows into the zero count (`reconcileZeroBuckets`), before merging the
+//! remaining buckets. The corpus does not exercise it (the dataset's histogram
+//! series carry a uniform zero bucket), so the port rests on hand-computed
+//! fixtures.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -110,6 +117,35 @@ impl FloatHistogram {
         self.scale == CUSTOM_BUCKETS_SCALE
     }
 
+    /// Whether two custom-bucket histograms carry the same boundaries,
+    /// Prometheus' `FloatBucketsMatch` over `CustomValues`. Only meaningful
+    /// when both sides use custom buckets; a caller combining two histograms
+    /// checks the schema family first (an exponential/custom mix is
+    /// Prometheus' `ErrHistogramsIncompatibleSchema`) and then uses this to
+    /// take the fast, index-aligned merge path when the bounds match. Differing
+    /// custom bounds are NOT an error in v3.13.1: they are reconciled onto the
+    /// intersection of the two boundary sets (see
+    /// [`FloatHistogram::combine_custom_reconciled`]).
+    pub fn custom_bounds_match(&self, other: &FloatHistogram) -> bool {
+        float_buckets_match(&self.custom_values, &other.custom_values)
+    }
+
+    /// Prometheus' `adjustCounterReset`, reduced to the one bit of its result
+    /// this crate consumes: whether the two operands of a histogram `+`/`-`
+    /// carry conflicting counter-reset hints (one `CounterReset`, the other
+    /// `NotCounterReset`). Prometheus also rewrites the receiver's hint and
+    /// re-labels a `Sub` result as a gauge; both are elided here because
+    /// nothing downstream of a binary operator reads `counter_reset_hint` (it
+    /// is not part of the query response, and Ravel's subquery grid is
+    /// float-only), so only the collision flag has an observable effect (the
+    /// caller raises one warning for it).
+    fn counter_reset_collision(&self, other: &FloatHistogram) -> bool {
+        matches!(
+            (self.counter_reset_hint, other.counter_reset_hint),
+            (ResetHint::Yes, ResetHint::No) | (ResetHint::No, ResetHint::Yes)
+        )
+    }
+
     /// Multiply every population (buckets, zero, count) and the sum by
     /// `factor`, in place: Prometheus' `FloatHistogram.Mul`, used to apply
     /// rate's per-second / extrapolation factor and `avg`'s `1/n`. Order of
@@ -131,14 +167,36 @@ impl FloatHistogram {
     /// field for field, exactly as Prometheus' `Div` does. This is NOT
     /// `mul(1/scalar)`: for a non-power-of-two divisor the two round
     /// differently, and only the direct division matches the pinned binary.
-    /// Ravel's only callers pass a positive scalar (`avg`'s group size,
-    /// `irate`'s sampled interval), so Prometheus' `scalar == 0`
-    /// bucket-clearing and `scalar < 0` gauge-hint special cases are
-    /// unreachable and not reproduced here.
+    ///
+    /// `histogram / float` takes its divisor from query text, so zero and
+    /// negative divisors are both reachable:
+    ///
+    /// * `scalar == 0` (either sign of zero, as in Go): count, sum and the
+    ///   zero bucket become an infinity and both bucket vectors are cleared,
+    ///   spans included. Verified against the pinned v3.13.1 binary, which
+    ///   answers `diff_native_hist / 0` with the zero bucket alone at `+Inf`
+    ///   and no positive buckets at all.
+    /// * `scalar < 0`: every population is negated as the plain division
+    ///   gives, with no other special case. The pinned binary's answer for
+    ///   `diff_native_hist / -2` is the negated buckets; its rendering drops
+    ///   the zero bucket there because a non-positive zero count is not
+    ///   emitted at all (see [`FloatHistogram::all_buckets`]), not because
+    ///   `div` treats it specially. Prometheus also re-labels such a result as
+    ///   a gauge internally; `counter_reset_hint` is left alone here because
+    ///   nothing downstream of a binary operator reads it (the hint is not
+    ///   part of the query response and Ravel's subquery grid is float-only),
+    ///   so there is no oracle for it.
     pub fn div(&mut self, scalar: f64) {
         self.zero_count /= scalar;
         self.count /= scalar;
         self.sum /= scalar;
+        if scalar == 0.0 {
+            self.positive_spans.clear();
+            self.positive_buckets.clear();
+            self.negative_spans.clear();
+            self.negative_buckets.clear();
+            return;
+        }
         for b in &mut self.positive_buckets {
             *b /= scalar;
         }
@@ -238,7 +296,8 @@ impl FloatHistogram {
     /// ascending order, exactly the order Prometheus' `AllFloatBucketIterator`
     /// yields: negative buckets most-negative first, the zero bucket, then
     /// positive buckets. Empty buckets are omitted (callers skip zero-count
-    /// buckets anyway); the zero bucket is emitted only when it has count.
+    /// buckets anyway); the zero bucket is emitted only when its count is
+    /// strictly positive.
     pub fn all_buckets(&self) -> Vec<Bucket> {
         let mut out = Vec::new();
 
@@ -253,8 +312,12 @@ impl FloatHistogram {
             });
         }
 
-        // Zero bucket.
-        if self.zero_count != 0.0 {
+        // Zero bucket, emitted only for a strictly positive count, as
+        // Prometheus' `allFloatBucketIterator` does. A zero count of exactly
+        // zero has nothing to report; a negative one (reachable since `h - h`
+        // and `h / <negative>` became query-expressible) is omitted too, which
+        // is what the pinned binary answers for `diff_native_hist / -2`.
+        if self.zero_count > 0.0 {
             out.push(Bucket {
                 lower: -self.zero_threshold,
                 upper: self.zero_threshold,
@@ -334,25 +397,79 @@ impl FloatHistogram {
         }
     }
 
-    /// `self - other`, in place, for the two histograms sharing a schema and
-    /// zero-threshold (Prometheus' `FloatHistogram.Sub` for the aligned case).
-    /// Rebuilds spans from the merged index maps; the resulting per-bucket
-    /// values are the exact float differences (`self_count - other_count` per
-    /// index), which is what every downstream value comparison reads.
-    pub fn sub_assign(&mut self, other: &FloatHistogram) {
-        self.combine(other, -1.0);
+    /// `self - other`, in place, for two exponential histograms sharing a
+    /// schema, or two custom-bucket histograms sharing their boundaries
+    /// (Prometheus' `FloatHistogram.Sub` for the aligned case). Differing zero
+    /// thresholds between two exponential operands are reconciled first (see
+    /// [`Self::combine`]). Rebuilds spans from the merged index maps; the
+    /// resulting per-bucket values are the exact float differences
+    /// (`self_count - other_count` per index), which is what every downstream
+    /// value comparison reads. Returns whether the two operands carried
+    /// conflicting counter-reset hints.
+    pub fn sub_assign(&mut self, other: &FloatHistogram) -> bool {
+        self.combine(other, -1.0)
     }
 
-    /// `self + other`, in place (Prometheus' `FloatHistogram.Add`).
-    pub fn add_assign(&mut self, other: &FloatHistogram) {
-        self.combine(other, 1.0);
+    /// `self + other`, in place (Prometheus' `FloatHistogram.Add`). Returns
+    /// whether the two operands carried conflicting counter-reset hints.
+    pub fn add_assign(&mut self, other: &FloatHistogram) -> bool {
+        self.combine(other, 1.0)
     }
 
-    fn combine(&mut self, other: &FloatHistogram, sign: f64) {
-        self.zero_count += sign * other.zero_count;
+    /// The aligned merge behind [`Self::add_assign`]/[`Self::sub_assign`]:
+    /// `self + sign*other` in place, for a pair the caller has already brought
+    /// to a common schema (exponential) or verified shares custom boundaries.
+    /// Returns the counter-reset collision flag.
+    ///
+    /// For exponential operands this first runs [`Self::reconcile_zero_buckets`]
+    /// so a differing zero threshold widens to the larger of the two and the
+    /// buckets it swallows fold into the zero count, then drops any merged
+    /// bucket that now lies WHOLLY inside that threshold (Prometheus'
+    /// `addBuckets` passes the zero threshold and excludes such buckets). A
+    /// bucket that straddles the threshold is kept: only a reconcile snaps the
+    /// threshold onto a bucket boundary, and it does not run when the two
+    /// thresholds already match. Custom-bucket operands carry no zero bucket,
+    /// so that step is skipped.
+    fn combine(&mut self, other: &FloatHistogram, sign: f64) -> bool {
+        let collision = self.counter_reset_collision(other);
+
+        if self.uses_custom_buckets() {
+            // NHCB carry no zero threshold, so there is nothing to reconcile and
+            // no threshold to filter the merged buckets against. Prometheus'
+            // custom-bucket Add/Sub merges only the positive side because its
+            // `Histogram.Validate` rejects an NHCB carrying a zero count or
+            // negative buckets; Ravel's ingest admits both, and `count`/`sum`
+            // below take the whole of `other`, so every side merges here or the
+            // other operand's counts would vanish from the buckets while still
+            // showing in the total.
+            self.zero_count += sign * other.zero_count;
+            self.count += sign * other.count;
+            self.sum += sign * other.sum;
+            let pos = combine_side(
+                &self.positive_index_map(),
+                &other.positive_index_map(),
+                sign,
+            );
+            let neg = combine_side(
+                &self.negative_index_map(),
+                &other.negative_index_map(),
+                sign,
+            );
+            let (ps, pb) = rebuild_side(&pos);
+            let (ns, nb) = rebuild_side(&neg);
+            self.positive_spans = ps;
+            self.positive_buckets = pb;
+            self.negative_spans = ns;
+            self.negative_buckets = nb;
+            return collision;
+        }
+
+        let other_zero = self.reconcile_zero_buckets(other);
+        self.zero_count += sign * other_zero;
         self.count += sign * other.count;
         self.sum += sign * other.sum;
 
+        let threshold = self.zero_threshold;
         let pos = combine_side(
             &self.positive_index_map(),
             &other.positive_index_map(),
@@ -363,6 +480,191 @@ impl FloatHistogram {
             &other.negative_index_map(),
             sign,
         );
+        // A bucket lying wholly inside the (reconciled) zero threshold has
+        // already been folded into the zero count on both sides; drop it from
+        // the regular merge, matching Prometheus' `addBuckets`. The test is on
+        // the bucket's OUTER edge, `bucket_bound(idx)`: a reconcile snaps the
+        // threshold onto a bucket boundary, so there the outer test and the
+        // inner one agree, but `reconcile_zero_buckets` returns early when the
+        // two thresholds are already equal, and that threshold need not sit on
+        // a boundary. An inner-edge test would then delete a bucket that merely
+        // straddles the threshold, along with a count nothing folded anywhere.
+        // A NaN threshold folds nothing either, so it drops nothing.
+        let keep = |idx: i32| threshold.is_nan() || self.bucket_bound(idx) > threshold;
+        let pos: BTreeMap<i32, f64> = pos.into_iter().filter(|&(idx, _)| keep(idx)).collect();
+        let neg: BTreeMap<i32, f64> = neg.into_iter().filter(|&(idx, _)| keep(idx)).collect();
+        let (ps, pb) = rebuild_side(&pos);
+        let (ns, nb) = rebuild_side(&neg);
+        self.positive_spans = ps;
+        self.positive_buckets = pb;
+        self.negative_spans = ns;
+        self.negative_buckets = nb;
+        collision
+    }
+
+    /// `self + sign*other` for two custom-bucket histograms whose boundaries
+    /// differ, Prometheus' `addCustomBucketsWithMismatches`: both operands are
+    /// re-bucketed onto the intersection of their two boundary sets (every
+    /// source bucket folds into the intersected bucket whose upper bound is the
+    /// first at or above the source bucket's own), then merged. The receiver
+    /// takes the intersected boundaries and the merged buckets. Returns the
+    /// counter-reset collision flag.
+    ///
+    /// Prometheus tracks Kahan compensation buckets alongside the counts; Ravel
+    /// carries none, so this is the same fold with the sign applied to
+    /// `other`'s contributions.
+    pub fn combine_custom_reconciled(&mut self, other: &FloatHistogram, sign: f64) -> bool {
+        let collision = self.counter_reset_collision(other);
+        // Every side merges, for the reason `combine`'s equal-bounds branch
+        // gives: `count` and `sum` take the whole of `other`, so the zero
+        // count and the negative side (both admitted by Ravel's ingest even
+        // though Prometheus rejects them on an NHCB) must fold in too, or the
+        // totals disagree with the buckets.
+        self.zero_count += sign * other.zero_count;
+        self.count += sign * other.count;
+        self.sum += sign * other.sum;
+
+        let intersected = intersect_custom_bucket_bounds(&self.custom_values, &other.custom_values);
+        let merged = add_custom_buckets_with_mismatches(
+            &self.positive_index_map(),
+            &self.custom_values,
+            &other.positive_index_map(),
+            &other.custom_values,
+            sign,
+            &intersected,
+        );
+        let merged_neg = add_custom_buckets_with_mismatches(
+            &self.negative_index_map(),
+            &self.custom_values,
+            &other.negative_index_map(),
+            &other.custom_values,
+            sign,
+            &intersected,
+        );
+        let (ps, pb) = rebuild_side(&merged);
+        let (ns, nb) = rebuild_side(&merged_neg);
+        self.positive_spans = ps;
+        self.positive_buckets = pb;
+        self.negative_spans = ns;
+        self.negative_buckets = nb;
+        self.custom_values = intersected;
+        collision
+    }
+
+    /// Prometheus' `reconcileZeroBuckets`, in place on the receiver: widen the
+    /// narrower of the two zero thresholds to match the larger, folding the
+    /// regular buckets it now covers into the zero count. Only the receiver is
+    /// mutated (its zero count, zero threshold, and trimmed buckets); the
+    /// return value is `other`'s zero count re-derived at the reconciled
+    /// threshold, which the caller adds with the operation's sign. A no-op fast
+    /// path when the thresholds already match, so equal-threshold operands
+    /// (every one the corpus carries) keep their exact prior behavior.
+    fn reconcile_zero_buckets(&mut self, other: &FloatHistogram) -> f64 {
+        // A NaN threshold reaches here from ingest: neither the remote-write nor
+        // the OTLP normalizer validates the field and the segment writer
+        // round-trips the raw bits. It compares unequal to everything including
+        // itself, so the loop below would spin forever (its two `>` tests are
+        // both false, so neither side ever moves) and hang the query thread.
+        // Neither side can be widened onto a threshold that orders against
+        // nothing, so leave both operands as they are.
+        if self.zero_threshold.is_nan() || other.zero_threshold.is_nan() {
+            return other.zero_count;
+        }
+        let mut other_zero_count = other.zero_count;
+        let mut other_zero_threshold = other.zero_threshold;
+        while other_zero_threshold != self.zero_threshold {
+            if self.zero_threshold > other_zero_threshold {
+                let (count, threshold) = other.zero_count_for_larger_threshold(self.zero_threshold);
+                other_zero_count = count;
+                other_zero_threshold = threshold;
+            }
+            if other_zero_threshold > self.zero_threshold {
+                let (count, threshold) = self.zero_count_for_larger_threshold(other_zero_threshold);
+                self.zero_count = count;
+                self.zero_threshold = threshold;
+                self.trim_buckets_in_zero_bucket();
+            }
+        }
+        other_zero_count
+    }
+
+    /// Prometheus' `zeroCountForLargerThreshold`: the zero count this histogram
+    /// would carry if its zero threshold were widened to `larger`, together
+    /// with the threshold snapped outward to a bucket boundary so no regular
+    /// bucket straddles it. Walks the positive then negative buckets outward
+    /// from zero, folding every bucket fully inside the threshold into the
+    /// count; a bucket the threshold cuts through pushes the threshold out to
+    /// that bucket's far edge and the walk restarts, so the returned threshold
+    /// always lands on a boundary at or beyond `larger`. Pure: `self` is not
+    /// modified.
+    fn zero_count_for_larger_threshold(&self, larger: f64) -> (f64, f64) {
+        if larger <= self.zero_threshold {
+            return (self.zero_count, self.zero_threshold);
+        }
+        let positive = self.positive_index_map();
+        let negative = self.negative_index_map();
+        let mut threshold = larger;
+        loop {
+            let mut count = self.zero_count;
+            let mut restarted = false;
+            // Positive side, ascending index = ascending bound = outward from
+            // zero. Bucket `idx` spans (bound(idx-1), bound(idx)].
+            for (&idx, &c) in &positive {
+                let lower = self.bucket_bound(idx - 1);
+                if lower >= threshold {
+                    break;
+                }
+                count += c;
+                let upper = self.bucket_bound(idx);
+                if upper > threshold {
+                    threshold = upper;
+                    restarted = true;
+                    break;
+                }
+            }
+            if restarted {
+                continue;
+            }
+            // Negative side, ascending index = ascending |inner edge| = outward
+            // from zero. Bucket `idx` spans (-bound(idx), -bound(idx-1)].
+            for (&idx, &c) in &negative {
+                let inner = self.bucket_bound(idx - 1);
+                if inner >= threshold {
+                    break;
+                }
+                count += c;
+                let outer = self.bucket_bound(idx);
+                if outer > threshold {
+                    threshold = outer;
+                    restarted = true;
+                    break;
+                }
+            }
+            if restarted {
+                continue;
+            }
+            return (count, threshold);
+        }
+    }
+
+    /// Prometheus' `trimBucketsInZeroBucket`: drop every regular bucket now
+    /// inside the (already widened) zero threshold from both sides. A bucket is
+    /// inside when its inner edge, `bucket_bound(idx - 1)`, is below the
+    /// threshold; the threshold sits on a boundary after
+    /// [`Self::zero_count_for_larger_threshold`], so such a bucket lies wholly
+    /// inside and its count is already in the zero count.
+    fn trim_buckets_in_zero_bucket(&mut self) {
+        let threshold = self.zero_threshold;
+        let pos: BTreeMap<i32, f64> = self
+            .positive_index_map()
+            .into_iter()
+            .filter(|&(idx, _)| self.bucket_bound(idx - 1) >= threshold)
+            .collect();
+        let neg: BTreeMap<i32, f64> = self
+            .negative_index_map()
+            .into_iter()
+            .filter(|&(idx, _)| self.bucket_bound(idx - 1) >= threshold)
+            .collect();
         let (ps, pb) = rebuild_side(&pos);
         let (ns, nb) = rebuild_side(&neg);
         self.positive_spans = ps;
@@ -481,6 +783,85 @@ fn rebuild_side(map: &BTreeMap<i32, f64>) -> (Vec<Span>, Vec<f64>) {
         prev_index = Some(idx);
     }
     (spans, buckets)
+}
+
+/// Prometheus' `intersectCustomBucketBounds`: the sorted intersection of two
+/// custom-bucket boundary lists. A boundary survives only when both operands
+/// carry it, so every source bucket of either operand maps onto some surviving
+/// bucket (the last shared boundary is `+Inf`, present in every custom-bucket
+/// histogram implicitly, so the map never falls off the end). Both inputs are
+/// already ascending and deduplicated (canonical `custom_values`), so this is a
+/// linear two-cursor merge.
+fn intersect_custom_bucket_bounds(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        let (x, y) = (a[i], b[j]);
+        if x.to_bits() == y.to_bits() {
+            out.push(x);
+            i += 1;
+            j += 1;
+        } else if x < y {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
+/// Prometheus' `addCustomBucketsWithMismatches`: fold each operand's custom
+/// buckets onto the intersected boundary set, then merge with `self + sign*b`.
+///
+/// A source bucket at Ravel absolute index `idx` has upper bound
+/// `bounds[idx - 1]` (Ravel's 1-based NHCB convention; `bucket_bound(0)` is
+/// `-Inf` and has no `custom_values` entry, so a positive custom bucket always
+/// has `idx >= 1`). It folds into the intersected bucket whose upper bound is
+/// the first entry of `intersected` at or above that source upper bound. The
+/// implicit final `+Inf` boundary is not stored in `custom_values`; a source
+/// bucket above every stored intersected bound lands in that overflow bucket,
+/// at target position `intersected.len()` (Ravel index `intersected.len() + 1`).
+fn add_custom_buckets_with_mismatches(
+    a: &BTreeMap<i32, f64>,
+    a_bounds: &[f64],
+    b: &BTreeMap<i32, f64>,
+    b_bounds: &[f64],
+    sign: f64,
+    intersected: &[f64],
+) -> BTreeMap<i32, f64> {
+    let mut out: BTreeMap<i32, f64> = BTreeMap::new();
+    fold_custom_side(&mut out, a, a_bounds, 1.0, intersected);
+    fold_custom_side(&mut out, b, b_bounds, sign, intersected);
+    out
+}
+
+/// Accumulate one operand's custom buckets onto the intersected boundary set.
+/// Each source count is added (scaled by `sign`) to the target bucket whose
+/// upper bound first reaches the source bucket's own upper bound.
+fn fold_custom_side(
+    out: &mut BTreeMap<i32, f64>,
+    side: &BTreeMap<i32, f64>,
+    bounds: &[f64],
+    sign: f64,
+    intersected: &[f64],
+) {
+    for (&idx, &count) in side {
+        let src0 = (idx - 1) as usize;
+        // Source upper bound; a bucket beyond the stored bounds is the +Inf
+        // overflow bucket, which maps to the intersected +Inf overflow.
+        let upper = bounds.get(src0).copied();
+        let target = match upper {
+            Some(u) => intersected
+                .iter()
+                .position(|&bound| bound >= u)
+                .unwrap_or(intersected.len()),
+            None => intersected.len(),
+        };
+        // Target Ravel index is 1-based over the intersected bounds, with the
+        // overflow bucket sitting one past the last stored bound.
+        let target_idx = target as i32 + 1;
+        *out.entry(target_idx).or_insert(0.0) += sign * count;
+    }
 }
 
 /// `2^(idx * 2^-scale)`. Exact for `scale <= 0` (integer exponent, a power of
@@ -1149,6 +1530,54 @@ mod tests {
         assert_eq!(h.positive_buckets[1].to_bits(), (20.0_f64 / 3.0).to_bits());
     }
 
+    /// Issue #1700 fix round: `histogram / float` takes its divisor from query
+    /// text, so a zero divisor is reachable. The pinned v3.13.1 binary answers
+    /// `diff_native_hist / 0` with the zero bucket alone at `+Inf` and no
+    /// positive buckets, so `div` clears both bucket vectors and their spans
+    /// rather than filling them with infinities.
+    #[test]
+    fn div_by_zero_clears_the_buckets_and_leaves_infinite_populations() {
+        let mut h = positive(0, 1, &[10.0, 20.0], 30.0);
+        h.zero_count = 5.0;
+        h.count += 5.0;
+        h.div(0.0);
+        assert_eq!(h.count, f64::INFINITY);
+        assert_eq!(h.sum, f64::INFINITY);
+        assert_eq!(h.zero_count, f64::INFINITY);
+        assert!(h.positive_buckets.is_empty(), "positive buckets cleared");
+        assert!(h.positive_spans.is_empty(), "positive spans cleared too");
+        assert!(h.negative_buckets.is_empty());
+        assert!(h.negative_spans.is_empty());
+        // Only the zero bucket survives into the rendered bucket list.
+        let buckets = h.all_buckets();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].count, f64::INFINITY);
+    }
+
+    /// Issue #1700 fix round: a negative divisor negates every population with
+    /// no special case, and the resulting non-positive zero bucket is not
+    /// rendered at all, matching the pinned binary's answer for
+    /// `diff_native_hist / -2`.
+    #[test]
+    fn div_by_a_negative_scalar_negates_and_hides_the_zero_bucket() {
+        let mut h = positive(0, 1, &[10.0, 20.0], 30.0);
+        h.zero_count = 5.0;
+        h.count += 5.0;
+        h.div(-2.0);
+        assert_eq!(h.count, -17.5);
+        assert_eq!(h.sum, -15.0);
+        assert_eq!(h.zero_count, -2.5);
+        assert_eq!(h.positive_buckets, vec![-5.0, -10.0]);
+        let buckets = h.all_buckets();
+        assert_eq!(
+            buckets.len(),
+            2,
+            "the two negated positive buckets, and no zero bucket: {buckets:?}"
+        );
+        assert_eq!(buckets[0].count, -5.0);
+        assert_eq!(buckets[1].count, -10.0);
+    }
+
     #[test]
     fn equals_ignores_counter_reset_hint_but_compares_populations() {
         let a = positive(0, 1, &[1.0, 2.0], 3.0);
@@ -1248,5 +1677,322 @@ mod tests {
             None,
             "a schema-type mismatch is not combinable, not a panic"
         );
+    }
+
+    /// Issue #1700 third fix round: adding two exponential histograms with
+    /// different zero thresholds reconciles them (Prometheus'
+    /// `reconcileZeroBuckets`) before merging. The receiver's threshold widens
+    /// to the larger of the two, the regular buckets it now covers fold into the
+    /// zero count, and those buckets are dropped from the regular merge.
+    ///
+    /// `a` has zero threshold 0.001, zero count 5, and one bucket over
+    /// `(0.5, 1.0]` holding 30 (scale 0 index 0). `b` has zero threshold 1.0,
+    /// zero count 20, and no regular buckets. Widening `a` to 1.0 folds its
+    /// `(0.5, 1.0]` bucket into the zero count: `5 + 30 = 35`. Adding `b`'s zero
+    /// count gives `35 + 20 = 55`, the regular buckets are empty, and the count
+    /// is `35 + 20 = 55`.
+    ///
+    /// This fails on pre-fix `combine`, which added the zero counts as if the
+    /// thresholds matched (`5 + 20 = 25`), kept the 0.001 threshold, and left
+    /// the 30-count bucket in the regular buckets.
+    #[test]
+    fn zero_threshold_reconciliation_widens_and_folds_on_addition() {
+        let mut a = positive(0, 0, &[30.0], 60.0);
+        a.zero_threshold = 0.001;
+        a.zero_count = 5.0;
+        a.count += 5.0;
+
+        let b = FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: 0,
+            zero_threshold: 1.0,
+            zero_count: 20.0,
+            count: 20.0,
+            sum: 40.0,
+            positive_spans: Vec::new(),
+            positive_buckets: Vec::new(),
+            negative_spans: Vec::new(),
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        };
+
+        let collision = a.add_assign(&b);
+        assert!(
+            !collision,
+            "both hints are Unknown, no counter-reset collision"
+        );
+        assert_eq!(
+            a.zero_threshold, 1.0,
+            "the receiver widens to the larger threshold"
+        );
+        assert_eq!(
+            a.zero_count, 55.0,
+            "5 + 30 folded from the bucket, then + 20"
+        );
+        assert!(
+            a.positive_buckets.is_empty() && a.positive_spans.is_empty(),
+            "the folded bucket is removed from the regular buckets"
+        );
+        assert_eq!(a.count, 55.0, "35 + 20");
+        assert_eq!(a.observation_sum(), 100.0, "60 + 40");
+    }
+
+    #[test]
+    fn intersect_custom_bucket_bounds_keeps_only_shared_boundaries() {
+        assert_eq!(
+            intersect_custom_bucket_bounds(&[1.0, 2.0, 4.0], &[1.0, 3.0, 5.0]),
+            vec![1.0]
+        );
+        assert_eq!(
+            intersect_custom_bucket_bounds(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]),
+            vec![1.0, 2.0, 3.0]
+        );
+        assert!(intersect_custom_bucket_bounds(&[1.0], &[2.0]).is_empty());
+    }
+
+    /// Issue #1700 third fix round: two custom-buckets histograms with differing
+    /// bounds re-bucket onto the intersection of their bounds and merge
+    /// (Prometheus' `addCustomBucketsWithMismatches`). `[1,2,4] counts [1,2,3]`
+    /// plus `[1,3,5] counts [1,2,3]` share only boundary `1`; every count above
+    /// `1` lands in the `+Inf` overflow bucket. The result carries bounds `[1]`,
+    /// bucket at bound 1 holding `1 + 1 = 2`, overflow holding
+    /// `(2 + 3) + (2 + 3) = 10`.
+    #[test]
+    fn combine_custom_reconciled_merges_on_intersected_bounds() {
+        let mut a = FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: CUSTOM_BUCKETS_SCALE,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count: 6.0,
+            sum: 12.0,
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 3,
+            }],
+            positive_buckets: vec![1.0, 2.0, 3.0],
+            negative_spans: Vec::new(),
+            negative_buckets: Vec::new(),
+            custom_values: vec![1.0, 2.0, 4.0],
+        };
+        let b = FloatHistogram {
+            custom_values: vec![1.0, 3.0, 5.0],
+            ..a.clone()
+        };
+
+        let collision = a.combine_custom_reconciled(&b, 1.0);
+        assert!(!collision);
+        assert_eq!(a.custom_values, vec![1.0]);
+        assert_eq!(
+            a.positive_spans,
+            vec![Span {
+                offset: 1,
+                length: 2
+            }]
+        );
+        assert_eq!(a.positive_buckets, vec![2.0, 10.0]);
+        assert_eq!(a.count, 12.0);
+        assert_eq!(a.observation_sum(), 24.0);
+    }
+
+    /// Issue #1700 third fix round: `combine` reports a counter-reset collision
+    /// (Prometheus' `adjustCounterReset`) when one operand's hint is
+    /// `CounterReset` and the other's is `NotCounterReset`, and nothing else.
+    #[test]
+    fn counter_reset_collision_flag_is_set_only_on_conflicting_hints() {
+        let mk = |hint: ResetHint| {
+            let mut h = positive(0, 1, &[1.0], 2.0);
+            h.counter_reset_hint = hint;
+            h
+        };
+        assert!(mk(ResetHint::Yes).add_assign(&mk(ResetHint::No)));
+        assert!(mk(ResetHint::No).add_assign(&mk(ResetHint::Yes)));
+        assert!(mk(ResetHint::No).sub_assign(&mk(ResetHint::Yes)));
+        assert!(!mk(ResetHint::Unknown).add_assign(&mk(ResetHint::Yes)));
+        assert!(!mk(ResetHint::Yes).add_assign(&mk(ResetHint::Yes)));
+        assert!(!mk(ResetHint::Gauge).add_assign(&mk(ResetHint::No)));
+    }
+
+    /// Issue #1700 fourth fix round: two operands whose zero thresholds already
+    /// match skip the reconcile entirely, so nothing was folded into the zero
+    /// count and the merge must keep every bucket the threshold only cuts
+    /// through. The threshold here is 0.001, the shape the ravel-otlp and
+    /// ravel-bench fixtures carry, which is not a power of two and so lands
+    /// strictly inside bucket -9, covering (2^-10, 2^-9].
+    #[test]
+    fn combine_keeps_a_bucket_straddling_an_unreconciled_zero_threshold() {
+        let mut a = positive(0, -9, &[4.0], 0.006);
+        a.zero_threshold = 0.001;
+        let b = a.clone();
+
+        assert_eq!(a.bucket_bound(-10), 0.0009765625, "2^-10");
+        assert_eq!(a.bucket_bound(-9), 0.001953125, "2^-9");
+        assert!(
+            a.bucket_bound(-10) < a.zero_threshold && a.zero_threshold < a.bucket_bound(-9),
+            "the threshold cuts through bucket -9 rather than sitting on a bound"
+        );
+
+        a.add_assign(&b);
+
+        assert_eq!(a.count, 8.0, "4 + 4");
+        assert_eq!(a.zero_count, 0.0, "nothing folded into the zero bucket");
+        assert_eq!(a.zero_threshold, 0.001, "an equal threshold does not move");
+        assert_eq!(
+            a.positive_spans,
+            vec![Span {
+                offset: -9,
+                length: 1
+            }],
+            "the straddling bucket keeps its index"
+        );
+        assert_eq!(a.positive_buckets, vec![8.0], "4 + 4, not dropped");
+        let buckets = a.all_buckets();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].lower, 0.0009765625);
+        assert_eq!(buckets[0].upper, 0.001953125);
+        assert_eq!(buckets[0].count, 8.0);
+    }
+
+    /// Issue #1700 fourth fix round: a NaN zero threshold survives ingest (no
+    /// normalizer validates the field), and `reconcile_zero_buckets` must stay
+    /// total on it. Before the fix this hung: its loop condition
+    /// `other_zero_threshold != self.zero_threshold` is always true for a NaN,
+    /// and both `>` tests inside are always false, so nothing ever moved.
+    #[test]
+    fn combine_with_a_nan_zero_threshold_terminates() {
+        let mut a = positive(0, 1, &[3.0], 6.0);
+        a.zero_threshold = f64::NAN;
+        a.zero_count = 2.0;
+        let b = a.clone();
+
+        a.add_assign(&b);
+
+        assert!(a.zero_threshold.is_nan(), "the threshold is left as it was");
+        assert_eq!(a.zero_count, 4.0, "2 + 2, folded from nothing");
+        assert_eq!(a.count, 6.0, "3 + 3");
+        assert_eq!(
+            a.positive_buckets,
+            vec![6.0],
+            "a threshold that orders against nothing drops no bucket"
+        );
+
+        // One NaN side is enough to take the same path.
+        let mut c = positive(0, 1, &[3.0], 6.0);
+        c.zero_threshold = f64::NAN;
+        let d = positive(0, 1, &[3.0], 6.0);
+        c.add_assign(&d);
+        assert!(c.zero_threshold.is_nan());
+        assert_eq!(c.positive_buckets, vec![6.0]);
+    }
+
+    /// Issue #1700 fourth fix round: an NHCB pair carrying negative buckets and
+    /// a zero count merges all of them. Prometheus' `Histogram.Validate` rejects
+    /// such a value so its custom-bucket `Add` never sees one, but
+    /// ravel-remote-write admits it; since `count` and `sum` take the whole of
+    /// both operands, merging only the positive side would leave the totals
+    /// disagreeing with the buckets.
+    #[test]
+    fn combine_custom_reconciled_merges_the_negative_side_and_the_zero_count() {
+        // Differing bounds take the reconciled path. Every side must merge
+        // there too, or count and sum would take both operands while the
+        // negative buckets and the zero count kept only the receiver's.
+        let mut a = FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: CUSTOM_BUCKETS_SCALE,
+            zero_threshold: 0.0,
+            zero_count: 3.0,
+            count: 11.0,
+            sum: 20.0,
+            // NHCB indices are 1-based: index 1 is the bucket whose upper
+            // bound is custom_values[0].
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 3,
+            }],
+            positive_buckets: vec![1.0, 1.0, 1.0],
+            negative_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_buckets: vec![5.0],
+            custom_values: vec![1.0, 2.0, 4.0],
+        };
+        let b = FloatHistogram {
+            zero_count: 1.0,
+            count: 15.0,
+            sum: 10.0,
+            positive_buckets: vec![2.0, 2.0, 2.0],
+            negative_buckets: vec![7.0],
+            custom_values: vec![1.0, 3.0, 5.0],
+            ..a.clone()
+        };
+
+        let collision = a.combine_custom_reconciled(&b, 1.0);
+
+        assert!(!collision);
+        assert_eq!(a.custom_values, vec![1.0], "the intersection of the bounds");
+        assert_eq!(
+            a.negative_buckets,
+            vec![12.0],
+            "5 + 7 on the intersected bound"
+        );
+        assert_eq!(
+            a.negative_spans,
+            vec![Span {
+                offset: 1,
+                length: 1
+            }]
+        );
+        assert_eq!(a.zero_count, 4.0, "3 + 1");
+        assert_eq!(a.count, 26.0, "11 + 15");
+        assert_eq!(a.observation_sum(), 30.0, "20 + 10");
+    }
+
+    #[test]
+    fn combine_custom_buckets_merges_the_negative_side_and_the_zero_count() {
+        let mut a = FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: CUSTOM_BUCKETS_SCALE,
+            zero_threshold: 0.0,
+            zero_count: 3.0,
+            count: 11.0,
+            sum: 20.0,
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 2,
+            }],
+            positive_buckets: vec![1.0, 2.0],
+            negative_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_buckets: vec![5.0],
+            custom_values: vec![1.0, 2.0],
+        };
+        let b = FloatHistogram {
+            zero_count: 1.0,
+            count: 15.0,
+            sum: 10.0,
+            positive_buckets: vec![3.0, 4.0],
+            negative_buckets: vec![7.0],
+            ..a.clone()
+        };
+
+        let collision = a.add_assign(&b);
+
+        assert!(!collision);
+        assert_eq!(a.positive_buckets, vec![4.0, 6.0], "1+3 and 2+4");
+        assert_eq!(a.negative_buckets, vec![12.0], "5 + 7");
+        assert_eq!(
+            a.negative_spans,
+            vec![Span {
+                offset: 1,
+                length: 1
+            }]
+        );
+        assert_eq!(a.zero_count, 4.0, "3 + 1");
+        assert_eq!(a.count, 26.0, "11 + 15");
+        assert_eq!(a.observation_sum(), 30.0, "20 + 10");
+        assert_eq!(a.custom_values, vec![1.0, 2.0], "the bounds are unchanged");
     }
 }

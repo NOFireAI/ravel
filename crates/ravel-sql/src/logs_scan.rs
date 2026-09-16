@@ -117,6 +117,62 @@
 //! not a general result about striping. Cache size, eviction, object size, and
 //! store latency all move it.
 //!
+//! # Whole-object fallback carry, and its memory bound (issue #835)
+//!
+//! `plan_segment`'s whole-object fallback (an undecidable block predicate, e.g.
+//! a text `has_word` arm the skip index cannot resolve) already reads the
+//! entire object to count survivors. Before #835 that read was thrown away:
+//! the scan phase re-opened the same object and, unless a read cache happened
+//! to be wired AND large enough to still hold every relevant object's bytes by
+//! the time the scan reached it, paid a second real wire GET for content the
+//! plan phase had just fetched. This is a different failure from issue #691's
+//! "an evicted plan entry is simply re-fetched by the scan" a few paragraphs
+//! up: #691 is about a cache-keyed footer/probe/section entry on the ABOVE-
+//! threshold ranged path, which by design may be re-fetched on a miss; #835 is
+//! about the whole object itself never being cache-size-dependent in the first
+//! place. Since #835, [`LogSegmentFetcher::plan_segment`]'s fallback branch carries its fetched
+//! bytes forward as a [`ravel_query::CarriedWholeObject`] (`SegPlan::whole_object`,
+//! threaded through [`OwnedSeg::whole_object`] to the subset open), so the
+//! object is read once for the statement, rather than twice, for the first
+//! `plan_concurrency` segments whose plan completes: their subset open issues
+//! neither a store GET nor a cache lookup. Every other relevant segment is re-fetched by the
+//! scan exactly as it was before #835; the peak bytes this carry retains is
+//! bounded by the plan fan-out (`plan_concurrency` objects) times object
+//! size, not by corpus size. Removing the remaining duplicate reads needs
+//! the carry to stream per partition instead of being held at the plan
+//! barrier, tracked separately as issue #1272. A reused read is charged to
+//! [`ravel_types::accounting::QueryAccounting::add_bytes_reused`], not folded
+//! into the GET-bytes figure the issuing (plan) phase already recorded.
+//!
+//! This carry's memory cost is bounded by `plan_concurrency`, not by corpus
+//! size: [`compute_plan_counts`] consumes the segment-plan stream as each
+//! `plan_segment` call completes (`buffer_unordered(plan_concurrency)`), not
+//! after the whole pass finishes, so it never retains more carried whole
+//! objects than are actually in flight at once. The first `plan_concurrency`
+//! segments to COMPLETE with a carried whole object -- arrival order, not
+//! segment order, so which segments those are is scheduling-dependent -- keep
+//! their [`SegPlan::whole_object`]; every later arrival has its
+//! `whole_object` forced to `None` before it is stored, so that segment's
+//! subset open pays a second read during the scan, a wire GET whenever the
+//! cache does not still hold the object, exactly as it would have
+//! before #835. `compute_plan_counts` sums only the bytes actually retained
+//! and records that figure via
+//! [`ravel_types::accounting::QueryAccounting::observe_intermediate_bytes`]; a
+//! dropped whole object is never charged to
+//! [`ravel_types::accounting::QueryAccounting::add_bytes_reused`], since the
+//! scan performs a real GET for it and that GET's own accounting covers it.
+//!
+//! The barrier itself is unchanged by this bound: no partition drains a block
+//! until every segment's survivor count is known, because the flattened
+//! block-striping assignment (ADR-0102) needs every segment's count to
+//! compute unit `i`'s owning partition, not just the segments before it in
+//! isolation. Only the CARRIED-BYTES retention is now concurrency-bounded;
+//! survivor counts, stats, and footers for every relevant segment are still
+//! held until the pass completes, because `owned_work` indexes all of them by
+//! segment position regardless. Letting a partition start draining before the
+//! whole pass completes would need ADR-0102's partitioning protocol itself to
+//! change, and is not made here.
+//!
 //! # Streaming, and why no ordering is declared (ADR-0087)
 //!
 //! This stage declares **no** output ordering. It used to declare `ts`
@@ -157,10 +213,15 @@
 //! produce. The projected columns, plus every field a pushed content predicate
 //! names, plus every attribute key a pending erasure predicate names, are
 //! resolved into a [`ColumnSelection`] that the reader uses to decode only
-//! those columns' pages ([`resolve_columns`]). Any reference to the SQL `attrs`
-//! map column resolves to every dynamic column plus `attrs_raw`, because the
-//! map's contract is that every key is present; per-key `attrs['k']`
-//! projection is out of scope (ADR-0087 decision 3).
+//! those columns' pages ([`resolve_columns`]). A reference to the whole SQL
+//! `attrs` map column (a bare `attrs` projection, `SELECT *`) resolves to every
+//! dynamic column plus `attrs_raw`, because the map's contract is that every key
+//! is present. A projection that reaches the map only through literal-key
+//! `attrs['k']` subscripts is rewritten by
+//! [`crate::attrs_per_key::AttrsPerKeyProjection`] into synthetic per-key
+//! columns (issue #1768), which resolve to just those keys' FIELD_DIR columns
+//! plus `attrs_raw` like a declared column does (ADR-0087, amended
+//! 2026-09-14).
 //!
 //! # Row refs, for TopK late materialization (ADR-0774)
 //!
@@ -228,13 +289,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use datafusion::arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, DictionaryArray, FixedSizeBinaryBuilder, Int32Array,
     Int64Builder, MapBuilder, StringArray, StringBuilder, StringDictionaryBuilder,
     TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
 };
-use datafusion::arrow::datatypes::{Int32Type, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -243,14 +305,14 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
-    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
 use datafusion::scalar::ScalarValue;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use ravel_catalog::{
     DeclaredColumnStats, LoadedColumnStats, SegmentRef, unique_column_stat,
     validate_min_max_presence,
@@ -265,7 +327,8 @@ use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
 use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{
-    ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher, LogSegmentScan,
+    CarriedWholeObject, ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher,
+    LogSegmentScan, PhaseAccounting,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -279,7 +342,7 @@ use crate::late_materialization::{RowRef, row_ref_field};
 use crate::logs_schema::{
     FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS,
     LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
-    SPAN_ID_WIDTH, TRACE_ID_WIDTH,
+    SPAN_ID_WIDTH, TRACE_ID_WIDTH, attr_key_field_name,
 };
 use crate::rlog_attrs::{
     attr_value_to_string, decode_stream_attrs, find_attr, merged_attrs, retain_unerased,
@@ -426,6 +489,8 @@ fn resolve_columns(
     content: &[Predicate],
     erasure: &[ErasurePredicate],
     declared: &[DeclaredColumn],
+    attr_keys: &[String],
+    full_len: usize,
 ) -> ResolvedColumns {
     // Accumulated as sets first, and turned into a `ColumnSelection` below, so
     // the same walk that decides what to decode also counts how many distinct
@@ -453,7 +518,18 @@ fn resolve_columns(
             // The merged `attrs` map exposes every key, so referencing it at
             // all means every dynamic column plus the overflow.
             LOG_COL_ATTRS => all_attrs = true,
-            // A declared typed attribute column (index >= FIRST_DECLARED_COL):
+            // A synthetic per-key attribute column (index >= full_len): decode
+            // exactly that key's FIELD_DIR column(s) plus `attrs_raw`, the same
+            // per-key selection a declared column resolves to (issue #1768).
+            // This is what keeps the whole `attrs` map off the selection so the
+            // scan decodes one key's pages instead of every dynamic column.
+            other if other >= full_len => match attr_keys.get(other - full_len) {
+                Some(key) => {
+                    attrs.insert(key.clone());
+                }
+                None => all = true,
+            },
+            // A declared typed attribute column (FIRST_DECLARED_COL..full_len):
             // decode exactly that key's dynamic column, the same per-key path
             // an erasure predicate uses. `i` here is never a fixed index
             // (0..=8 are matched above), so the subtraction cannot underflow;
@@ -1008,6 +1084,18 @@ pub struct LogsScanExec {
     /// Empty for a zero-declaration query, which is byte-identical to the
     /// pre-ADR-0090 scan.
     declared: Arc<Vec<DeclaredColumn>>,
+    /// Synthetic per-key attribute columns (issue #1768). Each renders one
+    /// `attrs['k']` subscript as a `Utf8` column using the merged map's rules
+    /// (record-wins over resource/scope, values rendered as text, NULL for an
+    /// absent key), so a projection that reaches the `attrs` map only through
+    /// literal-key subscripts drops the whole-map projection: the reader decodes
+    /// only these keys' FIELD_DIR columns plus `attrs_raw` (like a declared
+    /// column) instead of every dynamic column, and the scan stays on the
+    /// columnar fast path. Index `j` here is the synthetic schema index
+    /// `full_schema.fields().len() + j`, past every declared column. Empty for
+    /// every query the [`crate::attrs_per_key::AttrsPerKeyProjection`] rule did
+    /// not rewrite, which is byte-identical to the pre-#1768 scan.
+    attr_keys: Arc<Vec<String>>,
     /// Exact per-segment column statistics for the tenant's declared columns
     /// (ADR-0850), loaded once per plan and threaded down from
     /// [`crate::executor::SqlExecutor`]. `None` when no usable column-stats
@@ -1017,6 +1105,28 @@ pub struct LogsScanExec {
     /// `LoadedColumnStats::segments` has no exact statistics either, checked
     /// per column at the point of use rather than here.
     column_stats: Option<Arc<LoadedColumnStats>>,
+    /// Whether this scan publishes its per-segment scan timeline
+    /// (`SqlConfig::segment_timing`, issue #913). `false` by default,
+    /// installed with [`Self::with_segment_timing`]; gates
+    /// [`LogScanStream::mark_segment`] to a no-op (no label allocation, no
+    /// metric registration) so a production query pays nothing for a
+    /// timeline only the bench reporter reads.
+    segment_timing: bool,
+    /// The row count DataFusion's `LimitPushdown` optimizer rule pushed into
+    /// this scan (issue #362), installed with [`Self::with_fetch`]. `None`
+    /// (the default) reproduces the pre-#362 scan exactly: every segment this
+    /// partition owns is opened.
+    ///
+    /// Set, it bounds only what THIS PARTITION may stop early at: once a
+    /// partition's own emitted row count reaches `fetch`, [`LogScanStream`]
+    /// stops opening further owned segments (never mid-segment, and never
+    /// before `fetch` rows of its own are out). The real cross-partition
+    /// limit is still enforced above this node -- by the `CoalescePartitionsExec`
+    /// or `GlobalLimitExec` that absorbed the pushdown -- so a partition
+    /// emitting more than `fetch` rows (its last batch overshooting) is
+    /// harmless; emitting fewer than `fetch` while more of its own owned data
+    /// remains would silently under-answer the query and must never happen.
+    fetch: Option<usize>,
     /// The resolved full `logs` schema this scan projects, i.e.
     /// `logs_schema_with_declared(&declared)`. Kept so [`Self::reproject`] can
     /// build a narrower sibling scan over the same table without re-deriving
@@ -1048,12 +1158,17 @@ pub struct LogsScanExec {
     /// [`owned_work`]; the same predicate gates `declared_partitions` above.
     stripe_blocks: bool,
     properties: Arc<PlanProperties>,
-    /// This query's accounting handle (ADR-0044), threaded into every
-    /// per-partition fetch so log fetches are recorded like every other
-    /// funnel.
-    accounting: QueryAccounting,
+    /// This query's phase-split accounting handle (ADR-0044, issue #796),
+    /// threaded into every per-partition fetch so log fetches are recorded
+    /// like every other funnel, split by phase.
+    phase_accounting: PhaseAccounting,
     /// Block-level pruning counters, reported through `EXPLAIN ANALYZE`.
     metrics: ExecutionPlanMetricsSet,
+    /// The one monotonic origin every partition's timeline offsets
+    /// (`seg_*_offset`, `first_batch_elapsed`, `stream_elapsed`) are measured
+    /// from, so events from different partitions can be ordered against each
+    /// other. Taken when the plan node is built, before any partition exists.
+    created_at: Instant,
 }
 
 /// Which conjunct kept a statement off the predicate-free full-window
@@ -1144,11 +1259,70 @@ struct BlockMetrics {
     /// and that nothing fell through it.
     fast_path_whole_object_segments: Count,
     fast_path_ranged_segments: Count,
+    /// Wall time this partition spent with a segment open in flight: from the
+    /// `NextSegment` arm constructing the open future to the `Opening` arm
+    /// seeing it ready. It is the exposed open stall, not network time: an
+    /// open can mix cache hits, carried bytes, and real GETs, and the
+    /// partition does no decode while it waits.
+    open_elapsed: Time,
+    /// `Opening` polls that returned `Pending`, the count of times this
+    /// partition yielded to the runtime with an open in flight.
+    open_pending_polls: Count,
+    /// Segments this partition opened (first opens only; the `attrs_raw`
+    /// reopen counts under [`Self::reopens`]).
+    segments_opened: Count,
+    /// Wall time in `ReopenRows` opens (the `attrs_raw` fallback), kept apart
+    /// from [`Self::open_elapsed`] so a fallback's second open is visible.
+    reopen_elapsed: Time,
+    reopens: Count,
+    /// Wall time in the synchronous decode and Arrow build sites inside
+    /// `poll_next`: `next_block_columnar` plus `build_columnar_batches` on the
+    /// columnar path, `next_block` on the row path. Nothing nested is timed
+    /// twice, and the buffered-output drain is under [`Self::emit_elapsed`].
+    decode_build_elapsed: Time,
+    /// Wall time handing buffered output downstream: `emit_next_row_batch`
+    /// (which builds the row-path batch) and `emit_next_columnar_batch`.
+    emit_elapsed: Time,
+    /// This partition's wait on the shared plan barrier, from the stream's
+    /// creation to the `Planning` arm seeing the counts. Every partition waits
+    /// on the one cell, so the SUM over partitions overstates the query-level
+    /// delay; the barrier's own cost is [`Self::plan_init_elapsed`].
+    planning_wait_elapsed: Time,
+    /// Wall time of the one `compute_plan_counts` run, recorded by whichever
+    /// partition's poll initialized the shared cell. Non-zero on exactly one
+    /// partition per query, so its sum over partitions is the query's planning
+    /// cost counted once.
+    plan_init_elapsed: Time,
+    /// Offset from the exec's creation to this partition's first emitted
+    /// batch, and to the stream reporting `Done`. Both on the exec's clock.
+    first_batch_elapsed: Time,
+    stream_elapsed: Time,
+    /// `poll_next` calls, and how many of them returned `Pending`.
+    polls: Count,
+    polls_pending: Count,
 }
 
 impl BlockMetrics {
     fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         BlockMetrics {
+            open_elapsed: MetricBuilder::new(metrics).subset_time("open_elapsed", partition),
+            open_pending_polls: MetricBuilder::new(metrics)
+                .counter("open_pending_polls", partition),
+            segments_opened: MetricBuilder::new(metrics).counter("segments_opened", partition),
+            reopen_elapsed: MetricBuilder::new(metrics).subset_time("reopen_elapsed", partition),
+            reopens: MetricBuilder::new(metrics).counter("reopens", partition),
+            decode_build_elapsed: MetricBuilder::new(metrics)
+                .subset_time("decode_build_elapsed", partition),
+            emit_elapsed: MetricBuilder::new(metrics).subset_time("emit_elapsed", partition),
+            planning_wait_elapsed: MetricBuilder::new(metrics)
+                .subset_time("planning_wait_elapsed", partition),
+            plan_init_elapsed: MetricBuilder::new(metrics)
+                .subset_time("plan_init_elapsed", partition),
+            first_batch_elapsed: MetricBuilder::new(metrics)
+                .subset_time("first_batch_elapsed", partition),
+            stream_elapsed: MetricBuilder::new(metrics).subset_time("stream_elapsed", partition),
+            polls: MetricBuilder::new(metrics).counter("polls", partition),
+            polls_pending: MetricBuilder::new(metrics).counter("polls_pending", partition),
             total: MetricBuilder::new(metrics).counter("blocks_total", partition),
             scanned: MetricBuilder::new(metrics).counter("blocks_scanned", partition),
             pruned_by_postings: MetricBuilder::new(metrics)
@@ -1270,7 +1444,7 @@ impl LogsScanExec {
         prune: Arc<Vec<Predicate>>,
         erasure: Arc<Vec<ErasurePredicate>>,
         projection: Option<&Vec<usize>>,
-        accounting: QueryAccounting,
+        phase_accounting: PhaseAccounting,
         full_schema: SchemaRef,
         declared: Arc<Vec<DeclaredColumn>>,
     ) -> DFResult<Self> {
@@ -1286,9 +1460,10 @@ impl LogsScanExec {
             prune,
             erasure,
             projection,
-            accounting,
+            phase_accounting,
             full_schema,
             declared,
+            Vec::new(),
             false,
         )
     }
@@ -1318,12 +1493,58 @@ impl LogsScanExec {
             Arc::clone(&self.prune),
             Arc::clone(&self.erasure),
             Some(projection),
-            self.accounting.clone(),
+            self.phase_accounting.clone(),
             Arc::clone(&self.full_schema),
             Arc::clone(&self.declared),
+            self.attr_keys.as_ref().clone(),
             row_refs,
         )
-        .map(|scan| scan.with_column_stats(self.column_stats.clone()))
+        .map(|scan| {
+            scan.with_column_stats(self.column_stats.clone())
+                .with_segment_timing(self.segment_timing)
+                .with_fetch_pushed(self.fetch)
+        })
+    }
+
+    /// A sibling scan over the same table that materializes `attr_keys` as
+    /// synthetic per-key `Utf8` columns instead of the whole `attrs` map (issue
+    /// #1768). `projection` is over this scan's EXTENDED schema: the resolved
+    /// full schema (`logs_schema_with_declared`) followed by one `Utf8` field
+    /// per entry of `attr_keys`, in `attr_keys` order, so a projection index
+    /// `full_schema.fields().len() + j` selects `attr_keys[j]`. The whole-map
+    /// projection index [`LOG_COL_ATTRS`] must not appear in `projection`; the
+    /// [`crate::attrs_per_key::AttrsPerKeyProjection`] rule that calls this
+    /// replaces it with the per-key indices and rewrites the `get_field` above
+    /// the scan to match. Everything that decides which bytes are read is
+    /// carried over unchanged, so the surviving-block and surviving-row sets are
+    /// identical to the wide scan this replaces.
+    pub(crate) fn reproject_attr_keys(
+        &self,
+        projection: Vec<usize>,
+        attr_keys: Vec<String>,
+    ) -> DFResult<Self> {
+        Self::build(
+            self.tenant_hash,
+            self.fetcher.clone(),
+            &self.segments,
+            self.target_partitions,
+            self.ts_min,
+            self.ts_max,
+            Arc::clone(&self.content),
+            Arc::clone(&self.prune),
+            Arc::clone(&self.erasure),
+            Some(projection),
+            self.phase_accounting.clone(),
+            Arc::clone(&self.full_schema),
+            Arc::clone(&self.declared),
+            attr_keys,
+            false,
+        )
+        .map(|scan| {
+            scan.with_column_stats(self.column_stats.clone())
+                .with_segment_timing(self.segment_timing)
+                .with_fetch_pushed(self.fetch)
+        })
     }
 
     /// Attach this plan's loaded column statistics (ADR-0850), resolved once
@@ -1340,6 +1561,28 @@ impl LogsScanExec {
         self
     }
 
+    /// Turn on this scan's per-segment scan timeline (`SqlConfig::
+    /// segment_timing`, issue #913). A builder method for the same reason
+    /// [`Self::with_column_stats`] is one: every existing call site of
+    /// [`Self::new`] stays source-compatible, and `false` (the default)
+    /// reproduces the pre-gate scan exactly.
+    pub(crate) fn with_segment_timing(mut self, segment_timing: bool) -> Self {
+        self.segment_timing = segment_timing;
+        self
+    }
+
+    /// Carry a pushed `fetch` (issue #362) across a rebuild that otherwise
+    /// starts from `fetch: None` ([`Self::build`]'s default), the same way
+    /// [`Self::with_column_stats`] and [`Self::with_segment_timing`] carry
+    /// their fields across [`Self::reproject`] and [`Self::reproject_attr_keys`].
+    /// Not `pub(crate)`: the only external installer of a NEW fetch value is
+    /// the `ExecutionPlan::with_fetch` trait method, which builds the whole
+    /// struct itself rather than starting from [`Self::build`].
+    fn with_fetch_pushed(mut self, fetch: Option<usize>) -> Self {
+        self.fetch = fetch;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build(
         tenant_hash: TenantHash,
@@ -1352,9 +1595,10 @@ impl LogsScanExec {
         prune: Arc<Vec<Predicate>>,
         erasure: Arc<Vec<ErasurePredicate>>,
         projection: Option<Vec<usize>>,
-        accounting: QueryAccounting,
+        phase_accounting: PhaseAccounting,
         full_schema: SchemaRef,
         declared: Arc<Vec<DeclaredColumn>>,
+        attr_keys: Vec<String>,
         row_refs: bool,
     ) -> DFResult<Self> {
         // Blocks, not segments, are what get striped (ADR-0102), but the
@@ -1390,24 +1634,53 @@ impl LogsScanExec {
             target_partitions.max(1).min(segments.len().max(1))
         };
         let full = full_schema;
+        let full_len = full.fields().len();
+        // The scan's EXTENDED schema is the resolved full schema followed by one
+        // `Utf8` field per synthetic per-key attribute column (issue #1768), in
+        // `attr_keys` order. A projection index at or past `full_len` selects
+        // `attr_keys[i - full_len]`. With no per-key columns this is exactly the
+        // full schema, so every pre-#1768 caller is unaffected.
+        let effective: SchemaRef = if attr_keys.is_empty() {
+            Arc::clone(&full)
+        } else {
+            let mut fields = full.fields().to_vec();
+            for key in &attr_keys {
+                fields.push(Arc::new(Field::new(
+                    attr_key_field_name(key),
+                    DataType::Utf8,
+                    true,
+                )));
+            }
+            Arc::new(Schema::new(fields))
+        };
         // A `None` projection means every column, in schema order. Resolving it
         // here rather than carrying an `Option` keeps one code path for the
-        // schema, the batch builder, and the column-set resolution.
+        // schema, the batch builder, and the column-set resolution. A `None`
+        // projection never selects a synthetic per-key column: those are only
+        // ever introduced through an explicit projection by the
+        // `AttrsPerKeyProjection` rule.
         let projection: Vec<usize> = match projection {
             Some(p) => p,
-            None => (0..full.fields().len()).collect(),
+            None => (0..full_len).collect(),
         };
         for &i in &projection {
-            if i >= full.fields().len() {
+            if i >= effective.fields().len() {
                 return Err(DataFusionError::Internal(format!(
                     "logs scan projection index {i} out of range"
                 )));
             }
         }
-        let resolved = resolve_columns(&projection, &content, &erasure, &declared);
+        let resolved = resolve_columns(
+            &projection,
+            &content,
+            &erasure,
+            &declared,
+            &attr_keys,
+            full_len,
+        );
         let projected_fraction = resolved.fraction_of(declared.len());
         let columns = resolved.selection;
-        let projected = full.project(&projection)?;
+        let projected = effective.project(&projection)?;
         // The row-ref column is synthesized per row from the scan's own cursor
         // position, not decoded, so it contributes nothing to `columns` and
         // sits last, past every projected column, where a remapped column index
@@ -1436,15 +1709,19 @@ impl LogsScanExec {
             columns,
             projected_fraction,
             declared,
+            attr_keys: Arc::new(attr_keys),
             column_stats: None,
+            segment_timing: false,
+            fetch: None,
             full_schema: full,
             schema,
             row_refs,
             columnar_eligible,
             stripe_blocks,
             properties,
-            accounting,
+            phase_accounting,
             metrics: ExecutionPlanMetricsSet::new(),
+            created_at: Instant::now(),
         })
     }
 
@@ -1582,7 +1859,7 @@ impl LogsScanExec {
             let seg_stats = self
                 .column_stats
                 .as_ref()
-                .and_then(|stats| stats.segments.get(&segment_identity(seg)));
+                .and_then(|stats| stats.stat_for(&seg.content_hash, &segment_identity(seg)));
             let stamps = &seg.declared_column_stats;
             for (k, a) in acc.iter_mut().enumerate() {
                 if a.declined {
@@ -1692,7 +1969,7 @@ impl LogsScanExec {
         let stats = self.column_stats.as_ref()?;
         let mut total: u64 = 0;
         for seg in self.segments.iter() {
-            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let seg_stats = stats.stat_for(&seg.content_hash, &segment_identity(seg))?;
             let stat = reconciled_column_stat(seg_stats, seg, &declared.key)?;
             if !stat.dictionary_present {
                 return None;
@@ -1759,7 +2036,7 @@ impl LogsScanExec {
         let mut merged: HashMap<ScalarValue, u64> = HashMap::new();
         let mut null_count: u64 = 0;
         for seg in self.segments.iter() {
-            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let seg_stats = stats.stat_for(&seg.content_hash, &segment_identity(seg))?;
             let stat = reconciled_column_stat(seg_stats, seg, &declared.key)?;
             if !stat.dictionary_present {
                 return None;
@@ -1819,7 +2096,7 @@ impl LogsScanExec {
         let mut sum: i128 = 0;
         let mut non_null_count: u64 = 0;
         for seg in self.segments.iter() {
-            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let seg_stats = stats.stat_for(&seg.content_hash, &segment_identity(seg))?;
             let stat = reconciled_column_stat(seg_stats, seg, &declared.key)?;
             let seg_sum = stat.sum?;
             sum = sum.checked_add(i128::from(seg_sum))?;
@@ -1924,6 +2201,22 @@ impl LogsScanExec {
         &self.projection
     }
 
+    /// The width of the resolved full schema
+    /// (`logs_schema_with_declared(&declared).fields().len()`). A projection
+    /// index at or past this selects a synthetic per-key attribute column
+    /// (issue #1768); the [`crate::attrs_per_key::AttrsPerKeyProjection`] rule
+    /// builds its per-key indices as `full_schema_len() + j`.
+    pub(crate) fn full_schema_len(&self) -> usize {
+        self.full_schema.fields().len()
+    }
+
+    /// Whether this scan already carries synthetic per-key attribute columns
+    /// (issue #1768). The `AttrsPerKeyProjection` rule refuses to rewrite a scan
+    /// twice, so a scan it already touched reports `true` and is left alone.
+    pub(crate) fn has_attr_keys(&self) -> bool {
+        !self.attr_keys.is_empty()
+    }
+
     /// Whether this scan can be split into a narrow phase 1 and a row-ref
     /// fetch (ADR-0774).
     ///
@@ -1958,8 +2251,10 @@ impl LogsScanExec {
             columns: self.columns.clone(),
             projection: Arc::clone(&self.projection),
             declared: Arc::clone(&self.declared),
+            attr_keys: Arc::clone(&self.attr_keys),
+            full_len: self.full_schema.fields().len(),
             schema: Arc::clone(&self.schema),
-            accounting: self.accounting.clone(),
+            accounting: self.phase_accounting.scan().clone(),
             concurrency: self.target_partitions,
         }
     }
@@ -2000,6 +2295,12 @@ pub(crate) struct RowFetchSource {
     columns: ColumnSelection,
     projection: Arc<Vec<usize>>,
     declared: Arc<Vec<DeclaredColumn>>,
+    /// Synthetic per-key attribute columns (issue #1768), so phase 2 rebuilds
+    /// the same per-key `Utf8` columns the single-phase scan would have.
+    attr_keys: Arc<Vec<String>>,
+    /// The resolved full schema width, so a projection index past it maps to
+    /// `attr_keys[index - full_len]` (issue #1768).
+    full_len: usize,
     /// The scan's original output schema, which is also this fetch's: the
     /// rewrite restores column order, names, and nullability exactly.
     schema: SchemaRef,
@@ -2073,6 +2374,7 @@ impl RowFetchSource {
                 &self.columns,
                 &[block],
                 None,
+                None,
                 &self.accounting,
             )
             .await
@@ -2113,6 +2415,8 @@ impl RowFetchSource {
             Arc::clone(&self.schema),
             &self.projection,
             &self.declared,
+            &self.attr_keys,
+            self.full_len,
             None,
         )
     }
@@ -2173,6 +2477,58 @@ impl ExecutionPlan for LogsScanExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+
+    /// The row count DataFusion's `LimitPushdown` optimizer rule has pushed
+    /// into this scan (issue #362), if any. See [`Self::fetch`] the field's
+    /// doc comment for what this scan may act on it for.
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
+    /// Install a pushed `fetch` (issue #362), returning a sibling scan that is
+    /// otherwise identical to this one.
+    ///
+    /// An exhaustive struct literal rather than a call through [`Self::build`]:
+    /// every field of [`LogsScanExec`] is named here explicitly, so a field
+    /// added to the struct later without a matching line here is a compile
+    /// error, not a silently-dropped one (the exact bug class the
+    /// `segment_timing` fix on this file addressed for [`Self::reproject`]).
+    /// `counts` and `metrics` are shared with `self` via `Arc`/`Arc<Mutex<_>>`
+    /// clone rather than rebuilt, matching upstream's own `with_fetch` on leaf
+    /// nodes like `StreamingTableExec`: the optimizer replaces `self` with the
+    /// returned plan in the tree, so `self` is dropped and never executed, and
+    /// nothing is ever double-counted or double-planned.
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(LogsScanExec {
+            tenant_hash: self.tenant_hash,
+            fetcher: self.fetcher.clone(),
+            segments: Arc::clone(&self.segments),
+            target_partitions: self.target_partitions,
+            counts: Arc::clone(&self.counts),
+            ts_min: self.ts_min,
+            ts_max: self.ts_max,
+            content: Arc::clone(&self.content),
+            prune: Arc::clone(&self.prune),
+            erasure: Arc::clone(&self.erasure),
+            projection: Arc::clone(&self.projection),
+            columns: self.columns.clone(),
+            projected_fraction: self.projected_fraction,
+            declared: Arc::clone(&self.declared),
+            attr_keys: Arc::clone(&self.attr_keys),
+            column_stats: self.column_stats.clone(),
+            segment_timing: self.segment_timing,
+            fetch: limit,
+            full_schema: Arc::clone(&self.full_schema),
+            schema: Arc::clone(&self.schema),
+            row_refs: self.row_refs,
+            columnar_eligible: self.columnar_eligible,
+            stripe_blocks: self.stripe_blocks,
+            properties: Arc::clone(&self.properties),
+            phase_accounting: self.phase_accounting.clone(),
+            metrics: self.metrics.clone(),
+            created_at: self.created_at,
+        }))
     }
 
     /// Report the exact row count and `ts` span straight from the catalog's
@@ -2253,8 +2609,10 @@ impl ExecutionPlan for LogsScanExec {
             // ADR-0850 and ADR-0873: the same gate widens to a declared
             // column's exact min/max (and its exact NULL count, where a
             // carrier proves one), taken from the union of the `SegmentRef`
-            // stamp and the `.cstat` entry, both joined by segment identity
-            // rather than ordinal position. `declared_min_max_all` resolves
+            // stamp and the `.cstat` entry -- the stamp joined by segment
+            // identity, the `.cstat` entry by content hash first and
+            // identity as fallback (ADR-1413) -- rather than ordinal
+            // position. `declared_min_max_all` resolves
             // every declared column in one segment walk and enforces the
             // per-column fallback (a segment covered by neither carrier,
             // carriers that disagree, a refused entry, or an unsupported
@@ -2318,7 +2676,7 @@ impl ExecutionPlan for LogsScanExec {
             query,
             columns: self.columns.clone(),
             projected_fraction: self.projected_fraction,
-            accounting: self.accounting.clone(),
+            phase_accounting: self.phase_accounting.clone(),
         });
 
         // #693 part 3 deliverable 1, amended by #739: a predicate-free query
@@ -2329,6 +2687,7 @@ impl ExecutionPlan for LogsScanExec {
         // whole-object GET (no plan probe, no scan-side probe). Any other shape
         // falls to the plan-then-stripe path below, byte for byte, and records
         // which conjunct sent it there.
+        let blocks = BlockMetrics::new(&self.metrics, partition);
         let (work, fast_whole_segment, state) = match self.whole_segment_fast_path(&ctx.query) {
             Ok(relevant) => {
                 let n = self.target_partitions.max(1).min(relevant.max(1));
@@ -2350,6 +2709,7 @@ impl ExecutionPlan for LogsScanExec {
                     Arc::clone(&ctx),
                     Arc::clone(&self.segments),
                     self.target_partitions,
+                    blocks.plan_init_elapsed.clone(),
                 );
                 (VecDeque::new(), false, LogScanState::Planning(counts_fut))
             }
@@ -2359,10 +2719,19 @@ impl ExecutionPlan for LogsScanExec {
             schema: Arc::clone(&self.schema),
             projection: Arc::clone(&self.projection),
             declared: Arc::clone(&self.declared),
+            attr_keys: Arc::clone(&self.attr_keys),
+            full_len: self.full_schema.fields().len(),
             ctx,
             erasure: Arc::clone(&self.erasure),
             columnar_eligible: self.columnar_eligible,
-            blocks: BlockMetrics::new(&self.metrics, partition),
+            blocks,
+            metrics: self.metrics.clone(),
+            segment_timing: self.segment_timing,
+            origin: self.created_at,
+            stream_started: Instant::now(),
+            open_started: None,
+            first_batch_seen: false,
+            done_seen: false,
             partition,
             target_partitions: self.target_partitions,
             stripe_blocks: self.stripe_blocks,
@@ -2377,11 +2746,14 @@ impl ExecutionPlan for LogsScanExec {
             current_seg: None,
             current_seg_ordinal: 0,
             block_cursor: 0,
+            consecutive_fallbacks: 0,
             pending_range: None,
             current_indices: Vec::new(),
             current_footer: None,
-            seg_columnar_blocks: 0,
+            current_whole_object: None,
             state,
+            fetch: self.fetch,
+            rows_emitted: 0,
         }))
     }
 }
@@ -2417,6 +2789,16 @@ struct SegPlan {
     /// instead. Carried to each per-partition subset open through [`OwnedSeg`] so
     /// the open reuses it and skips its own suffix probe.
     footer: Option<LogFooter>,
+    /// The whole-object bytes the plan fallback branch already fetched for
+    /// this segment (issue #835), when that branch resolved the entire
+    /// object. Carried to the subset open through [`OwnedSeg`] so it does not
+    /// pay a second wire GET for bytes the plan phase already holds. `None`
+    /// on the fast/skip-decidable footer branches (no block read), on the
+    /// fallback's ranged crossover (not the whole object), and when
+    /// [`compute_plan_counts`]'s concurrency bound dropped an already-fetched
+    /// whole object because `plan_concurrency` other segments' bytes were
+    /// retained first -- that segment's subset open re-fetches instead.
+    whole_object: Option<CarriedWholeObject>,
 }
 
 type CountsFuture = Pin<Box<dyn Future<Output = DFResult<Arc<PlanCounts>>> + Send>>;
@@ -2430,28 +2812,68 @@ fn plan_counts_future(
     ctx: Arc<PartitionCtx>,
     segments: Arc<Vec<SegmentRef>>,
     plan_concurrency: usize,
+    plan_init_elapsed: Time,
 ) -> CountsFuture {
     Box::pin(async move {
         let counts = cell
-            .get_or_try_init(|| compute_plan_counts(&ctx, &segments, plan_concurrency))
+            .get_or_try_init(|| async {
+                // Only the initializing partition runs this closure, so the
+                // metric it records is the barrier's cost counted once.
+                let started = Instant::now();
+                let counts = compute_plan_counts(&ctx, &segments, plan_concurrency).await;
+                plan_init_elapsed.add_elapsed(started);
+                counts
+            })
             .await?;
         Ok(Arc::clone(counts))
     })
 }
 
+/// One segment's [`LogSegmentFetcher::plan_segment`] result: survivor count,
+/// stats, a carried footer (skip-decidable branches), and a carried
+/// whole-object body (the fallback branch, issue #835). `None` when the
+/// segment was pruned by ts bounds alone and never reached the fetcher.
+type PlanSegmentResult = Option<(
+    usize,
+    ScanStats,
+    Option<LogFooter>,
+    Option<CarriedWholeObject>,
+)>;
+
 /// Prune every segment once (no block decode) to build the shared block plan.
 ///
-/// The prunes run `plan_concurrency` at a time (`buffered`, so `segs` keeps
-/// snapshot order and [`owned_work`] can index it by segment position). Every
-/// partition awaits this whole pass before it drains anything, so the plan
-/// phase sits alone on the query's critical path: run serially it costs one
-/// object-store round trip per segment in sequence (issue #691 measured about
-/// 20 minutes per statement on 8424 objects, one GET in flight for the whole
-/// time). Concurrency here changes only how many of those reads are in flight,
-/// never their count (still one plan read sequence per segment) or their
-/// semantics (the first error aborts the plan, and `get_or_try_init` does not
-/// cache it); the fetcher's own in-flight GET semaphore remains the global
-/// bound, so an oversized `plan_concurrency` is safe.
+/// The prunes run `plan_concurrency` at a time (`buffer_unordered`, consumed
+/// as each completes rather than after the whole pass), and results are
+/// written into a position-indexed `Vec` so `segs` keeps snapshot order and
+/// [`owned_work`] can still index it by segment position even though
+/// completion order does not match it. Every partition awaits this whole pass
+/// before it drains anything, so the plan phase sits alone on the query's
+/// critical path: run serially it costs one object-store round trip per
+/// segment in sequence (issue #691 measured about 20 minutes per statement on
+/// 8424 objects, one GET in flight for the whole time). Concurrency here
+/// changes only how many of those reads are in flight, never their count
+/// (still one plan read sequence per segment) or their semantics (the first
+/// error aborts the plan, and `get_or_try_init` does not cache it). Which
+/// error that is became scheduling-dependent when the pass moved to
+/// completion order: a query whose segments fail differently can surface
+/// either one. The
+/// fetcher's own in-flight GET semaphore remains the global bound, so an
+/// oversized `plan_concurrency` is safe.
+///
+/// `plan_concurrency` here is `self.target_partitions`, the query's SQL
+/// partition count -- not `--store-get-concurrency`'s object-store GET
+/// limiter (ADR-1195), which bounds in-flight wire requests process-wide
+/// and, since ADR-1195 T2, is a separate knob from this one.
+///
+/// `plan_concurrency` also bounds how many carried whole objects (issue #835)
+/// this pass retains at once (issue #835 follow-up): the first
+/// `plan_concurrency` segments to COMPLETE with a carried whole object (not
+/// the first `plan_concurrency` by segment position -- completion order under
+/// `buffer_unordered` is scheduling-dependent) keep their bytes; every later
+/// one has its `whole_object` forced to `None` before it is stored, so its
+/// subset open pays a real re-fetch in the scan phase instead of holding
+/// bytes the rest of the pass has not yet caught up to consuming. See this
+/// module's doc, "Whole-object fallback carry, and its memory bound".
 // Issue #693 part 3: the predicate-free full-window fast path in `execute`
 // skips this whole pass; see `owned_work` and `plan_segment_fast`.
 async fn compute_plan_counts(
@@ -2459,49 +2881,88 @@ async fn compute_plan_counts(
     segments: &[SegmentRef],
     plan_concurrency: usize,
 ) -> DFResult<Arc<PlanCounts>> {
-    // Not-yet-polled futures, one per segment, so `buffered` decides how many
-    // run at once. Built with a loop rather than a `map` closure: a closure
-    // returning a future that borrows its argument cannot satisfy the
-    // higher-ranked bound this `Send` boxed future needs.
+    // Not-yet-polled futures, one per segment tagged with its snapshot
+    // position, so `buffer_unordered` decides how many run at once and the
+    // consumer loop below can still store each result at its original index.
+    // Built with a loop rather than a `map` closure: a closure returning a
+    // future that borrows its argument cannot satisfy the higher-ranked bound
+    // this `Send` boxed future needs.
     let mut prunes = Vec::with_capacity(segments.len());
-    for seg in segments {
+    for (idx, seg) in segments.iter().enumerate() {
         // Refuse an unreadable version BEFORE the plan probe, not after. This
         // is a second entry point into the fetch layer alongside the three
         // route choices below, and `plan_segment` issues its footer probe
         // before the open phase can reject the version -- so without this the
         // ordering guarantee holds on the scan path and quietly fails here.
         refuse_unreadable_version(seg)?;
-        prunes.push(
-            ctx.fetcher
-                .plan_segment(seg, ctx.tenant_hash, &ctx.query, &ctx.accounting),
+        let prune = ctx.fetcher.plan_segment(
+            seg,
+            ctx.tenant_hash,
+            &ctx.query,
+            ctx.phase_accounting.plan(),
         );
+        prunes.push(async move { (idx, prune.await) });
     }
-    let planned: Vec<Option<(usize, ScanStats, Option<LogFooter>)>> = futures::stream::iter(prunes)
-        .buffered(plan_concurrency.max(1))
-        .map_err(SqlError::from)
-        .try_collect()
-        .await?;
-    let mut segs = Vec::with_capacity(segments.len());
+    let budget = plan_concurrency.max(1);
+    let mut stream = futures::stream::iter(prunes).buffer_unordered(budget);
+    let mut segs: Vec<Option<SegPlan>> = std::iter::repeat_with(|| None)
+        .take(segments.len())
+        .collect();
     let mut total_blocks = 0usize;
     let mut full_reads = 0usize;
-    for entry in planned {
-        match entry {
-            Some((survivors, stats, footer)) => {
-                total_blocks += survivors;
-                // A relevant segment planned from the skip index carries its
-                // footer forward; the whole-object fallback (#761) carries none.
-                if footer.is_none() {
-                    full_reads += 1;
-                }
-                segs.push(Some(SegPlan {
-                    survivors,
-                    stats,
-                    footer,
-                }));
+    // Only the RETAINED carried bytes -- the first `budget` segments to
+    // complete with a whole object -- are summed here, so this is the true
+    // peak `compute_plan_counts` holds at once, not the whole corpus. A
+    // dropped whole object never reaches this sum: its `whole_object` is
+    // `None` before `SegPlan` is built below.
+    let mut carried_bytes = 0u64;
+    let mut carried_seen = 0usize;
+    while let Some((idx, entry)) = stream.next().await {
+        let entry: PlanSegmentResult = entry.map_err(SqlError::from)?;
+        if let Some((survivors, stats, footer, whole_object)) = entry {
+            total_blocks += survivors;
+            // A relevant segment planned from the skip index carries its
+            // footer forward; the whole-object fallback (#761) carries none.
+            if footer.is_none() {
+                full_reads += 1;
             }
-            None => segs.push(None),
+            let whole_object = match whole_object {
+                // `survivors > 0` mirrors the condition `owned_work` uses to
+                // decide whether any partition ever opens this segment: a
+                // zero-survivor segment is dropped there regardless, so
+                // spending the budget on its carry here would retain bytes
+                // no partition ever reuses and starve a segment that would
+                // have.
+                Some(w) if survivors > 0 && carried_seen < budget => {
+                    carried_seen += 1;
+                    carried_bytes += w.byte_len();
+                    Some(w)
+                }
+                // Either no whole object to begin with, no surviving block to
+                // spend it on, or one arrived after the budget was already
+                // spent by earlier completions: drop it before it is ever
+                // stored, so it is never retained and never charged as
+                // reused.
+                _ => None,
+            };
+            segs[idx] = Some(SegPlan {
+                survivors,
+                stats,
+                footer,
+                whole_object,
+            });
         }
     }
+    // A single call with the final sum is only correct because `carried_bytes`
+    // is monotonically non-decreasing across this loop: nothing here ever
+    // releases a retained buffer mid-pass, so the last value is also the
+    // peak. If a future change lets retention shrink before this function
+    // returns (an eviction, an early release), this call must move inside
+    // the loop so `observe_intermediate_bytes` sees every local maximum, not
+    // just the end state.
+    ctx.phase_accounting
+        .plan()
+        .observe_intermediate_bytes(carried_bytes);
     Ok(Arc::new(PlanCounts {
         segs,
         total_blocks,
@@ -2521,6 +2982,11 @@ struct OwnedSeg {
     /// carried to the subset open so it skips its own suffix probe. `None` on the
     /// whole-segment fast path (no plan phase) and when the plan slow branch ran.
     footer: Option<LogFooter>,
+    /// The plan fallback's whole-object bytes for this segment (issue #835),
+    /// carried to the subset open so it does not pay a second wire GET.
+    /// `None` whenever [`SegPlan::whole_object`] was `None`, and always
+    /// `None` on the whole-segment fast path (no plan phase).
+    whole_object: Option<CarriedWholeObject>,
 }
 
 /// This partition's share of the block assignment, in one of two modes
@@ -2565,6 +3031,7 @@ fn owned_work(
                     ordinal: seg_idx,
                     indices,
                     footer: plan.footer.clone(),
+                    whole_object: plan.whole_object.clone(),
                 });
             }
         }
@@ -2581,6 +3048,7 @@ fn owned_work(
                     ordinal: seg_idx,
                     indices: (0..plan.survivors).collect(),
                     footer: plan.footer.clone(),
+                    whole_object: plan.whole_object.clone(),
                 });
             }
             seg_ordinal += 1;
@@ -2619,6 +3087,7 @@ fn owned_whole_segments(
                 ordinal: seg_idx,
                 indices: Vec::new(),
                 footer: None,
+                whole_object: None,
             });
         }
         ordinal += 1;
@@ -2636,7 +3105,7 @@ struct PartitionCtx {
     /// [`LogsScanExec::projected_fraction`], carried so the whole-segment fast
     /// path can route each segment as it opens it (issue #862).
     projected_fraction: f64,
-    accounting: QueryAccounting,
+    phase_accounting: PhaseAccounting,
 }
 
 impl PartitionCtx {
@@ -2684,9 +3153,9 @@ impl PartitionCtx {
     /// re-count, so the two counters sum to the fast-path segment count.
     fn record_open_shape(&self, by_column_chunk: bool) {
         if by_column_chunk {
-            self.accounting.add_logs_ranged_opens(1);
+            self.phase_accounting.scan().add_logs_ranged_opens(1);
         } else {
-            self.accounting.add_logs_whole_object_opens(1);
+            self.phase_accounting.scan().add_logs_whole_object_opens(1);
         }
     }
 
@@ -2733,7 +3202,7 @@ impl PartitionCtx {
     /// statement takes the same route and exactly one of the two recorders can
     /// fire for a given object.
     fn record_data_object_touched(&self) {
-        self.accounting.add_data_objects_touched(1);
+        self.phase_accounting.scan().add_data_objects_touched(1);
     }
 }
 
@@ -2777,6 +3246,7 @@ fn open_segment_subset(
     seg: SegmentRef,
     indices: Vec<usize>,
     footer: Option<LogFooter>,
+    whole_object: Option<CarriedWholeObject>,
 ) -> OpenFuture {
     Box::pin(async move {
         refuse_unreadable_version(&seg)?;
@@ -2789,7 +3259,8 @@ fn open_segment_subset(
                 &ctx.columns,
                 &indices,
                 footer.as_ref(),
-                &ctx.accounting,
+                whole_object,
+                ctx.phase_accounting.scan(),
             )
             .await
             .map_err(SqlError::from)?;
@@ -2814,7 +3285,7 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
                 ctx.tenant_hash,
                 &ctx.query,
                 &ctx.columns,
-                &ctx.accounting,
+                ctx.phase_accounting.scan(),
             )
             .await
             .map_err(SqlError::from)?;
@@ -2844,7 +3315,7 @@ fn open_segment_ranged(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
                 ctx.tenant_hash,
                 &ctx.query,
                 &ctx.columns,
-                &ctx.accounting,
+                ctx.phase_accounting.scan(),
             )
             .await
             .map_err(SqlError::from)?;
@@ -2862,6 +3333,18 @@ fn open_segment_fast(ctx: Arc<PartitionCtx>, seg: SegmentRef, by_column_chunk: b
     }
 }
 
+/// Consecutive `attrs_raw`-overflow fallbacks (see
+/// [`LogScanStream::consecutive_fallbacks`]) tolerated within one segment
+/// before the rest of this partition's block list is committed to the row
+/// path in one reopen, rather than reopening again to retry columnar. `1`:
+/// the first fallback still gets a columnar retry (the sparse case, where a
+/// single overflowing block among clean ones is common and worth resuming
+/// columnar for), but a second fallback immediately after it -- with no
+/// clean columnar block in between -- escalates. This bounds a segment to at
+/// most `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS + 1` reopens regardless of how
+/// many of its blocks overflow.
+const MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS: usize = 1;
+
 enum LogScanState {
     /// Awaiting the shared per-segment block plan (ADR-0102). Once it resolves,
     /// this partition's owned `(segment, block-index-list)` work is computed and
@@ -2873,31 +3356,50 @@ enum LogScanState {
     /// partition's block-index list).
     Opening(OpenFuture),
     /// Draining one segment's surviving blocks through the columnar fast path
-    /// (ADR-0099 decision 2). Entered only when the scan is statically eligible;
-    /// a block carrying an `attrs_raw` overflow page falls this segment back to
-    /// the row path via [`LogScanState::ReopenRows`].
+    /// (ADR-0099 decision 2). Entered when the scan is statically eligible, and
+    /// re-entered (issue #1769) once [`LogScanState::RowFallbackBlock`] has
+    /// taken the one block that carried an `attrs_raw` overflow page, so only
+    /// that block runs the row path instead of the rest of the segment.
     Columnar(Box<LogSegmentScan>),
     /// Draining one segment's surviving blocks through the row path
     /// ([`LogSegmentScan::next_block`]), rebuilding a [`LogRecord`] per row: the
-    /// unchanged pre-ADR-0099 path, taken by an ineligible scan or by the
-    /// `attrs_raw` fallback. `skip` blocks are drained and discarded first, to
-    /// step past the blocks a fallback already emitted columnar before it hit
-    /// the overflow page (0 for an ineligible scan that never ran the fast path).
-    Rows {
-        scan: Box<LogSegmentScan>,
-        skip: usize,
-    },
+    /// unchanged pre-ADR-0099 path, taken by a scan that is statically
+    /// ineligible for the columnar fast path, OR handed the
+    /// still-open scan by [`LogScanState::RowFallbackBlock`] once a segment
+    /// has hit [`MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS`] consecutive `attrs_raw`
+    /// fallbacks, committing the rest of this partition's block list to the
+    /// row path in one reopen instead of retrying columnar block by block.
+    /// Never carries a `skip`: a fallback reopen needs one only while it is
+    /// still resuming columnar, which is `RowFallbackBlock`'s job.
+    Rows(Box<LogSegmentScan>),
     /// Re-opening the current segment to restart it on the row path after a
     /// block turned out to carry an `attrs_raw` overflow page. The re-opened
     /// scan is given the SAME block-index list this partition owns for the
     /// segment (ADR-0102), so `skip` is a position within that list: the number
-    /// of this partition's blocks already emitted columnar. The re-opened row
-    /// scan drains and discards exactly those, then resumes, so no row this
-    /// partition owns is emitted twice or dropped -- and because the list is
-    /// this partition's own, a fallback another partition independently triggers
-    /// for the same segment concerns a disjoint list and cannot interfere.
+    /// of this partition's blocks already fully emitted (columnar, or by an
+    /// earlier `RowFallbackBlock`). Ready, it becomes
+    /// [`LogScanState::RowFallbackBlock`], never `Rows`: this state exists only
+    /// for the `attrs_raw` fallback.
     ReopenRows {
         fut: OpenFuture,
+        skip: usize,
+    },
+    /// The re-opened row scan from [`LogScanState::ReopenRows`]: drain and
+    /// discard `skip` blocks (already emitted columnar or by an earlier
+    /// fallback, so re-decoding them here does not re-emit a row), then take
+    /// exactly the next block -- the one that carried the `attrs_raw` overflow
+    /// page -- through the row path (issue #1769). That block done, the same
+    /// still-open scan is handed back to [`LogScanState::Columnar`] so the
+    /// blocks after it keep decoding columnar instead of falling the rest of
+    /// the segment to rows -- unless this is this segment's
+    /// [`MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS`]-th consecutive fallback with no
+    /// clean columnar block in between, in which case it is handed to
+    /// [`LogScanState::Rows`] instead, committing the rest of
+    /// the block list to the row path with no further reopen. A block-index
+    /// list this partition owns is never touched by another partition's
+    /// fallback (ADR-0102), so this reopen cannot race one.
+    RowFallbackBlock {
+        scan: Box<LogSegmentScan>,
         skip: usize,
     },
     Done,
@@ -2997,6 +3499,14 @@ struct LogScanStream {
     /// [`build_batch`] and [`build_columnar_batches`] for a projected declared
     /// index.
     declared: Arc<Vec<DeclaredColumn>>,
+    /// Synthetic per-key attribute columns (issue #1768), consulted by
+    /// [`build_batch`] and [`build_columnar_batches`] for a projected per-key
+    /// index (>= [`Self::full_len`]).
+    attr_keys: Arc<Vec<String>>,
+    /// The resolved full schema width (`full_schema.fields().len()`): a
+    /// projection index at or past it selects a synthetic per-key attribute
+    /// column, `attr_keys[index - full_len]`.
+    full_len: usize,
     ctx: Arc<PartitionCtx>,
     erasure: Arc<Vec<ErasurePredicate>>,
     /// Whether this scan may attempt the columnar fast path (the query-shape
@@ -3042,12 +3552,31 @@ struct LogScanStream {
     /// the segment field of every row-ref stamped while draining it.
     current_seg_ordinal: usize,
     /// How many blocks of the current segment's cursor this partition has
-    /// consumed, i.e. the position within [`Self::current_indices`] of the
-    /// block being drained. Reset when a new segment starts and carried across
-    /// the `attrs_raw` re-open, which resumes at exactly this position. It is
-    /// what turns a cursor position into a stable surviving-block index
-    /// ([`Self::current_block`]).
+    /// fully emitted, i.e. the position within [`Self::current_indices`] of the
+    /// block being drained. Advanced by both the columnar path and the row
+    /// path, so it stays correct across an `attrs_raw` fallback's `Columnar` ->
+    /// `RowFallbackBlock` -> `Columnar` round trip: it is both what turns a
+    /// cursor position into a stable surviving-block index
+    /// ([`Self::current_block`]) and the `skip` count a later fallback's
+    /// [`LogScanState::ReopenRows`] re-derives from. Reset when a new segment
+    /// starts.
     block_cursor: usize,
+    /// Count of `attrs_raw`-overflow fallbacks (issue #1769) since the last
+    /// clean columnar block in the current segment, reset to 0 at
+    /// `NextSegment` and by [`Step::Held`]. `max_dynamic_columns`
+    /// (`crates/ravel-logseg/src/writer.rs`, `block.rs`) is a PER-OBJECT
+    /// budget, so once a tenant's declared-plus-dynamic key count for a
+    /// segment exceeds it, the overflow keys recur across most of that
+    /// object's blocks: two fallbacks in a row is evidence the object's
+    /// budget is exhausted for its remaining blocks, not that this one block
+    /// was unlucky. [`MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS`] is the count of
+    /// consecutive fallbacks tolerated before the rest of this partition's
+    /// block list for the segment is committed to the row path in one
+    /// reopen instead of retrying columnar block by block,
+    /// which is what bounds the segment's total reopens to a constant
+    /// (`MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS + 1`) instead of one per
+    /// overflowing block.
+    consecutive_fallbacks: usize,
     /// The address the row-path batch builder stamps from while draining the
     /// held block. `None` when this scan emits no row refs.
     pending_range: Option<RowRefRange>,
@@ -3059,15 +3588,78 @@ struct LogScanStream {
     /// 2), kept so the `attrs_raw` fallback re-opens the subset with the same
     /// footer it first used. `None` on the whole-segment fast path.
     current_footer: Option<LogFooter>,
-    /// How many of this partition's blocks in the current segment the columnar
-    /// fast path has already emitted. The `attrs_raw` fallback re-opens the
-    /// segment over `current_indices` and skips this many positions so none is
-    /// emitted twice. Reset when a new segment starts draining.
-    seg_columnar_blocks: usize,
+    /// The plan fallback's whole-object bytes for [`Self::current_seg`]
+    /// (issue #835), consumed exactly once per stream by the FIRST open of
+    /// this segment (`Option::take` at the `NextSegment` state, before
+    /// `open_segment_subset`). `None` whenever the plan phase did not carry
+    /// whole-object bytes forward for this segment, always `None` on the
+    /// whole-segment fast path, and `None` here after that first take even
+    /// though the carry existed -- a later `ReopenRows`/`attrs_raw`-overflow
+    /// reopen of the SAME segment therefore takes the normal fetch/cache path
+    /// rather than reusing these bytes a second time.
+    ///
+    /// Once per stream, not once per buffer: under block striping a segment's
+    /// survivors can be owned by several partitions, each of which clones the
+    /// carry and charges the object's length to
+    /// `QueryAccounting::add_bytes_reused`. That matches what the figure
+    /// counts, one avoided store call per open, and is the same convention
+    /// those opens were charged under as cache hits before this carry existed.
+    /// The memory bound is unaffected: `Bytes` clones share one allocation.
+    current_whole_object: Option<CarriedWholeObject>,
     state: LogScanState,
+    /// The `fetch` pushed into the exec (issue #362), carried unchanged from
+    /// [`LogsScanExec::fetch`]. `None` means this stream drains every segment
+    /// it owns, exactly the pre-#362 behavior.
+    fetch: Option<usize>,
+    /// Rows this partition has emitted so far, summed at every batch actually
+    /// handed downstream (post content-filter and post `attrs_raw` erasure --
+    /// whatever a caller of this stream actually receives). Consulted only at
+    /// [`LogScanState::NextSegment`], and only to decide whether to open
+    /// another owned segment; it never truncates a batch or interrupts a
+    /// segment already being drained, so a partition can finish with more
+    /// than `fetch` rows of its own (the cross-partition limit is still
+    /// enforced above this node) but never with fewer while more of its own
+    /// owned work remained.
+    rows_emitted: usize,
+    /// The exec's metric set, kept so per-segment timeline points can be
+    /// published as labelled metrics (`segment=<ordinal>`) alongside the
+    /// per-partition totals in [`Self::blocks`].
+    metrics: ExecutionPlanMetricsSet,
+    /// Whether [`Self::mark_segment`] does anything (`SqlConfig::
+    /// segment_timing`, issue #913). `false` by default: no label
+    /// allocation, no metric registration, so `accumulate_scan_timing` finds
+    /// no per-segment rows.
+    segment_timing: bool,
+    /// The exec's creation instant; every `*_offset` metric is measured from it.
+    origin: Instant,
+    /// When this partition's stream was built; `planning_wait_elapsed` and
+    /// `stream_elapsed` start here.
+    stream_started: Instant,
+    /// When the open (or reopen) currently in flight was constructed.
+    open_started: Option<Instant>,
+    /// Whether `first_batch_elapsed` has been recorded.
+    first_batch_seen: bool,
+    /// Whether `stream_elapsed` has been recorded. `LogScanState::Done` keeps
+    /// returning `Poll::Ready(None)`, and the metric holds an offset from the
+    /// origin rather than an interval, so a second poll after completion would
+    /// overwrite a correct figure with a larger one that still looks monotone.
+    done_seen: bool,
 }
 
 impl LogScanStream {
+    /// Publish one timeline point for the segment being drained: `name` at the
+    /// current offset from the exec's origin, labelled with the segment's
+    /// snapshot ordinal so a reader can line the partitions up on one clock.
+    fn mark_segment(&self, name: &'static str) {
+        if !self.segment_timing {
+            return;
+        }
+        MetricBuilder::new(&self.metrics)
+            .with_new_label("segment", self.current_seg_ordinal.to_string())
+            .subset_time(name, self.partition)
+            .add_elapsed(self.origin);
+    }
+
     /// The surviving-block index of the block the cursor is about to yield, or
     /// `None` when this scan emits no row refs.
     ///
@@ -3108,6 +3700,8 @@ impl LogScanStream {
             Arc::clone(&self.schema),
             &self.projection,
             &self.declared,
+            &self.attr_keys,
+            self.full_len,
             pending_range.map(|r| RowRefRange {
                 first_row: r.first_row + *pos,
                 ..r
@@ -3227,16 +3821,42 @@ impl Stream for LogScanStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        this.blocks.polls.add(1);
+        let polled = this.poll_inner(cx);
+        match &polled {
+            Poll::Pending => this.blocks.polls_pending.add(1),
+            Poll::Ready(Some(Ok(_))) if !this.first_batch_seen => {
+                this.first_batch_seen = true;
+                this.blocks.first_batch_elapsed.add_elapsed(this.origin);
+            }
+            Poll::Ready(None) if !this.done_seen => {
+                this.done_seen = true;
+                this.blocks.stream_elapsed.add_elapsed(this.origin);
+            }
+            Poll::Ready(_) => {}
+        }
+        polled
+    }
+}
+
+impl LogScanStream {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<DFResult<RecordBatch>>> {
+        let this = self;
         loop {
             // Anything buffered from the current block goes out first.
             if this.has_pending() {
+                let emit_started = Instant::now();
                 let emitted = match &this.pending {
                     Pending::Rows { .. } => this.emit_next_row_batch(),
                     Pending::Batches(_) => this.emit_next_columnar_batch(),
                     Pending::None => unreachable!("has_pending() ruled this out"),
                 };
+                this.blocks.emit_elapsed.add_elapsed(emit_started);
                 return match emitted {
-                    Ok(batch) => Poll::Ready(Some(Ok(batch))),
+                    Ok(batch) => {
+                        this.rows_emitted += batch.num_rows();
+                        Poll::Ready(Some(Ok(batch)))
+                    }
                     Err(e) => this.fail(e),
                 };
             }
@@ -3249,6 +3869,9 @@ impl Stream for LogScanStream {
             match &mut this.state {
                 LogScanState::Planning(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(counts)) => {
+                        this.blocks
+                            .planning_wait_elapsed
+                            .add_elapsed(this.stream_started);
                         // Cap the stride by the real block count (ADR-0102): with
                         // fewer blocks than partitions this collapses the extra
                         // partitions to empty work, exactly what the declared
@@ -3278,19 +3901,45 @@ impl Stream for LogScanStream {
                     Poll::Ready(Err(e)) => return this.fail(e),
                     Poll::Pending => return Poll::Pending,
                 },
+                LogScanState::NextSegment
+                    if this.fetch.is_some_and(|fetch| this.rows_emitted >= fetch) =>
+                {
+                    // This partition's own emitted rows already meet the
+                    // pushed fetch (issue #362): stop opening further owned
+                    // segments. Never entered mid-segment (a segment already
+                    // in `Opening`/`Columnar`/`Rows` state drains to its own
+                    // completion first, so this partition never emits fewer
+                    // than `fetch` rows while more of its own owned data
+                    // remains), and never a truncation of what is already
+                    // buffered (`has_pending` above always runs first).
+                    this.work.clear();
+                    this.state = LogScanState::Done;
+                }
                 LogScanState::NextSegment => match this.work.pop_front() {
                     Some(OwnedSeg {
                         seg,
                         ordinal,
                         indices,
                         footer,
+                        whole_object,
                     }) => {
                         this.current_seg = Some(seg.clone());
                         this.current_seg_ordinal = ordinal;
                         this.current_indices = indices.clone();
                         this.current_footer = footer.clone();
-                        this.seg_columnar_blocks = 0;
+                        // Moved, not cloned: this stream consumes the carried
+                        // whole object exactly once, by whichever open below
+                        // `take()`s it first. A later `ReopenRows` reopen
+                        // must see `None` and pay for its own fetch (real GET
+                        // or read-cache hit), or `tenant_bytes_with_footer`
+                        // charges `add_bytes_reused` twice for one buffer
+                        // (issue #835 follow-up).
+                        this.current_whole_object = whole_object;
                         this.block_cursor = 0;
+                        this.consecutive_fallbacks = 0;
+                        this.blocks.segments_opened.add(1);
+                        this.open_started = Some(Instant::now());
+                        this.mark_segment("seg_open_start_offset");
                         // Whole-segment fast path reads the object in one GET
                         // (#693 part 3), or by column chunk when the projection
                         // is narrow enough to pay for the extra round trips
@@ -3312,11 +3961,18 @@ impl Stream for LogScanStream {
                                 by_chunk,
                             ))
                         } else {
+                            // `take()`, not the moved-in value directly: this
+                            // IS the one consumption of the carried whole
+                            // object (see the comment above where it moved
+                            // into `current_whole_object`). Taking it here
+                            // leaves `None` behind for any later reopen.
+                            let whole_object = this.current_whole_object.take();
                             LogScanState::Opening(open_segment_subset(
                                 Arc::clone(&this.ctx),
                                 seg,
                                 indices,
                                 footer,
+                                whole_object,
                             ))
                         };
                     }
@@ -3326,25 +3982,37 @@ impl Stream for LogScanStream {
                 },
                 LogScanState::Opening(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(Some(scan))) => {
+                        if let Some(started) = this.open_started.take() {
+                            this.blocks.open_elapsed.add_elapsed(started);
+                        }
+                        this.mark_segment("seg_open_ready_offset");
                         this.state = if this.columnar_eligible {
                             LogScanState::Columnar(Box::new(scan))
                         } else {
-                            LogScanState::Rows {
-                                scan: Box::new(scan),
-                                skip: 0,
-                            }
+                            LogScanState::Rows(Box::new(scan))
                         };
                     }
                     // The segment's ts span could not satisfy the query: no GET
                     // was issued and there is nothing to drain.
-                    Poll::Ready(Ok(None)) => this.state = LogScanState::NextSegment,
+                    Poll::Ready(Ok(None)) => {
+                        if let Some(started) = this.open_started.take() {
+                            this.blocks.open_elapsed.add_elapsed(started);
+                        }
+                        this.state = LogScanState::NextSegment;
+                    }
                     Poll::Ready(Err(e)) => return this.fail(e),
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        this.blocks.open_pending_polls.add(1);
+                        return Poll::Pending;
+                    }
                 },
                 LogScanState::ReopenRows { fut, skip } => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(Some(scan))) => {
+                        if let Some(started) = this.open_started.take() {
+                            this.blocks.reopen_elapsed.add_elapsed(started);
+                        }
                         let skip = *skip;
-                        this.state = LogScanState::Rows {
+                        this.state = LogScanState::RowFallbackBlock {
                             scan: Box::new(scan),
                             skip,
                         };
@@ -3382,6 +4050,7 @@ impl Stream for LogScanStream {
                     // The view borrows `scan`, so every outcome is folded into an
                     // owned `Step` here; `this.fail`/`this.state` are only touched
                     // after the match, once that borrow has ended.
+                    let decode_started = Instant::now();
                     let step = match scan.next_block_columnar() {
                         Ok(ColumnarBlockOutcome::Exhausted) => Step::Exhausted(scan.stats()),
                         // The fast path is only entered with no erasure, so this
@@ -3411,6 +4080,8 @@ impl Stream for LogScanStream {
                                         &this.schema,
                                         &this.projection,
                                         &this.declared,
+                                        &this.attr_keys,
+                                        this.full_len,
                                         block.map(|block| RowRefRange {
                                             segment: this.current_seg_ordinal,
                                             block,
@@ -3429,6 +4100,7 @@ impl Stream for LogScanStream {
                         }
                         Err(e) => Step::Failed(SqlError::from(e).into()),
                     };
+                    this.blocks.decode_build_elapsed.add_elapsed(decode_started);
                     match step {
                         Step::Failed(e) => return this.fail(e),
                         Step::Exhausted(stats) => {
@@ -3440,28 +4112,35 @@ impl Stream for LogScanStream {
                             if this.fast_whole_segment {
                                 this.blocks.record_segment_totals(&stats);
                             }
+                            this.mark_segment("seg_done_offset");
                             this.state = LogScanState::NextSegment;
                         }
                         Step::Fallback => {
                             // Re-open the segment on the row path over the SAME
                             // block-index list this partition owns (ADR-0102),
-                            // skipping the blocks already emitted columnar so no
-                            // row is emitted twice. `skip` is a position within
-                            // this partition's own list, so the count and the list
-                            // line up even when the segment's blocks are striped
-                            // across several partitions.
+                            // skipping the blocks already fully emitted (columnar,
+                            // or row-emitted by an earlier fallback in this same
+                            // segment) so no row is emitted twice. `skip` is
+                            // `block_cursor`, a position within this partition's
+                            // own list, so the count and the list line up even
+                            // when the segment's blocks are striped across several
+                            // partitions. `RowFallbackBlock` (issue #1769) takes
+                            // only the next block -- the one that just failed the
+                            // columnar attempt -- through the row path, then hands
+                            // this reopened scan back to `Columnar` for the rest.
                             //
                             // Publish the abandoned columnar cursor's partial
                             // counters (issue #474) before it is dropped: the
                             // re-opened row scan below re-decodes this partition's
-                            // whole list from the start, so those blocks' pages are
-                            // decoded twice, but the abandoned cursor's own count
-                            // of its first pass was previously discarded along with
-                            // it. `record_scan` accumulates, so this and the row
-                            // scan's own eventual `record_scan` call sum to the
-                            // real total decode work across both passes, matching
-                            // what `EXPLAIN ANALYZE` claims the counters prove
-                            // (ADR-0087): that projection reached the page level.
+                            // list from the start up to `skip`, so those blocks'
+                            // pages are decoded twice, but the abandoned cursor's
+                            // own count of its first pass was previously discarded
+                            // along with it. `record_scan` accumulates, so this
+                            // and the reopened scan's own eventual `record_scan`
+                            // call(s) sum to the real total decode work across all
+                            // passes, matching what `EXPLAIN ANALYZE` claims the
+                            // counters prove (ADR-0087): that projection reached
+                            // the page level.
                             this.blocks.record_scan(&scan.stats());
                             let seg = match this.current_seg.clone() {
                                 Some(seg) => seg,
@@ -3480,28 +4159,42 @@ impl Stream for LogScanStream {
                                 let by_chunk = this.ctx.open_by_column_chunk(&seg);
                                 open_segment_fast(Arc::clone(&this.ctx), seg, by_chunk)
                             } else {
+                                // `take()`, not `clone()`: the first open
+                                // already took the carried whole object (if
+                                // any), so this is always `None` here. `take`
+                                // rather than reading the field directly keeps
+                                // that single-consumption invariant true by
+                                // construction instead of by this call site
+                                // happening to run after the first one.
                                 open_segment_subset(
                                     Arc::clone(&this.ctx),
                                     seg,
                                     this.current_indices.clone(),
                                     this.current_footer.clone(),
+                                    this.current_whole_object.take(),
                                 )
                             };
+                            this.blocks.reopens.add(1);
+                            this.consecutive_fallbacks += 1;
+                            this.open_started = Some(Instant::now());
                             this.state = LogScanState::ReopenRows {
                                 fut,
-                                skip: this.seg_columnar_blocks,
+                                skip: this.block_cursor,
                             };
                         }
                         Step::Held {
                             batches,
                             block_bytes,
                         } => {
+                            // A clean columnar block: the streak of consecutive
+                            // fallbacks that would otherwise escalate to a
+                            // full row-path commit is broken.
+                            this.consecutive_fallbacks = 0;
                             // Count every consumed clean block, empty or not, so
-                            // a later `attrs_raw` fallback skips exactly the
-                            // blocks the columnar cursor advanced past. The
+                            // a later `attrs_raw` fallback's `ReopenRows` skips
+                            // exactly the blocks the cursor advanced past. The
                             // row-ref cursor moves with it, so a fallback
                             // re-opens at the same surviving-block position.
-                            this.seg_columnar_blocks += 1;
                             this.block_cursor += 1;
                             // A block with no surviving row is not held at all:
                             // the loop asks for the next block immediately,
@@ -3516,25 +4209,11 @@ impl Stream for LogScanStream {
                         }
                     }
                 }
-                LogScanState::Rows { scan, skip } => {
-                    // Drain and discard the blocks a columnar fallback already
-                    // emitted, then hold the next block's records.
-                    if *skip > 0 {
-                        match scan.next_block() {
-                            Ok(Some(_)) => *skip -= 1,
-                            Ok(None) => {
-                                let stats = scan.stats();
-                                this.blocks.record_scan(&stats);
-                                if this.fast_whole_segment {
-                                    this.blocks.record_segment_totals(&stats);
-                                }
-                                this.state = LogScanState::NextSegment;
-                            }
-                            Err(e) => return this.fail(SqlError::from(e).into()),
-                        }
-                        continue;
-                    }
-                    match scan.next_block() {
+                LogScanState::Rows(scan) => {
+                    let decode_started = Instant::now();
+                    let next = scan.next_block();
+                    this.blocks.decode_build_elapsed.add_elapsed(decode_started);
+                    match next {
                         Ok(Some(records)) => {
                             // Stamp the block's row-ref address before the
                             // records are held: the batch builder reads it out
@@ -3555,6 +4234,97 @@ impl Stream for LogScanStream {
                             if this.fast_whole_segment {
                                 this.blocks.record_segment_totals(&stats);
                             }
+                            this.mark_segment("seg_done_offset");
+                            this.state = LogScanState::NextSegment;
+                        }
+                        Err(e) => return this.fail(SqlError::from(e).into()),
+                    }
+                }
+                LogScanState::RowFallbackBlock { scan, skip } => {
+                    // Drain and discard the blocks already fully emitted
+                    // (columnar, or row-emitted by an earlier fallback in this
+                    // same segment), then take exactly the next block -- the one
+                    // that carried the `attrs_raw` overflow page -- through the
+                    // row path.
+                    if *skip > 0 {
+                        let decode_started = Instant::now();
+                        let next = scan.next_block();
+                        this.blocks.decode_build_elapsed.add_elapsed(decode_started);
+                        match next {
+                            Ok(Some(_)) => *skip -= 1,
+                            Ok(None) => {
+                                let stats = scan.stats();
+                                this.blocks.record_scan(&stats);
+                                if this.fast_whole_segment {
+                                    this.blocks.record_segment_totals(&stats);
+                                }
+                                this.mark_segment("seg_done_offset");
+                                this.state = LogScanState::NextSegment;
+                            }
+                            Err(e) => return this.fail(SqlError::from(e).into()),
+                        }
+                        continue;
+                    }
+                    let decode_started = Instant::now();
+                    let next = scan.next_block();
+                    this.blocks.decode_build_elapsed.add_elapsed(decode_started);
+                    match next {
+                        Ok(Some(records)) => {
+                            // Stamp the block's row-ref address before the
+                            // records are held: the batch builder reads it out
+                            // of `pending_range` as it chunks them.
+                            match this.take_block_range() {
+                                Ok(range) => this.pending_range = range,
+                                Err(e) => return this.fail(e),
+                            }
+                            if let Err(e) = this.take_row_block(records) {
+                                return this.fail(e);
+                            }
+                            // Exactly one block goes through the row path per
+                            // fallback (issue #1769): hand the still-open scan
+                            // back to the columnar cursor for the blocks after
+                            // it instead of falling the rest of the segment to
+                            // rows -- UNLESS this segment has now hit
+                            // `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS` fallbacks in
+                            // a row with no clean columnar block between them
+                            // (issue #1769 follow-up): the per-object `attrs_raw` budget
+                            // that caused this block to overflow almost
+                            // certainly causes the rest of this partition's
+                            // block list to as well, so retrying columnar
+                            // block by block would pay one reopen per
+                            // remaining block for no columnar benefit. Commit
+                            // the still-open scan straight to `Rows` instead:
+                            // it already sits right after the block just
+                            // emitted, so the remaining blocks drain through
+                            // the row path with no further reopen, bounding
+                            // this segment's total reopens to
+                            // `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS + 1`.
+                            let scan = match std::mem::replace(&mut this.state, LogScanState::Done)
+                            {
+                                LogScanState::RowFallbackBlock { scan, .. } => scan,
+                                _ => unreachable!("state just matched as RowFallbackBlock"),
+                            };
+                            this.state = if this.consecutive_fallbacks
+                                > MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS
+                            {
+                                LogScanState::Rows(scan)
+                            } else {
+                                LogScanState::Columnar(scan)
+                            };
+                        }
+                        // Cannot happen: the columnar cursor that triggered this
+                        // fallback had already decoded this exact block, so a
+                        // fresh cursor positioned at the same index (past the
+                        // `skip` already discarded) must yield it too. Treated
+                        // as end-of-segment rather than panicking, matching
+                        // `ReopenRows`'s own `Ok(None)` handling above.
+                        Ok(None) => {
+                            let stats = scan.stats();
+                            this.blocks.record_scan(&stats);
+                            if this.fast_whole_segment {
+                                this.blocks.record_segment_totals(&stats);
+                            }
+                            this.mark_segment("seg_done_offset");
                             this.state = LogScanState::NextSegment;
                         }
                         Err(e) => return this.fail(SqlError::from(e).into()),
@@ -3595,6 +4365,8 @@ fn build_batch(
     schema: SchemaRef,
     projection: &[usize],
     declared: &[DeclaredColumn],
+    attr_keys: &[String],
+    full_len: usize,
     row_refs: Option<RowRefRange>,
 ) -> DFResult<RecordBatch> {
     // Precompute the merged attribute view once per record when any projected
@@ -3684,6 +4456,23 @@ fn build_batch(
                 }
                 Arc::new(attrs.finish())
             }
+            // A synthetic per-key attribute column (issue #1768): index
+            // >= full_len selects `attr_keys[i - full_len]`, rendered as `Utf8`
+            // straight from the merged view with the map's own rules. This is
+            // the row-path (attrs_raw fallback) sibling of the columnar
+            // [`build_attr_key_columnar_array`], and it renders each value with
+            // the same [`attr_value_to_string`] the `attrs` map arm above uses,
+            // so the divergence from a declared column (a non-`Str` value under
+            // a `Str` declaration renders as text here, reads NULL there) is
+            // reproduced exactly.
+            other if other >= full_len => match attr_keys.get(other - full_len) {
+                Some(key) => attr_key_column_array(key, &merged),
+                None => {
+                    return Err(DataFusionError::Internal(format!(
+                        "logs scan projection index {other} out of range"
+                    )));
+                }
+            },
             // A declared typed attribute column (ADR-0090 decisions 5-7):
             // index >= FIRST_DECLARED_COL selects `declared[i - FIRST_DECLARED_COL]`.
             // The declared key is still present in the `attrs` map arm above
@@ -3786,6 +4575,29 @@ fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>
             Arc::new(b.finish())
         }
     }
+}
+
+/// Build one synthetic per-key attribute column as a `Utf8` array from the
+/// per-record precomputed merged views (issue #1768), the row-path sibling of
+/// [`build_attr_key_columnar_array`].
+///
+/// For each record the key is looked up in that record's merged view via
+/// [`find_attr`] and rendered to text with [`attr_value_to_string`], exactly as
+/// the `attrs` map column renders it; an absent key is NULL. This is what makes
+/// `attrs['k']` diverge from a declared `Str` column `"k"` by design: a record
+/// holding a non-`Str` value under the key renders as text here (`7`) while the
+/// declared column reads NULL. The row path runs only for the `attrs_raw`
+/// overflow fallback of an otherwise-columnar query; the common case is
+/// [`build_attr_key_columnar_array`].
+fn attr_key_column_array(key: &str, merged: &[Vec<(String, AttrValue)>]) -> ArrayRef {
+    let mut b = StringBuilder::new();
+    for row in merged {
+        match find_attr(row, key) {
+            Some(v) => b.append_value(attr_value_to_string(v)),
+            None => b.append_null(),
+        }
+    }
+    Arc::new(b.finish())
 }
 
 // ---------------------------------------------------------------------------
@@ -3897,11 +4709,34 @@ impl<'d, 'a> DeclaredPlan<'d, 'a> {
         self.cursors.len() == 1 && self.matching_idx == Some(0)
     }
 
-    /// Whether the record sets the key in any of its FIELD_DIR columns at
-    /// surviving row `i`. Only consulted in the multi-column case; the fused case
-    /// gets the same answer from the single matching read.
-    fn record_sets_key(&self, i: usize) -> bool {
-        self.cursors.iter().any(|c| c.present_at(i))
+    /// The index into [`Self::cols`]/[`Self::cursors`] of the record's WINNING
+    /// occurrence of the key at surviving row `i`, or `None` when the record does
+    /// not set the key at all.
+    ///
+    /// A record that carries one name in several FIELD_DIR columns (a name
+    /// written as both a string and an integer splits into two columns) resolves
+    /// to one value, and which one is fixed by docs/log-segment-format.md
+    /// ("Within the record layer"): `rebuild_record` lays a record's columnar
+    /// occurrences out ascending by FIELD_DIR type byte and `merged_attrs` folds
+    /// that list last-wins, so the occurrence with the highest type byte wins.
+    /// The `attrs_raw` overflow tier, which beats every columnar occurrence,
+    /// cannot appear here: a block carrying an `attrs_raw` page falls the whole
+    /// segment back to the row path before the fast path builds a column.
+    ///
+    /// `max_by_key` returns the LAST maximum, which is the tie-break the same
+    /// paragraph pins; the type byte is read from [`Self::cols`] rather than
+    /// from FIELD_DIR position, so the answer does not depend on the directory's
+    /// sort order.
+    ///
+    /// Only consulted in the multi-column case; the fused case gets the same
+    /// answer from the single matching read.
+    fn winning_idx(&self, i: usize) -> Option<usize> {
+        self.cursors
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.present_at(i))
+            .max_by_key(|(k, _)| self.cols[*k].ty.to_u8())
+            .map(|(k, _)| k)
     }
 }
 
@@ -3953,12 +4788,13 @@ fn resource_attrs<'c>(
 /// `stream_ref`, so it is memoized per `stream_ref`: its scan and the one clone
 /// of its result run once per distinct stream in the block, not once per row.
 ///
-/// The precedence is unchanged (ADR-0090 decision 7): the record's own value
-/// wins if it sets the key in any FIELD_DIR column; a record that sets the key at
-/// a different type yields NULL and does NOT consult the fallback; only a record
-/// that does not set the key at all reads the resource/scope value. The
-/// `single_matching` fast path still treats a `Str` cell that is not valid UTF-8
-/// as absent, falling through to the fallback.
+/// The precedence is ADR-0090 decision 7: the record's own value wins if it sets
+/// the key in any FIELD_DIR column; a record whose winning occurrence
+/// ([`DeclaredPlan::winning_idx`]) is at a different type yields NULL and does
+/// NOT consult the fallback; only a record that does not set the key at all
+/// reads the resource/scope value. The `single_matching` fast path still treats
+/// a `Str` cell that is not valid UTF-8 as absent, falling through to the
+/// fallback.
 struct DeclaredResolver<'p, 'd, 'a> {
     plan: &'p DeclaredPlan<'d, 'a>,
     /// [`DeclaredPlan::single_matching`], resolved once for the block.
@@ -4006,11 +4842,13 @@ impl<'p, 'd, 'a> DeclaredResolver<'p, 'd, 'a> {
     }
 
     /// The merged value of the declared key at surviving row `i`. Returns the
-    /// record-column value when the record sets the key at the declared type;
-    /// `None` when the record sets it at a different type (wrong variant, NULL by
-    /// ADR-0090 decision 7). Only when the record does not set the key at all is
-    /// the resource/scope fallback consulted, whose variant the caller checks
-    /// against the declared type.
+    /// record-column value when the record's WINNING occurrence of the key
+    /// ([`DeclaredPlan::winning_idx`]) is at the declared type; `None` when that
+    /// winner is at a different type (wrong variant, NULL by ADR-0090 decision
+    /// 7), including the case where the record also has a declared-type cell at
+    /// this row that the winner shadows. Only when the record does not set the
+    /// key at all is the resource/scope fallback consulted, whose variant the
+    /// caller checks against the declared type.
     fn merged_value(
         &mut self,
         view: &ColumnarBlockView<'_>,
@@ -4026,11 +4864,17 @@ impl<'p, 'd, 'a> DeclaredResolver<'p, 'd, 'a> {
             if let Some(v) = self.matching_cursor.and_then(|c| c.value_at(i)) {
                 return Ok(Some(v));
             }
-        } else if self.plan.record_sets_key(i) {
-            // Record wins. Its value is the declared-type column's cell, or NULL
-            // when the record set the key only in a different-typed column
-            // (ADR-0090 decision 7); either way the fallback is not consulted.
-            return Ok(self.matching_cursor.and_then(|c| c.value_at(i)));
+        } else if let Some(win) = self.plan.winning_idx(i) {
+            // Record wins. Its value is the cell of the occurrence that wins the
+            // record layer's last-occurrence-wins order
+            // ([`DeclaredPlan::winning_idx`]), or NULL when that winner is of a
+            // type other than the declared one (ADR-0090 decision 7); either way
+            // the fallback is not consulted.
+            return Ok(if Some(win) == self.plan.matching_idx {
+                self.plan.cursors[win].value_at(i)
+            } else {
+                None
+            });
         }
         let Some(stream_ref) = view.stream_ref(i) else {
             return Ok(None);
@@ -4155,13 +4999,17 @@ fn build_declared_str_columnar(
                 })?;
                 let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
                 for i in start..end {
-                    if plan.record_sets_key(i) {
-                        // Record wins. `id_at` is `Some` only when the record's
-                        // `Str` column has a value at this row; `None` (record set
-                        // the key in another-typed column) is a NULL cell. An `id`
-                        // pointing at a non-UTF-8 (NULL) dictionary value also reads
-                        // NULL, matching the UTF-8 rule on the `Str` cursor.
-                        match col.id_at(i) {
+                    if let Some(win) = plan.winning_idx(i) {
+                        // Record wins. Its value is the winning occurrence's cell
+                        // ([`DeclaredPlan::winning_idx`]); a winner in another-typed
+                        // column of the same key is a NULL cell, even when this row
+                        // also has a `Str` cell the winner shadows. An `id` pointing
+                        // at a non-UTF-8 (NULL) dictionary value also reads NULL,
+                        // matching the UTF-8 rule on the `Str` cursor.
+                        match (Some(win) == plan.matching_idx)
+                            .then(|| col.id_at(i))
+                            .flatten()
+                        {
                             Some(id) => keys.push(Some(i32::try_from(id).map_err(|_| {
                                 DataFusionError::Internal(
                                     "declared Str dictionary id exceeds i32".into(),
@@ -4217,10 +5065,14 @@ fn build_declared_str_columnar(
                         }
                         // A `None` here (absent, or not UTF-8) falls through to
                         // the fallback, matching the row path.
-                    } else if plan.record_sets_key(i) {
-                        // Record wins: its declared-type `Str` cell, or NULL when
-                        // it set the key only in a different-typed column.
-                        match matching_str.and_then(|c| c.str_at(i)) {
+                    } else if let Some(win) = plan.winning_idx(i) {
+                        // Record wins: the winning occurrence's `Str` cell, or NULL
+                        // when that winner sits in a different-typed column of the
+                        // same key ([`DeclaredPlan::winning_idx`]).
+                        match (Some(win) == plan.matching_idx)
+                            .then(|| matching_str.and_then(|c| c.str_at(i)))
+                            .flatten()
+                        {
                             Some(s) => {
                                 values.append_value(s);
                                 keys.push(Some(next));
@@ -4257,6 +5109,123 @@ fn build_declared_str_columnar(
     )
 }
 
+/// One synthetic per-key attribute column's FIELD_DIR resolution for a block
+/// (issue #1768), the map-rendering sibling of [`DeclaredPlan`]. It resolves
+/// every FIELD_DIR column of the key to a cursor once, so the row loop reads a
+/// value with no per-cell column lookup.
+struct AttrKeyPlan<'a> {
+    key: String,
+    /// The raw FIELD_DIR columns of this key, across all stored types.
+    cols: Vec<AttrColumn>,
+    /// Cursors parallel to [`Self::cols`], resolved once for the block.
+    cursors: Vec<DeclaredCursor<'a>>,
+}
+
+impl<'a> AttrKeyPlan<'a> {
+    fn build(view: &ColumnarBlockView<'a>, key: &str) -> AttrKeyPlan<'a> {
+        let cols: Vec<AttrColumn> = view.attr_columns_for(key).collect();
+        let cursors = cols
+            .iter()
+            .map(|&c| DeclaredCursor::resolve(view, c))
+            .collect();
+        AttrKeyPlan {
+            key: key.to_string(),
+            cols,
+            cursors,
+        }
+    }
+
+    /// The index of the record's WINNING occurrence of the key at surviving row
+    /// `i`, or `None` when the record sets the key in no FIELD_DIR column.
+    /// Identical rule to [`DeclaredPlan::winning_idx`]: the highest FIELD_DIR
+    /// type byte wins (the record layer's last-occurrence-wins order,
+    /// docs/log-segment-format.md), and a `Str` cell that is not valid UTF-8 is
+    /// not "present", so it does not shadow the resource/scope fallback. The
+    /// `attrs_raw` overflow tier cannot appear here: a block carrying an
+    /// `attrs_raw` page falls the whole segment back to the row path before this
+    /// builds a column.
+    fn winning_idx(&self, i: usize) -> Option<usize> {
+        self.cursors
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.present_at(i))
+            .max_by_key(|(k, _)| self.cols[*k].ty.to_u8())
+            .map(|(k, _)| k)
+    }
+}
+
+/// Per-key, per-block resolver for a synthetic attribute column's merged value
+/// rendered as text (issue #1768). Unlike [`DeclaredResolver`], which yields
+/// NULL for a record value whose variant does not match the declared type, this
+/// renders the WINNING value of any variant to text with
+/// [`attr_value_to_string`], reproducing the `attrs` map's own rendering and its
+/// divergence from a declared column. The resource/scope fallback is memoized
+/// per `stream_ref` exactly as `DeclaredResolver` does.
+struct AttrKeyResolver<'p, 'a> {
+    plan: &'p AttrKeyPlan<'a>,
+    fallback: HashMap<u32, Option<String>>,
+}
+
+impl<'p, 'a> AttrKeyResolver<'p, 'a> {
+    fn new(plan: &'p AttrKeyPlan<'a>) -> Self {
+        AttrKeyResolver {
+            plan,
+            fallback: HashMap::new(),
+        }
+    }
+
+    /// The merged value of the key at surviving row `i`, rendered to text, or
+    /// `None` (NULL) when the key is absent. The record's own winning
+    /// occurrence wins over the resource/scope value; only a record that sets
+    /// the key in no FIELD_DIR column consults the fallback.
+    fn text_at(
+        &mut self,
+        view: &ColumnarBlockView<'_>,
+        i: usize,
+        cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+    ) -> DFResult<Option<String>> {
+        if let Some(win) = self.plan.winning_idx(i) {
+            // A winning occurrence is present by construction, so `value_at` is
+            // `Some`; render it to text like the `attrs` map column does.
+            return Ok(self.plan.cursors[win]
+                .value_at(i)
+                .as_ref()
+                .map(attr_value_to_string));
+        }
+        let Some(stream_ref) = view.stream_ref(i) else {
+            return Ok(None);
+        };
+        match self.fallback.entry(stream_ref) {
+            std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut().clone()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let resource = resource_attrs(view, cache, stream_ref)?;
+                let value = find_attr(resource, &self.plan.key).map(attr_value_to_string);
+                Ok(e.insert(value).clone())
+            }
+        }
+    }
+}
+
+/// Build one synthetic per-key attribute column as a `Utf8` array for surviving
+/// rows `start..end` straight from the view (issue #1768). Byte-identical to
+/// [`attr_key_column_array`] over the same input.
+fn build_attr_key_columnar_array(
+    view: &ColumnarBlockView<'_>,
+    resolver: &mut AttrKeyResolver<'_, '_>,
+    start: usize,
+    end: usize,
+    cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+) -> DFResult<ArrayRef> {
+    let mut b = StringBuilder::new();
+    for i in start..end {
+        match resolver.text_at(view, i, cache)? {
+            Some(s) => b.append_value(s),
+            None => b.append_null(),
+        }
+    }
+    Ok(Arc::new(b.finish()))
+}
+
 /// A UTF-8 log field (`body`, `severity_text`) read from the view; a violation
 /// is the same client-visible corruption class the row path's `string_from_bytes`
 /// produces, never a panic or silently-wrong data.
@@ -4276,18 +5245,32 @@ fn build_columnar_batches(
     schema: &SchemaRef,
     projection: &[usize],
     declared: &[DeclaredColumn],
+    attr_keys: &[String],
+    full_len: usize,
     row_refs: Option<RowRefRange>,
 ) -> DFResult<Vec<RecordBatch>> {
     let n = view.surviving_count();
     // Resolve each projected declared column's FIELD_DIR columns to cursors once
     // for the whole block (ADR-0099 decision 2, #875), not per row and not per
     // chunk: the row loop then reads through the cursors with no column lookup.
+    // A synthetic per-key column (index >= full_len) is out of `declared`'s
+    // range, so this loop skips it; it gets its own plan below.
     let mut plans: HashMap<usize, DeclaredPlan<'_, '_>> = HashMap::new();
     for &idx in projection {
-        if idx >= FIRST_DECLARED_COL
+        if (FIRST_DECLARED_COL..full_len).contains(&idx)
             && let Some(dc) = declared.get(idx - FIRST_DECLARED_COL)
         {
             plans.insert(idx, DeclaredPlan::build(view, dc));
+        }
+    }
+    // Synthetic per-key attribute columns (issue #1768): one plan per projected
+    // per-key index, resolved once for the whole block like the declared plans.
+    let mut attr_plans: HashMap<usize, AttrKeyPlan<'_>> = HashMap::new();
+    for &idx in projection {
+        if idx >= full_len
+            && let Some(key) = attr_keys.get(idx - full_len)
+        {
+            attr_plans.insert(idx, AttrKeyPlan::build(view, key));
         }
     }
     // One resolver per declared column for the WHOLE block, not per chunk:
@@ -4297,6 +5280,10 @@ fn build_columnar_batches(
     let mut resolvers: HashMap<usize, DeclaredResolver<'_, '_, '_>> = plans
         .iter()
         .map(|(idx, plan)| (*idx, DeclaredResolver::new(plan)))
+        .collect();
+    let mut attr_resolvers: HashMap<usize, AttrKeyResolver<'_, '_>> = attr_plans
+        .iter()
+        .map(|(idx, plan)| (*idx, AttrKeyResolver::new(plan)))
         .collect();
     let mut cache: HashMap<u32, Arc<Vec<(String, AttrValue)>>> = HashMap::new();
     let mut out = Vec::new();
@@ -4308,6 +5295,7 @@ fn build_columnar_batches(
             schema,
             projection,
             &mut resolvers,
+            &mut attr_resolvers,
             &mut cache,
             start,
             end,
@@ -4331,6 +5319,7 @@ fn build_columnar_batch(
     schema: &SchemaRef,
     projection: &[usize],
     resolvers: &mut HashMap<usize, DeclaredResolver<'_, '_, '_>>,
+    attr_resolvers: &mut HashMap<usize, AttrKeyResolver<'_, '_>>,
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
     start: usize,
     end: usize,
@@ -4426,14 +5415,17 @@ fn build_columnar_batch(
                     "columnar fast path reached with an attrs map projection".into(),
                 ));
             }
-            other => match resolvers.get_mut(&other) {
-                Some(resolver) => build_declared_columnar_array(view, resolver, start, end, cache)?,
-                None => {
+            other => {
+                if let Some(resolver) = resolvers.get_mut(&other) {
+                    build_declared_columnar_array(view, resolver, start, end, cache)?
+                } else if let Some(resolver) = attr_resolvers.get_mut(&other) {
+                    build_attr_key_columnar_array(view, resolver, start, end, cache)?
+                } else {
                     return Err(DataFusionError::Internal(format!(
                         "logs columnar scan projection index {other} out of range"
                     )));
                 }
-            },
+            }
         };
         columns.push(array);
     }
@@ -4568,6 +5560,7 @@ mod cstat_reconcile_tests {
         );
         let stats = Arc::new(LoadedColumnStats {
             segments,
+            by_content_hash: HashMap::new(),
             part_blake3: Vec::new(),
         });
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -4583,7 +5576,7 @@ mod cstat_reconcile_tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             None,
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
             schema,
             Arc::new(declared),
         )
@@ -4742,7 +5735,7 @@ mod cstat_reconcile_tests {
 #[allow(clippy::expect_used)]
 mod columnar_lookup_tests {
     use super::*;
-    use datafusion::arrow::array::{Array, Int64Array};
+    use datafusion::arrow::array::{Array, BinaryArray, BooleanArray, Int64Array};
     use ravel_logseg::record::stream_attrs_bytes;
     use ravel_logseg::{
         ColumnSelection, LogRecord, ObjectIdentity, Predicate, RlogConfig, RlogReader, RlogWriter,
@@ -5223,6 +6216,268 @@ mod columnar_lookup_tests {
              resolver would read 6"
         );
     }
+
+    /// One declared column's cells rendered to a form the two paths can be
+    /// compared in: `None` for NULL, otherwise the value's text (lowercase hex
+    /// for `bytes`). `Str` is a `Dictionary(Int32, Utf8)` on both paths, so its
+    /// keys are resolved through the dictionary values here rather than
+    /// compared as ids: the two paths build different dictionaries for the same
+    /// logical column and only the logical values must match.
+    fn declared_cells(arr: &ArrayRef, ty: DeclaredType) -> Vec<Option<String>> {
+        match ty {
+            DeclaredType::Str => {
+                let d = arr
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()
+                    .expect("declared Str dictionary array");
+                let values = d
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 dictionary values");
+                (0..d.len())
+                    .map(|i| {
+                        if d.is_null(i) {
+                            return None;
+                        }
+                        let k = usize::try_from(d.keys().value(i)).expect("non-negative key");
+                        (!values.is_null(k)).then(|| values.value(k).to_string())
+                    })
+                    .collect()
+            }
+            DeclaredType::I64 => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("declared I64 array");
+                (0..a.len())
+                    .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
+                    .collect()
+            }
+            DeclaredType::Bool => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("declared Bool array");
+                (0..a.len())
+                    .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
+                    .collect()
+            }
+            DeclaredType::Bytes => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .expect("declared Bytes array");
+                (0..a.len())
+                    .map(|i| (!a.is_null(i)).then(|| hex::encode(a.value(i))))
+                    .collect()
+            }
+        }
+    }
+
+    /// Issue #1182, the reader half: a record carrying one attribute name more
+    /// than once resolves that name to ONE value, and both reader paths must
+    /// pick the same one.
+    ///
+    /// The rule is docs/log-segment-format.md, "Within the record layer": the
+    /// record's columnar occurrences ascending by FIELD_DIR type byte
+    /// (str=1 i64=2 f64=3 bool=4 bytes=5), then its `attrs_raw` overflow
+    /// occurrences ascending by canonical encoded value bytes, last entry wins.
+    /// It is NOT the record's write order, which the on-disk format does not
+    /// preserve. So among the columnar occurrences the HIGHEST type byte wins,
+    /// and the two records below that carry the same pair in opposite write
+    /// orders resolve identically.
+    ///
+    /// Every row is asserted against a literal expected value for each of the
+    /// four declarable types, so a drift names both the consumer and the type.
+    /// The two consumers this can reach in-crate are the row path
+    /// (`declared_column_array` over `merged_attrs` + `find_attr`, already
+    /// correct before #1182) and the columnar fast path
+    /// (`DeclaredResolver::merged_value` + `build_declared_str_columnar`, which
+    /// was first-occurrence-per-(name, type)-wins). The other two consumers of
+    /// the same rule live in crates this one does not depend on and pin the
+    /// SAME table of records and expectations:
+    /// `ravel_ingest::log_declared_stats::tests::duplicate_key_stamp_follows_the_readers_rule`
+    /// and `ravel_maintain::rlog::tests::duplicate_key_stamp_follows_the_readers_rule`.
+    ///
+    /// Prove-the-test: restoring `merged_value`'s `record_sets_key` arm
+    /// (`return Ok(self.matching_cursor.and_then(|c| c.value_at(i)))`) makes the
+    /// declared I64 column read 9 at ts 102 and 1 at ts 103 where the row path
+    /// reads NULL; restoring either `record_sets_key` arm of
+    /// `build_declared_str_columnar` makes the declared Str column read "x" at
+    /// ts 100 and 101 where the row path reads NULL.
+    #[test]
+    fn a_duplicate_key_resolves_last_occurrence_wins_on_both_reader_paths() {
+        let cfg = RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 16,
+            ..RlogConfig::default()
+        };
+        let res = [("svc", AttrValue::Str("a".into()))];
+        let records = vec![
+            // I64 written first, Str second: i64 (2) > str (1), so `k` is 5 and
+            // a declared Str column reads NULL, not "x".
+            rec(
+                1,
+                100,
+                &res,
+                &[("k", AttrValue::I64(5)), ("k", AttrValue::Str("x".into()))],
+            ),
+            // The same pair in the opposite write order: same winner.
+            rec(
+                1,
+                101,
+                &res,
+                &[("k", AttrValue::Str("x".into())), ("k", AttrValue::I64(5))],
+            ),
+            // bool (4) > i64 (2): a declared I64 column reads NULL, not 9.
+            rec(
+                1,
+                102,
+                &res,
+                &[("k", AttrValue::Bool(true)), ("k", AttrValue::I64(9))],
+            ),
+            // bytes (5) beats every other type.
+            rec(
+                1,
+                103,
+                &res,
+                &[
+                    ("k", AttrValue::I64(1)),
+                    ("k", AttrValue::Bytes(vec![0xab])),
+                ],
+            ),
+            // A single occurrence resolves to itself: the Str column is not
+            // simply always NULL, and the I64 column is not simply always set.
+            rec(1, 104, &res, &[("k", AttrValue::Str("y".into()))]),
+        ];
+        // The merged view every consumer must agree on, per record, keyed by ts.
+        let want_merged: Vec<(i64, AttrValue)> = vec![
+            (100, AttrValue::I64(5)),
+            (101, AttrValue::I64(5)),
+            (102, AttrValue::Bool(true)),
+            (103, AttrValue::Bytes(vec![0xab])),
+            (104, AttrValue::Str("y".into())),
+        ];
+        // The same view projected onto each declarable type: a value of another
+        // variant is NULL, never a cast (ADR-0090 decision 7).
+        let want_str = [None, None, None, None, Some("y".to_string())];
+        let want_i64 = [
+            Some("5".to_string()),
+            Some("5".to_string()),
+            None,
+            None,
+            None,
+        ];
+        let want_bool = [None, None, Some("true".to_string()), None, None];
+        let want_bytes = [None, None, None, Some("ab".to_string()), None];
+
+        // Row path (consumer 1, correct before #1182): decode the block's
+        // records, merge, build.
+        let mut obj = Vec::new();
+        let reader = write_and_scan(&records, &cfg, &mut obj);
+        let mut scan = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let block = scan.next_block(&obj).expect("row exit").expect("one block");
+        assert!(
+            scan.next_block(&obj).expect("row exit").is_none(),
+            "the input fits one block"
+        );
+        let merged: Vec<Vec<(String, AttrValue)>> = block
+            .iter()
+            .map(|r| merged_attrs(r).expect("merge"))
+            .collect();
+        // Consumer 1, field by field: `merged_attrs` + `find_attr` resolve the
+        // winner the format doc pins, for the record with that ts.
+        assert_eq!(block.len(), want_merged.len(), "every record survives");
+        for (r, row) in block.iter().zip(merged.iter()) {
+            let (_, want) = want_merged
+                .iter()
+                .find(|(ts, _)| *ts == r.ts_ns)
+                .expect("a record per expected ts");
+            assert_eq!(
+                find_attr(row, "k"),
+                Some(want),
+                "row path merged view at ts {}",
+                r.ts_ns
+            );
+        }
+
+        // Columnar fast path (consumer 2) over the same object.
+        let mut obj2 = Vec::new();
+        let reader2 = write_and_scan(&records, &cfg, &mut obj2);
+        let mut scan2 = reader2
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let view = scan2
+            .next_block_columnar(&obj2)
+            .expect("columnar exit")
+            .expect("one block");
+        assert!(
+            !view.has_attrs_raw_page(),
+            "no occurrence overflows, so the columnar path is what a scan takes \
+             here rather than falling back to the row path"
+        );
+        let rows = view.surviving_count();
+        assert_eq!(rows, records.len(), "all records survive in one block");
+
+        for (ty, want) in [
+            (DeclaredType::Str, &want_str),
+            (DeclaredType::I64, &want_i64),
+            (DeclaredType::Bool, &want_bool),
+            (DeclaredType::Bytes, &want_bytes),
+        ] {
+            let dc = DeclaredColumn::new("k", ty);
+            let plan = DeclaredPlan::build(&view, &dc);
+            assert!(
+                !plan.single_matching(),
+                "{ty:?}: `k` has a Str, I64, Bool and Bytes FIELD_DIR column, so \
+                 the multi-column precedence arm is what runs"
+            );
+            let mut cache = HashMap::new();
+            let col = declared_cells(
+                &build_declared_columnar_array(
+                    &view,
+                    &mut DeclaredResolver::new(&plan),
+                    0,
+                    rows,
+                    &mut cache,
+                )
+                .expect("columnar array"),
+                ty,
+            );
+            let row = declared_cells(&declared_column_array(&dc, &merged), ty);
+
+            // Consumer 1 against its literal expectation, in block order.
+            for (i, r) in block.iter().enumerate() {
+                let k = want_merged
+                    .iter()
+                    .position(|(ts, _)| *ts == r.ts_ns)
+                    .expect("a record per expected ts");
+                assert_eq!(
+                    row[i], want[k],
+                    "{ty:?}: row path at ts {} (block position {i})",
+                    r.ts_ns
+                );
+            }
+            // Consumer 2 against consumer 1, cell by cell. Both paths read the
+            // block's surviving rows in the same order, so this compares the
+            // same record on both sides.
+            assert_eq!(
+                col.len(),
+                row.len(),
+                "{ty:?}: the two paths build the same row count"
+            );
+            for i in 0..row.len() {
+                assert_eq!(
+                    col[i], row[i],
+                    "{ty:?}: columnar path disagrees with the row path at block \
+                     position {i}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5247,7 +6502,9 @@ mod projection_width_tests {
     }
 
     fn resolve(projection: &[usize]) -> ResolvedColumns {
-        resolve_columns(projection, &[], &[], &declared())
+        let declared = declared();
+        let full_len = FIRST_DECLARED_COL + declared.len();
+        resolve_columns(projection, &[], &[], &declared, &[], full_len)
     }
 
     /// `ts` plus one declared column: three object columns, the q07 shape.
@@ -5300,11 +6557,15 @@ mod projection_width_tests {
             "d00".to_string(),
             "v".to_string(),
         )])];
+        let declared = declared();
+        let full_len = FIRST_DECLARED_COL + declared.len();
         let r = resolve_columns(
             &[LOG_COL_TS, FIRST_DECLARED_COL],
             &[],
             &erasure,
-            &declared(),
+            &declared,
+            &[],
+            full_len,
         );
         assert_eq!(r.width, Some(3));
     }
@@ -5317,7 +6578,9 @@ mod projection_width_tests {
             field: FieldSel::Body,
             word: "x".to_string(),
         }];
-        let r = resolve_columns(&[LOG_COL_TS], &content, &[], &declared());
+        let declared = declared();
+        let full_len = FIRST_DECLARED_COL + declared.len();
+        let r = resolve_columns(&[LOG_COL_TS], &content, &[], &declared, &[], full_len);
         assert_eq!(r.width, Some(3), "ts, stream_ref, body");
     }
 
@@ -5326,7 +6589,7 @@ mod projection_width_tests {
     /// the tenant's, not a constant.
     #[test]
     fn the_denominator_follows_the_declared_set() {
-        let r = resolve_columns(&[LOG_COL_TS], &[], &[], &[]);
+        let r = resolve_columns(&[LOG_COL_TS], &[], &[], &[], &[], FIRST_DECLARED_COL);
         assert_eq!(r.width, Some(2));
         assert_eq!(r.fraction_of(0), 2.0 / 10.0);
     }

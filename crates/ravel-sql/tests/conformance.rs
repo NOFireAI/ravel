@@ -311,6 +311,7 @@ fn validation_variant(err: &ValidationError) -> &'static str {
         ValidationError::ExcludedAggregate { .. } => "ValidationError::ExcludedAggregate",
         ValidationError::ExcludedScalar { .. } => "ValidationError::ExcludedScalar",
         ValidationError::ExcludedWindow { .. } => "ValidationError::ExcludedWindow",
+        ValidationError::TooComplex(_) => "ValidationError::TooComplex",
     }
 }
 
@@ -813,6 +814,12 @@ async fn samples_table_documents_histogram_exclusion() {
         flat.contains("undercount on tenants that ingest histograms"),
         "the generated conformance doc must state that counts and aggregations over the samples \
          table undercount on tenants that ingest histograms (#581)"
+    );
+    assert!(
+        flat.contains("The undercount is not silent")
+            && flat.contains("top-level `warnings` array"),
+        "the generated conformance doc must state that an affected statement returns a warnings \
+         array, not a bare short answer (#1738)"
     );
 }
 

@@ -136,6 +136,13 @@ impl RecordCache {
         }
     }
 
+    /// True if `key` is currently resident for `tenant`, without recording a
+    /// cache hit or miss and without changing recency. The resolve path uses
+    /// this at its single commit-record warming site (the prewarm pass) to
+    /// decide "served from cache" for the exact `commit_record_cache_hits`
+    /// count, separately from the pooled hit/miss accounting [`Self::get`]
+    /// performs on every touch; peeking here rather than counting a second
+    /// [`Self::get`] is what keeps the pooled counters untouched.
     pub(crate) fn insert(
         &self,
         tenant: TenantHash,
@@ -700,8 +707,6 @@ mod tests {
             folder_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
             shard_generation_count: 1,
-            column_stats: None,
-            column_stats_part: None,
         }
     }
 

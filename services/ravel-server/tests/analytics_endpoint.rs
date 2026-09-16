@@ -153,6 +153,7 @@ fn build_router_with_sink(
             std::collections::HashSet::new(),
         )),
         audit_sink,
+        query_admission: AnalyticsState::unlimited_admission(),
     })
 }
 
@@ -189,6 +190,7 @@ fn build_router_distributed(
         None,
         clock.clone(),
         metrics.clone(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
     );
     let fetcher = Arc::new(RoutingSliceFetcher::new(
         Arc::new(OnceLock::new()),
@@ -215,6 +217,7 @@ fn build_router_distributed(
             std::collections::HashSet::new(),
         )),
         audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+        query_admission: AnalyticsState::unlimited_admission(),
     })
 }
 
@@ -831,6 +834,7 @@ fn dead_federation(name: &str, endpoint: &str) -> ravel_query::distrib::Federati
         name: name.to_string(),
         endpoint: endpoint.to_string(),
         credential: GATE_OPERATOR_CRED.to_string(),
+        tenant: None,
         tls: false,
         tls_ca_file: None,
         skip_unavailable: true,
@@ -841,6 +845,7 @@ fn dead_federation(name: &str, endpoint: &str) -> ravel_query::distrib::Federati
     Federation::new(vec![RemoteCluster {
         name: name.to_string(),
         fetcher: Arc::new(fetcher),
+        tenant: None,
         skip_unavailable: true,
         soft_timeout: Duration::from_secs(3),
     }])
@@ -875,6 +880,7 @@ async fn federated_app(metric: &str, samples: &[(i64, f64)]) -> Router {
             std::collections::HashSet::new(),
         )),
         audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+        query_admission: AnalyticsState::unlimited_admission(),
     })
 }
 

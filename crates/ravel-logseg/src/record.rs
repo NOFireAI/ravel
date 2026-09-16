@@ -9,7 +9,8 @@
 
 use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 
-use crate::varint::put_uvarint;
+use crate::error::LogSegError;
+use crate::varint::{get_ivarint, get_uvarint, put_uvarint};
 
 // Fixed column ids (docs/log-segment-format.md FIELD_DIR). These occupy the
 // reserved ids 0..=9 and never appear in FIELD_DIR; dynamic attribute columns
@@ -66,6 +67,183 @@ pub fn stream_attrs_bytes(
     out.extend_from_slice(scope_version.as_bytes());
     out.extend_from_slice(&canonical_attr_bytes(scope_attrs));
     out
+}
+
+/// Depth cap when decoding a stream_attrs blob, so hostile nesting cannot
+/// exhaust the stack.
+const MAX_ATTR_DEPTH: u32 = 32;
+
+/// Entry/element-count cap per attribute set or list when decoding, so a
+/// corrupt count is rejected rather than allocated on.
+const MAX_ATTR_ENTRIES: u64 = 1 << 20;
+
+/// The decoded form of a [`LogRecord::stream_attrs`] blob: the resource
+/// attribute set, scope name and version, and the scope attribute set, exactly
+/// as [`stream_attrs_bytes`] encoded them (the inverse of that function).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamAttrs {
+    pub resource: Vec<(String, AttrValue)>,
+    pub scope_name: String,
+    pub scope_version: String,
+    pub scope_attrs: Vec<(String, AttrValue)>,
+}
+
+/// Decodes a [`LogRecord::stream_attrs`] blob into its structured form
+/// ([`stream_attrs_bytes`]'s inverse). Every [`AttrValue`] variant round-trips
+/// exactly, including a nested `List`/`Map` and an `F64`'s exact bit pattern (a
+/// NaN payload or -0.0 survives, since the encoding stores `to_bits` verbatim).
+/// Corrupt input (a truncated blob, an over-long length prefix, an unknown
+/// value tag) is a typed [`LogSegError::Corrupted`], never a panic.
+pub fn decode_stream_attrs(blob: &[u8]) -> Result<StreamAttrs, LogSegError> {
+    let mut pos = 0usize;
+    let resource = decode_attr_set(blob, &mut pos, 0)?;
+    let scope_name = decode_len_prefixed_string(blob, &mut pos)?;
+    let scope_version = decode_len_prefixed_string(blob, &mut pos)?;
+    let scope_attrs = decode_attr_set(blob, &mut pos, 0)?;
+    Ok(StreamAttrs {
+        resource,
+        scope_name,
+        scope_version,
+        scope_attrs,
+    })
+}
+
+/// v1 stringification of a dynamic attribute value, used to render `attrs`
+/// map values to text. Scalar values render to their natural text; `Bytes`,
+/// `List`, and `Map` render to the lowercase hex of their canonical encoding, a
+/// deterministic, injective form pending a richer typed column.
+pub fn attr_value_to_string(v: &AttrValue) -> String {
+    match v {
+        AttrValue::Str(s) => s.clone(),
+        AttrValue::I64(i) => i.to_string(),
+        AttrValue::F64(f) => f.to_string(),
+        AttrValue::Bool(b) => b.to_string(),
+        AttrValue::Bytes(b) => hex_lower(b),
+        AttrValue::List(_) | AttrValue::Map(_) => hex_lower(&canonical_attr_bytes(
+            std::slice::from_ref(&(String::new(), v.clone())),
+        )),
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // Writing to a String never fails.
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn decode_attr_set(
+    buf: &[u8],
+    pos: &mut usize,
+    depth: u32,
+) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+    if depth > MAX_ATTR_DEPTH {
+        return Err(corrupt("stream_attrs nesting too deep"));
+    }
+    let count = get_uvarint(buf, pos)?;
+    if count > MAX_ATTR_ENTRIES {
+        return Err(corrupt("stream_attrs entry count over cap"));
+    }
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let klen = usize_of(get_uvarint(buf, pos)?)?;
+        let kstart = *pos;
+        advance(buf, pos, klen)?;
+        let key = std::str::from_utf8(&buf[kstart..*pos])
+            .map_err(|_| corrupt("stream_attrs key not utf-8"))?
+            .to_string();
+        let value = decode_value(buf, pos, depth + 1)?;
+        out.push((key, value));
+    }
+    Ok(out)
+}
+
+/// Decodes one encoded attribute value at `pos` (frozen grammar,
+/// `ravel_types::logstream`: 1=Str 2=I64 3=F64 4=Bool 5=Bytes 6=List 7=Map),
+/// advancing `pos` past it.
+fn decode_value(buf: &[u8], pos: &mut usize, depth: u32) -> Result<AttrValue, LogSegError> {
+    if depth > MAX_ATTR_DEPTH {
+        return Err(corrupt("stream_attrs nesting too deep"));
+    }
+    let tag = read_u8(buf, pos)?;
+    Ok(match tag {
+        1 => {
+            let len = usize_of(get_uvarint(buf, pos)?)?;
+            let start = *pos;
+            advance(buf, pos, len)?;
+            let s = std::str::from_utf8(&buf[start..*pos])
+                .map_err(|_| corrupt("stream_attrs str not utf-8"))?
+                .to_string();
+            AttrValue::Str(s)
+        }
+        2 => AttrValue::I64(get_ivarint(buf, pos)?),
+        3 => {
+            let start = *pos;
+            advance(buf, pos, 8)?;
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&buf[start..*pos]);
+            AttrValue::F64(f64::from_bits(u64::from_le_bytes(b)))
+        }
+        4 => AttrValue::Bool(read_u8(buf, pos)? != 0),
+        5 => {
+            let len = usize_of(get_uvarint(buf, pos)?)?;
+            let start = *pos;
+            advance(buf, pos, len)?;
+            AttrValue::Bytes(buf[start..*pos].to_vec())
+        }
+        6 => {
+            let n = get_uvarint(buf, pos)?;
+            if n > MAX_ATTR_ENTRIES {
+                return Err(corrupt("stream_attrs list length over cap"));
+            }
+            let mut items = Vec::new();
+            for _ in 0..n {
+                items.push(decode_value(buf, pos, depth + 1)?);
+            }
+            AttrValue::List(items)
+        }
+        7 => AttrValue::Map(decode_attr_set(buf, pos, depth + 1)?),
+        _ => return Err(corrupt("bad stream_attrs value tag")),
+    })
+}
+
+fn decode_len_prefixed_string(buf: &[u8], pos: &mut usize) -> Result<String, LogSegError> {
+    let len = usize_of(get_uvarint(buf, pos)?)?;
+    let start = *pos;
+    advance(buf, pos, len)?;
+    std::str::from_utf8(&buf[start..*pos])
+        .map(|s| s.to_string())
+        .map_err(|_| corrupt("stream_attrs scope name/version not utf-8"))
+}
+
+fn read_u8(buf: &[u8], pos: &mut usize) -> Result<u8, LogSegError> {
+    let b = *buf
+        .get(*pos)
+        .ok_or_else(|| corrupt("stream_attrs truncated"))?;
+    *pos += 1;
+    Ok(b)
+}
+
+fn advance(buf: &[u8], pos: &mut usize, n: usize) -> Result<(), LogSegError> {
+    let end = pos
+        .checked_add(n)
+        .ok_or_else(|| corrupt("stream_attrs length overflow"))?;
+    if end > buf.len() {
+        return Err(corrupt("stream_attrs truncated"));
+    }
+    *pos = end;
+    Ok(())
+}
+
+fn usize_of(v: u64) -> Result<usize, LogSegError> {
+    usize::try_from(v).map_err(|_| corrupt("stream_attrs length exceeds usize"))
+}
+
+fn corrupt(what: &str) -> LogSegError {
+    LogSegError::Corrupted(format!("stream_attrs: {what}"))
 }
 
 /// A single log record as handed to the writer.
@@ -298,10 +476,12 @@ pub enum Predicate {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::*;
+    use proptest::prelude::*;
     use ravel_types::logstream::log_stream_id;
+
+    use super::*;
 
     fn resource() -> Vec<(String, AttrValue)> {
         vec![
@@ -355,5 +535,92 @@ mod tests {
             stream_attrs_bytes(&[], "ab", "c", &[]),
             stream_attrs_bytes(&[], "a", "bc", &[])
         );
+    }
+
+    #[test]
+    fn attr_value_to_string_renders_each_type() {
+        assert_eq!(attr_value_to_string(&AttrValue::Str("api".into())), "api");
+        assert_eq!(attr_value_to_string(&AttrValue::I64(-42)), "-42");
+        assert_eq!(attr_value_to_string(&AttrValue::Bool(true)), "true");
+        assert_eq!(
+            attr_value_to_string(&AttrValue::Bytes(vec![0xab, 0x01])),
+            "ab01"
+        );
+        // Bytes/List/Map render as lowercase hex of the canonical encoding,
+        // never the natural text.
+        let list = AttrValue::List(vec![AttrValue::Str("a".into())]);
+        let want = {
+            use std::fmt::Write as _;
+            let mut s = String::new();
+            for b in canonical_attr_bytes(std::slice::from_ref(&(String::new(), list.clone()))) {
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        };
+        assert_eq!(attr_value_to_string(&list), want);
+    }
+
+    #[test]
+    fn decode_stream_attrs_rejects_truncated_blob() {
+        let blob = stream_attrs_bytes(&[("k".into(), AttrValue::Str("v".into()))], "s", "1", &[]);
+        let err = decode_stream_attrs(&blob[..blob.len() - 1]).unwrap_err();
+        assert!(matches!(err, LogSegError::Corrupted(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_stream_attrs_rejects_bad_length_prefix() {
+        // One resource entry whose key length varint claims a length far
+        // beyond the buffer.
+        let blob = vec![1u8, 0x80, 0x80, 0x80, 0x80, 0x01];
+        let err = decode_stream_attrs(&blob).unwrap_err();
+        assert!(matches!(err, LogSegError::Corrupted(_)), "got {err:?}");
+    }
+
+    fn arb_value() -> impl Strategy<Value = AttrValue> {
+        let leaf = prop_oneof![
+            ".*".prop_map(AttrValue::Str),
+            any::<i64>().prop_map(AttrValue::I64),
+            any::<u64>().prop_map(|b| AttrValue::F64(f64::from_bits(b))),
+            any::<bool>().prop_map(AttrValue::Bool),
+            proptest::collection::vec(any::<u8>(), 0..8).prop_map(AttrValue::Bytes),
+        ];
+        leaf.prop_recursive(3, 16, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(AttrValue::List),
+                proptest::collection::vec(("[a-z]{1,4}", inner), 0..4).prop_map(AttrValue::Map),
+            ]
+        })
+    }
+
+    fn arb_attrs() -> impl Strategy<Value = Vec<(String, AttrValue)>> {
+        proptest::collection::vec(("[a-z]{1,4}", arb_value()), 0..6)
+    }
+
+    proptest! {
+        #[test]
+        fn stream_attrs_round_trip(
+            resource in arb_attrs(),
+            scope_name in "[a-z]{0,8}",
+            scope_version in "[a-z0-9.]{0,8}",
+            scope_attrs in arb_attrs(),
+        ) {
+            let blob = stream_attrs_bytes(&resource, &scope_name, &scope_version, &scope_attrs);
+            let decoded = decode_stream_attrs(&blob).expect("decode");
+            // `canonical_attr_bytes` sorts entries (by key then encoded value),
+            // so a decoded set need not match the input's insertion order; two
+            // sets carry the same information iff their canonical bytes match.
+            // The encoding stores an F64 as `to_bits()`, so this comparison is
+            // bit-exact too (a NaN payload or -0.0 changes the bytes).
+            prop_assert_eq!(
+                canonical_attr_bytes(&decoded.resource),
+                canonical_attr_bytes(&resource)
+            );
+            prop_assert_eq!(decoded.scope_name, scope_name);
+            prop_assert_eq!(decoded.scope_version, scope_version);
+            prop_assert_eq!(
+                canonical_attr_bytes(&decoded.scope_attrs),
+                canonical_attr_bytes(&scope_attrs)
+            );
+        }
     }
 }

@@ -56,6 +56,12 @@ pub(crate) struct AuditWrite {
 /// owns the shard, the per-batch `record_id`, and the flush.
 #[derive(Clone, Debug)]
 pub struct AuditRecord {
+    /// The tenant this record belongs to. Every object-level identity the
+    /// batch write derives - the data key, the object header's tenant hash,
+    /// and the commit record - comes from this field, so a record can only
+    /// ever be filed under the tenant whose action it describes. A batch
+    /// mixing tenants is rejected rather than filed under one of them.
+    pub tenant: TenantHash,
     /// The record timestamp; contributes to the batch's event/ingest-time
     /// bounds and hour bucket.
     pub now_ns: i64,
@@ -104,6 +110,7 @@ pub(crate) async fn write_audit_object(
     let shard = write.shard;
     let record_id = write.record_id;
     let record = AuditRecord {
+        tenant: *tenant,
         now_ns: write.now_ns,
         stream_id: write.stream_id,
         stream_attrs: write.stream_attrs,
@@ -112,7 +119,7 @@ pub(crate) async fn write_audit_object(
         body: write.body,
         attrs: write.attrs,
     };
-    write_audit_batch(store, tenant, shard, record_id, vec![record]).await
+    write_audit_batch(store, shard, record_id, vec![record]).await
 }
 
 /// Encode a whole batch of audit records as **one** L0 [`Signal::Audit`] object
@@ -132,17 +139,33 @@ pub(crate) async fn write_audit_object(
 /// idempotent republish, while `AlreadyExists` on the commit record is a hard
 /// error because a reused `record_id` would collide two logically distinct
 /// batches onto one commit key.
+///
+/// The tenant is taken from the records themselves, never from a parameter a
+/// caller resolved once at construction time: the object identity, the data
+/// key, and the commit record all derive from `records[0].tenant`, and a batch
+/// whose records do not all name that same tenant is rejected as an invariant
+/// breach. Filing one tenant's audit record under another's prefix would
+/// disclose it to that other tenant, since the `audit` SQL table resolves per
+/// tenant hash, so the mixed-tenant case fails the whole batch rather than
+/// choosing a tenant for it.
 pub(crate) async fn write_audit_batch(
     store: &dyn ObjectStoreBackend,
-    tenant: &TenantHash,
     shard: u32,
     record_id: Uuid,
     records: Vec<AuditRecord>,
 ) -> Result<()> {
-    if records.is_empty() {
+    let Some(first) = records.first() else {
         return Err(MaintainError::Invariant(
             "write_audit_batch called with an empty record set".to_string(),
         ));
+    };
+    let tenant = first.tenant;
+    if let Some(other) = records.iter().find(|record| record.tenant != tenant) {
+        return Err(MaintainError::Invariant(format!(
+            "write_audit_batch called with a mixed-tenant batch: {} and {}",
+            tenant.to_hex(),
+            other.tenant.to_hex()
+        )));
     }
 
     // Aggregate the commit record's fields across the whole batch: the count is
@@ -185,7 +208,7 @@ pub(crate) async fn write_audit_batch(
         ))
     })?;
     let commit = record::build(NewCommitRecord {
-        tenant_hash: *tenant,
+        tenant_hash: tenant,
         signal: Signal::Audit,
         shard,
         writer_id: record_id,
@@ -204,7 +227,15 @@ pub(crate) async fn write_audit_batch(
         ingest_hour_bucket,
     })?;
 
-    let data_key = keys::data_key(tenant, Signal::Audit, shard, record_id, 0, 0, &content_hash)?;
+    let data_key = keys::data_key(
+        &tenant,
+        Signal::Audit,
+        shard,
+        record_id,
+        0,
+        0,
+        &content_hash,
+    )?;
     let data_checksum = UploadChecksum::Crc32c(crc32c::crc32c(&object));
     match store
         .put(
@@ -275,9 +306,10 @@ mod tests {
         (id, blob)
     }
 
-    fn test_record(now_ns: i64, stream_seed: u32) -> AuditRecord {
+    fn test_record(tenant: TenantHash, now_ns: i64, stream_seed: u32) -> AuditRecord {
         let (stream_id, stream_attrs) = test_stream(stream_seed);
         AuditRecord {
+            tenant,
             now_ns,
             stream_id,
             stream_attrs,
@@ -297,15 +329,15 @@ mod tests {
         // Four records across two distinct streams, with a spread of
         // timestamps, all inside one hour bucket.
         let records = vec![
-            test_record(base + 500, 1),
-            test_record(base + 100, 1),
-            test_record(base + 900, 2),
-            test_record(base + 300, 2),
+            test_record(tenant, base + 500, 1),
+            test_record(tenant, base + 100, 1),
+            test_record(tenant, base + 900, 2),
+            test_record(tenant, base + 300, 2),
         ];
         let expected_min = base + 100;
         let expected_max = base + 900;
 
-        write_audit_batch(&store, &tenant, AUDIT_SHARD, Uuid::new_v4(), records)
+        write_audit_batch(&store, AUDIT_SHARD, Uuid::new_v4(), records)
             .await
             .expect("batch write");
 
@@ -344,10 +376,9 @@ mod tests {
 
         write_audit_batch(
             &store,
-            &tenant,
             AUDIT_SHARD,
             Uuid::new_v4(),
-            vec![test_record(now_ns, 1)],
+            vec![test_record(tenant, now_ns, 1)],
         )
         .await
         .expect("single-record batch");
@@ -366,10 +397,40 @@ mod tests {
     #[tokio::test]
     async fn empty_batch_is_rejected() {
         let store = MemoryStore::new();
-        let tenant = TenantHash([23u8; 16]);
-        let err = write_audit_batch(&store, &tenant, AUDIT_SHARD, Uuid::new_v4(), Vec::new())
+        let err = write_audit_batch(&store, AUDIT_SHARD, Uuid::new_v4(), Vec::new())
             .await
             .expect_err("empty batch is an invariant breach");
         assert!(matches!(err, MaintainError::Invariant(_)));
+    }
+
+    #[tokio::test]
+    async fn a_mixed_tenant_batch_is_rejected_and_writes_nothing() {
+        let store = MemoryStore::new();
+        let one = TenantHash([24u8; 16]);
+        let two = TenantHash([25u8; 16]);
+        let base = 7 * NS_PER_HOUR;
+
+        let err = write_audit_batch(
+            &store,
+            AUDIT_SHARD,
+            Uuid::new_v4(),
+            vec![test_record(one, base, 1), test_record(two, base + 1, 1)],
+        )
+        .await
+        .expect_err("a batch spanning two tenants is an invariant breach");
+        assert!(matches!(err, MaintainError::Invariant(_)));
+
+        // The rejection happens before any PUT, so neither tenant's prefix
+        // gained an object: a mixed batch cannot half-file itself.
+        for tenant in [one, two] {
+            let data_prefix = format!("t/{}/", tenant.to_hex());
+            let objects = list_all(&store, &data_prefix).await.unwrap();
+            assert_eq!(
+                objects.len(),
+                0,
+                "no object under {}, the batch was rejected before any PUT",
+                tenant.to_hex()
+            );
+        }
     }
 }

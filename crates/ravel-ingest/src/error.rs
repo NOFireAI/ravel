@@ -13,12 +13,20 @@ pub enum WriteError {
     /// send half or a strict-mode ack fail because the actor task is gone.
     /// This means the router is shutting down, or an individual shard actor
     /// task ended without shutdown (e.g. it panicked mid-flush); the latter
-    /// leaves the router serving the surviving shards while every series
-    /// hashing to the dead shard fails here. The router counts each distinct
-    /// shard death (`IngestMetricsSnapshot::shard_deaths`) so the degraded
-    /// state is observable rather than silent. Retryable at the
-    /// client, but points routed to a dead shard keep failing until the
-    /// process is restarted.
+    /// leaves the router serving the surviving shards while the write that
+    /// observed the death, and any concurrent one to the same shard, fails
+    /// here. The router counts each death (`IngestMetricsSnapshot::shard_deaths`)
+    /// so the degraded state is observable rather than silent (issue #1299).
+    /// Retryable at the client, and usually transient: the router respawns the
+    /// dead shard with a fresh writer identity (up to
+    /// [`crate::IngestRouter::MAX_SHARD_RESPAWNS`] within one decay window), so
+    /// a retry routed after the respawn reaches a live actor. The buffered points the dead actor held
+    /// are not recovered by the respawn, which is why even a buffered-mode
+    /// writer's already-acked points for that flush are lost. Once a shard
+    /// exhausts its respawn budget it is condemned: writes to it keep failing,
+    /// and the router reports not-ready (`IngestRouter::ready`), which sheds
+    /// traffic from this replica but does not replace it. Recovering the shard
+    /// needs the process rolled.
     #[error("shard actor unavailable")]
     ShardUnavailable,
     /// A strict-mode ack did not arrive within the caller's `ack_deadline`.
@@ -190,5 +198,125 @@ mod tests {
             durable: vec![token],
         };
         assert!(!not_retryable.is_retryable());
+    }
+
+    /// Test debt (formal/tla/TRACEABILITY.md, ingest row 2, `AdmitFailClosed`
+    /// fence / `StaleProvisioningView`): a writer whose cached provisioning
+    /// view has gone stale past the refresh interval `C`, and whose re-read
+    /// of the provisioning record cannot complete, and whose grace-extend
+    /// horizon has already been crossed, gets exactly
+    /// `WriteError::StaleProvisioningView` and durably writes nothing --
+    /// no data object and no commit record appear in the store.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn stale_provisioning_view_fails_closed_past_the_staleness_fence() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::time::Duration;
+
+        use ravel_object_store::fault::{
+            FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_object_store::{ObjectStoreBackend, list_all};
+        use ravel_otlp::NormalizedPoint;
+        use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantId};
+
+        use crate::clock::Clock;
+        use crate::config::IngestConfig;
+        use crate::router::{IngestRouter, WriteMode};
+
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+        struct FrozenClock(AtomicI64);
+
+        impl Clock for FrozenClock {
+            fn now_ns(&self) -> i64 {
+                self.0.load(Ordering::SeqCst)
+            }
+
+            fn sleep(&self, _dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+                Box::pin(async {})
+            }
+        }
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Transient("simulated sustained store latency".into()),
+            )
+            .with_occurrence(Occurrence::Always),
+        );
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(FaultStore::new(MemoryStore::new(), plan));
+
+        let t0 = 10 * NS_PER_HOUR;
+        let clock = Arc::new(FrozenClock(AtomicI64::new(t0)));
+        let router = IngestRouter::new(
+            IngestConfig {
+                shard_count: 4,
+                ..IngestConfig::default()
+            },
+            Arc::clone(&store),
+            Signal::Metrics,
+            clock.clone(),
+        );
+
+        let tenant = TenantId::new("acme");
+
+        // Seed a fresh cached view the ordinary way (this call never touches
+        // the store), then move the clock past both the refresh interval `C`
+        // and the grace-extend horizon (`min_lead_hours(C)` = 2 hours past t0
+        // for the default `C`), so the upcoming write's re-read is forced and
+        // its grace fallback is refused.
+        router.refresh_generations(tenant.hash(), vec![], t0);
+        clock.0.store(t0 + 3 * NS_PER_HOUR, Ordering::SeqCst);
+
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "cpu_usage".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&tenant, "cpu_usage", &labels).expect("series id");
+        let point = NormalizedPoint {
+            series_id,
+            labels: Arc::new(labels),
+            sample: Sample {
+                ts_ns: t0,
+                value: 1.0,
+            },
+            is_monotonic_sum: false,
+        };
+
+        let result = router
+            .write(
+                tenant.clone(),
+                vec![point],
+                WriteMode::Buffered,
+                Duration::from_secs(5),
+            )
+            .await;
+
+        match result {
+            Err(WriteError::StaleProvisioningView) => {}
+            Ok(_) => panic!("past the staleness fence, must fail closed, not route"),
+            Err(other) => panic!("past the staleness fence, wrong error: {other:?}"),
+        }
+        assert_eq!(
+            router.metrics().snapshot().stale_provisioning_flushes,
+            1,
+            "the fail-closed counter fires exactly once"
+        );
+
+        let objects = list_all(store.as_ref(), "t/")
+            .await
+            .expect("list must succeed: only Get is faulted");
+        assert!(
+            objects.is_empty(),
+            "a write that fails closed on a stale provisioning view must not \
+             durably write anything, but the store holds {objects:?}"
+        );
     }
 }

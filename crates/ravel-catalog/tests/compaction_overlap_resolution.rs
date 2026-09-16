@@ -848,3 +848,133 @@ async fn strict_superset_input_set_wins_over_the_smaller_hash() {
     assert_eq!(snapshot.segments.len(), 1);
     assert_eq!(served_rows(&snapshot), 3);
 }
+
+/// Issue #1171: a `min_token` covered by BOTH of two overlapping compaction
+/// records is satisfied through the WINNING record's parts only, never the
+/// loser's. `resolve_min_token_fallback` is reached only when the token's
+/// exact commit-record GET misses (the record was compacted away and swept),
+/// so `target` is never PUT as an L0 here -- that is exactly the fallback's
+/// intended scenario, not an oversight.
+///
+/// The winner names `[target, extra]` (the strict superset), so it wins on
+/// cardinality regardless of hash; the loser names `[target]` only. Both
+/// cover the token. The loser's seed is chosen so its key sorts first in the
+/// bucket LIST (`BTreeMap` order in `MemoryStore`), which is what makes the
+/// pre-fix bug deterministic: the old loop returns on the FIRST record whose
+/// inputs cover the token, so it would return the loser's part.
+///
+/// Flipped to watch it fail: the
+/// `losing_compaction_records.contains(ckey.as_str())` skip added to
+/// `resolve_min_token_fallback`'s covers-test loop (catalog.rs). Without it
+/// the loop matches the loser (listed first) and adds its part on top of the
+/// winner's part the bucket listing already resolved: `l1_keys(&snapshot)`
+/// carries BOTH keys instead of just the winner's, and the `assert_eq!`
+/// below fails (observed: a two-element vec with the loser's key first and
+/// the winner's second, against the expected one-element `[winner_part_key]`).
+#[tokio::test]
+async fn min_token_resolves_through_the_winning_record_only() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let (range, now) = hour_range_and_now();
+
+    let target = l0_record(Signal::Logs, Uuid::new_v4(), 1, now);
+    let extra = l0_record(Signal::Logs, Uuid::new_v4(), 2, now);
+    let token = record::token_for(&target).expect("token");
+
+    let (lose_seed, win_seed) = order_by_hash(b"min-token-set-1", b"min-token-set-2");
+    let winner = put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&target, &extra],
+        vec![part(0, 1)],
+        now,
+        win_seed,
+    )
+    .await;
+    put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&target],
+        vec![part(0, 2)],
+        now,
+        lose_seed,
+    )
+    .await;
+
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Logs, range, &[token], now)
+        .await
+        .expect("resolve");
+
+    let winner_part_key =
+        keys::reconstruct_l1_part_key(&winner, &winner.parts[0]).expect("winner part key");
+    assert_eq!(
+        l1_keys(&snapshot),
+        vec![winner_part_key],
+        "the token resolves through the winning record's part only"
+    );
+    assert_eq!(snapshot.segments.len(), 1, "no part from the losing record");
+    assert_eq!(catalog.compaction_input_set_conflicts(), 1);
+}
+
+/// Reachability check for issue #1171 at the query-serving boundary
+/// (`Catalog::resolve`, what every query endpoint calls through): a
+/// `min_token` query over a logs bucket with two overlapping compaction
+/// records returns exactly the winner's N rows, never `2N` from also serving
+/// the loser's equally-sized overlapping part. Logs have no query-time
+/// dedup by `(series_id, ts)` the way metrics do, so a duplicated part is a
+/// duplicated result row, not a harmless re-count.
+///
+/// Winner and loser parts are given the SAME row count `N` on purpose: if the
+/// fallback serves both (winner via the normal bucket listing, which already
+/// resolves overlap correctly per issue #1070, and the loser via this
+/// fallback's bug), the two parts carry different data keys and both are
+/// counted, so the total is exactly `2N` rather than some other wrong number.
+///
+/// Flipped to watch it fail: the same
+/// `losing_compaction_records.contains(ckey.as_str())` skip in
+/// `resolve_min_token_fallback` (catalog.rs). Without it, `served_rows`
+/// is `4` (`2N`), not `2` (`N`), and the `assert_eq!` below fails.
+#[tokio::test]
+async fn min_token_query_over_logs_returns_exact_rows_not_double() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let (range, now) = hour_range_and_now();
+
+    let target = l0_record(Signal::Logs, Uuid::new_v4(), 1, now);
+    let extra = l0_record(Signal::Logs, Uuid::new_v4(), 2, now);
+    let token = record::token_for(&target).expect("token");
+
+    const N: u64 = 2;
+    let (lose_seed, win_seed) = order_by_hash(b"min-token-rows-1", b"min-token-rows-2");
+    put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&target, &extra],
+        vec![part_with_rows(0, 1, N)],
+        now,
+        win_seed,
+    )
+    .await;
+    put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&target],
+        vec![part_with_rows(0, 2, N)],
+        now,
+        lose_seed,
+    )
+    .await;
+
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Logs, range, &[token], now)
+        .await
+        .expect("resolve");
+
+    assert_eq!(
+        served_rows(&snapshot),
+        N,
+        "exactly the winner's N rows, not 2N from also serving the loser's part"
+    );
+    assert_eq!(snapshot.segments.len(), 1);
+}

@@ -306,6 +306,35 @@ Before this amendment nothing set it, so every logs scan ran at most 16
 GETs in flight regardless of the flag, and a 100M-row `count(*)` measured
 the same 160 s at `--fetch-concurrency` 16 and 32.
 
+## Amendment 2026-09-05 (ADR-1195): the RLOG permit pool is the shared GET limiter
+
+ADR-1195 replaces the per-fetcher semaphores with one
+`ravel_query::GetLimiter` shared by every fetcher a `QueryEngine` owns, sized
+by the new `--store-get-concurrency` knob (derived default
+`max(8, 2 x cores)`, the formula `--fetch-concurrency` used). This supersedes
+"sized independently for RLOG's call volume" in decision 1 and "separate from
+RSEG's" in the amendment above: RLOG's `BlockRangeFetcher` now draws from the
+same pool as RSEG and RSPAN, and `LogSegmentFetcher::with_max_concurrent_gets`
+is a convenience that builds a private limiter for callers outside an engine
+(the benches). The knob ADR-1195 left for this ADR to name is
+`--store-get-concurrency`.
+
+The server half of ADR-1195 has since landed, so the sharing this amendment
+described as pending is implemented: `ravel-server` builds one
+`Arc<GetLimiter>` from `--store-get-concurrency` (the legacy
+`--fetch-concurrency` when only that is set) and hands that same instance to
+its query engine, its SQL state's RSEG/RLOG/RSPAN fetchers, the distributed
+fragment service's fetcher, and the standalone fetchers of the startup cache
+warm, so the pool is process-wide there rather than per engine. Outside the
+server, a fetcher built without one (the benches) still carries its own.
+
+The RLOG whole-object funnel (`fetch_accounted` and `whole_object_bytes`) was
+still unpermitted at the time this amendment was written; the ADR-1195
+follow-up has since closed that. Every RLOG GET, whole-object or ranged,
+now takes a permit from the fetcher's `GetLimiter`, and inside `ravel-server`
+that limiter is the one process-wide pool described above
+(`docs/query-engine.md`, "GET concurrency (ADR-1195)").
+
 ## Amendment 2026-08-26 (issue #693 part 3): a footer carried from the plan phase establishes the etag pin on the first data GET
 
 Decision 1 establishes the mandatory etag pin on the suffix probe: the probe is
@@ -337,3 +366,71 @@ bytes `RlogReader` re-parses to open the assembled buffer. The block-range
 (non-coverage) branch, reachable only when a caller forces the ranged path,
 places that tail region explicitly so a footer-carried open never assembles a
 buffer with a zeroed trailer.
+
+## Amendment 2026-09-05 (issue #835): the plan phase's whole-object fallback carries its bytes into the scan
+
+The amendment above carries a *footer* from the plan phase's predicate-free
+fast path so the scan skips its own probe. It does not cover the fallback
+this ADR's "Requests per object" section already describes: a predicate the
+skip index cannot decide (`has_word`/text, an `attrs` POSTINGS equality, a
+stream filter) makes `plan_segment` read the WHOLE object to count survivors,
+counted in `plan_full_reads`, and forwards no footer. `plan_full_reads` counts
+those fallback reads, not wire GETs: the read goes through ADR-0046's read
+cache, so a counted read can be served from cache and issue no store GET at
+all. Before #835 those bytes were then discarded: the scan that followed
+reopened the same object from scratch, so the object was read twice per
+statement, and the second read crossed the wire whenever a read cache was not
+wired, or was too small to still hold the object by the time the scan reached
+it. A tenant whose corpus exceeds the cache, or a query run with no cache at
+all, paid the second GET in full.
+
+Since #835, `plan_segment`'s fallback branch carries its fetched buffer
+forward as a `ravel_query::CarriedWholeObject` (threaded through
+`SegPlan::whole_object` in `ravel_sql::logs_scan`), and the scan's subset open
+consumes it instead of issuing its own read when supplied, for the first
+`plan_concurrency` segments whose plan completes: those objects are read once
+for the statement rather than twice, so the scan issues neither a store GET
+nor a cache lookup for them. Every other relevant segment is re-read by the scan exactly as
+it was before #835, and the peak bytes this carry retains is bounded by the
+plan fan-out (`plan_concurrency` objects) times object size, not by corpus
+size. Removing the remaining duplicate reads needs the carry to stream per
+partition instead of being held at the plan barrier; that redesign is
+tracked separately as issue #1272. As
+with the footer carry, this needs no etag re-check of its own: the plan and
+scan of one statement resolve against the same immutable `SegmentRef` out of
+one resolved snapshot, and the whole-object cache key is already keyed on
+`seg_ref.content_hash`, so there is no live GET spanning the gap between the
+carried read and its reuse for a replaced object to slip through. The reused
+bytes are charged to `QueryAccounting::add_bytes_reused`, kept distinct from
+the GET-bytes figure the issuing plan phase already recorded, so a report
+can still tell a fresh read from a carried reuse.
+
+This carry's memory cost is bounded by `plan_concurrency`, not by corpus
+size. `plan_concurrency` here is `LogsScanExec::target_partitions`, the SQL
+partition count DataFusion assigned this scan; since ADR-1195 T2 it is a
+separate knob from `--store-get-concurrency`'s object-store GET limiter,
+which bounds in-flight wire requests process-wide rather than how many
+segments' plan results this pass retains. `compute_plan_counts` consumes the
+segment-plan stream as each
+`plan_segment` call completes (`buffer_unordered(plan_concurrency)`), not
+after the whole pass finishes, so it never retains more carried whole
+objects than are actually in flight at once: the first `plan_concurrency`
+segments to COMPLETE with a carried whole object -- arrival order, not
+segment order, so which segments those are is scheduling-dependent -- keep
+their `SegPlan::whole_object`; every later arrival has its `whole_object`
+forced to `None` before it is stored, so that segment's subset open pays a
+second read during the scan, a wire GET whenever the cache does not still
+hold the object, exactly as it would have before #835. Survivor
+counts, stats, and footers for every relevant segment are still held until
+the shared pass returns, because ADR-0102's flattened block-striping
+assignment needs every segment's survivor count before any partition can
+drain a block, not just the segments ahead of it in isolation; only the
+CARRIED-BYTES retention is concurrency-bounded, not the rest of the plan
+result. `compute_plan_counts` sums only the bytes actually retained and
+reports that figure via `QueryAccounting::observe_intermediate_bytes`, so a
+dropped whole object is never double-counted: the scan's own real GET for it
+carries its own accounting. `crates/ravel-sql/src/logs_scan.rs`'s module doc
+("Whole-object fallback carry, and its memory bound (issue #835)") describes
+the same bound, and
+`crates/ravel-sql/tests/logs_selective_scan_amplification.rs`'s
+`plan_carry_peak_bytes_bounded_by_plan_concurrency` pins it.

@@ -33,6 +33,12 @@ ravel-promql = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-cache = { workspace = true }
+# Process-wide byte accountant (ADR-1170 decision 2). The fetch layer reserves
+# the bytes a GET will materialize before issuing it, owns the reservation for
+# the buffer's lifetime, and refuses with a typed error when the shared budget
+# is exhausted. `MemoryBudget::unlimited()` is the default, so the edge is
+# inert until a server task installs a finite budget.
+ravel-memory = { workspace = true }
 # The evidential query-audit sink (QueryAuditSink/AuditEvent) the PromQL HTTP
 # handlers submit through and await durability on (ADR-0062 §2a).
 # ravel-maintain does not depend on ravel-query, so this edge is
@@ -95,7 +101,7 @@ ravel-cache = { workspace = true }
 # proof (tests/differential_compaction.rs) drives P4's real compactor to
 # produce write_v4 L1 parts. ravel-maintain does not depend on ravel-query,
 # so this is acyclic.
-ravel-maintain = { path = "../ravel-maintain", version = "0.12.0" }
+ravel-maintain = { path = "../ravel-maintain", version = "0.15.0" }
 proptest = { workspace = true }
 # The ADR-0046 disk cache tier (crates/ravel-query/src/cache_correctness.rs)
 # needs a real on-disk directory to construct a `ravel_cache::DiskCache`; the
@@ -110,6 +116,11 @@ criterion = { workspace = true }
 # span test installs a scoped fmt subscriber over a buffer and asserts each
 # phase span fires. Version comes from [workspace.dependencies].
 tracing-subscriber = { workspace = true }
+# Test-only: the metadata cache's refresh test seeds a metric metadata record
+# stamped at a format version this build's writer never emits, and the record
+# body is zstd-compressed. Version from [workspace.dependencies]; ravel-catalog,
+# ravel-segment, and ravel-logseg already depend on it.
+zstd = { workspace = true }
 
 [[bench]]
 name = "fetch_soa_vs_fetch"

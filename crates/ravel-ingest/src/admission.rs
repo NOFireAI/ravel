@@ -40,6 +40,7 @@ use ravel_types::{SeriesId, Signal, TenantHash, TenantId};
 use uuid::Uuid;
 
 use crate::Clock;
+use crate::reconcile::ReconcileCycleStats;
 
 /// Width of the rotating active-identity epoch (ADR-0051 section 2). Fixed,
 /// not a configuration knob: an active series/stream is one seen in the
@@ -522,6 +523,12 @@ pub struct AdmissionController {
     /// sibling sum. Generated once at construction; it need not be meaningful
     /// outside this mechanism.
     process_id: Uuid,
+    /// What the most recent completed reconciliation cycle cost and saw
+    /// (issue #1679), so an exporter holding this controller can render the
+    /// cycle's own health beside the per-tenant admission families. Its own
+    /// mutex, not the tenant map's: a cycle publishes it after every tenant is
+    /// applied, and a scrape reading it must never contend with admission.
+    last_cycle: Mutex<ReconcileCycleStats>,
 }
 
 impl AdmissionController {
@@ -531,7 +538,24 @@ impl AdmissionController {
             defaults,
             tenants: Mutex::new(HashMap::new()),
             process_id: Uuid::new_v4(),
+            last_cycle: Mutex::new(ReconcileCycleStats::default()),
         }
+    }
+
+    /// The figures the most recent completed reconciliation cycle reported
+    /// (issue #1679), all zero before the first cycle. The cycle is what
+    /// degrades first when the control-plane prefixes fill up, and it degrades
+    /// without moving any existing counter, so these are read by the exporter
+    /// alongside `ravel_admission_reconciliation_failures_total`. See
+    /// [`ReconcileCycleStats`] for the name each field renders under.
+    pub fn last_reconcile_cycle_stats(&self) -> ReconcileCycleStats {
+        *lock(&self.last_cycle)
+    }
+
+    /// Publish one completed cycle's figures (called by
+    /// [`crate::reconcile::reconcile_once`] once every tenant has been applied).
+    pub(crate) fn record_reconcile_cycle(&self, stats: ReconcileCycleStats) {
+        *lock(&self.last_cycle) = stats;
     }
 
     /// This process's stable, fleet-unique snapshot-key owner id (ADR-0057
@@ -541,7 +565,11 @@ impl AdmissionController {
         self.process_id
     }
 
-    fn now_ns(&self) -> i64 {
+    /// This controller's injected clock reading. Crate-visible so the
+    /// reconciliation cycle in [`crate::reconcile`] can stamp its own duration
+    /// from the same injected clock the rest of the controller uses, rather
+    /// than reaching for wall time of its own.
+    pub(crate) fn now_ns(&self) -> i64 {
         self.clock.now_ns()
     }
 

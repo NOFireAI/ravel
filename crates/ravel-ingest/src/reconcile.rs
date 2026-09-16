@@ -72,6 +72,54 @@
 //! GET) fails, it keeps its last-computed threshold and increments
 //! `ravel_admission_reconciliation_failures_total`; it never fails closed to
 //! zero admission on a transient store error.
+//!
+//! ## Reading only the live fleet, and reaping the dead
+//!
+//! A snapshot key is written once per process per (tenant, signal) and the
+//! process id is fresh per process, so the prefix accumulates one key for every
+//! process that has ever served the tenant. Reading them all back would make a
+//! cycle's cost grow without bound: with a GET per listed key, a year of daily
+//! restarts turns one cycle into hundreds of thousands of serial round trips,
+//! the cycle overruns `2 * R`, every sibling then reads as stale and each
+//! process enforces the whole fleet cap alone (issue #1679).
+//!
+//! Two bounds keep the cost proportional to the *live* fleet instead:
+//!
+//! - The LIST result already carries each key's
+//!   [`last_modified_unix_ms`](ravel_object_store::ObjectMeta::last_modified_unix_ms),
+//!   so a key whose modification time is
+//!   already past the same `2 * R` window is skipped without a GET
+//!   ([`mtime_stale`]). The body's `snapshot_unix_ns` is stamped no later than
+//!   the write that set the modification time, so a key the LIST shows as past
+//!   the window can only hold a body that is at least as old, and skipping it
+//!   drops no sibling the decoded body would have counted as fresh.
+//!
+//!   That ordering holds within one clock. `snapshot_unix_ns` comes from the
+//!   writer and the modification time from the object store, so a writer whose
+//!   clock runs ahead of the store's can produce a body that reads fresh
+//!   behind a modification time that reads stale. The skip is deliberately NOT
+//!   widened for that: it uses the same bare `2 * R` that [`is_stale`] uses, so
+//!   it skips exactly the keys `is_stale` would then discard. Widening it would
+//!   only pay a GET to reach the same answer, and the skew exposure is the one
+//!   [`is_stale`] already carries rather than a new one. A live sibling
+//!   refreshes its own modification time every `R`, so reaching this case needs
+//!   skew large enough to break `is_stale` too, and it self-corrects on the
+//!   next interval.
+//!
+//!   The reap below widens where this does not, and the asymmetry is the
+//!   point: a skipped GET costs one interval of under-counting that the next
+//!   interval fixes, and a delete is not recoverable.
+//! - A key past the *reap horizon* ([`reap_horizon_ns`], `2 * R` widened by the
+//!   same factor again) is deleted, which bounds the LIST itself. The extra
+//!   width is the clock-skew margin: the modification time comes from the
+//!   object store's clock while the horizon is measured against this reader's,
+//!   so a writer whose key looks older than it is keeps a full staleness window
+//!   of grace before its key is reaped. Reaping a live process's key costs
+//!   nothing but one interval of invisibility anyway, since that process
+//!   rewrites the key every `R`.
+//!
+//! A backend that reports no usable modification time (`<= 0`) gets neither
+//! treatment: its keys are read, as before, and never reaped.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -184,6 +232,53 @@ pub(crate) fn is_stale(now_ns: i64, snapshot_unix_ns: i64, two_r_ns: i64) -> boo
     now_ns.saturating_sub(snapshot_unix_ns) > two_r_ns
 }
 
+/// How much wider than the staleness window the reap horizon is: a key is
+/// deleted only once it is `REAP_WINDOW_FACTOR * 2 * R` old. The factor, rather
+/// than a second absolute duration, keeps one configured `R` the only knob and
+/// leaves the reap horizon derived from the same window
+/// [`is_stale`] judges against.
+pub(crate) const REAP_WINDOW_FACTOR: i64 = 2;
+
+/// The reap horizon for a staleness window (issue #1679): the window widened by
+/// [`REAP_WINDOW_FACTOR`], which is the clock-skew margin. Staleness is judged
+/// against a stamp the writer wrote with its own clock, while reaping is judged
+/// against a modification time the object store wrote with *its* clock; a
+/// writer whose apparent age runs ahead by up to a full staleness window (skew
+/// plus write jitter plus the modification time's 1-second granularity on real
+/// backends) is therefore still not reaped while it is alive.
+pub(crate) fn reap_horizon_ns(window_ns: i64) -> i64 {
+    window_ns.saturating_mul(REAP_WINDOW_FACTOR)
+}
+
+/// Whether a listed key is already past `window_ns` according to the LIST
+/// result's modification time alone, so its GET can be skipped (or, at the reap
+/// horizon, the key deleted).
+///
+/// `last_modified_unix_ms <= 0` means the backend reported no usable
+/// modification time (the in-memory oracle's default clock does exactly this).
+/// That is "unknown", never "ancient": the key is read normally and is never
+/// reaped, so a backend without modification times keeps the pre-#1679
+/// behaviour rather than silently losing every sibling.
+pub(crate) fn mtime_stale(now_ns: i64, last_modified_unix_ms: i64, window_ns: i64) -> bool {
+    if last_modified_unix_ms <= 0 {
+        return false;
+    }
+    let last_modified_ns = last_modified_unix_ms.saturating_mul(1_000_000);
+    is_stale(now_ns, last_modified_ns, window_ns)
+}
+
+/// What one [`read_siblings`] call observed under a (tenant, signal) prefix.
+#[derive(Default)]
+struct SiblingRead {
+    /// Siblings whose body was read and decoded (still subject to the
+    /// authoritative [`is_stale`] check on `snapshot_unix_ns`).
+    siblings: Vec<SiblingSnapshot>,
+    /// Keys past the reap horizon, for the caller to delete.
+    reapable: Vec<String>,
+    /// Keys the LIST returned whose GET was skipped as already stale.
+    skipped_stale: u64,
+}
+
 /// Extract the `<process_id>` from a snapshot key
 /// (`.../admission/<process_id>.snapshot`). Returns `None` for a key that does
 /// not match the shape (a defensive guard; every key this task writes matches).
@@ -191,25 +286,41 @@ fn process_id_of(key: &str) -> Option<&str> {
     key.rsplit('/').next()?.strip_suffix(".snapshot")
 }
 
-/// Read and decode every sibling snapshot under a (tenant, signal)'s admission
-/// prefix, excluding this process's own key. A corrupt or future-version
-/// sibling is skipped (treated as absent, self-correcting next interval), not
-/// an error: only a failed LIST or GET is an [`Err`] the caller counts as a
-/// reconciliation failure (ADR-0057 section 3).
+/// Read and decode every *live* sibling snapshot under a (tenant, signal)'s
+/// admission prefix, excluding this process's own key. A corrupt or
+/// future-version sibling is skipped (treated as absent, self-correcting next
+/// interval), not an error: only a failed LIST or GET is an [`Err`] the caller
+/// counts as a reconciliation failure (ADR-0057 section 3).
+///
+/// A key the LIST already shows as older than `two_r_ns` costs no GET, and one
+/// past [`reap_horizon_ns`] is returned for the caller to delete (issue #1679);
+/// see the [module docs](self).
 async fn read_siblings(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
     signal: Signal,
     own_process_id: &str,
-) -> Result<Vec<SiblingSnapshot>, StoreError> {
+    now_ns: i64,
+    two_r_ns: i64,
+) -> Result<SiblingRead, StoreError> {
     let prefix = admission_prefix(tenant_hash, signal);
     let objects = list_all(store, &prefix).await?;
-    let mut out = Vec::new();
+    let reap_horizon = reap_horizon_ns(two_r_ns);
+    let mut out = SiblingRead::default();
     for meta in objects {
         let Some(pid) = process_id_of(&meta.key) else {
             continue;
         };
         if pid == own_process_id {
+            continue;
+        }
+        if mtime_stale(now_ns, meta.last_modified_unix_ms, two_r_ns) {
+            // Already past the staleness window by the LIST's own metadata: it
+            // would contribute zero, so its body is never fetched.
+            out.skipped_stale = out.skipped_stale.saturating_add(1);
+            if mtime_stale(now_ns, meta.last_modified_unix_ms, reap_horizon) {
+                out.reapable.push(meta.key);
+            }
             continue;
         }
         let pid = pid.to_string();
@@ -229,7 +340,7 @@ async fn read_siblings(
             );
             continue;
         }
-        out.push(SiblingSnapshot {
+        out.siblings.push(SiblingSnapshot {
             process_id: pid,
             snapshot_unix_ns: snap.snapshot_unix_ns,
             active_series_count: snap.active_series_count,
@@ -271,6 +382,43 @@ fn reconcile_rate(configured: crate::admission::RateLimit, n: u64) -> Option<u64
     }
 }
 
+/// What one [`reconcile_once`] cycle cost and saw (issue #1679). The cycle is
+/// what silently degrades when the control-plane prefixes fill with dead
+/// processes' keys, and nothing observable moved while it did: the LISTs and
+/// GETs all succeed, so `ravel_admission_reconciliation_failures_total` stays
+/// at zero while every sibling ages past `2 * R` before it is read.
+///
+/// Returned by [`reconcile_once`] and published on the controller, where
+/// [`AdmissionController::last_reconcile_cycle_stats`] reads the most recent
+/// cycle's copy. Each field names the `ravel_admission_*` series it belongs
+/// under, beside the existing families.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileCycleStats {
+    /// `ravel_admission_reconciliation_cycle_duration_seconds` (gauge, exported
+    /// as seconds): how long this cycle took, measured on the controller's
+    /// injected clock. A cycle approaching `2 * R` is the failure this figure
+    /// exists to make visible; it saturates at zero rather than going negative
+    /// if the clock steps backwards mid-cycle.
+    pub cycle_duration_ns: i64,
+    /// `ravel_admission_reconciliation_siblings_observed` (gauge): distinct
+    /// non-stale sibling processes seen across every (tenant, signal) this
+    /// cycle, which is the live fleet size this process reconciled against.
+    pub siblings_observed: u64,
+    /// `ravel_admission_reconciliation_stale_keys_skipped` (gauge): listed keys
+    /// whose GET was skipped because the LIST already showed them past the
+    /// staleness window.
+    pub stale_keys_skipped: u64,
+    /// Keys past the reap horizon this cycle deleted.
+    ///
+    /// Per-cycle, like the two fields above: `record_reconcile_cycle` replaces
+    /// `last_cycle` wholesale, so this reads "reaped this cycle", never a
+    /// running total. An exporter rendering it as
+    /// `ravel_admission_reconciliation_keys_reaped_total` must accumulate it
+    /// itself; publishing this value under a `_total` name yields a counter
+    /// that drops to zero on the first cycle that reaps nothing.
+    pub keys_reaped: u64,
+}
+
 /// Run exactly one reconciliation cycle for every (tenant, signal) the process
 /// currently tracks (ADR-0057 sections 1-3). This is the whole mechanism; the
 /// server wraps it in a periodic loop with clean shutdown (like the fold and
@@ -281,15 +429,23 @@ fn reconcile_rate(configured: crate::admission::RateLimit, n: u64) -> Option<u64
 /// the two lock-free-I/O hooks ([`AdmissionController::snapshot_for_reconciliation`]
 /// and [`AdmissionController::apply_reconciliation`]), and every object-store
 /// LIST/GET/PUT happens between them with no lock held.
+///
+/// The cycle reads only the live fleet and reaps the dead from the prefixes it
+/// already lists (issue #1679, see the [module docs](self)), and returns what it
+/// cost and saw as [`ReconcileCycleStats`].
 pub async fn reconcile_once(
     controller: &AdmissionController,
     store: &dyn ObjectStoreBackend,
     interval: Duration,
     now_ns: i64,
-) {
+) -> ReconcileCycleStats {
     let r_ns = i64::try_from(interval.as_nanos()).unwrap_or(i64::MAX);
     let two_r_ns = r_ns.saturating_mul(2);
     let process_id = controller.process_id().to_string();
+    let mut stats = ReconcileCycleStats::default();
+    // Every distinct non-stale sibling this cycle saw, across every tenant and
+    // signal: the live fleet size, reported as one gauge for the process.
+    let mut cycle_siblings: HashSet<String> = HashSet::new();
 
     let states = controller.snapshot_for_reconciliation(now_ns);
     for state in states {
@@ -351,14 +507,29 @@ pub async fn reconcile_once(
         let mut nonstale_siblings: HashSet<String> = HashSet::new();
 
         for &signal in &state.signals {
-            match read_siblings(store, &state.tenant_hash, signal, &process_id).await {
-                Ok(siblings) => {
-                    for sib in siblings {
+            match read_siblings(
+                store,
+                &state.tenant_hash,
+                signal,
+                &process_id,
+                now_ns,
+                two_r_ns,
+            )
+            .await
+            {
+                Ok(read) => {
+                    stats.stale_keys_skipped =
+                        stats.stale_keys_skipped.saturating_add(read.skipped_stale);
+                    stats.keys_reaped = stats
+                        .keys_reaped
+                        .saturating_add(reap_keys(store, &read.reapable).await);
+                    for sib in read.siblings {
                         if is_stale(now_ns, sib.snapshot_unix_ns, two_r_ns) {
                             continue;
                         }
                         sibling_series = sibling_series.saturating_add(sib.active_series_count);
                         sibling_streams = sibling_streams.saturating_add(sib.active_streams_count);
+                        cycle_siblings.insert(sib.process_id.clone());
                         nonstale_siblings.insert(sib.process_id);
                     }
                 }
@@ -407,6 +578,35 @@ pub async fn reconcile_once(
             baseline_created: state.snapshot_created_total,
         });
     }
+
+    stats.siblings_observed = cycle_siblings.len() as u64;
+    // Measured on the controller's injected clock, the same one `now_ns` was
+    // drawn from, so a test drives it deterministically and no library logic
+    // reads wall time of its own.
+    stats.cycle_duration_ns = controller.now_ns().saturating_sub(now_ns).max(0);
+    controller.record_reconcile_cycle(stats);
+    stats
+}
+
+/// Delete every key past the reap horizon, best effort (issue #1679). A delete
+/// that fails is logged and retried by whichever process next lists the prefix;
+/// it is never a reconciliation read failure, because the fleet picture this
+/// cycle computed is complete either way. `delete` is idempotent, so several
+/// processes reaping the same dead key concurrently is not a race.
+async fn reap_keys(store: &dyn ObjectStoreBackend, keys: &[String]) -> u64 {
+    let mut reaped = 0;
+    for key in keys {
+        match store.delete(key).await {
+            Ok(()) => reaped += 1,
+            Err(err) => tracing::warn!(
+                key = %key,
+                error = %err,
+                "admission reconciliation: reaping a dead process's snapshot failed; \
+                 retried next cycle"
+            ),
+        }
+    }
+    reaped
 }
 
 #[cfg(test)]
@@ -415,7 +615,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI64, Ordering};
 
-    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::{SeriesId, TenantId};
 
@@ -483,6 +685,79 @@ mod tests {
         // live.
         let _ = controller.check_byte_rate(tenant, Signal::Metrics, per_sec, clock.now_ns());
         controller
+    }
+
+    /// A clock that advances by `step` on every read, so the duration a cycle
+    /// measures between two reads is a deterministic function of the reads it
+    /// makes rather than of how long the test machine took.
+    struct SteppingClock {
+        next: AtomicI64,
+        step: i64,
+    }
+    impl SteppingClock {
+        fn new(start_ns: i64, step: i64) -> Arc<Self> {
+            Arc::new(SteppingClock {
+                next: AtomicI64::new(start_ns),
+                step,
+            })
+        }
+    }
+    impl Clock for SteppingClock {
+        fn now_ns(&self) -> i64 {
+            self.next.fetch_add(self.step, Ordering::SeqCst)
+        }
+    }
+
+    /// Write one sibling snapshot whose *store* modification time is
+    /// `mtime_ms`, which is what the LIST result carries and therefore what the
+    /// read-side staleness skip and the reaper judge against. The oracle's
+    /// clock is left at `restore_ms` so later writes (this process's own
+    /// snapshot, above all) land with a current modification time.
+    async fn seed_snapshot(
+        store: &FaultStore<MemoryStore>,
+        key: &str,
+        mtime_ms: u64,
+        restore_ms: u64,
+        snapshot_unix_ns: i64,
+        active_series_count: u64,
+    ) {
+        store.inner().set_clock_ms(mtime_ms);
+        let snapshot = AdmissionUsageSnapshot {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            active_series_count,
+            active_streams_count: 0,
+            byte_rate_consumed_since_last_snapshot: 0,
+            series_creation_consumed_since_last_snapshot: 0,
+            snapshot_unix_ns,
+        };
+        store
+            .put(
+                key,
+                snapshot.encode_to_vec().into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("seed sibling snapshot");
+        store.inner().set_clock_ms(restore_ms);
+    }
+
+    /// The keys currently under a (tenant, signal)'s admission prefix, sorted.
+    async fn keys_under(
+        store: &FaultStore<MemoryStore>,
+        tenant_hash: &TenantHash,
+        signal: Signal,
+    ) -> Vec<String> {
+        let mut keys: Vec<String> = list_all(store, &admission_prefix(tenant_hash, signal))
+            .await
+            .expect("list admission prefix")
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect();
+        keys.sort();
+        keys
     }
 
     fn sibling(snapshot_unix_ns: i64, active_series_count: u64) -> SiblingSnapshot {
@@ -792,6 +1067,262 @@ mod tests {
             a.effective_byte_rate_per_sec(&tenant).unwrap(),
             100,
             "a stale sole sibling drops out of N, restoring the full fleet cap"
+        );
+    }
+
+    /// Issue #1679's own case: a prefix filled with the snapshots of processes
+    /// that have long since exited costs one LIST and a GET per LIVE sibling,
+    /// not a GET per key, and the two live siblings are still both counted.
+    ///
+    /// The GET budget is asserted through the fault plan rather than by reading
+    /// a counter: the 4th GET under the admission prefix is scripted to fail,
+    /// so more than three of them shows up as a fired fault (and, since a
+    /// failed read keeps the previous threshold, as the wrong cap). Against the
+    /// pre-fix `read_siblings` the cycle issues 502 GETs and both assertions
+    /// fail.
+    async fn stale_prefix_case(memory: MemoryStore) {
+        const STALE_SIBLINGS: usize = 500;
+        let tenant = TenantId::new("acme");
+        let tenant_hash = tenant.hash();
+        let now_ns = 1_000 * R_NS;
+        let now_ms = (now_ns / 1_000_000) as u64;
+        // Every dead process's key is 10 * R old: past the 2 * R staleness
+        // window and past the 4 * R reap horizon.
+        let dead_ms = now_ms - 10 * (R_NS / 1_000_000) as u64;
+
+        let clock = TestClock::new(now_ns);
+        let controller = AdmissionController::new(clock.clone(), count_only_limits(100));
+        controller.set_tenant_limits(tenant.clone(), count_only_limits(100));
+        for i in 0..10u8 {
+            controller.admit_series(&tenant, [series(i)], clock.now_ns());
+        }
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Transient("a 4th admission GET in one cycle".into()),
+            )
+            .with_key_contains("/admission/")
+            .with_occurrence(Occurrence::Nth(4)),
+        );
+        let store = Arc::new(FaultStore::new(memory, plan));
+        store.inner().set_clock_ms(now_ms);
+
+        for i in 0..STALE_SIBLINGS {
+            seed_snapshot(
+                store.as_ref(),
+                &snapshot_key(&tenant_hash, Signal::Metrics, &format!("dead-{i:04}")),
+                dead_ms,
+                now_ms,
+                now_ns - 10 * R_NS,
+                90,
+            )
+            .await;
+        }
+        let fresh_a = snapshot_key(&tenant_hash, Signal::Metrics, "live-a");
+        let fresh_b = snapshot_key(&tenant_hash, Signal::Metrics, "live-b");
+        seed_snapshot(store.as_ref(), &fresh_a, now_ms, now_ms, now_ns, 7).await;
+        seed_snapshot(store.as_ref(), &fresh_b, now_ms, now_ms, now_ns, 13).await;
+
+        let stats = reconcile_once(&controller, store.as_ref(), R, now_ns).await;
+
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Transient),
+            0,
+            "the 4th GET under the admission prefix never happened: at most 3"
+        );
+        // own(10) + max(0, 100 - 10 - (7 + 13)) = 80: both live siblings counted,
+        // and no dead one. Either live sibling missing would read 87 or 93.
+        assert_eq!(
+            controller.effective_max_active_series(&tenant),
+            Some(CountLimit::Bounded(80)),
+            "both fresh siblings count, and no stale one does"
+        );
+        assert_eq!(stats.siblings_observed, 2, "two live siblings");
+        assert_eq!(
+            stats.stale_keys_skipped, STALE_SIBLINGS as u64,
+            "every dead process's key was judged from the LIST result alone"
+        );
+        assert_eq!(
+            stats.keys_reaped, STALE_SIBLINGS as u64,
+            "and every one past the reap horizon was deleted"
+        );
+
+        // The prefix now holds exactly the live fleet: this process and the two
+        // fresh siblings, by exact key set.
+        let own = snapshot_key(
+            &tenant_hash,
+            Signal::Metrics,
+            &controller.process_id().to_string(),
+        );
+        let mut expected = vec![own, fresh_a, fresh_b];
+        expected.sort();
+        assert_eq!(
+            keys_under(store.as_ref(), &tenant_hash, Signal::Metrics).await,
+            expected,
+            "the dead keys are gone and every live one survived"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prefix_of_dead_processes_costs_no_gets_and_is_reaped() {
+        stale_prefix_case(MemoryStore::new()).await;
+    }
+
+    /// The same case over a listing that pages: a reaper (or a skip) that works
+    /// on one page and not on two would pass the test above and still leave
+    /// most of the prefix behind.
+    #[tokio::test]
+    async fn a_prefix_of_dead_processes_is_reaped_across_list_pages() {
+        stale_prefix_case(MemoryStore::with_page_size(2)).await;
+    }
+
+    /// The reap horizon is the staleness window widened by
+    /// [`REAP_WINDOW_FACTOR`], and that extra width is the clock-skew margin: a
+    /// key inside it is already excluded from the fleet sum (and costs no GET)
+    /// but is NOT deleted, so a live process whose key looks older than it is
+    /// keeps its key.
+    #[tokio::test]
+    async fn a_key_inside_the_skew_margin_is_skipped_but_not_reaped() {
+        let tenant = TenantId::new("acme");
+        let tenant_hash = tenant.hash();
+        let now_ns = 1_000 * R_NS;
+        let now_ms = (now_ns / 1_000_000) as u64;
+        let r_ms = (R_NS / 1_000_000) as u64;
+
+        let clock = TestClock::new(now_ns);
+        let controller = AdmissionController::new(clock.clone(), count_only_limits(100));
+        controller.set_tenant_limits(tenant.clone(), count_only_limits(100));
+        for i in 0..10u8 {
+            controller.admit_series(&tenant, [series(i)], clock.now_ns());
+        }
+
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        store.inner().set_clock_ms(now_ms);
+
+        // 3 * R old: past the 2 * R staleness window, inside the 4 * R horizon.
+        let inside = snapshot_key(&tenant_hash, Signal::Metrics, "skewed");
+        // 5 * R old: past the horizon.
+        let past = snapshot_key(&tenant_hash, Signal::Metrics, "long-dead");
+        seed_snapshot(
+            store.as_ref(),
+            &inside,
+            now_ms - 3 * r_ms,
+            now_ms,
+            now_ns - 3 * R_NS,
+            40,
+        )
+        .await;
+        seed_snapshot(
+            store.as_ref(),
+            &past,
+            now_ms - 5 * r_ms,
+            now_ms,
+            now_ns - 5 * R_NS,
+            40,
+        )
+        .await;
+
+        let stats = reconcile_once(&controller, store.as_ref(), R, now_ns).await;
+
+        assert_eq!(stats.stale_keys_skipped, 2, "both keys are past 2 * R");
+        assert_eq!(
+            stats.keys_reaped, 1,
+            "only the key past the reap horizon is deleted"
+        );
+        assert_eq!(stats.siblings_observed, 0, "neither counts as live");
+        assert_eq!(
+            controller.effective_max_active_series(&tenant),
+            Some(CountLimit::Bounded(100)),
+            "a stale sibling contributes zero whether or not it was reaped"
+        );
+
+        let own = snapshot_key(
+            &tenant_hash,
+            Signal::Metrics,
+            &controller.process_id().to_string(),
+        );
+        let mut expected = vec![own, inside];
+        expected.sort();
+        assert_eq!(
+            keys_under(store.as_ref(), &tenant_hash, Signal::Metrics).await,
+            expected,
+            "the key inside the skew margin survives; the one past the horizon does not"
+        );
+    }
+
+    /// The read-side skip judges a listed key from the modification time the
+    /// LIST result carries, and a backend that reports none (`<= 0`, which is
+    /// the in-memory oracle's default) is read exactly as before rather than
+    /// read as ancient. Every other reconciliation test in this module relies
+    /// on that: they seed siblings without ever setting the oracle's clock.
+    #[test]
+    fn a_missing_modification_time_is_unknown_never_ancient() {
+        let now = 1_000 * R_NS;
+        let two_r = 2 * R_NS;
+        let now_ms = now / 1_000_000;
+        let r_ms = R_NS / 1_000_000;
+
+        assert!(
+            !mtime_stale(now, 0, two_r),
+            "no modification time means read the key, not skip it"
+        );
+        assert!(!mtime_stale(now, -1, two_r), "nor does a negative one");
+        assert!(
+            !mtime_stale(now, now_ms - 2 * r_ms, two_r),
+            "exactly 2 * R old is still fresh, exactly as is_stale judges it"
+        );
+        assert!(
+            mtime_stale(now, now_ms - 2 * r_ms - 1, two_r),
+            "one millisecond past 2 * R is stale"
+        );
+        // The reap horizon is the same window, widened by the factor: nothing
+        // is reaped that the staleness window would not already exclude.
+        assert_eq!(reap_horizon_ns(two_r), 4 * R_NS);
+        assert!(!mtime_stale(now, now_ms - 4 * r_ms, reap_horizon_ns(two_r)));
+        assert!(mtime_stale(
+            now,
+            now_ms - 4 * r_ms - 1,
+            reap_horizon_ns(two_r)
+        ));
+    }
+
+    /// The cycle duration is measured on the controller's injected clock: a
+    /// clock that does not move reports exactly zero, and one that advances by
+    /// a known step reports exactly that step (the cycle takes one end stamp).
+    /// No wall-clock reading enters the figure.
+    #[tokio::test]
+    async fn cycle_duration_is_measured_on_the_injected_clock() {
+        let tenant = TenantId::new("solo");
+        let now_ns = 500 * R_NS;
+        let store = Arc::new(MemoryStore::new());
+
+        let fixed = TestClock::new(now_ns);
+        let controller = AdmissionController::new(fixed.clone(), count_only_limits(100));
+        controller.set_tenant_limits(tenant.clone(), count_only_limits(100));
+        controller.admit_series(&tenant, [series(1)], now_ns);
+        let stats = reconcile_once(&controller, store.as_ref(), R, now_ns).await;
+        assert_eq!(
+            stats.cycle_duration_ns, 0,
+            "a clock that did not move measures a zero-length cycle"
+        );
+        assert_eq!(stats.siblings_observed, 0, "a lone process has no siblings");
+
+        const STEP_NS: i64 = 250_000;
+        let stepping = SteppingClock::new(now_ns, STEP_NS);
+        let controller = AdmissionController::new(stepping.clone(), count_only_limits(100));
+        controller.set_tenant_limits(tenant.clone(), count_only_limits(100));
+        controller.admit_series(&tenant, [series(1)], now_ns);
+        let start_ns = stepping.now_ns();
+        let stats = reconcile_once(&controller, store.as_ref(), R, start_ns).await;
+        assert_eq!(
+            stats.cycle_duration_ns, STEP_NS,
+            "the cycle's end stamp comes from the same injected clock as its start"
+        );
+        assert_eq!(
+            controller.last_reconcile_cycle_stats(),
+            stats,
+            "the cycle publishes the same figures it returned, for the exporter to read"
         );
     }
 }

@@ -25,6 +25,20 @@
               "spec": {
                 "description": "`RavelCluster` spec. Each field maps onto `ravel-server`'s real CLI surface\n(`services/ravel-server/src/config.rs`); the memory store is deliberately\nunrepresentable (ADR-0034 decision 2), so `storage.s3` is mandatory.",
                 "properties": {
+                  "auditTokenKeySecretRef": {
+                    "description": "Secret with a single key `key` holding 64 hex characters, the\nquery-audit token key the query tier reads as\n`RAVEL_AUDIT_TOKEN_KEY` (#1487). Query tier only: gateway and\nmaintain never read a query-audit token. Omit on a cluster with\n`deploymentKeySecretRef` set -- the server derives the key from the\ndeployment key. Omitting both leaves the query tier unable to start\naudit tokenization: the operator does not generate this Secret\n(issue #126's `secrets get`-only posture forbids the create/patch\nthat would need), so a cluster with neither ref set reports\n`AuditTokenKeyMissing` and its query tier's Deployment is left as it\nis until this field is set.",
+                    "nullable": true,
+                    "properties": {
+                      "name": {
+                        "description": "Name of the Secret.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
                   "deploymentKeySecretRef": {
                     "description": "Secret with a single key `key` holding the deployment's 32-byte\ndeployment key (64 hex characters or 32 raw bytes, the same format\n`--tenant-hash-key-file` reads). This one key doubles as the v2-keyed\ntenant-hash key and the `sys/auth` token-hashing key (ADR-0072\ndecision 4): when set, the operator mounts it and renders\n`--tenant-hash-key-file` instead of `--tenant-hash-unkeyed`, and\nreconciles `sys/auth` from `tenantTokensSecretRef` each cycle. Additive\nopt-in, not a migration of existing unkeyed clusters; omit to keep\nunkeyed behavior unchanged.",
                     "nullable": true,
@@ -219,6 +233,13 @@
                             "rule": "!has(self.key) || !has(self.key.source) || self.key.source != 'header' || (has(self.key.headerName) && self.key.headerName != '')"
                           }
                         ]
+                      },
+                      "maxInflightFlushes": {
+                        "description": "Per-shard cross-tenant flush isolation bound (`--max-inflight-flushes`).\nIt caps how many flushes a shard actor runs at once, so one tenant's\nstalled flush cannot block co-resident tenants beyond this many permits.\nIngest runs only in the gateway tier (the query and maintain modes never\nenter the ingest path), so this is a gateway-only field, like `fold`.\nOmit to keep `ravel-server`'s own default of 1 (today's non-pipelined\nbehavior). The CRD schema enforces a minimum of 1 at admission:\n`ravel-server` rejects 0 as a flush deadlock.",
+                        "format": "uint32",
+                        "minimum": 1.0,
+                        "nullable": true,
+                        "type": "integer"
                       },
                       "replicas": {
                         "default": 1,
@@ -600,11 +621,32 @@
                     "nullable": true,
                     "type": "integer"
                   },
+                  "qualifyFailureCount": {
+                    "description": "Consecutive qualify-Job failures for the current inputs (issue #36, finding\n3). Drives the capped exponential recreation backoff and the terminal\ncooldown: the operator does not recreate a failing qualify Job unboundedly,\nit spaces the recreations out and, past a threshold, holds. Reset to absent\non a successful qualification and on any input change (a moving\n`storeQualifiedHash` input); never part of the qualified-input hash, so\ncounting failures never re-runs a qualification that would otherwise pass.\n\nSerialized even when absent (as explicit `null`) so the status merge patch\nclears it on success; a skipped field would leave a stale count behind.",
+                    "format": "int32",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "qualifyNextRetryTime": {
+                    "description": "RFC3339 instant before which the operator creates no new qualify Job after\na failure (issue #36, finding 3): the next point on the capped exponential\nbackoff, or the terminal cooldown's expiry. Absent when not holding.\n\nSerialized even when absent (as explicit `null`) so the status merge patch\nclears it; a skipped field would leave a stale deadline behind.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "qualifyRetryHash": {
+                    "description": "The qualify-Job input hash the persisted `qualifyFailureCount` and\n`qualifyNextRetryTime` were recorded against (issue #36, finding 3). The\nretry state is meaningful only for the inputs that produced the failures:\nwhen the desired inputs no longer hash to this value the operator resets\nthe count and next-retry and qualifies the new inputs at once, whether or\nnot the failing Job still exists. Without this key the operator cannot tell\na changed-input pass from an unchanged one once the Failed Job is\nTTL-garbage-collected (both observe the Job absent), so a config edit made\nafter the Job's TTL collected it would wait out the old inputs' cooldown and\ninherit their failure count. This is never part of the qualified-input hash\nitself, so recording it never re-runs a qualification that would pass.\n\nSerialized even when absent (as explicit `null`) so the status merge patch\nclears it on reset or success; a skipped field would leave a stale key\nbehind.",
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "queryReadyReplicas": {
                     "description": "Ready replicas reported by the query Deployment.",
                     "format": "int32",
                     "nullable": true,
                     "type": "integer"
+                  },
+                  "storeQualifiedHash": {
+                    "description": "The qualify-Job input hash (bucket, region, endpoint, image, credentials\nSecret name) that store qualification last succeeded against (issue #36).\nThe operator gates serving on `ravel-cli store qualify` before it creates any\nDeployment; recording the qualified inputs here makes that gate durable:\na later pass whose inputs still hash to this value proceeds without\nre-running qualification even after the one-shot Job has been\nTTL-garbage-collected, and a pass whose inputs no longer match re-runs it\n(the `StoreQualified` condition flips back to `Pending`) without tearing\ndown the running Deployments. Absent until the first qualification\nsucceeds. Qualification is never re-run on a schedule; only an input\nchange re-triggers it.",
+                    "nullable": true,
+                    "type": "string"
                   }
                 },
                 "type": "object"

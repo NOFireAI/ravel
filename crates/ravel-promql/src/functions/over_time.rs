@@ -473,6 +473,37 @@ mod tests {
         }
     }
 
+    /// ADR-1103: a log-derived series delivers one sample per record, so
+    /// two records logged at the same nanosecond are two real samples, not
+    /// a duplicate to collapse. A window holding [t1=3, t2=5, t2=7, t3=9]
+    /// (two samples sharing `t2`) must be reduced as four samples by every
+    /// `_over_time` reducer, matching Prometheus' `[3,5,7,9]` on the same
+    /// four values. Demonstrated failing by deduping the window to one
+    /// sample per timestamp before reducing (e.g. inserting a
+    /// `samples.dedup_by_key(|s| s.ts_ns)` ahead of each call below) fails
+    /// every assertion (a three-sample reduction instead of four).
+    #[test]
+    fn equal_timestamp_samples_count_individually() {
+        let samples = [
+            sample(0, 3.0),
+            sample(1_000, 5.0),
+            sample(1_000, 7.0),
+            sample(2_000, 9.0),
+        ];
+        let w = window(0, 2_000, 2_000);
+        assert_eq!(count_over_time(&samples, w), Some(4.0));
+        assert_eq!(sum_over_time(&samples, w), Some(24.0));
+        assert_eq!(avg_over_time(&samples, w), Some(6.0));
+        assert_eq!(max_over_time(&samples, w), Some(9.0));
+        assert_eq!(min_over_time(&samples, w), Some(3.0));
+        // Prometheus quantile(0.5) over the four sorted values [3,5,7,9]:
+        // rank = 0.5*3 = 1.5, interpolating halfway between index 1 (5) and
+        // index 2 (7).
+        assert_eq!(quantile_over_time(0.5, &samples, w), Some(6.0));
+        assert_eq!(last_over_time(&samples, w), Some(9.0));
+        assert_eq!(present_over_time(&samples, w), Some(1.0));
+    }
+
     #[test]
     fn sum_over_time_adds_every_sample() {
         let samples = [sample(0, 1.0), sample(1_000, 2.0), sample(2_000, 3.5)];

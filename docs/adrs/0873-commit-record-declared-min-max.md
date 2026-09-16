@@ -1226,6 +1226,120 @@ flowchart TD
   claims in `CompactionPart` with ADR-0815's, first-to-land takes the
   lower numbers; this ADR claims only field 12.
 
+## Amendment: the .cstat carrier joins by entry identity and STR extrema stay .cstat-only
+
+Amended 2026-09-03. Two statements above do not describe the shipped reader.
+Decision 4 says both carriers of the union resolve through one segment
+identity, the data object's content hash. Decision 2 says a `.cstat` `STR`
+extremum is answered at `Precision::Exact` today and mandates a positive
+regression test for that. The code does neither, and the decision here is
+that the code is right and this document moves to it. The decisions' original
+text stands as written except where this section supersedes it.
+
+The `.cstat` side of the union joins by the entry identity the fold already
+writes into the object: ingest hour bucket, shard, writer id, writer epoch,
+and writer sequence. The stamp side joins by content hash in the only sense a
+stamp can, since it rides the resolved segment reference itself and that
+reference's content hash is the record's. Both lookups start from one
+resolved segment reference and read fields of that reference, so the two
+carriers are matched to the same segment through the reference rather than
+through two independently stored keys that could name different segments.
+That is what keeps this inside ADR-0942 rather than beside it. What it
+introduces is nothing: no new field on any object, no key a reader must
+store, compare across objects, or keep converging with another. The identity
+tuple is the fold's existing per-entry key and the content hash is the
+record's existing one; neither is a name this ADR invents, and no durable
+object gains a second way to be addressed. What ADR-0942 forbade was a join
+key that covered many segments at once and so merged their statistics. The
+entry identity has the opposite property, naming exactly one flush of one
+shard in one ingest hour, and a compacted segment carries the nil writer id,
+matches no `.cstat` entry, and falls back to a scan.
+
+A `.cstat` `STR` extremum is never consulted. The read side declines a
+declared `STR` column before either carrier is examined, because the column
+is projected as a dictionary-encoded string and has no scalar form on the
+statistics path, so `MIN` and `MAX` over a declared `STR` column are answered
+by scanning. Decision 2's "from today" claim for `STR` is withdrawn, and with
+it the positive regression test that decision mandates for a `STR` entry: no
+such test can pass against a reader that never reaches the entry. The `BYTES`
+half of that mandate stands unchanged, since `BYTES` is excluded from the
+stamp vocabulary, is read from `.cstat`, and does reach `Precision::Exact`.
+Where decision 4 describes the union degenerating to the `.cstat` carrier
+alone for a declared `STR` or `BYTES` column, that now describes `BYTES`
+only; the `STR` case is not a degenerate union but no union at all.
+
+## Amendment 2026-09-03: the stamp's basis is the merged attribute view
+
+Issue #1057. Decision 3 describes the L0 and L1 folds in terms of the
+writer's per-block NumStats, which count merged-view resolution per row
+(docs/log-segment-format.md, "What a numeric stat bounds": a row that
+resolves a name off its stream layer contributes its resource- or
+scope-level value). Both shipped producers instead fold the records
+themselves, and both folded a record's own attribute set only. That made a
+declared column whose values live on the stream's resource or scope
+attributes stamp `null_count == sample_count` with absent extrema, which is
+an affirmative all-NULL statement rather than an absent one. DataFusion's
+aggregate-statistics rule declines a NULL min/max scalar, so `MIN`/`MAX`
+fell back to a scan and were still correct; only `COUNT` trusted the
+statement outright and answered zero over a column every row of the object
+resolves a value for.
+
+The basis is unchanged by this amendment; it is restated because the
+implementation had drifted from it. For every row, both producers now
+resolve the value the reader resolves (`ravel_sql`'s
+`logs_scan::merged_value`): the record's own attribute when the record sets
+that key at any value kind, and otherwise the row's stream-level resource or
+scope attribute of the same name, first blob occurrence winning. A stream's
+attributes are decoded once per stream per object, never per record. When a
+stream's attribute blob does not decode, the producer emits no stamps at all
+for that object rather than an affirmative statement over an unresolved
+view, which is the fail-closed reading of decision 3's staleness rule.
+
+## Amendment 2026-09-07: the stamp is a direct record fold, not a fold over the writer's per-block NumStats
+
+Issue #1168. Decision 3 ("Capture at write time") routes both stamp
+producers through `RlogWriter`'s per-block NumStats: the L0 flush folds the
+writer's per-block statistics through `finish_with_stats`, and the L1
+compaction through `finish_compacted_with_stats`. Both shipped producers
+instead fold the records directly and never read the writer's per-block
+NumStats:
+
+- the ingest flush fold, `crates/ravel-ingest/src/log_declared_stats.rs`
+  (its module doc already records this posture), which folds a flush
+  buffer's records through `DeclaredStatAccum::observe_records`;
+- the compaction recompute, `crates/ravel-maintain/src/rlog.rs`
+  (`DeclaredStatAccum`), which folds each part's records through
+  `observe_record` on the same per-record `PartBuilder::push` path the
+  encode rides.
+
+This amendment records the direct record fold as the decision. The
+producers are correct as shipped and are not to be changed to match
+decision 3's sketch.
+
+The rationale is a units mismatch between what the writer measures and what
+the stamp must state. The writer's NumStats are per block and per resolved
+column: each entry bounds one column over the rows of one encoded block,
+and the resolution the block already performed. The stamp, by contrast, is
+one figure per `CommitRecord` (or `CompactionPart`), and its null count
+depends on the stream-level fallback multiplicity of the merged attribute
+view -- how many rows resolve a declared column's value off their stream's
+resource or scope layer rather than off the record's own attributes. That
+multiplicity is a property of the record-to-stream fan-out, which is
+present at the record fold and absent from the writer's per-block,
+per-resolved-column tally: folding NumStats would recover a per-block extent
+but not the per-commit-record fallback count the reader's null contract
+needs. So both producers fold the merged-attribute records, where the
+fallback view is available, rather than the writer's statistics.
+
+This is a separate divergence from the 2026-09-03 merged-view amendment
+above, and predates it. That amendment fixed the *semantic basis* of the
+fold (record-own attributes versus the merged resource/scope view) and took
+the record fold as given; this one records *which component* computes the
+stamp at all (a direct record fold versus decision 3's fold over the
+writer's per-block NumStats). Read together: the stamp is a record fold
+(this amendment) over the merged attribute view (the merged-view
+amendment).
+
 ## Out-of-scope findings, reported not fixed
 
 1. **docs/adrs/README.md index drift**: the index (111 rows) is missing

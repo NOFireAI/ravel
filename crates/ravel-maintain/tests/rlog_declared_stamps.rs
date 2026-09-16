@@ -100,13 +100,61 @@ fn split_config() -> CompactorConfig {
 /// A synthetic stream `n`'s id and canonical resource+scope blob, identical to
 /// the crate's own RLOG test helper: the id is the true hash of the blob.
 fn stream_ident(n: u32) -> (LogStreamId, Vec<u8>) {
-    let res = vec![(
+    stream_ident_with(n, &[])
+}
+
+/// The same, with `extra` resource attributes beyond the service identity, so a
+/// declared column's values can live on the stream rather than on the records.
+fn stream_ident_with(n: u32, extra: &[(&str, AttrValue)]) -> (LogStreamId, Vec<u8>) {
+    let mut res = vec![(
         "service.name".to_string(),
         AttrValue::Str(format!("svc{n}")),
     )];
+    res.extend(extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
     let id = log_stream_id(&res, "scope", "1", &[]);
     let blob = ravel_logseg::stream_attrs_bytes(&res, "scope", "1", &[]);
     (id, blob)
+}
+
+/// The same as [`stream_ident_with`], but also carrying `scope_extra`
+/// attributes beyond an otherwise-empty scope set, so a declared column's
+/// stream-level fallback can be exercised on either half of the merged view
+/// in one stream (issue #1057 finding 1: a List/Map resource occurrence must
+/// not shadow a matching-typed scope occurrence behind it).
+fn stream_ident_with_scope(
+    n: u32,
+    res_extra: &[(&str, AttrValue)],
+    scope_extra: &[(&str, AttrValue)],
+) -> (LogStreamId, Vec<u8>) {
+    let mut res = vec![(
+        "service.name".to_string(),
+        AttrValue::Str(format!("svc{n}")),
+    )];
+    res.extend(res_extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
+    let scope: Vec<(String, AttrValue)> = scope_extra
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.clone()))
+        .collect();
+    let id = log_stream_id(&res, "scope", "1", &scope);
+    let blob = ravel_logseg::stream_attrs_bytes(&res, "scope", "1", &scope);
+    (id, blob)
+}
+
+/// One record at `ts` on an explicit stream, carrying `attrs` and nothing else.
+fn rec_on(stream: &(LogStreamId, Vec<u8>), ts: i64, attrs: Vec<(&str, AttrValue)>) -> LogRecord {
+    LogRecord {
+        stream_id: stream.0,
+        stream_attrs: stream.1.clone(),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: body_of(ts),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+    }
 }
 
 /// A body of exactly [`BODY_LEN`] bytes, tagged with `ts` so distinct records
@@ -365,7 +413,7 @@ fn part_bool(p: &CompactionPart, name: &str) -> (Option<bool>, Option<bool>, u64
 /// asserted here. `non_null + null_count == sample_count` is checked on every
 /// part, the invariant `read_compaction_part` relies on.
 ///
-/// Prove-the-test: delete the `self.declared_accum.observe_record(&r.attrs)`
+/// Prove-the-test: delete the `self.declared_accum.observe_record(&r)`
 /// call in `PartBuilder::push` (crates/ravel-maintain/src/rlog.rs) and every
 /// part stamps all-NULL, so each `Some(..)` min/max assertion fails.
 #[tokio::test]
@@ -427,6 +475,117 @@ async fn each_output_part_stamps_exactly_its_own_records() {
         part_bool(p1, CACHE),
         (Some(true), Some(true), 1),
         "part1 cache true, one NULL (D)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 1b: the fold is over the MERGED attribute view (issue #1057).
+// ---------------------------------------------------------------------------
+
+/// A declared column whose values live on the stream's resource attributes is
+/// stamped at its stream-level value for every record that does not set the key
+/// itself, exactly as a reader resolves it -- not as an affirmative all-NULL.
+///
+/// Both inputs carry the pre-fix L0 stamp for this shape (all-NULL over their
+/// own rows, since no record sets `STATUS`), so this also pins the
+/// recompute-never-copy rule: the output part's stamp is what the compactor
+/// folded, not what the inputs claimed.
+///
+/// Prove-the-test: delete the `schema.fallbacks_for(r.stream_id)` loop at the
+/// end of `DeclaredStatAccum::observe_record` (crates/ravel-maintain/src/rlog.rs)
+/// and the part stamps `(None, None, 3)` instead of `(Some(7), Some(7), 0)`.
+#[tokio::test]
+async fn part_stamps_the_stream_level_value_of_a_declared_column() {
+    let store = MemoryStore::new();
+    let stream = stream_ident_with(5, &[(STATUS, AttrValue::I64(7))]);
+    let input_1 = vec![rec_on(&stream, 1000, vec![]), rec_on(&stream, 3000, vec![])];
+    let input_2 = vec![rec_on(&stream, 2000, vec![])];
+    seed(&store, Uuid::from_u128(20), 1, &input_1, true).await;
+    seed(&store, Uuid::from_u128(21), 2, &input_2, true).await;
+
+    let record = compact_and_record(&store, &CompactorConfig::default()).await;
+    assert_eq!(record.parts.len(), 1, "three small records -> one part");
+    let p = &record.parts[0];
+    assert_eq!(p.sample_count, 3);
+    assert_eq!(
+        part_i64(p, STATUS),
+        (Some(7), Some(7), 0),
+        "every row reads the stream's status 7"
+    );
+    assert_eq!(
+        part_bool(p, CACHE),
+        (None, None, 3),
+        "a column neither the records nor the stream carry is all-NULL"
+    );
+}
+
+/// A record that sets the declared key overrides its stream's value for that
+/// row only, at any value kind: the I64 row reads 2, the Str row reads NULL
+/// (never the stream's 7), and the untouched row reads 7.
+#[tokio::test]
+async fn record_attribute_overrides_the_stream_level_value_for_its_row() {
+    let store = MemoryStore::new();
+    let stream = stream_ident_with(6, &[(STATUS, AttrValue::I64(7))]);
+    let input_1 = vec![
+        rec_on(&stream, 1000, vec![(STATUS, AttrValue::I64(2))]),
+        rec_on(&stream, 3000, vec![]),
+    ];
+    let input_2 = vec![rec_on(
+        &stream,
+        2000,
+        vec![(STATUS, AttrValue::Str("nope".to_string()))],
+    )];
+    seed(&store, Uuid::from_u128(30), 1, &input_1, true).await;
+    seed(&store, Uuid::from_u128(31), 2, &input_2, true).await;
+
+    let record = compact_and_record(&store, &CompactorConfig::default()).await;
+    assert_eq!(record.parts.len(), 1);
+    let p = &record.parts[0];
+    assert_eq!(p.sample_count, 3);
+    assert_eq!(
+        part_i64(p, STATUS),
+        (Some(2), Some(7), 1),
+        "2 from the record, 7 from the stream, one NULL for the Str row"
+    );
+}
+
+/// Issue #1057 finding 1: a stream whose RESOURCE attributes carry the
+/// declared column as a List and whose SCOPE attributes carry it as a
+/// matching-typed I64 must fall back to the scope value for a row that does
+/// not set the key itself, exactly as the compaction record's own reader
+/// resolves it -- the same shape as `list_resource_attribute_is_skipped_for_a_
+/// matching_scope_fallback` in `ravel-ingest`, recomputed by the compactor.
+///
+/// Prove-the-test: drop the `AttrValue::List(_) | AttrValue::Map(_)` skip
+/// from `DeclaredSchema::build` (crates/ravel-maintain/src/rlog.rs) and the
+/// List's first occurrence claims `STATUS` with no fallback, so the part
+/// stamps `(Some(2), Some(2), 2)` (the base's wrong answer) instead of
+/// `(Some(2), Some(7), 0)`.
+#[tokio::test]
+async fn part_stamps_skip_list_resource_for_a_matching_scope_fallback() {
+    let store = MemoryStore::new();
+    let stream = stream_ident_with_scope(
+        7,
+        &[(STATUS, AttrValue::List(vec![AttrValue::I64(1)]))],
+        &[(STATUS, AttrValue::I64(7))],
+    );
+    let input_1 = vec![
+        rec_on(&stream, 1000, vec![(STATUS, AttrValue::I64(2))]),
+        rec_on(&stream, 3000, vec![]),
+    ];
+    let input_2 = vec![rec_on(&stream, 2000, vec![])];
+    seed(&store, Uuid::from_u128(40), 1, &input_1, true).await;
+    seed(&store, Uuid::from_u128(41), 2, &input_2, true).await;
+
+    let record = compact_and_record(&store, &CompactorConfig::default()).await;
+    assert_eq!(record.parts.len(), 1, "three small records -> one part");
+    let p = &record.parts[0];
+    assert_eq!(p.sample_count, 3);
+    assert_eq!(
+        part_i64(p, STATUS),
+        (Some(2), Some(7), 0),
+        "the List resource occurrence is skipped; the scope's 7 is the \
+         fallback for the two rows that do not set STATUS themselves"
     );
 }
 

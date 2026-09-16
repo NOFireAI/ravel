@@ -143,3 +143,50 @@ impl MetricsService for GrpcMetricsService {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use ravel_ingest::AdmissionLimits;
+    use tonic::Code;
+
+    use super::*;
+    use crate::otlp_http::tests::{state_with_limits, value_kind_mismatch_request};
+    use crate::wire_byte_count::WireByteCounter;
+
+    /// A permanent, non-retryable write rejection
+    /// (`WriteError::SeriesValueKindMismatch`) must stay outside the OTLP-spec
+    /// retryable gRPC code set (CANCELLED, DEADLINE_EXCEEDED, ABORTED,
+    /// OUT_OF_RANGE, UNAVAILABLE, DATA_LOSS): a well-behaved exporter that
+    /// retries only on those codes must not retry a request that can never
+    /// succeed. This pins the gRPC side of the same property the HTTP
+    /// handlers now enforce as 400 instead of 503, without changing gRPC's
+    /// own (already-correct) status mapping.
+    ///
+    /// `export` calls `wire_request_bytes` before it ever reaches the
+    /// Write-error match arms, and that call fails closed without a
+    /// `WireByteCounter` in the request's extensions (normally placed there
+    /// by `WireByteCountLayer` on the real tonic listener). This test calls
+    /// `export` directly, bypassing that layer, so it must seed the
+    /// extension itself or it fails at admission instead of exercising the
+    /// mapping under test.
+    #[tokio::test]
+    async fn permanent_write_error_stays_outside_retryable_grpc_codes() {
+        let state = state_with_limits(AdmissionLimits::default());
+        let service = GrpcMetricsService::new(state);
+
+        let mut request = Request::new(value_kind_mismatch_request());
+        request
+            .extensions_mut()
+            .insert(WireByteCounter::for_test_with_message(false, 64));
+
+        let result = service.export(request).await;
+
+        let status = result.expect_err("a series value-kind mismatch must not be admitted");
+        assert!(
+            matches!(status.code(), Code::Internal | Code::InvalidArgument),
+            "a permanent write error must map to a non-retryable gRPC code, got {:?}",
+            status.code()
+        );
+    }
+}

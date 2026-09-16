@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use ravel_catalog::{CatalogConfig, FoldReport, PartLimits};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_proto::catalog::v1::SnapshotColumnStatsPartRef;
 use ravel_types::{Signal, TenantHash, TenantId};
 use uuid::Uuid;
 
@@ -67,6 +68,14 @@ fn seal_margin_ns(config: &CatalogConfig) -> anyhow::Result<i64> {
 /// line, and a fold over a tenant prefix that holds nothing at all on the
 /// defaulted memory store is refused rather than reported as a fold that
 /// sealed nothing (issue #1024).
+///
+/// `json`, when `true`, prints the whole [`FoldReport`] as JSON instead of
+/// the human-readable field-by-field report. Both forms carry every field
+/// (#1598): the human-readable report used to print 10 of `FoldReport`'s 23
+/// fields and silently omit the other 13. (An earlier version of this comment
+/// said "13 of 23", counting the report's printed LINES, three of which
+/// (`store`, `signal`, `seal_margin`) are not `FoldReport` fields at all.)
+#[allow(clippy::too_many_arguments)]
 pub async fn fold(
     store: Arc<dyn ObjectStoreBackend>,
     selection: StoreSelection,
@@ -75,6 +84,41 @@ pub async fn fold(
     signal: SignalArg,
     max_flush_lifetime_ns: Option<i64>,
     now_ns: i64,
+    json: bool,
+) -> anyhow::Result<(FoldReport, String)> {
+    fold_inner(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        max_flush_lifetime_ns,
+        now_ns,
+        json,
+        None,
+    )
+    .await
+}
+
+/// The testable core of [`fold`]. `column_stats_ceiling_override`, when
+/// `Some`, replaces the per-part column-statistics ceiling (normally
+/// [`ravel_catalog::DEFAULT_MAX_COLUMN_STATS_BYTES`], 256 MiB) via
+/// [`ravel_catalog::Catalog::set_column_stats_part_ceiling_for_test`], so a
+/// test can force the degrade loop at a few kilobytes instead of a
+/// multi-hundred-megabyte fixture. `fold` always passes `None`; no CLI flag
+/// exposes this, exactly as `now_ns` is threaded as a plain parameter rather
+/// than read from `SystemTime::now()` internally (#1598).
+#[allow(clippy::too_many_arguments)]
+pub async fn fold_inner(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    max_flush_lifetime_ns: Option<i64>,
+    now_ns: i64,
+    json: bool,
+    column_stats_ceiling_override: Option<u64>,
 ) -> anyhow::Result<(FoldReport, String)> {
     let mut catalog_config = CatalogConfig {
         shard_count,
@@ -99,9 +143,12 @@ pub async fn fold(
     // short-circuiting to the single implicit generation 0 and enumerating only
     // `0..--shards` (ADR-0052 sections 4/5, Finding 3). Without this the fold is
     // blind to any reshard and writes an under-scanning HEAD.
-    let catalog = ravel_catalog::Catalog::new(store, catalog_config)
+    let mut catalog = ravel_catalog::Catalog::new(store, catalog_config)
         .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
         .with_provisioning_enforcement();
+    if let Some(ceiling) = column_stats_ceiling_override {
+        catalog.set_column_stats_part_ceiling_for_test(ceiling);
+    }
 
     let folder_id = Uuid::new_v4();
     let report = catalog
@@ -116,6 +163,75 @@ pub async fn fold(
         .await
         .map_err(|err| anyhow::anyhow!("fold failed: {err}"))?;
 
+    let out = render_fold_report(&report, selection, signal, seal_margin_ns, json)?;
+    print!("{out}");
+    Ok((report, out))
+}
+
+/// Renders a [`FoldReport`] either as JSON (`json: true`) or as the
+/// human-readable field-by-field report (`json: false`). Both forms print
+/// every field on the struct: a reader without `--json` must never be
+/// missing a counter the JSON form carries (#1598).
+fn render_fold_report(
+    report: &FoldReport,
+    selection: StoreSelection,
+    signal: SignalArg,
+    seal_margin_ns: i64,
+    json: bool,
+) -> anyhow::Result<String> {
+    if json {
+        // stdout must be ONE JSON document: `--json | jq .put_requests` is the
+        // whole point of the flag, and a `store:` line above the body makes
+        // every consumer skip a first line by undocumented convention. The
+        // store selection still has to be visible (#1024), so it becomes a
+        // field instead: `jq .store` reads `memory (default)`, which is harder
+        // to miss than a header line, not easier.
+        let mut value = serde_json::to_value(report)
+            .map_err(|err| anyhow::anyhow!("failed to serialize fold report: {err}"))?;
+        let header = selection.header();
+        let store_value = header.strip_prefix("store: ").unwrap_or(&header);
+        match value.as_object_mut() {
+            Some(obj) => {
+                // The three lines the human report carries that are not
+                // `FoldReport` fields. All three belong in the machine-readable
+                // form too: `--json` exists for a harness reading these
+                // counters, and a report that does not say WHICH signal was
+                // folded cannot be filed against a tenant that has more than
+                // one.
+                let seal_margin = humantime::format_duration(Duration::from_nanos(
+                    u64::try_from(seal_margin_ns).unwrap_or(0),
+                ))
+                .to_string();
+                for (key, value) in [
+                    ("store", store_value.to_string()),
+                    ("signal", signal_word(signal.to_signal()).to_string()),
+                    ("seal_margin", seal_margin),
+                ] {
+                    // Refuse rather than overwrite. These three are not
+                    // `FoldReport` fields today; if the struct ever gains one
+                    // of these names, silently replacing its value would make
+                    // `--json` disagree with the human report about a real
+                    // counter, which is the class of drift this flag exists to
+                    // end.
+                    if obj
+                        .insert(key.to_string(), serde_json::Value::String(value))
+                        .is_some()
+                    {
+                        anyhow::bail!(
+                            "FoldReport now has a `{key}` field, which collides with the \
+                             report-level key of the same name; rename one of them"
+                        );
+                    }
+                }
+            }
+            // `FoldReport` is a struct, so this is unreachable today. Fail
+            // loudly rather than silently dropping the store from the output.
+            None => anyhow::bail!("fold report did not serialize to a JSON object"),
+        }
+        let body = serde_json::to_string_pretty(&value)
+            .map_err(|err| anyhow::anyhow!("failed to serialize fold report: {err}"))?;
+        return Ok(format!("{body}\n"));
+    }
     let mut out = String::new();
     out.push_str(&format!("{}\n", selection.header()));
     out.push_str(&format!("signal: {}\n", signal_word(signal.to_signal())));
@@ -135,11 +251,34 @@ pub async fn fold(
     out.push_str(&format!("buckets_folded: {}\n", report.buckets_folded));
     out.push_str(&format!("entry_count: {}\n", report.entry_count));
     out.push_str(&format!("part_bytes: {}\n", report.part_bytes));
+    out.push_str(&format!("parts_total: {}\n", report.parts_total));
+    out.push_str(&format!("parts_reused: {}\n", report.parts_reused));
     out.push_str(&format!("list_requests: {}\n", report.list_requests));
     out.push_str(&format!("get_requests: {}\n", report.get_requests));
     out.push_str(&format!("put_requests: {}\n", report.put_requests));
-    print!("{out}");
-    Ok((report, out))
+    out.push_str(&format!("postings_built: {}\n", report.postings_built));
+    out.push_str(&format!("postings_bytes: {}\n", report.postings_bytes));
+    out.push_str(&format!(
+        "column_stats_part_objects_built: {}\n",
+        report.column_stats_part_objects_built
+    ));
+    out.push_str(&format!(
+        "column_stats_dictionaries_dropped: {}\n",
+        report.column_stats_dictionaries_dropped
+    ));
+    out.push_str(&format!(
+        "layout_drift_count: {}\n",
+        report.layout_drift_count
+    ));
+    out.push_str(&format!(
+        "frontier_hours_reconciled: {}\n",
+        report.frontier_hours_reconciled
+    ));
+    out.push_str(&format!(
+        "frontier_hours_deferred: {}\n",
+        report.frontier_hours_deferred
+    ));
+    Ok(out)
 }
 
 pub async fn inspect(
@@ -236,6 +375,17 @@ pub async fn render_inspect(
             part_ref.size,
             part_ref.entry_count
         ));
+        // Before the fetch, for the same reason the `range=` line above is:
+        // `part_ref.column_stats` comes from the HEAD protobuf already in hand
+        // and needs neither the object nor a successful decode. Emitting it
+        // after the `?`-returning fetch would omit the line entirely for a part
+        // whose object is missing or corrupt, which is the omitted-line-versus-
+        // unset-field ambiguity this output exists to remove, on exactly the
+        // parts worth inspecting.
+        out.push_str(&format!(
+            "    column_stats (field 7): {}\n",
+            format_column_stats_part_ref(part_ref.column_stats.as_ref())
+        ));
         let got = store
             .get(&part_ref.key, GetRange::Full)
             .await
@@ -257,6 +407,17 @@ pub async fn render_inspect(
         ));
     }
     Ok(())
+}
+
+/// Formats a `SnapshotColumnStatsPartRef` (per-part field 7, ADR-1413) as a
+/// `key=... size=...` line, or `ABSENT` when the field is unset. Printing
+/// `ABSENT` rather than omitting the line matters: an omitted line and an
+/// unset field are otherwise indistinguishable to a reader (#1598).
+fn format_column_stats_part_ref(r: Option<&SnapshotColumnStatsPartRef>) -> String {
+    match r {
+        Some(r) => format!("key={} size={}", r.key, r.size),
+        None => "ABSENT".to_string(),
+    }
 }
 
 /// The `--signal` spelling of a [`Signal`], so every report names the signal
@@ -299,6 +460,84 @@ fn format_uuid_bytes(bytes: &[u8]) -> String {
     <[u8; 16]>::try_from(bytes)
         .map(|raw| Uuid::from_bytes(raw).to_string())
         .unwrap_or_else(|_| hex::encode(bytes))
+}
+
+/// Decodes a column-statistics (`.cstat`) object's envelope and header
+/// (ADR-0850/ADR-0942/ADR-1413) and prints it. `bytes` is the whole object,
+/// already read by the caller (a local file or an object-store key, via
+/// [`crate::store::read_bytes`]).
+pub fn inspect_cstat(bytes: &[u8]) -> anyhow::Result<()> {
+    let mut out = String::new();
+    let result = render_inspect_cstat(bytes, &mut out);
+    print!("{out}");
+    result
+}
+
+/// Renders `inspect_cstat`'s report into `out`. The header is read with
+/// [`ravel_catalog::decode_column_stats_header`], which never decompresses
+/// the body, so an object whose declared `body_uncompressed_len` exceeds the
+/// decode ceiling still yields every header field and the over-ceiling
+/// verdict rather than an error -- exactly the object no full decode can
+/// ever read (#1598). Only when the object is under ceiling does this go on
+/// to fully decode it (which does decompress) for the per-column
+/// `dictionary_present` listing.
+pub fn render_inspect_cstat(bytes: &[u8], out: &mut String) -> anyhow::Result<()> {
+    let peek = ravel_catalog::decode_column_stats_header(bytes)
+        .map_err(|err| anyhow::anyhow!("cstat envelope/header is corrupt: {err}"))?;
+    out.push_str(&format!("envelope_version: {}\n", peek.envelope_version));
+    out.push_str(&format!("header_len: {}\n", peek.header_len));
+    out.push_str(&format!("format_version: {}\n", peek.header.format_version));
+    out.push_str(&format!(
+        "tenant_hash: {}\n",
+        hex::encode(&peek.header.tenant_hash)
+    ));
+    out.push_str(&format!("signal: {}\n", peek.header.signal));
+    out.push_str(&format!(
+        "part_blake3: {}\n",
+        peek.header
+            .part_blake3
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+    out.push_str(&format!("segment_count: {}\n", peek.header.segment_count));
+    out.push_str(&format!(
+        "body_uncompressed_len: {}\n",
+        peek.header.body_uncompressed_len
+    ));
+
+    let ceiling = ravel_catalog::DEFAULT_MAX_COLUMN_STATS_BYTES;
+    let over_ceiling = peek.header.body_uncompressed_len > ceiling;
+    out.push_str(&format!(
+        "over_ceiling (body_uncompressed_len > {ceiling}): {over_ceiling}\n"
+    ));
+    if over_ceiling {
+        out.push_str(
+            "dictionary_present listing: unavailable, body_uncompressed_len exceeds the \
+             decode ceiling and no reader can decompress this object\n",
+        );
+        return Ok(());
+    }
+
+    let limits = ravel_catalog::ColumnStatsLimits::default();
+    let decoded = ravel_catalog::decode_column_stats(bytes, &limits)
+        .map_err(|err| anyhow::anyhow!("cstat body is corrupt: {err}"))?;
+    for segment in &decoded.segments {
+        for column in &segment.columns {
+            out.push_str(&format!(
+                "  segment shard={} ingest_hour_bucket={} writer_epoch={} writer_seq={} \
+                 column={} dictionary_present={}\n",
+                segment.shard,
+                segment.ingest_hour_bucket,
+                segment.writer_epoch,
+                segment.writer_seq,
+                column.name,
+                column.dictionary_present
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Re-lists every sealed commit record directly from the store and diffs it
@@ -428,6 +667,7 @@ mod tests {
                 entry_count: 0,
                 watermark_hour: *watermark_hour,
                 min_hour: *min_hour,
+                column_stats: None,
             });
         }
 
@@ -441,8 +681,6 @@ mod tests {
             folder_id: vec![0u8; 16],
             created_unix_ns: 0,
             postings: None,
-            column_stats: None,
-            column_stats_part: None,
             shard_generation_count: 1,
         };
         let head_bytes = ravel_catalog::encode_head(&head).expect("encode head");
@@ -529,6 +767,7 @@ mod tests {
             SignalArg::Metrics,
             None,
             now,
+            false,
         )
         .await
         .expect("cli fold");

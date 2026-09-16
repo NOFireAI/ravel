@@ -7,21 +7,54 @@
 //! new snapshots (the resolver's job, ravel-catalog), then a horizon-gated
 //! physical sweep here.
 //!
-//! 1. **Expiry evaluation** decodes the bucket's already-listed commit and
-//!    compaction records and takes `max(max_event_ts_ns)` across all of them
-//!    (no footer reads). A bucket is expired when it is sealed and that
-//!    maximum is `< now - R`, so no sample younger than `R` is ever excluded
-//!    (ADR-0019 decision 1; the impossibility floor).
+//! 1. **Expiry evaluation** decodes the bucket's already-listed commit,
+//!    compaction, and selective-erasure rewrite records and takes
+//!    `max(max_event_ts_ns)` across all of them (no footer reads). A bucket is
+//!    expired when it is sealed and that maximum is `< now - R`, so no sample
+//!    younger than `R` is ever excluded (ADR-0019 decision 1; the
+//!    impossibility floor). ADR-0019 decision 1 names only L0 commit records
+//!    and compaction records because selective erasure (ADR-0064) postdates
+//!    it; a rewrite record is a live record set exactly as a compaction record
+//!    is, and rewrite-record-only is the durable steady state of an erased
+//!    bucket once the superseded-input sweep has removed its inputs, so
+//!    omitting it retained erased-and-rewritten data past `R` forever
+//!    (issue #1321).
 //! 2. **Tombstone** is written `CreateIfAbsent` at the fixed per-bucket key
 //!    with an injected `retired_at_ns`. It is durable and irreversible:
 //!    raising `R` later never resurrects a tombstoned bucket (ADR-0019
 //!    decision 2).
-//! 3. **Physical sweep** runs once `now >= retired_at_ns + protection_horizon`,
-//!    deleting in the fixed order L0 commit records, compaction records, L0
-//!    data objects, L1 parts, then the tombstone last, and only after a
-//!    verifying LIST shows the bucket's commit prefix holds only the tombstone
-//!    and its `l1/` prefix is empty. Any residue leaves the tombstone in place
-//!    for the next pass (ADR-0019 decision 4).
+//! 3. **Legal-hold gate** (ADR-0042 decision 2) is the first gate in the
+//!    physical sweep, before the version probe below, so a held bucket costs
+//!    no suffix GETs. It is all-or-nothing over the bucket: every key the pass
+//!    would delete is offered to the [`LeaseCheck`], and if any one of them is
+//!    protected the pass deletes nothing, leaves the tombstone in place,
+//!    counts the hold, and reports `SweptPartial`. Retention's deletes are one
+//!    retirement, not a set of independent deletes: the commit records and
+//!    the tombstone are what make the bucket's data objects discoverable and
+//!    sweepable, so deleting the unheld part of a held bucket loses the held
+//!    bytes by a slower route (issue #1697). A bucket that is both legally
+//!    held and version-held therefore counts on the legal-hold counter.
+//! 4. **Version hold** (ADR-0066 decisions 1 and 2) runs next, still before
+//!    any delete. Each data object the sweep is about to delete is
+//!    probed for its trailer version through a 16-byte suffix GET, and the
+//!    answer is a typed classification, never a string: readable here, outside
+//!    this build's reader window, or corrupt. An object outside the window is
+//!    not garbage -- a peer running the other side of a rolling upgrade, or the
+//!    build a rollback returns to, reads it normally -- so the sweep declines to
+//!    delete anything in that bucket this pass, leaves the tombstone in place,
+//!    counts the hold, and reports `SweptPartial`. A corrupt object is swept as
+//!    before: no build can read it, holding it protects nothing. This narrows
+//!    ADR-0066 decision 4's "retention ages old-version objects out" to objects
+//!    this build can actually read; see that ADR's 2026-09-13 amendment.
+//! 5. **Physical sweep** runs once `now >= retired_at_ns + protection_horizon`,
+//!    deleting in the fixed order L0 commit records, compaction records,
+//!    rewrite records, L0 data objects, L1 parts, then the tombstone last, and
+//!    only after a verifying LIST shows the bucket's commit prefix holds only
+//!    the tombstone and its `l1/` prefix is empty. Any residue leaves the
+//!    tombstone in place for the next pass (ADR-0019 decision 4). The rewrite
+//!    record is deleted with the other records for the same reason it is read
+//!    during expiry evaluation: without it the verifying LIST always found
+//!    residue and the sweep never got past `SweptPartial` (issue #1321).
 //!
 //! Retention runs before compaction ([`maintain_bucket`], ADR-0019 decision
 //! 6): an expired bucket is tombstoned, never compacted first. That ordering
@@ -33,13 +66,18 @@
 //! declines when it lists a tombstone, but ADR-0019 calls that "an efficiency
 //! measure only": its absence would only waste work, never corrupt data.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use prost::Message;
+use ravel_commit::erasure;
 use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all,
 };
-use ravel_proto::commit::v1::{CommitRecord, CompactionRecord, RetentionTombstone};
+use ravel_proto::commit::v1::{CommitRecord, CompactionRecord, RetentionTombstone, RewriteRecord};
+use ravel_segment::{TRAILER_LEN, TrailerClass, classify_trailer};
+use ravel_types::{Signal, TenantHash};
 
 use crate::bucket::Bucket;
 use crate::clock::Clock;
@@ -56,6 +94,52 @@ use crate::sweep::LeaseCheck;
 /// names it here.
 pub use crate::reachability::{SnapshotBlock, SnapshotReachability};
 
+/// Counter seam for `ravel_maintain_retention_held_out_of_window_objects_total`
+/// (ADR-0066 decisions 1 and 2): data objects the physical sweep declined to
+/// delete because their trailer version is outside this build's reader window.
+///
+/// Process-wide and monotonic, incremented once per object per pass that
+/// declined it, so a nonzero rate (not just a nonzero total) is the signal: it
+/// means a deployment is refusing deletes right now because it is holding
+/// objects some other build can read. Holding is the safe answer to an
+/// unfinished rolling upgrade, and it is also the only way retention can retain
+/// data past its window, so this must not stay nonzero: the remedy is to finish
+/// the upgrade, complete `maintain migrate`, or roll back, after which the next
+/// pass sweeps the bucket normally.
+static HELD_OUT_OF_WINDOW_OBJECTS: AtomicU64 = AtomicU64::new(0);
+
+/// Read [`HELD_OUT_OF_WINDOW_OBJECTS`]. Zero on a healthy deployment.
+pub fn held_out_of_window_objects_total() -> u64 {
+    HELD_OUT_OF_WINDOW_OBJECTS.load(Ordering::Relaxed)
+}
+
+/// Counter seam for `ravel_maintain_retention_held_by_lease_buckets_total`
+/// (ADR-0042 decision 2): tombstoned buckets the physical sweep declined to
+/// touch this pass because a [`LeaseCheck`] protects at least one key the pass
+/// would have deleted. Legal hold ([`crate::legal_hold::LegalHoldCheck`]) is
+/// the production implementation of that seam, so in practice this counts
+/// buckets parked by a hold.
+///
+/// Process-wide and monotonic, incremented once per bucket per pass that
+/// declined it. It counts buckets rather than keys because the gate is
+/// all-or-nothing: one protected key parks the whole bucket, and the number of
+/// keys under it says nothing about how many retirements are stalled.
+///
+/// Unlike [`HELD_OUT_OF_WINDOW_OBJECTS`] a nonzero rate here is not by itself a
+/// fault: a hold is deliberate, and this stays nonzero for as long as the hold
+/// stands. It exists so the stall is visible at all, because a bucket parked in
+/// [`RetentionOutcome::SweptPartial`] is a bucket kept past its retention
+/// window, and an operator has to be able to see which holds are doing that and
+/// for how long. The total goes flat again once the hold is cleared and the
+/// next pass retires the bucket.
+static HELD_BY_LEASE_BUCKETS: AtomicU64 = AtomicU64::new(0);
+
+/// Read [`HELD_BY_LEASE_BUCKETS`]. Zero when no hold covers a bucket whose
+/// physical sweep is otherwise due.
+pub fn held_by_lease_buckets_total() -> u64 {
+    HELD_BY_LEASE_BUCKETS.load(Ordering::Relaxed)
+}
+
 /// The outcome of one retention pass over a bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetentionOutcome {
@@ -68,9 +152,16 @@ pub enum RetentionOutcome {
     /// Expired: a tombstone is present (written this pass or already there)
     /// and the protection horizon has not elapsed, so no bytes were deleted.
     Tombstoned,
-    /// Tombstone present and horizon elapsed, but a verifying LIST still found
-    /// residue (a delete lost to a lease or a concurrent write), so the
-    /// tombstone was left in place for the next pass to finish.
+    /// Tombstone present and horizon elapsed, but the bucket was not emptied,
+    /// for one of three reasons: a verifying LIST still found residue (a delete
+    /// lost to a concurrent write); the sweep declined to delete anything
+    /// because at least one data object's format version is outside this
+    /// build's reader window (ADR-0066, see
+    /// [`held_out_of_window_objects_total`]); or the sweep declined to delete
+    /// anything because a [`LeaseCheck`], in production a legal hold, protects
+    /// at least one key the pass would have deleted (ADR-0042 decision 2, see
+    /// [`held_by_lease_buckets_total`]). In all three the tombstone was left in
+    /// place for the next pass to finish.
     SweptPartial,
     /// Tombstone present, horizon elapsed, bucket verified empty, tombstone
     /// deleted last: the bucket is fully retired.
@@ -87,6 +178,45 @@ pub enum RetentionOutcome {
     BlockedBySnapshot(SnapshotBlock),
 }
 
+/// Resolve a tenant's effective retention window the same way the catalog fold
+/// does (ADR-0078): overlay the durable per-tenant `TenantConfig.retention_ns`
+/// on the deployment default that `RetentionConfig::window_for` yields (the
+/// `--retention-tenant` per-tenant override if set, else `--retention-default`).
+/// The durable record is read from the same object store, under the same key,
+/// through the same decoder the fold uses
+/// ([`ravel_catalog::read_config_values`]), and the precedence is the single one
+/// stated in [`ravel_catalog::resolve_retention_window`] -- durable record wins,
+/// then CLI per-tenant override, then CLI default -- so the sweep and the fold
+/// never resolve different windows for the same tenant. Without this the sweep
+/// read only the CLI map and would tombstone an hour a longer durable window
+/// keeps, which the fold's frontier reconcile never drops, stalling the physical
+/// sweep on a repeating `BlockedBySnapshot`.
+///
+/// A config-read fault fails the resolution closed (propagates the error) rather
+/// than falling back to the possibly shorter CLI window: a tombstone is
+/// irreversible, so a transient store fault must never shorten the window and
+/// retire a bucket the durable record would keep. The sweep is idempotent, so
+/// the pass simply retries on the next tick.
+pub async fn resolve_retention_window_ns(
+    store: &dyn ObjectStoreBackend,
+    retention: &RetentionConfig,
+    tenant: &TenantHash,
+) -> Result<Option<i64>> {
+    let default_retention_ns = retention.window_for(tenant);
+    let tenant_config = ravel_catalog::read_config_values(store, tenant)
+        .await
+        .map_err(|e| {
+            MaintainError::Invariant(format!(
+                "tenant config read failed while resolving retention window for {}: {e}",
+                tenant.to_hex()
+            ))
+        })?;
+    Ok(ravel_catalog::resolve_retention_window(
+        tenant_config.as_ref(),
+        default_retention_ns,
+    ))
+}
+
 /// Run one retention pass over a single sealed bucket (ADR-0019):
 /// evaluate expiry, write the tombstone if newly expired, and run the
 /// horizon-gated physical sweep if a tombstone is already present and its
@@ -101,8 +231,9 @@ pub async fn retention_sweep_bucket(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<RetentionOutcome> {
+    let window_ns = resolve_retention_window_ns(store, retention, &bucket.tenant_hash).await?;
     let mut reach = SnapshotReachability::new();
-    retention_sweep_bucket_with_reach(&mut reach, store, clock, config, retention, lease, bucket)
+    retention_sweep_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket)
         .await
 }
 
@@ -113,17 +244,25 @@ pub async fn retention_sweep_bucket(
 /// public [`retention_sweep_bucket`] wraps this with a fresh per-call cache;
 /// [`crate::scan::scan_and_maintain_with_memo`] owns one cache for the whole
 /// per-(tenant, signal, shard) pass and calls this directly.
+///
+/// `window_ns` is the tenant's effective retention window already resolved by
+/// [`resolve_retention_window_ns`] (durable record over CLI, ADR-0078). The
+/// caller resolves it once per pass -- the window is constant across a tenant's
+/// buckets, so reading the durable config per bucket would be one redundant GET
+/// per bucket -- and threads the same value into every bucket of the pass, so
+/// the sweep, the pass's zone classification, and the fold all use one window.
+/// `None` means no retention policy for this tenant.
 #[allow(clippy::too_many_arguments)]
 pub async fn retention_sweep_bucket_with_reach(
     reach: &mut SnapshotReachability,
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
     config: &CompactorConfig,
-    retention: &RetentionConfig,
+    window_ns: Option<i64>,
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<RetentionOutcome> {
-    let Some(window_ns) = retention.window_for(&bucket.tenant_hash) else {
+    let Some(window_ns) = window_ns else {
         return Ok(RetentionOutcome::NoPolicy);
     };
     let now = clock.now_ns();
@@ -167,7 +306,11 @@ pub async fn retention_sweep_bucket_with_reach(
     for key in &listing.compaction_record_keys {
         compaction_records.push(get_compaction_record(store, key).await?);
     }
-    let max_event = max_event_ts(&commit_records, &compaction_records);
+    let mut rewrite_records = Vec::with_capacity(listing.rewrite_record_keys.len());
+    for key in &listing.rewrite_record_keys {
+        rewrite_records.push(get_rewrite_record(store, key).await?);
+    }
+    let max_event = max_event_ts(&commit_records, &compaction_records, &rewrite_records);
     if !is_expired(max_event, now, window_ns) {
         return Ok(RetentionOutcome::NotExpired);
     }
@@ -193,26 +336,28 @@ pub async fn maintain_bucket(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<(RetentionOutcome, Option<CompactionOutcome>)> {
+    let window_ns = resolve_retention_window_ns(store, retention, &bucket.tenant_hash).await?;
     let mut reach = SnapshotReachability::new();
-    maintain_bucket_with_reach(&mut reach, store, clock, config, retention, lease, bucket).await
+    maintain_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket).await
 }
 
 /// [`maintain_bucket`] with a caller-owned [`SnapshotReachability`] cache
 /// shared across the buckets of one sweep pass (ADR-0076 request cost, see
 /// [`retention_sweep_bucket_with_reach`]). The public [`maintain_bucket`] wraps
-/// this with a fresh per-call cache.
+/// this with a fresh per-call cache. `window_ns` is the pass-resolved retention
+/// window (see [`retention_sweep_bucket_with_reach`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn maintain_bucket_with_reach(
     reach: &mut SnapshotReachability,
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
     config: &CompactorConfig,
-    retention: &RetentionConfig,
+    window_ns: Option<i64>,
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<(RetentionOutcome, Option<CompactionOutcome>)> {
     let outcome =
-        retention_sweep_bucket_with_reach(reach, store, clock, config, retention, lease, bucket)
+        retention_sweep_bucket_with_reach(reach, store, clock, config, window_ns, lease, bucket)
             .await?;
     let compaction = match outcome {
         // The bucket is (or is being) retired, or its delete is blocked by a
@@ -228,11 +373,27 @@ pub async fn maintain_bucket_with_reach(
     Ok((outcome, compaction))
 }
 
-/// The maximum `max_event_ts_ns` across a bucket's L0 commit records and
-/// compaction-record parts. `None` when the bucket holds no records.
+/// The maximum `max_event_ts_ns` across a bucket's L0 commit records,
+/// compaction-record parts, and rewrite-record parts. `None` when the bucket
+/// holds no records.
+///
+/// Every record kind `keys::partition_bucket_entry` can classify inside a
+/// bucket's commit prefix contributes here except the tombstone (whose own
+/// presence short-circuits expiry evaluation entirely). A rewrite record left
+/// out of this maximum is a bucket that can never expire: once the
+/// protection-horizon sweep has removed a rewrite's superseded inputs, the
+/// rewrite record is the bucket's whole live record set (issue #1321).
+///
+/// A rewrite record with no parts (an erasure that dropped every record in the
+/// bucket, which `RewriteRecord.parts` explicitly permits) carries no event
+/// timestamp at all, so it contributes its own `created_unix_ns` instead. It
+/// holds no sample, so no sample younger than `R` can hide behind it, and
+/// anchoring on the instant the record was published is what keeps such a
+/// bucket expirable rather than permanently retained metadata.
 pub fn max_event_ts(
     commit_records: &[CommitRecord],
     compaction_records: &[CompactionRecord],
+    rewrite_records: &[RewriteRecord],
 ) -> Option<i64> {
     let mut max: Option<i64> = None;
     let mut bump = |v: i64| max = Some(max.map_or(v, |m: i64| m.max(v)));
@@ -240,6 +401,15 @@ pub fn max_event_ts(
         bump(rec.max_event_ts_ns);
     }
     for rec in compaction_records {
+        for part in &rec.parts {
+            bump(part.max_event_ts_ns);
+        }
+    }
+    for rec in rewrite_records {
+        if rec.parts.is_empty() {
+            bump(rec.created_unix_ns);
+            continue;
+        }
         for part in &rec.parts {
             bump(part.max_event_ts_ns);
         }
@@ -271,7 +441,13 @@ async fn write_tombstone(
     listing: &BucketListing,
     dry_run: bool,
 ) -> Result<()> {
-    let record_count = (listing.commit_keys.len() + listing.compaction_record_keys.len()) as u64;
+    // Every record kind the bucket can hold counts, rewrite records included:
+    // `record_count_observed` is the audit evidence for what was in the bucket
+    // when it was retired, and a rewrite-record-only bucket reporting zero
+    // records observed reads as an empty bucket that was never written to.
+    let record_count = (listing.commit_keys.len()
+        + listing.compaction_record_keys.len()
+        + listing.rewrite_record_keys.len()) as u64;
     let tombstone = RetentionTombstone {
         format_version: 1,
         tenant_hash: bucket.tenant_hash.0.to_vec(),
@@ -299,10 +475,15 @@ async fn write_tombstone(
 }
 
 /// Horizon-gated physical sweep (ADR-0019 decision 4). Deletes in the
-/// fixed order L0 commit records, compaction records, L0 data objects, L1
-/// parts, then the tombstone last, and only after a verifying LIST shows the
-/// bucket's commit prefix holds only the tombstone and its `l1/` prefix is
-/// empty. Any residue leaves the tombstone in place.
+/// fixed order L0 commit records, compaction records, rewrite records, L0 data
+/// objects, L1 parts, then the tombstone last, and only after a verifying LIST
+/// shows the bucket's commit prefix holds only the tombstone and its `l1/`
+/// prefix is empty. Any residue leaves the tombstone in place.
+///
+/// The record deletes cover every non-tombstone shape
+/// `keys::partition_bucket_entry` classifies in the commit prefix, which is
+/// the same set [`bucket_is_empty_but_tombstone`] refuses to call empty: a
+/// shape deleted by neither is residue forever (issue #1321).
 async fn physical_sweep(
     reach: &mut SnapshotReachability,
     store: &dyn ObjectStoreBackend,
@@ -347,6 +528,10 @@ async fn physical_sweep(
             Err(e) => return Err(MaintainError::Store(e)),
         }
     }
+    // Rewrite output parts need no separate resolution step: ADR-0064 decision
+    // 3 point 2 PUTs them under the same `l1/` part-key shape a compaction
+    // record's parts use, so the fresh LIST below already covers them.
+    //
     // Discover L1 parts by a fresh LIST of the bucket's own l1/ prefix (the
     // same LIST bucket_is_empty_but_tombstone uses), not by reconstructing
     // keys from compaction records. This makes the L1 delete independent of
@@ -363,10 +548,69 @@ async fn physical_sweep(
         .map(|meta| meta.key)
         .collect();
 
+    // Legal-hold gate (ADR-0042 decision 2), all-or-nothing over the bucket and
+    // ahead of every delete. `delete_all` below skips a protected key one key at
+    // a time, which is the right rule for a sweep whose deletes are independent
+    // of each other. Retention's are not: the commit records name the L0 data
+    // objects, the tombstone is what keeps the bucket excluded from snapshots,
+    // and the three are one retirement. Deleting the unheld part of a held
+    // bucket leaves the held bytes with no record naming them and no tombstone
+    // covering them, which loses the data a hold exists to preserve by a slower
+    // route and is unrecoverable once done. So the pass asks about every key it
+    // would delete and deletes nothing if any one of them is protected.
+    //
+    // Declining is the conservative direction in both failure modes: a hold
+    // wrongly reported here costs a stalled retirement that the next pass
+    // completes once the hold clears, while a hold wrongly missed destroys held
+    // data. The bucket keeps its tombstone, so it stays excluded from snapshots
+    // and the retirement resumes rather than restarting.
+    //
+    // This runs before the version probe below so a held bucket costs no suffix
+    // GETs: the answer needs no I/O, and both gates return the same outcome.
+    let protected =
+        protected_sweep_keys(lease, listing, &l0_data_keys, &l1_part_keys, tombstone_key);
+    if let Some(first) = protected.first() {
+        HELD_BY_LEASE_BUCKETS.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            tenant = %bucket.tenant_hash.to_hex(),
+            signal = ?bucket.signal,
+            shard = bucket.shard,
+            ingest_hour_bucket = bucket.ingest_hour_bucket,
+            protected_keys = protected.len(),
+            first_protected_key = first,
+            "retention sweep held a tombstoned bucket: a lease or legal hold protects keys this pass would delete"
+        );
+        return Ok(RetentionOutcome::SweptPartial);
+    }
+
+    // Version hold (ADR-0066 decisions 1 and 2): before deleting anything,
+    // refuse if any data object about to be deleted carries a format version
+    // outside this build's reader window. Such an object is readable by the
+    // other side of a rolling upgrade and by the build a rollback returns to,
+    // so deleting it destroys data that is only unreadable HERE. The hold
+    // covers the whole bucket rather than the individual object: a commit
+    // record deleted while the object it names survives leaves that object
+    // undiscoverable, which loses the data by a slower route.
+    let held = held_out_of_window(store, bucket, &l0_data_keys, &l1_part_keys).await?;
+    if !held.is_empty() {
+        HELD_OUT_OF_WINDOW_OBJECTS.fetch_add(held.len() as u64, Ordering::Relaxed);
+        tracing::warn!(
+            tenant = %bucket.tenant_hash.to_hex(),
+            signal = ?bucket.signal,
+            shard = bucket.shard,
+            ingest_hour_bucket = bucket.ingest_hour_bucket,
+            held_objects = held.len(),
+            versions = ?held.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+            "retention sweep held a tombstoned bucket: format versions outside this build's reader window"
+        );
+        return Ok(RetentionOutcome::SweptPartial);
+    }
+
     // Deletion order (docs/consistency-model.md "Deletion and GC", ADR-0019
     // decision 4): records, then data objects, then L1 parts, tombstone last.
     delete_all(store, lease, &listing.commit_keys, dry_run).await?;
     delete_all(store, lease, &listing.compaction_record_keys, dry_run).await?;
+    delete_all(store, lease, &listing.rewrite_record_keys, dry_run).await?;
     delete_all(store, lease, &l0_data_keys, dry_run).await?;
     delete_all(store, lease, &l1_part_keys, dry_run).await?;
 
@@ -391,9 +635,117 @@ async fn physical_sweep(
     Ok(RetentionOutcome::Swept)
 }
 
+/// The data objects of one bucket whose format version is outside this build's
+/// reader window, as `(key, version)` pairs in probe order.
+///
+/// The distinction this draws is the whole point (ADR-0066 decision 2): a
+/// version this build does not admit and bytes no build can read are both
+/// "cannot read this", and collapsing them turns a rolling upgrade into data
+/// loss. It is drawn from [`ravel_segment::classify_trailer`]'s typed answer,
+/// which applies the same version gate a full read applies, so this cannot
+/// disagree with the reader about which versions are admitted. A corrupt object
+/// is deliberately NOT held: no build reads it, so holding it keeps nothing
+/// alive and would only stall the bucket forever.
+///
+/// Scope: RSEG (metrics) only. RLOG and RSPAN objects carry their own trailers
+/// and their own windows in `ravel-logseg` and `ravel-rspan`; probing them with
+/// the RSEG gate would report every one of them as corrupt, which is the exact
+/// collapse this function exists to prevent. Those two signals keep today's
+/// unconditional sweep until their readers grow the same probe (the remaining
+/// half of issue #530).
+///
+/// Cost: one 16-byte suffix GET per data object, charged to the sweep phase,
+/// and only in the pass that would delete (after the tombstone's protection
+/// horizon has elapsed and the HEAD-reachability gate is clear). The GET also
+/// returns the object's total size, so no separate HEAD is needed.
+async fn held_out_of_window(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    l0_data_keys: &[String],
+    l1_part_keys: &[String],
+) -> Result<Vec<(String, u16)>> {
+    if bucket.signal != Signal::Metrics {
+        return Ok(Vec::new());
+    }
+    let mut held = Vec::new();
+    for key in l0_data_keys.iter().chain(l1_part_keys.iter()) {
+        if let Some(version) = out_of_window_version(store, key).await? {
+            held.push((key.clone(), version));
+        }
+    }
+    Ok(held)
+}
+
+/// The trailer version of one RSEG object when it is outside this build's
+/// reader window, `None` when the object is readable here, is corrupt, or is
+/// already gone (a delete that a previous pass completed is not a hold).
+async fn out_of_window_version(store: &dyn ObjectStoreBackend, key: &str) -> Result<Option<u16>> {
+    let got = match store.get(key, GetRange::Suffix(TRAILER_LEN)).await {
+        Ok(got) => got,
+        Err(StoreError::NotFound) => return Ok(None),
+        Err(e) => return Err(MaintainError::Store(e)),
+    };
+    match classify_trailer(got.total_size, got.data.as_ref()) {
+        TrailerClass::OutsideVersionWindow(version) => Ok(Some(version)),
+        TrailerClass::Readable(_) | TrailerClass::Corrupt(_) => Ok(None),
+    }
+}
+
+/// Every key one physical sweep pass would delete, in delete order, tombstone
+/// last.
+///
+/// The all-or-nothing gate and the deletes below have to enumerate the same
+/// set: a key the sweep deletes but never offers to the [`LeaseCheck`] is a
+/// hold that did not hold, and that is exactly the shape of the bug this gate
+/// closes. The gate reads this iterator; the deletes below are still written
+/// out per class, so a new key class goes in both places, and
+/// `the_delete_set_is_every_class_in_delete_order` pins that they match.
+fn sweep_delete_keys<'a>(
+    listing: &'a BucketListing,
+    l0_data_keys: &'a [String],
+    l1_part_keys: &'a [String],
+    tombstone_key: &'a str,
+) -> impl Iterator<Item = &'a str> {
+    listing
+        .commit_keys
+        .iter()
+        .chain(listing.compaction_record_keys.iter())
+        .chain(listing.rewrite_record_keys.iter())
+        .chain(l0_data_keys.iter())
+        .chain(l1_part_keys.iter())
+        .map(String::as_str)
+        .chain(std::iter::once(tombstone_key))
+}
+
+/// The keys of a pending physical sweep that the [`LeaseCheck`] protects, in
+/// delete order. Empty means the sweep may proceed.
+///
+/// Every key is offered rather than stopping at the first protected one. The
+/// check is a pure in-memory prefix match (no I/O), the count is what the
+/// operator warning reports, and stopping early would leave the key classes
+/// behind the first hit unasked, so a hold covering only those would be decided
+/// by the ordering of the classes rather than by its own scope.
+fn protected_sweep_keys<'a>(
+    lease: &dyn LeaseCheck,
+    listing: &'a BucketListing,
+    l0_data_keys: &'a [String],
+    l1_part_keys: &'a [String],
+    tombstone_key: &'a str,
+) -> Vec<&'a str> {
+    sweep_delete_keys(listing, l0_data_keys, l1_part_keys, tombstone_key)
+        .filter(|key| lease.is_protected(key))
+        .collect()
+}
+
 /// Delete each key idempotently, skipping any the [`LeaseCheck`] protects
 /// (a protected key becomes residue that the verifying LIST will catch, so the
 /// tombstone stays for a later pass).
+///
+/// In the retention sweep this per-key skip is now unreachable: the
+/// all-or-nothing gate in [`physical_sweep`] has already refused the pass if
+/// any of these keys is protected. It stays as the last line of defence, so a
+/// future caller that reaches the deletes by another route still cannot delete
+/// a held key.
 async fn delete_all(
     store: &dyn ObjectStoreBackend,
     lease: &dyn LeaseCheck,
@@ -415,6 +767,14 @@ async fn delete_all(
 /// tombstone: the commit prefix contains only the tombstone entry, and the
 /// `l1/` prefix for this bucket is empty (ADR-0019 decision 4's verifying
 /// LIST).
+///
+/// This enumerates by exclusion rather than by listing the shapes it expects,
+/// so it needs no change when a new record kind appears: anything
+/// `keys::partition_bucket_entry` classifies as other than the tombstone is
+/// residue, and an unclassifiable key is layout drift. What that costs is
+/// silence about which shape the sweeper forgot to delete -- a rewrite record
+/// held this check false on every pass forever until the delete list above
+/// learned about it (issue #1321).
 async fn bucket_is_empty_but_tombstone(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -468,17 +828,205 @@ async fn get_compaction_record(
     key: &str,
 ) -> Result<CompactionRecord> {
     let got = store.get(key, GetRange::Full).await?;
-    let record = CompactionRecord::decode(got.data.as_ref())
+    let record = record::decode_compaction(got.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("compaction record decode failed: {e}")))?;
     keys::verify_compaction_record_key(&record, key)?;
+    Ok(record)
+}
+
+/// GET, decode, and key-verify one selective-erasure rewrite record (ADR-0064
+/// decision 3, ADR-0010 §7). Decoded through
+/// [`ravel_commit::erasure::decode_rewrite`], never a raw `prost` decode: that
+/// is the reader with the `format_version` gate (ADR-0066 decision 2), and it
+/// also re-verifies the record's own `input_set_hash` and the bucket its
+/// `superseded_record_key` names.
+async fn get_rewrite_record(store: &dyn ObjectStoreBackend, key: &str) -> Result<RewriteRecord> {
+    let got = store.get(key, GetRange::Full).await?;
+    let record = erasure::decode_rewrite(got.data.as_ref())
+        .map_err(|e| MaintainError::Invariant(format!("rewrite record decode failed: {e}")))?;
+    keys::verify_rewrite_record_key(&record, key)?;
     Ok(record)
 }
 
 /// GET, decode, and key-verify one retention tombstone (ADR-0010 §7 discipline).
 async fn get_tombstone(store: &dyn ObjectStoreBackend, key: &str) -> Result<RetentionTombstone> {
     let got = store.get(key, GetRange::Full).await?;
-    let tombstone = RetentionTombstone::decode(got.data.as_ref())
+    let tombstone = record::decode_tombstone(got.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("tombstone decode failed: {e}")))?;
     keys::verify_retention_tombstone_key(&tombstone, key)?;
     Ok(tombstone)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::Signal;
+
+    use super::*;
+
+    fn tenant() -> TenantHash {
+        TenantHash([0u8; 16])
+    }
+
+    /// A [`LeaseCheck`] protecting exactly one key, recording every key it was
+    /// asked about.
+    struct HoldOneKey {
+        held: String,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LeaseCheck for HoldOneKey {
+        fn is_protected(&self, key: &str) -> bool {
+            self.asked.lock().expect("asked lock").push(key.to_string());
+            key == self.held
+        }
+    }
+
+    fn listing_of_every_class() -> BucketListing {
+        BucketListing {
+            commit_keys: vec!["commit-a".to_string(), "commit-b".to_string()],
+            compaction_record_keys: vec!["compaction".to_string()],
+            rewrite_record_keys: vec!["rewrite".to_string()],
+            tombstone_key: Some("tombstone".to_string()),
+        }
+    }
+
+    /// The gate's delete set is every class the sweep deletes, in delete order,
+    /// tombstone last. The rewrite-record class is the one no integration
+    /// fixture here produces, and it is also the class whose omission from the
+    /// deletes once stalled every erased bucket forever (issue #1321), so it is
+    /// pinned by name.
+    #[test]
+    fn the_delete_set_is_every_class_in_delete_order() {
+        let listing = listing_of_every_class();
+        let l0 = vec!["l0-data".to_string()];
+        let l1 = vec!["l1-part".to_string()];
+        let keys: Vec<&str> = sweep_delete_keys(&listing, &l0, &l1, "tombstone").collect();
+        assert_eq!(
+            keys,
+            vec![
+                "commit-a",
+                "commit-b",
+                "compaction",
+                "rewrite",
+                "l0-data",
+                "l1-part",
+                "tombstone",
+            ]
+        );
+    }
+
+    /// Every key is offered to the check, not just enough to reach a verdict:
+    /// a hold on the last class in delete order is found, and the classes after
+    /// the first protected key are still asked about.
+    #[test]
+    fn the_gate_offers_every_key_and_finds_a_hold_on_any_class() {
+        let listing = listing_of_every_class();
+        let l0 = vec!["l0-data".to_string()];
+        let l1 = vec!["l1-part".to_string()];
+        for held in [
+            "commit-a",
+            "commit-b",
+            "compaction",
+            "rewrite",
+            "l0-data",
+            "l1-part",
+            "tombstone",
+        ] {
+            let lease = HoldOneKey {
+                held: held.to_string(),
+                asked: std::sync::Mutex::new(Vec::new()),
+            };
+            let protected = protected_sweep_keys(&lease, &listing, &l0, &l1, "tombstone");
+            assert_eq!(protected, vec![held], "a hold on {held} must be found");
+            assert_eq!(
+                lease.asked.lock().expect("asked lock").len(),
+                7,
+                "every key is offered even once {held} has already matched"
+            );
+        }
+    }
+
+    /// The retention read of a compaction record refuses a future
+    /// `format_version` (ADR-0066 decision 2), not reads it as version 1. The
+    /// record is otherwise self-consistent (its identity fields reconstruct its
+    /// own key), so the version gate is the only thing that can reject it.
+    /// Removing that gate makes this test fail: the record then decodes and
+    /// key-verifies as version 1 and the call returns `Ok`.
+    #[tokio::test]
+    async fn retention_refuses_a_future_version_compaction_record() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let record = CompactionRecord {
+            format_version: 2,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as i32,
+            shard: 0,
+            ingest_hour_bucket: 1,
+            input_set_hash: vec![0x33; 32],
+            ..Default::default()
+        };
+        let key = keys::compaction_record_key_for(&record).expect("key");
+        store
+            .put(
+                &key,
+                record::encode_compaction(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed put");
+
+        let err = get_compaction_record(&store, &key)
+            .await
+            .expect_err("a version-2 compaction record must be refused, not read as v1");
+        match &err {
+            MaintainError::Invariant(msg) => assert!(
+                msg.contains("format_version") && msg.contains("2"),
+                "the failure names the version gate and the version seen: {msg}"
+            ),
+            other => panic!("expected Invariant from the version gate, got {other:?}"),
+        }
+    }
+
+    /// The retention read of a tombstone refuses a future `format_version`
+    /// (ADR-0066 decision 2), not reads it as version 1. Same self-consistent
+    /// record and same gate-flip failure argument as the compaction case.
+    #[tokio::test]
+    async fn retention_refuses_a_future_version_tombstone() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let tombstone = RetentionTombstone {
+            format_version: 2,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as i32,
+            shard: 0,
+            ingest_hour_bucket: 1,
+            retired_at_ns: 1,
+            retention_window_ns: 1,
+            record_count_observed: 0,
+        };
+        let key = keys::retention_tombstone_key_for(&tombstone).expect("key");
+        store
+            .put(
+                &key,
+                record::encode_tombstone(&tombstone),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed put");
+
+        let err = get_tombstone(&store, &key)
+            .await
+            .expect_err("a version-2 tombstone must be refused, not read as v1");
+        match &err {
+            MaintainError::Invariant(msg) => assert!(
+                msg.contains("format_version") && msg.contains("2"),
+                "the failure names the version gate and the version seen: {msg}"
+            ),
+            other => panic!("expected Invariant from the version gate, got {other:?}"),
+        }
+    }
 }

@@ -167,6 +167,19 @@ pub enum FetchError {
     },
     #[error("etag changed between reads of segment {key}: store returned inconsistent data")]
     EtagChanged { key: String },
+    /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
+    /// reservation for the bytes this GET would materialize. Carries only the
+    /// three accounting figures, never an object key or tenant value: the
+    /// refusal is a resource condition, not data corruption, and its message
+    /// must not leak which object or tenant provoked it.
+    #[error(
+        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget already reserved"
+    )]
+    FetchMemoryExhausted {
+        requested: u64,
+        reserved: u64,
+        limit: u64,
+    },
 }
 
 /// The error channel for a cache-routed GET's `get_or_fetch` closure
@@ -474,11 +487,24 @@ pub struct FetchedHistogramSeries {
 }
 
 /// Page-kind counters accumulated over one `fetch_soa` call, for downstream
-/// consumers to read. Currently tracks VAL_RAW_F64 pages only.
+/// consumers to read. Tracks VAL_RAW_F64 pages plus the histogram-kind series
+/// a scalar-only fetch dropped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FetchStats {
     pub raw_f64_pages: u64,
     pub raw_f64_bytes: u64,
+    /// Histogram-kind series this segment's catalog matched and a scalar-only
+    /// fetch ([`SegmentFetcher::fetch_soa_phase_accounted`] and its siblings)
+    /// did not return, because they carry no scalar float value. Nonzero means
+    /// the returned scalar series are not the whole of what the matchers
+    /// selected, which is what lets a caller with no histogram model of its own
+    /// (ravel-sql's `samples` table) say so instead of answering short in
+    /// silence (issue #1738).
+    ///
+    /// Counted per segment, so a series present in several segments counts once
+    /// per segment: this is a presence signal, not a distinct-series count.
+    /// Zero from the combined scalar-and-histogram fetch, which drops nothing.
+    pub histogram_series_skipped: u64,
 }
 
 impl FetchStats {
@@ -497,11 +523,23 @@ impl FetchStats {
 #[derive(Default)]
 struct FetchedRegions {
     buffers: Vec<(u64, Bytes)>,
+    /// Fetch-layer byte reservations (ADR-1170 decision 2) covering the GETs
+    /// that filled `buffers`. Owned here so a reservation lives exactly as long
+    /// as the fetched regions it accounts for: dropping this `FetchedRegions`
+    /// releases them. The reservation guards the coalesced run lengths reserved
+    /// once before the `join_all` in `ensure_ranges`, never a per-GET or
+    /// request-scoped claim.
+    reservations: Vec<ravel_memory::Reservation>,
 }
 
 impl FetchedRegions {
     fn insert(&mut self, start: u64, bytes: Bytes) {
         self.buffers.push((start, bytes));
+    }
+
+    /// Takes ownership of a reservation so it lives as long as these regions.
+    fn hold_reservation(&mut self, reservation: ravel_memory::Reservation) {
+        self.reservations.push(reservation);
     }
 
     fn covers(&self, start: u64, end: u64) -> bool {
@@ -570,13 +608,14 @@ pub struct SegmentFetcher {
     /// instead of a footer suffix.
     whole_object_threshold: u64,
     limits: ReaderLimits,
-    /// Bounds the byte-range GETs kept in flight. Shared across `clone`s (it
-    /// is an `Arc`), so every concurrent segment fetch in one query draws
-    /// from the same permit pool rather than each opening its own unbounded
-    /// fan-out. It is only ever held around a single leaf
-    /// `store.get`, never across a scope that acquires another permit, so no
-    /// fetch can deadlock waiting on permits it already holds.
-    get_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Bounds the byte-range GETs kept in flight. Shared across `clone`s and,
+    /// via [`Self::with_get_limiter`], across every other fetcher and engine
+    /// holding the same `Arc` (ADR-1195): every concurrent segment fetch in
+    /// the process draws from the same permit pool rather than each fetcher
+    /// opening its own unbounded fan-out. It is only ever held around a
+    /// single leaf `store.get`, never across a scope that acquires another
+    /// permit, so no fetch can deadlock waiting on permits it already holds.
+    get_limiter: std::sync::Arc<crate::GetLimiter>,
     /// ADR-0046's read cache, consulted by `guarded_get` for every
     /// byte-range (and whole-object) GET. `None` -- the default from
     /// `new` -- reproduces exactly the pre-cache behavior: every GET goes
@@ -610,6 +649,16 @@ pub struct SegmentFetcher {
     /// materializations. Shared across clones (an `Arc`), never reset, read the
     /// same way as [`suffix_fallbacks`](Self::suffix_fallbacks).
     label_sets_materialized: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The process-wide fetch memory budget (ADR-1170 decision 2). Every GET
+    /// this fetcher issues reserves the bytes it will materialize against this
+    /// budget before the GET, and the reservation is owned for the fetched
+    /// buffer's lifetime. Shared across clones and, via
+    /// [`Self::with_memory_budget`], across every other fetcher and engine
+    /// holding the same `Arc`, exactly like [`get_limiter`](Self::get_limiter).
+    /// The default is [`MemoryBudget::unlimited`], which never refuses, so a
+    /// fetcher built with plain `new` behaves as it did before this budget
+    /// existed.
+    memory_budget: std::sync::Arc<ravel_memory::MemoryBudget>,
 }
 
 impl SegmentFetcher {
@@ -620,12 +669,13 @@ impl SegmentFetcher {
             coalesce_gap: DEFAULT_COALESCE_GAP,
             whole_object_threshold: DEFAULT_WHOLE_OBJECT_THRESHOLD,
             limits: ReaderLimits::default(),
-            get_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            get_limiter: std::sync::Arc::new(crate::GetLimiter::new_unchecked(
                 DEFAULT_MAX_CONCURRENT_GETS,
             )),
             cache: None,
             suffix_fallbacks: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             label_sets_materialized: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            memory_budget: std::sync::Arc::new(ravel_memory::MemoryBudget::unlimited()),
         }
     }
 
@@ -699,15 +749,92 @@ impl SegmentFetcher {
         self
     }
 
-    /// Sets the in-flight byte-range GET bound. Shared across
-    /// this fetcher's clones.
+    /// The whole-object threshold this fetcher opens segments with (see
+    /// [`Self::with_whole_object_threshold`]). Read-only counterpart used by
+    /// `io_shape`'s structural `dependency_depth` classification, which needs
+    /// the same size cutoff `open_segment` branches on without duplicating or
+    /// re-deriving it.
+    pub fn whole_object_threshold(&self) -> u64 {
+        self.whole_object_threshold
+    }
+
+    /// Sets the in-flight byte-range GET bound by building a new private
+    /// limiter. Shared across this fetcher's clones; not shared with any
+    /// other fetcher unless [`Self::with_get_limiter`] is used instead.
     #[must_use]
     pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
-        self.get_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(n.max(1)));
+        self.get_limiter = std::sync::Arc::new(crate::GetLimiter::new_unchecked(n.max(1)));
         self
     }
 
-    /// One store GET, bounded by the shared in-flight semaphore. The permit
+    /// Wires this fetcher to a caller-owned [`crate::GetLimiter`] (ADR-1195),
+    /// so it draws GET permits from the same pool as every other fetcher (and,
+    /// via [`crate::QueryEngine::with_get_limiter`], every other engine)
+    /// holding the same `Arc`.
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: std::sync::Arc<crate::GetLimiter>) -> Self {
+        self.get_limiter = limiter;
+        self
+    }
+
+    /// This fetcher's current limiter, for a test to `Arc::ptr_eq` against
+    /// another fetcher's or an engine's, proving two fetchers actually share
+    /// one `GetLimiter` rather than each holding an equal-but-distinct one.
+    #[cfg(test)]
+    pub(crate) fn get_limiter_for_test(&self) -> &std::sync::Arc<crate::GetLimiter> {
+        &self.get_limiter
+    }
+
+    /// This fetcher's `GetLimiter` permit count (ADR-1195): the process-wide
+    /// GET concurrency bound, shared with every other fetcher and engine that
+    /// took the same `Arc` via [`Self::with_get_limiter`]. `io_shape`'s
+    /// `service_batches` needs this the same way
+    /// `ravel_query::engine::io_shape_for_resolve` reads its own
+    /// `QueryEngine::get_limiter`: a caller who set `--store-get-concurrency`
+    /// below its own fan-out makes the limiter, not the fan-out, the real
+    /// binding bound.
+    #[must_use]
+    pub fn get_limiter_permits(&self) -> usize {
+        self.get_limiter.permits()
+    }
+
+    /// Wires this fetcher to a caller-owned [`ravel_memory::MemoryBudget`]
+    /// (ADR-1170 decision 2), so the bytes it reserves before each GET draw
+    /// from the same budget as every other fetcher (and, via
+    /// [`crate::QueryEngine::with_memory_budget`], every other engine) holding
+    /// the same `Arc`. Mirrors [`Self::with_get_limiter`].
+    #[must_use]
+    pub fn with_memory_budget(
+        mut self,
+        budget: std::sync::Arc<ravel_memory::MemoryBudget>,
+    ) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    /// This fetcher's current memory budget, for a test to `Arc::ptr_eq`
+    /// against another fetcher's or an engine's, proving they share one budget
+    /// rather than each holding an equal-but-distinct one.
+    #[cfg(test)]
+    pub(crate) fn memory_budget_for_test(&self) -> &std::sync::Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
+    }
+
+    /// Reserves `n` bytes against this fetcher's budget before a GET, mapping a
+    /// refusal to the typed [`FetchError::FetchMemoryExhausted`]. The returned
+    /// guard is owned for the fetched buffer's lifetime; it is never released
+    /// because a GET completed (ADR-1170 decision 2).
+    fn reserve_fetch(&self, n: u64) -> Result<ravel_memory::Reservation, FetchError> {
+        self.memory_budget
+            .reserve(n)
+            .map_err(|e| FetchError::FetchMemoryExhausted {
+                requested: e.requested,
+                reserved: e.reserved,
+                limit: e.limit,
+            })
+    }
+
+    /// One store GET, bounded by the shared in-flight limiter. The permit
     /// is released the moment the GET resolves; callers must
     /// never hold the returned future's permit across another
     /// `guarded_get`/`ensure_ranges` call, or a query whose in-flight GETs
@@ -726,10 +853,9 @@ impl SegmentFetcher {
         range: GetRange,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, StoreError> {
-        let _permit =
-            self.get_semaphore.acquire().await.map_err(|_| {
-                StoreError::Transient("fetch concurrency semaphore closed".to_string())
-            })?;
+        let _permit = self.get_limiter.acquire().await.map_err(|_| {
+            StoreError::Transient("GetLimiter semaphore closed unexpectedly".into())
+        })?;
         accounting.record_s3_request(AccountedOp::Get);
         let got = self.store.get(key, range).await?;
         accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
@@ -1026,20 +1152,41 @@ impl SegmentFetcher {
         // shared semaphore inside `guarded_get` bounds the actual in-flight
         // GETs; `join_all` preserves input order, so the resulting
         // `regions` insert order is identical to the old sequential loop.
-        let gets = join_all(coalesce_ranges(missing, self.coalesce_gap).into_iter().map(
-            |(start, end)| async move {
-                let (got, got_cost) = self
-                    .guarded_get(
-                        seg_ref,
-                        tenant_hash,
-                        GetRange::Range(start, end),
-                        Some(suffix_etag),
-                        accounting,
-                    )
-                    .await?;
-                Ok::<(u64, Bytes, GetCost), FetchError>((start, got.data, got_cost))
-            },
-        ))
+        let runs = coalesce_ranges(missing, self.coalesce_gap);
+        // Reserve the memory the coalesced runs will materialize before the
+        // `join_all` issues a single GET (ADR-1170 decision 2): a refusal
+        // fails the whole fetch typed, with zero GETs issued, never a smaller
+        // fetch. The guard is owned by `regions`, so it lives exactly as long
+        // as the bytes it accounts for and releases on their drop, never
+        // because the GETs completed.
+        let reserved: u64 = runs
+            .iter()
+            .map(|(start, end)| end.saturating_sub(*start))
+            .fold(0u64, u64::saturating_add);
+        let mut reservation = self.reserve_fetch(reserved)?;
+        if self.cache.is_some() {
+            // Every run below is a `GetRange::Range`, so `guarded_get` routes
+            // all of them through `cached_get` when a cache is configured: the
+            // bytes this reservation covers land in the cache's own ledger too,
+            // on a hit or a miss alike (`cached_get`'s `Source::Cache` and
+            // `Source::Upstream` arms), the same overlap `whole_object_bytes`'s
+            // two arms mark, decided once here for the whole coalesced batch
+            // rather than per source.
+            reservation.mark_handed_off();
+        }
+        regions.hold_reservation(reservation);
+        let gets = join_all(runs.into_iter().map(|(start, end)| async move {
+            let (got, got_cost) = self
+                .guarded_get(
+                    seg_ref,
+                    tenant_hash,
+                    GetRange::Range(start, end),
+                    Some(suffix_etag),
+                    accounting,
+                )
+                .await?;
+            Ok::<(u64, Bytes, GetCost), FetchError>((start, got.data, got_cost))
+        }))
         .await;
         // Each coalesced GET reports its own store-vs-cache cost, so a range
         // served from a warm cache adds nothing here while a store GET adds one
@@ -1667,7 +1814,11 @@ impl SegmentFetcher {
     ///
     /// Histogram-valued series are skipped here: a scalar SoA cannot hold
     /// them. They are fetched by the mirror-image
-    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) instead.
+    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) instead. How many
+    /// were skipped is reported on [`FetchStats::histogram_series_skipped`],
+    /// independently of `count_stats` (which gates the page-kind counters
+    /// only): the skip is a completeness fact about the result, not an
+    /// optional statistic.
     async fn fetch_runs(
         &self,
         tenant_hash: TenantHash,
@@ -1696,8 +1847,19 @@ impl SegmentFetcher {
             .iter()
             .filter(|e| e.entry.value_kind == ValueKind::Scalar)
             .collect();
+        // The catalog is already decoded and its value kinds already read, so
+        // the count of what this filter drops is free here and nowhere else:
+        // a caller that only ever sees the scalar result cannot reconstruct it
+        // (`FetchStats::histogram_series_skipped`).
+        let skipped = (selected.len() - scalar.len()) as u64;
         if scalar.is_empty() {
-            return Ok((Vec::new(), FetchStats::default()));
+            return Ok((
+                Vec::new(),
+                FetchStats {
+                    histogram_series_skipped: skipped,
+                    ..FetchStats::default()
+                },
+            ));
         }
         let planned = self
             .fetch_scalar_pages(
@@ -1710,7 +1872,7 @@ impl SegmentFetcher {
                 accounting.scan(),
             )
             .await?;
-        self.build_scalar_decodes(
+        let (runs, mut stats) = self.build_scalar_decodes(
             key,
             seg_ref,
             &scalar,
@@ -1718,7 +1880,9 @@ impl SegmentFetcher {
             &regions,
             count_stats,
             accounting.scan(),
-        )
+        )?;
+        stats.histogram_series_skipped = skipped;
+        Ok((runs, stats))
     }
 
     /// Decodes the already-fetched scalar page bytes of `scalar` into one
@@ -2255,6 +2419,27 @@ impl SegmentFetcher {
         Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))
     }
 
+    /// Phase-split counterpart of [`fetch_soa_accounted`](Self::fetch_soa_accounted)
+    /// (issue #1367): the scalar-only sibling of
+    /// [`fetch_soa_and_histograms_phase_accounted`](Self::fetch_soa_and_histograms_phase_accounted),
+    /// for a caller (`ravel-sql`'s metrics table scan) with no use for
+    /// histogram series that would otherwise pay their decode for nothing.
+    /// `pub`, unlike its histogram-carrying sibling, because `ravel-sql` calls
+    /// it directly with a real, persistent `PhaseAccounting` for per-phase
+    /// visibility, the same way `engine.rs` calls the sibling.
+    pub async fn fetch_soa_phase_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &PhaseAccounting,
+    ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
+        let (runs, stats) = self
+            .fetch_runs(tenant_hash, seg_ref, matchers, true, accounting)
+            .await?;
+        Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))
+    }
+
     /// Histogram counterpart to [`fetch_soa`](Self::fetch_soa): fetches
     /// and decodes the native-histogram samples of every histogram-kind series
     /// in this segment matching `matchers`, as SoA
@@ -2621,6 +2806,22 @@ pub(crate) fn clone_store_error(err: &StoreError) -> StoreError {
         StoreError::InvalidRange(msg) => StoreError::InvalidRange(msg.clone()),
         StoreError::Transient(msg) => StoreError::Transient(msg.clone()),
         StoreError::Permanent(msg) => StoreError::Permanent(msg.clone()),
+        StoreError::ListRepeatedToken { prefix } => StoreError::ListRepeatedToken {
+            prefix: prefix.clone(),
+        },
+        StoreError::ListPageCeiling { prefix, ceiling } => StoreError::ListPageCeiling {
+            prefix: prefix.clone(),
+            ceiling: *ceiling,
+        },
+        StoreError::ListOrderViolation {
+            prefix,
+            previous,
+            offending,
+        } => StoreError::ListOrderViolation {
+            prefix: prefix.clone(),
+            previous: previous.clone(),
+            offending: offending.clone(),
+        },
     }
 }
 
@@ -3390,6 +3591,159 @@ mod tests {
         );
     }
 
+    /// ADR-1195: two `SegmentFetcher`s sharing one `GetLimiter::new(1)` must
+    /// never let both their GETs reach the store concurrently. The gate
+    /// observes the store's own in-flight GET count directly, so this pins
+    /// the process-wide bound rather than trusting the fetchers' bookkeeping.
+    #[tokio::test]
+    async fn shared_get_limiter_bounds_peak_concurrent_gets_to_one() {
+        use ravel_object_store::fault::{GateHandle, Occurrence};
+
+        let (source, tenant_hash, seg_ref) = write_test_segment().await;
+        let object_bytes = source
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let memory = MemoryStore::new();
+        memory
+            .put(
+                &seg_ref.data_object_key,
+                object_bytes.clone(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put segment object");
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let shared = Arc::new(crate::GetLimiter::new(1).expect("1 permit is valid"));
+        let fetcher_a = SegmentFetcher::new(backend.clone()).with_get_limiter(shared.clone());
+        let fetcher_b = SegmentFetcher::new(backend).with_get_limiter(shared);
+
+        let seg_a = seg_ref.clone();
+        let handle_a = tokio::spawn(async move { fetcher_a.fetch(tenant_hash, &seg_a, &[]).await });
+        let seg_b = seg_ref.clone();
+        let handle_b = tokio::spawn(async move { fetcher_b.fetch(tenant_hash, &seg_b, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("one of the two fetches issues its GET within 30 s");
+
+        // The other fetch's GET must never become in-flight while the shared
+        // permit is held: if the shared limiter did not actually bound
+        // concurrency, `wait_until_held(2)` would resolve well within this
+        // window instead of timing out.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(2)
+            )
+            .await
+            .is_err(),
+            "one shared permit must cap in-flight GETs at exactly 1, \
+             not merely at more than 0"
+        );
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "one shared permit must cap in-flight GETs at exactly 1"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing the first permit lets the second GET proceed within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must be the only one held once the first releases"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b");
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 2);
+    }
+
+    /// Control for [`shared_get_limiter_bounds_peak_concurrent_gets_to_one`]:
+    /// the same two fetchers, but each with its OWN private limiter of 1
+    /// permit rather than a shared one. Private pools do not add, so both
+    /// GETs reach the store at once and peak in-flight is exactly 2 --
+    /// proving the shared test's bound of 1 comes from sharing, not from some
+    /// other serialization (object identity, a single-flight cache, tokio
+    /// scheduling).
+    #[tokio::test]
+    async fn private_get_limiters_do_not_share_a_bound() {
+        use ravel_object_store::fault::{GateHandle, Occurrence};
+
+        let (source, tenant_hash, seg_ref) = write_test_segment().await;
+        let object_bytes = source
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let memory = MemoryStore::new();
+        memory
+            .put(
+                &seg_ref.data_object_key,
+                object_bytes.clone(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put segment object");
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let fetcher_a = SegmentFetcher::new(backend.clone()).with_max_concurrent_gets(1);
+        let fetcher_b = SegmentFetcher::new(backend).with_max_concurrent_gets(1);
+
+        let seg_a = seg_ref.clone();
+        let handle_a = tokio::spawn(async move { fetcher_a.fetch(tenant_hash, &seg_a, &[]).await });
+        let seg_b = seg_ref.clone();
+        let handle_b = tokio::spawn(async move { fetcher_b.fetch(tenant_hash, &seg_b, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(2))
+            .await
+            .expect("two independently-limited fetchers both reach the store within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            2,
+            "two private 1-permit limiters admit exactly 2 concurrent GETs, not 1"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b");
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 2);
+    }
+
     /// ADR-0044: accounting must be pure observation. The accounted and
     /// unaccounted entry points must fetch identical bytes and decode
     /// identical samples -- including the NaN bit pattern in
@@ -3766,6 +4120,129 @@ mod tests {
     // fetcher's whole multi-GET plan reduces to these two helpers, so they are
     // pinned directly here (the end-to-end path is exercised in
     // tests/fetch_multi_get.rs).
+
+    /// Deliverable 2 (RSEG): the byte reservation `ensure_ranges` takes for its
+    /// coalesced runs is owned by the `FetchedRegions` it fills, so the budget
+    /// stays reserved for exactly the run-length sum while those regions are
+    /// held and returns to zero the moment they drop, never released because the
+    /// GET completed.
+    ///
+    /// Non-vacuity: dropping the
+    /// `regions.hold_reservation(self.reserve_fetch(reserved)?)` line in
+    /// `ensure_ranges` releases the guard at the end of the call, so `reserved()`
+    /// reads 0 while the regions are still held and the first assertion fails.
+    #[tokio::test]
+    async fn rseg_range_reservation_is_owned_by_the_filled_regions() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        // whole_object_threshold(0) plus a short suffix keep the first GET a
+        // footer tail read, so the front byte range below is genuinely missing
+        // and reaches the `ensure_ranges` reservation site rather than being
+        // served from an already-whole-object buffer.
+        let fetcher = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(0)
+            .with_suffix_len(16)
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let (_footer, _total, suffix_etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+
+        const RUN: u64 = 64;
+        assert!(
+            !regions.covers(0, RUN),
+            "the front of the object must not be covered by the footer tail read"
+        );
+        assert_eq!(budget.reserved(), 0, "open_segment reserves nothing");
+        fetcher
+            .ensure_ranges(
+                &seg_ref,
+                tenant_hash,
+                &suffix_etag,
+                &[(0, RUN)],
+                &mut regions,
+                &accounting,
+            )
+            .await
+            .expect("ensure_ranges");
+        assert_eq!(
+            budget.reserved(),
+            RUN,
+            "the reservation equals the coalesced run-length sum while the regions are held"
+        );
+        drop(regions);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the reservation releases when the FetchedRegions buffer drops"
+        );
+    }
+
+    /// `ensure_ranges`'s reservation covers a coalesced-run batch, not one
+    /// GET, so it cannot branch on a per-range `Source` the way
+    /// `LogSegmentFetcher::whole_object_bytes`'s two arms do: every run it
+    /// fetched routes through `cached_get` when a cache is configured
+    /// (`guarded_get`'s cache-eligible branch), so the whole reservation is
+    /// handed off once, decided from `self.cache.is_some()` rather than from
+    /// any one run's hit/miss outcome.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call added
+    /// in `ensure_ranges` leaves `handoff_overlap()` at 0 while the regions
+    /// are held, so the first assertion below fails with: assertion
+    /// `left == right` failed: ensure_ranges's reservation is marked handed
+    /// off while a cache is configured, since every coalesced run it fetched
+    /// is now cache-resident too -- left: 0, right: 64 (confirmed by making
+    /// exactly that edit, observing the failure, and reverting it by hand).
+    #[tokio::test]
+    async fn rseg_ensure_ranges_cache_marks_the_reservation_handed_off() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let fetcher = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(0)
+            .with_suffix_len(16)
+            .with_cache(ram_cache())
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let (_footer, _total, suffix_etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+
+        const RUN: u64 = 64;
+        assert_eq!(budget.reserved(), 0, "open_segment reserves nothing");
+        fetcher
+            .ensure_ranges(
+                &seg_ref,
+                tenant_hash,
+                &suffix_etag,
+                &[(0, RUN)],
+                &mut regions,
+                &accounting,
+            )
+            .await
+            .expect("ensure_ranges");
+        assert_eq!(
+            budget.handoff_overlap(),
+            RUN,
+            "ensure_ranges's reservation is marked handed off while a cache is \
+             configured, since every coalesced run it fetched is now \
+             cache-resident too"
+        );
+        drop(regions);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the regions drop"
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the reservation releases with the regions"
+        );
+    }
 
     #[test]
     fn coalesce_merges_within_gap_and_splits_beyond() {
@@ -4311,6 +4788,140 @@ mod tests {
                 fetcher.suffix_fallbacks(),
                 1,
                 "an unsized ref must take the observable suffix fallback exactly once"
+            );
+        }
+    }
+
+    /// `crate::io_shape::depth_for_object` (issue #1214) mirrors the real
+    /// branches `open_segment` -> `decode_selected` -> `fetch_scalar_pages`
+    /// takes, not just the footer stage. A small object (`object_size` in
+    /// `(0, threshold]`) resolves footer, catalog, and pages from one GET:
+    /// zero dependent stages, depth 1. Every other case takes the
+    /// footer-tail path, whose footer stage is either 1 GET (the tail guess
+    /// covers the real footer) or 2 (a `FooterOutcome::NeedRange` chase),
+    /// followed by a dependent catalog `ensure_ranges` GET (LABEL_DICT /
+    /// SERIES_IDS / SERIES_META, at the object front, never inside the
+    /// footer-tail bytes) and a dependent page `ensure_ranges` GET (the run
+    /// ranges the catalog just named): up to 4 stages total. The pre-fix
+    /// `depth_for_object` tested only `object_size <= whole_object_threshold`,
+    /// which is vacuously true for `object_size == 0` against any
+    /// non-negative threshold, and so wrongly reported depth 1 -- the
+    /// whole-object depth -- for a segment that `open_segment` actually
+    /// routes down the footer-tail path.
+    ///
+    /// Every case below drives the real GET count through a full `.fetch()`
+    /// call against a counting store (`FaultStore`'s `sequence_progress`),
+    /// not a recomputation from a partial call (`open_segment` alone) that
+    /// cannot see the catalog or page stages. Flip the `object_size != 0 &&`
+    /// guard back off in `depth_for_object` to watch the `object_size == 0`
+    /// assertion in (c) fail: it would then predict 1, not 4.
+    #[tokio::test]
+    async fn depth_for_object_upper_bounds_the_real_footer_and_page_chain() {
+        use crate::io_shape::depth_for_object;
+
+        // (a) Whole-object path: resolves everything from the single first
+        // GET, zero dependent stages.
+        {
+            let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+            let bytes = mem
+                .get(&seg_ref.data_object_key, GetRange::Full)
+                .await
+                .expect("get bytes")
+                .data;
+            let size = seg_ref.object_size;
+            let store = counting_store(bytes, &seg_ref.data_object_key).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+            SegmentFetcher::new(backend)
+                .with_whole_object_threshold(size + 1)
+                .fetch(tenant_hash, &seg_ref, &[])
+                .await
+                .expect("whole-object fetch");
+            let real_chain = store.sequence_progress(0);
+            assert_eq!(
+                real_chain, 1,
+                "whole-object path resolves footer, catalog, and pages from one GET"
+            );
+            assert_eq!(
+                depth_for_object(size, size + 1),
+                1,
+                "predicted depth must match the real single-GET chain exactly"
+            );
+        }
+
+        // (b) Forced footer-tail path with a `NeedRange` chase (`suffix_len`
+        // too small to cover the footer): the real chain runs the whole
+        // pipeline (footer tail, NeedRange chase, catalog fetch, page
+        // fetch), counted from a full `.fetch()` against a counting store,
+        // not recomputed from `open_segment` alone.
+        {
+            let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+            let bytes = mem
+                .get(&seg_ref.data_object_key, GetRange::Full)
+                .await
+                .expect("get bytes")
+                .data;
+            let store = counting_store(bytes, &seg_ref.data_object_key).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+            SegmentFetcher::new(backend)
+                .with_whole_object_threshold(0)
+                .with_suffix_len(16)
+                .fetch(tenant_hash, &seg_ref, &[])
+                .await
+                .expect("forced NeedRange chase fetch");
+            let real_chain = store.sequence_progress(0);
+            assert_eq!(
+                real_chain, 4,
+                "a 16-byte suffix_len is too small to cover the footer, forcing a \
+                 NeedRange chase, and this segment's catalog and page sections sit \
+                 outside the footer-tail bytes: footer tail + NeedRange chase + \
+                 catalog fetch + page fetch is a 4-GET chain"
+            );
+            assert_eq!(
+                depth_for_object(seg_ref.object_size, 0),
+                4,
+                "predicted upper bound must equal the real chain exactly in the \
+                 worst case"
+            );
+        }
+
+        // (c) `object_size == 0` (unknown size): takes the SAME footer-tail
+        // path as (b), not the whole-object path, even though the pre-fix
+        // code's `object_size <= whole_object_threshold` test was vacuously
+        // true for 0 against any non-negative threshold. A 250-byte
+        // `suffix_len` covers this segment's footer in a single GET (no
+        // `NeedRange` chase) without reaching far enough back to also cover
+        // the catalog or page sections, so the real chain is 3 (footer +
+        // catalog + page), safely within the upper bound of 4.
+        {
+            let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+            let bytes = mem
+                .get(&seg_ref.data_object_key, GetRange::Full)
+                .await
+                .expect("get bytes")
+                .data;
+            let mut sizeless = seg_ref.clone();
+            sizeless.object_size = 0;
+            let store = counting_store(bytes, &seg_ref.data_object_key).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+            SegmentFetcher::new(backend)
+                .with_whole_object_threshold(1_000_000)
+                .with_suffix_len(250)
+                .fetch(tenant_hash, &sizeless, &[])
+                .await
+                .expect("sizeless fetch");
+            let real_chain = store.sequence_progress(0);
+            assert_eq!(
+                real_chain, 3,
+                "a 250-byte suffix_len covers the footer without a NeedRange chase \
+                 and without reaching the catalog or page sections: footer + \
+                 catalog + page is a 3-GET chain"
+            );
+            assert_eq!(
+                depth_for_object(0, 1_000_000),
+                4,
+                "object_size == 0 must take the footer-tail upper bound, not the \
+                 whole-object depth of 1, even though 0 <= any non-negative \
+                 threshold"
             );
         }
     }

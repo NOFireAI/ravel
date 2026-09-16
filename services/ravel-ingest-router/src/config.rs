@@ -1,6 +1,6 @@
 //! CLI configuration for the ingest router.
 //!
-//! The auth-resolver flags (`--oidc-*`, `--mtls-*`, `--dev-insecure-tenant-header`,
+//! The auth-resolver flags (`--oidc-*`, `--mtls-header`, `--dev-insecure-tenant-header`,
 //! `--tenant-token`) mirror `services/ravel-server`'s flag shape so a later task
 //! (#158) can thread the identical Secret/ConfigMap references the operator
 //! already wires into the gateway Deployment into this router's Deployment as a
@@ -8,7 +8,10 @@
 //! and are only meaningful under `--key-source canonical-tenant`; the CLI
 //! rejects them under any other key source (fail-fast, matching this repo's
 //! dependent-flag validation convention) rather than constructing an unused
-//! resolver chain.
+//! resolver chain. `--mtls-enabled` is the one exception: it is refused
+//! unconditionally, under every key source, because this router has no
+//! dedicated listener to isolate the mTLS resolver on (ADR-0050 decision 1
+//! shape; see [`Cli::into_config`]).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -111,7 +114,10 @@ pub struct Cli {
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 
-    /// Dev-only tenant resolution via the `x-ravel-tenant` header.
+    /// Dev-only tenant resolution via the `x-ravel-tenant` header. Refuses to
+    /// enable unless every bound listener (`--listen-http` and, when set,
+    /// `--listen-grpc`) is loopback: the dev header resolves an unauthenticated
+    /// routing key on every bound listener, not just HTTP.
     #[arg(long)]
     pub dev_insecure_tenant_header: bool,
 
@@ -139,15 +145,22 @@ pub struct Cli {
     #[arg(long, default_value_t = 300)]
     pub oidc_jwks_refresh_interval_secs: u64,
 
-    /// Enable the mTLS tenant resolver in the canonical-tenant chain, mapping a
-    /// trusted proxy-forwarded client-certificate header to a tenant.
+    /// Refused unconditionally at startup (ADR-0050 decision 1 shape): folding
+    /// the mTLS resolver into this router's one public chain would let any
+    /// client set the client-certificate identity header and pick its own
+    /// tenant, since nothing here verifies it. The resolver needs a dedicated
+    /// listener this router does not have. Kept as a flag only so an operator
+    /// who passes it gets a clear refusal naming `--tenant-token` and
+    /// `--oidc-*` instead of `error: unrecognized argument`.
     #[arg(long)]
     pub mtls_enabled: bool,
 
     /// Header the reverse proxy forwards the verified client-certificate
-    /// identity in. Defaults to `x-ravel-client-cert-cn`. Used by the
-    /// `mtls-subject` key source, and by the canonical-tenant chain when
-    /// `--mtls-enabled`.
+    /// identity in. Defaults to `x-ravel-client-cert-cn`. Read as a routing key
+    /// by the `mtls-subject` key source only (`--mtls-enabled` is refused, so no
+    /// canonical-tenant chain ever reads this header), and stripped from every
+    /// forwarded request under every key source, since nothing in this router
+    /// verifies it.
     #[arg(long, value_name = "HEADER")]
     pub mtls_header: Option<String>,
 }
@@ -212,8 +225,6 @@ pub struct CanonicalAuthSettings {
     pub tokens: Vec<(String, String)>,
     pub dev_header: bool,
     pub oidc: Option<OidcSettings>,
-    /// The trusted client-cert header, `Some` only when `--mtls-enabled`.
-    pub mtls_header: Option<String>,
 }
 
 impl std::fmt::Debug for CanonicalAuthSettings {
@@ -226,7 +237,6 @@ impl std::fmt::Debug for CanonicalAuthSettings {
             )
             .field("dev_header", &self.dev_header)
             .field("oidc", &self.oidc)
-            .field("mtls_header", &self.mtls_header)
             .finish()
     }
 }
@@ -255,6 +265,13 @@ pub struct RouterConfig {
     pub gateway_port_name: Option<String>,
     pub subset_size: usize,
     pub key: KeyConfig,
+    /// The client-certificate identity header this deployment names
+    /// (`--mtls-header`, defaulting to [`MtlsResolver::DEFAULT_HEADER`]).
+    /// Nothing here verifies it, so both forwarding paths strip it from every
+    /// request before dialing the upstream; it is resolved under every key
+    /// source, not only `mtls-subject`, because a deployment that names it and
+    /// then routes by another key would otherwise forward it untouched.
+    pub identity_header: HeaderName,
     pub listen_http: SocketAddr,
     pub listen_grpc: Option<SocketAddr>,
     pub round_robin_max_entries: usize,
@@ -270,6 +287,7 @@ impl std::fmt::Debug for RouterConfig {
             .field("subset_size", &self.subset_size)
             // `key`'s own Debug (via CanonicalAuthSettings) redacts any tokens.
             .field("key", &self.key)
+            .field("identity_header", &self.identity_header)
             .field("listen_http", &self.listen_http)
             .field("listen_grpc", &self.listen_grpc)
             .field("round_robin_max_entries", &self.round_robin_max_entries)
@@ -282,6 +300,24 @@ impl Cli {
     /// Validate the flags and produce the runtime [`RouterConfig`], failing fast
     /// on any contradictory combination.
     pub fn into_config(self) -> anyhow::Result<RouterConfig> {
+        // ADR-0050 decision 1 shape: refuse rather than fold the mTLS resolver
+        // into the one public chain this router builds. The resolver trusts a
+        // client-supplied header with no verification of its own; on a shared
+        // chain any client could set that header and pick its own tenant. The
+        // fix that decision took for ravel-server was a dedicated listener
+        // whose chain alone carries the resolver -- this router has no such
+        // listener, so there is no safe way to honor the flag at all.
+        if self.mtls_enabled {
+            anyhow::bail!(
+                "--mtls-enabled is refused: this router builds one resolver chain shared by \
+                 every listener, and the mTLS resolver trusts the client-certificate identity \
+                 header with no verification of its own, so folding it in would let any client \
+                 set that header and pick its own tenant. Use --tenant-token or \
+                 --oidc-issuer/--oidc-jwks-url instead. The mTLS resolver needs a dedicated \
+                 listener this router does not have; a --mtls-listener is a possible follow-up \
+                 that needs its own ADR, not something this flag can safely opt into today."
+            );
+        }
         if self.subset_size == 0 {
             anyhow::bail!("--subset-size must be at least 1");
         }
@@ -317,6 +353,11 @@ impl Cli {
             _ => {}
         }
 
+        // Resolved under every key source: the forwarding paths strip this name
+        // whatever the router routes by, so an invalid `--mtls-header` is a
+        // startup failure rather than a name that silently fails to strip.
+        let identity_header = self.identity_header_name()?;
+
         let key = if self.key_source == KeySource::CanonicalTenant {
             KeyConfig::CanonicalTenant(self.canonical_auth_settings()?)
         } else {
@@ -326,12 +367,39 @@ impl Cli {
             KeyConfig::Header(self.header_key_name()?)
         };
 
+        // #1293 sibling: the dev header resolves an `x-ravel-tenant` routing key
+        // from an unauthenticated header. Because the proxy forwards the original
+        // request headers and the upstream gateway re-authenticates, this forges
+        // routing affinity rather than tenant identity, which is why it is a
+        // lower guard than the gateway's. It must still never be reachable off
+        // loopback: require every bound listener to be loopback when the flag is
+        // set. Reaching here with the flag set means the key source is
+        // canonical-tenant; a non-canonical source already failed in
+        // `reject_canonical_only_flags` above.
+        if self.dev_insecure_tenant_header {
+            if !self.listen_http.ip().is_loopback() {
+                anyhow::bail!(
+                    "--dev-insecure-tenant-header refuses to enable unless --listen-http binds a \
+                     loopback address"
+                );
+            }
+            if let Some(grpc) = self.listen_grpc
+                && !grpc.ip().is_loopback()
+            {
+                anyhow::bail!(
+                    "--dev-insecure-tenant-header refuses to enable unless --listen-grpc binds a \
+                     loopback address"
+                );
+            }
+        }
+
         Ok(RouterConfig {
             gateway_service_name: self.gateway_service_name,
             gateway_service_namespace: self.gateway_service_namespace,
             gateway_port_name: self.gateway_port_name,
             subset_size: self.subset_size as usize,
             key,
+            identity_header,
             listen_http: self.listen_http,
             listen_grpc: self.listen_grpc,
             round_robin_max_entries: self.round_robin_max_entries,
@@ -349,16 +417,25 @@ impl Cli {
                 HeaderName::try_from(name)
                     .map_err(|e| anyhow::anyhow!("invalid --key-header-name '{name}': {e}"))?
             }
-            KeySource::MtlsSubject => {
-                let name = self
-                    .mtls_header
-                    .as_deref()
-                    .unwrap_or(MtlsResolver::DEFAULT_HEADER);
-                HeaderName::try_from(name)
-                    .map_err(|e| anyhow::anyhow!("invalid --mtls-header '{name}': {e}"))?
-            }
+            KeySource::MtlsSubject => self.identity_header_name()?,
             KeySource::CanonicalTenant => unreachable!("canonical-tenant is not a header source"),
         })
+    }
+
+    /// The client-certificate identity header this deployment names
+    /// (`--mtls-header`, defaulting to [`MtlsResolver::DEFAULT_HEADER`]).
+    ///
+    /// One resolution shared by the two readers of the flag: the `mtls-subject`
+    /// key source hashes this header, and both forwarding paths strip it before
+    /// dialing the upstream. Resolving it twice would let a configured name be
+    /// routed by and still forwarded.
+    fn identity_header_name(&self) -> anyhow::Result<HeaderName> {
+        let name = self
+            .mtls_header
+            .as_deref()
+            .unwrap_or(MtlsResolver::DEFAULT_HEADER);
+        HeaderName::try_from(name)
+            .map_err(|e| anyhow::anyhow!("invalid --mtls-header '{name}': {e}"))
     }
 
     /// Reject flags that only make sense under `--key-source canonical-tenant`.
@@ -369,9 +446,6 @@ impl Cli {
         }
         if !self.oidc_audiences.is_empty() || self.oidc_tenant_claim.is_some() {
             anyhow::bail!("--oidc-* flags are only valid with --key-source canonical-tenant");
-        }
-        if self.mtls_enabled {
-            anyhow::bail!("--mtls-enabled is only valid with --key-source canonical-tenant");
         }
         if self.dev_insecure_tenant_header {
             anyhow::bail!(
@@ -453,37 +527,19 @@ impl Cli {
             }
         }
 
-        let mtls_header = if self.mtls_enabled {
-            let header = self
-                .mtls_header
-                .clone()
-                .unwrap_or_else(|| MtlsResolver::DEFAULT_HEADER.to_string());
-            if header.is_empty() {
-                anyhow::bail!("--mtls-header must be non-empty");
-            }
-            Some(header)
-        } else {
-            None
-        };
-
         let settings = CanonicalAuthSettings {
             tokens,
             dev_header: self.dev_insecure_tenant_header,
             oidc,
-            mtls_header,
         };
 
         // A canonical-tenant router with no resolver at all would 401 every
         // request: a total ingest outage disguised as fail-closed. Refuse to
         // start rather than serve it.
-        if settings.tokens.is_empty()
-            && !settings.dev_header
-            && settings.oidc.is_none()
-            && settings.mtls_header.is_none()
-        {
+        if settings.tokens.is_empty() && !settings.dev_header && settings.oidc.is_none() {
             anyhow::bail!(
                 "--key-source canonical-tenant needs at least one resolver: set --tenant-token, \
-                 --oidc-issuer/--oidc-jwks-url, --mtls-enabled, or --dev-insecure-tenant-header"
+                 --oidc-issuer/--oidc-jwks-url, or --dev-insecure-tenant-header"
             );
         }
 
@@ -565,12 +621,64 @@ mod tests {
     }
 
     #[test]
-    fn canonical_only_flags_rejected_under_header_source() {
-        let err = cli(&["--key-source", "authorization-header", "--mtls-enabled"])
+    fn identity_header_defaults_to_the_mtls_default_name() {
+        let config = cli(&["--key-source", "authorization-header"])
             .into_config()
-            .expect_err("--mtls-enabled under a header source must fail");
-        assert!(err.to_string().contains("--mtls-enabled"));
+            .expect("valid config");
+        assert_eq!(
+            config.identity_header.as_str(),
+            MtlsResolver::DEFAULT_HEADER,
+            "a deployment that never sets --mtls-header still strips the default name"
+        );
+    }
 
+    #[test]
+    fn configured_mtls_header_becomes_the_identity_header() {
+        // Under `mtls-subject` the configured name is both the routing key and
+        // the name the forwarding paths strip.
+        let config = cli(&["--key-source", "mtls-subject", "--mtls-header", "x-cert-cn"])
+            .into_config()
+            .expect("valid config");
+        assert_eq!(config.identity_header.as_str(), "x-cert-cn");
+        match config.key {
+            KeyConfig::Header(name) => assert_eq!(name.as_str(), "x-cert-cn"),
+            other => panic!("expected header key config, got {other:?}"),
+        }
+
+        // And under a key source that never reads it: the name is still carried
+        // through, because a deployment that names an identity header must not
+        // forward it whatever it routes by.
+        let config = cli(&[
+            "--key-source",
+            "authorization-header",
+            "--mtls-header",
+            "x-cert-cn",
+        ])
+        .into_config()
+        .expect("valid config");
+        assert_eq!(config.identity_header.as_str(), "x-cert-cn");
+    }
+
+    #[test]
+    fn invalid_mtls_header_is_refused_under_every_key_source() {
+        for source in ["mtls-subject", "authorization-header"] {
+            let err = cli(&["--key-source", source, "--mtls-header", "bad header"])
+                .into_config()
+                .expect_err("an invalid header name must fail startup");
+            assert!(
+                err.to_string().contains("--mtls-header"),
+                "error names the flag: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_only_flags_rejected_under_header_source() {
+        // `--mtls-enabled` is not covered here: it now trips the unconditional
+        // refusal at the top of `into_config`, which runs before the key source
+        // is looked at, so it never reaches `reject_canonical_only_flags`.
+        // `mtls_enabled_is_refused_on_the_ingest_router` covers it under both a
+        // header and the canonical-tenant key source.
         let err = cli(&[
             "--key-source",
             "authorization-header",
@@ -580,6 +688,47 @@ mod tests {
         .into_config()
         .expect_err("--tenant-token under a header source must fail");
         assert!(err.to_string().contains("--tenant-token"));
+
+        let err = cli(&[
+            "--key-source",
+            "authorization-header",
+            "--dev-insecure-tenant-header",
+        ])
+        .into_config()
+        .expect_err("--dev-insecure-tenant-header under a header source must fail");
+        assert!(err.to_string().contains("--dev-insecure-tenant-header"));
+    }
+
+    #[test]
+    fn mtls_enabled_is_refused_on_the_ingest_router() {
+        // Even with another resolver configured (so this is not the
+        // no-resolver-at-all case), --mtls-enabled must be refused outright:
+        // this router has no dedicated listener to isolate the mTLS resolver
+        // on (ADR-0050 decision 1 shape).
+        let err = cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--tenant-token",
+            "t=acme",
+            "--mtls-enabled",
+        ])
+        .into_config()
+        .expect_err("--mtls-enabled must be refused unconditionally");
+        assert!(
+            err.to_string().contains("--mtls-enabled"),
+            "error names the flag: {err}"
+        );
+
+        // And under a header key source, where the refusal at the top of
+        // `into_config` is the only thing that rejects it: the key source never
+        // reaches `reject_canonical_only_flags`, which does not name this flag.
+        let err = cli(&["--key-source", "authorization-header", "--mtls-enabled"])
+            .into_config()
+            .expect_err("--mtls-enabled under a header source must fail too");
+        assert!(
+            err.to_string().contains("--mtls-enabled"),
+            "error names the flag: {err}"
+        );
     }
 
     #[test]
@@ -609,6 +758,66 @@ mod tests {
             }
             other => panic!("expected canonical key config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dev_insecure_tenant_header_on_non_loopback_listen_fails_validate() {
+        // Default --listen-http is 0.0.0.0:8080, a non-loopback bind. The dev
+        // header resolves an x-ravel-tenant routing key from an unauthenticated
+        // header, so it must refuse to enable off loopback (#1293 sibling).
+        let err = cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--dev-insecure-tenant-header",
+        ])
+        .into_config()
+        .expect_err("non-loopback --listen-http with the dev header must refuse startup");
+        assert!(
+            err.to_string().contains("--dev-insecure-tenant-header"),
+            "error names the flag: {err}"
+        );
+        assert!(
+            err.to_string().contains("--listen-http"),
+            "error names the listener: {err}"
+        );
+    }
+
+    #[test]
+    fn dev_insecure_tenant_header_on_loopback_listen_validates() {
+        // Positive control so the guard is not vacuous: both bound listeners
+        // loopback validates.
+        cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--dev-insecure-tenant-header",
+            "--listen-http",
+            "127.0.0.1:8080",
+            "--listen-grpc",
+            "127.0.0.1:8081",
+        ])
+        .into_config()
+        .expect("both listeners loopback with the dev header is fine");
+    }
+
+    #[test]
+    fn dev_insecure_tenant_header_on_non_loopback_grpc_fails_validate() {
+        // --listen-http loopback but --listen-grpc public: the gRPC proxy
+        // listener carries the forged affinity too, so refuse.
+        let err = cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--dev-insecure-tenant-header",
+            "--listen-http",
+            "127.0.0.1:8080",
+            "--listen-grpc",
+            "0.0.0.0:8081",
+        ])
+        .into_config()
+        .expect_err("non-loopback --listen-grpc with the dev header must refuse startup");
+        assert!(
+            err.to_string().contains("--listen-grpc"),
+            "error names the gRPC listener: {err}"
+        );
     }
 
     #[test]
@@ -680,7 +889,6 @@ mod tests {
             tokens: vec![(SECRET.to_string(), "acme".to_string())],
             dev_header: false,
             oidc: None,
-            mtls_header: None,
         };
         let rendered = format!("{settings:?}");
         assert!(

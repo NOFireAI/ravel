@@ -4,10 +4,16 @@
 //! `t/<tenant_hash>/<sig>/prov` recording the `shard_count` its data was
 //! written under. `shard_count` lives only in process config otherwise, and
 //! resolution iterates `0..shard_count` (catalog.rs), so a process configured
-//! with a lower value than the data was written under silently omits every
-//! series in the missing shards. This record turns that silent truncation into
-//! a loud refusal: every ingest, catalog, and maintain touch validates the
-//! configured value against the record before acting.
+//! with a lower value than the data was written under would silently omit every
+//! series in the missing shards. This record makes the shard count a tenant's
+//! data was written under durable and self-describing: routing and scanning
+//! derive the shard fan-out from the record's own generation history, so a
+//! process configured with a different live `--shards` default still serves an
+//! already-provisioned tenant correctly (ADR-0082). Every ingest, catalog, and
+//! maintain touch validates the record on the way past; a genuinely corrupt or
+//! undecodable record still fails closed, and a recorded count that merely
+//! differs from the live default is tolerated drift, logged and counted, never a
+//! refusal.
 //!
 //! This module is the one shared implementation the three consumers named in
 //! ADR-0050 section 5 call: ingest-router first write, catalog first resolve,
@@ -20,7 +26,10 @@
 //! EK); nothing here changes a recorded value, only refuses when config and
 //! record disagree.
 
+use std::collections::HashSet;
 use std::future::Future;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use prost::Message;
 use ravel_object_store::{
@@ -29,11 +38,47 @@ use ravel_object_store::{
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::{Signal, TenantHash};
 
-/// Format floor written into every provisioning record this build emits, and
-/// the highest record version it understands. A record declaring a higher
-/// version is refused rather than misread under this layout (ADR-0050 section
-/// 5), matching the `sys/tenancy` marker's version guard.
-pub const PROVISIONING_FORMAT_VERSION: u32 = 1;
+/// Format version written into every provisioning record this build emits:
+/// every writer, including the CAS rewrite paths ([`append_generation`],
+/// [`raise_format_floor`]), stamps exactly this. It is also the highest version
+/// a rewrite path can reproduce byte-for-byte, so a rewrite refuses any record
+/// declaring a version above it rather than strip a field it does not model
+/// (ADR-0066 decision 5).
+///
+/// ADR-0066 R2 raised this from 1 to 2, the writer half of the
+/// readers-before-writers sequence R1 opened. Version 2 carries the same field
+/// set as version 1; the bump is a floor signal, so a binary predating R1 --
+/// whose gate ceiling is 1 -- refuses these records instead of rewriting them
+/// whole and stripping the additive fields it does not model. That fail-closed
+/// refusal is the point (issue #1300), and it is safe only because R1's reader
+/// accepts 2 fleet-wide already.
+pub const PROVISIONING_FORMAT_VERSION: u32 = 2;
+
+/// Highest record version a reader accepts: the supported read set is
+/// `PROVISIONING_MIN_READ_VERSION..=PROVISIONING_MAX_READ_VERSION` (ADR-0066
+/// decision 4). A record declaring a higher version is refused rather than
+/// misread under this layout, matching the `sys/tenancy` marker's version guard.
+///
+/// R1 raised this to 2 one release ahead of the writer (readers-before-writers),
+/// so a lagging binary meeting a record a newer peer wrote halted nowhere on the
+/// read path. This record is read on the ingest hot path by `GenerationSwitch`,
+/// which fails a flush closed on a read failure, so a single-release bump that
+/// refused the newer version would have been a fleet-wide ingest outage during
+/// any rolling upgrade. R2 flipped the writer into that already-accepted
+/// ceiling, so the read set is unchanged here and now ends exactly at what the
+/// writer stamps. A future additive field repeats the sequence: raise this
+/// ceiling first, ship it, then raise the writer.
+pub const PROVISIONING_MAX_READ_VERSION: u32 = 2;
+
+/// Lowest record version a reader accepts: the supported read set is a closed
+/// interval `PROVISIONING_MIN_READ_VERSION..=PROVISIONING_MAX_READ_VERSION`, a
+/// set with a floor and not a ceiling. Version 0 is an unstamped record from a
+/// writer that never set `format_version`; admitting it would let a valid-shaped
+/// but unstamped record enter shard routing and be rewritten by a CAS path, so
+/// it is refused with [`ProvisioningError::VersionBelowFloor`] -- a distinct
+/// error from the ceiling's, because the remediation is distinct (ADR-0066
+/// decision 4).
+pub const PROVISIONING_MIN_READ_VERSION: u32 = 1;
 
 /// Object key for a (tenant, signal) provisioning record: `t/<hex>/<sig>/prov`.
 /// Under the tenant's own prefix, alongside its `l0/` and `c/` shard data, not
@@ -86,12 +131,45 @@ pub enum ProvisioningError {
         #[source]
         source: prost::DecodeError,
     },
+    /// The record declares a version ABOVE the reader's ceiling: a newer writer
+    /// produced it, and this build cannot know which fields it carries. Refused
+    /// rather than misread. The remediation is to upgrade this binary, which is
+    /// why this is a separate variant from
+    /// [`ProvisioningError::VersionBelowFloor`] (a below-floor record is not a
+    /// future format and upgrading fixes nothing).
     #[error(
-        "provisioning record {key:?} declares format_version {got}, but this build only \
-         understands version {PROVISIONING_FORMAT_VERSION}: refusing rather than misread a future \
-         record format"
+        "provisioning record {key:?} declares format_version {got}, above the highest version this \
+         build reads ({ceiling}): a newer writer produced it, so refusing rather than misread it. \
+         Upgrade this binary to one whose reader accepts version {got}"
     )]
-    UnsupportedVersion { key: String, got: u32 },
+    UnsupportedVersion { key: String, got: u32, ceiling: u32 },
+    /// The record declares a version BELOW the reader's floor. Version 0 is the
+    /// case that occurs in practice: an unstamped record from a writer that
+    /// never set `format_version`. This is not a future format, so upgrading
+    /// changes nothing; the record itself has to be migrated or rewritten by a
+    /// writer of a supported version.
+    #[error(
+        "provisioning record {key:?} declares format_version {got}, below the lowest version this \
+         build reads ({floor}): the record is unstamped or predates the supported floor, not a \
+         future format. Refusing rather than admit a record no supported writer produced"
+    )]
+    VersionBelowFloor { key: String, got: u32, floor: u32 },
+    /// A CAS rewrite path ([`append_generation`], [`raise_format_floor`]) read a
+    /// record declaring a version this build's writer cannot reproduce
+    /// (> [`PROVISIONING_FORMAT_VERSION`]). Rewriting it whole would re-encode
+    /// through this build's field set and silently drop any field a newer writer
+    /// added, so the rewrite is refused and nothing is written (ADR-0066 decision
+    /// 5). Distinct from [`ProvisioningError::UnsupportedVersion`] because it
+    /// says nothing was written rather than nothing was read: while
+    /// [`PROVISIONING_MAX_READ_VERSION`] exceeds the writer's version (the state
+    /// R1 shipped, and the state any future additive field re-enters) a read-only
+    /// path accepts exactly the versions a rewrite refuses here.
+    #[error(
+        "provisioning record {key:?} declares format_version {got}, newer than this build's writer \
+         version {PROVISIONING_FORMAT_VERSION}: refusing to rewrite it whole and strip fields this \
+         build does not model (ADR-0066 decision 5)"
+    )]
+    RefusingToRewriteNewerRecord { key: String, got: u32 },
     #[error(
         "provisioning record {key:?} is misfiled: it records {field} {actual}, but the key it was \
          read under expects {expected}"
@@ -101,21 +179,6 @@ pub enum ProvisioningError {
         field: &'static str,
         expected: String,
         actual: String,
-    },
-    /// The record exists and its `shard_count` disagrees with the configured
-    /// value. This is the S1-E6 refusal (ADR-0050 section 5): a `FieldMismatch`
-    /// naming the record, tenant, signal, expected, and actual.
-    #[error(
-        "provisioning record {key:?} for tenant {tenant_hash} signal {signal} records \
-         shard_count {actual}, but this process is configured for {expected}: refusing to resolve \
-         over a subset of shards (ADR-0050 section 5, S1-E6)"
-    )]
-    ShardCountMismatch {
-        key: String,
-        tenant_hash: String,
-        signal: &'static str,
-        expected: u32,
-        actual: u32,
     },
     /// Pre-ADR data has a shard index at or above the configured count, so the
     /// configured value is provably hiding data. Adoption writes nothing and
@@ -275,6 +338,12 @@ pub enum GenerationDefect {
     AdjacentEqualCount,
     /// A generation's `shard_count` is outside `1..=10000`.
     CountOutOfRange,
+    /// `generations[0].activation_hour` is not 0. Every routing helper
+    /// (`active_shard_count`, `scan_count`, `max_scan_count_over_range`,
+    /// `shard_ceiling`) assumes generation 0 activates at hour 0 and so covers
+    /// every hour back to the epoch; a nonzero first activation leaves the
+    /// hours before it with no covering generation.
+    FirstActivationNonzero,
 }
 
 impl std::fmt::Display for GenerationDefect {
@@ -291,6 +360,7 @@ impl std::fmt::Display for GenerationDefect {
                 "adjacent generations have equal shard_count (a no-op reshard)"
             }
             GenerationDefect::CountOutOfRange => "a generation shard_count is outside 1..=10000",
+            GenerationDefect::FirstActivationNonzero => "generations[0].activation_hour is not 0",
         };
         f.write_str(s)
     }
@@ -575,6 +645,55 @@ pub fn max_scan_count_over_range(
     }
 }
 
+/// The scan-set width a reader must use over `[start_hour, end_hour]` for
+/// `signal`: [`max_scan_count_over_range`] floored at the signal's
+/// writer-pinned shard count (ADR-1101 decision 2).
+///
+/// Alerts and audit writers pin fixed shard indices by constant
+/// (`ALERT_SHARD`, `AUDIT_HOLD_SHARD`, `QUERY_AUDIT_SHARD`) instead of hashing
+/// a series into `0..shard_count`, and neither signal is ever provisioned, so
+/// both resolve through the implicit generation 0 at the process
+/// `shard_count`. Without the floor a `--shards 1` deployment derives a scan
+/// set of shard 0 alone and silently omits every record the query-audit writer
+/// pinned to shard 1. The floor is a floor, never a cap: a wider generation
+/// history or a larger configured `shard_count` still wins.
+///
+/// This is the ONLY function the catalog's over-a-range scan-set derivations
+/// may call. Calling [`max_scan_count_over_range`] directly from a read path
+/// reintroduces the silent miss, and having each derivation apply its own
+/// floor lets them disagree about how wide the fan-out is; the crossover
+/// decision and the path it selects must agree exactly.
+/// [`scan_shards_for_hour`] is the per-hour sibling.
+pub fn scan_shards_over_range(
+    signal: Signal,
+    generations: &[ShardGeneration],
+    start_hour: u32,
+    end_hour: u32,
+    slack_hours: u32,
+) -> u32 {
+    max_scan_count_over_range(generations, start_hour, end_hour, slack_hours)
+        .max(signal.fixed_read_shards())
+}
+
+/// The scan-set width a reader must use for the single ingest-hour bucket
+/// `hour` for `signal`: [`scan_count`] floored at the signal's writer-pinned
+/// shard count, the per-hour sibling of [`scan_shards_over_range`] and the
+/// same floor for the same reason (ADR-1101 decision 2).
+///
+/// The over-a-range bound and this per-hour bound are two halves of one rule:
+/// a per-shard LIST cannot vary its bound per hour, so it lists up to the
+/// range max and each listed bucket is then re-checked against its own hour.
+/// A floored range bound with an unfloored per-hour check lists the pinned
+/// shard and then discards it, which is the silent miss again one step later.
+pub fn scan_shards_for_hour(
+    signal: Signal,
+    generations: &[ShardGeneration],
+    hour: u32,
+    slack_hours: u32,
+) -> u32 {
+    scan_count(generations, hour, slack_hours).max(signal.fixed_read_shards())
+}
+
 /// The generation that *unambiguously* owns ingest-hour bucket `hour`, or
 /// `None` when more than one generation's shards can hold that hour's data
 /// (ADR-0103 decision 1(b)). The generation-identity sibling of [`scan_count`]:
@@ -740,6 +859,8 @@ pub fn read_generations(
             if g.shard_count == prev.shard_count {
                 return Err(corrupt(GenerationDefect::AdjacentEqualCount));
             }
+        } else if g.activation_hour != 0 {
+            return Err(corrupt(GenerationDefect::FirstActivationNonzero));
         }
         out.push(ShardGeneration {
             generation: g.generation,
@@ -749,6 +870,54 @@ pub fn read_generations(
         });
     }
     Ok(out)
+}
+
+/// Classify a record's declared `format_version` against a closed supported
+/// read interval `min_read_version..=max_read_version` (ADR-0066 decision 4).
+/// The one gate every reader of this record goes through.
+///
+/// Below the floor and above the ceiling are separate errors because the
+/// remediation is opposite: an above-ceiling record needs a newer binary, a
+/// below-floor record needs the record migrated and would not be helped by any
+/// upgrade.
+///
+/// The bounds are parameters rather than direct reads of the two constants so a
+/// test can instantiate the gate another release of this code carries. Under
+/// readers-before-writers sequencing two adjacent releases hold different bounds
+/// over this same gate, and reproducing an older binary's refusal is exactly
+/// what proves the version bump fails closed instead of stripping fields.
+fn check_read_version(
+    format_version: u32,
+    min_read_version: u32,
+    max_read_version: u32,
+    key: &str,
+) -> Result<(), ProvisioningError> {
+    if format_version < min_read_version {
+        return Err(ProvisioningError::VersionBelowFloor {
+            key: key.to_string(),
+            got: format_version,
+            floor: min_read_version,
+        });
+    }
+    if format_version > max_read_version {
+        return Err(ProvisioningError::UnsupportedVersion {
+            key: key.to_string(),
+            got: format_version,
+            ceiling: max_read_version,
+        });
+    }
+    Ok(())
+}
+
+/// [`check_read_version`] at this build's own bounds, the form every production
+/// reader calls.
+fn check_supported_version(format_version: u32, key: &str) -> Result<(), ProvisioningError> {
+    check_read_version(
+        format_version,
+        PROVISIONING_MIN_READ_VERSION,
+        PROVISIONING_MAX_READ_VERSION,
+        key,
+    )
 }
 
 /// [`read_generations`], plus the same format-version and (tenant, signal)
@@ -766,12 +935,7 @@ pub fn read_generations_checked(
     tenant_hash: &TenantHash,
     signal: Signal,
 ) -> Result<Vec<ShardGeneration>, ProvisioningError> {
-    if record.format_version > PROVISIONING_FORMAT_VERSION {
-        return Err(ProvisioningError::UnsupportedVersion {
-            key: key.to_string(),
-            got: record.format_version,
-        });
-    }
+    check_supported_version(record.format_version, key)?;
     if record.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
         return Err(ProvisioningError::CorruptRecord {
             key: key.to_string(),
@@ -838,12 +1002,43 @@ impl ProvisioningError {
     }
 }
 
-/// What [`validate_or_adopt`] did. Every variant is a success; a disagreement
-/// is a [`ProvisioningError`], never a variant here.
+/// Count of provisioning validations that observed a present, decodable record
+/// whose generation-0 `shard_count` differs from this process's live configured
+/// default (ADR-0082). Such drift is tolerated, not fatal: routing uses the
+/// record's own shard-generation history via [`active_shard_count`] /
+/// [`scan_count`], independent of the live default, so a lowered fleet-wide
+/// `--shards` no longer refuses an already-provisioned tenant. The counter keeps
+/// the drift observable; ravel-server renders it as
+/// `ravel_provisioning_shard_count_drift_total`, distinct from the
+/// corruption-only `ravel_provisioning_shard_count_mismatch_total`.
+/// Process-global, single source, no labels.
+static SHARD_COUNT_DRIFTS: AtomicU64 = AtomicU64::new(0);
+
+/// `(tenant, signal)` pairs whose drift has already been logged once. The
+/// maintenance tick re-validates every signal on every tick (ADR-0050 section
+/// 5), so an unguarded log line would repeat forever for a tenant that is
+/// simply running below or above the live default. [`SHARD_COUNT_DRIFTS`]
+/// still increments on every validation; only the log line is deduplicated.
+static SHARD_COUNT_DRIFT_LOGGED: Mutex<Option<HashSet<(TenantHash, Signal)>>> = Mutex::new(None);
+
+/// The process-global shard-count drift count for the `/metrics` renderer
+/// (ADR-0082). See [`SHARD_COUNT_DRIFTS`].
+pub fn shard_count_drift_count() -> u64 {
+    SHARD_COUNT_DRIFTS.load(Ordering::Relaxed)
+}
+
+/// What [`validate_or_adopt`] did. Every variant is a success; a genuinely
+/// corrupt or undecodable record is a [`ProvisioningError`], never a variant
+/// here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvisioningCheck {
-    /// A record was present and its `shard_count` matched the configured value.
-    Matched,
+    /// A record was present and decoded successfully. Its generation-0
+    /// `shard_count` is `recorded_shard_count`; this is no longer required to
+    /// equal the live configured default (ADR-0082). Routing uses the record's
+    /// own generation history regardless of the live `--shards` value, so a
+    /// difference is drift: tolerated, logged at info, and counted in
+    /// [`shard_count_drift_count`], never a refusal.
+    RecordPresent { recorded_shard_count: u32 },
     /// No record and no shard data: a fresh (tenant, signal). Nothing was
     /// written (the caller passed [`AbsentPolicy::AdoptIfData`]); the record is
     /// created on the tenant's first actual write. This is the fresh-tenant,
@@ -856,10 +1051,11 @@ pub enum ProvisioningCheck {
 }
 
 /// What [`validate_or_adopt`] is allowed to write when no record exists. Every
-/// policy validates a *present* record identically and refuses on a
-/// `shard_count` mismatch; they differ only in what happens when the record is
-/// absent (ADR-0050 section 5 lists ingest and maintenance as adopters, and the
-/// read path as write-free).
+/// policy validates a *present* record identically (accepting it regardless of
+/// how its generation-0 `shard_count` compares to the configured value under
+/// ADR-0082, and failing closed only on a corrupt or undecodable record); they
+/// differ only in what happens when the record is absent (ADR-0050 section 5
+/// lists ingest and maintenance as adopters, and the read path as write-free).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbsentPolicy {
     /// Write the record from config on a fresh (tenant, signal), and adopt
@@ -968,8 +1164,9 @@ pub(crate) async fn read_generations_accounted(
 
 /// The read-path ([`AbsentPolicy::CheckOnly`]) branch of [`validate_or_adopt`]
 /// over an [`AccountedRecordGet`], for the catalog resolve path (issue #729). It
-/// validates a present record's `shard_count` and generation history exactly as
-/// [`validate_or_adopt`] does under `CheckOnly`, returns
+/// validates a present record (accepting a drifted generation-0 `shard_count`
+/// under ADR-0082, failing closed only on corruption) and its generation history
+/// exactly as [`validate_or_adopt`] does under `CheckOnly`, returns
 /// [`ProvisioningCheck::FreshNoData`] when the record is absent, and never
 /// writes or lists (a query-only node may hold write-restricted credentials).
 /// The sole difference from `validate_or_adopt(.., CheckOnly)` is that the
@@ -984,15 +1181,20 @@ pub(crate) async fn validate_check_only_accounted(
     let key = provisioning_key(tenant_hash, signal);
     if let Some(record) = read_record_accounted(getter, &key).await? {
         validate_record(&record, &key, tenant_hash, signal, shard_count)?;
-        return Ok(ProvisioningCheck::Matched);
+        return Ok(ProvisioningCheck::RecordPresent {
+            recorded_shard_count: record.shard_count,
+        });
     }
     Ok(ProvisioningCheck::FreshNoData)
 }
 
-/// Validate a decoded record against the (tenant, signal) it was read under and
-/// the configured `shard_count`. A version, tenant_hash, or signal disagreement
-/// is a corrupt/misfiled record; a `shard_count` disagreement is the S1-E6
-/// mismatch.
+/// Validate a decoded record against the (tenant, signal) it was read under.
+/// A version, tenant_hash, or signal disagreement is a corrupt/misfiled record
+/// and fails closed; a corrupt shard-generation history fails closed too. The
+/// record's generation-0 `shard_count` is no longer required to equal the
+/// configured value (ADR-0082): a difference is drift, logged and counted here
+/// but not an error, because routing uses the record's own generation history
+/// (`active_shard_count` / `scan_count`), not this comparison.
 fn validate_record(
     record: &sysproto::ProvisioningRecord,
     key: &str,
@@ -1000,12 +1202,7 @@ fn validate_record(
     signal: Signal,
     shard_count: u32,
 ) -> Result<(), ProvisioningError> {
-    if record.format_version > PROVISIONING_FORMAT_VERSION {
-        return Err(ProvisioningError::UnsupportedVersion {
-            key: key.to_string(),
-            got: record.format_version,
-        });
-    }
+    check_supported_version(record.format_version, key)?;
     if record.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
         return Err(ProvisioningError::CorruptRecord {
             key: key.to_string(),
@@ -1022,22 +1219,40 @@ fn validate_record(
             actual: format!("{}", record.signal),
         });
     }
-    if record.shard_count != shard_count {
-        return Err(ProvisioningError::ShardCountMismatch {
-            key: key.to_string(),
-            tenant_hash: tenant_hash.to_hex(),
-            signal: signal.key_prefix(),
-            expected: shard_count,
-            actual: record.shard_count,
-        });
-    }
-    // The scalar `shard_count` is generation 0's count and the configured value
-    // still equals it (a reshard never touches gen 0). But the append-only
-    // generation history (ADR-0052 section 1) must also be structurally sound on
-    // every touch: a corrupt history could route or scan over the wrong shard
-    // set. Validate it here so any consumer fails closed, exactly as it does on
-    // a `shard_count` disagreement.
+    let drifted = record.shard_count != shard_count;
+    // The append-only generation history (ADR-0052 section 1) must still be
+    // structurally sound on every touch: a corrupt history could route or scan
+    // over the wrong shard set. Validate it here so any consumer fails closed on
+    // corruption, before the drift counter (below) trusts this record as a
+    // rejected-but-countable case rather than an unusable one.
     read_generations(record, key)?;
+    if drifted {
+        // ADR-0082: drift is tolerated, not fatal. The live `--shards` default
+        // is a default for new tenants; an already-provisioned tenant keeps
+        // routing at its own generation history (`active_shard_count` /
+        // `scan_count`), which never consults this scalar against the live
+        // config. Keep the drift observable so an operator can still see which
+        // tenants run below or above today's default.
+        SHARD_COUNT_DRIFTS.fetch_add(1, Ordering::Relaxed);
+        let first_time_seeing_this_drift = {
+            let mut logged = SHARD_COUNT_DRIFT_LOGGED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            logged
+                .get_or_insert_with(HashSet::new)
+                .insert((*tenant_hash, signal))
+        };
+        if first_time_seeing_this_drift {
+            tracing::info!(
+                tenant_hash = %tenant_hash.to_hex(),
+                signal = signal.key_prefix(),
+                recorded_shard_count = record.shard_count,
+                live_shards_default = shard_count,
+                "provisioning record shard_count differs from the live --shards default; \
+                 tolerated, routing uses the record's own generation history (ADR-0082)"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1109,9 +1324,11 @@ fn build_record(
 }
 
 /// Write the record with `CreateIfAbsent`. A racing loser (`AlreadyExists`)
-/// re-reads the winner's record and validates the configured value against it,
-/// so a race can never let an incompatible `shard_count` through (ADR-0050
-/// section 5, mirroring the `sys/tenancy` write_marker race handling).
+/// re-reads the winner's record and validates it (accepting a drifted
+/// generation-0 `shard_count` under ADR-0082, failing closed only on a corrupt
+/// record), so the winner's record wins — the correct record-wins semantics of a
+/// mid-rolling-upgrade race (ADR-0050 section 5, mirroring the `sys/tenancy`
+/// write_marker race handling).
 async fn write_record_race_safe(
     store: &dyn ObjectStoreBackend,
     key: &str,
@@ -1140,7 +1357,9 @@ async fn write_record_race_safe(
                 ProvisioningError::store(key, StoreError::NotFound)
             })?;
             validate_record(&winner, key, tenant_hash, signal, shard_count)?;
-            Ok(ProvisioningCheck::Matched)
+            Ok(ProvisioningCheck::RecordPresent {
+                recorded_shard_count: winner.shard_count,
+            })
         }
         Err(err) => Err(ProvisioningError::store(key, err)),
     }
@@ -1163,9 +1382,12 @@ async fn write_record_race_safe(
 ///    `< shard_count`, write the record from config. If any is `>= shard_count`,
 ///    the configured value hides data:
 ///    [`ProvisioningError::AdoptionWouldHideData`], writing nothing.
-/// 3. Record present: compare `shard_count`. Equal is
-///    [`ProvisioningCheck::Matched`]; unequal is
-///    [`ProvisioningError::ShardCountMismatch`]. Identical under every policy.
+/// 3. Record present: accept it. The record's generation-0 `shard_count` is
+///    returned in [`ProvisioningCheck::RecordPresent`]; it is no longer required
+///    to equal the configured value (ADR-0082). A difference is drift, logged
+///    and counted, not an error, because routing uses the record's own
+///    generation history. A corrupt or undecodable record still fails closed.
+///    Identical under every policy.
 pub async fn validate_or_adopt(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -1178,7 +1400,9 @@ pub async fn validate_or_adopt(
 
     if let Some(record) = read_record(store, &key).await? {
         validate_record(&record, &key, tenant_hash, signal, shard_count)?;
-        return Ok(ProvisioningCheck::Matched);
+        return Ok(ProvisioningCheck::RecordPresent {
+            recorded_shard_count: record.shard_count,
+        });
     }
 
     // No record. The read path never writes and never needs to list: pass
@@ -1291,6 +1515,20 @@ pub async fn append_generation(
         Err(err) => return Err(ProvisioningError::store(&key, err)),
     };
 
+    // Rewrite refusal (ADR-0066 decision 5): this appends and writes the record
+    // back whole, re-encoding through this build's field set. A record a newer
+    // writer wrote (version above what this build stamps) may carry a field this
+    // build does not model, which a whole-record rewrite would silently strip. A
+    // read-only path tolerates such a record (up to PROVISIONING_MAX_READ_VERSION);
+    // a rewrite must refuse it. Checked before read_generations_checked, which
+    // accepts the wider read set and so would let a newer record through here.
+    if record.format_version > PROVISIONING_FORMAT_VERSION {
+        return Err(ProvisioningError::RefusingToRewriteNewerRecord {
+            key,
+            got: record.format_version,
+        });
+    }
+
     // Version, misfile, and history-corruption guard, then normalize the
     // existing history (fail closed on any of these) before extending it. A
     // record misfiled under the wrong tenant or signal must never be extended
@@ -1326,8 +1564,12 @@ pub async fn append_generation(
     });
 
     // Persist the full, now-explicit history. The scalar shard_count stays
-    // generation 0's count; every prior generation is carried verbatim.
+    // generation 0's count; every prior generation is carried verbatim. The
+    // stamp is this build's writer version, not the version read: these bytes
+    // are what this build's field set produces, so they must declare it (a
+    // version-1 record rewritten here comes back as version 2).
     let mut new_record = record;
+    new_record.format_version = PROVISIONING_FORMAT_VERSION;
     new_record.generations = history
         .iter()
         .map(|g| sysproto::ShardGeneration {
@@ -1469,12 +1711,7 @@ pub fn read_floors_checked(
     tenant_hash: &TenantHash,
     signal: Signal,
 ) -> Result<Vec<FormatFloor>, ProvisioningError> {
-    if record.format_version > PROVISIONING_FORMAT_VERSION {
-        return Err(ProvisioningError::UnsupportedVersion {
-            key: key.to_string(),
-            got: record.format_version,
-        });
-    }
+    check_supported_version(record.format_version, key)?;
     if record.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
         return Err(ProvisioningError::CorruptRecord {
             key: key.to_string(),
@@ -1606,6 +1843,18 @@ pub async fn raise_format_floor(
         Err(err) => return Err(ProvisioningError::store(&key, err)),
     };
 
+    // Rewrite refusal (ADR-0066 decision 5): raising a floor writes the record
+    // back whole, so a record a newer writer wrote may carry a field this build
+    // does not model that the rewrite would strip. A read-only path tolerates it
+    // (up to PROVISIONING_MAX_READ_VERSION); this rewrite refuses it, before
+    // read_floors_checked lets the wider read set through.
+    if record.format_version > PROVISIONING_FORMAT_VERSION {
+        return Err(ProvisioningError::RefusingToRewriteNewerRecord {
+            key,
+            got: record.format_version,
+        });
+    }
+
     // Version, misfile, and history-corruption guard, then normalize the
     // existing floor history (fail closed on any of these) before extending it.
     let mut floors = read_floors_checked(&record, &key, tenant_hash, signal)?;
@@ -1626,8 +1875,11 @@ pub async fn raise_format_floor(
         raised_by: raised_by.to_string(),
     });
 
-    // Persist the full history. shard_count and generations are carried verbatim.
+    // Persist the full history. shard_count and generations are carried
+    // verbatim; the stamp becomes this build's writer version, same reason as
+    // in `append_generation`.
     let mut new_record = record;
+    new_record.format_version = PROVISIONING_FORMAT_VERSION;
     new_record.format_floors = floors
         .iter()
         .map(|f| sysproto::FormatFloor {
@@ -1661,13 +1913,21 @@ pub async fn raise_format_floor(
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{ObjectStoreBackend, PutMode, PutOptions};
     use std::sync::Arc;
+
+    /// Serializes every test that reads or asserts on the process-global
+    /// [`SHARD_COUNT_DRIFTS`] counter. `cargo test` (unlike nextest) runs a
+    /// binary's tests on threads within one process, so an unguarded
+    /// concurrent increment from another counter-touching test can land
+    /// between a test's `before` read and its `assert_eq!` on the delta.
+    pub(crate) static SHARD_COUNT_DRIFT_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     fn tenant() -> TenantHash {
         TenantHash([0xABu8; 16])
@@ -1807,13 +2067,154 @@ mod tests {
         )
         .await
         .expect("matching record");
-        assert_eq!(out, ProvisioningCheck::Matched);
+        assert_eq!(
+            out,
+            ProvisioningCheck::RecordPresent {
+                recorded_shard_count: 4
+            }
+        );
     }
 
+    /// ADR-0082: a present, decodable record whose generation-0 `shard_count`
+    /// (4) is above the live `--shards` default (2) is accepted, not refused.
+    /// Routing uses the record's own generation history regardless of the live
+    /// default. Before this change `validate_or_adopt` returned
+    /// `ProvisioningError::ShardCountMismatch { expected: 2, actual: 4 }` and the
+    /// `.expect(...)` on the `Ok` value below panicked.
     #[tokio::test]
-    async fn record_present_and_disagreeing_is_shard_count_mismatch() {
+    async fn record_present_above_live_default_is_present_not_refused() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
         let store = mem();
         seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+        let out = validate_or_adopt(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            2,
+            1_000,
+            AbsentPolicy::AdoptIfData,
+        )
+        .await
+        .expect("a record above the live default is tolerated (ADR-0082)");
+        assert_eq!(
+            out,
+            ProvisioningCheck::RecordPresent {
+                recorded_shard_count: 4
+            }
+        );
+    }
+
+    /// ADR-0082 in the other direction: recorded 4, live default 8. Before this
+    /// change this too returned `ProvisioningError::ShardCountMismatch { expected:
+    /// 8, actual: 4 }`; now it is tolerated and returns the present-record check.
+    #[tokio::test]
+    async fn record_present_below_live_default_is_present_not_refused() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
+        let store = mem();
+        seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+        let out = validate_or_adopt(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            8,
+            1_000,
+            AbsentPolicy::AdoptIfData,
+        )
+        .await
+        .expect("a record below the live default is tolerated (ADR-0082)");
+        assert_eq!(
+            out,
+            ProvisioningCheck::RecordPresent {
+                recorded_shard_count: 4
+            }
+        );
+    }
+
+    /// ADR-0082 drift metric: one validation of a drifted record increments the
+    /// drift counter exactly once, and a validation of a matching record
+    /// increments it zero times. The counter is process-global, so this test
+    /// holds [`SHARD_COUNT_DRIFT_TEST_LOCK`] for its whole body to keep its
+    /// exact delta correct under a plain `cargo test` run, where all tests in
+    /// this binary share one process (nextest's process-per-test isolation
+    /// would make the lock unnecessary, but cannot be relied on).
+    #[tokio::test]
+    async fn drift_counter_increments_once_for_drift_zero_for_match() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
+        let store = mem();
+        // Drifted record (recorded 4, live default 2): exactly one increment.
+        seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+        let before = shard_count_drift_count();
+        validate_or_adopt(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            2,
+            1_000,
+            AbsentPolicy::AdoptIfData,
+        )
+        .await
+        .expect("drifted record tolerated");
+        assert_eq!(
+            shard_count_drift_count(),
+            before + 1,
+            "one validation of a drifted record increments the drift counter once"
+        );
+        // Matching record (recorded 4, live default 4): zero further increments.
+        let th2 = TenantHash([0xCDu8; 16]);
+        seed_record(store.as_ref(), &th2, Signal::Metrics, 4).await;
+        validate_or_adopt(
+            store.as_ref(),
+            &th2,
+            Signal::Metrics,
+            4,
+            1_000,
+            AbsentPolicy::AdoptIfData,
+        )
+        .await
+        .expect("matching record");
+        assert_eq!(
+            shard_count_drift_count(),
+            before + 1,
+            "a matching record does not move the drift counter"
+        );
+    }
+
+    /// A record that is both drifted (recorded 4, live default 2) and has a
+    /// corrupt generation history must be rejected as `CorruptGenerations`,
+    /// and the drift counter must not move: a rejected record cannot provide
+    /// routing history, so it must never be counted as a tolerated drift.
+    /// Before the fix (drift counted ahead of `read_generations`), this test's
+    /// `assert_eq!(shard_count_drift_count(), before, ...)` failed because the
+    /// increment at the old call site (this file, formerly directly inside the
+    /// `if record.shard_count != shard_count` block ahead of
+    /// `read_generations(record, key)?`) ran before the corruption was ever
+    /// detected.
+    #[tokio::test]
+    async fn drifted_record_with_corrupt_generations_does_not_count_as_drift() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
+        let store = mem();
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            // ScalarMismatch: generations[0].shard_count (8) != scalar shard_count (4).
+            generations: vec![sysproto::ShardGeneration {
+                generation: 0,
+                shard_count: 8,
+                activation_hour: 0,
+                appended_unix_ns: 0,
+            }],
+            format_floors: Vec::new(),
+        };
+        store
+            .put(&key, record.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed corrupt-generations record");
+
+        let before = shard_count_drift_count();
         let err = validate_or_adopt(
             store.as_ref(),
             &tenant(),
@@ -1823,16 +2224,78 @@ mod tests {
             AbsentPolicy::AdoptIfData,
         )
         .await
-        .expect_err("a lower configured shard_count must refuse");
-        match err {
-            ProvisioningError::ShardCountMismatch {
-                expected, actual, ..
-            } => {
-                assert_eq!(expected, 2);
-                assert_eq!(actual, 4);
-            }
-            other => panic!("wrong error: {other}"),
-        }
+        .expect_err("a corrupt generation history must be rejected, not tolerated as drift");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::CorruptGenerations {
+                    defect: GenerationDefect::ScalarMismatch,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+        assert_eq!(
+            shard_count_drift_count(),
+            before,
+            "a rejected corrupt-generations record must not increment the drift counter"
+        );
+    }
+
+    /// The same drift-counter discipline for the `FirstActivationNonzero`
+    /// defect specifically: a drifted (recorded 4, live default 2) record
+    /// whose generation 0 carries a nonzero `activation_hour` is rejected as
+    /// `CorruptGenerations` before drift is ever counted.
+    #[tokio::test]
+    async fn drifted_record_with_nonzero_first_activation_does_not_count_as_drift() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
+        let store = mem();
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            generations: vec![sysproto::ShardGeneration {
+                generation: 0,
+                shard_count: 4,
+                activation_hour: 1,
+                appended_unix_ns: 0,
+            }],
+            format_floors: Vec::new(),
+        };
+        store
+            .put(&key, record.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed generation-0-nonzero-activation record");
+
+        let before = shard_count_drift_count();
+        let err = validate_or_adopt(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            2,
+            1_000,
+            AbsentPolicy::AdoptIfData,
+        )
+        .await
+        .expect_err("generation 0 at a nonzero activation_hour must be rejected, not tolerated");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::CorruptGenerations {
+                    defect: GenerationDefect::FirstActivationNonzero,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+        assert_eq!(
+            shard_count_drift_count(),
+            before,
+            "a rejected generation-0-nonzero-activation record must not increment the drift counter"
+        );
     }
 
     #[tokio::test]
@@ -1967,7 +2430,10 @@ mod tests {
         let store = mem();
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let mut record = build_record(&tenant(), Signal::Metrics, 4, 1_000);
-        record.format_version = PROVISIONING_FORMAT_VERSION + 1;
+        // A version past the supported read set (3, above PROVISIONING_MAX_READ_VERSION
+        // = 2). Version 2 is now inside the read set and is accepted on the read
+        // path (see reader_accepts_version_one_and_two_and_refuses_zero_and_three).
+        record.format_version = PROVISIONING_MAX_READ_VERSION + 1;
         store
             .put(&key, record.encode_to_vec().into(), PutOptions::default())
             .await
@@ -2015,7 +2481,12 @@ mod tests {
         )
         .await
         .expect("race loser re-reads and validates against the winner");
-        assert_eq!(out, ProvisioningCheck::Matched);
+        assert_eq!(
+            out,
+            ProvisioningCheck::RecordPresent {
+                recorded_shard_count: 4
+            }
+        );
         assert_eq!(
             store.fault_count(Op::Get, ravel_object_store::fault::FaultKind::NotFoundBlip),
             1,
@@ -2023,11 +2494,14 @@ mod tests {
         );
     }
 
-    /// Same race, but the loser's configured shard_count disagrees with the
-    /// winner's record: the re-read surfaces the mismatch rather than silently
-    /// accepting either value.
+    /// Same race, but the loser's live `--shards` default (2) differs from the
+    /// winner's recorded generation-0 count (4). Under ADR-0082 that drift is
+    /// tolerated: the re-read validates and returns the present-record check.
+    /// Before this change it returned `ProvisioningError::ShardCountMismatch` and
+    /// the `.expect(...)` on the `Ok` value below panicked.
     #[tokio::test]
-    async fn create_if_absent_race_loser_surfaces_mismatch() {
+    async fn create_if_absent_race_loser_accepts_winner_on_drift() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
         let inner = MemoryStore::new();
         let th = tenant();
         seed_record(&inner, &th, Signal::Metrics, 4).await;
@@ -2038,7 +2512,7 @@ mod tests {
         );
         let store = FaultStore::new(inner, plan);
 
-        let err = validate_or_adopt(
+        let out = validate_or_adopt(
             &store,
             &th,
             Signal::Metrics,
@@ -2047,8 +2521,13 @@ mod tests {
             AbsentPolicy::CreateFromConfig,
         )
         .await
-        .expect_err("a race loser configured for a different shard_count must refuse");
-        assert!(matches!(err, ProvisioningError::ShardCountMismatch { .. }));
+        .expect("a race loser tolerates drift and accepts the winner (ADR-0082)");
+        assert_eq!(
+            out,
+            ProvisioningCheck::RecordPresent {
+                recorded_shard_count: 4
+            }
+        );
         assert_eq!(
             store.fault_count(Op::Get, ravel_object_store::fault::FaultKind::NotFoundBlip),
             1
@@ -2577,6 +3056,78 @@ mod tests {
         );
     }
 
+    /// The alerts and audit floor (ADR-1101 decision 2) raises a narrower
+    /// generation history and never caps a wider one.
+    ///
+    /// FLIP (pre-fix demonstration): make `Signal::fixed_read_shards` return
+    /// `0` for `Signal::Audit` (crates/ravel-types/src/lib.rs, the
+    /// `Signal::Audit => 2` arm). The `shard_count` 1 audit assertion then
+    /// reads 1 instead of 2.
+    #[test]
+    fn scan_shards_over_range_floors_at_the_signals_fixed_read_shards() {
+        // A single implicit generation at the process `shard_count`, exactly
+        // what `read_scan_generations` returns for an unprovisioned signal.
+        let narrow = [sg(0, 1, 0)];
+        assert_eq!(
+            scan_shards_over_range(Signal::Audit, &narrow, 0, 1_000, DEFAULT_SCAN_SLACK_HOURS),
+            2,
+            "audit pins shards 0 and 1, so a --shards 1 reader must scan both"
+        );
+        assert_eq!(
+            scan_shards_over_range(Signal::Alerts, &narrow, 0, 1_000, DEFAULT_SCAN_SLACK_HOURS),
+            1
+        );
+        assert_eq!(
+            scan_shards_over_range(Signal::Logs, &narrow, 0, 1_000, DEFAULT_SCAN_SLACK_HOURS),
+            1,
+            "no pinned writers: the history alone decides"
+        );
+        assert_eq!(
+            scan_shards_over_range(Signal::Metrics, &narrow, 0, 1_000, DEFAULT_SCAN_SLACK_HOURS),
+            1
+        );
+
+        // A floor, never a cap: every signal takes the wider history.
+        let wide = [sg(0, 4, 0)];
+        for signal in [Signal::Audit, Signal::Alerts, Signal::Logs, Signal::Metrics] {
+            assert_eq!(
+                scan_shards_over_range(signal, &wide, 0, 1_000, DEFAULT_SCAN_SLACK_HOURS),
+                4,
+                "signal {signal:?} takes the history's wider count, not the floor"
+            );
+        }
+    }
+
+    /// The per-hour sibling floors identically, so the union LIST bound and
+    /// the per-hour re-check in `list_window_bounded` cannot disagree about a
+    /// pinned shard.
+    ///
+    /// FLIP (pre-fix demonstration): the same `Signal::Audit => 2` arm; the
+    /// `shard_count` 1 audit assertion then reads 1.
+    #[test]
+    fn scan_shards_for_hour_floors_at_the_signals_fixed_read_shards() {
+        let narrow = [sg(0, 1, 0)];
+        assert_eq!(
+            scan_shards_for_hour(Signal::Audit, &narrow, 500_000, DEFAULT_SCAN_SLACK_HOURS),
+            2
+        );
+        assert_eq!(
+            scan_shards_for_hour(Signal::Alerts, &narrow, 500_000, DEFAULT_SCAN_SLACK_HOURS),
+            1
+        );
+        assert_eq!(
+            scan_shards_for_hour(Signal::Logs, &narrow, 500_000, DEFAULT_SCAN_SLACK_HOURS),
+            1
+        );
+
+        let wide = [sg(0, 4, 0)];
+        assert_eq!(
+            scan_shards_for_hour(Signal::Audit, &wide, 500_000, DEFAULT_SCAN_SLACK_HOURS),
+            4,
+            "floor, not cap"
+        );
+    }
+
     /// `max_scan_count_over_range`: a single implicit generation scans its
     /// whole count for any range.
     #[test]
@@ -2764,13 +3315,79 @@ mod tests {
         ));
     }
 
-    /// [`read_generations_checked`] refuses a record from a future format
-    /// version before ever trusting its generation history, matching the guard
-    /// [`validate_record`] already applies on the [`validate_or_adopt`] path.
+    /// An explicit generation 0 with a nonzero `activation_hour` is refused.
+    /// Every routing helper (`active_shard_count`, `scan_count`,
+    /// `max_scan_count_over_range`, `shard_ceiling`) is documented and relies
+    /// on generation 0 covering every hour back to the epoch; a record that
+    /// skips this check would be returned as a validated history to those
+    /// helpers with that assumption already false.
+    #[test]
+    fn read_generations_rejects_generation_zero_nonzero_activation() {
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            generations: vec![sysproto::ShardGeneration {
+                generation: 0,
+                shard_count: 4,
+                activation_hour: 1,
+                appended_unix_ns: 0,
+            }],
+            format_floors: Vec::new(),
+        };
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let err = read_generations(&record, &key)
+            .expect_err("generation 0 at a nonzero activation_hour must be refused");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::CorruptGenerations {
+                    defect: GenerationDefect::FirstActivationNonzero,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// The well-formed counterpart to the test above: generation 0 at
+    /// `activation_hour` 0 is accepted unchanged.
+    #[test]
+    fn read_generations_accepts_generation_zero_at_hour_zero() {
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            generations: vec![sysproto::ShardGeneration {
+                generation: 0,
+                shard_count: 4,
+                activation_hour: 0,
+                appended_unix_ns: 0,
+            }],
+            format_floors: Vec::new(),
+        };
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let gens = read_generations(&record, &key)
+            .expect("generation 0 at activation_hour 0 is well-formed");
+        assert_eq!(gens.len(), 1);
+        assert_eq!(gens[0].generation, 0);
+        assert_eq!(gens[0].shard_count, 4);
+        assert_eq!(gens[0].activation_hour, 0);
+    }
+
+    /// [`read_generations_checked`] refuses a record past the supported read set
+    /// (version 3, above PROVISIONING_MAX_READ_VERSION) before ever trusting its
+    /// generation history, matching the guard [`validate_record`] applies on the
+    /// [`validate_or_adopt`] path. Version 2 is inside the set and is accepted
+    /// (see reader_accepts_version_one_and_two_and_refuses_zero_and_three).
     #[test]
     fn read_generations_checked_rejects_future_format_version() {
         let record = sysproto::ProvisioningRecord {
-            format_version: PROVISIONING_FORMAT_VERSION + 1,
+            format_version: PROVISIONING_MAX_READ_VERSION + 1,
             tenant_hash: tenant().0.to_vec(),
             signal: sysproto::Signal::Metrics as i32,
             shard_count: 4,
@@ -3486,9 +4103,10 @@ mod tests {
         );
     }
 
-    /// A record built at first write carries no floors, and its bytes are
-    /// unchanged by this field (additive: the empty list is omitted on encode),
-    /// so a pre-EM reader is unaffected.
+    /// A record built at first write carries no floors, and the floor field adds
+    /// no bytes to it (additive: the empty list is omitted on encode). What a
+    /// pre-EM reader now refuses on is the version stamp alone, deliberately
+    /// (ADR-0066 R2), not the presence of field 7.
     #[test]
     fn built_record_has_no_floors_and_is_byte_compatible() {
         let built = build_record(&tenant(), Signal::Metrics, 4, 1_234);
@@ -3496,9 +4114,499 @@ mod tests {
             built.format_floors.is_empty(),
             "a freshly built record carries no floors"
         );
+        // ADR-0066 R2: the writer stamps 2, the ceiling R1 shipped a release
+        // earlier. The read set is unchanged at {1, 2}.
+        assert_eq!(built.format_version, 2, "writer stamps version 2 (R2)");
+        assert_eq!(PROVISIONING_FORMAT_VERSION, 2);
+        assert_eq!(PROVISIONING_MIN_READ_VERSION, 1);
+        assert_eq!(PROVISIONING_MAX_READ_VERSION, 2);
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let floors = read_floors(&built, &key).expect("empty floor history is valid");
         assert!(floors.is_empty(), "empty history reads as no floors");
         assert_eq!(current_floor(&floors, RSEG), None);
+    }
+
+    // ---- ADR-0066: reader supported set {1, 2}, rewrite refuses newer ----
+
+    /// A record shaped exactly like one a newer writer would persist: generation
+    /// 0's implicit count plus a raised format floor in field 7, stamped at
+    /// `version`. `raised_unix_ns`/`raised_by` are pinned so the encoded bytes
+    /// are deterministic for the exact-bytes preservation checks.
+    fn record_with_floor_at_version(version: u32) -> sysproto::ProvisioningRecord {
+        sysproto::ProvisioningRecord {
+            format_version: version,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 1_000,
+            generations: Vec::new(),
+            format_floors: vec![sysproto::FormatFloor {
+                family: "rseg".to_string(),
+                floor_version: 6,
+                raised_unix_ns: 2_000,
+                raised_by: "migrate".to_string(),
+            }],
+        }
+    }
+
+    /// The read-side supported set is exactly {1, 2}, a closed set with a floor
+    /// and a ceiling: a version-1 and a version-2 record are both accepted at
+    /// every reader gate (validate_or_adopt's validate_record,
+    /// read_generations_checked, read_floors_checked), while both a version-0
+    /// record (below the floor: an unstamped record from a writer that never set
+    /// format_version) and a version-3 record (above the ceiling) are refused at
+    /// each, with the two refusals carrying DIFFERENT typed errors:
+    /// VersionBelowFloor and UnsupportedVersion. Pins ADR-0066 decision 4's
+    /// supported set for the three provisioning reader sites, and the split
+    /// diagnostic an operator reads off them.
+    #[tokio::test]
+    async fn reader_accepts_version_one_and_two_and_refuses_zero_and_three() {
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+
+        for version in [1u32, 2u32] {
+            let mut record = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+            record.format_version = version;
+
+            // read_generations_checked (site 1) accepts it.
+            read_generations_checked(&record, &key, &tenant(), Signal::Metrics)
+                .unwrap_or_else(|e| panic!("version {version} must be read-accepted: {e}"));
+            // read_floors_checked (site 3) accepts it.
+            read_floors_checked(&record, &key, &tenant(), Signal::Metrics)
+                .unwrap_or_else(|e| panic!("version {version} floors must be accepted: {e}"));
+
+            // validate_record via validate_or_adopt's CheckOnly path (site 2).
+            let store = mem();
+            store
+                .put(&key, record.encode_to_vec().into(), PutOptions::default())
+                .await
+                .expect("seed record");
+            validate_or_adopt(
+                store.as_ref(),
+                &tenant(),
+                Signal::Metrics,
+                4,
+                1_000,
+                AbsentPolicy::CheckOnly,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("version {version} must pass validate_record: {e}"));
+        }
+
+        // Version 3 (one past the read set) is refused at each gate.
+        let mut v3 = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        v3.format_version = 3;
+        assert!(
+            matches!(
+                read_generations_checked(&v3, &key, &tenant(), Signal::Metrics),
+                Err(ProvisioningError::UnsupportedVersion {
+                    got: 3,
+                    ceiling: 2,
+                    ..
+                })
+            ),
+            "read_generations_checked must refuse version 3"
+        );
+        assert!(
+            matches!(
+                read_floors_checked(&v3, &key, &tenant(), Signal::Metrics),
+                Err(ProvisioningError::UnsupportedVersion {
+                    got: 3,
+                    ceiling: 2,
+                    ..
+                })
+            ),
+            "read_floors_checked must refuse version 3"
+        );
+        let store = mem();
+        store
+            .put(&key, v3.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed v3");
+        assert!(
+            matches!(
+                validate_or_adopt(
+                    store.as_ref(),
+                    &tenant(),
+                    Signal::Metrics,
+                    4,
+                    1_000,
+                    AbsentPolicy::CheckOnly,
+                )
+                .await,
+                Err(ProvisioningError::UnsupportedVersion {
+                    got: 3,
+                    ceiling: 2,
+                    ..
+                })
+            ),
+            "validate_record must refuse version 3"
+        );
+
+        // Version 0 (below the floor: an unstamped record from a writer that
+        // never set format_version) is refused at each gate, and with the
+        // below-floor error rather than the ceiling's: an operator who upgrades
+        // on reading "a newer writer produced it" learns nothing here, the
+        // record itself is the problem. A supported set has a floor as well as a
+        // ceiling: admitting version 0 would let a valid-shaped but unstamped
+        // record enter shard routing and later be rewritten by a CAS path.
+        let mut v0 = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        v0.format_version = 0;
+        assert!(
+            matches!(
+                read_generations_checked(&v0, &key, &tenant(), Signal::Metrics),
+                Err(ProvisioningError::VersionBelowFloor {
+                    got: 0,
+                    floor: 1,
+                    ..
+                })
+            ),
+            "read_generations_checked must refuse version 0 as below the floor"
+        );
+        assert!(
+            matches!(
+                read_floors_checked(&v0, &key, &tenant(), Signal::Metrics),
+                Err(ProvisioningError::VersionBelowFloor {
+                    got: 0,
+                    floor: 1,
+                    ..
+                })
+            ),
+            "read_floors_checked must refuse version 0 as below the floor"
+        );
+        let store = mem();
+        store
+            .put(&key, v0.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed v0");
+        assert!(
+            matches!(
+                validate_or_adopt(
+                    store.as_ref(),
+                    &tenant(),
+                    Signal::Metrics,
+                    4,
+                    1_000,
+                    AbsentPolicy::CheckOnly,
+                )
+                .await,
+                Err(ProvisioningError::VersionBelowFloor {
+                    got: 0,
+                    floor: 1,
+                    ..
+                })
+            ),
+            "validate_record must refuse version 0 as below the floor"
+        );
+    }
+
+    /// A record from a writer newer than this build (version 3, above what this
+    /// build stamps) put through the `append_generation` rewrite is REFUSED, not
+    /// stripped: the rewrite re-encodes the whole record through this build's
+    /// field set, which would drop a field that newer writer added. The stored
+    /// bytes must be exactly unchanged after the refusal (no CAS write happened
+    /// at all). The refusal is version-driven, not field-driven: field 7 is one
+    /// this build models, and the record is refused anyway because a version
+    /// above the writer's may carry a field it does not.
+    #[tokio::test]
+    async fn append_generation_preserves_format_floors_written_by_a_newer_writer() {
+        let store = mem();
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let seeded = record_with_floor_at_version(3).encode_to_vec();
+        store
+            .put(&key, seeded.clone().into(), PutOptions::default())
+            .await
+            .expect("seed a version-3 record with a format floor");
+
+        // Reshard append onto a newer record: refused, not stripped.
+        let err = append_generation(store.as_ref(), &tenant(), Signal::Metrics, 8, 1_000_000, 0)
+            .await
+            .expect_err("appending onto a newer record must be refused");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::RefusingToRewriteNewerRecord { got: 3, .. }
+            ),
+            "got: {err}"
+        );
+
+        // Exact-bytes: nothing was written back, the newer record is intact.
+        let after = store.get(&key, GetRange::Full).await.expect("re-read").data;
+        assert_eq!(
+            after.as_ref(),
+            seeded.as_slice(),
+            "the stored version-3 record must be byte-for-byte unchanged"
+        );
+    }
+
+    /// The sibling rewrite path: `raise_format_floor` refuses a record from a
+    /// newer writer too, leaving its bytes exactly unchanged. Sweeps the rule
+    /// across both CAS rewrite paths of this record, not only the one the spec
+    /// named.
+    #[tokio::test]
+    async fn raise_format_floor_refuses_a_record_from_a_newer_writer() {
+        let store = mem();
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let seeded = record_with_floor_at_version(3).encode_to_vec();
+        store
+            .put(&key, seeded.clone().into(), PutOptions::default())
+            .await
+            .expect("seed a version-3 record");
+
+        let err = raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            "rseg",
+            9,
+            "job",
+            3_000,
+        )
+        .await
+        .expect_err("raising a floor on a newer record must be refused");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::RefusingToRewriteNewerRecord { got: 3, .. }
+            ),
+            "got: {err}"
+        );
+
+        let after = store.get(&key, GetRange::Full).await.expect("re-read").data;
+        assert_eq!(
+            after.as_ref(),
+            seeded.as_slice(),
+            "the stored version-3 record must be byte-for-byte unchanged"
+        );
+    }
+
+    /// Decode fails closed with a typed error, never a panic or wrong data, on
+    /// three malformed inputs through the raw-store read path: an unknown
+    /// (too-new) format version, a truncated body, and a corrupted body. Covers
+    /// ADR-0066's "typed error, never a panic" for the provisioning decode gate.
+    #[tokio::test]
+    async fn decode_rejects_truncated_and_corrupt_record() {
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+
+        // 1. Unknown (too-new) version: a well-formed record stamped past the read
+        //    set is a typed UnsupportedVersion, surfaced through the checked read.
+        let mut future = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        future.format_version = PROVISIONING_MAX_READ_VERSION + 1;
+        let store = mem();
+        store
+            .put(&key, future.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed future record");
+        let err = read_generations_from_store(store.as_ref(), &tenant(), Signal::Metrics)
+            .await
+            .expect_err("an unknown version must be a typed error");
+        assert!(
+            matches!(err, ProvisioningError::UnsupportedVersion { got, .. } if got == PROVISIONING_MAX_READ_VERSION + 1),
+            "got: {err}"
+        );
+
+        // 2. Truncated body: a valid record encoding cut in half is a typed Decode
+        //    error, not a panic.
+        let full = build_record(&tenant(), Signal::Metrics, 4, 1_000).encode_to_vec();
+        let truncated = full[..full.len() / 2].to_vec();
+        let store = mem();
+        store
+            .put(&key, truncated.into(), PutOptions::default())
+            .await
+            .expect("seed truncated body");
+        let err = read_generations_from_store(store.as_ref(), &tenant(), Signal::Metrics)
+            .await
+            .expect_err("a truncated body must be a typed error");
+        assert!(
+            matches!(err, ProvisioningError::Decode { .. }),
+            "got: {err}"
+        );
+
+        // 3. Corrupted body: arbitrary garbage bytes are a typed Decode error.
+        let store = mem();
+        store
+            .put(
+                &key,
+                vec![0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x42].into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed garbage body");
+        let err = read_generations_from_store(store.as_ref(), &tenant(), Signal::Metrics)
+            .await
+            .expect_err("a corrupt body must be a typed error");
+        assert!(
+            matches!(err, ProvisioningError::Decode { .. }),
+            "got: {err}"
+        );
+    }
+
+    // ---- ADR-0066 R2: the writer stamps 2 and a pre-R1 binary fails closed ----
+
+    /// Tag byte for field 15, varint wire type: a field number no
+    /// `ProvisioningRecord` this build models uses (1..=7 are taken). Appended to
+    /// an encoded record it is, on the wire, exactly an additive field a newer
+    /// writer added, and prost keeps no unknown fields, so any whole-record
+    /// re-encode through this build's field set drops it. That is the strip
+    /// issue #1300 is about, reproduced without needing a second binary.
+    const UNMODELED_FIELD_TAG: u8 = 15 << 3;
+    const UNMODELED_FIELD_VALUE: u8 = 0x2A;
+
+    fn with_unmodeled_field(mut encoded: Vec<u8>) -> Vec<u8> {
+        encoded.push(UNMODELED_FIELD_TAG);
+        encoded.push(UNMODELED_FIELD_VALUE);
+        encoded
+    }
+
+    /// The read-modify-write a binary predating the first round performs: its
+    /// reader gate is this same shared gate at the pre-R1 bounds (a supported set
+    /// of exactly {1}), and its write re-encodes the decoded view, so any field
+    /// it does not model is gone from the bytes it puts back. Built from the
+    /// shared gate rather than by running a second binary.
+    fn pre_r1_rewrite(stored: &[u8], key: &str) -> Result<Vec<u8>, ProvisioningError> {
+        let record = sysproto::ProvisioningRecord::decode(stored).map_err(|source| {
+            ProvisioningError::Decode {
+                key: key.to_string(),
+                source,
+            }
+        })?;
+        check_read_version(record.format_version, 1, 1, key)?;
+        Ok(record.encode_to_vec())
+    }
+
+    /// The test issue #1300 asks for, for the ProvisioningRecord family. A record
+    /// the current writer produced, carrying a field a version-1 writer never
+    /// emits, is REFUSED by a binary that predates the first round, with the
+    /// above-ceiling error, and the stored bytes are unchanged. The last
+    /// assertion shows the alternative is a real strip: a re-encode that the gate
+    /// had admitted comes back short by exactly that field.
+    ///
+    /// Flip the writer back to stamping 1 and this fails twice over: the stamp
+    /// assertion, and then the refusal, because the old gate accepts a version-1
+    /// record and strips the field.
+    #[tokio::test]
+    async fn a_pre_r1_binary_refuses_a_current_record_instead_of_stripping_it() {
+        let store = mem();
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let seeded = with_unmodeled_field(
+            build_record(&tenant(), Signal::Metrics, 4, 1_000).encode_to_vec(),
+        );
+        store
+            .put(&key, seeded.clone().into(), PutOptions::default())
+            .await
+            .expect("seed a current-writer record carrying an unmodeled field");
+
+        let stored = sysproto::ProvisioningRecord::decode(seeded.as_slice()).expect("decode");
+        assert_eq!(
+            stored.format_version, 2,
+            "the current writer stamps exactly version 2"
+        );
+
+        let err = pre_r1_rewrite(&seeded, &key)
+            .expect_err("a binary predating R1 must refuse this record, not rewrite it");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::UnsupportedVersion {
+                    got: 2,
+                    ceiling: 1,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+
+        // Nothing was written back: the record, unmodeled field included, is
+        // byte-for-byte what the current writer put there.
+        let after = store.get(&key, GetRange::Full).await.expect("re-read").data;
+        assert_eq!(
+            after.as_ref(),
+            seeded.as_slice(),
+            "the refused record must be byte-for-byte unchanged"
+        );
+
+        // And the strip the refusal prevents is real, not hypothetical: the
+        // bytes a whole-record re-encode produces are the seeded bytes minus
+        // exactly the two bytes of the unmodeled field.
+        let re_encoded = sysproto::ProvisioningRecord::decode(seeded.as_slice())
+            .expect("decode")
+            .encode_to_vec();
+        assert_eq!(
+            re_encoded.as_slice(),
+            &seeded[..seeded.len() - 2],
+            "a whole-record re-encode drops the unmodeled field"
+        );
+    }
+
+    /// Every writer of this record stamps 2 on the wire: first write, reshard
+    /// append, floor raise. Asserted on the bytes read back from the store and
+    /// decoded, at the exact value, not on the in-memory struct and not with an
+    /// inequality. The append case starts from a stored version-1 record, so it
+    /// also pins that a rewrite re-stamps rather than carrying the read version
+    /// through.
+    #[tokio::test]
+    async fn every_writer_stamps_version_two_on_the_wire() {
+        /// The `format_version` on the wire at `key`, decoded from the stored
+        /// bytes rather than read off any in-memory struct.
+        async fn stamped(store: &dyn ObjectStoreBackend, key: &str) -> u32 {
+            let bytes = store.get(key, GetRange::Full).await.expect("re-read").data;
+            sysproto::ProvisioningRecord::decode(bytes.as_ref())
+                .expect("decode")
+                .format_version
+        }
+
+        let store = mem();
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+
+        // 1. First write, through validate_or_adopt's create path.
+        validate_or_adopt(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            4,
+            1_000,
+            AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("first write");
+        assert_eq!(
+            stamped(store.as_ref(), &key).await,
+            2,
+            "the first-write path stamps 2"
+        );
+
+        // 2. Reshard append, starting from a stored version-1 record: the
+        //    rewrite re-stamps to this build's writer version.
+        let mut v1 = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        v1.format_version = 1;
+        store
+            .put(&key, v1.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed a version-1 record");
+        append_generation(store.as_ref(), &tenant(), Signal::Metrics, 8, 1_000_000, 0)
+            .await
+            .expect("append onto a version-1 record");
+        assert_eq!(
+            stamped(store.as_ref(), &key).await,
+            2,
+            "the reshard rewrite re-stamps a version-1 record as 2"
+        );
+
+        // 3. Floor raise.
+        raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            "rseg",
+            6,
+            "job",
+            3_000,
+        )
+        .await
+        .expect("raise a floor");
+        assert_eq!(
+            stamped(store.as_ref(), &key).await,
+            2,
+            "the floor-raise rewrite stamps 2"
+        );
     }
 }

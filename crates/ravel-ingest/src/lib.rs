@@ -40,9 +40,9 @@ pub use attribution::{MAX_TRACKED_TENANTS, PUTS_PER_FLUSH, TenantPutAttribution,
 pub use budget::{IngestByteBudget, IngestByteBudgetLimit, IngestByteCharge, IngestByteShed};
 pub use clock::{Clock, SystemClock};
 pub use config::{
-    IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MIN_PLAUSIBLE_INGEST_CLOCK_NS,
-    SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION, STRICT_VISIBILITY_RESERVE_NS,
-    plausible_ingest_clock,
+    IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
+    MIN_PLAUSIBLE_INGEST_CLOCK_NS, SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION,
+    STRICT_VISIBILITY_RESERVE_NS, plausible_ingest_clock,
 };
 pub use error::WriteError;
 pub use generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed};
@@ -64,7 +64,9 @@ pub use metrics_meta_sink::{
     DEFAULT_MAX_CAS_RETRIES, DEFAULT_METADATA_FLUSH_WINDOW, FlushSummary, MetadataSink,
     MetadataSinkConfig, catalog_metric_kind,
 };
-pub use reconcile::{DEFAULT_ADMISSION_RECONCILE_INTERVAL, reconcile_once, snapshot_key};
+pub use reconcile::{
+    DEFAULT_ADMISSION_RECONCILE_INTERVAL, ReconcileCycleStats, reconcile_once, snapshot_key,
+};
 pub use router::{IngestRouter, WriteMode, WriteReceipt};
 pub use span_error::SpanWriteError;
 pub use span_metrics::{SpanIngestMetrics, SpanIngestMetricsSnapshot};

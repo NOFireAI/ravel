@@ -10,7 +10,14 @@ without passing all of them.
 This guide covers what each knob does, its shipped default, and exactly what
 a client sees when it trips one. For the read-side query budgets
 (`max_series`/`max_samples`/`max_segments`), see
-[query.md](query.md#query-budgets); those are a different mechanism.
+[query.md](query.md#query-budgets); those are a different mechanism, and
+several of them are resolved at startup rather than compiled in: unset,
+`--fetch-concurrency` follows the core count, and the two SQL memory ceilings
+and `--cache-max-bytes` follow the host's memory (`MemTotal`, capped by the
+cgroup limit in a container), while `--max-segments` (1,000,000) and the
+engine deadline (11 minutes) are fixed defaults that do not vary with the
+host. Read the resolved values off the startup log, not off a compiled-in
+number.
 
 ## Where limits are configured
 
@@ -114,7 +121,17 @@ points/records/spans and admits the rest through OTLP partial success.
 | Byte rate | request | 429 + `Retry-After` | `RESOURCE_EXHAUSTED` | 429 + `Retry-After` |
 | Series-creation rate | request | 429 + `Retry-After` | `RESOURCE_EXHAUSTED` | 429 + `Retry-After` |
 | Active-series/stream cap | per series | 200 + partial success | OK + partial success | 204, written-count header excludes rejected samples |
+| Data points per request | request | 200 + partial success, whole-request count | OK + partial success | not applicable |
+| Histogram bucket cap | per point | 200 + partial success | OK + partial success | not applicable |
 | Event-time skew | per point | 200 + partial success | OK + partial success | 204, written-count header excludes rejected samples |
+| Informational field drop | per item, costs no item | 200 + partial success, zero count | OTLP: OK + partial success, zero count. OTAP: not reported | not reported (no partial-success message) |
+
+The last row is not an admission limit: it is a field of an admitted item that
+Ravel could not store (a histogram `min`/`max`, an exemplar, an integer past
+2^53, one bad attribute of a log record or span). It appears here because the
+transports answer it differently, and because a zero rejected count with a
+populated `error_message` is easy to mistake for a clean write.
+[ingest.md](ingest.md#zero-count-partial-success) is normative for it.
 
 ### Body size
 
@@ -162,6 +179,27 @@ Prometheus retry or drop the whole batch, including its admitted samples, so
 later. The dropped over-cap series is observable through the per-tenant
 rejection counters.
 
+### Data points per request and the histogram bucket cap
+
+Both are structural bounds in normalization, not deployment knobs: they live
+in `IngestLimits` and no flag or `--limits-file` key configures them.
+[ingest.md](ingest.md#admission-limits) lists them with their defaults.
+
+`max_data_points_per_request` (100,000) is checked against the wire data-point
+count and again against the normalized points those data points expand into,
+because one classic `Histogram` data point explodes into one point per
+explicit bound plus `+Inf`/`_sum`/`_count`. The second check
+rejects the whole request like the first, and both report the rejected total
+in wire data points.
+
+`max_histogram_buckets` (160) bounds the `explicit_bounds` of one classic
+`Histogram` data point and rejects only that data point. It is a memory-safety
+bound: the bound list is the sender's to choose, every bound becomes a series
+carrying its own copy of the point's labels, and the transport body limit
+alone would let one request expand into millions of them. A real exporter
+never meets it, so a deployment that sees this rejection is looking at a
+misconfigured or hostile sender, not at a limit to raise.
+
 ### Event-time skew
 
 Metrics, logs, and spans all enforce event-time skew at admission, through
@@ -202,27 +240,43 @@ loud, attributable rejection spike (honest clients' current timestamps fall
 outside the bad clock's shifted window and are rejected `reason="skew"`)
 instead of silent pollution of the hour-partitioned layout.
 
-## Raising max_ingest_lag: a coordinated change
+## Raising max_ingest_lag to replay old telemetry
 
-`max_ingest_lag` is one shared bound, not a per-signal one, in the sense
-that matters operationally: the three admission checks (metrics, logs, spans)
-and the catalog listing window each hold their own `max_ingest_lag_ns`
-constant, duplicated rather than shared by reference. Maintenance carries a
-startup equality assertion against its own copy, and that assertion plus
-convention is the whole of the enforcement: nothing else keeps the values
-equal, which is exactly why the coordinated-raise rule below exists. The
-admission bound decides what old data is *admitted*;
-the listing window decides what old data is *discoverable*. If you raise the
-admission lag alone, you admit and acknowledge records that the listing
-window can then fail to find on any non-token query.
+`max_ingest_lag` is one shared bound, not a per-signal one: the three
+admission checks (metrics, logs, spans) and the catalog listing window each
+hold their own `max_ingest_lag_ns` constant. The admission bound decides what
+old data is *admitted*; the listing window decides what old data is
+*discoverable*. Admitting records the listing window cannot find loses them
+silently on any non-token query, so the two must move together: widen the
+catalog window first, then the admission bound. Lowering the bound is always
+safe.
 
-Raising the admission lag for a signal or tenant is therefore legal only
-together with the catalog-side listing-window config: widen the catalog
-window first, then the admission bound. Lowering the admission lag is always
-safe. This is the same coordinated-config discipline `max_flush_lifetime`
-follows between writers and folders
-([catalog-and-mvcc.md](../catalog-and-mvcc.md), "Config discipline"); the
-normative statement of this rule lives in
+The `--max-ingest-lag` flag makes that coordinated move a single knob. One
+value drives both the catalog listing window
+(`ravel_catalog::CatalogConfig::max_ingest_lag_ns`) and all three OTLP
+admission bounds
+(`IngestLimits`/`LogIngestLimits`/`SpanIngestLimits::max_ingest_lag_ns`),
+resolved so the window is set first and the admission bound derived from it,
+so the "widen the window first" order holds by construction and the two can
+never be set inconsistently. It defaults to `2h`; omitting it is
+byte-identical to before the flag existed. Set it to replay telemetry older
+than 2h after an outage, or to bulk-import an archive:
+
+```
+ravel-server --max-ingest-lag 720h ...
+```
+
+The change takes effect at startup and reaches every network ingest surface
+at once (OTLP HTTP, OTLP gRPC, OTAP, Remote Write, and the span surface). It
+is a humantime duration (e.g. `2h`, `720h`, `30d`); a zero duration is
+rejected. Startup also refuses a value the catalog listing window cannot
+serve, naming both values, rather than silently admitting data no query can
+find. Because the flag couples the two bounds, the raise still respects the
+`max_flush_lifetime` retention-floor discipline
+([catalog-and-mvcc.md](../catalog-and-mvcc.md), "Config discipline"): a
+`--max-ingest-lag` above the configured retention window fails startup at the
+retention-floor check. The normative statement of the late-data rule
+lives in
 [consistency-model.md](../consistency-model.md#late-and-skewed-data).
 
 ## Fleet-wide enforcement via reconciliation
@@ -303,7 +357,8 @@ The admission controller's per-(tenant, signal) counters are rendered on
 | `ravel_admission_admitted_total` | counter | Requests admitted past the byte-rate layer. |
 | `ravel_admission_admitted_bytes_total` | counter | Bytes charged against the byte-rate layer, which for a compressed request is the decompressed size. |
 | `ravel_ingest_wire_bytes_total` | counter | Request-body bytes as they arrived on the wire. Its ratio to the row above is a tenant's effective compression factor. |
-| `ravel_admission_rejected_total` | counter | Rejections, with a fourth `reason` label: `byte_rate`, `series_rate`, `series_cap`, `clock`. |
+| `ravel_admission_rejected_total` | counter | Rejections, with a fourth `reason` label: `byte_rate`, `series_rate`, `series_cap`, `clock`, `skew`, `structural`. The first four count whole requests or series; `skew` and `structural` count individual points, log records, or spans, matching what the OTLP partial-success response tells the sender. |
+| `ravel_ingest_body_conversions_total` | counter | Log records whose structured body was converted to canonical JSON text at normalization. Not a rejection, and counted before the stream cap and the write, so not a count of stored records. Normative description: [the observability guide](observability.md#reading-the-reason-label). |
 | `ravel_admission_reconciliation_failures_total` | counter | Reconciliation cycles whose sibling-snapshot read failed. The last-known threshold stays in force, so this says fleet-wide accuracy is degrading, not that ingest is down. |
 
 By default every tenant's rows fold into `tenant_hash="other"`, so the family's

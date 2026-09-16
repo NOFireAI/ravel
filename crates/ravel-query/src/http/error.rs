@@ -14,6 +14,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use ravel_catalog::CatalogError;
+use ravel_object_store::StoreError;
 
 use crate::QueryError;
 use crate::fetcher::FetchError;
@@ -35,6 +36,14 @@ pub const MSG_CORRUPT: &str = "stored data failed integrity validation";
 /// the corruption message so a client and operator can tell a retryable
 /// outage apart from a permanent data fault without the leaked detail.
 pub const MSG_UNAVAILABLE: &str = "upstream storage temporarily unavailable";
+
+/// Stable client message for a query whose evidential audit event could not be
+/// made durable (ADR-0062 section 2a). Distinct from [`MSG_UNAVAILABLE`]: the
+/// read itself may have succeeded, and what failed is the audit trail, so an
+/// operator reading a client report can tell the two apart. Every query
+/// surface in the process, HTTP and Flight SQL alike, renders this exact
+/// string, so the wire contract cannot drift between transports.
+pub const MSG_AUDIT_UNAVAILABLE: &str = "query audit is temporarily unavailable; retry";
 
 /// Stable client message for a `min_commit_token` that did not resolve after
 /// the catalog's retry. The token fields come from the caller's own request,
@@ -162,7 +171,23 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
     match err {
         QueryError::Fetch(fetch) => Some(match fetch {
             FetchError::Corrupt { .. } => MSG_CORRUPT,
-            FetchError::Store { .. } | FetchError::EtagChanged { .. } => MSG_UNAVAILABLE,
+            // An RLOG fault reaches this enum as `Store` carrying a
+            // `Corrupted` source, because `FetchError::Corrupt` can only hold
+            // an RSEG `SegmentError`: `engine`'s log-series mapper folds
+            // `LogFetchError::Corrupt` and `CarryMismatch` in that way. Both
+            // are permanent data faults, so they take the corruption class
+            // here rather than the retryable one, which a client would retry
+            // forever against data that cannot change.
+            FetchError::Store {
+                source: StoreError::Corrupted(_),
+                ..
+            } => MSG_CORRUPT,
+            // A memory-budget refusal is transient backpressure carrying only
+            // byte counts, not a storage fault; redacted to the retryable
+            // transient message alongside the other non-corrupt Store causes.
+            FetchError::Store { .. }
+            | FetchError::EtagChanged { .. }
+            | FetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE,
         }),
         // An over-wide-window refusal carries only counts and is
         // safe to show; like the budget errors it is not a storage fault, so
@@ -253,7 +278,7 @@ impl ApiError {
     /// The status, stable `errorType` tag, and message this error renders to.
     /// Extracted so both [`IntoResponse`] and the public
     /// [`QueryErrorResponse`] mapping share one table and cannot drift.
-    fn into_parts(self) -> QueryErrorResponse {
+    pub fn into_parts(self) -> QueryErrorResponse {
         let (status, error_type, message) = match self {
             ApiError::BadData(msg) => (StatusCode::BAD_REQUEST, "bad_data", msg),
             ApiError::Unsupported(msg) => (StatusCode::UNPROCESSABLE_ENTITY, "execution", msg),
@@ -529,6 +554,47 @@ mod tests {
             actual: TENANT_HASH.to_string(),
         });
         assert_eq!(status_code(catalog_mismatch), 500);
+    }
+
+    #[test]
+    fn log_path_corruption_is_500_not_503() {
+        // The local (non-distributed) PromQL log path folds every RLOG fault
+        // through `FetchError::Store`, since `FetchError::Corrupt` can only
+        // carry an RSEG error. Without matching on the `Corrupted` source
+        // these land in the retryable class, so a corrupt object and a carry
+        // paired with the wrong segment would both answer 503 and a client
+        // would retry forever against data that cannot change.
+        let corrupt_rlog = QueryError::Fetch(FetchError::Store {
+            key: LEAKY_KEY.to_string(),
+            source: StoreError::Corrupted("corrupt log segment: bad footer".to_string()),
+        });
+        assert_eq!(status_code(corrupt_rlog), 500);
+
+        let carry_mismatch = QueryError::Fetch(FetchError::Store {
+            key: LEAKY_KEY.to_string(),
+            source: StoreError::Corrupted(
+                crate::log_fetcher::LogFetchError::CarryMismatch {
+                    key: LEAKY_KEY.to_string(),
+                    carried_key: format!("{LEAKY_KEY}.other"),
+                    tenant: ravel_types::TenantHash([1u8; 16]),
+                    carried_tenant: ravel_types::TenantHash([2u8; 16]),
+                }
+                .to_string(),
+            ),
+        });
+        assert_eq!(status_code(carry_mismatch), 500);
+
+        // Still redacted: neither key nor tenant reaches the body.
+        match ApiError::from(QueryError::Fetch(FetchError::Store {
+            key: LEAKY_KEY.to_string(),
+            source: StoreError::Corrupted(LEAKY_KEY.to_string()),
+        })) {
+            ApiError::Corrupt(msg) => {
+                assert_eq!(msg, MSG_CORRUPT);
+                assert!(!msg.contains(LEAKY_KEY), "leaked key: {msg}");
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
     }
 
     #[test]

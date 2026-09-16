@@ -59,7 +59,39 @@ mod imp {
         /// `finish_with_stats` in the spawned flush. `RlogWriter`, not
         /// `SegmentWriter`; it excludes the object-store PUT, which decision 5
         /// measures separately.
+        ///
+        /// [`LogStage::Bloom`] construction happens inside this window: it is
+        /// a nested sub-phase, not a slice cut out of it, so `Encode`'s total
+        /// is unchanged by `Bloom` existing. Summing every [`LogStage`]
+        /// variant's `total_ns` double-counts bloom time for exactly that
+        /// reason.
         Encode,
+        /// Per-block bloom construction inside the RLOG block-write loop
+        /// (issue #1516): each block's `BloomBuilder::new`-through-`finish`
+        /// window in `ravel_logseg::RlogWriter`'s `build_object` /
+        /// `build_object_columnar`, one sample per block. It covers the bloom
+        /// build only, excluding `write_block` / `write_block_columnar`
+        /// (block assembly), POSTINGS term accumulation, and everything else
+        /// those functions do: the figure excludes POSTINGS term
+        /// accumulation, so an indexed tenant is not charged for it here.
+        ///
+        /// `build_object` (row path, driven by `LogIngestRouter::write` and
+        /// so by OTLP ingest) inserts every row's string column once per
+        /// row. `build_object_columnar` (driven by `write_columnar`, and so
+        /// by `ravel-cli load --parquet`) tokenizes a dict-encoded string
+        /// column once per distinct value in the block instead. Both set the
+        /// same bloom bits, but at different insert cost, so a `bloom`
+        /// figure from one path is not comparable to one from the other
+        /// whenever a string column dict-encodes.
+        ///
+        /// This window is INSIDE [`LogStage::Encode`], not subtracted from
+        /// it: `Encode` still times the whole `RlogWriter::push` +
+        /// `finish_with_stats` call, bloom construction included. `Bloom` is
+        /// reported anyway, nested, because a profile (#1511) found bloom
+        /// construction is 61% of `Encode` and the only way to see that
+        /// number before this stage existed was hand-instrumenting two crates
+        /// and reverting the patch afterward.
+        Bloom,
     }
 
     impl LogStage {
@@ -70,6 +102,7 @@ mod imp {
                 LogStage::Route => "route",
                 LogStage::Merge => "merge",
                 LogStage::Encode => "encode",
+                LogStage::Bloom => "bloom",
             }
         }
     }
@@ -101,6 +134,7 @@ mod imp {
         route: StageCell,
         merge: StageCell,
         encode: StageCell,
+        bloom: StageCell,
     }
 
     impl LogStageTimings {
@@ -114,6 +148,7 @@ mod imp {
                 LogStage::Route => &self.route,
                 LogStage::Merge => &self.merge,
                 LogStage::Encode => &self.encode,
+                LogStage::Bloom => &self.bloom,
             }
         }
 
@@ -123,6 +158,20 @@ mod imp {
             let cell = self.cell(stage);
             cell.samples.fetch_add(1, Ordering::Relaxed);
             let ns = u64::try_from(dur.as_nanos()).unwrap_or(u64::MAX);
+            cell.total_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+
+        /// Adds `samples` samples summing to `total` to `stage` in one fold, for
+        /// a caller that already accumulated a count and a sum (for example,
+        /// `WriteStats::bloom_blocks` and `bloom_total_ns`) rather than one
+        /// [`std::time::Instant`] pair per sample. A no-op when `samples` is 0.
+        pub fn record_n(&self, stage: LogStage, samples: u64, total: Duration) {
+            if samples == 0 {
+                return;
+            }
+            let cell = self.cell(stage);
+            cell.samples.fetch_add(samples, Ordering::Relaxed);
+            let ns = u64::try_from(total.as_nanos()).unwrap_or(u64::MAX);
             cell.total_ns.fetch_add(ns, Ordering::Relaxed);
         }
 
@@ -137,6 +186,7 @@ mod imp {
                 LogStage::Route,
                 LogStage::Merge,
                 LogStage::Encode,
+                LogStage::Bloom,
             ] {
                 let cell = self.cell(stage);
                 let samples = cell.samples.load(Ordering::Relaxed);
@@ -409,13 +459,15 @@ mod tests {
     }
 
     /// Drives a real logs write through the router to a flush and asserts the
-    /// wired stage set is EXACTLY {admit, route, merge, encode} -- no missing
-    /// stage, no extra one -- and every stage recorded a nonzero duration.
+    /// wired stage set is EXACTLY {admit, route, merge, encode, bloom} -- no
+    /// missing stage, no extra one -- and every stage recorded a nonzero
+    /// duration.
     ///
     /// The set is pinned exactly on purpose: a "the map is non-empty" assertion
-    /// would still pass with three of the four stages silently unwired, which is
-    /// the failure this test exists to catch (ADR-0104 decision 2 wires four
-    /// logs stages).
+    /// would still pass with several of the five stages silently unwired,
+    /// which is the failure this test exists to catch (ADR-0104 decision 2
+    /// wires the original four logs stages; issue #1516 adds `bloom` as a
+    /// fifth, nested inside `encode`).
     #[cfg(feature = "stage-timing")]
     #[tokio::test]
     async fn logs_pipeline_records_every_wired_stage() {
@@ -451,12 +503,13 @@ mod tests {
             LogStage::Route,
             LogStage::Merge,
             LogStage::Encode,
+            LogStage::Bloom,
         ];
         let recorded: Vec<LogStage> = snap.stages().collect();
         assert_eq!(
             recorded,
             wired.to_vec(),
-            "recorded stage set must be exactly the four wired logs stages, got {:?}",
+            "recorded stage set must be exactly the five wired logs stages, got {:?}",
             recorded.iter().map(|s| s.name()).collect::<Vec<_>>(),
         );
 

@@ -43,9 +43,19 @@ The cache stores byte ranges read from two kinds of objects:
   shape, where the threshold above governs. See the flag table below.
 
 Both PromQL queries and SQL queries over the `samples` table use the
-metric path. SQL queries over the `logs` table use the log path.
+metric path. SQL queries over the `logs`, `alerts` and `audit` tables use the
+log path.
 
-Two things are not cached, for two different reasons:
+Alert transitions and audit records are log objects on their own signal
+prefixes, and the `alerts` and `audit` tables read them through that same log
+fetcher, so their bytes are cached on the same terms as any other log object:
+whole object or block ranges by the same size threshold and fetch policy, keyed
+the same way, accounted through the same funnel, and held by whichever tiers
+the process built: the RAM tier always, plus the local-disk tier when
+`--cache-dir` is set, exactly as for `logs`. Nothing about the cache is
+specific to those two signals.
+
+One thing is not cached:
 
 - **Spans.** The `spans` SQL table is queryable on `POST /api/v1/sql`, but its
   reads are uncached. The span scan fetches each RSPAN segment straight from
@@ -53,10 +63,6 @@ Two things are not cached, for two different reasons:
   and the tenant identity the log path uses to key its cache entries serves
   only as that tenant check here. A repeated span query therefore re-reads the
   same objects. This is the one genuine cache gap.
-- **Alert transitions and audit records.** These are written durably, but
-  the SQL session registers exactly three tables, `samples`, `logs`, and
-  `spans`, and no query surface can read alert or audit data at all, so there
-  is no read path to cache.
 
 Each cache entry is keyed by tenant, the content hash of the object it
 came from, and the byte offset and length. Content is immutable once
@@ -84,19 +90,54 @@ directory are **not** encrypted by Ravel, even with SSE-KMS configured for
 object storage. SSE-KMS protects object bytes at rest in the store, not the
 local cache. If you need bytes-at-rest encryption for the cache directory,
 provide it at the filesystem/volume layer (an encrypted volume mounted at
-`--cache-dir`).
+`--cache-dir`). Ravel does restrict who can read those plaintext bytes
+locally: on Unix it creates each cache entry file owner-read-write only
+(`0600`) and each cache directory it creates owner-only (`0700`), whatever
+the ambient umask is. That is filesystem permissions, not encryption: it stops
+another local user reading the bytes, and it does nothing against anyone who
+can read the volume itself. Ravel sets modes within its own namespace
+subtree under the configured directory, and never on the configured
+directory itself: a cache root you create yourself keeps the mode you gave
+it, while a root that does not exist yet is created owner-only along with
+any missing ancestor of it. On startup Ravel also narrows the directories
+and entries beneath its namespace that an older build left at the ambient
+umask, so upgrading a node in place closes the same gap on a cache tree that
+already exists. A tree from before the per-instance namespace layout sits
+beside the namespace rather than under it, and the startup narrowing does
+not reach it: remove it with `ravel-cli cache reclaim-legacy --cache-dir
+<dir> --apply` (without `--apply` the command only lists; see the
+maintenance guide's section on reclaiming a pre-namespacing cache
+directory).
 
 ## CLI flags
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--cache-max-bytes <n>` | `268435456` (256 MiB) | Maximum bytes the RAM tier holds. Bounds **both** caches in the process from one number: the fetcher cache and the catalog byte cache. Read once at startup; there is no live resize. |
-| `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by the same `--cache-max-bytes` number (there is no separate disk-tier capacity flag). Absent, the process has a RAM tier only. Bytes written here are not SSE-KMS encrypted (see "Two tiers" above). |
-| `--disable-cache` | off | Turns **both** caches off. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. |
+| `--cache-max-bytes <n>` | fetcher cache derived: 25% of the process memory budget; catalog byte cache derived: 5% of the same budget (each `268435456`, 256 MiB, when memory cannot be read) | Maximum bytes the RAM tier holds. **Set**, it bounds **both** caches at that one value. **Unset**, the two derive independently from the process memory budget (effective, cgroup-capped memory minus a fixed overhead reserve, not raw host memory): the fetcher cache at 25% (`7516192768` on the 30 GB reference host) and the catalog byte cache at 5% (`1503238553`), a smaller separate ceiling so the two LRU caches do not each claim a quarter of RAM. Startup refuses to start, rather than silently clamping, if an explicit value here pushes the two resolved caps above the process memory budget (not under `--disable-cache`, which builds neither cache, so neither cap claims anything). Read once at startup; there is no live resize. |
+| `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by its own resolved RAM ceiling: the fetcher cache's disk tier by `--cache-max-bytes` or its derived 25% share, the catalog byte cache's by its own resolved value (the derived 5% share, or `--cache-max-bytes` when that flag is set explicitly). There is no separate disk-tier capacity flag. Absent, the process has a RAM tier only. Bytes written here are not SSE-KMS encrypted, and on Unix Ravel keeps what it writes here readable by its own user only (see "Two tiers" above for both). |
+| `--disable-cache` | off | Turns **both** caches off. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. Because neither cache exists, neither ceiling is charged against the process memory budget: the whole budget goes to the shared SQL/fetch accountant, and the startup refusal above cannot fire, whatever `--cache-max-bytes` says. |
 | `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole regardless of size; set it to `0` to use the block-range path for every object. Read once at startup. Under a resolved fetch policy that reads every object whole (`--logs-fetch-policy request-minimal`, or `cost-based` at a profile whose bytes are free) this flag is **overridden**, and startup logs a WARN naming the value it overrode. |
-| `--logs-fetch-policy <policy>` | `cost-based` | The logs read shape. `request-minimal` reads every object whole in one covering GET, with no tail probe and no ranged read: the cost-preferring shape where transfer is free and the object-store bill is requests. `byte-minimal` uses ranged reads wherever they save more bytes than a request costs, for egress-billed and network-constrained deployments. `cost-based` derives the choice from `--store-cost-profile`; at the shipped reference profile (intra-region, transfer free) that resolves to request-minimal behaviour, so **a deployment on default flags reads log objects whole**. Read once at startup; the running process never changes its own policy. The resolved policy, profile, and byte quantities are logged at startup on the `logs fetch policy resolved` line. |
+| `--logs-fetch-policy <policy>` | `cost-based` | The logs read shape. `request-minimal` reads every object whole in one covering GET, with no tail probe and no ranged read: the cost-preferring shape where transfer is free and the object-store bill is requests. `byte-minimal` uses ranged reads wherever they save more bytes than a request costs, for egress-billed and network-constrained deployments. `cost-based` derives the choice from `--store-cost-profile`; at the shipped reference profile (intra-region, transfer free) that resolves to request-minimal behaviour, so **a deployment on default flags reads log objects whole**. `latency-first` resolves the same byte quantities as `byte-minimal`; it is an intent for deployments where cold wall-clock matters more than the request bill, and it pays off only once GET concurrency is also raised explicitly (it sets no concurrency default of its own), which carries a memory caveat -- see the operations guide before turning it on. Read once at startup; the running process never changes its own policy. The resolved policy, profile, and byte quantities are logged at startup on the `logs fetch policy resolved` line. |
 | `--store-cost-profile <path>` | reference profile (`s3-intra-region-2026`) | TOML file carrying this deployment's object-store prices in integer nanodollars: `name`, `put_class_nanodollars`, `get_class_nanodollars`, `transfer_nanodollars_per_gib`, `retrieval_nanodollars_per_gib`, and optionally `delete_class_nanodollars`. Only `--logs-fetch-policy cost-based` reads it, to derive how many transferred bytes one saved request is worth; no price reaches the fetch layer. An unreadable file, invalid TOML, an unknown key, or a blank `name` fails startup rather than falling back to the reference prices. |
 | `--logs-max-fetch-run-bytes <bytes>` | `67108864` (64 MiB) | The fetch bound: the maximum length of one covering GET on the log path, on every policy. An object at or under it is read in a single request; a larger one is read as sequential block-aligned covering sub-ranges of at most this many bytes each, so one oversized object cannot pull an unbounded response into memory. `0` is refused at startup. |
+
+Both `--cache-max-bytes` figures are **LRU caps, not reservations**. Neither
+cache pre-allocates its ceiling; each holds only the bytes it has actually
+admitted and evicts least-recently-used entries once it reaches its cap. The
+ceiling is an upper bound on resident cache bytes, not memory claimed at
+startup. Because the two caches are independent and the SQL memory pools
+(`--sql-max-query-bytes`, `--sql-tenant-max-bytes`) are bounded separately
+again, the **sum of every ceiling can exceed physical RAM**: the fetcher cache
+(25% of the process memory budget by default) plus the catalog byte cache
+(5%) plus the SQL pools is more than 100% of raw host memory on the
+reference host. That is deliberate.
+The caches only fill under a working set that touches that many distinct bytes,
+and the SQL pools abort a query rather than growing past their own ceiling, so
+the peaks do not coincide the way the arithmetic sum suggests. Size a host
+against its real working set, not against the sum of the caps. Set an explicit
+`--cache-max-bytes` to bound both caches at one value on a memory-constrained
+host, or `--disable-cache` to hold no read-cache memory at all and leave the
+entire process memory budget to the query path.
 
 ### The max-age sweep
 
@@ -124,6 +165,9 @@ When the cache is on, `ravel-server` warms it before it reports ready
 (`/readyz`). For each tenant storage holds data for, it reads a small,
 bounded number of that tenant's most recent metric and log segments, so the
 first real query after a restart is not the one paying full cold cost.
+"Most recent" is measured from each tenant's own latest ingest hour, not
+from wall-clock time: a tenant that has not ingested in the
+last day still gets its most recent parts warmed, not zero.
 
 Warmup is best-effort:
 
@@ -132,6 +176,58 @@ Warmup is best-effort:
   starts with a smaller warm set.
 - A failure warming one tenant or one segment is logged and skipped. It
   never fails startup.
+
+To tell a warmed restart from an unwarmed one, or to see what was warmed,
+read the `cache_warm` module's log lines rather than guessing from query
+latency. `cache_warm` alone decides the level of the per-(tenant, signal)
+line -- `Catalog::latest_ingest_hour` never logs above `debug!`, so a
+signal a tenant does not use never produces a `warn!` on its own.
+The line is an `info!` (or `warn!` if the tenant has a live part for that
+signal but none of them warmed -- a resolve or fetch failure ate the
+whole signal) and carries `tenant_hash`, `signal`, `parts_warmed`, and
+`latest_ingest_hour`, which takes one of three values:
+
+- an hour number: the tenant's own latest ingest hour was found -- the
+  newest hour bucket holding a commit-record-shaped key of any kind
+  (commit, compaction, rewrite, or tombstone), not only a live commit
+  record. `parts_warmed` counts what actually warmed from it, which is 0
+  when that hour's only key was a tombstone; that case still logs at
+  `info!`, since a tombstone-only hour has no live part to have failed to
+  warm. An hour that holds both a live record and a tombstone counts as
+  having a live part while the resolve drops the tombstoned bucket, so
+  when nothing else in the window warms the `warn!` can fire for it;
+  read that warning as a hint to look at the resolve, not as a fault.
+- `"none"`: `Catalog::latest_ingest_hour` returned `Ok(None)` -- the
+  tenant has no discoverable ingest for that signal, either because it
+  never ingested it or because its last ingest predates the discovery
+  lookback cap (see below). `parts_warmed` is always 0 for this value,
+  and the `cache_warm` pass logs it at `info!`, not `warn!`: no parts to
+  warm is a normal outcome, not a failure.
+- `"error"`: the `Catalog::latest_ingest_hour` listing itself failed
+  (an object store fault, or the per-shard LIST budget refused). This
+  value appears on a separate `warn!` event, `cache warmup:
+  latest_ingest_hour failed; skipping this tenant and signal`, which
+  carries `tenant_hash`, `signal`, `error` and `latest_ingest_hour` and
+  no `parts_warmed`; the pass emits no result line for that tenant and
+  signal, so a filter on `parts_warmed` alone will not show it. It is
+  distinct from the `"none"` case so a store fault is never mistaken for
+  a tenant that has no data.
+
+`Catalog::latest_ingest_hour` exhausting its lookback cap (64 days)
+without finding anything logs at `debug!`, not `warn!`: it cannot itself
+tell a tenant that never used a signal apart from one whose ingest is
+genuinely stuck past the cap -- both produce the identical `Ok(None)` --
+and neither case is a failure worth a warning on its own. Do not expect a
+`warn!` from this path on a normal warmup pass; the only `warn!` a
+tenant/signal combination can produce is the `"error"` case above or
+`cache_warm`'s own "has parts but none warmed" line.
+
+One final `info!` at the end of the pass
+carries the total `parts_warmed` across every tenant and signal and the
+pass's `elapsed_ms`. A restart whose log shows this final line warmed the cache; one that hit
+the time budget above never reaches it, and logs the `warn!` naming the
+deadline instead -- the per-(tenant, signal) lines up to that point are
+whatever the pass warmed before it ran out of time.
 
 ## Metrics
 
@@ -221,8 +317,9 @@ in-process, which is what the `ravel-bench` logs scan does.
 
 The one genuine gap is spans: RSPAN reads have no cache seam, so a repeated
 span query re-reads the same objects from the store every time. Alert
-transitions and audit records are not a cache gap, because they have no read
-path at all: neither is a registered SQL table.
+transitions and audit records are not a gap: the `alerts` and `audit` tables
+read through the log fetcher, so their bytes are cached exactly as log bytes
+are.
 
 ## Background
 

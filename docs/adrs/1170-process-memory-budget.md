@@ -1,0 +1,686 @@
+# ADR-1170: One process-wide memory budget for ravel-server
+
+Status: Proposed
+
+## Context
+
+Issue #1170, the design gate that epic #1191 names as its last item.
+
+`ravel-server` derives its memory ceilings from the host (#1141, PR #1166) and
+enforces each in a different component that knows nothing of the others. The
+kernel has killed the server three times on the reference box for it, and a
+10-connection diagnostic window on that box reproduces the kill on demand.
+
+### What was measured
+
+Reference box: c6a.4xlarge, 16 cores, 30 GiB, ClickBench tenant of 2,617
+objects and 11.24 GB, `a0eedfbf` with the allocator and cache residency gauges
+from `Refs: #1170`, 10 concurrent connections for 600 s.
+
+The read cache fills to the whole corpus in 41 s and never evicts, because its
+cap (then 80% of MemTotal, 26.3 GB) is larger than the corpus. On top of that
+floor the query and fetch working set oscillates between 3.9 and 15.0 GB, then
+recedes. It is concurrent demand, not a leak. The kill lands when a spike meets
+the floor.
+
+A sweep over the cache cap, same window:
+
+| cache cap | error ratio | peak RSS | peak non-cache |
+| --- | --- | --- | --- |
+| 4 GiB | 3.5% | 20.0 GB | 18.1 GB |
+| 6 GiB | 3.9% | 24.6 GB | 20.8 GB |
+| 8 GiB | 4.4% | 23.7 GB | 18.3 GB |
+| 12 GiB | 99.7% | 24.8 GB | 17.2 GB |
+| unbounded | 99.8% | killed | 15.0 GB |
+
+The load-bearing column is `peak non-cache`: 17 to 21 GB **regardless of the
+cache cap**. The query and fetch working set for ten connections is about
+20 GB and is independent of cache sizing, so the constraint is a subtraction,
+`cache <= usable - query demand - overhead`, and 80% could never satisfy it.
+That first fix has landed: `CACHE_MEMORY_PERCENT` is 25
+(`services/ravel-server/src/config.rs:1578`, commit `0964b01d`, with the sweep
+table in its doc comment).
+
+Two things the sweep does NOT establish, and this ADR takes both seriously.
+Capping the cache does not make the server stable: every arm was dead by the
+end of its window, the 6 GiB arm surviving 600 s and dying eight minutes later
+while idle. And the residual 3 to 4% of errors are not one known-bad statement;
+they spread across q15-q19 and q31-q35.
+
+A separate A/B with the fetch policy as the only variable, at concurrency 256:
+whole-object fetches complete 43 of 43 at 19.4 GB peak; ranged fetches are
+killed at statement 31 with the kernel reporting 31.1 GB. The ranged path is
+the one that cuts cold query time by 46% (#1185). It is unusable as a default
+because nothing bounds its memory.
+
+### What the code does today
+
+Verified against the tree at `4e5c0ea8`.
+
+- **Derivation** is one pure function, `resolve_performance_defaults`
+  (`config.rs:1762-1865`), over `HostProfile { cores, mem_total_bytes }`, where
+  `mem_total_bytes` is already capped by cgroup v2 `memory.max` or v1
+  `memory.limit_in_bytes` (`config.rs:1467-1513`). Shares: fetch cache 25%,
+  catalog cache 5%, SQL per-query 25%, SQL per-tenant 50%, with exact-integer
+  tests (`config.rs:4896-4904`). The per-query share nests inside the
+  per-tenant share (`crates/ravel-sql/src/memory.rs:321-336` charges the same
+  bytes to both), so the sum for one tenant is 80%, not 135%. The per-tenant
+  share is per `TenantHash` (`crates/ravel-sql/src/executor.rs:459-470`), so N
+  active tenants can reserve N x 50%.
+- **Two of the four ceilings are eviction caps, not reservations.** The fetch
+  cache and the catalog byte cache are the same `ravel_cache::Cache` type;
+  `S3Fifo::insert` evicts to bounds (`crates/ravel-cache/src/s3fifo.rs:144-192,
+  251-273`) and never fails. Neither cache can be asked to shed to a target: the
+  public surface is `get`, `insert`, `get_or_fetch`, `len`, `total_bytes`, and
+  `evict_to_bounds` is private with one caller. A hit is a `Bytes` refcount
+  bump (`cache.rs:43-46`), so evicting an entry frees nothing until every
+  reader drops it.
+- **The SQL pool has one fallible seam.** `TenantDelegatingPool::try_grow`
+  (`memory.rs:321-348`) charges query then tenant and returns
+  `ResourcesExhausted` on refusal; `grow` (`memory.rs:264-310`) cannot decline,
+  because DataFusion's `MemoryReservation::resize` and its join operators call
+  it with unchecked deltas, so it records a `CeilingBreach` that the query
+  stream turns into a typed error on its next poll (`executor.rs:1805-1815`).
+  Every reservation ravel-sql itself makes uses `try_grow` (`scan.rs:598,
+  736`, `logs_scan.rs:3118, 3156, 3181`, `late_materialization.rs:769, 782`,
+  `spans_scan.rs:776`, `alerts_scan.rs:350`, `audit_scan.rs:281`), including
+  the scan reservation #837 and ADR-0954 found non-spillable. The pool can
+  consult only its tenant accountant, its breach cell and its accounting; the
+  accountant's own doc (`memory.rs:68-75`) reserves the seam: "When a
+  process-wide accountant lands, this becomes a thin adapter over it."
+- **In-flight fetch bytes are charged to nothing.** The `GetLimiter`
+  (`crates/ravel-query/src/limiter.rs:29-31`) bounds GETs in flight, a count.
+  Permits are released before decode (`fetcher.rs:731-754`,
+  `log_fetcher.rs:1017-1019`); the bytes outlive the permit. RSEG's
+  `ensure_ranges` (`fetcher.rs:995-1073`) issues every coalesced run in one
+  `join_all` and retains every response in `FetchedRegions`; RLOG's block-range
+  path assembles the whole object (`ObjectAssembler`, `log_fetcher.rs:3041-3047`,
+  `covering_read` 3432-3499) and `fetch_blocks` / `fetch_chunk_ranges` join
+  every range at once (5322, 4971). The `AssemblyBufferPool`
+  (`log_fetcher.rs:2893-2905`) is a free-list bounding idle buffers, not live
+  ones. ADR-0996 states the bound as "formally unbounded `permits x
+  object_size`" until #1007, and #1007 has not landed.
+- **The startup log names each ceiling and no aggregate**
+  (`ResolvedPerformanceDefaults::emit`, `config.rs:1876-1953`). There is no
+  gauge for SQL or fetch reservations; `TenantMemoryAccountant::reserved`
+  has no caller in the server. The allocator gauge
+  `ravel_process_allocator_bytes{stat="resident"}` and
+  `ravel_cache_resident_bytes` exist (`services/ravel-server/src/metrics.rs:
+  2427-2568`).
+
+### Constraints a governor has to satisfy
+
+Found by review of a draft that did not, recorded on the ticket, and confirmed
+by the code above:
+
+1. Reservations must follow allocation ownership, not request lifetime. A GET
+   completing frees nothing; the assembler and the retained `Bytes` own the
+   memory through decode and scan.
+2. The minimum-progress unit is not knowable at admission. Object sizes and
+   selected ranges come from resolve and planning.
+3. `join_all` cannot degrade. Both fetch paths launch every range and retain
+   every result; "reserve less and lower concurrency" is not available without
+   a scheduler rewrite, and for RSEG a lower concurrency retains the same total.
+4. The ceiling cannot be RSS. MemTotal and `memory.max` are kill boundaries;
+   DataFusion's `grow` allocates before a breach is detectable. The honest
+   claim is "tracked allocations are bounded, with a measured overhead
+   reserve".
+
+And the standing rule from ADR-0954: exact result via bounded spill, or a typed
+failure, never a partial answer.
+
+## Decision
+
+One process-wide accountant that the existing per-tenant accountants adapt to,
+a byte reservation at the fetch layer where the unit is known, a static carve so
+the startup sum is under the budget by construction, and the aggregate made
+visible. Four parts; the first two are the substance.
+
+### 1. `MemoryBudget`, a process-wide accountant
+
+A new leaf crate, `ravel-memory`, with no store I/O and no dependency beyond
+std. `MemoryBudget { limit, reserved: AtomicU64 }` exposes two shapes over one
+counter, because its two consumers account differently:
+
+- Counter operations for the SQL adapter: `try_reserve(n) -> Result<(),
+  MemoryExhausted>` (a CAS against `limit`), `reserve_unchecked(n)` (the
+  infallible path, may overshoot), and `release(n)`. `TenantMemoryAccountant`
+  already keeps grow and shrink as separate counter operations
+  (`memory.rs:105-130`) and `TenantDelegatingPool` already forwards every
+  DataFusion `grow`, `try_grow` and `shrink` to it 1:1 with rollback on
+  refusal (`memory.rs:264-348`); the adapter forwards each of those to the
+  process counter with the same delta, in the same order, so process-level
+  bytes track SQL bytes exactly: tenant then process on the way up, process
+  then tenant on the way down, and a refusal at either level rolls the other
+  back before surfacing as `ResourcesExhausted`. No guard is held across a
+  query; the counters are the ledger, as they are today.
+- An RAII `Reservation` guard for the fetch layer, a thin wrapper that calls
+  `try_reserve` on construction and `release` on drop. Ownership follows the
+  guard, which follows the allocation: whoever holds the buffer holds the
+  guard. That is constraint 1 by construction for buffers, and the SQL
+  adapter's explicit shrink is constraint 1 for reservations DataFusion
+  resizes.
+
+The per-tenant ceiling stays as a fairness limit nested inside the process
+limit, so N tenants can no longer reserve N x 50%.
+
+The infallible `grow` path keeps its shape: `reserve_unchecked` records the
+overshoot into the process counter and `CeilingBreach` trips exactly as today,
+so a DataFusion-internal overshoot ends in a typed error on the stream's next
+poll (`executor.rs:1805-1815`). What that path cannot promise is stated, not
+hidden: the bytes are allocated before the breach is visible, and a delta larger
+than the headroom between the budget and the kill boundary kills the process
+before the next poll runs. The overshoot per poll is bounded by what DataFusion
+allocates between two polls of the query stream, one batch per partition, so
+the exposure is `partitions x max batch bytes` per query, and it ADDS across
+statements that reach `grow` in the same interval. The bound that matters is
+therefore the aggregate, `max_concurrent_queries x partitions x max batch
+bytes`, where `max_concurrent_queries` is the server's existing admission cap
+(`--max-concurrent-queries`, `services/ravel-server/src/config.rs:483`,
+enforced by `QueryAdmissionController`). The overhead reserve in decision 3
+must exceed that aggregate; a deployment that leaves the cap unset has an
+unbounded exposure, and the startup aggregate line in decision 4 says so in
+words rather than printing a number that is not a bound. The acceptance in
+decision 4 says what a kill that slips through counts as.
+
+### 2. A fetch byte reservation at the points where the unit is known
+
+The fetch layer reserves from the same budget before it issues, at the sites
+where the byte count is known before the GET:
+
+- RSEG: the sum of coalesced run lengths in `ensure_ranges`, reserved once
+  before the `join_all`, guard stored alongside `FetchedRegions`.
+- RLOG block-range: the object size at `ObjectAssembler` construction, guard
+  owned by the assembler; and the summed range lengths before the `join_all`
+  in `fetch_blocks` and `fetch_chunk_ranges`.
+- RLOG whole-object: the object size at the `GetRange::Full` sites in
+  `fetch_accounted` and `whole_object_bytes`.
+
+A refusal is a typed `FetchMemoryExhausted`, mapped to the query's existing
+error path, never a smaller fetch and never a partial result. This is
+constraint 3 taken at its word: a `join_all` path that cannot degrade must
+refuse before it issues, and it refuses with the unit it actually needs, which
+is constraint 2 answered by reserving at fetch time rather than at admission.
+Reservations are released when the buffer is dropped, not when the GET
+completes.
+
+Buffers outlive the fetch layer, so the guard needs a handoff rule, and the
+rule is: **every LIVE byte is under at least one of three ledgers at every
+instant, the cache cap, a fetch guard, or an SQL reservation; a handoff may
+put a byte under two, and that overlap is accounted rather than tolerated, but
+no byte may ever be under none.** Coverage is the invariant and a gap is the
+violation; the overlap is measured by `handoff_overlap` so `unique` can
+subtract it. "Exactly one" was the original wording and it contradicted the
+handoff cases immediately below it. Concretely:
+
+- A fetched buffer handed to an SQL scan is charged by that scan's own
+  `try_grow` (the `LogScanStream` reservation over pending and emitted buffers,
+  `crates/ravel-sql/src/logs_scan.rs:2992-3068`, and `scan.rs:598` for RSEG),
+  which now reaches the same process budget through the adapter. The fetch
+  guard is released only after that `try_grow` has succeeded, so the bytes are
+  double-counted from the handoff until the buffer drops (see the amendment
+  below, which corrects an earlier "width of one call" reading) and never
+  uncounted. A `try_grow`
+  refusal at handoff drops the buffer and surfaces the SQL error; the fetch
+  guard's release follows the drop.
+- A buffer inserted into a cache is covered by the cache's hard cap from the
+  insert onward; the fetch guard is released after the insert. A `Bytes` that a
+  reader retains after the cache evicts it is covered by that reader's ledger:
+  the SQL reservation for a scan, the fetch guard for a consumer without a
+  pool (PromQL today), which is why the guard rides with the `Bytes` in
+  `FetchedRegions` rather than with the request.
+- A buffer that reaches no consumer (an error between fetch and handoff) is
+  released by the guard's drop, as any RAII value is.
+
+The static cache carve bounds residency, not references; the handoff rule is
+what bounds the references, and it is what a review of a draft without it
+found missing.
+
+Concurrency knobs stop being the only thing bounding fetch memory. Raising
+`--store-get-concurrency` to 256 with a ranged policy becomes a throughput
+choice whose memory cost is charged and refused, instead of the kernel's
+problem. That is the precondition ADR-1196 needs before a latency-first policy
+can be a default.
+
+#### Amendment (2026-09-06, Refs: #1254)
+
+Reviewing the implemented fetch reservations against the text above found two
+claims that describe an intended design the code does not implement. The
+decision stands; these correct its accounting description and record the sites
+that are not yet reserved or tracked.
+
+1. **The SQL cross-boundary overlap lasts the buffer's life, not "the width of
+   one call."** The bullet above says a fetched buffer handed to an SQL scan has
+   its fetch guard "released only after that `try_grow` has succeeded, so the
+   bytes are double-counted for the width of one call." The fetch layer cannot
+   do this: it returns the `Bytes` before the SQL layer calls `try_grow`, and
+   the guard rides inside those `Bytes` (`attach_reservation` /
+   `Bytes::from_owner`, `log_fetcher.rs`, `span_fetcher.rs`). So on the SQL
+   path the fetch reservation and the scan's `try_grow` reservation coexist for
+   the whole life of the buffer in the scan, releasing only when the consumer
+   drops the `Bytes`, not for one call. This is the same lifetime
+   `docs/query-engine.md` already describes.
+
+2. **`unique` is not exact by construction.** Decision 3 defines
+   `unique = cache_resident + sql_reserved + fetch_reserved - handoff_overlap`
+   and calls it exact. `handoff_overlap` counts only overlaps that call
+   `Reservation::mark_handed_off`, and the only site that does is a cache
+   *insert* (`Source::Upstream`, `log_fetcher.rs`/`span_fetcher.rs`). Two real
+   overlaps are therefore not in the gauge, so `unique` overstates the tracked
+   total by their size:
+   - the SQL cross-boundary overlap from correction 1 (fetch guard riding in the
+     returned `Bytes` while the scan also holds its `try_grow`), never marked;
+   - a cache **hit** (`Source::Cache`), where the returned buffer is the resident
+     cache entry and the fetch guard reserves the same bytes the cache cap
+     already holds. This one is now marked in both fetchers, so the residual `d`
+     below was believed to be the SQL boundary alone -- the first 2026-09-13
+     amendment below found a third untracked site (`covering_read`'s insert
+     branch), and the second found a fourth class (RSEG's `ensure_ranges` plus
+     every `ObjectAssembler`-based multi-GET path), so that is no longer the
+     case; the reasoning is kept because it is the same shape and because a hit
+     was as real an overlap as an insert all along.
+
+   The direction is an overcount of `unique` by the untracked overlap `d`, and
+   that overcount does not stop at the decision-4 acceptance assertion: decision
+   3's frozen reserve is `max_t(resident_t - unique_t) x 1.25` (plus margin),
+   calibrated from the SAME overstated `unique_t`. Subtracting a too-large
+   `unique_t` understates `resident_t - unique_t` by `d` at calibration time, so
+   the frozen reserve is itself undersized by about `1.25 x d`, not merely
+   `unique`'s term in the assertion. At acceptance time the same overcount raises
+   `unique_t` by `d` again, so the assertion's RHS, `unique_t + reserve`, nets to
+   about `0.25 x d` BELOW what it would be with an exact `unique`: the assertion
+   is tighter than intended, not looser, because the reserve lost more to the
+   overcount than the `unique_t` term gained back. A tighter assertion is not
+   free slack: the frozen reserve is also required to exceed the `partitions x
+   max batch bytes` exposure from decision 1 (the infallible-`grow` overshoot
+   bound), and an `1.25 x d`-undersized reserve can fail to clear that bound
+   even where it looks like it clears the acceptance band, which is a safety
+   property, not headroom to spend. The calibration run must therefore do one
+   of two things, not silently ship the 1.25 constant unchanged: either mark
+   the handoff at the remaining untracked site first (the SQL boundary) so
+   calibration measures an exact `unique` and the reserve is derived from the
+   true `resident_t - unique_t`, or, if calibration still runs against the
+   overstated `unique`, measure and record the residual `d` (now the SQL
+   cross-boundary overlap alone, sampled the same way as
+   `ravel_memory_handoff_overlap_bytes` would if it covered it) and widen the
+   multiplier to cover `1.25 x d` on top of the existing margin, with that
+   arithmetic in the constant's doc comment. Making `unique` exact means
+   marking the handoff at these two sites too (or subtracting them another
+   way), which is follow-up work; until it lands, the reserve derivation must
+   account for `d` explicitly rather than assume the overcount is harmless.
+
+**Known-unreserved / not-yet-enforcing sites** (the budget observes nothing at
+these until a finite budget is wired and, for the last two, the overlap is
+marked):
+
+- RSPAN fetchers and every fetcher `build_sql_state` constructs
+  (`services/ravel-server/src/query.rs`) reserve against their default
+  `MemoryBudget::unlimited()`: `QueryEngine::with_memory_budget` reaches only its
+  `fetcher` and `log_fetcher`, and no server task installs a finite budget yet.
+- The SQL cross-boundary overlap is untracked by `handoff_overlap`. The
+  cache-hit overlap was too, and is now marked at every cache-hit call site,
+  and `covering_read`'s own cache-insert branch and RSEG's `ensure_ranges`
+  reservation are now marked too (2026-09-13 second amendment below). The
+  residual is the SQL boundary plus a materially larger, previously
+  unenumerated class: every `ObjectAssembler`-based multi-GET reservation in
+  `log_fetcher.rs` (see the second amendment), not the SQL boundary alone.
+- **Idle assembly buffers.** The invariant above is stated over LIVE bytes for
+  a reason: `AssemblyBuffer::drop` returns its allocation to
+  `AssemblyBufferPool`'s free list, not to the allocator, so those bytes stay
+  resident under none of the three ledgers. This is structural to every RLOG
+  path, not to any one of them, and it is bounded separately by
+  `MAX_IDLE_ASSEMBLY_BUFFERS` and `MAX_IDLE_ASSEMBLY_BYTES` per fetcher, which
+  is why it is a known gap rather than an unbounded one. It matters most at the
+  coverage crossover, which drops its assembler before the covering read
+  reserves fresh: the reservation figure is then one object while residency is
+  briefly two, until the pool hands that buffer to the next read or evicts it.
+  Anything comparing `resident_t` against reserved totals, decision 4's
+  acceptance assertion included, must count the pool's idle bytes on the
+  resident side or it will read the difference as an accounting error.
+
+#### Amendment (2026-09-13, Refs: #1170)
+
+The 2026-09-06 amendment above marked cache hits in the whole-object funnel
+(`log_fetcher.rs`/`span_fetcher.rs`, `Source::Cache`) and concluded that doing
+so left the SQL boundary as the only untracked overlap. That conclusion
+undercounted by one call site: `BlockRangeFetcher::covering_read`'s
+single-GET branch (`log_fetcher.rs`, used both directly and by
+`whole_object_bytes`'s above-threshold segmented funnel) also returns a
+cache-resident buffer on a hit, and left it unmarked. That branch is now
+marked too.
+
+Marking it exposed a second, distinct gap the whole-object funnel does not
+have: `covering_read`'s single-GET branch also leaves a cache **insert**
+(`cached_extent` returning `live == true`, the `Source::Upstream` equivalent)
+unmarked. The whole-object funnel and both `span_fetcher` call sites mark
+their insert arm (the original decision-2 behavior); `covering_read` never
+did. Reproduced directly: a fetch of an object above the suffix-probe window
+(so the probe and the covering read land on different cache keys) and below
+`max_fetch_run_bytes` (so it takes the single-GET branch) leaves
+`handoff_overlap()` at `0` while the covering read's buffer is held, though
+the same bytes just went to cache with the store's own eviction cap covering
+them.
+
+So after this amendment the untracked residual `d` in decision 2's `unique`
+expression is the SQL cross-boundary overlap (still unmarked) **plus**
+`covering_read`'s cache-insert overlap (also still unmarked), not the SQL
+boundary alone. Both are the same shape as an already-marked site elsewhere
+in the same file, so closing either is a mirror of existing code, not new
+design; neither is done in this amendment; the reserve derivation must
+account for both terms of `d`, or mark both sites, before decision 3's
+`1.25 x d` sizing can be measured against a value smaller than what the
+calibration run linked from decision 2 already computes.
+
+#### Amendment (2026-09-13, second pass, Refs: #1170)
+
+Both sites the amendment above left open are now marked:
+`covering_read`'s single-GET cache-insert branch (`log_fetcher.rs`), and a
+site this ADR never enumerated at all -- RSEG's
+`SegmentFetcher::ensure_ranges` (`fetcher.rs`), whose reservation covers a
+`join_all`-coalesced batch of ranges that `guarded_get` routes through
+`cached_get` whenever a cache is configured, on a hit or a miss alike. This
+ADR's residual discussion has only ever tracked the RLOG (`log_fetcher.rs`)
+and RSPAN (`span_fetcher.rs`) paths; RSEG had the identical shape of gap and
+was simply never audited for it. Both fixes decide handoff from
+`self.cache.is_some()` at the batch level rather than from any individual
+sub-fetch's `Source`/`live` result, since `mark_handed_off` is idempotent and
+whole-reservation-granularity, and every cache-eligible sub-range in such a
+batch becomes cache-resident (hit or insert) whenever a cache exists at all.
+
+Closing those two was the prompt for a full sweep of every `reserve_fetch`
+call site in `ravel-query` (fetcher.rs, log_fetcher.rs, span_fetcher.rs),
+grepping `reserve_fetch`, `mark_handed_off`, and the cache-`Source`/`live`
+discriminant together. The result is that the residual does **not** shrink
+to the SQL boundary alone: it shrinks by two sites and grows by a fourth,
+previously undocumented class, which is materially larger than either fixed
+site. Every `ObjectAssembler`-based multi-GET reservation in `log_fetcher.rs`
+leaves `mark_handed_off` uncalled on every branch, hit or miss:
+
+- `covering_read`'s own segmented branch (`log_fetcher.rs`, the
+  `ObjectAssembler` loop past the single-GET early return): the reservation
+  moves into the assembler and neither the hit nor the miss arm of its
+  per-range `cached_extent` call marks it.
+- `fetch_object_with_footer`'s asm-owned reservation.
+- `fetch_object_v4` and the helpers it feeds (`fetch_blocks`,
+  `fetch_chunk_ranges`): `fetch_chunk_ranges` and `fetch_blocks` each also
+  hold their own *transient* pre-`join_all` reservation, the same shape
+  `ensure_ranges` had, also unmarked.
+- Inside `fetch_blocks`, a raw `cache.get`/`cache.insert` pair (the
+  already-resident-from-probe branch) that never goes through
+  `reserve_fetch` or a reservation at all: verified bytes are inserted into
+  the cache with no ledger overlap recorded on either side, because there is
+  no reservation live at that point to mark.
+
+`ObjectAssembler` exposes no method to mark handoff on the `Reservation` it
+owns, so none of these close with a one-line mirror of this round's fix; each
+needs either a handoff-marking method added to `ObjectAssembler` or a
+restructure of the call site. None of this is fixed in this pass -- it is
+scope beyond the two sites this round closed -- and it is reported rather
+than silently patched, per this repo's contradiction/bug-outside-scope rule.
+
+So after this second amendment the untracked residual `d` in decision 2's
+`unique` expression is the SQL cross-boundary overlap (still unmarked, and
+outside `ravel-query`) **plus** the `ObjectAssembler`-based multi-GET class
+above (also still unmarked, and larger in call-site count than either of the
+two sites this round closed), not the SQL boundary alone. The reserve
+derivation must account for both terms, or close the `ObjectAssembler` class,
+before decision 3's `1.25 x d` sizing can be measured against a value smaller
+than what the calibration run linked from decision 2 already computes.
+
+### 3. A static carve under one number
+
+`resolve_performance_defaults` derives one `memory_budget_bytes` from the
+cgroup-capped effective memory minus an overhead reserve. The two caches keep
+hard eviction caps carved from it (they cannot shed, so they cannot share);
+SQL and fetch draw from the remainder through the accountant, with the
+per-tenant ceiling as the fairness bound within it. The sum of hard caps plus
+the shared remainder equals the budget by construction, and startup refuses a
+flag combination whose hard caps alone exceed it.
+
+The overhead reserve is a measured number, not a guess, and it is measured in
+a calibration run that is separate from, and frozen before, the acceptance
+runs, so the acceptance assertion is not circular. Calibration: parts 1, 2 and
+4 landed, the budget set to unlimited so nothing is refused, the same
+10-connection window; the reserve is the maximum over the window of
+`ravel_process_allocator_bytes{stat="resident"}` minus the UNIQUE tracked
+total, plus a 25% margin, rounded up to the next 256 MiB, and it must exceed
+the `partitions x max batch bytes` exposure in decision 1.
+
+The unique total is not the sum of the ledgers, because the handoff rule
+deliberately lets a buffer sit in two ledgers for the width of one call, and a
+sum that counts those bytes twice overstates what is tracked and undersizes
+the reserve. The fetch layer therefore keeps one more gauge,
+`ravel_memory_handoff_overlap_bytes`: a fetch guard adds its size to it the
+moment the receiving `try_grow` or cache insert succeeds and subtracts it on
+its own drop, so the gauge is exactly the bytes currently in two ledgers.
+`unique = cache_resident + sql_reserved + fetch_reserved - handoff_overlap`,
+and the same expression is what the acceptance assertion in decision 4
+subtracts.
+
+This paragraph originally said that expression was exact by construction. It is
+exact only if every overlap is marked, which the first implementation did not
+achieve: see the amendments under decision 2. Cache hits are now marked at
+every call site, and so are `covering_read`'s cache-insert branch and RSEG's
+`ensure_ranges` reservation (2026-09-13, second amendment), but two classes of
+overlap remain unmarked: the SQL cross-boundary one, where the fetch guard and
+the scan's `try_grow` both cover the buffer, and every `ObjectAssembler`-based
+multi-GET reservation in `log_fetcher.rs` (also the second amendment), a
+larger class than either site just closed. Until both are marked, `unique` is
+an upper bound, the reserve derived from it is undersized by roughly 1.25
+times their combined residual, and the calibration run must either mark them
+first or measure the residual and widen the multiplier. The margin covers
+allocator slack and sampling, not accounting
+overlap, so it cannot be leaned on to absorb this. That value lands as a
+constant in the derivation with the calibration figures in its doc comment, the
+way `CACHE_MEMORY_PERCENT` carries the sweep, in a commit that precedes the
+first acceptance run. The acceptance runs then use the frozen value and can
+fail against it: resident above `budget + reserve` in acceptance means an
+allocation that calibration did not see, which is a finding, not a recalibration.
+
+### 4. The aggregate, visible and asserted
+
+- `emit` logs one more line: the budget, the sum of hard caps, the shared
+  remainder, and the overhead reserve, with `source=`.
+- Gauges: `ravel_memory_budget_bytes`, `ravel_memory_reserved_bytes{component=
+  "sql"|"fetch"}`, and `ravel_memory_handoff_overlap_bytes` (the bytes
+  currently in two ledgers, so the unique tracked total is computable), beside
+  the existing cache residency and allocator gauges.
+- Pre-registered acceptance, same box, same tenant, same 600 s window at 10
+  connections, three consecutive runs after the reserve is frozen: every
+  over-budget query ends in a typed error, `ResourcesExhausted` (which is also
+  what a `CeilingBreach` surfaces as: the breach is the mechanism that records
+  an infallible-`grow` overshoot, and the query stream maps it to the same
+  `SqlError::ResourcesExhausted` on its next poll, `executor.rs:1805-1815,
+  1961-1980`) or `FetchMemoryExhausted`;
+  error ratio at or below the 6 GiB arm's 3.9%; and, pointwise over every
+  sample `t` of the window, `resident_t <= unique_t + frozen reserve`, which is
+  `max_t(resident_t - unique_t) <= frozen reserve` with both figures from the
+  SAME scrape, never a peak of one against a peak of the other, where unique
+  subtracts the handoff overlap gauge; the runs set `--max-concurrent-queries`
+  to the window's connection count (10) so the exposure bound is finite and
+  the reserve is checked against it; and zero kernel kills attributable to a tracked ledger. A kill is
+  attributable to the infallible `grow` path only if the SUM of the unchecked
+  deltas in the breach records of every statement in flight at the kill (each
+  statement's stream records its own `CeilingBreach`) exceeds the reserve;
+  several deltas each below the reserve that add past it are exactly the
+  aggregate case, and are attributed the same way. Such a kill is itself a
+  finding against the reserve's sizing, recorded and re-run, not accepted. A run that survives with resident above the band has an untracked
+  allocation and fails the gate.
+
+```mermaid
+flowchart TD
+    M["effective memory<br/>(MemTotal capped by cgroup)"] --> R["overhead reserve<br/>(measured)"]
+    M --> B["memory budget"]
+    B --> C1["fetch cache cap<br/>hard, evicts, cannot shed"]
+    B --> C2["catalog cache cap<br/>hard, evicts, cannot shed"]
+    B --> P["shared remainder<br/>MemoryBudget accountant"]
+    P --> T1["tenant A ceiling<br/>(fairness, nested)"]
+    P --> T2["tenant B ceiling"]
+    T1 --> S["SQL try_grow<br/>typed ResourcesExhausted"]
+    P --> F["fetch reservation<br/>before join_all<br/>typed FetchMemoryExhausted"]
+    S -.->|"DataFusion grow()<br/>infallible"| X["CeilingBreach<br/>typed error next poll"]
+    F --> G["guard owned by<br/>assembler / FetchedRegions<br/>released on drop"]
+```
+
+### What lands where
+
+| Part | Crates |
+| --- | --- |
+| `MemoryBudget`, `Reservation`, `MemoryExhausted` | new `ravel-memory` |
+| Accountant adapter, process counter in `grow` overshoot | ravel-sql |
+| Fetch reservations, `FetchMemoryExhausted` | ravel-query |
+| Carve, startup refusal, `emit` aggregate, gauges | ravel-server |
+| Docs: query-engine memory section, operations guide, flag reference | docs |
+
+The PromQL path has no memory pool at all today (`memory.rs:167-169`); its
+fetch buffers are covered by part 2 through the shared fetcher, and a PromQL
+pool is out of scope here.
+
+## Rejected alternatives
+
+**Cache eviction under SQL pressure (the ticket's shape 1).** Wrong trigger,
+wrong lever. The bytes that spike are fetch buffers, which no SQL pool sees, so
+SQL pressure is not the signal that precedes the kill. The caches have no shed
+API, the pool has no handle to them, and evicting an entry frees nothing while
+a reader holds the `Bytes`. It could act only on `try_grow`, leaving the
+infallible `grow` overshoot untouched.
+
+**Static caps only, SQL share derived from memory minus cache ceilings (shape
+3).** Pure arithmetic in the existing derivation, exactly testable, and it
+brings one tenant's startup sum under 100%. It bounds nothing that was
+measured: fetch bytes stay uncharged, N tenants still multiply, `grow`
+overshoot is untouched. Part 3 of the decision keeps its arithmetic and adds
+the accountant it lacks.
+
+**Reserve at admission.** The unit is unknown there (constraint 2). A
+worst-case reservation at admission serialises every query behind the largest
+possible object; a small one arrives too late to prevent the hold-and-wait it
+was meant to prevent.
+
+**Reserve per request and release on GET completion.** Undercounts exactly at
+the peak: the assembler and the retained regions own the bytes through decode
+and scan (constraint 1).
+
+**Lower concurrency under pressure instead of refusing.** Not an available
+behaviour on either fetch path; `join_all` launches everything and retains
+everything, and for RSEG a lower width retains the same total (constraint 3).
+
+**Use RSS or `memory.max` as the ceiling.** Kill boundaries, not budgets;
+`grow` has already allocated by the time a breach is visible (constraint 4).
+The budget bounds tracked allocations and the acceptance test measures the
+residual against a stated reserve.
+
+**Land #1007 first.** It bounds the whole-object path's resident size by
+decoding per sub-range. The configuration that was killed at 31.1 GB routes
+ranged and never reaches that path, so #1007 is worth doing and is not the
+unblocker; the ticket's own correction says so.
+
+**A PromQL memory pool in the same change.** Real gap, separate ADR.
+
+## Consequences
+
+Over-budget work fails with a typed error naming the component instead of the
+kernel killing the process, and the process survives to answer the next query.
+The startup log states one number that the operator can compare with the box.
+
+The ranged fetch policy becomes admissible as a default candidate, because its
+memory is now a charged, refused quantity rather than an unbounded one; that is
+the gate ADR-1196 waits behind.
+
+Costs, named: a new leaf crate; an atomic add and subtract on every fetch
+issue and drop and on every SQL reservation; refusals on queries that used to
+succeed by overshooting into headroom another component was not using. The
+last is the point, and the acceptance band says how many refusals are
+acceptable.
+
+A residual the design does not remove: DataFusion's infallible `grow` can
+allocate past the budget before the next poll detects it, so process survival
+is guaranteed for tracked allocations and bounded, not guaranteed, for that
+path, by the overhead reserve exceeding `partitions x max batch bytes`. A
+budget that made that path fallible would need a DataFusion change or a
+pool that lies to `resize`, which desynchronises the reservation; neither is
+taken here.
+
+Report only, found while verifying: ADR-0107's 2026-09-05 amendment said the
+RLOG whole-object funnel issues GETs without a permit; `fad582c7` closed
+that, `docs/query-engine.md`'s "GET concurrency (ADR-1195)" section is
+current, and the amendment has since been corrected to match.
+
+## Amendment 2026-09-07 (issue #1255): decisions 3 and 4 landed
+
+Decisions 3 and 4 landed in `ravel-server`. `resolve_performance_defaults`
+derives `memory_budget_bytes` from cgroup-capped effective memory minus
+`MEMORY_OVERHEAD_RESERVE_BYTES` (both in
+`services/ravel-server/src/config.rs`); both cache carves rebase
+onto it; startup refuses with a typed `MemoryBudgetExceeded` rather than
+clamping when an explicit `--cache-max-bytes` pushes the two hard caps above
+the budget; `emit` logs the derivation one line per figure; and `/metrics`
+exposes `ravel_memory_budget_bytes`, `ravel_memory_reserved_bytes{component=
+"sql"|"fetch"}`, and `ravel_memory_handoff_overlap_bytes` in every mode.
+
+`--disable-cache` is outside the carve and outside the refusal. The process
+then builds neither cache (`store::build_cache` returns `None`,
+`query::build_catalog` forces the byte cache's `0` sentinel), so both hard
+caps are `0`, the remainder is the whole budget, and `check_memory_budget`
+returns `Ok`. Decision 3's "hard caps plus remainder equals the budget"
+identity still holds; what changes is that the caps are not the two resolved
+cache ceilings on that path. The refusal cannot fire on a process that holds
+no cache memory, which is what keeps `--disable-cache` usable as the remedy
+the caching guide names it as, and what keeps a container whose effective
+memory is at or below the overhead reserve (budget `0`, caps `0`, refused by
+the `>=` comparison with no flag able to satisfy it) starting as it did
+before this decision landed. That is the one path allowed to run with a `0`
+remainder, and `emit` WARNs on it.
+
+Decision 1's accountant adapter is also already in place in `ravel-sql`
+(`TenantMemoryAccountant::with_process_budget`, `crates/ravel-sql/src/
+memory.rs`), forwarding each tenant `grow`/`try_grow`/`shrink` to the same
+process-wide counter this amendment's gauges read; `SqlExecutor` and
+`MetricsState` now share one `Arc<ravel_memory::MemoryBudget>` instance built
+from `memory_remainder_bytes` (`ServerConfig::process_memory_budget_bytes` is
+filled from it in `services/ravel-server/src/main.rs`, and `start` builds the
+single `Arc` in `services/ravel-server/src/lib.rs`), so `component="sql"`
+reads real reservations, not a placeholder.
+
+One process-wide counter for every tenant means a cross-tenant cascade,
+which the accountant wiring above does not state on its own: once any one
+tenant's infallible `grow` (`reserve_unchecked`'s saturating add) pushes the
+shared counter above `limit`, every OTHER tenant's next `try_reserve(n > 0)`
+-- including a 1-byte one -- also fails, until the first tenant's `shrink`
+releases enough for the counter to fall back under `limit`. This follows
+directly from `reserve_unchecked` and `try_reserve`'s `reserved + n <= limit`
+comparison (`crates/ravel-memory/src/lib.rs`), and it is faithful to decision
+1 as designed, not a new defect introduced by landing it: decision 1
+deliberately made `grow` infallible and shared the counter process-wide, and
+a cascade is the necessary consequence of both choices together. A later
+acceptance run (M5) must count cascade-caused `try_grow` refusals separately
+from the breaching tenant's own `grow` overshoot: pooling the two into one
+error-rate figure hides whether a band was blown by one tenant's breach or
+by the cascade it triggered against every other tenant sharing the counter.
+
+Decision 2 has not landed in the server: `ravel-query`'s fetchers do reserve
+fetch bytes and mark their cache handoffs, but each one carries a private
+`MemoryBudget::unlimited` unless a caller installs a shared instance, and
+`ravel-server` installs it on none of them. So nothing reserves against the
+budget these gauges read, and both `component="fetch"` and
+`ravel_memory_handoff_overlap_bytes` always read `0`. That is the one
+piece decisions 3 and 4 depend on without providing: the fetch-side kill this
+ADR opened with is not yet charged or refused by anything landed here, only
+observed through the existing allocator and cache-residency gauges as before.
+
+`MEMORY_OVERHEAD_RESERVE_BYTES` is, as landed, the round provisional 2 GiB
+decision 3 names as a placeholder (its own doc comment in
+`services/ravel-server/src/config.rs` states the calibration rule that will
+replace it), not the measured
+figure a frozen calibration run would produce. Decision 1's aggregate
+exposure bound for the infallible `grow` path, `max_concurrent_queries x
+partitions x max batch bytes`, must stay under whatever reserve is in force
+for that path's blast radius to stay bounded; that inequality has not been
+checked, because the calibration run decision 3 specifies has not been made,
+and a deployment that leaves `--max-concurrent-queries` unset carries an
+unbounded left-hand side against this constant right-hand side today. Landing
+decisions 3 and 4 narrows the regression this ADR opened with (the
+25%-of-MemTotal cache carve, `#1395`) without yet closing the kill this ADR
+analyzes: an infallible-`grow` overshoot is still bounded only by a
+provisional constant, and fetch-layer memory is still uncharged until
+decision 2 lands and a calibration run freezes the reserve against it.

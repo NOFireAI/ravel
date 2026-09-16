@@ -12,7 +12,7 @@ use common::*;
 use proptest::prelude::*;
 use ravel_commit::keys;
 use ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
-use ravel_maintain::retention::{is_expired, max_event_ts};
+use ravel_maintain::retention::{is_expired, max_event_ts, resolve_retention_window_ns};
 use ravel_maintain::scan::scan_and_maintain;
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FixedClock, NoLeases, RetentionConfig,
@@ -24,13 +24,17 @@ use ravel_object_store::fault::{
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
-use ravel_proto::commit::v1::{CommitRecord, Signal as ProtoSignal};
+use ravel_proto::commit::v1::{
+    CommitRecord, CompactionInputIdentity, CompactionPart, RewriteDrop, RewriteRecord,
+    Signal as ProtoSignal,
+};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use bytes::Bytes;
 use ravel_maintain::Clock;
-use ravel_types::{Signal, TimeRange};
+use ravel_types::{CommitToken, Signal, TimeRange};
 
 #[derive(Debug, Clone, Copy)]
 enum Sig {
@@ -234,7 +238,7 @@ proptest! {
     ) {
         let commits: Vec<CommitRecord> =
             events.iter().map(|&ts| commit_with_max_event(ts)).collect();
-        let max = max_event_ts(&commits, &[]);
+        let max = max_event_ts(&commits, &[], &[]);
         let expired = is_expired(max, now, r);
         let threshold = now.saturating_sub(r);
 
@@ -1279,6 +1283,380 @@ async fn scan_reports_blocked_by_snapshot_counter() {
     assert_eq!(r2.blocked_by_unreadable_head, 0);
 }
 
+// --- #1131: the sweep resolves the retention window like the fold ----------
+
+/// Count the commit records currently present in a bucket.
+async fn count_commit_records(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> usize {
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .unwrap();
+    list_all(store, &prefix)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|m| {
+            matches!(
+                keys::partition_bucket_entry(&m.key),
+                Ok(keys::BucketEntry::CommitRecord(_))
+            )
+        })
+        .count()
+}
+
+/// Count the retention tombstones currently present in a bucket.
+async fn count_tombstones(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> usize {
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .unwrap();
+    list_all(store, &prefix)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|m| {
+            matches!(
+                keys::partition_bucket_entry(&m.key),
+                Ok(keys::BucketEntry::Tombstone(_))
+            )
+        })
+        .count()
+}
+
+/// #1131 (a): a tenant whose durable `retention_ns` is 48h under a CLI default
+/// of 24h. The sweep must resolve the durable 48h window (exactly as the fold
+/// does, ADR-0078), so an hour aged ~30h is NOT tombstoned (exact kept count)
+/// and one aged ~50h IS (exact tombstoned count).
+///
+/// Failing assertion against pre-fix code: `assert_eq!(out_30,
+/// RetentionOutcome::NotExpired)` (and `count_tombstones(.., &bucket_30) == 0`).
+/// Pre-fix the sweep resolved the window from `RetentionConfig::window_for`
+/// alone (the CLI 24h map), never reading `TenantConfig.retention_ns`, so the
+/// 30h-old hour is expired and tombstoned: the outcome is `Tombstoned` and the
+/// tombstone count is 1.
+#[tokio::test]
+async fn sweep_honors_durable_window_over_shorter_cli_default() {
+    let store = Arc::new(MemoryStore::new());
+    let config = cfg();
+    let cli_default = 24 * NS_PER_HOUR;
+    let durable = 48 * NS_PER_HOUR;
+    let retention = RetentionConfig::from_policy(
+        RetentionPolicy {
+            default: Some(cli_default),
+            tenants: vec![],
+        },
+        &config,
+        DEFAULT_MAX_INGEST_LAG_NS,
+    )
+    .expect("cli retention config");
+    write_tenant_retention(store.as_ref(), durable).await;
+
+    let now = (i64::from(HOUR) + 60) * NS_PER_HOUR;
+    let clock = FixedClock::new(now);
+
+    // Aged ~30h: kept under 48h, expired under 24h.
+    let hour_30 = HOUR + 30;
+    let bucket_30 = bucket_at(hour_30);
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            hour_30,
+            Uuid::from_u128(0x30),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "h30")],
+                &[(i64::from(hour_30) * NS_PER_HOUR + 1_000, 1.0)],
+            )],
+        ),
+    )
+    .await;
+
+    // Aged ~50h: expired under both 48h and 24h.
+    let hour_50 = HOUR + 10;
+    let bucket_50 = bucket_at(hour_50);
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            hour_50,
+            Uuid::from_u128(0x50),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "h50")],
+                &[(i64::from(hour_50) * NS_PER_HOUR + 1_000, 2.0)],
+            )],
+        ),
+    )
+    .await;
+
+    // The 30h-old hour: kept by the durable 48h window.
+    let out_30 = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket_30,
+    )
+    .await
+    .expect("sweep h30");
+    assert_eq!(
+        out_30,
+        RetentionOutcome::NotExpired,
+        "the durable 48h window keeps the 30h-old hour (pre-fix reads CLI 24h and tombstones it)"
+    );
+    assert_eq!(
+        count_tombstones(store.as_ref(), &bucket_30).await,
+        0,
+        "no tombstone for the kept hour"
+    );
+    assert_eq!(
+        count_commit_records(store.as_ref(), &bucket_30).await,
+        1,
+        "the kept hour's commit record is untouched"
+    );
+
+    // The 50h-old hour: expired even under the durable 48h window.
+    let out_50 = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket_50,
+    )
+    .await
+    .expect("sweep h50");
+    assert_eq!(
+        out_50,
+        RetentionOutcome::Tombstoned,
+        "the 50h-old hour expires under the durable 48h window"
+    );
+    assert_eq!(
+        count_tombstones(store.as_ref(), &bucket_50).await,
+        1,
+        "exactly one tombstone for the expired hour"
+    );
+}
+
+/// #1131 (b): the liveness stall. With a durable window longer than the CLI
+/// default and a live HEAD naming the hour, the sweep must resolve the durable
+/// window and leave the hour retained -- never tombstone it -- so the physical
+/// sweep never repeats `BlockedBySnapshot` waiting for a frontier reconcile
+/// that (at the durable window) would not drop the hour.
+///
+/// Failing assertion against pre-fix code: `assert_eq!(pass1,
+/// RetentionOutcome::NotExpired)`. Pre-fix the sweep resolves the CLI 24h
+/// window and tombstones the 30h-old hour; a pass past the horizon then returns
+/// `BlockedBySnapshot(SnapshotBlock::Named)` on every tick, because the fold
+/// (at the durable window) keeps naming the hour and its frontier reconcile
+/// never drops it -- the stall this fix removes.
+#[tokio::test]
+async fn durable_window_avoids_blocked_by_snapshot_stall() {
+    let store = Arc::new(MemoryStore::new());
+    let config = cfg();
+    let cli_default = 24 * NS_PER_HOUR;
+    let durable = 200 * NS_PER_HOUR;
+    let retention = RetentionConfig::from_policy(
+        RetentionPolicy {
+            default: Some(cli_default),
+            tenants: vec![],
+        },
+        &config,
+        DEFAULT_MAX_INGEST_LAG_NS,
+    )
+    .expect("cli retention config");
+    write_tenant_retention(store.as_ref(), durable).await;
+
+    let now = (i64::from(HOUR) + 60) * NS_PER_HOUR;
+    let clock = FixedClock::new(now);
+    let hour_30 = HOUR + 30;
+    let bucket_30 = bucket_at(hour_30);
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            hour_30,
+            Uuid::from_u128(0x31),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "h30")],
+                &[(i64::from(hour_30) * NS_PER_HOUR + 1_000, 1.0)],
+            )],
+        ),
+    )
+    .await;
+
+    // A live HEAD naming the hour: the fold overlays the durable window, so its
+    // frontier reconcile keeps this hour. The sweep must agree and keep it too.
+    let default_retention_ns = retention.window_for(&tenant_hash());
+    fold_head(&store, Signal::Metrics, now, default_retention_ns).await;
+
+    // First sweep: retained under the durable window, no tombstone written.
+    let pass1 = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket_30,
+    )
+    .await
+    .expect("sweep pass 1");
+    assert_eq!(
+        pass1,
+        RetentionOutcome::NotExpired,
+        "the durable window keeps the hour; pre-fix reads CLI 24h and tombstones it"
+    );
+    assert_eq!(count_tombstones(store.as_ref(), &bucket_30).await, 0);
+
+    // The fold's frontier reconcile runs (watermark advanced). At the durable
+    // window it does not drop the hour, matching the sweep.
+    fold_head(
+        &store,
+        Signal::Metrics,
+        now + 3 * NS_PER_HOUR,
+        default_retention_ns,
+    )
+    .await;
+
+    // A second sweep, past the protection horizon: still retained, never
+    // BlockedBySnapshot. Pre-fix the hour is tombstoned and this pass returns
+    // BlockedBySnapshot(Named) on every tick.
+    clock.set(now + config.protection_horizon_ns + 1);
+    let pass2 = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket_30,
+    )
+    .await
+    .expect("sweep pass 2");
+    assert_ne!(
+        pass2,
+        RetentionOutcome::BlockedBySnapshot(SnapshotBlock::Named),
+        "the durable window means the hour is never tombstoned, so no snapshot block"
+    );
+    assert_eq!(
+        pass2,
+        RetentionOutcome::NotExpired,
+        "the hour is reported retained on the second pass"
+    );
+    assert_eq!(count_tombstones(store.as_ref(), &bucket_30).await, 0);
+}
+
+/// #1131 (c): the fold and the sweep resolve the SAME window (exact ns) for a
+/// tenant with a durable record, one with only a CLI override, and one with
+/// neither. Also pins the precedence tiebreak: a durable record wins over a CLI
+/// per-tenant override.
+///
+/// Failing assertion against pre-fix code: in case 1, `assert_eq!(sweep,
+/// Some(durable))`. To reproduce the pre-fix resolution, make
+/// `resolve_retention_window_ns` return `Ok(retention.window_for(tenant))`
+/// (ignore the durable record): the sweep then resolves the CLI override (36h),
+/// not the durable 48h, and diverges from the fold.
+#[tokio::test]
+async fn fold_and_sweep_resolve_the_same_window() {
+    let config = cfg();
+    let cli_default = 24 * NS_PER_HOUR;
+    let cli_override = 36 * NS_PER_HOUR;
+    let durable = 48 * NS_PER_HOUR;
+
+    // Resolve the window through both paths: the sweep's new async resolver, and
+    // the fold's own resolution (read the durable record the same way and
+    // overlay it on the deployment default services/ravel-server/src/fold.rs
+    // hands to Catalog::fold, `RetentionConfig::window_for`).
+    async fn resolve_both(
+        store: &dyn ObjectStoreBackend,
+        retention: &RetentionConfig,
+    ) -> (Option<i64>, Option<i64>) {
+        let th = tenant_hash();
+        let sweep = resolve_retention_window_ns(store, retention, &th)
+            .await
+            .expect("sweep resolves window");
+        let tenant_config = ravel_catalog::read_config_values(store, &th)
+            .await
+            .expect("read tenant config");
+        let fold = ravel_catalog::resolve_retention_window(
+            tenant_config.as_ref(),
+            retention.window_for(&th),
+        );
+        (sweep, fold)
+    }
+
+    // Case 1: a durable record present (with a CLI override too) -> durable wins.
+    {
+        let store = Arc::new(MemoryStore::new());
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(cli_default),
+                tenants: vec![(TENANT.to_string(), cli_override)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("retention config");
+        write_tenant_retention(store.as_ref(), durable).await;
+        let (sweep, fold) = resolve_both(store.as_ref(), &retention).await;
+        assert_eq!(
+            sweep,
+            Some(durable),
+            "the durable record wins over the CLI per-tenant override"
+        );
+        assert_eq!(fold, Some(durable));
+        assert_eq!(
+            sweep, fold,
+            "the sweep and the fold resolve the same window"
+        );
+    }
+
+    // Case 2: only a CLI per-tenant override, no durable record.
+    {
+        let store = Arc::new(MemoryStore::new());
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(cli_default),
+                tenants: vec![(TENANT.to_string(), cli_override)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("retention config");
+        let (sweep, fold) = resolve_both(store.as_ref(), &retention).await;
+        assert_eq!(sweep, Some(cli_override));
+        assert_eq!(fold, Some(cli_override));
+        assert_eq!(
+            sweep, fold,
+            "the sweep and the fold resolve the same window"
+        );
+    }
+
+    // Case 3: neither a durable record nor any CLI policy.
+    {
+        let store = Arc::new(MemoryStore::new());
+        let retention = RetentionConfig::default();
+        let (sweep, fold) = resolve_both(store.as_ref(), &retention).await;
+        assert_eq!(sweep, None);
+        assert_eq!(fold, None);
+        assert_eq!(
+            sweep, fold,
+            "the sweep and the fold resolve the same window"
+        );
+    }
+}
+
 /// Deliverable 5 (counters): the fail-closed undecodable-HEAD block is
 /// observable through `MaintainReport::blocked_by_unreadable_head`, distinct
 /// from the named-block counter.
@@ -1334,4 +1712,512 @@ async fn scan_reports_blocked_by_unreadable_head_counter() {
         "the fail-closed unreadable-HEAD block is counted distinctly"
     );
     assert_eq!(r2.blocked_by_snapshot, 0);
+}
+
+// --- #1113 traceability: TombstoneBucket / commit-token query --------------
+
+/// TombstoneBucket (commit traceability row 5): a commit-token query for a
+/// flush whose bucket was tombstoned through the real `write_tombstone`
+/// production path must answer tombstoned -- satisfied with zero segments --
+/// not a plain miss. The tombstone is reached by faulting the tombstone's own
+/// delete during the physical sweep (mirrors `partial_sweep_crash_then_
+/// converges`), so the commit record is already gone while the tombstone
+/// object still stands: exactly the state a client holding a stale token can
+/// observe.
+///
+/// To watch this FAIL, change `resolve_min_token_fallback` to ignore a
+/// tombstone match on the listed bucket (treat it the same as finding
+/// nothing): the `catalog.resolve` call then returns
+/// `CatalogError::UnsatisfiableToken` instead of a snapshot, so the
+/// `.expect("a tombstoned token resolves...")` panics.
+#[tokio::test]
+async fn tombstoned_bucket_token_query_reports_tombstoned() {
+    let inner = Arc::new(MemoryStore::new());
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Delete, ScriptedFault::Timeout)
+            .with_key_contains("retire.tmb")
+            .with_occurrence(Occurrence::Nth(1)),
+    );
+    let store = FaultStore::new(inner.clone(), plan);
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let writer_id = Uuid::from_u128(0x70);
+    let spec = InputSpec::new(
+        writer_id,
+        3,
+        1,
+        vec![raw_series("m", &[("k", "a")], &[(1_000, 1.0)])],
+    );
+    seed_input(&store, &spec).await;
+    let bucket = bucket();
+    let config = cfg();
+    let retention = retention_at_floor(&config);
+
+    let tombstoned =
+        retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &bucket)
+            .await
+            .expect("tombstone pass");
+    assert_eq!(tombstoned, RetentionOutcome::Tombstoned);
+
+    // Past the horizon: the physical sweep deletes the commit record and
+    // data, then the tombstone's own delete faults, leaving the tombstone in
+    // place with the record already gone.
+    clock.set(created + config.protection_horizon_ns + 1);
+    let err = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &bucket).await;
+    assert!(err.is_err(), "the tombstone delete fault aborts the sweep");
+    assert_eq!(store.fault_count(Op::Delete, FaultKind::Timeout), 1);
+    assert!(
+        has_tombstone(inner.as_ref(), &bucket).await,
+        "tombstone survives the crash, so exclusion still holds"
+    );
+    assert_eq!(
+        count_commit_records(inner.as_ref(), &bucket).await,
+        0,
+        "the commit record is already gone: the exact-key GET must miss"
+    );
+
+    let token = CommitToken {
+        shard: SHARD,
+        writer_id,
+        epoch: spec.epoch,
+        seq: spec.seq,
+        ingest_hour_bucket: HOUR,
+    };
+    let dyn_store: Arc<dyn ObjectStoreBackend> = inner.clone();
+    let catalog = ravel_catalog::Catalog::new(
+        dyn_store,
+        ravel_catalog::CatalogConfig {
+            shard_count: SHARD + 1,
+            ..Default::default()
+        },
+    )
+    .expect("catalog");
+    let range = TimeRange {
+        start_ns: i64::from(HOUR) * NS_PER_HOUR,
+        end_ns: (i64::from(HOUR) + 1) * NS_PER_HOUR,
+    };
+    let snapshot = catalog
+        .resolve(
+            &tenant_hash(),
+            Signal::Metrics,
+            range,
+            &[token],
+            clock.now_ns(),
+        )
+        .await
+        .expect("a tombstoned token resolves, not UnsatisfiableToken");
+    assert!(
+        snapshot.segments.is_empty(),
+        "the tombstoned flush is satisfied with zero segments, not served stale data"
+    );
+}
+
+// --- Rewrite records are records for retention (issue #1321) ---------------
+//
+// A selective-erasure rewrite record (ADR-0064 decision 3) is a bucket's whole
+// live record set once the superseded-input sweep has removed its inputs, and
+// compaction refuses a bucket holding one, so rewrite-record-only is the
+// durable steady state of an erased bucket. Retention must read it when
+// computing expiry and delete it when sweeping.
+
+/// The synthetic raw-L0 input identity the seeded rewrite records supersede,
+/// and the erasure request they record as applied. Neither has to exist as an
+/// object: retention reads the rewrite record's own fields, and
+/// `erasure::decode_rewrite` validates them against the record's key.
+const REWRITE_INPUT_WRITER: u128 = 0x51;
+const REWRITE_REQUEST: u128 = 0x77;
+
+/// The bytes seeded at each rewrite output part key. Content is irrelevant to
+/// retention (it reads records, never parts), only the object's presence is.
+const REWRITE_PART_BYTES: &[u8] = b"rewrite-output-part";
+
+/// Build one rewrite record for `bucket`: `parts` gives each output part's
+/// `(min_event_ts_ns, max_event_ts_ns)`, empty for a rewrite that dropped
+/// every record in the bucket (which `RewriteRecord.parts` permits).
+fn rewrite_record_for(
+    bucket: &Bucket,
+    created_unix_ns: i64,
+    parts: &[(i64, i64)],
+) -> RewriteRecord {
+    let inputs = vec![CompactionInputIdentity {
+        writer_id: Uuid::from_u128(REWRITE_INPUT_WRITER).to_string(),
+        writer_epoch: 1,
+        writer_seq: 1,
+    }];
+    let request_id = Uuid::from_u128(REWRITE_REQUEST).to_string();
+    let input_set_hash = ravel_commit::erasure::compute_rewrite_input_set_hash(
+        &inputs,
+        None,
+        std::slice::from_ref(&request_id),
+    );
+    RewriteRecord {
+        format_version: 1,
+        tenant_hash: bucket.tenant_hash.0.to_vec(),
+        signal: ravel_commit::signal::to_proto(bucket.signal) as i32,
+        shard: bucket.shard,
+        ingest_hour_bucket: bucket.ingest_hour_bucket,
+        inputs,
+        input_set_hash: input_set_hash.to_vec(),
+        parts: parts
+            .iter()
+            .enumerate()
+            .map(
+                |(index, (min_event_ts_ns, max_event_ts_ns))| CompactionPart {
+                    part_index: index as u32,
+                    first_series_id: vec![0x00; 16],
+                    last_series_id: vec![0xff; 16],
+                    content_hash: vec![0xab; 32],
+                    object_size: REWRITE_PART_BYTES.len() as u64,
+                    sample_count: 1,
+                    series_count: 1,
+                    run_count: 1,
+                    min_event_ts_ns: *min_event_ts_ns,
+                    max_event_ts_ns: *max_event_ts_ns,
+                    segment_format_version: 3,
+                    declared_column_stats: Vec::new(),
+                },
+            )
+            .collect(),
+        drops: vec![RewriteDrop {
+            request_id,
+            dropped_count: 1,
+        }],
+        created_unix_ns,
+        superseded_record_key: String::new(),
+    }
+}
+
+/// Seed [`rewrite_record_for`] plus the L1 part object each of its parts
+/// names, exactly as `publish_rewrite_record` would (ADR-0064 decision 3
+/// point 2: rewrite outputs are PUT under the L1 part-key shape). Returns the
+/// record key and the part keys.
+async fn seed_rewrite_record(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    created_unix_ns: i64,
+    parts: &[(i64, i64)],
+) -> (String, Vec<String>) {
+    let record = rewrite_record_for(bucket, created_unix_ns, parts);
+    let record_key = keys::rewrite_record_key_for(&record).expect("rewrite record key");
+    store
+        .put(
+            &record_key,
+            ravel_commit::erasure::encode_rewrite(&record),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put rewrite record");
+    let mut part_keys = Vec::new();
+    for part in &record.parts {
+        let key = keys::reconstruct_rewrite_part_key(&record, part).expect("rewrite part key");
+        store
+            .put(
+                &key,
+                Bytes::from_static(REWRITE_PART_BYTES),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put rewrite part");
+        part_keys.push(key);
+    }
+    (record_key, part_keys)
+}
+
+/// The exact set of keys in the store, so a sweep assertion pins which objects
+/// are gone rather than how many.
+async fn key_set(store: &dyn ObjectStoreBackend) -> BTreeSet<String> {
+    list_all(store, "")
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|meta| meta.key)
+        .collect()
+}
+
+fn tombstone_key_of(bucket: &Bucket) -> String {
+    keys::retention_tombstone_key(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .expect("tombstone key")
+}
+
+/// `now`, and the tenant's window, for a bucket whose expiry threshold
+/// (`now - R`) is a workable number: sealed well past the seal margin, with
+/// `R` at the config floor.
+fn window_and_now(config: &CompactorConfig) -> (i64, i64) {
+    let window = config.retention_floor_ns(DEFAULT_MAX_INGEST_LAG_NS);
+    (window, sealed_now_ns() + window)
+}
+
+/// The expiry maximum takes the later of an L0 commit record's
+/// `max_event_ts_ns` and a rewrite record's part bounds, in both directions,
+/// and falls back to a part-less rewrite record's own `created_unix_ns`.
+///
+/// Exact values, not bands: dropping the rewrite arm of `max_event_ts` makes
+/// the first assertion return `Some(1_000)` instead of `Some(5_000)` and the
+/// third `None` instead of `Some(7_777)`.
+#[test]
+fn max_event_ts_takes_the_later_of_l0_and_rewrite() {
+    let b = bucket();
+    let rewrite = rewrite_record_for(&b, 42, &[(2_000, 5_000)]);
+
+    assert_eq!(
+        max_event_ts(
+            &[commit_with_max_event(1_000)],
+            &[],
+            std::slice::from_ref(&rewrite)
+        ),
+        Some(5_000),
+        "the rewrite record's part is the newest record in the bucket"
+    );
+    assert_eq!(
+        max_event_ts(&[commit_with_max_event(9_000)], &[], &[rewrite]),
+        Some(9_000),
+        "the L0 commit record is the newest record in the bucket"
+    );
+    assert_eq!(
+        max_event_ts(&[], &[], &[rewrite_record_for(&b, 7_777, &[])]),
+        Some(7_777),
+        "a rewrite with no surviving part contributes its own created_unix_ns"
+    );
+    assert_eq!(
+        max_event_ts(&[], &[], &[]),
+        None,
+        "a bucket with no records at all still yields no maximum"
+    );
+}
+
+/// A bucket whose only record is a rewrite record is tombstoned once the clock
+/// passes the tenant's retention window, and the horizon-gated sweep then
+/// deletes the rewrite record, its output part, and the tombstone, leaving the
+/// bucket empty.
+///
+/// Exact key sets at both steps, so a sweep that leaves the rewrite record
+/// behind (the pre-fix `SweptPartial` forever) cannot pass.
+#[tokio::test]
+async fn rewrite_record_only_bucket_is_tombstoned_then_fully_swept() {
+    let store = MemoryStore::new();
+    let config = cfg();
+    let retention = retention_at_floor(&config);
+    let (window, now) = window_and_now(&config);
+    let b = bucket();
+
+    // One nanosecond older than the expiry threshold `now - R`: expired.
+    let max_event = now - window - 1;
+    let (record_key, part_keys) =
+        seed_rewrite_record(&store, &b, max_event, &[(max_event - 1_000, max_event)]).await;
+    assert_eq!(part_keys.len(), 1, "one output part seeded");
+    let seeded: BTreeSet<String> = [record_key.clone(), part_keys[0].clone()]
+        .into_iter()
+        .collect();
+    assert_eq!(key_set(&store).await, seeded, "exactly what was seeded");
+
+    let clock = FixedClock::new(now);
+    let outcome = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &b)
+        .await
+        .expect("retention pass");
+    assert_eq!(outcome, RetentionOutcome::Tombstoned);
+
+    let tombstone_key = tombstone_key_of(&b);
+    let mut tombstoned = seeded.clone();
+    tombstoned.insert(tombstone_key.clone());
+    assert_eq!(
+        key_set(&store).await,
+        tombstoned,
+        "the tombstone is the only new object; nothing is deleted yet"
+    );
+
+    // The tombstone counts the rewrite record as a record observed.
+    let bytes = store
+        .get(&tombstone_key, ravel_object_store::GetRange::Full)
+        .await
+        .expect("get tombstone")
+        .data;
+    let tombstone = ravel_commit::record::decode_tombstone(bytes.as_ref()).expect("decode");
+    assert_eq!(
+        tombstone.record_count_observed, 1,
+        "the rewrite record is the one record the bucket held"
+    );
+    assert_eq!(tombstone.retired_at_ns, now);
+    assert_eq!(tombstone.retention_window_ns, window as u64);
+
+    // Horizon elapsed: the physical sweep finishes the bucket.
+    let after_horizon = FixedClock::new(now + config.protection_horizon_ns);
+    let outcome =
+        retention_sweep_bucket(&store, &after_horizon, &config, &retention, &NoLeases, &b)
+            .await
+            .expect("sweep pass");
+    assert_eq!(outcome, RetentionOutcome::Swept);
+    assert_eq!(
+        key_set(&store).await,
+        BTreeSet::new(),
+        "rewrite record, its part, and the tombstone are all gone"
+    );
+}
+
+/// A rewrite-record-only bucket still inside its retention window is not
+/// tombstoned, at the threshold (`max_event_ts == now - R`, which
+/// [`is_expired`] treats as live) and strictly inside it.
+#[tokio::test]
+async fn rewrite_record_only_bucket_inside_its_window_is_not_tombstoned() {
+    for past_threshold in [0i64, 1] {
+        let store = MemoryStore::new();
+        let config = cfg();
+        let retention = retention_at_floor(&config);
+        let (window, now) = window_and_now(&config);
+        let b = bucket();
+
+        let max_event = now - window + past_threshold;
+        let (record_key, part_keys) =
+            seed_rewrite_record(&store, &b, max_event, &[(max_event - 1_000, max_event)]).await;
+        let seeded: BTreeSet<String> = [record_key, part_keys[0].clone()].into_iter().collect();
+
+        let clock = FixedClock::new(now);
+        let outcome = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &b)
+            .await
+            .expect("retention pass");
+        assert_eq!(
+            outcome,
+            RetentionOutcome::NotExpired,
+            "max_event_ts {max_event} is not older than the threshold {}",
+            now - window
+        );
+        assert!(!has_tombstone(&store, &b).await, "no tombstone was written");
+        assert_eq!(
+            key_set(&store).await,
+            seeded,
+            "an unexpired bucket is untouched: exact key set unchanged"
+        );
+    }
+}
+
+/// A bucket holding a rewrite record plus a live L0 commit record expires on
+/// the later of the two timestamps, whichever record carries it. The
+/// rewrite-is-younger direction is what fails when `max_event_ts` ignores
+/// rewrite records: the bucket then looks expired and is tombstoned while a
+/// surviving rewrite output part is still inside the window.
+#[tokio::test]
+async fn rewrite_record_plus_live_l0_expires_on_the_later_timestamp() {
+    // (label, rewrite part max_event offset from the threshold, L0 offset)
+    let cases = [
+        ("rewrite is younger", 1i64, -1i64),
+        ("l0 is younger", -1, 1),
+    ];
+    for (label, rewrite_offset, l0_offset) in cases {
+        let store = MemoryStore::new();
+        let config = cfg();
+        let retention = retention_at_floor(&config);
+        let (window, now) = window_and_now(&config);
+        let threshold = now - window;
+        let b = bucket();
+
+        let l0_max = threshold + l0_offset;
+        let commit_key = seed_input(
+            &store,
+            &InputSpec::new(
+                Uuid::from_u128(0x71),
+                4,
+                1,
+                vec![raw_series(
+                    "m",
+                    &[("k", "a")],
+                    &[(l0_max - 1_000, 1.0), (l0_max, 2.0)],
+                )],
+            ),
+        )
+        .await;
+        let rewrite_max = threshold + rewrite_offset;
+        let (record_key, part_keys) = seed_rewrite_record(
+            &store,
+            &b,
+            rewrite_max,
+            &[(rewrite_max - 1_000, rewrite_max)],
+        )
+        .await;
+
+        let clock = FixedClock::new(now);
+        let outcome = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &b)
+            .await
+            .expect("retention pass");
+        assert_eq!(
+            outcome,
+            RetentionOutcome::NotExpired,
+            "{label}: the later of {rewrite_max} (rewrite) and {l0_max} (L0) is not \
+             older than the threshold {threshold}"
+        );
+        assert!(
+            !has_tombstone(&store, &b).await,
+            "{label}: no tombstone was written"
+        );
+        let expected: BTreeSet<String> = [commit_key, record_key, part_keys[0].clone()]
+            .into_iter()
+            .chain(
+                list_all(
+                    &store,
+                    &format!("t/{}/{}/l0/", b.tenant_hash.to_hex(), b.signal.key_prefix()),
+                )
+                .await
+                .expect("list l0")
+                .into_iter()
+                .map(|meta| meta.key),
+            )
+            .collect();
+        assert_eq!(
+            key_set(&store).await,
+            expected,
+            "{label}: an unexpired bucket is untouched"
+        );
+    }
+}
+
+/// A rewrite that dropped every record in its bucket leaves a part-less
+/// rewrite record: no event timestamp anywhere in the bucket. It expires on
+/// the record's own `created_unix_ns`, so the metadata is not retained
+/// forever, and it is swept the same way.
+#[tokio::test]
+async fn part_less_rewrite_record_expires_on_its_created_ts() {
+    let config = cfg();
+    let (window, now) = window_and_now(&config);
+    let b = bucket();
+
+    // Inside the window: the record's creation instant is the threshold
+    // itself, which is not strictly older than it.
+    let store = MemoryStore::new();
+    let retention = retention_at_floor(&config);
+    let (record_key, part_keys) = seed_rewrite_record(&store, &b, now - window, &[]).await;
+    assert!(part_keys.is_empty(), "a part-less rewrite seeds no part");
+    let clock = FixedClock::new(now);
+    let outcome = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &b)
+        .await
+        .expect("retention pass");
+    assert_eq!(outcome, RetentionOutcome::NotExpired);
+    assert_eq!(
+        key_set(&store).await,
+        BTreeSet::from([record_key.clone()]),
+        "the rewrite record is untouched"
+    );
+
+    // One nanosecond older: expired, then swept away entirely.
+    let store = MemoryStore::new();
+    let (record_key, _) = seed_rewrite_record(&store, &b, now - window - 1, &[]).await;
+    let outcome = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &b)
+        .await
+        .expect("retention pass");
+    assert_eq!(outcome, RetentionOutcome::Tombstoned);
+    assert_eq!(
+        key_set(&store).await,
+        BTreeSet::from([record_key, tombstone_key_of(&b)]),
+        "the tombstone joins the rewrite record"
+    );
+
+    let after_horizon = FixedClock::new(now + config.protection_horizon_ns);
+    let outcome =
+        retention_sweep_bucket(&store, &after_horizon, &config, &retention, &NoLeases, &b)
+            .await
+            .expect("sweep pass");
+    assert_eq!(outcome, RetentionOutcome::Swept);
+    assert_eq!(key_set(&store).await, BTreeSet::new());
 }

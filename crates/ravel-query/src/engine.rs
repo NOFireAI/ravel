@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,9 @@ use ravel_promql::{
 };
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_segment::ReaderLimits;
-use ravel_types::accounting::{CostEstimate, QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::{
+    AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
+};
 use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
 };
@@ -31,7 +33,12 @@ use crate::fetcher::{
     FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, ReadCache, SamplePriority,
     SegmentFetcher,
 };
+use crate::io_shape::{IoShapeCounts, PlanClass, QueryIoShape};
+use crate::limiter::GetLimiter;
+use crate::log_fetcher::{DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogFetchError, LogSegmentFetcher};
+use crate::log_series;
 use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
+use crate::request_budgets::RequestBudgets;
 use crate::segment_admission;
 
 /// Which evaluation shape a prefetch is being computed for: an instant
@@ -102,15 +109,23 @@ pub struct QueryStats {
     /// healthy. Surfaced into the query response's `warnings` array alongside
     /// the evaluator's own [`Annotations`] warnings.
     pub warnings: Vec<String>,
+    /// The query's I/O dependency shape (issue #1214): chain depth, LIST
+    /// pagination, concurrency-forced batching, exact unfolded-record count,
+    /// and pre-execution plan class. See `crate::io_shape` module docs for
+    /// what each figure means, and how it differs from `phase_accounting`'s
+    /// request/byte cost split above.
+    pub io_shape: QueryIoShape,
 }
 
 impl QueryStats {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         segments_fetched: u64,
         segments_pruned: u64,
         page_stats: FetchStats,
         phase_accounting: PhaseAccountingSnapshot,
         estimate: CostEstimate,
+        io_shape: QueryIoShape,
     ) -> Self {
         QueryStats {
             segments_fetched,
@@ -121,6 +136,7 @@ impl QueryStats {
             estimate,
             partial: false,
             warnings: Vec::new(),
+            io_shape,
         }
     }
 }
@@ -139,6 +155,7 @@ impl Default for QueryStats {
             estimate: CostEstimate::new(0, 0, 0, 0, 0),
             partial: false,
             warnings: Vec::new(),
+            io_shape: QueryIoShape::default(),
         }
     }
 }
@@ -313,11 +330,86 @@ fn estimate_cost(
     )
 }
 
+/// A running request's spend, readable from outside the call.
+///
+/// The engine builds a fresh [`PhaseAccounting`] per lane and per attempt and
+/// returns its snapshot only inside a successful [`QueryStats`], so a caller
+/// whose future is dropped mid-query has nothing to read. An engine handed one
+/// of these through [`QueryEngine::with_live_usage`] registers each of those
+/// handles here before it issues its first store call, so a drop guard can read
+/// what the abandoned request had spent by then. The mirror of
+/// `ravel_sql::LiveAccounting`, which is what the SQL surface reads on the
+/// same path.
+///
+/// The view is ADDITIVE: it keeps every handle registered during the request
+/// and [`Self::snapshot`] sums them. One request can spend through several
+/// handles -- the metrics lane and the log lane of one PromQL query, one per
+/// `match[]` selector of a metadata request, and one per attempt when a
+/// snapshot is invalidated and the query re-resolves -- and a cancelled request
+/// owes the total, not whichever handle happened to be installed last. Each
+/// site registers a handle it just built, exactly once, so no counter block is
+/// summed twice.
+#[derive(Clone, Default)]
+pub struct LiveQueryAccounting(Arc<std::sync::Mutex<Vec<PhaseAccounting>>>);
+
+impl LiveQueryAccounting {
+    /// A live view whose counters are all zero until a lane or an attempt
+    /// registers its handle.
+    pub fn new() -> Self {
+        LiveQueryAccounting::default()
+    }
+
+    /// The spend issued so far across every registered handle, each pooled
+    /// across phases the way [`QueryStats::accounting`] is and then summed.
+    pub fn snapshot(&self) -> QueryAccountingSnapshot {
+        self.lock()
+            .iter()
+            .fold(QueryAccountingSnapshot::default(), |total, accounting| {
+                total.saturating_add(&accounting.snapshot().pooled())
+            })
+    }
+
+    /// Register `accounting` (the lane or attempt about to run) with this
+    /// view. Clones the handle, so the two share one counter block and every
+    /// increment the lane makes is visible through [`Self::snapshot`].
+    fn install(&self, accounting: &PhaseAccounting) {
+        self.lock().push(accounting.clone());
+    }
+
+    /// Lock the inner slot, recovering a poisoned guard. The slot holds
+    /// cheap-to-clone handles and no torn state, so recovering is strictly
+    /// better than failing every later snapshot.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PhaseAccounting>> {
+        match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
 /// Resolves snapshots, fetches segments, merges cross-segment duplicates,
 /// and evaluates PromQL over the result (docs/query-engine.md).
 pub struct QueryEngine {
     catalog: Arc<Catalog>,
     fetcher: SegmentFetcher,
+    /// Fetches log segments for `ravel_log_lines`/`ravel_log_bytes`
+    /// selectors (ADR-1103). Built from the same store as `fetcher`,
+    /// with the logs-specific fetch bounds from `config`.
+    log_fetcher: LogSegmentFetcher,
+    /// The one process-shareable GET limiter (ADR-1195) this engine's
+    /// `fetcher` and `log_fetcher` were built to share. Kept so
+    /// [`Self::with_get_limiter`] can hand out the SAME `Arc` a caller
+    /// later wants a second engine (or a directly-constructed fetcher) to
+    /// also draw permits from.
+    get_limiter: Arc<GetLimiter>,
+    /// The one process-shareable fetch memory budget (ADR-1170 decision 2)
+    /// this engine's `fetcher` and `log_fetcher` were built to share. Kept, like
+    /// [`get_limiter`](Self::get_limiter), so [`Self::with_memory_budget`] can
+    /// hand out the SAME `Arc` a caller later wants a second engine (or a
+    /// server task installing a finite budget) to also reserve against. The
+    /// default from [`Self::new`] is [`ravel_memory::MemoryBudget::unlimited`],
+    /// so nothing is refused until a caller installs a finite budget.
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
     config: EngineConfig,
     /// ADR-0071 distributed read fan-out. `None` is the default:
     /// the engine runs the local fetch path untouched. `Some` opts this engine
@@ -330,6 +422,12 @@ pub struct QueryEngine {
     /// clusters and unioning their series into the merge pool; see
     /// [`QueryEngine::with_federation`].
     federation: Option<Arc<crate::distrib::Federation>>,
+    /// A caller's live view of this request's spend. Every site that builds a
+    /// `PhaseAccounting` registers it here: each attempt in
+    /// `resolve_snapshot_with_retry`, and the log lane in `prefetch`. `None`
+    /// is the default: an engine nobody asked for a live view from registers
+    /// nothing. See [`QueryEngine::with_live_usage`].
+    live_usage: Option<LiveQueryAccounting>,
 }
 
 impl QueryEngine {
@@ -338,12 +436,68 @@ impl QueryEngine {
         store: Arc<dyn ObjectStoreBackend>,
         config: EngineConfig,
     ) -> Self {
+        // `EngineConfig::validate` is not run by every caller of `new`
+        // (services/ravel-server/src/query.rs's non-SQL path calls this
+        // infallibly), so a zero bound is substituted here rather than
+        // propagated as a constructor error.
+        let fetch_run_bytes = if config.logs_max_fetch_run_bytes == 0 {
+            crate::config::DEFAULT_LOG_MAX_FETCH_RUN_BYTES
+        } else {
+            config.logs_max_fetch_run_bytes
+        };
+        // One process-owned limiter shared by every fetcher this engine owns
+        // (ADR-1195), built from `store_get_concurrency` rather than the
+        // legacy `fetch_concurrency` the two `with_max_concurrent_gets` calls
+        // below used before this change -- `store_get_concurrency()` resolves
+        // to `fetch_concurrency` itself when unset, so an untouched
+        // deployment is unaffected.
+        //
+        // The permit bounds GETs in flight, not tasks in flight: an RLOG
+        // block-range read builds its `ObjectAssembler` (charged to the
+        // assembly pool) before its first extent reaches `store_get_pinned`
+        // and waits for a permit, so with `promql_fetch_fanout` (or the SQL
+        // partition count) above `store_get_concurrency` up to that many
+        // object-sized assemblies can sit queued behind the limiter at once.
+        // Peak assembly memory scales with the fan-out, not with this count.
+        let get_limiter = Arc::new(GetLimiter::new_unchecked(
+            config.store_get_concurrency().max(1),
+        ));
+        // One process-owned fetch memory budget shared by every fetcher this
+        // engine owns (ADR-1170 decision 2), wired exactly like `get_limiter`.
+        // The default is unlimited: no reservation is ever refused until a
+        // caller installs a finite budget via `with_memory_budget`, so an
+        // engine built with plain `new` behaves as it did before this budget.
+        let memory_budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let log_fetcher = LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(config.logs_block_range_threshold)
+            .with_get_limiter(get_limiter.clone())
+            .with_memory_budget(memory_budget.clone())
+            .with_request_cost_bytes(config.logs_request_cost_bytes)
+            .with_max_fetch_run_bytes(fetch_run_bytes)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    error = %err,
+                    fetch_run_bytes,
+                    "invalid logs_max_fetch_run_bytes; using the log fetcher's default bound"
+                );
+                LogSegmentFetcher::new(store.clone())
+                    .with_block_range_threshold(config.logs_block_range_threshold)
+                    .with_get_limiter(get_limiter.clone())
+                    .with_memory_budget(memory_budget.clone())
+                    .with_request_cost_bytes(config.logs_request_cost_bytes)
+            });
         QueryEngine {
             catalog,
-            fetcher: SegmentFetcher::new(store),
+            fetcher: SegmentFetcher::new(store)
+                .with_get_limiter(get_limiter.clone())
+                .with_memory_budget(memory_budget.clone()),
+            log_fetcher,
+            get_limiter,
+            memory_budget,
             config,
             distributed: None,
             federation: None,
+            live_usage: None,
         }
     }
 
@@ -381,12 +535,121 @@ impl QueryEngine {
     /// [`ReadCache::Tiered`] so the disk tier reaches this engine's fetcher.
     #[must_use]
     pub fn with_cache(mut self, cache: impl Into<ReadCache>) -> Self {
-        self.fetcher = self.fetcher.with_cache(cache);
+        let cache = cache.into();
+        self.fetcher = self.fetcher.with_cache(cache.clone());
+        self.log_fetcher = self.log_fetcher.with_cache(cache);
+        self
+    }
+
+    /// Replaces the limiter on every fetcher this engine owns (`fetcher` and
+    /// `log_fetcher`) with `limiter`, so a process can share one
+    /// [`GetLimiter`] -- and so one process-wide GET ceiling -- across several
+    /// `QueryEngine`s (ADR-1195). `QueryEngine::new` already builds one
+    /// private limiter from `store_get_concurrency` and wires both fetchers to
+    /// it; this is the seam a caller uses to replace that private limiter with
+    /// a shared one after construction, mirroring [`Self::with_cache`].
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: Arc<GetLimiter>) -> Self {
+        self.fetcher = self.fetcher.with_get_limiter(limiter.clone());
+        self.log_fetcher = self.log_fetcher.with_get_limiter(limiter.clone());
+        self.get_limiter = limiter;
+        self
+    }
+
+    /// Replaces the fetch memory budget on every fetcher this engine owns
+    /// (`fetcher` and `log_fetcher`) with `budget`, so a process can share one
+    /// [`ravel_memory::MemoryBudget`] -- and so one process-wide fetch memory
+    /// ceiling -- across several `QueryEngine`s (ADR-1170 decision 2).
+    /// `QueryEngine::new` already builds one unlimited budget and wires both
+    /// fetchers to it; this is the seam a server task uses to replace that
+    /// default with a finite, shared budget after construction, mirroring
+    /// [`Self::with_get_limiter`].
+    #[must_use]
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.fetcher = self.fetcher.with_memory_budget(budget.clone());
+        self.log_fetcher = self.log_fetcher.with_memory_budget(budget.clone());
+        self.memory_budget = budget;
         self
     }
 
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// This engine scoped to one request's lowered budgets (ADR-1374
+    /// decision 3): the same catalog, fetchers, limiter, and fan-out
+    /// contexts, with `config`'s three budget fields replaced by
+    /// [`RequestBudgets::clamp`]'s output.
+    ///
+    /// Substituting the config rather than threading an extra parameter is
+    /// what makes every enforcement site read the effective budget without
+    /// each one having to consult a second value: `admit`, the three
+    /// bytes-scanned checks, and the request-budget check all already read
+    /// `self.config`. The clone is cheap and shares state by construction:
+    /// [`SegmentFetcher`] and [`LogSegmentFetcher`] both share their cache
+    /// and their [`GetLimiter`] across clones, so a scoped engine draws
+    /// permits from the same limiter and hits the same cache entries as the
+    /// engine it came from. It must stay that way; a fetcher clone that
+    /// forked its limiter would turn one query's budget scope into a second
+    /// concurrency allowance.
+    fn scoped_to(&self, budgets: &RequestBudgets) -> QueryEngine {
+        QueryEngine {
+            catalog: Arc::clone(&self.catalog),
+            fetcher: self.fetcher.clone(),
+            log_fetcher: self.log_fetcher.clone(),
+            get_limiter: Arc::clone(&self.get_limiter),
+            memory_budget: Arc::clone(&self.memory_budget),
+            config: budgets.clamp(&self.config).applied_to(&self.config),
+            distributed: self.distributed.clone(),
+            federation: self.federation.clone(),
+            live_usage: self.live_usage.clone(),
+        }
+    }
+
+    /// This engine, registering every lane's and every attempt's accounting
+    /// handle with `live` before that lane issues a store call.
+    ///
+    /// The caller keeps `live` and can read it at any instant, including from
+    /// a drop guard after the query's future was dropped, which is the one
+    /// path that has no [`QueryStats`] to read a spend from. Without it a
+    /// cancelled PromQL, metadata, or analytics query records a spend of zero
+    /// no matter how many objects it had already fetched. `live` sums the
+    /// handles, so one engine handed to a multi-selector metadata request
+    /// reports every selector's spend and not only the last one's.
+    ///
+    /// The clone shares state exactly as [`Self::scoped_to`]'s does: same
+    /// catalog, same fetchers, same [`GetLimiter`]. Handing a request-scoped
+    /// engine to `instant_with_budgets` and friends keeps working, because
+    /// `scoped_to` carries the live view through.
+    pub fn with_live_usage(&self, live: &LiveQueryAccounting) -> QueryEngine {
+        QueryEngine {
+            catalog: Arc::clone(&self.catalog),
+            fetcher: self.fetcher.clone(),
+            log_fetcher: self.log_fetcher.clone(),
+            get_limiter: Arc::clone(&self.get_limiter),
+            memory_budget: Arc::clone(&self.memory_budget),
+            config: self.config,
+            distributed: self.distributed.clone(),
+            federation: self.federation.clone(),
+            live_usage: Some(live.clone()),
+        }
+    }
+
+    /// The [`GetLimiter`] this engine's `fetcher` and `log_fetcher` currently
+    /// share. Test-only: production code has no reason to reach behind the
+    /// engine at its fetchers' shared limiter, only to replace it wholesale
+    /// via [`Self::with_get_limiter`].
+    #[cfg(test)]
+    fn get_limiter_for_test(&self) -> &Arc<GetLimiter> {
+        &self.get_limiter
+    }
+
+    /// The [`ravel_memory::MemoryBudget`] this engine's `fetcher` and
+    /// `log_fetcher` currently share. Test-only, same rationale as
+    /// [`Self::get_limiter_for_test`].
+    #[cfg(test)]
+    fn memory_budget_for_test(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
     }
 
     /// Evaluates `query` as an instant query, returning its value paired with
@@ -455,6 +718,52 @@ impl QueryEngine {
         )
         .await;
         unify_deadline(outcome, deadline)
+    }
+
+    /// [`Self::instant_with_stats_annotated`] under one request's
+    /// caller-supplied budgets (ADR-1374 decision 3).
+    ///
+    /// `budgets` can only LOWER this engine's configured ceilings; see
+    /// [`RequestBudgets::clamp`]. `None` delegates to
+    /// [`Self::instant_with_stats_annotated`] unchanged, which is what every
+    /// HTTP handler passes: the agent surface (#1381) is the caller that
+    /// supplies budgets.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn instant_with_budgets(
+        &self,
+        tenant_hash: TenantHash,
+        query: &str,
+        t_ms: i64,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+        budgets: Option<&RequestBudgets>,
+    ) -> Result<(Value, Annotations, QueryStats), QueryError> {
+        match budgets {
+            None => {
+                self.instant_with_stats_annotated(
+                    tenant_hash,
+                    query,
+                    t_ms,
+                    min_tokens,
+                    now_ns,
+                    deadline,
+                )
+                .await
+            }
+            Some(budgets) => {
+                self.scoped_to(budgets)
+                    .instant_with_stats_annotated(
+                        tenant_hash,
+                        query,
+                        t_ms,
+                        min_tokens,
+                        now_ns,
+                        deadline,
+                    )
+                    .await
+            }
+        }
     }
 
     async fn instant_inner(
@@ -609,6 +918,54 @@ impl QueryEngine {
         unify_deadline(outcome, deadline)
     }
 
+    /// [`Self::range_hist_with_stats_annotated`] under one request's
+    /// caller-supplied budgets (ADR-1374 decision 3). Same contract as
+    /// [`Self::instant_with_budgets`]: lowering only, and `None` is the
+    /// existing method unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn range_hist_with_budgets(
+        &self,
+        tenant_hash: TenantHash,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+        budgets: Option<&RequestBudgets>,
+    ) -> Result<(RangeValue, Annotations, QueryStats), QueryError> {
+        match budgets {
+            None => {
+                self.range_hist_with_stats_annotated(
+                    tenant_hash,
+                    query,
+                    start_ms,
+                    end_ms,
+                    step_ms,
+                    min_tokens,
+                    now_ns,
+                    deadline,
+                )
+                .await
+            }
+            Some(budgets) => {
+                self.scoped_to(budgets)
+                    .range_hist_with_stats_annotated(
+                        tenant_hash,
+                        query,
+                        start_ms,
+                        end_ms,
+                        step_ms,
+                        min_tokens,
+                        now_ns,
+                        deadline,
+                    )
+                    .await
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn range_inner(
         &self,
@@ -691,6 +1048,48 @@ impl QueryEngine {
         .map_err(|_| QueryError::DeadlineExceeded { deadline })?
     }
 
+    /// [`Self::resolve_series_with_stats`] under one request's
+    /// caller-supplied budgets (ADR-1374 decision 3). Same contract as
+    /// [`Self::instant_with_budgets`]: lowering only, and `None` is the
+    /// existing method unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_series_with_budgets(
+        &self,
+        tenant_hash: TenantHash,
+        matchers: &[LabelMatcher],
+        window: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+        budgets: Option<&RequestBudgets>,
+    ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
+        match budgets {
+            None => {
+                self.resolve_series_with_stats(
+                    tenant_hash,
+                    matchers,
+                    window,
+                    min_tokens,
+                    now_ns,
+                    deadline,
+                )
+                .await
+            }
+            Some(budgets) => {
+                self.scoped_to(budgets)
+                    .resolve_series_with_stats(
+                        tenant_hash,
+                        matchers,
+                        window,
+                        min_tokens,
+                        now_ns,
+                        deadline,
+                    )
+                    .await
+            }
+        }
+    }
+
     async fn resolve_series_inner(
         &self,
         tenant_hash: TenantHash,
@@ -699,6 +1098,12 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
+        if let Some(metric) = log_series::log_metric_of(matchers) {
+            return self
+                .resolve_log_series_inner(tenant_hash, metric, matchers, window, min_tokens, now_ns)
+                .await;
+        }
+
         let name_filter = equality_name_filter(matchers);
         // Discovery does not push aggregation down (ADR-0103 is scalar-sample
         // pushdown), so it ignores the resolve's generation history.
@@ -771,11 +1176,100 @@ impl QueryEngine {
         let ((series, warnings, partial), mut stats) = self
             .resolve_snapshot_with_retry(
                 tenant_hash,
+                Signal::Metrics,
                 window,
                 min_tokens,
                 now_ns,
                 name_filter.as_deref(),
                 1,
+                1,
+                true, // metadata_only: discovery never fetches pages.
+                attempt,
+            )
+            .await?;
+        stats.partial = partial;
+        stats.warnings = warnings;
+        Ok((series, stats))
+    }
+
+    /// Discovery-path counterpart of the metrics branch above, for a
+    /// `match[]` selector naming `ravel_log_lines`/`ravel_log_bytes`
+    /// (ADR-1103). Resolves `Signal::Logs` directly with no name-postings
+    /// filter, contributes each derived series' label set the same way a
+    /// metrics series would (same erasure, same dedup-by-label-set via
+    /// `build_series_by_id`), and never fans the selector to a remote
+    /// cluster: a federated deployment gets a warning annotation instead,
+    /// mirroring `prefetch`'s log lane rather than `federate_discovery`.
+    async fn resolve_log_series_inner(
+        &self,
+        tenant_hash: TenantHash,
+        metric: log_series::LogMetric,
+        matchers: &[LabelMatcher],
+        window: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+    ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
+        let attempt = |snapshot: Snapshot,
+                       _generations: Vec<ShardGeneration>,
+                       accounting: PhaseAccounting| async move {
+            let erasure = snapshot_erasure_predicates(&snapshot);
+            let req = log_series::LogSeriesRequest {
+                metric,
+                matchers,
+                window,
+                erasure: &erasure,
+                max_samples: self.config.max_samples,
+                max_series: self.config.max_series,
+                max_bytes_scanned: self.config.max_bytes_scanned,
+                max_s3_requests: self.config.max_s3_requests,
+                deadline: None,
+            };
+            let out = log_series::fetch_log_series(
+                &self.log_fetcher,
+                tenant_hash,
+                &snapshot.segments,
+                &req,
+                &accounting,
+            )
+            .await
+            .map_err(|err| self.map_log_series_error(err))?;
+
+            // Keyed on the remotes THIS tenant reaches, not on the presence of a
+            // federation context: a local tenant with no mapped remote runs a
+            // fully local query, so telling it a log selector was not federated
+            // describes a fan-out that was never going to happen.
+            let mut warnings = Vec::new();
+            if self
+                .federation
+                .as_ref()
+                .is_some_and(|f| f.has_remotes_for(tenant_hash))
+            {
+                warnings.push(log_not_federated_warning(metric.name()));
+            }
+
+            let by_id = build_series_by_id(
+                out.series
+                    .into_iter()
+                    .map(|s| (log_series_discovery_id(&s.labels), s.labels)),
+                self.config.max_series,
+            )?;
+            Ok((
+                (by_id.into_iter().collect::<Vec<_>>(), warnings, false),
+                FetchStats::default(),
+            ))
+        };
+
+        let ((series, warnings, partial), mut stats) = self
+            .resolve_snapshot_with_retry(
+                tenant_hash,
+                Signal::Logs,
+                window,
+                min_tokens,
+                now_ns,
+                None,
+                1,
+                1,
+                true, // metadata_only: log discovery never fetches pages.
                 attempt,
             )
             .await?;
@@ -790,9 +1284,14 @@ impl QueryEngine {
     /// because discovery enumerates series, not samples.
     ///
     /// Routes through the SAME [`crate::distrib::Federation`] coordinator the
-    /// query path uses -- there is no second federation path. Each remote
-    /// resolves under ITS OWN tenant auth (the operator credential baked into the
-    /// fetcher, never a wire `tenant_hash` and never a client credential),
+    /// query path uses -- there is no second federation path. `tenant_hash`
+    /// therefore selects the remotes this local tenant may use
+    /// ([`crate::distrib::RemoteCluster::tenant`]), so discovery cannot enumerate
+    /// a remote tenant's label namespace for a local tenant holding no
+    /// credential for it; a local tenant no remote names enumerates local series
+    /// only. Each selected remote then resolves under ITS OWN tenant auth (the
+    /// operator credential baked into the fetcher, never a wire `tenant_hash`
+    /// and never a client credential),
     /// enforces its own admission/limits/erasure, and returns decoded series that
     /// this method unions into the local pool. `skip_unavailable`, the
     /// deduplicated skipped-cluster warnings, and the partial-coverage marker all
@@ -864,17 +1363,15 @@ impl QueryEngine {
         Ok((series, outcome.warnings, outcome.partial))
     }
 
-    /// Prefetches every selector `plan_selectors` reported: one shared
-    /// snapshot resolved against the union of every selector's own fetch
-    /// window (`padded_range`, docs/query-engine.md), then one
-    /// concurrency-bounded, independently budget-checked fetch+merge per
-    /// selector's own matchers against that snapshot. A selector's fetch
-    /// only prunes by its own matchers server-side; a later
-    /// `SeriesSource::query` call still clips to its own window, so
-    /// combining every selector's already-merged series into one flat
-    /// source is correct regardless of how widely the selectors' windows
-    /// or matchers differ. An empty plan list (a query with no selectors,
-    /// e.g. a bare scalar or string literal) skips storage entirely.
+    /// Prefetches every selector `plan_selectors` reported, for BOTH signals
+    /// (ADR-1103 decision 4/5): metrics selectors run through
+    /// [`Self::prefetch_metric_plans`] unchanged, and any `ravel_log_lines`/
+    /// `ravel_log_bytes` selector (`log_series::log_metric_of`) runs on a
+    /// separate lane that resolves `Signal::Logs` directly, never through
+    /// distributed fan-out or federation, and spends only the query-wide
+    /// budget the metrics lane left remaining. A query naming no log metric
+    /// takes the metrics-only path with zero added cost or `Signal::Logs`
+    /// resolves.
     async fn prefetch(
         &self,
         tenant_hash: TenantHash,
@@ -888,6 +1385,356 @@ impl QueryEngine {
                 MergedSource {
                     series: Vec::new(),
                     histogram_series: Vec::new(),
+                    log_series: Vec::new(),
+                    precomputed_count: None,
+                },
+                QueryStats::default(),
+            ));
+        }
+
+        let metric_plans: Vec<SelectorPlan> = plans
+            .iter()
+            .filter(|p| log_series::log_metric_of(&p.matchers).is_none())
+            .cloned()
+            .collect();
+        let log_plans: Vec<SelectorPlan> = plans
+            .iter()
+            .filter(|p| log_series::log_metric_of(&p.matchers).is_some())
+            .cloned()
+            .collect();
+
+        let (mut source, mut stats) = self
+            .prefetch_metric_plans(tenant_hash, &metric_plans, eval_window, min_tokens, now_ns)
+            .await?;
+
+        if log_plans.is_empty() {
+            return Ok((source, stats));
+        }
+
+        let log_windows: Vec<TimeRange> = log_plans
+            .iter()
+            .map(|plan| selector_fetch_window(plan, eval_window))
+            .collect::<Result<_, _>>()?;
+        let mut log_padded = log_windows[0];
+        for w in &log_windows[1..] {
+            log_padded.start_ns = log_padded.start_ns.min(w.start_ns);
+            log_padded.end_ns = log_padded.end_ns.max(w.end_ns);
+        }
+
+        // The log lane never retries on `NotFound` the way
+        // `resolve_snapshot_with_retry` does for metrics: it runs strictly
+        // after the metrics lane has already produced its result, so a
+        // concurrent GC/compaction race here is the same
+        // `SnapshotInvalidated` class of rare failure the metrics lane's own
+        // second attempt exists to paper over, not a case worth duplicating
+        // that machinery for.
+        let log_accounting = PhaseAccounting::new();
+        // Before the log lane's own resolve, for the reason the metrics lane
+        // installs before its own: this lane spends through a handle of its
+        // own, and a caller's future dropped inside the log resolve or the
+        // log fetch below must still find these counters through the live
+        // view. Without it a query naming only `ravel_log_lines` (ADR-1103)
+        // never registers a handle at all and a cancellation records zero.
+        self.install_live_usage(&log_accounting);
+        let (log_snapshot, _log_generations, log_unfolded) = self
+            .resolve_bounded(
+                tenant_hash,
+                Signal::Logs,
+                log_padded,
+                min_tokens,
+                now_ns,
+                None,
+                log_accounting.resolve(),
+            )
+            .await?;
+
+        // Checked here, right after the log lane's own resolve returns, for
+        // the same reason the metrics lane checks in `resolve_snapshot_with_retry`
+        // do: a log selector whose snapshot resolves to zero segments never
+        // reaches the incremental checks in the log fetch loop below.
+        //
+        // Combined with the metrics lane's own already-spent total
+        // (`stats.phase_accounting`, populated by `prefetch_metric_plans`
+        // above), not the log lane's total alone: the two lanes share ONE
+        // query-wide `max_s3_requests` ceiling (the same reasoning
+        // `requests_remaining` below applies to the log fetch loop itself),
+        // so a metrics lane that already spent most of the budget must not
+        // let the log lane's resolve alone re-check against the whole
+        // ceiling as if the metrics spend never happened.
+        let combined_requests_so_far = stats
+            .phase_accounting
+            .pooled()
+            .total_s3_requests()
+            .saturating_add(log_accounting.snapshot().pooled().total_s3_requests());
+        if let Some(err) = segment_admission::request_budget_exceeded(
+            combined_requests_so_far,
+            self.config.max_s3_requests,
+        ) {
+            return Err(err);
+        }
+
+        // ADR-1103 decision 4 step 4: a query with both a metrics and a log
+        // selector must not spend two full `max_segments` budgets. Each
+        // `resolve_bounded` call above already checked its OWN sealed-segment
+        // count individually (`segment_admission::admit`); this adds the
+        // cumulative check across both lanes, using each lane's total
+        // resolved segment count (not just the sealed subset `admit` checks)
+        // as a conservative approximation -- `resolve_bounded` does not
+        // return the sealed/exempt split to its caller.
+        let total_segments = stats.segments_fetched + log_snapshot.segments.len() as u64;
+        if total_segments as usize > self.config.max_segments {
+            return Err(QueryError::TooManySegments {
+                count: total_segments as usize,
+                max: self.config.max_segments,
+            });
+        }
+
+        let erasure = snapshot_erasure_predicates(&log_snapshot);
+
+        // Remaining query-wide budget after the metrics lane's own spend
+        // (ADR-1103 decision 4 step 4): a log lane spending a second full
+        // budget would let a query with both selector kinds cost twice what
+        // `EngineConfig` bounds it to.
+        let samples_so_far: usize = source.series.iter().map(|s| s.samples.len()).sum::<usize>()
+            + source
+                .histogram_series
+                .iter()
+                .map(|s| s.samples.len())
+                .sum::<usize>();
+        let series_so_far = source.series.len() + source.histogram_series.len();
+        let mut samples_remaining = self.config.max_samples.saturating_sub(samples_so_far);
+        let mut series_remaining = self.config.max_series.saturating_sub(series_so_far);
+
+        let scanned_so_far = stats.phase_accounting.pooled().total_s3_bytes();
+        let bytes_remaining = match self.config.max_bytes_scanned {
+            ByteLimit::Bounded(max) => ByteLimit::Bounded(max.saturating_sub(scanned_so_far)),
+            ByteLimit::Unlimited => ByteLimit::Unlimited,
+        };
+        let requests_so_far = stats.phase_accounting.pooled().total_s3_requests();
+        let requests_remaining = match self.config.max_s3_requests {
+            RequestLimit::Bounded(max) => {
+                RequestLimit::Bounded(max.saturating_sub(requests_so_far))
+            }
+            RequestLimit::Unlimited => RequestLimit::Unlimited,
+        };
+
+        // `bytes_remaining`/`requests_remaining` are the absolute ceiling for
+        // the WHOLE log lane (every log plan below shares `log_accounting`,
+        // so `fetch_log_series`'s own per-segment check sees each plan's
+        // predecessor's spend too and naturally enforces the combined
+        // budget). `samples_remaining`/`series_remaining` are plain counts
+        // with no shared live accounting behind them, so they are reduced by
+        // hand after each plan below -- otherwise two log selectors would
+        // each see, and could each spend, the full remaining budget.
+        let mut log_series_out: Vec<SeriesData> = Vec::new();
+        // Indexes into `log_snapshot.segments`, unioned across the lane's
+        // plans: every plan walks that same slice, and a segment one plan
+        // prunes can be the one another plan fetches (issue #1228).
+        let mut log_fetched_segments: HashSet<usize> = HashSet::new();
+        let mut fed_metric_names: Vec<&'static str> = Vec::new();
+        for plan in &log_plans {
+            // `log_plans` was filtered by `log_metric_of(...).is_some()`
+            // above, so this is always `Some`; the `continue` never fires but
+            // keeps this loop panic-free rather than relying on that
+            // invariant holding across future edits to the filter above.
+            let Some(metric) = log_series::log_metric_of(&plan.matchers) else {
+                continue;
+            };
+            let req = log_series::LogSeriesRequest {
+                metric,
+                matchers: &plan.matchers,
+                window: log_padded,
+                erasure: &erasure,
+                max_samples: samples_remaining,
+                max_series: series_remaining,
+                max_bytes_scanned: bytes_remaining,
+                max_s3_requests: requests_remaining,
+                deadline: Some(Instant::now() + self.config.deadline),
+            };
+            let out = log_series::fetch_log_series(
+                &self.log_fetcher,
+                tenant_hash,
+                &log_snapshot.segments,
+                &req,
+                &log_accounting,
+            )
+            .await
+            .map_err(|err| self.map_log_series_error(err))?;
+            let out_samples: usize = out.series.iter().map(|s| s.samples.len()).sum();
+            samples_remaining = samples_remaining.saturating_sub(out_samples);
+            series_remaining = series_remaining.saturating_sub(out.series.len());
+            log_fetched_segments.extend(out.fetched_segments);
+            log_series_out.extend(out.series);
+            if !fed_metric_names.contains(&metric.name()) {
+                fed_metric_names.push(metric.name());
+            }
+        }
+
+        source.log_series = log_series_out;
+        let log_segments_fetched = log_fetched_segments.len() as u64;
+        // The union counts each segment once however many plans fetched it,
+        // so the rest of the resolved set is pruned and
+        // `fetched + pruned == log_snapshot.segments.len()` for any plan
+        // count. Every caller today passes the whole slice, so the union
+        // cannot exceed its length; the subtraction saturates only so a
+        // future caller unioning indexes from a subslice cannot wrap.
+        // `log_snapshot.segments_pruned` is 0 for this lane (the resolve
+        // passes no name filter, see `log_plan_class` below); adding it keeps
+        // a future resolve-side prune from being dropped.
+        let log_segments_pruned =
+            (log_snapshot.segments.len() as u64).saturating_sub(log_segments_fetched);
+        stats.segments_fetched += log_segments_fetched;
+        stats.segments_pruned += log_segments_pruned + log_snapshot.segments_pruned;
+        stats.phase_accounting =
+            combine_phase_accounting(&stats.phase_accounting, &log_accounting.snapshot());
+        stats.accounting = stats.phase_accounting.pooled();
+
+        // Fold the log lane's own io_shape contribution into the metrics
+        // lane's, mirroring the `combine_phase_accounting` fold above. The
+        // two lanes run STRICTLY SERIALLY, never alongside each other (see
+        // the comment above `resolve_bounded` at the top of this function:
+        // the log lane's resolve is only reached after the metrics lane's
+        // `prefetch_metric_plans` call has already been awaited to
+        // completion). Each field's combining rule follows from ONE
+        // criterion, stated once so the three do not silently drift onto
+        // three different unstated rules:
+        // - `list_page_depth` and `service_batches` are both
+        //   SERIALIZATION-ROUND counts: the number of sequential rounds a
+        //   lane's own fan-out actually waited through (LIST pages one
+        //   lane's resolve issued; concurrency-permit batches one lane's
+        //   fetch was forced into). Because the two lanes run one after the
+        //   other in wall-clock time with no overlap, the rounds a query
+        //   waits through end-to-end are the metrics lane's rounds followed
+        //   by the log lane's rounds -- genuinely additive, not a max: a
+        //   query whose metrics lane paginated 4 LIST pages and whose log
+        //   lane paginated 2 more waited through 6 serial pages, not 4, and
+        //   the same reasoning applies unchanged to `service_batches`'s
+        //   fetch-concurrency rounds.
+        // - `dependency_depth` uses a DIFFERENT criterion: DATA
+        //   independence, not serialization order. It measures the longest
+        //   chain of stages where a later stage needs an earlier stage's
+        //   bytes to know its own keys. The log lane's fetch chain needs no
+        //   byte the metrics lane fetched to know its own segment keys, so
+        //   the two chains are independent chains that merely happen to run
+        //   one after the other -- across lanes this stays max-based,
+        //   matching `dependency_depth`'s own definition, which a serial but
+        //   data-independent pair of chains does not satisfy.
+        // `unfolded_segments_resolved` IS additive (an exact total count
+        // across both lanes' resolves, with no ambiguity about how the two
+        // lanes' costs compose), and `unfolded_records_served_from_cache`
+        // follows the same rule for the same reason: it is an exact count of
+        // commit records served from cache during each lane's own resolve,
+        // and the two lanes' resolves are distinct resolves against
+        // (possibly) distinct commit records, so the query's total is the
+        // sum, not a max.
+        //
+        // The log lane's `whole_object_threshold` is not reachable from
+        // here (`BlockRangeFetcher::effective_whole_object_threshold` is
+        // private and, unlike `SegmentFetcher`'s fixed field, scales
+        // dynamically with `request_cost_bytes`); `DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`
+        // is used as a structural approximation, so a log fetcher configured
+        // with a non-default override can misclassify a segment's
+        // dependency_depth here.
+        let mut log_counts = IoShapeCounts {
+            dependency_depth: stats.io_shape.dependency_depth,
+            list_page_depth: 0,
+            service_batches: 0,
+        };
+        let log_depth = log_snapshot
+            .segments
+            .iter()
+            .map(|seg| {
+                crate::io_shape::depth_for_object(
+                    seg.object_size,
+                    DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+                )
+            })
+            .max()
+            .unwrap_or(0);
+        log_counts.record_dependency_chain(log_depth);
+        log_counts.record_service_batches(crate::io_shape::service_batches(
+            log_snapshot.segments.len() as u64,
+            self.config.fetch_concurrency.max(1) as u64,
+        ));
+        log_counts.service_batches = stats
+            .io_shape
+            .service_batches
+            .saturating_add(log_counts.service_batches);
+        let log_resolve_snapshot = log_accounting.resolve().snapshot();
+        let log_list_requests = log_resolve_snapshot.s3_requests(AccountedOp::List);
+        log_counts.record_list_pages(log_list_requests.min(u64::from(u32::MAX)) as u32);
+        log_counts.list_page_depth = stats
+            .io_shape
+            .list_page_depth
+            .saturating_add(log_counts.list_page_depth);
+        // The log lane's `resolve_bounded` call above always passes
+        // `name_filter: None` (ADR-1103's log discovery has no name-postings
+        // filter to prune against), so `Snapshot::segments_pruned` is
+        // structurally always 0 for this lane regardless of how narrow the
+        // resolved window actually is: `postings_ordinals_for_filter`'s
+        // first line returns `None` immediately when there is no name
+        // filter, so the pruning-count increment in
+        // `SnapshotWindow::extract_into` is unreachable here. Reporting
+        // `ExhaustiveScan` on that basis would be fabricated severity this
+        // lane cannot actually back up, and letting it through
+        // `merge_plan_class` would wrongly outrank a metrics lane that DID
+        // classify itself correctly. `Unclassified` says plainly that this
+        // crate cannot tell, for this lane, whether the fetch was pruned or
+        // exhaustive.
+        let log_plan_class = PlanClass::Unclassified;
+        stats.io_shape = log_counts.into_shape(
+            stats.io_shape.unfolded_segments_resolved + log_unfolded,
+            stats.io_shape.unfolded_records_served_from_cache
+                + log_resolve_snapshot.commit_record_cache_hits,
+            crate::io_shape::merge_plan_class(stats.io_shape.plan_class, log_plan_class),
+        );
+
+        // ADR-1103 decision 5: a federated query answers a log selector
+        // locally only, never fanning it to a remote cluster; the client is
+        // told so via the same `warnings` channel `federate_scalar` already
+        // populates for a skipped remote. Keyed on the remotes THIS tenant
+        // reaches: for a tenant with no mapped remote the whole query is local
+        // and there is no fan-out to have excluded the log selector from.
+        if self
+            .federation
+            .as_ref()
+            .is_some_and(|f| f.has_remotes_for(tenant_hash))
+        {
+            for name in fed_metric_names {
+                stats.warnings.push(log_not_federated_warning(name));
+            }
+        }
+
+        Ok((source, stats))
+    }
+
+    /// Prefetches every metrics selector `plan_selectors` reported: one
+    /// shared snapshot resolved against the union of every selector's own
+    /// fetch window (`padded_range`, docs/query-engine.md), then one
+    /// concurrency-bounded, independently budget-checked fetch+merge per
+    /// selector's own matchers against that snapshot. A selector's fetch
+    /// only prunes by its own matchers server-side; a later
+    /// `SeriesSource::query` call still clips to its own window, so
+    /// combining every selector's already-merged series into one flat
+    /// source is correct regardless of how widely the selectors' windows
+    /// or matchers differ. An empty plan list (no metrics selector in the
+    /// query -- a bare scalar/string literal, or a query naming only log
+    /// metrics) skips storage entirely and issues zero `Signal::Metrics`
+    /// resolves.
+    async fn prefetch_metric_plans(
+        &self,
+        tenant_hash: TenantHash,
+        plans: &[SelectorPlan],
+        eval_window: &EvalWindow,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+    ) -> Result<(MergedSource, QueryStats), QueryError> {
+        if plans.is_empty() {
+            return Ok((
+                MergedSource {
+                    series: Vec::new(),
+                    histogram_series: Vec::new(),
+                    log_series: Vec::new(),
                     precomputed_count: None,
                 },
                 QueryStats::default(),
@@ -909,7 +1756,7 @@ impl QueryEngine {
         let max_samples = self.config.max_samples;
         let max_bytes_scanned = self.config.max_bytes_scanned;
         let max_s3_requests = self.config.max_s3_requests;
-        let concurrency = self.config.fetch_concurrency.max(1);
+        let concurrency = self.config.promql_fetch_fanout().max(1);
         // The query's absolute deadline in unix nanoseconds, from the injected
         // `now_ns` and the configured engine deadline. Threaded into the
         // distributed fan-out (ADR-0071 amendment, decision 2) so the coordinator
@@ -920,9 +1767,24 @@ impl QueryEngine {
             .saturating_add(i64::try_from(self.config.deadline.as_nanos()).unwrap_or(i64::MAX));
         // One independent fetch per selector against the same snapshot
         // (below): an N-selector query re-opens every snapshot segment up to
-        // N times, so the pre-fetch cost estimate must scale by this same
-        // factor to stay a genuine upper bound.
+        // N times in the worst case (no shared matcher set), so the
+        // pre-fetch cost estimate must scale by this same factor to stay a
+        // genuine upper bound. Deliberately NOT deduplicated by matcher
+        // equality: `estimate_cost` is an upper envelope (like every other
+        // term it computes), so over-counting a query whose plans happen to
+        // share a matcher set is a legitimate conservative slop, not a bug.
         let fetch_multiplier = plans.len() as u64;
+        // The fan-out `service_batches` actually measures (`io_shape.rs`'s
+        // doc comment: "a LOWER bound on the serial service rounds this
+        // query's per-segment fan-out needed") is real, not an envelope: the
+        // `attempt` closure below fetches exactly one distinct matcher set's
+        // segments per pass (`distinct_plans_by_matcher`, same dedup the
+        // closure's own `distinct_plans` uses), so `up + up offset 5m` --
+        // two plans, one distinct matcher set -- runs as ONE fetch pass over
+        // the snapshot, not two. Using `fetch_multiplier` here as well (the
+        // upper-envelope, undeduplicated count) would report a round count
+        // the fan-out never actually needed.
+        let service_fetch_multiplier = distinct_plans_by_matcher(plans).len() as u64;
         // Captured by reference (like `plans`), so the `FnMut` attempt copies
         // the reference on each retry rather than moving the owned `Vec` out of
         // its environment. The per-plan futures below build owned pairs from it.
@@ -958,26 +1820,26 @@ impl QueryEngine {
             // would otherwise pay for -- and account -- the same segment
             // fetch once per plan even though a cache/single-flight layer
             // underneath never re-hits the store for the repeat. Dedup by
-            // matcher equality (`LabelMatcher` has no `Hash`, only a
-            // structural `Eq`, hence a linear scan rather than a set; a
-            // query's selector count is small enough that this stays cheap)
-            // so each distinct matcher set is fetched, decoded, and counted
-            // exactly once, however many plans reference it.
-            let mut distinct_plans: Vec<SelectorPlan> = Vec::with_capacity(plans.len());
-            for plan in plans {
-                if !distinct_plans.iter().any(|p| p.matchers == plan.matchers) {
-                    distinct_plans.push(plan.clone());
-                }
-            }
+            // matcher equality so each distinct matcher set is fetched,
+            // decoded, and counted exactly once, however many plans
+            // reference it -- `distinct_plans_by_matcher` is the same
+            // dedup `service_fetch_multiplier` below was sized from, so the
+            // two never drift onto two different notions of "distinct".
+            let distinct_plans = distinct_plans_by_matcher(plans);
             // ADR-0103 eligibility gate, evaluated ONCE per query over the whole
             // resolved snapshot's segment set and the generation history THIS
             // resolve produced (never a per-matcher-set subset, never a
-            // separately-read history). Passing `self.federation.as_deref()`
+            // separately-read history). Passing a real federation reference
             // (not a hardcoded `None`) is load-bearing: `None` here would make
             // every federated query look eligible, the exact wrong-answer bug
-            // decision 1(a) exists to prevent.
+            // decision 1(a) exists to prevent. The reference is filtered by the
+            // remotes THIS tenant reaches, because that is the set `fetch`
+            // dispatches to: a tenant with no mapped remote receives no remote
+            // runs, so no local partial of its can be incomplete for one.
             let snapshot_eligible = crate::distrib::is_pushdown_eligible(
-                self.federation.as_deref(),
+                self.federation
+                    .as_deref()
+                    .filter(|f| f.has_remotes_for(tenant_hash)),
                 &snapshot.segments,
                 &generations,
             );
@@ -1190,10 +2052,7 @@ impl QueryEngine {
                     matchers: target.matchers.clone(),
                     start_ns: target.reduce_start_ns,
                     end_ns: target.reduce_end_ns,
-                    counts: partials
-                        .into_iter()
-                        .filter_map(|p| p.count.and_then(|c| (c != 0).then_some((p.labels, c))))
-                        .collect(),
+                    counts: sorted_pushdown_counts(partials),
                 }),
                 _ => None,
             };
@@ -1202,6 +2061,10 @@ impl QueryEngine {
                     MergedSource {
                         series,
                         histogram_series,
+                        // Task #6 (log-plan partitioning) fills this in from
+                        // the log lane's own fetch, run outside this
+                        // `attempt` closure.
+                        log_series: Vec::new(),
                         precomputed_count,
                     },
                     fed_warnings,
@@ -1214,17 +2077,30 @@ impl QueryEngine {
         let ((source, warnings, partial), mut stats) = self
             .resolve_snapshot_with_retry(
                 tenant_hash,
+                Signal::Metrics,
                 padded,
                 min_tokens,
                 now_ns,
                 name_filter.as_deref(),
                 fetch_multiplier,
+                service_fetch_multiplier,
+                false, // metadata_only: this path fetches scalar/histogram pages.
                 attempt,
             )
             .await?;
         stats.partial = partial;
         stats.warnings = warnings;
         Ok((source, stats))
+    }
+
+    /// Register this lane's or attempt's accounting handle with the caller's
+    /// live view, if it asked for one. The view sums every handle registered
+    /// with it, so calling this once per handle is what makes the live figure
+    /// the request's total rather than one lane's.
+    fn install_live_usage(&self, accounting: &PhaseAccounting) {
+        if let Some(live) = &self.live_usage {
+            live.install(accounting);
+        }
     }
 
     /// Resolves a snapshot, enforces `max_segments`, runs `attempt` once,
@@ -1236,11 +2112,33 @@ impl QueryEngine {
     async fn resolve_snapshot_with_retry<T, F, Fut>(
         &self,
         tenant_hash: TenantHash,
+        signal: Signal,
         window: TimeRange,
         min_tokens: &[CommitToken],
         now_ns: i64,
         name_filter: Option<&str>,
+        // Upper-envelope selector fan-out factor for `estimate_cost`
+        // (`plans.len()`, undeduplicated -- see the comment above its
+        // assignment in `prefetch_metric_plans`): legitimately over-counts
+        // a query whose plans share a matcher set, since `estimate_cost` is
+        // an upper bound by design.
         fetch_multiplier: u64,
+        // The real per-distinct-matcher-set fan-out factor `io_shape`'s
+        // `service_batches` scales by: the count of distinct matcher sets
+        // the fetch fan-out actually issues one pass per
+        // (`distinct_plans_by_matcher`), never larger than `fetch_multiplier`
+        // and strictly smaller whenever two plans share a matcher set (`up +
+        // up offset 5m`). `service_batches` documents itself as a lower
+        // bound on the serial rounds the fan-out actually needed, so it must
+        // use this deduplicated count rather than the upper-envelope one.
+        service_fetch_multiplier: u64,
+        // `QueryIoShape::plan_class` is decided before any segment is opened
+        // (issue #1214): `true` for a discovery-only caller
+        // (`resolve_series_inner`/`resolve_log_series_inner`, neither of
+        // which reaches `fetch_scalar_pages`/`fetch_histogram_pages`),
+        // `false` for the metrics evaluation path, which then classifies by
+        // the resolve's own pruning outcome below.
+        metadata_only: bool,
         mut attempt: F,
     ) -> Result<(T, QueryStats), QueryError>
     where
@@ -1251,17 +2149,33 @@ impl QueryEngine {
         // attempts: `window` and `now_ns` do not change on retry, only the
         // snapshot resolve's outcome does.
         let catalog_requests = self.catalog.estimated_catalog_requests(window, now_ns);
+        // The two bounds `io_shape`'s `service_batches` divides by: the
+        // `buffer_unordered` width the fetch streams below are built with
+        // (`promql_fetch_fanout`, ADR-1195) and the permit count of the one
+        // `GetLimiter` every fetcher this engine owns draws from. Reading the
+        // permits off the engine's own limiter rather than off a fetcher
+        // keeps one source of truth for it under `with_get_limiter`.
+        let concurrency = self.config.promql_fetch_fanout().max(1) as u64;
+        let whole_object_threshold = self.fetcher.whole_object_threshold();
+        let shared_get_permits = self.get_limiter.permits() as u64;
         // Fresh handle per attempt, created before `resolve_bounded` runs so
         // the same handle that goes on to fetch segments also receives
         // resolve's own catalog-side counters (ADR-0044 decision 1: "created
         // once per query" -- here, per the query attempt that wins). A
         // retried attempt re-resolves and re-fetches from scratch, so the
         // discarded first attempt's in-flight counts must not bleed into the
-        // attempt that actually produced the result.
+        // `QueryStats` the successful attempt reports. The live view is the
+        // other side of that: it sums both attempts, because a caller that
+        // cancelled after a retry started owes what both of them issued.
         let first_accounting = PhaseAccounting::new();
-        let (first, first_generations) = self
+        // Before the resolve, not after it: a caller's future dropped during
+        // the first catalog LIST must still find this attempt's counters
+        // through the live view.
+        self.install_live_usage(&first_accounting);
+        let (first, first_generations, first_unfolded) = self
             .resolve_bounded(
                 tenant_hash,
+                signal,
                 window,
                 min_tokens,
                 now_ns,
@@ -1269,18 +2183,42 @@ impl QueryEngine {
                 first_accounting.resolve(),
             )
             .await?;
+        // Checked here, right after the resolve returns, not only at the
+        // segment-fetch boundaries below: a query whose snapshot resolves to
+        // zero segments never reaches those checks, so a caller with a
+        // lowered `max_s3_requests` (ADR-1374 decision 3) must still be
+        // stopped from completing on the strength of the resolve's own
+        // catalog requests alone.
+        if let Some(err) = segment_admission::request_budget_exceeded(
+            first_accounting.snapshot().pooled().total_s3_requests(),
+            self.config.max_s3_requests,
+        ) {
+            return Err(err);
+        }
         let first_estimate = estimate_cost(&first, fetch_multiplier, catalog_requests);
         let first_segments = first.segments.len() as u64;
         let first_pruned = first.segments_pruned;
+        let first_io_shape = io_shape_for_resolve(
+            &first,
+            metadata_only,
+            whole_object_threshold,
+            concurrency,
+            service_fetch_multiplier,
+            shared_get_permits,
+            &first_accounting,
+            first_unfolded,
+        );
         match attempt(first, first_generations, first_accounting.clone()).await {
             Err(QueryError::Fetch(FetchError::Store {
                 source: StoreError::NotFound,
                 ..
             })) => {
                 let second_accounting = PhaseAccounting::new();
-                let (second, second_generations) = self
+                self.install_live_usage(&second_accounting);
+                let (second, second_generations, second_unfolded) = self
                     .resolve_bounded(
                         tenant_hash,
+                        signal,
                         window,
                         min_tokens,
                         now_ns,
@@ -1288,9 +2226,25 @@ impl QueryEngine {
                         second_accounting.resolve(),
                     )
                     .await?;
+                if let Some(err) = segment_admission::request_budget_exceeded(
+                    second_accounting.snapshot().pooled().total_s3_requests(),
+                    self.config.max_s3_requests,
+                ) {
+                    return Err(err);
+                }
                 let second_estimate = estimate_cost(&second, fetch_multiplier, catalog_requests);
                 let second_segments = second.segments.len() as u64;
                 let second_pruned = second.segments_pruned;
+                let second_io_shape = io_shape_for_resolve(
+                    &second,
+                    metadata_only,
+                    whole_object_threshold,
+                    concurrency,
+                    service_fetch_multiplier,
+                    shared_get_permits,
+                    &second_accounting,
+                    second_unfolded,
+                );
                 match attempt(second, second_generations, second_accounting.clone()).await {
                     Err(QueryError::Fetch(FetchError::Store {
                         source: StoreError::NotFound,
@@ -1304,6 +2258,7 @@ impl QueryEngine {
                             page_stats,
                             second_accounting.snapshot(),
                             second_estimate,
+                            second_io_shape,
                         ),
                     )),
                     Err(other) => Err(other),
@@ -1317,6 +2272,7 @@ impl QueryEngine {
                     page_stats,
                     first_accounting.snapshot(),
                     first_estimate,
+                    first_io_shape,
                 ),
             )),
             Err(other) => Err(other),
@@ -1329,15 +2285,17 @@ impl QueryEngine {
     // `resolve_pruned_with_accounting` directly and never reaches this wrapper
     // (ADR-0044 decision 5). Instrumenting here too would span a
     // resolve reached through ravel-query twice.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_bounded(
         &self,
         tenant_hash: TenantHash,
+        signal: Signal,
         window: TimeRange,
         min_tokens: &[CommitToken],
         now_ns: i64,
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
-    ) -> Result<(Snapshot, Vec<ShardGeneration>), QueryError> {
+    ) -> Result<(Snapshot, Vec<ShardGeneration>, u64), QueryError> {
         // `resolve_pruned_with_generations` returns the shard-generation history
         // THIS resolve computed its scan set from (ADR-0103 decision 1(b)): the
         // pushdown eligibility gate reads exactly this copy, never a separately
@@ -1347,7 +2305,7 @@ impl QueryEngine {
             .catalog
             .resolve_pruned_with_generations(
                 &tenant_hash,
-                Signal::Metrics,
+                signal,
                 window,
                 min_tokens,
                 now_ns,
@@ -1360,7 +2318,89 @@ impl QueryEngine {
         // 2). Their cost is bounded separately by the request budget
         // checked incrementally during fetch, below.
         segment_admission::admit(&snapshot, &origins, &self.config)?;
-        Ok((snapshot, generations))
+        // Exact count of segments this resolve took from the recent
+        // (unfolded) listing path rather than a folded snapshot part
+        // (`QueryIoShape::unfolded_segments_resolved`, issue #1214): gates a
+        // downstream fold-benefit decision, so this must be the real count,
+        // never an estimate.
+        let unfolded_segments_resolved = crate::io_shape::count_unfolded_segments(&origins.origins);
+        Ok((snapshot, generations, unfolded_segments_resolved))
+    }
+
+    /// Maps a log lane failure onto the same [`QueryError`] variants the
+    /// metrics fetch path returns, so the HTTP layer's status mapping and
+    /// object-key redaction (`http/error.rs`) apply unchanged to a log
+    /// selector. `Corrupt`/`Decode`/`UnknownStream` have no structurally
+    /// matching `FetchError` variant available from this crate (adding one
+    /// would touch `fetcher.rs`, out of this task's scope), so all three
+    /// coarsen to `FetchError::Store` with a `StoreError::Corrupted` cause --
+    /// the client-visible message becomes "unavailable" rather than
+    /// "corrupt" for exactly those three cases, a deliberate scope trade-off
+    /// flagged in the task report, not a silent behavior change.
+    fn map_log_series_error(&self, err: log_series::LogSeriesError) -> QueryError {
+        match err {
+            log_series::LogSeriesError::SamplesExceeded { count, max } => {
+                QueryError::TooManySamples { count, max }
+            }
+            log_series::LogSeriesError::SeriesExceeded { count, max } => {
+                QueryError::TooManySeries { count, max }
+            }
+            log_series::LogSeriesError::BytesScannedExceeded { scanned, max } => {
+                QueryError::TooManyBytesScanned { scanned, max }
+            }
+            log_series::LogSeriesError::RequestsExceeded { requests, max } => {
+                QueryError::RequestBudgetExceeded { requests, max }
+            }
+            log_series::LogSeriesError::DeadlineExceeded => QueryError::DeadlineExceeded {
+                deadline: self.config.deadline,
+            },
+            log_series::LogSeriesError::Fetch(LogFetchError::Store { key, source }) => {
+                QueryError::Fetch(FetchError::Store { key, source })
+            }
+            log_series::LogSeriesError::Fetch(LogFetchError::EtagChanged { key }) => {
+                QueryError::Fetch(FetchError::EtagChanged { key })
+            }
+            log_series::LogSeriesError::Fetch(LogFetchError::Corrupt { key, source }) => {
+                QueryError::Fetch(FetchError::Store {
+                    key,
+                    source: StoreError::Corrupted(source.to_string()),
+                })
+            }
+            log_series::LogSeriesError::Fetch(LogFetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit,
+            }) => QueryError::Fetch(FetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit,
+            }),
+            // A carry paired with the wrong segment breaks the caller's
+            // contract rather than the object: it surfaces as hard corruption
+            // like `Corrupt`, never as a retryable store fault.
+            log_series::LogSeriesError::Fetch(carry @ LogFetchError::CarryMismatch { .. }) => {
+                let key = match &carry {
+                    LogFetchError::CarryMismatch { key, .. } => key.clone(),
+                    _ => String::new(),
+                };
+                QueryError::Fetch(FetchError::Store {
+                    key,
+                    source: StoreError::Corrupted(carry.to_string()),
+                })
+            }
+            log_series::LogSeriesError::Decode(source) => QueryError::Fetch(FetchError::Store {
+                key: String::new(),
+                source: StoreError::Corrupted(source.to_string()),
+            }),
+            log_series::LogSeriesError::UnknownStream { stream_id } => {
+                QueryError::Fetch(FetchError::Store {
+                    key: format!("stream:{stream_id:?}"),
+                    source: StoreError::Corrupted(format!(
+                        "record's stream {stream_id:?} is not present in its segment's STREAM_DIR"
+                    )),
+                })
+            }
+        }
     }
 
     /// Fetches every matched series from each snapshot segment in a single
@@ -1387,7 +2427,7 @@ impl QueryEngine {
         ),
         QueryError,
     > {
-        let concurrency = self.config.fetch_concurrency.max(1);
+        let concurrency = self.config.promql_fetch_fanout().max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
         let mut stream = stream::iter(snapshot.segments.iter().cloned())
             .map(|seg_ref| {
@@ -1621,11 +2661,14 @@ impl QueryEngine {
             return Ok((runs, hist_runs, stats, warnings, partial));
         };
         for (matchers, start_ns, end_ns) in plan_matchers_windows {
-            // Empty erasure and empty min-commit-tokens cross the boundary: the
-            // remote resolves its own snapshot and enforces its own erasure,
-            // and commit tokens are cluster-local (also structurally prevents
-            // leaking this cluster's tokens). The operator credential is baked
-            // into the fetcher, so no client credential is threaded here.
+            // `tenant_hash` selects which remotes this local tenant may use
+            // before any is dialed, so a tenant with no mapped remote fans out
+            // to nothing and receives nothing. Empty erasure and empty
+            // min-commit-tokens cross the boundary: the remote resolves its own
+            // snapshot and enforces its own erasure, and commit tokens are
+            // cluster-local (also structurally prevents leaking this cluster's
+            // tokens). The operator credential is baked into the fetcher, so no
+            // client credential is threaded here.
             // Owned args (accounting is an `Arc` clone that folds into the same
             // handle) keep the fan-out future higher-ranked `Send`. Remote
             // spend is charged to `scan` (issue #796 finding: opaque remote
@@ -1695,7 +2738,7 @@ impl QueryEngine {
         max_bytes_scanned: ByteLimit,
         max_s3_requests: RequestLimit,
     ) -> Result<Vec<Vec<ravel_segment::SeriesEntry>>, QueryError> {
-        let concurrency = self.config.fetch_concurrency.max(1);
+        let concurrency = self.config.promql_fetch_fanout().max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
         let mut stream = stream::iter(snapshot.segments.iter().cloned())
             .map(|seg_ref| {
@@ -1777,6 +2820,176 @@ impl QueryEngine {
 /// (`services/ravel-server/src/distrib.rs`) re-exports and calls it.
 pub fn snapshot_erasure_predicates(snapshot: &Snapshot) -> Vec<ErasurePredicate> {
     crate::erasure::snapshot_pending_erasure_predicates(snapshot)
+}
+
+/// Field-wise sums two independently-tracked [`PhaseAccountingSnapshot`]s
+/// (ADR-1103 decision 4 step 4): `prefetch`'s log lane runs its own
+/// [`PhaseAccounting`] handle rather than sharing the metrics lane's live
+/// handle, so the two lanes' costs are combined only once, at snapshot time,
+/// for the query-wide total the caller reports.
+fn combine_phase_accounting(
+    a: &PhaseAccountingSnapshot,
+    b: &PhaseAccountingSnapshot,
+) -> PhaseAccountingSnapshot {
+    PhaseAccountingSnapshot {
+        resolve: a.resolve.saturating_add(&b.resolve),
+        plan: a.plan.saturating_add(&b.plan),
+        probe: a.probe.saturating_add(&b.probe),
+        scan: a.scan.saturating_add(&b.scan),
+    }
+}
+
+/// Builds one resolve attempt's [`QueryIoShape`] (issue #1214) entirely from
+/// values already produced by that attempt's resolve: the segment set's own
+/// `object_size`s (structural `dependency_depth`, see
+/// `io_shape::depth_for_object`), the resolved segment count against this
+/// query's concurrency permit (`service_batches`), the resolve phase's own
+/// LIST request count (`list_page_depth`, an upper-bound serial depth --
+/// see `crate::io_shape` module docs for why this crate cannot see whether
+/// two shards' LIST pages ran concurrently with each other), and the
+/// already-computed exact unfolded-segment count and plan-class decision.
+///
+/// `service_fetch_multiplier` is the count of DISTINCT matcher sets the
+/// metrics fetch fan-out actually issues one pass per
+/// (`distinct_plans_by_matcher` in `prefetch_metric_plans`, e.g. `up + up
+/// offset 5m` -- two plans, one distinct matcher set, one pass), not the raw
+/// plan count `estimate_cost` scales by: that estimate is a deliberate
+/// upper envelope, but `service_batches` is a LOWER bound on serial rounds
+/// under a wave-synchronous model of the fan-out (see
+/// `crate::io_shape::service_batches_over_plan_waves` and the module docs'
+/// `service_batches` entry for why this is a lower, not an upper or exact,
+/// bound), and must not carry the envelope's slop either.
+///
+/// The fan-out itself is a NESTED `buffer_unordered` (`futures::stream`):
+/// one `buffer_unordered(promql_fetch_fanout)` over distinct plans
+/// (`prefetch_metric_plans`'s `attempt` closure, `distinct_plans_by_matcher`
+/// in `engine.rs`), each of which runs its own
+/// `buffer_unordered(promql_fetch_fanout)` over that plan's segments
+/// (`fetch_all_samples_and_histograms`). The OUTER `buffer_unordered` admits
+/// at most `promql_fetch_fanout` plans at once, however many distinct
+/// matcher sets the query has, and it is a SLIDING window, not a
+/// wave-synchronous one: as soon as one admitted plan finishes, the next
+/// plan is admitted, without waiting for its siblings. Modeling it as
+/// wave-synchronous anyway -- computing one binding concurrency
+/// (`min(promql_fetch_fanout * min(service_fetch_multiplier,
+/// promql_fetch_fanout), shared_get_permits)`) and dividing the total work
+/// (`segments * service_fetch_multiplier` GETs) by it in one division --
+/// UNDERCOUNTS whenever the outer window is not full for the query's whole
+/// duration: 3 distinct plans, 1 segment each, `promql_fetch_fanout` 2, and
+/// `shared_get_permits` 1000 gives peak capacity `min(2 * 2, 1000) = 4`, so
+/// that single division reports `ceil(3 / 4) = 1` round, but plans 1 and 2
+/// admit together in the first round and plan 3 only after one of them
+/// finishes, in a second round -- 2 rounds, not 1. Every GET from every
+/// plan also passes through the one `GetLimiter` this engine wired to every
+/// fetcher it owns (ADR-1195, `limiter.rs`), whose permit count is
+/// `shared_get_permits` here (`GetLimiter::permits`, resolved from
+/// `EngineConfig::store_get_concurrency`, which falls back to
+/// `fetch_concurrency` when unset).
+///
+/// So this figure is computed per WAVE of the outer fan-out
+/// (`crate::io_shape::service_batches_over_plan_waves`): `waves =
+/// ceil(service_fetch_multiplier / promql_fetch_fanout)`; for 0-based wave
+/// `w`, `active_w = min(promql_fetch_fanout, service_fetch_multiplier - w *
+/// promql_fetch_fanout)` plans are admitted, `capacity_w =
+/// min(promql_fetch_fanout * active_w, shared_get_permits)` is that wave's
+/// binding concurrency, and `batches_w = service_batches(segments *
+/// active_w, capacity_w)` is its own serial round count; `service_batches`
+/// is the sum of `batches_w` over every wave. This is still a lower bound,
+/// not an exact count: the sliding window can only pack work at least as
+/// tightly as the wave-synchronous model assumes, never more loosely, so
+/// the real scheduler takes at least this many rounds. 2 distinct matcher
+/// sets, 64 segments, `promql_fetch_fanout` 8, `shared_get_permits` 16: one
+/// wave, `active_0 = 2`, `capacity_0 = min(16, 16) = 16`, `batches_0 =
+/// ceil(128 / 16) = 8`. `promql_fetch_fanout` 1, 3 distinct matcher sets, 20
+/// segments, `shared_get_permits` 1000: three waves, each `active_w = 1`,
+/// `capacity_w = min(1, 1000) = 1`, `batches_w = ceil(20 / 1) = 20`, summing
+/// to 60 -- not the 20 a single `min(1 * 3, 1000) = 3`-capacity division
+/// would report, which would silently assume all 3 plans ran at once when
+/// the outer stream never admits more than 1.
+///
+/// A single-plan query (`service_fetch_multiplier == 1`) always has exactly
+/// one wave with `active_0 = 1`, reducing to `service_batches(segments,
+/// min(promql_fetch_fanout, shared_get_permits))`. An operator who sets
+/// `--store-get-concurrency` below `--promql-fetch-fanout` makes the
+/// limiter the binding bound even for one plan, and this figure follows
+/// that.
+///
+/// Deliberately does NOT thread any new instrumentation into the per-segment
+/// fetch loops (`fetch_all_samples_and_histograms`/`fetch_all_series`):
+/// every figure here is a pure function of the resolved `Snapshot` and the
+/// query's own configuration, computable before a single segment fetch
+/// starts.
+#[allow(clippy::too_many_arguments)]
+fn io_shape_for_resolve(
+    snapshot: &Snapshot,
+    metadata_only: bool,
+    whole_object_threshold: u64,
+    concurrency: u64,
+    service_fetch_multiplier: u64,
+    shared_get_permits: u64,
+    accounting: &PhaseAccounting,
+    unfolded_segments_resolved: u64,
+) -> QueryIoShape {
+    let mut counts = IoShapeCounts::default();
+    let depth = snapshot
+        .segments
+        .iter()
+        .map(|seg| crate::io_shape::depth_for_object(seg.object_size, whole_object_threshold))
+        .max()
+        .unwrap_or(0);
+    counts.record_dependency_chain(depth);
+    counts.record_service_batches(crate::io_shape::service_batches_over_plan_waves(
+        snapshot.segments.len() as u64,
+        service_fetch_multiplier,
+        concurrency,
+        shared_get_permits,
+    ));
+    let resolve_snapshot = accounting.resolve().snapshot();
+    let resolve_list_requests = resolve_snapshot.s3_requests(AccountedOp::List);
+    counts.record_list_pages(resolve_list_requests.min(u64::from(u32::MAX)) as u32);
+    let plan_class = if metadata_only {
+        PlanClass::MetadataOnly
+    } else if snapshot.segments_pruned > 0 {
+        PlanClass::SelectiveIndexed
+    } else {
+        PlanClass::ExhaustiveScan
+    };
+    counts.into_shape(
+        unfolded_segments_resolved,
+        resolve_snapshot.commit_record_cache_hits,
+        plan_class,
+    )
+}
+
+/// A locally-scoped series identity for a log-derived series returned from
+/// a discovery endpoint (`/api/v1/series`, `/api/v1/labels`,
+/// `/api/v1/label/{name}/values`). Log series carry no persisted
+/// `SeriesId` -- ADR-1103 derives them at query time, never at ingest --
+/// and query-time code holds only a `TenantHash`, not the `TenantId`
+/// `SeriesId::compute`'s canonical encoding requires. This hash is used
+/// only to dedupe within one `resolve_log_series_inner` call (always
+/// scoped to a single tenant) and is discarded before the label set
+/// reaches the client (`series_to_json`), so it need not be canonical,
+/// persistent, or stable across calls -- unlike `SeriesId::compute`, whose
+/// doc comment marks its encoding a persistent contract.
+fn log_series_discovery_id(labels: &LabelSet) -> SeriesId {
+    let mut sorted: Vec<(&str, &str)> = labels
+        .iter()
+        .map(|l| (l.name.as_str(), l.value.as_str()))
+        .collect();
+    sorted.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ravel-log-series-discovery-v1\0");
+    for (name, value) in sorted {
+        hasher.update(&(name.len() as u32).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&(value.len() as u32).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let hash = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    SeriesId(bytes)
 }
 
 /// Builds a `series_id -> labels` map incrementally, rejecting the moment a
@@ -2175,6 +3388,28 @@ fn shared_equality_name_filter<'a>(plans: &'a [SelectorPlan]) -> Option<Cow<'a, 
     shared
 }
 
+/// Deduplicates `plans` by matcher equality, keeping the first plan seen for
+/// each distinct matcher set. The single source of truth for what
+/// `prefetch_metric_plans`'s per-attempt fetch fan-out (`engine.rs`, the
+/// `distinct_plans` loop inside its `attempt` closure) actually fetches:
+/// `LabelMatcher` has no `Hash`, only a structural `Eq`, hence a linear scan
+/// rather than a set, which stays cheap for the small selector counts a
+/// query carries. Called twice per query attempt against the same `plans`
+/// slice (once here to size the metrics fetch fan-out's `service_batches`
+/// contribution before any segment is opened, once inside the fetch closure
+/// to build the actual per-matcher-set future list) rather than threaded
+/// through as a value, so the two call sites can never drift onto two
+/// different notions of "distinct".
+fn distinct_plans_by_matcher(plans: &[SelectorPlan]) -> Vec<SelectorPlan> {
+    let mut distinct: Vec<SelectorPlan> = Vec::with_capacity(plans.len());
+    for plan in plans {
+        if !distinct.iter().any(|p| p.matchers == plan.matchers) {
+            distinct.push(plan.clone());
+        }
+    }
+    distinct
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod name_filter_tests {
@@ -2342,6 +3577,13 @@ mod name_filter_tests {
         let one_bypasses = vec![plan(re("^foo.*$")), plan(re("foo|bar"))];
         assert!(shared_equality_name_filter(&one_bypasses).is_none());
     }
+}
+
+/// ADR-1103 decision 5: a federated query answers a log selector locally
+/// only, never fanning it to a remote cluster. Shared by both call sites so
+/// the two `warnings` entries this produces cannot drift apart.
+fn log_not_federated_warning(name: &str) -> String {
+    format!("{name} is answered by this cluster only; log series are not federated")
 }
 
 /// Parses `query` as a bare vector selector (Phase 1 scope) and returns its
@@ -3181,13 +4423,153 @@ struct PrecomputedCount {
     start_ns: i64,
     /// Inclusive upper bound of the reduction window.
     end_ns: i64,
-    /// One per-series count, exactly as the workers reported it.
+    /// One per-series count, ordered by label set (see `sorted_pushdown_counts`).
     counts: Vec<(LabelSet, u64)>,
+}
+
+/// Build the pushdown count table from the collected worker partials: drop a
+/// zero-in-window count (a series with no output sample, per ADR-0103's
+/// amendment) and order the survivors by label set.
+///
+/// The order is deliberate. The raw distributed path sorts its merged series
+/// by this exact comparison before the evaluator sees them, but the collected
+/// partials arrive in slice-completion order under the fan-out's
+/// `buffer_unordered`, which varies from run to run. Sorting here gives the
+/// pushdown path the same stable, backend-order-independent encounter order as
+/// the raw path, so any consumer of `query_precomputed_count` sees one order
+/// rather than the arrival order of whichever slice finished first.
+pub(crate) fn sorted_pushdown_counts(
+    partials: Vec<crate::distrib::codec::PartialAggregate>,
+) -> Vec<(LabelSet, u64)> {
+    let mut counts: Vec<(LabelSet, u64)> = partials
+        .into_iter()
+        .filter_map(|p| p.count.and_then(|c| (c != 0).then_some((p.labels, c))))
+        .collect();
+    counts.sort_by(|a, b| a.0.iter().cmp(b.0.iter()));
+    counts
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod pushdown_count_sort_tests {
+    use ravel_types::{Label, LabelSet, SeriesId};
+
+    use super::sorted_pushdown_counts;
+    use crate::distrib::codec::PartialAggregate;
+
+    fn labels(id: u8) -> LabelSet {
+        LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: "http_requests_total".to_string(),
+            },
+            Label {
+                name: "id".to_string(),
+                value: format!("{id:02}"),
+            },
+        ])
+        .expect("valid labels")
+    }
+
+    fn partial(id: u8, count: u64) -> PartialAggregate {
+        PartialAggregate {
+            series_id: SeriesId([id; 16]),
+            labels: labels(id),
+            count: Some(count),
+            min: None,
+            max: None,
+        }
+    }
+
+    /// The collected partials arrive in slice-completion order, which varies
+    /// run to run. `sorted_pushdown_counts` must produce the same label-set
+    /// order the raw path uses, independent of that arrival order.
+    ///
+    /// Reverting the `counts.sort_by(...)` line in `sorted_pushdown_counts`
+    /// makes this fail: the two orders come back different, and the equal-count
+    /// tie means the divergence is not masked by any value difference.
+    #[test]
+    fn orders_by_label_set_independent_of_arrival_order() {
+        // Ten series, every count tied at 5, so nothing but the label set can
+        // break the order.
+        let ascending: Vec<PartialAggregate> = (0..10).map(|id| partial(id, 5)).collect();
+        let mut descending = ascending.clone();
+        descending.reverse();
+        let mut scrambled = ascending.clone();
+        scrambled.swap(0, 7);
+        scrambled.swap(2, 9);
+        scrambled.swap(3, 5);
+
+        let from_ascending = sorted_pushdown_counts(ascending);
+        let from_descending = sorted_pushdown_counts(descending);
+        let from_scrambled = sorted_pushdown_counts(scrambled);
+
+        // All three arrival orders collapse to one deterministic table.
+        assert_eq!(from_ascending, from_descending);
+        assert_eq!(from_ascending, from_scrambled);
+
+        // And that table is in ascending label-set order (the exact
+        // comparison the raw path applies to its merged series), 00..09.
+        let ids: Vec<String> = from_ascending
+            .iter()
+            .map(|(ls, _)| {
+                ls.iter()
+                    .find(|l| l.name == "id")
+                    .map(|l| l.value.clone())
+                    .expect("id label present")
+            })
+            .collect();
+        let expected: Vec<String> = (0..10).map(|id| format!("{id:02}")).collect();
+        assert_eq!(ids, expected, "count table is not in label-set order");
+    }
+
+    /// A zero-in-window count is dropped (ADR-0103 amendment: no output sample
+    /// for an empty window), and an absent count is dropped too, while the
+    /// nonzero survivors stay sorted.
+    #[test]
+    fn drops_zero_and_absent_counts_and_keeps_order() {
+        let partials = vec![
+            partial(3, 7),
+            partial(1, 0),
+            PartialAggregate {
+                series_id: SeriesId([9; 16]),
+                labels: labels(9),
+                count: None,
+                min: None,
+                max: None,
+            },
+            partial(0, 2),
+        ];
+        let counts = sorted_pushdown_counts(partials);
+        let ids: Vec<(String, u64)> = counts
+            .iter()
+            .map(|(ls, c)| {
+                (
+                    ls.iter()
+                        .find(|l| l.name == "id")
+                        .map(|l| l.value.clone())
+                        .expect("id label present"),
+                    *c,
+                )
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![("00".to_string(), 2), ("03".to_string(), 7)],
+            "zero and absent counts must drop, survivors sorted by label set"
+        );
+    }
 }
 
 struct MergedSource {
     series: Vec<SeriesData>,
     histogram_series: Vec<HistogramSeriesData>,
+    /// ADR-1103 log-derived series (`ravel_log_lines`/`ravel_log_bytes`),
+    /// merged in by `prefetch`'s log lane. Consulted by `query` only when
+    /// the matcher set names a log metric (`log_series::log_metric_of`);
+    /// never by `query_histograms` or `query_precomputed_count`, which
+    /// have no log-signal counterpart.
+    log_series: Vec<SeriesData>,
     /// ADR-0103 collected pushdown count table. Written by `prefetch` and read
     /// by `query_precomputed_count` (this impl) on the T4b fast path.
     precomputed_count: Option<PrecomputedCount>,
@@ -3199,10 +4581,29 @@ impl SeriesSource for MergedSource {
         matchers: &[LabelMatcher],
         window: TimeRange,
     ) -> Result<Vec<SeriesData>, SourceError> {
-        Ok(self
-            .series
+        let is_log_pool = log_series::log_metric_of(matchers).is_some();
+        let pool = if is_log_pool {
+            &self.log_series
+        } else {
+            &self.series
+        };
+        // `fetch_log_series` already applied every `__body__` matcher per
+        // record (ADR-1103 decision 3: `__body__` is a per-record pseudo-label,
+        // never a member of a log series' `LabelSet`). Re-checking it here
+        // against `s.labels` would hit matchers.rs's absent-label-as-empty-
+        // string rule and wrongly drop every series for a non-empty-matching
+        // `__body__` matcher.
+        let label_matchers: Vec<&LabelMatcher> = if is_log_pool {
+            matchers
+                .iter()
+                .filter(|m| m.name != log_series::BODY_MATCHER_LABEL)
+                .collect()
+        } else {
+            matchers.iter().collect()
+        };
+        Ok(pool
             .iter()
-            .filter(|s| matches_series(matchers, &s.labels))
+            .filter(|s| label_matchers.iter().all(|m| m.is_match(&s.labels)))
             .map(|s| SeriesData {
                 labels: s.labels.clone(),
                 samples: s
@@ -3783,6 +5184,172 @@ mod tests {
     use ravel_types::{Label, LabelSet, SeriesId};
 
     use super::*;
+
+    /// A query whose snapshot resolves to zero segments never enters the
+    /// segment-fetch loop, so the incremental `max_s3_requests` check there
+    /// never runs. A caller-lowered budget of zero (ADR-1374 decision 3) must
+    /// still be enforced on the strength of the resolve's own catalog
+    /// requests, and the server default ceiling (far above any resolve cost)
+    /// must not change behavior for the same fixture.
+    #[tokio::test]
+    async fn lowered_request_budget_is_enforced_after_resolve() {
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let catalog = ravel_catalog::Catalog::new(
+            Arc::clone(&store),
+            ravel_catalog::CatalogConfig::default(),
+        )
+        .expect("catalog");
+        let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
+        let tenant_hash = ravel_types::TenantId::new("acme").hash();
+        // No segments are ever published to this store, so the window is
+        // arbitrary: the snapshot resolves empty regardless of its bounds.
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 60 * 1_000_000_000,
+        };
+        let now_ns = window.end_ns;
+        let deadline = Duration::from_secs(30);
+
+        let budgets = RequestBudgets {
+            max_store_requests: Some(RequestLimit::Bounded(0)),
+            ..Default::default()
+        };
+        let err = engine
+            .resolve_series_with_budgets(
+                tenant_hash,
+                &[],
+                window,
+                &[],
+                now_ns,
+                deadline,
+                Some(&budgets),
+            )
+            .await
+            .expect_err("a zero store-request budget must trip even on an empty snapshot");
+        let QueryError::RequestBudgetExceeded { requests, max } = err else {
+            panic!("expected QueryError::RequestBudgetExceeded, got {err:?}");
+        };
+        assert_eq!(
+            max, 0,
+            "the caller's lowered ceiling must be reported exactly"
+        );
+        // Pinned: an empty-snapshot resolve against a fresh `MemoryStore`
+        // issues exactly 3 catalog requests. A regression that changes the
+        // resolve's own request count is exactly what this bound catches.
+        assert_eq!(
+            requests, 3,
+            "the resolve's own catalog request count must be exact, not just nonzero"
+        );
+
+        // Control: the server's default ceiling is far above any resolve
+        // cost, so the identical fixture succeeds under it, and the
+        // accounted request count is the same exact number.
+        let (_series, stats) = engine
+            .resolve_series_with_budgets(tenant_hash, &[], window, &[], now_ns, deadline, None)
+            .await
+            .expect("the server default ceiling must not trip on the resolve's own cost");
+        assert_eq!(
+            stats.accounting.total_s3_requests(),
+            requests,
+            "the default-ceiling control must account the same resolve cost as the trip"
+        );
+    }
+
+    /// The log lane's post-resolve budget check added in `prefetch` (see
+    /// `lowered_request_budget_is_enforced_after_resolve` above) compared
+    /// only the log lane's OWN resolve cost against the ceiling, ignoring
+    /// whatever the metrics lane had already spent. A mixed metrics+logs
+    /// query must be checked against the COMBINED total right after the log
+    /// lane's resolve, the same way the log fetch loop's own incremental
+    /// checks already account for the metrics lane's prior spend
+    /// (`requests_remaining` below in `prefetch`).
+    #[tokio::test]
+    async fn mixed_metrics_and_log_lanes_share_the_request_budget_after_resolve() {
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let catalog = ravel_catalog::Catalog::new(
+            Arc::clone(&store),
+            ravel_catalog::CatalogConfig::default(),
+        )
+        .expect("catalog");
+        let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
+        let tenant_hash = ravel_types::TenantId::new("acme-mixed").hash();
+        let now_ns = 60 * 1_000_000_000;
+        let t_ms = now_ns / 1_000_000;
+        let deadline = Duration::from_secs(30);
+        // `or` is PromQL's set operator (tolerates label-set mismatch,
+        // matching `two_log_selectors_share_one_request_budget` in
+        // tests/log_series_engine.rs): the metrics lane ("m") and the log
+        // lane (`ravel_log_lines`) both resolve empty snapshots against this
+        // fresh, unpublished store.
+        let query = r#"m or count_over_time(ravel_log_lines{job="x"}[1h])"#;
+
+        // Pinned: the metrics lane alone spends exactly 3 catalog requests
+        // resolving an empty snapshot (the same fixed cost
+        // `lowered_request_budget_is_enforced_after_resolve` pins for a lone
+        // empty-snapshot resolve), and the log lane spends exactly 3 more.
+        const METRICS_LANE_REQUESTS: u64 = 3;
+        const LOG_LANE_REQUESTS: u64 = 3;
+
+        let budgets = RequestBudgets {
+            max_store_requests: Some(RequestLimit::Bounded(METRICS_LANE_REQUESTS)),
+            ..Default::default()
+        };
+        let err = engine
+            .instant_with_budgets(
+                tenant_hash,
+                query,
+                t_ms,
+                &[],
+                now_ns,
+                deadline,
+                Some(&budgets),
+            )
+            .await
+            .expect_err(
+                "a budget sized for the metrics lane alone must still trip once the log \
+                 lane's own resolve is added",
+            );
+        let QueryError::RequestBudgetExceeded { requests, max } = err else {
+            panic!("expected QueryError::RequestBudgetExceeded, got {err:?}");
+        };
+        assert_eq!(
+            max, METRICS_LANE_REQUESTS,
+            "the caller's lowered ceiling must be reported exactly"
+        );
+        assert_eq!(
+            requests,
+            METRICS_LANE_REQUESTS + LOG_LANE_REQUESTS,
+            "the trip must report the COMBINED total, not the log lane's total alone"
+        );
+
+        // Control: a budget sized for both lanes' combined resolve cost
+        // succeeds, and accounts the same combined total the trip reported.
+        let combined_budgets = RequestBudgets {
+            max_store_requests: Some(RequestLimit::Bounded(
+                METRICS_LANE_REQUESTS + LOG_LANE_REQUESTS,
+            )),
+            ..Default::default()
+        };
+        let (_value, _annotations, stats) = engine
+            .instant_with_budgets(
+                tenant_hash,
+                query,
+                t_ms,
+                &[],
+                now_ns,
+                deadline,
+                Some(&combined_budgets),
+            )
+            .await
+            .expect("a budget sized for the combined resolve cost must succeed");
+        assert_eq!(
+            stats.accounting.total_s3_requests(),
+            METRICS_LANE_REQUESTS + LOG_LANE_REQUESTS,
+            "the combined-budget control must account the same combined resolve cost as the trip"
+        );
+    }
 
     /// Issue #529: the labels/series HTTP endpoints
     /// (`http/handlers.rs`'s `match[]` parameter) reach `parse_selector`
@@ -4818,6 +6385,7 @@ mod histogram_source_tests {
         MergedSource {
             series: Vec::new(),
             histogram_series,
+            log_series: Vec::new(),
             precomputed_count: None,
         }
     }
@@ -5107,6 +6675,18 @@ mod prefetch_tests {
             offset_ns: 0,
             anchor: PlanAnchor::Window,
             count_over_time_pushdown_candidate: false,
+        }
+    }
+
+    /// Same matcher set as `window_plan`, a different `offset_ns`: two plans
+    /// built this way carry identical `matchers` (a query like `up + up
+    /// offset 5m`) and so collapse to one distinct matcher set under
+    /// `distinct_plans_by_matcher`, despite being two separate `SelectorPlan`
+    /// entries.
+    fn window_plan_with_offset(metric: &str, offset_ns: i64) -> SelectorPlan {
+        SelectorPlan {
+            offset_ns,
+            ..window_plan(metric)
         }
     }
 
@@ -5654,6 +7234,145 @@ mod prefetch_tests {
         handle.abort();
     }
 
+    /// A healthy remote that contributes nothing and counts its dispatches, so
+    /// a test can assert which tenant actually fanned out.
+    #[derive(Default)]
+    struct CountingEmptyFetcher {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::distrib::client::SliceFetcher for CountingEmptyFetcher {
+        async fn fetch(
+            &self,
+            _request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
+        {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                stats: FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: ravel_proto::queryfrag::v1::status::Code::Ok,
+                status_message: String::new(),
+            })
+        }
+    }
+
+    /// ADR-0103 decision 1(a) is keyed on the remotes THIS tenant reaches, not
+    /// on a federation context existing in the process. Both arms run the same
+    /// eligible `count_over_time` query on the same fixture, and differ only in
+    /// which local tenant the one remote is keyed to.
+    ///
+    /// The unmapped arm is what ADR-1295 makes reachable: a multi-tenant
+    /// coordinator with one keyed remote leaves every other local tenant
+    /// federating nothing, and declaring those tenants ineligible costs them
+    /// pushdown for a remote they never dispatch to. The mapped arm is the
+    /// control, and it is what keeps this from passing by simply disabling the
+    /// federation exclusion. The dispatch count is asserted in both arms, so
+    /// "reaches the remote" is proven rather than assumed.
+    #[tokio::test]
+    async fn pushdown_eligibility_follows_this_tenant_s_remotes() {
+        /// Returns (pushdown taken, remote dispatch count).
+        async fn run(remote_tenant: TenantHash, querying: TenantHash) -> (bool, usize) {
+            let store = Arc::new(MemoryStore::new());
+            publish_metric_segment(
+                &store,
+                querying,
+                1,
+                "m",
+                vec![
+                    Sample {
+                        ts_ns: BASE_NS - NS_PER_MIN,
+                        value: 1.0,
+                    },
+                    Sample {
+                        ts_ns: BASE_NS - 2 * NS_PER_MIN,
+                        value: 2.0,
+                    },
+                ],
+                u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket"),
+                BASE_NS,
+            )
+            .await;
+            let segments = resolve_metric_segments(Arc::clone(&store), querying, BASE_NS).await;
+            let (worker, handle) = spawn_metric_worker(Arc::clone(&store), segments).await;
+            let distributed = Arc::new(crate::distrib::Distributed::new(
+                Arc::new(worker),
+                zero_thresholds(),
+            ));
+            let fetcher = Arc::new(CountingEmptyFetcher::default());
+            let federation = Arc::new(crate::distrib::Federation::new(vec![
+                crate::distrib::RemoteCluster {
+                    name: "eu-west".to_string(),
+                    fetcher: Arc::clone(&fetcher) as Arc<dyn crate::distrib::client::SliceFetcher>,
+                    tenant: Some(remote_tenant),
+                    skip_unavailable: false,
+                    soft_timeout: Duration::from_secs(5),
+                },
+            ]));
+            let eng = engine(Arc::clone(&store))
+                .with_distributed(distributed)
+                .with_federation(federation);
+
+            let plans = plan_selectors("count_over_time(m[5m])", BASE_MS, BASE_MS).expect("plans");
+            let (source, _stats) = eng
+                .prefetch(
+                    querying,
+                    &plans,
+                    &EvalWindow::Instant { t_ns: BASE_NS },
+                    &[],
+                    BASE_NS,
+                )
+                .await
+                .expect("prefetch succeeds");
+            let got = Evaluator::new()
+                .instant(&source, "count_over_time(m[5m])", BASE_MS)
+                .expect("evaluate");
+            assert_eq!(got.len(), 1, "one series");
+            assert_eq!(
+                got[0].value, 2.0,
+                "both in-window samples counted either way"
+            );
+            handle.abort();
+            // The pushdown branch returns the partial INSTEAD OF raw runs, so
+            // an empty raw series list is the observable signal that the gate
+            // admitted this query.
+            (
+                source.series.is_empty(),
+                fetcher.calls.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+
+        let acme = TenantId::new("acme").hash();
+        let beta = TenantId::new("beta").hash();
+
+        let (unmapped_pushdown, unmapped_calls) = run(beta, acme).await;
+        assert_eq!(
+            unmapped_calls, 0,
+            "acme is not the remote's local tenant, so nothing is dispatched to it"
+        );
+        assert!(
+            unmapped_pushdown,
+            "acme reaches no remote, so its local partial cannot be incomplete for one"
+        );
+
+        let (mapped_pushdown, mapped_calls) = run(beta, beta).await;
+        assert_eq!(
+            mapped_calls, 1,
+            "beta is the remote's local tenant, so the fan-out really happens"
+        );
+        assert!(
+            !mapped_pushdown,
+            "beta reaches the remote, so decision 1(a) still excludes it"
+        );
+    }
+
     /// ADR-0103 (epic #64) differential: the pushed-down result is identical to
     /// the non-pushdown result for the same samples. The eligible arm (single
     /// stable generation) takes the pushdown path; the ineligible arm (segments
@@ -5897,6 +7616,7 @@ mod prefetch_tests {
         let source = MergedSource {
             series: Vec::new(),
             histogram_series: Vec::new(),
+            log_series: Vec::new(),
             precomputed_count: Some(PrecomputedCount {
                 matchers: matchers.clone(),
                 start_ns: 100,
@@ -6367,6 +8087,590 @@ mod prefetch_tests {
             stats.estimate.segments
         );
         assert_estimate_covers_actual("multi-segment query", &stats);
+    }
+
+    /// Regression for issue #1214's second review round, Finding 1: a real
+    /// `up + up offset 5m`-shaped query (two `SelectorPlan`s sharing one
+    /// matcher set, `window_plan` plus `window_plan_with_offset`) run through
+    /// a real `QueryEngine` must report `service_batches` from the
+    /// DEDUPLICATED matcher-set count, not the raw plan count. 5 segments
+    /// under the default `fetch_concurrency` of 8: the fixed
+    /// `service_fetch_multiplier` (1 distinct matcher set) gives
+    /// `ceil(5 * 1 / 8) == 1`; the pre-fix `fetch_multiplier` (2, the raw
+    /// plan count) would have given `ceil(5 * 2 / 8) == 2`. Flip
+    /// `service_fetch_multiplier` back to `fetch_multiplier` at its
+    /// `resolve_snapshot_with_retry` call site (`prefetch_metric_plans`) to
+    /// watch the `service_batches` assertion below fail: it would then read
+    /// 2, not 1.
+    #[tokio::test]
+    async fn real_query_with_shared_matcher_plans_reports_deduplicated_service_batches() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=5u64 {
+            let ts = BASE_NS - (6 - seq as i64) * NS_PER_MIN;
+            publish_metric(&store, tenant_hash, seq, "dedup_metric", ts, seq as f64).await;
+        }
+
+        let eng = engine(store);
+        let plans = vec![
+            window_plan("dedup_metric"),
+            window_plan_with_offset("dedup_metric", 5 * 60 * NS_PER_SEC),
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch shared-matcher query");
+
+        assert!(
+            stats.estimate.segments >= 5,
+            "expected the snapshot to span at least the 5 published segments, got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 1,
+            "two plans sharing one matcher set must fetch as one distinct pass: \
+             ceil(5 segments * 1 distinct matcher set / 8 concurrency) == 1"
+        );
+        assert_eq!(
+            stats.io_shape.list_page_depth, 2,
+            "every resolve issues one bounded shard LIST plus one \
+             unconditional pending-erasure `del/` LIST (ravel-catalog, \
+             ADR-0064 decision 2), regardless of plan count: 2 total"
+        );
+    }
+
+    /// Regression for issue #1214's worked acceptance case: a multi-selector
+    /// metrics query's `service_batches` must divide by the BINDING
+    /// concurrency (`min(distinct_matcher_sets * promql_fetch_fanout,
+    /// shared_get_permits)`), not by the fan-out width alone. Two distinct
+    /// matcher sets (`binding_metric_a`, `binding_metric_b`, no shared
+    /// `__name__` filter so the resolve prunes nothing and the padded window
+    /// resolves all 64 published segments), the default `promql_fetch_fanout`
+    /// (8, resolving to `fetch_concurrency`), and a shared `GetLimiter`
+    /// (ADR-1195) built with exactly 16 permits: 128 GETs (64 segments * 2
+    /// distinct matcher sets) at binding concurrency `min(2 * 8, 16) == 16`
+    /// is 8 batches. The limiter is wired explicitly rather than left at the
+    /// resolved default so the expectation is pinned by the test, not by
+    /// whatever `store_get_concurrency` resolves to on the host. Before the
+    /// fix, `io_shape_for_resolve` divided the plan-multiplied numerator by
+    /// the fan-out width alone -- `ceil(64 * 2 / 8) == 16`, double the real
+    /// figure. Flip `binding_concurrency` in `io_shape_for_resolve` back to
+    /// plain `concurrency` to watch the assertion below fail: it would then
+    /// read 16, not 8.
+    #[tokio::test]
+    async fn service_batches_divides_by_binding_concurrency_not_fetch_concurrency_alone() {
+        const WIDE_RANGE_NS: i64 = 70 * NS_PER_MIN;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=64u64 {
+            let ts = BASE_NS - (65 - seq as i64) * NS_PER_MIN;
+            let metric = if seq % 2 == 0 {
+                "binding_metric_a"
+            } else {
+                "binding_metric_b"
+            };
+            publish_metric(&store, tenant_hash, seq, metric, ts, seq as f64).await;
+        }
+
+        let eng = engine(store).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(16).expect("16 permits is valid"),
+        ));
+        let plans = vec![
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("binding_metric_a")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("binding_metric_b")
+            },
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch two-distinct-matcher-set query");
+
+        assert_eq!(
+            stats.estimate.segments, 64,
+            "expected the padded window to resolve exactly the 64 published \
+             segments (no shared name filter to prune by), got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 8,
+            "64 segments * 2 distinct matcher sets = 128 GETs at binding \
+             concurrency min(2 * 8, 16) == 16 is 8 batches, not \
+             ceil(64 * 2 / 8) == 16"
+        );
+    }
+
+    /// Regression for issue #1214: exercises `min()` in the OTHER direction
+    /// from the worked acceptance case above -- here the outer plan fan-out
+    /// (`distinct_matcher_sets * promql_fetch_fanout`), not the shared
+    /// limiter, is the binding constraint, so the pre-fix and post-fix
+    /// formulas disagree on a case where the limiter was never close to
+    /// full. `fetch_concurrency` is lowered to 4 (`EngineConfig`, and
+    /// `promql_fetch_fanout` resolves to it), so 2 distinct matcher sets give
+    /// a plan fan-out bound of `2 * 4 == 8`, strictly under the 16 permits
+    /// the shared `GetLimiter` is built with here: `min(8, 16) == 8` is bound
+    /// by the plan fan-out, not the limiter. 20 segments * 2 matcher sets =
+    /// 40 GETs at that binding concurrency is `ceil(40 / 8) == 5`. The
+    /// limiter is wired explicitly (rather than left at the resolved
+    /// `store_get_concurrency`, which would follow `fetch_concurrency` down
+    /// to 4 and make the limiter bind after all) so this case keeps testing
+    /// the direction it names. The pre-fix formula (dividing by the fan-out
+    /// width alone, ignoring the multiplier entirely) would have read
+    /// `ceil(20 * 2 / 4) == 10`, twice the correct figure -- a different
+    /// wrong answer than the worked acceptance case's, because here the
+    /// multiplier's own contribution to the divisor was never capped by the
+    /// limiter.
+    #[tokio::test]
+    async fn service_batches_binds_on_plan_fanout_when_semaphore_has_headroom() {
+        const WIDE_RANGE_NS: i64 = 25 * NS_PER_MIN;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=20u64 {
+            let ts = BASE_NS - (21 - seq as i64) * NS_PER_MIN;
+            let metric = if seq % 2 == 0 {
+                "fanout_metric_a"
+            } else {
+                "fanout_metric_b"
+            };
+            publish_metric(&store, tenant_hash, seq, metric, ts, seq as f64).await;
+        }
+
+        let config = EngineConfig {
+            fetch_concurrency: 4,
+            ..EngineConfig::default()
+        };
+        let eng = engine_with_config(store, config).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(16).expect("16 permits is valid"),
+        ));
+        let plans = vec![
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("fanout_metric_a")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("fanout_metric_b")
+            },
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch plan-fanout-bound query");
+
+        assert_eq!(
+            stats.estimate.segments, 20,
+            "expected the padded window to resolve exactly the 20 published \
+             segments (no shared name filter to prune by), got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 5,
+            "plan fan-out binds here, not the shared limiter: min(2 distinct \
+             matcher sets * 4 promql_fetch_fanout, 16 shared permits) == 8, \
+             so 20 segments * 2 matcher sets = 40 GETs is ceil(40 / 8) == 5"
+        );
+    }
+
+    /// Pins WHERE the shared permit count comes from after ADR-1195: the
+    /// `GetLimiter` this engine wired to the fetchers it owns, not a
+    /// fetcher-local default. Same shape as the two cases above (2 distinct
+    /// matcher sets, default `promql_fetch_fanout` of 8), but the engine's
+    /// limiter is replaced with a 4-permit one, well under the plan fan-out
+    /// bound of `2 * 8 == 16`: `min(16, 4) == 4`, so 20 segments * 2 matcher
+    /// sets = 40 GETs is `ceil(40 / 4) == 10`. Reading the permit count from
+    /// the fetcher module's `DEFAULT_MAX_CONCURRENT_GETS` (16) instead --
+    /// which is what the pre-ADR-1195 `SegmentFetcher::max_concurrent_gets`
+    /// accessor reported for a fetcher nobody had overridden -- would give
+    /// `min(16, 16) == 16` and report `ceil(40 / 16) == 3`.
+    #[tokio::test]
+    async fn service_batches_reads_permits_from_the_engines_shared_limiter() {
+        const WIDE_RANGE_NS: i64 = 25 * NS_PER_MIN;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=20u64 {
+            let ts = BASE_NS - (21 - seq as i64) * NS_PER_MIN;
+            let metric = if seq % 2 == 0 {
+                "limiter_metric_a"
+            } else {
+                "limiter_metric_b"
+            };
+            publish_metric(&store, tenant_hash, seq, metric, ts, seq as f64).await;
+        }
+
+        let eng = engine(store).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(4).expect("4 permits is valid"),
+        ));
+        let plans = vec![
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("limiter_metric_a")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("limiter_metric_b")
+            },
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch limiter-bound query");
+
+        assert_eq!(
+            stats.estimate.segments, 20,
+            "expected the padded window to resolve exactly the 20 published \
+             segments (no shared name filter to prune by), got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 10,
+            "the shared limiter binds here: min(2 distinct matcher sets * 8 \
+             promql_fetch_fanout, 4 shared permits) == 4, so 20 segments * 2 \
+             matcher sets = 40 GETs is ceil(40 / 4) == 10, not the 3 a \
+             16-permit fetcher default would report"
+        );
+    }
+
+    /// Regression for issue #1214's second review round, Finding 2: the
+    /// OUTER `buffer_unordered(promql_fetch_fanout)` over distinct plans
+    /// admits at most `promql_fetch_fanout` plans at once, so plan capacity
+    /// is `promql_fetch_fanout * min(distinct_plans, promql_fetch_fanout)`,
+    /// not `promql_fetch_fanout * distinct_plans` -- that formula assumes
+    /// every distinct plan runs concurrently, which is only true when
+    /// `distinct_plans <= promql_fetch_fanout`. Here `promql_fetch_fanout`
+    /// is 1 (`fetch_concurrency` lowered to 1) with THREE distinct matcher
+    /// sets, so only one plan's segments are ever in flight: plan capacity
+    /// is `1 * min(3, 1) == 1`. The shared `GetLimiter` is built with a
+    /// large permit count so the semaphore never binds and the plan-capacity
+    /// term is what's under test. 20 segments * 3 distinct matcher sets = 60
+    /// GETs at binding concurrency `min(1, 1000) == 1` is 60 batches. The
+    /// pre-fix formula (`concurrency * distinct_plans`, uncapped by
+    /// `concurrency` itself) would have computed binding concurrency
+    /// `min(1 * 3, 1000) == 3` and reported `ceil(60 / 3) == 20`, the raw
+    /// segment count, silently dropping the fact that only one plan's
+    /// segments ever fetch at a time. Flip `service_fetch_multiplier.min(concurrency)`
+    /// in `io_shape_for_resolve` back to plain `service_fetch_multiplier` to
+    /// watch the assertion below fail: it would then read 20, not 60.
+    #[tokio::test]
+    async fn service_batches_caps_plan_capacity_at_outer_fanout_width() {
+        const WIDE_RANGE_NS: i64 = 25 * NS_PER_MIN;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=20u64 {
+            let ts = BASE_NS - (21 - seq as i64) * NS_PER_MIN;
+            let metric = match seq % 3 {
+                0 => "capacity_metric_a",
+                1 => "capacity_metric_b",
+                _ => "capacity_metric_c",
+            };
+            publish_metric(&store, tenant_hash, seq, metric, ts, seq as f64).await;
+        }
+
+        let config = EngineConfig {
+            fetch_concurrency: 1,
+            ..EngineConfig::default()
+        };
+        let eng = engine_with_config(store, config).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(1000).expect("1000 permits is valid"),
+        ));
+        let plans = vec![
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("capacity_metric_a")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("capacity_metric_b")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("capacity_metric_c")
+            },
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch three-distinct-matcher-set query");
+
+        assert_eq!(
+            stats.estimate.segments, 20,
+            "expected the padded window to resolve exactly the 20 published \
+             segments (no shared name filter to prune by), got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 60,
+            "outer plan admission binds here, not the shared limiter: \
+             min(1 promql_fetch_fanout * min(3 distinct matcher sets, 1 \
+             promql_fetch_fanout), 1000 shared permits) == 1, so 20 \
+             segments * 3 matcher sets = 60 GETs is ceil(60 / 1) == 60, \
+             not the 20 an uncapped plan-capacity term would report"
+        );
+    }
+
+    /// Regression for issue #1214 (defect found in review of this PR):
+    /// dividing TOTAL work by PEAK capacity in one division undercounts
+    /// whenever the outer plan fan-out window is not full for the query's
+    /// whole duration. Reviewer's case: 3 distinct matcher plans, 1
+    /// resolved segment, `promql_fetch_fanout` 2, and a 1000-permit shared
+    /// limiter (`GetLimiter::new(1000)`, wired explicitly so the expectation
+    /// does not depend on whatever `store_get_concurrency` resolves to on
+    /// the host). The pre-fix formula computed one binding concurrency
+    /// `min(2 * min(3, 2), 1000) = min(4, 1000) = 4` and divided the total
+    /// work (`1 segment * 3 distinct matcher sets = 3` GETs) by it in one
+    /// shot: `ceil(3 / 4) == 1`. The real outer `buffer_unordered(2)` admits
+    /// only 2 of the 3 plans in its first wave; the third plan is admitted
+    /// only after one of the first two finishes, in a second wave -- 2
+    /// serial rounds, not 1. The wave-accounted fix computes 2 waves: wave 0
+    /// (`active_0 = min(2, 3) = 2`, `capacity_0 = min(2 * 2, 1000) = 4`,
+    /// `batches_0 = ceil(1 * 2 / 4) = 1`) and wave 1 (`active_1 = min(2, 1)
+    /// = 1`, `capacity_1 = min(2 * 1, 1000) = 2`, `batches_1 = ceil(1 * 1 /
+    /// 2) = 1`), summing to 2. Flip `io_shape_for_resolve`'s call site back
+    /// to a single `service_batches(segments * service_fetch_multiplier,
+    /// min(concurrency * service_fetch_multiplier.min(concurrency),
+    /// shared_get_permits))` division to watch the assertion below fail: it
+    /// would then read 1, not 2.
+    #[tokio::test]
+    async fn service_batches_accounts_for_outer_fanout_waves_not_peak_capacity() {
+        const WIDE_RANGE_NS: i64 = 25 * NS_PER_MIN;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "wave_metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+
+        let config = EngineConfig {
+            promql_fetch_fanout: Some(2),
+            ..EngineConfig::default()
+        };
+        let eng = engine_with_config(store, config).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(1000).expect("1000 permits is valid"),
+        ));
+        let plans = vec![
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("wave_metric_a")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("wave_metric_b")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("wave_metric_c")
+            },
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch three-distinct-matcher-set single-segment query");
+
+        assert_eq!(
+            stats.estimate.segments, 1,
+            "expected the padded window to resolve exactly the 1 published \
+             segment (no shared name filter to prune by, since the 3 plans \
+             name 3 different metrics), got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 2,
+            "3 distinct matcher plans over a promql_fetch_fanout of 2 admit \
+             in 2 waves (2 plans, then 1); wave 0 is ceil(1 * 2 / min(4, \
+             1000)) == 1 batch and wave 1 is ceil(1 * 1 / min(2, 1000)) == \
+             1 batch, summing to 2 -- not the 1 a single peak-capacity \
+             division (ceil(3 / min(4, 1000)) == ceil(3 / 4) == 1) would \
+             report"
+        );
+    }
+
+    /// Issue #1219: `QueryIoShape::unfolded_records_served_from_cache` must be
+    /// the EXACT count of commit records a resolve served from the catalog's
+    /// local decoded-record cache, read straight from accounting -- never a
+    /// `> 0` check, which the deleted `(cache_hits - (cache_misses - 1)) / 2`
+    /// pooled-counter inference also passed while reading one too high
+    /// whenever a snapshot HEAD exists. Same `QueryEngine` (so the same
+    /// `Catalog` and its decoded-record cache persist across both calls),
+    /// same window, `record_count` commit records both times: the first
+    /// resolve is cold, so its own delta is 0; the second serves every one of
+    /// the `record_count` commit records from cache, so its delta is exactly
+    /// `record_count`.
+    ///
+    /// FLIP: change `record_count` from 3 to 4 (one more `publish_metric`
+    /// call) to watch the second assertion read 4, not 3 -- the figure
+    /// tracks the exact number of commit records the window holds, not a
+    /// fixed constant.
+    #[tokio::test]
+    async fn unfolded_records_served_from_cache_reports_exact_commit_record_serves() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let record_count = 3u64;
+        for seq in 1..=record_count {
+            let ts = BASE_NS - (record_count as i64 + 1 - seq as i64) * NS_PER_MIN;
+            publish_metric(
+                &store,
+                tenant_hash,
+                seq,
+                "cache_serve_metric",
+                ts,
+                seq as f64,
+            )
+            .await;
+        }
+
+        let eng = engine(store);
+        let plans = vec![window_plan("cache_serve_metric")];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+
+        let (_source, cold_stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("cold prefetch");
+        assert_eq!(
+            cold_stats.io_shape.unfolded_records_served_from_cache, 0,
+            "a cold resolve fetches every commit record it touches, so none is \
+             served from cache"
+        );
+
+        let (_source, warm_stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("warm prefetch");
+        assert_eq!(
+            warm_stats.io_shape.unfolded_records_served_from_cache, record_count,
+            "the second resolve over the same window serves every commit \
+             record the first one warmed"
+        );
+    }
+
+    /// Issue #1219, the case the deleted pooled-counter inference got wrong
+    /// by one: a tenant WITH a folded snapshot HEAD must not have its decoded
+    /// snapshot-HEAD probe inflate `unfolded_records_served_from_cache`. One
+    /// sealed hour folds into a snapshot; `record_count` commit records are
+    /// published above the watermark in later hours, the only commit records
+    /// a resolve of this window ever lists. A first resolve (cold) warms them
+    /// and admits the HEAD to the head cache, its own delta 0; a second
+    /// resolve at the same `now_ns` (so the HEAD probe is itself a cache hit)
+    /// serves all `record_count` recent records from the decoded-record
+    /// cache. The figure must read exactly `record_count`, not
+    /// `record_count + 1` with the HEAD probe folded in.
+    ///
+    /// FLIP: add a `record_commit_record_cache_hit()` call to the head-cache
+    /// hit branch of `ravel-catalog`'s `read_head` (`snapshot_resolve.rs`,
+    /// mirroring the same regression the sibling `ravel-catalog` test
+    /// `commit_record_cache_serves_are_counted_exactly_with_a_folded_snapshot_head`
+    /// pins directly) to watch the assertion below fail: it would then read
+    /// `record_count + 1`.
+    #[tokio::test]
+    async fn unfolded_records_served_from_cache_excludes_the_folded_head_probe() {
+        const NS_PER_HOUR: i64 = 3_600 * NS_PER_SEC;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let fold_margin = ravel_catalog::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + ravel_catalog::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+
+        // One sealed hour, folded into a snapshot (HEAD + one part).
+        let sealed_hour = 500_000u32;
+        let sealed_created = (i64::from(sealed_hour) + 1) * NS_PER_HOUR - 1_000;
+        publish_metric_segment(
+            &store,
+            tenant_hash,
+            1,
+            "folded_cache_metric",
+            vec![Sample {
+                ts_ns: sealed_created - 1_000,
+                value: 1.0,
+            }],
+            sealed_hour,
+            sealed_created,
+        )
+        .await;
+        let fold_now = (i64::from(sealed_hour) + 1) * NS_PER_HOUR + fold_margin;
+        let fold_backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<_>;
+        let fold_catalog =
+            Catalog::new(Arc::clone(&fold_backend), CatalogConfig::default()).expect("catalog");
+        fold_catalog
+            .fold(
+                &tenant_hash,
+                Signal::Metrics,
+                Uuid::new_v4(),
+                fold_now,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold produces a snapshot HEAD");
+
+        // `record_count` commit records above the watermark, published in
+        // later hours: the only listed commit records a resolve of this
+        // window ever touches.
+        let record_count = 2u32;
+        for i in 0..record_count {
+            let hour = sealed_hour + 10 + i;
+            let created = i64::from(hour) * NS_PER_HOUR + 60 * NS_PER_SEC;
+            publish_metric_segment(
+                &store,
+                tenant_hash,
+                2 + u64::from(i),
+                "folded_cache_metric",
+                vec![Sample {
+                    ts_ns: created - 1_000,
+                    value: 1.0,
+                }],
+                hour,
+                created,
+            )
+            .await;
+        }
+        let now_ns = i64::from(sealed_hour + 10 + record_count) * NS_PER_HOUR + fold_margin;
+
+        // A fresh engine/catalog so both the head cache and the record cache
+        // start empty; the same instance across both prefetches so they
+        // persist.
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<_>;
+        let catalog =
+            Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
+        let eng = QueryEngine::new(Arc::new(catalog), backend, EngineConfig::default());
+        let plans = vec![SelectorPlan {
+            range_ns: NS_PER_HOUR * i64::from(record_count + 11),
+            ..window_plan("folded_cache_metric")
+        }];
+        let eval_window = EvalWindow::Instant { t_ns: now_ns };
+
+        let (_source, cold_stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], now_ns)
+            .await
+            .expect("cold prefetch over folded tenant");
+        assert_eq!(
+            cold_stats.io_shape.unfolded_records_served_from_cache, 0,
+            "a cold resolve serves no commit record from cache"
+        );
+
+        let (_source, warm_stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], now_ns)
+            .await
+            .expect("warm prefetch over folded tenant");
+        assert_eq!(
+            warm_stats.io_shape.unfolded_records_served_from_cache,
+            u64::from(record_count),
+            "the two recent commit records are counted; the folded HEAD cache \
+             hit must not inflate the figure"
+        );
     }
 
     /// Native-histogram fixture (ADR-0044 finding 2): a 200-bucket sample's
@@ -6874,6 +9178,7 @@ mod coverage_wrapper_tests {
         let federation = Federation::new(vec![RemoteCluster {
             name: REMOTE.to_string(),
             fetcher,
+            tenant: None,
             skip_unavailable: true,
             soft_timeout: Duration::from_secs(5),
         }]);
@@ -7004,5 +9309,130 @@ mod coverage_wrapper_tests {
     #[tokio::test]
     async fn resolve_series_reports_partial_coverage_matching_its_stats() {
         assert_resolve_series_parity(false).await;
+    }
+}
+
+/// ADR-1195: `QueryEngine::new` builds one process-shareable `GetLimiter` and
+/// wires it to every fetcher it owns; `with_get_limiter` replaces it on all of
+/// them at once, for a process sharing one limiter across engines.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod get_limiter_tests {
+    use ravel_catalog::{Catalog, CatalogConfig};
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::*;
+
+    fn engine(store: Arc<MemoryStore>) -> QueryEngine {
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let catalog =
+            Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
+        QueryEngine::new(Arc::new(catalog), backend, EngineConfig::default())
+    }
+
+    /// `QueryEngine::new` must wire the SAME limiter `Arc` to both fetchers it
+    /// owns, not two equal-but-distinct ones: two independent limiters would
+    /// let each fetcher exhaust its own pool while the other sits idle, which
+    /// is exactly the multiplication ADR-1195 exists to close.
+    #[test]
+    fn new_wires_one_shared_limiter_to_both_owned_fetchers() {
+        let engine = engine(Arc::new(MemoryStore::new()));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.get_limiter_for_test(),
+            engine.log_fetcher.get_limiter_for_test()
+        ));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.get_limiter_for_test(),
+            engine.get_limiter_for_test()
+        ));
+    }
+
+    /// `with_get_limiter` must replace the limiter on every fetcher the engine
+    /// owns, and record the new `Arc` as the engine's own, so a later
+    /// `with_get_limiter` call (or another engine sharing this one) still sees
+    /// the current limiter rather than the one `new` built privately.
+    ///
+    /// Three fetchers reach here, not two: RSEG's `fetcher`, RLOG's OWN
+    /// whole-object limiter, and RLOG's block-range limiter. Before the
+    /// ADR-1195 gap this closes, `log_fetcher`'s own whole-object GETs (the
+    /// funnel every RLOG object at or below `block_range_threshold` routes
+    /// through, which is the stock `cost-based`-policy ClickBench path) had no
+    /// limiter of their own to replace, so a test asserting only the
+    /// block-range side could not see that gap.
+    #[test]
+    fn with_get_limiter_replaces_every_owned_fetcher() {
+        let engine = engine(Arc::new(MemoryStore::new()));
+        let original = engine.get_limiter_for_test().clone();
+        let replacement = Arc::new(GetLimiter::new(4).expect("4 permits is valid"));
+        let engine = engine.with_get_limiter(replacement.clone());
+
+        assert!(Arc::ptr_eq(engine.get_limiter_for_test(), &replacement));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.get_limiter_for_test(),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            engine.log_fetcher.get_limiter_for_test(),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            engine.log_fetcher.block_range_get_limiter_for_test(),
+            &replacement
+        ));
+        assert!(!Arc::ptr_eq(
+            engine.fetcher.get_limiter_for_test(),
+            &original
+        ));
+    }
+
+    /// Deliverable 1: `QueryEngine::new` wires the SAME `MemoryBudget` `Arc` to
+    /// every fetcher it owns, exactly as it does the `GetLimiter`. One shared
+    /// budget is what makes the process-wide fetch-byte ceiling real: two
+    /// independent budgets would each admit up to the limit, doubling peak
+    /// resident fetch bytes.
+    #[test]
+    fn new_wires_one_shared_memory_budget_to_both_owned_fetchers() {
+        let engine = engine(Arc::new(MemoryStore::new()));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.memory_budget_for_test(),
+            engine.log_fetcher.memory_budget_for_test()
+        ));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.memory_budget_for_test(),
+            engine.log_fetcher.block_range_memory_budget_for_test()
+        ));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.memory_budget_for_test(),
+            engine.memory_budget_for_test()
+        ));
+    }
+
+    /// Deliverable 1: `with_memory_budget` replaces the budget on every fetcher
+    /// the engine owns (RSEG `fetcher`, RLOG whole-object, RLOG block-range) and
+    /// records the new `Arc` as the engine's own, mirroring `with_get_limiter`.
+    #[test]
+    fn with_memory_budget_replaces_every_owned_fetcher() {
+        let engine = engine(Arc::new(MemoryStore::new()));
+        let original = engine.memory_budget_for_test().clone();
+        let replacement = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let engine = engine.with_memory_budget(replacement.clone());
+
+        assert!(Arc::ptr_eq(engine.memory_budget_for_test(), &replacement));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.memory_budget_for_test(),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            engine.log_fetcher.memory_budget_for_test(),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            engine.log_fetcher.block_range_memory_budget_for_test(),
+            &replacement
+        ));
+        assert!(!Arc::ptr_eq(
+            engine.fetcher.memory_budget_for_test(),
+            &original
+        ));
     }
 }

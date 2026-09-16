@@ -5,19 +5,23 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use parking_lot::Mutex;
+#[cfg(test)]
 use prost::Message;
 use ravel_cache::{
     Cache, CacheKey, CacheLimits, DiskCache, SingleFlightError, Source, TieredCache,
 };
 use ravel_commit::keys::BucketEntry;
 use ravel_commit::{erasure, keys, record, signal};
-use ravel_object_store::{GetOutcome, GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
+use ravel_object_store::{
+    DrainStep, GetOutcome, GetRange, MAX_LIST_PAGES, ObjectMeta, ObjectStoreBackend, StoreError,
+    drain_pages,
+};
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionPart, CompactionRecord, ErasureRequest, RewriteRecord,
 };
@@ -35,14 +39,6 @@ use crate::provisioning::ShardGeneration;
 use crate::snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
-/// Bound on the object-store requests one resolve keeps in flight at once.
-/// A cold resolve issues one LIST per (shard, hour) plus one
-/// GET per uncached commit/compaction record and per snapshot part; these
-/// used to run strictly one await at a time. They now run concurrently up to
-/// this bound, held by [`Catalog::request_semaphore`] and acquired only
-/// around a single leaf request, so the fan-out collapses from k sequential
-/// round trips toward ceil(k / this) without ever exceeding it.
-pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 16;
 /// One shard's listed commit-bucket entries, keyed by `(shard, ingest_hour)`,
 /// as produced by [`Catalog::list_shard_hours`] and merged in
 /// [`Catalog::list_window_bounded`].
@@ -136,6 +132,22 @@ fn clone_store_error(err: &StoreError) -> StoreError {
         StoreError::InvalidRange(msg) => StoreError::InvalidRange(msg.clone()),
         StoreError::Transient(msg) => StoreError::Transient(msg.clone()),
         StoreError::Permanent(msg) => StoreError::Permanent(msg.clone()),
+        StoreError::ListRepeatedToken { prefix } => StoreError::ListRepeatedToken {
+            prefix: prefix.clone(),
+        },
+        StoreError::ListPageCeiling { prefix, ceiling } => StoreError::ListPageCeiling {
+            prefix: prefix.clone(),
+            ceiling: *ceiling,
+        },
+        StoreError::ListOrderViolation {
+            prefix,
+            previous,
+            offending,
+        } => StoreError::ListOrderViolation {
+            prefix: prefix.clone(),
+            previous: previous.clone(),
+            offending: offending.clone(),
+        },
     }
 }
 
@@ -198,8 +210,15 @@ struct ColumnStatsCache {
     refusals: AtomicU64,
 }
 
+/// `ColumnStatsCache` entry key: tenant, signal, and the query window's hour
+/// bounds (ADR-1413). A per-part-scoped load answers only for the parts its
+/// own window covers, so two queries over the same HEAD but different windows
+/// must never share an entry -- the window bounds are part of the key for
+/// exactly the same reason a resolved snapshot itself is window-scoped.
+type ColumnStatsCacheKey = (TenantHash, Signal, u32, u32);
+
 struct ColumnStatsCacheState {
-    entries: HashMap<(TenantHash, Signal), CachedColumnStats>,
+    entries: HashMap<ColumnStatsCacheKey, CachedColumnStats>,
     /// Sum of every live entry's `bytes`; the invariant this cache bounds.
     held_bytes: u64,
     /// Monotonic access counter; the next recency stamp. Incremented on every
@@ -227,7 +246,7 @@ impl ColumnStatsCache {
     /// `None`, and the caller re-fetches; nothing stale is ever handed back.
     fn get(
         &self,
-        key: (TenantHash, Signal),
+        key: ColumnStatsCacheKey,
         stats_blake3: &[u8; 32],
         part_blake3: &[[u8; 32]],
     ) -> Option<Arc<LoadedColumnStats>> {
@@ -250,7 +269,7 @@ impl ColumnStatsCache {
     /// `load_column_stats`, so refusing to cache never changes an answer.
     fn insert(
         &self,
-        key: (TenantHash, Signal),
+        key: ColumnStatsCacheKey,
         stats_blake3: [u8; 32],
         stats: Arc<LoadedColumnStats>,
     ) {
@@ -311,7 +330,7 @@ impl ColumnStatsCache {
     fn evict_tenants(&self, idle: &[TenantHash]) {
         let mut state = self.state.lock();
         let mut freed = 0u64;
-        state.entries.retain(|(tenant, _), entry| {
+        state.entries.retain(|(tenant, _, _, _), entry| {
             if idle.contains(tenant) {
                 freed += entry.bytes;
                 false
@@ -332,6 +351,25 @@ impl ColumnStatsCache {
 
     fn held_bytes(&self) -> u64 {
         self.state.lock().held_bytes
+    }
+}
+
+/// One fold-accounting slot per [`Signal`] variant, so the per-signal fold
+/// counters are a fixed-size array indexed by [`fold_slot`] rather than a map
+/// behind a lock on the fold path.
+const SIGNAL_SLOTS: usize = 6;
+
+/// The fold-accounting slot for a signal. Exhaustive: adding a [`Signal`]
+/// variant breaks this compile until it is given a slot and [`SIGNAL_SLOTS`]
+/// is raised, rather than silently aliasing onto another signal's counters.
+const fn fold_slot(signal: Signal) -> usize {
+    match signal {
+        Signal::Metrics => 0,
+        Signal::Logs => 1,
+        Signal::Spans => 2,
+        Signal::Profiles => 3,
+        Signal::Alerts => 4,
+        Signal::Audit => 5,
     }
 }
 
@@ -402,6 +440,52 @@ pub struct Catalog {
     /// these also fails the query: the count is a record of hard failures,
     /// not a harmless-overlap anomaly tally.
     isolation_breaches: AtomicU64,
+    /// Count of [`Catalog::fold`] calls that returned `Ok`, per signal,
+    /// including the no-op folds that are the healthy steady state. This
+    /// counts fold *cycles*, not published snapshots: a fold seals an ingest
+    /// hour only once `max_flush_lifetime + clock_skew_allowance +
+    /// fold_safety_margin` has elapsed past that hour, so most cycles
+    /// legitimately publish nothing, and a counter that moved only on publish
+    /// would read as a stopped fold on any quiet tenant.
+    ///
+    /// Keyed by signal because folding is per (tenant, signal) throughout and
+    /// the server drives it as one independent task per signal: a
+    /// process-global counter reads as healthy while one signal's fold has
+    /// stopped and the others keep running. Indexed by [`fold_slot`].
+    fold_cycles: [AtomicU64; SIGNAL_SLOTS],
+    /// Count of [`Catalog::fold`] calls that returned `Err`, per signal.
+    /// Before this counter the fold's failure path was `tracing` only, so a
+    /// fold failing every cycle was indistinguishable at `/metrics` from a
+    /// fold that was succeeding: the unsealed span grows either way and the
+    /// first visible symptom was a recent-window query exceeding its request
+    /// budget. Indexed by [`fold_slot`].
+    fold_failures: [AtomicU64; SIGNAL_SLOTS],
+    /// Caller-supplied `now_ns` of the most recent [`Catalog::fold`] call for
+    /// this signal that returned `Ok`, or `0` when no fold of that signal has
+    /// succeeded in this process. This crate reads no clock: the value is
+    /// whatever `now_ns` the caller passed into `fold`, which is that caller's
+    /// injected clock. Indexed by [`fold_slot`].
+    ///
+    /// Updated with a plain `store`, not `fetch_max`: the latest reading to
+    /// FINISH wins, and that can be an older reading than the slot already
+    /// holds. Two things produce that. Folds of one signal overlap (the
+    /// server's scheduled loop for that signal folds its tenants one at a
+    /// time, re-reading the clock per tenant, while an on-demand fold of the
+    /// same signal for a different tenant runs against the same `Catalog`),
+    /// and each stamp is the reading taken *before* its fold began, so a fold
+    /// that starts later and finishes sooner is overwritten by the slower one
+    /// completing behind it. The resulting step back is bounded by the slower
+    /// fold's own duration. An NTP step back on the host does the same thing
+    /// without any overlap.
+    ///
+    /// Both are transient and bounded, and the next successful fold clears
+    /// them; that is what picks `store` over `fetch_max`. `fetch_max` would
+    /// latch a forward NTP step permanently, leaving the gauge stuck at a
+    /// future reading it can never come down from, so `time() - gauge` stays
+    /// small and a later genuine stall is masked with no bound on how long. On
+    /// a liveness signal a bounded false positive is the safe side; an
+    /// unbounded false negative is not.
+    fold_last_success_unix_ns: [AtomicI64; SIGNAL_SLOTS],
     /// Bounds the object-store requests one resolve keeps in flight. Ephemeral, process-local, correctness-free: it changes only
     /// how many round trips overlap, never which segments a resolve returns.
     request_semaphore: Arc<tokio::sync::Semaphore>,
@@ -451,6 +535,32 @@ pub struct Catalog {
     /// stats object with no reuse, matching the `byte_cache_max_bytes == 0`
     /// disabled sentinel.
     column_stats_cache: Option<ColumnStatsCache>,
+    /// `(tenant, signal, object key)` triples whose column-stats DECODE the
+    /// reader has already refused and logged (issue #1400). HEAD references the
+    /// object but its bytes will not open, so the same refusal recurs on every
+    /// eligible query for that HEAD; the WARN is emitted once per key, not once
+    /// per query. Swept per idle tenant in [`Catalog::evict_idle_tenants`]
+    /// alongside the per-tenant caches, so a tenant that returns after eviction
+    /// warns again, and a re-fold that publishes a NEW object key warns for the
+    /// new key while the old one ages out with its tenant. Bounded by the
+    /// (tenant, signal, key) triples the process has actually referenced;
+    /// unrelated to the reuse cache, which may be disabled.
+    warned_decode_failures: Mutex<HashSet<(TenantHash, Signal, String)>>,
+    /// Cumulative count of column-stats objects HEAD referenced that the reader
+    /// refused to DECODE (issue #1400), incremented on EVERY refusal whether or
+    /// not it logged, so a metric can show the condition persisting after the
+    /// single WARN. Surfaced by [`Catalog::column_stats_decode_refusals`].
+    column_stats_decode_refusals: AtomicU64,
+    /// Test-only override of the per-part column-statistics ceiling
+    /// (ADR-1413 decision 3, normally
+    /// [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`]), so a fold
+    /// test can exercise the degrade loop at a few kilobytes instead of 256
+    /// MiB. Not `#[cfg(test)]`: `ravel-cli`'s own `catalog fold` test sets
+    /// this through a normal (non-dev) dependency edge on `ravel-catalog`,
+    /// which never compiles with this crate's own `cfg(test)` active.
+    /// `None` in every real production run; read through
+    /// [`Catalog::column_stats_part_ceiling`].
+    column_stats_part_ceiling_override: Option<u64>,
 }
 
 /// Adapts [`Catalog::guarded_get`] to the provisioning module's
@@ -475,13 +585,28 @@ impl crate::provisioning::AccountedRecordGet for GuardedRecordGet<'_> {
 
 impl Catalog {
     /// Errors if `config.shard_count == 0` (a resolvable catalog needs at
-    /// least one shard).
+    /// least one shard), `config.resolve_get_concurrency == 0` (a
+    /// zero-permit semaphore would deadlock every resolve, never silently
+    /// clamped to 1), or `config.resolve_get_concurrency >
+    /// crate::config::MAX_RESOLVE_GET_CONCURRENCY` (past that ceiling,
+    /// `tokio::sync::Semaphore::new` panics instead of failing typed --
+    /// see that constant's doc comment for the basis).
     pub fn new(
         store: Arc<dyn ObjectStoreBackend>,
         config: CatalogConfig,
     ) -> Result<Self, CatalogError> {
         if config.shard_count == 0 {
-            return Err(CatalogError::InvalidConfig);
+            return Err(CatalogError::InvalidConfig("shard_count must be > 0"));
+        }
+        if config.resolve_get_concurrency == 0 {
+            return Err(CatalogError::InvalidConfig(
+                "resolve_get_concurrency must be > 0",
+            ));
+        }
+        if config.resolve_get_concurrency > crate::config::MAX_RESOLVE_GET_CONCURRENCY {
+            return Err(CatalogError::InvalidConfig(
+                "resolve_get_concurrency exceeds MAX_RESOLVE_GET_CONCURRENCY",
+            ));
         }
         // `byte_cache_max_bytes == 0` is the disabled sentinel:
         // build no byte cache at all rather than a zero-capacity one, so the
@@ -513,11 +638,19 @@ impl Catalog {
             compaction_input_set_conflicts: AtomicU64::new(0),
             rewrite_sibling_conflicts: AtomicU64::new(0),
             isolation_breaches: AtomicU64::new(0),
-            request_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            fold_cycles: std::array::from_fn(|_| AtomicU64::new(0)),
+            fold_failures: std::array::from_fn(|_| AtomicU64::new(0)),
+            fold_last_success_unix_ns: std::array::from_fn(|_| AtomicI64::new(0)),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                config.resolve_get_concurrency,
+            )),
             enforce_provisioning: false,
             provisioning_checked: Mutex::new(HashSet::new()),
             tenant_activity: Mutex::new(HashMap::new()),
             column_stats_cache,
+            warned_decode_failures: Mutex::new(HashSet::new()),
+            column_stats_decode_refusals: AtomicU64::new(0),
+            column_stats_part_ceiling_override: None,
         })
     }
 
@@ -627,9 +760,9 @@ impl Catalog {
             self.config.shard_count,
         )
         .await?;
-        // Only a `Matched` result is safe to cache forever: the record is
-        // immutable, so a match stays a match. `FreshNoData` means "no record
-        // exists yet, nothing to validate against" -- caching it would skip the
+        // Only a `RecordPresent` result is safe to cache forever: the record is
+        // immutable, so a present record stays present. `FreshNoData` means "no
+        // record exists yet, nothing to validate against" -- caching it would skip the
         // real check once a later, higher-shard_count process writes the record
         // and lands data across shards this process would then silently omit
         // (records are immutable; a stale cache hit never re-checks). Re-check
@@ -821,6 +954,14 @@ impl Catalog {
     /// returned key must begin with `tenant`'s prefix, or this is a hard
     /// isolation-breach `CatalogError::FieldMismatch`, never a silently
     /// dropped or served foreign key.
+    ///
+    /// The drain itself is [`ravel_object_store::drain_pages`], so a backend
+    /// that repeats a continuation token or exceeds
+    /// [`ravel_object_store::MAX_LIST_PAGES`] fails with a typed
+    /// [`StoreError`] instead of spinning here. Dedup is the contract's
+    /// constant-memory form: the raw delivery sequence never decreases, a
+    /// repeat re-delivers the last key delivered, and anything below it is a
+    /// typed order violation.
     async fn guarded_list_all(
         &self,
         tenant: &TenantHash,
@@ -829,36 +970,33 @@ impl Catalog {
     ) -> Result<Vec<ObjectMeta>, CatalogError> {
         let tenant_prefix = format!("t/{}/", tenant.to_hex());
         let mut out: Vec<ObjectMeta> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut page_token = None;
-        loop {
-            let page = {
+        drain_pages(
+            prefix,
+            None,
+            MAX_LIST_PAGES,
+            |_start_after, page_token| async move {
                 let _permit = self.request_semaphore.acquire().await.map_err(|_| {
                     StoreError::Transient("catalog request semaphore closed".to_string())
                 })?;
                 let page = self.store.list(prefix, page_token).await;
                 accounting.record_s3_request(AccountedOp::List);
-                page?
-            };
-            for meta in page.objects {
+                Ok(page?)
+            },
+            |meta: ObjectMeta| {
                 if !meta.key.starts_with(&tenant_prefix) {
                     self.record_isolation_breach();
                     return Err(CatalogError::FieldMismatch {
                         key: prefix.to_string(),
                         field: "list_prefix",
-                        expected: tenant_prefix,
+                        expected: tenant_prefix.clone(),
                         actual: meta.key,
                     });
                 }
-                if seen.insert(meta.key.clone()) {
-                    out.push(meta);
-                }
-            }
-            match page.next {
-                Some(next) => page_token = Some(next),
-                None => break,
-            }
-        }
+                out.push(meta);
+                Ok(DrainStep::Continue)
+            },
+        )
+        .await?;
         Ok(out)
     }
 
@@ -945,6 +1083,47 @@ impl Catalog {
         self.isolation_breaches.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// [`Catalog::fold`] calls for `signal` that returned `Ok` across this
+    /// catalog's lifetime, no-op cycles included. See the field docs for why a
+    /// no-op counts, and why this is per signal rather than process-global.
+    pub fn fold_cycles(&self, signal: Signal) -> u64 {
+        self.fold_cycles[fold_slot(signal)].load(Ordering::Relaxed)
+    }
+
+    /// [`Catalog::fold`] calls for `signal` that returned `Err` across this
+    /// catalog's lifetime.
+    pub fn fold_failures(&self, signal: Signal) -> u64 {
+        self.fold_failures[fold_slot(signal)].load(Ordering::Relaxed)
+    }
+
+    /// The `now_ns` of the most recent successful [`Catalog::fold`] call for
+    /// `signal`, or `0` if none has succeeded in this process. The age of this
+    /// value is the one figure that moves when that signal's fold STOPS rather
+    /// than when it runs, which is what an operator alerts on.
+    pub fn fold_last_success_unix_ns(&self, signal: Signal) -> i64 {
+        self.fold_last_success_unix_ns[fold_slot(signal)].load(Ordering::Relaxed)
+    }
+
+    /// `pub(crate)`: the single accounting point every [`Catalog::fold`]
+    /// outcome passes through, called from the wrapper in `fold.rs` rather
+    /// than from each of the fold body's many exits. Keeping it in one place
+    /// is what makes the counters cover every fold call path with no
+    /// per-call-site wiring to forget. In the server that matters because the
+    /// scheduled fold loops and the on-demand admin route are `Arc` clones of
+    /// one `Catalog` in one process, so a family fed by only one of them would
+    /// read as healthy while the other was dead. A `ravel-cli` fold and the
+    /// catalog bench run in their own processes, each with its own `Catalog`
+    /// and no `/metrics` route, so they account into counters nothing scrapes.
+    pub(crate) fn record_fold_outcome(&self, signal: Signal, now_ns: i64, succeeded: bool) {
+        let slot = fold_slot(signal);
+        if succeeded {
+            self.fold_cycles[slot].fetch_add(1, Ordering::Relaxed);
+            self.fold_last_success_unix_ns[slot].store(now_ns, Ordering::Relaxed);
+        } else {
+            self.fold_failures[slot].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// `pub(crate)`: lets `fold` issue
     /// its own LIST/GET/PUT calls through the same store handle, in its own
     /// `impl Catalog` block in `fold.rs`, without duplicating the
@@ -965,18 +1144,38 @@ impl Catalog {
     }
 
     /// Resolve exact per-segment column statistics for `(tenant, signal)`
-    /// from the current folded snapshot HEAD (ADR-0850), for a query engine
-    /// to join against its own resolved snapshot by identity. `Ok(None)`
-    /// means no usable column-stats object exists right now (nothing folded
-    /// yet, no configured typed columns, or the last fold's column-stats
-    /// build/PUT failed): the caller must fall back to scanning, never treat
-    /// this as "zero columns configured means zero rows". See
-    /// [`column_stats_resolve::load_column_stats`] for the full
-    /// degrade-to-`Ok(None)` contract.
+    /// over the query window `[range, now_ns]` (ADR-1413), for a query engine
+    /// to join against its own resolved snapshot's live segments via
+    /// [`LoadedColumnStats::stat_for`]. `Ok(None)` means no usable
+    /// column-stats object covers any part this window touches (nothing
+    /// folded yet, no configured typed columns, or the last fold's
+    /// column-stats build/PUT failed): the caller must fall back to
+    /// scanning, never treat this as "zero columns configured means zero
+    /// rows".
+    ///
+    /// Only parts whose `[min_hour, watermark_hour]` intersects the window
+    /// are read at all -- the same predicate `resolve` itself applies via
+    /// [`crate::snapshot_resolve::parts_intersecting`] -- so a query over a
+    /// narrow window against a many-part tenant issues per-part GETs for
+    /// exactly those parts, never the whole tenant.
+    ///
+    /// Per covered part (ADR-1413 decision 6): the part's own v3 object
+    /// (`parts[i].column_stats`, field 7) is the only source. A part with no
+    /// such ref, or whose object fails to load (blake3 mismatch, decode
+    /// refusal, missing object), is simply left uncovered and the caller
+    /// scans it -- there is no whole-object fallback; the fold no longer
+    /// publishes the whole-tenant v1/v2 objects at any size, and a HEAD still
+    /// carrying either from before this change is decoded with no slot for
+    /// them (the fields are `reserved`). Every failure degrades silently
+    /// EXCEPT a decode refusal, which emits one `tracing::warn!` per object
+    /// key and increments [`Catalog::column_stats_decode_refusals`] before
+    /// degrading (issue #1400).
     pub async fn load_column_stats(
         &self,
         tenant: &TenantHash,
         signal: Signal,
+        range: TimeRange,
+        now_ns: i64,
         accounting: &QueryAccounting,
     ) -> Result<Option<Arc<LoadedColumnStats>>, LoadColumnStatsError> {
         // Route every GET through the same semaphore-bounded, accounted funnel
@@ -987,41 +1186,168 @@ impl Catalog {
             catalog: self,
             accounting,
         };
-        // Always read HEAD (one GET): the stats object is bound to the CURRENT
-        // folded HEAD, not the pinned snapshot, so this is the only way to
-        // detect a fold that superseded a cached object (ADR-0850, issue #888).
-        let Some(resolved) =
-            column_stats_resolve::resolve_stats_ref(&getter, tenant, signal).await?
+
+        let Some((window_start_hour, window_end_hour)) = self.window_hour_bounds(range, now_ns)
         else {
             return Ok(None);
         };
-        // Reuse the cached object only when its content hash AND the HEAD's
-        // covered part set both still match `resolved`: a changed fold produces
-        // a different `blake3` (a rebuilt object) or a different part set (the
-        // binding a stale object fails), and either misses. This skips the
-        // second GET, the stats-object fetch, and nothing else. An entry the
-        // byte budget evicted also misses here and re-fetches, never returning a
-        // partial or stale statistic.
-        let cache_hit = self.column_stats_cache.as_ref().and_then(|cache| {
-            cache.get(
-                (*tenant, signal),
-                &resolved.blake3,
-                &resolved.expected_part_blake3,
-            )
-        });
+
+        // Always read HEAD (one GET): statistics are bound to the CURRENT
+        // folded HEAD, not a pinned snapshot, so this is the only way to
+        // detect a fold that superseded a cached object (ADR-0850, issue #888).
+        let Some(head) = column_stats_resolve::resolve_stats_head(&getter, tenant, signal).await?
+        else {
+            return Ok(None);
+        };
+
+        let covered = crate::snapshot_resolve::parts_intersecting(
+            &head.parts,
+            window_start_hour,
+            window_end_hour,
+        );
+        if covered.is_empty() {
+            return Ok(None);
+        }
+        let covered_part_blake3: Vec<[u8; 32]> = covered
+            .iter()
+            .filter_map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()).ok())
+            .collect();
+        if covered_part_blake3.len() != covered.len() {
+            return Ok(None);
+        }
+
+        // The composite identity a cache entry is valid against: every
+        // object a fully-resolved load for this exact covered-part set would
+        // consult, by its DECLARED blake3 (derivable from `head` alone, no
+        // extra GET). A re-fold that rewrites any one of those objects
+        // changes this fingerprint, so a stale entry always misses -- the
+        // same guarantee issue #888 gives the single-whole-object case,
+        // extended per part.
+        let fingerprint = Self::column_stats_fingerprint(&covered);
+        let cache_key: ColumnStatsCacheKey = (*tenant, signal, window_start_hour, window_end_hour);
+        let cache_hit = self
+            .column_stats_cache
+            .as_ref()
+            .and_then(|cache| cache.get(cache_key, &fingerprint, &covered_part_blake3));
         if let Some(stats) = cache_hit {
             return Ok(Some(stats));
         }
-        let Some(loaded) =
-            column_stats_resolve::fetch_stats_object(&getter, tenant, &resolved).await?
-        else {
+
+        let mut segments: HashMap<
+            crate::EntryIdentity,
+            ravel_proto::catalog::v1::ColumnStatsSegment,
+        > = HashMap::new();
+        let mut by_content_hash: HashMap<[u8; 32], ravel_proto::catalog::v1::ColumnStatsSegment> =
+            HashMap::new();
+
+        for part in &covered {
+            // No field-7 ref at all: the part is simply left uncovered.
+            if let Some(resolved) = column_stats_resolve::resolve_part_stats_ref(part) {
+                match column_stats_resolve::fetch_stats_object(&getter, tenant, &resolved).await? {
+                    column_stats_resolve::FetchOutcome::Loaded(decoded) => {
+                        segments.extend(decoded.segments);
+                        by_content_hash.extend(decoded.by_content_hash);
+                    }
+                    // Store read or stale binding: this part is simply
+                    // left uncovered, silently.
+                    column_stats_resolve::FetchOutcome::Absent => {}
+                    // The part's own ref points at an object the reader
+                    // refused to decode: log once per key, count, and
+                    // leave the part uncovered (issue #1400).
+                    column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
+                        self.note_column_stats_decode_refusal(tenant, signal, &resolved.key, &err);
+                    }
+                }
+            }
+        }
+
+        if segments.is_empty() && by_content_hash.is_empty() {
             return Ok(None);
-        };
-        let stats = Arc::new(loaded);
+        }
+
+        let stats = Arc::new(LoadedColumnStats {
+            segments,
+            by_content_hash,
+            part_blake3: covered_part_blake3,
+        });
         if let Some(cache) = self.column_stats_cache.as_ref() {
-            cache.insert((*tenant, signal), resolved.blake3, Arc::clone(&stats));
+            cache.insert(cache_key, fingerprint, Arc::clone(&stats));
         }
         Ok(Some(stats))
+    }
+
+    /// The declared-blake3 fingerprint [`Catalog::load_column_stats`] keys its
+    /// reuse cache on: each covered part's v3 ref blake3 (or a zero sentinel
+    /// when the part carries none), in `covered`'s order. Computed entirely
+    /// from HEAD-derived refs, with no object GET, so a cache check costs
+    /// nothing beyond the HEAD read already paid for.
+    fn column_stats_fingerprint(covered: &[ravel_proto::catalog::v1::SnapshotPartRef]) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(covered.len() * 32);
+        for part in covered {
+            match column_stats_resolve::resolve_part_stats_ref(part) {
+                Some(resolved) => buf.extend_from_slice(&resolved.blake3),
+                None => buf.extend_from_slice(&[0u8; 32]),
+            }
+        }
+        *blake3::hash(&buf).as_bytes()
+    }
+
+    /// Record a decode refusal on the column-stats object HEAD references for
+    /// `(tenant, signal)` at `key` (issue #1400): increment
+    /// [`Catalog::column_stats_decode_refusals`] unconditionally, then emit ONE
+    /// `tracing::warn!` the first time this exact `(tenant, signal, key)` is
+    /// seen. The warn-once set is consulted under its own lock; the WARN itself
+    /// is emitted after the lock is dropped, so a subscriber's unbounded work
+    /// never runs while the lock is held.
+    ///
+    /// The counter moves on every refusal so a metric shows the condition
+    /// persisting; the log fires once per key so a per-query failure does not
+    /// flood the log. A re-fold that publishes a new object key is a new key
+    /// and warns again; a tenant swept from the set by
+    /// [`Catalog::evict_idle_tenants`] warns again on its return.
+    fn note_column_stats_decode_refusal(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        key: &str,
+        err: &crate::snapshot_format::SnapshotFormatError,
+    ) {
+        self.column_stats_decode_refusals
+            .fetch_add(1, Ordering::Relaxed);
+        let first = {
+            let mut warned = self.warned_decode_failures.lock();
+            warned.insert((*tenant, signal, key.to_string()))
+        };
+        if !first {
+            return;
+        }
+        match err {
+            crate::snapshot_format::SnapshotFormatError::ColumnStatsDecompressedTooLarge {
+                declared,
+                cap,
+            } => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    key = %key,
+                    declared_uncompressed_bytes = *declared,
+                    cap_uncompressed_bytes = *cap,
+                    "HEAD references a column-statistics object the reader refused to decode: its \
+                     header declares more uncompressed bytes than the decode ceiling. The query \
+                     proceeds without column statistics and scans."
+                );
+            }
+            other => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    key = %key,
+                    error = %other,
+                    "HEAD references a column-statistics object the reader refused to decode. The \
+                     query proceeds without column statistics and scans."
+                );
+            }
+        }
     }
 
     /// Evict every per-tenant cache outer-map entry for tenants last touched
@@ -1048,6 +1374,9 @@ impl Catalog {
         // Collect the idle tenants under the activity lock, then drop the lock
         // before touching the cache locks: never hold two cache-related locks
         // at once, so this can never deadlock against a concurrent resolve.
+        // The one lock nested inside it is the warn-once marks lock, whose
+        // only other holder (`note_column_stats_decode_refusal`) takes no
+        // other lock, so activity-then-marks is the only order that exists.
         let idle: Vec<TenantHash> = {
             let mut activity = self.tenant_activity.lock();
             let idle: Vec<TenantHash> = activity
@@ -1058,6 +1387,21 @@ impl Catalog {
             for tenant in &idle {
                 activity.remove(tenant);
             }
+            // Sweep the decode-refusal warn-once marks (issue #1400) while the
+            // activity lock is still held, against the live map: a resolve
+            // that stamps a tenant waits for this lock, so its mark can never
+            // land between a snapshot and the sweep and be swept as stale.
+            // Keyed by (tenant, signal, key); keep only triples whose tenant
+            // is still stamped. That drops the idle tenants just removed AND
+            // any tenant that never resolved: `load_column_stats` does not
+            // stamp activity, so a caller that reaches it without a preceding
+            // resolve would otherwise leave its marks with no sweep able to
+            // select them. A swept tenant warns again on its next refusal.
+            // Runs on every call, not only when `idle` is non-empty, for the
+            // same reason.
+            self.warned_decode_failures
+                .lock()
+                .retain(|(tenant, _, _)| activity.contains_key(tenant));
             idle
         };
         for tenant in &idle {
@@ -1136,6 +1480,22 @@ impl Catalog {
             .map_or(0, ColumnStatsCache::refusals)
     }
 
+    /// Cumulative column-statistics DECODE refusals (issue #1400): objects HEAD
+    /// referenced that the reader refused to decode (an oversized declared body,
+    /// corruption, a crc or header failure). Counted on every occurrence, so a
+    /// climbing value means a folded HEAD keeps pointing at an object the reader
+    /// cannot open and the tenant is running with NO column statistics; the
+    /// matching WARN (once per object key) names the tenant, signal, key, and
+    /// for the oversized case the declared and cap bytes. Distinct from
+    /// [`Catalog::column_stats_cache_refusals`], which counts a decodable object
+    /// too large for the reuse cache's byte budget. Unlike a bare `Ok(None)`
+    /// (no HEAD, no stats object), this never fires for legitimately absent
+    /// statistics. Independent of the reuse cache, so it counts even when that
+    /// cache is disabled. Exporting it on `/metrics` is the server's follow-up.
+    pub fn column_stats_decode_refusals(&self) -> u64 {
+        self.column_stats_decode_refusals.load(Ordering::Relaxed)
+    }
+
     /// Bytes currently held by the column-statistics cache (issue #905), the
     /// sum of every cached object's [`LoadedColumnStats::heap_bytes`]. Bounded
     /// by [`CatalogConfig::column_stats_cache_max_bytes`]. `0` when the cache is
@@ -1183,6 +1543,33 @@ impl Catalog {
     #[cfg(test)]
     pub(crate) fn set_tiered_byte_cache_for_test(&mut self, tiered: TieredCache<Arc<StoreError>>) {
         self.byte_cache = Some(ByteCache::Tiered(tiered));
+    }
+
+    /// The per-part column-statistics ceiling (ADR-1413 decision 3): the
+    /// fixed bound the fold degrades a part's statistics down to, and the
+    /// same bound the v3 reader enforces
+    /// ([`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`]). A test
+    /// build may override it via [`Catalog::set_column_stats_part_ceiling_for_test`]
+    /// to exercise the degrade loop at a few kilobytes.
+    pub(crate) fn column_stats_part_ceiling(&self) -> u64 {
+        if let Some(ceiling) = self.column_stats_part_ceiling_override {
+            return ceiling;
+        }
+        crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES
+    }
+
+    /// Test-only seam: override the per-part column-statistics ceiling this
+    /// catalog's fold enforces, so a test can force the degrade loop (or the
+    /// no-dictionary-left refusal) at a size far below the real 256 MiB
+    /// constant without a multi-hundred-megabyte fixture. `pub`, not
+    /// `#[cfg(test)]`, because `ravel-cli`'s own `catalog fold` test needs it
+    /// through a normal (non-dev) dependency edge, the same way `fold`
+    /// threads `now_ns` as a plain parameter rather than reaching for
+    /// `SystemTime::now()` internally: production code never calls this, and
+    /// every real caller goes through [`Catalog::column_stats_part_ceiling`],
+    /// which returns the real constant whenever no override is set (#1598).
+    pub fn set_column_stats_part_ceiling_for_test(&mut self, ceiling: u64) {
+        self.column_stats_part_ceiling_override = Some(ceiling);
     }
 
     /// Resolve a query-time snapshot (docs/catalog-and-mvcc.md "Snapshot
@@ -1621,7 +2008,8 @@ impl Catalog {
             // decision and `list_window_by_prefix`'s shard loop must agree on
             // that wider bound so the decision stays consistent with what is
             // scanned.
-            let suffix_scan_shards = crate::provisioning::max_scan_count_over_range(
+            let suffix_scan_shards = crate::provisioning::scan_shards_over_range(
+                signal,
                 &generations,
                 listing_start_hour,
                 window_end_hour,
@@ -1851,6 +2239,245 @@ impl Catalog {
         }
     }
 
+    /// The newest-ingest-hour probe widths [`Catalog::latest_ingest_hour`]
+    /// tries per shard, newest-window-first, each one doubling the last
+    /// (issue #1233). The widest entry is [`LATEST_HOUR_MAX_LOOKBACK_HOURS`];
+    /// once it also misses, the tenant/signal is reported as having no
+    /// ingest within the lookback cap rather than paging through its entire
+    /// history.
+    const LATEST_HOUR_PROBE_WINDOWS_HOURS: [u32; 7] = [24, 48, 96, 192, 384, 768, 1536];
+
+    /// The widest window [`Catalog::latest_ingest_hour`] will probe: 64 days,
+    /// the last entry of `LATEST_HOUR_PROBE_WINDOWS_HOURS`. A tenant whose
+    /// latest ingest for a signal is older than this returns `Ok(None)`.
+    pub const LATEST_HOUR_MAX_LOOKBACK_HOURS: u32 = 24 * 64;
+
+    /// The newest ingest-hour bucket holding any commit-record-shaped part
+    /// (a raw commit record, a compaction record, a rewrite record, or a
+    /// tombstone -- any of the four [`BucketEntry`] shapes anchors the hour,
+    /// not only a raw ingest) for this tenant and signal, across every
+    /// shard, or `None` if it has none within
+    /// [`Catalog::LATEST_HOUR_MAX_LOOKBACK_HOURS`] (issue #1233: startup cache
+    /// warmup needs this to warm a tenant whose last ingest is older than its
+    /// lookback window, rather than always resolving `[now - lookback,
+    /// now]`). The returned `bool` is `true` when the winning hour's page(s)
+    /// carried at least one non-tombstone entry (a commit, compaction, or
+    /// rewrite record): a caller resolving the warm window around a
+    /// tombstone-only anchor hour should expect an empty snapshot, since
+    /// [`Catalog::process_bucket`] drops a bucket outright the moment it
+    /// observes a tombstone, and that emptiness is not evidence of a failed
+    /// fetch.
+    ///
+    /// Probes each shard with a bounded, floored `list_after` starting at
+    /// `now - w` for each width `w` in
+    /// [`Catalog::LATEST_HOUR_PROBE_WINDOWS_HOURS`], newest first, stopping at
+    /// the first width whose probe returns any object: a narrower width
+    /// already came back empty, so nothing in this shard falls between it and
+    /// the current floor, and the returned page(s) already carry the shard's
+    /// true maximum (commit keys sort chronologically by ingest hour, so the
+    /// last page of a hit drains to the newest key). This bounds the shard to
+    /// at most seven probes -- one for a tenant that ingested in the last
+    /// 24h -- each probe draining its pages under
+    /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests),
+    /// refusing with [`CatalogError::WindowTooWide`] rather than paging a
+    /// shard's dense window unboundedly; it never lists the tenant's full
+    /// history. The shard set scanned is
+    /// [`crate::provisioning::scan_shards_over_range`] over
+    /// `[now - LATEST_HOUR_MAX_LOOKBACK_HOURS, now]`, the same mandated
+    /// over-a-range derivation every other read path uses (ADR-0052 section
+    /// 4, ADR-1101 decision 2): a signal with fixed read shards is probed on
+    /// those shards even under a small configured `shard_count`, and a
+    /// shard-count decrease keeps a retiring generation's higher indices in
+    /// scope for `DEFAULT_SCAN_SLACK_HOURS`. Shards are fanned out
+    /// concurrently, `CatalogConfig::resolve_get_concurrency` at a time, the
+    /// same bound every other listing fan-out in this file uses.
+    ///
+    /// This cannot use `list_delimited`: that call has no `start_after` and
+    /// no pagination, so it cannot be floored without listing a shard's
+    /// entire commit-record prefix on every call, which is the exact
+    /// unbounded cost this method exists to avoid. `list_after` is the
+    /// in-scope primitive that supports a floor, at the cost of counting
+    /// object keys rather than one common prefix per ingest hour; a sparse
+    /// shard still resolves in one page per probe.
+    ///
+    /// An hour text past `now_ns + clock_skew_allowance_ns` is ignored, the
+    /// same guard [`Catalog::window_hour_bounds`] applies to a listing
+    /// window's upper edge: a clock-skewed or corrupt future-dated bucket
+    /// must never masquerade as "most recent". Symmetrically, a part is only
+    /// treated as anchoring "now" when its event time is within
+    /// `max_ingest_lag_ns` of its ingest hour AND that ingest hour is not
+    /// itself ahead of the wall clock: a part filed into an hour within
+    /// `clock_skew_allowance_ns` of the future can still move the anchor
+    /// forward by up to an hour, but never past `max_hour_ns` above.
+    ///
+    /// Past the lookback cap this returns `Ok(None)` silently (a `debug!` at
+    /// most, carrying the cap): a tenant that simply does not use a signal is
+    /// not a warning-worthy event in a library that cannot know the caller's
+    /// intent. The caller (`services/ravel-server/src/cache_warm.rs`'s
+    /// `log_warm_result`) alone decides the log level a caller should see for
+    /// that outcome.
+    pub async fn latest_ingest_hour(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        now_ns: i64,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<(u32, bool)>, CatalogError> {
+        let max_hour_ns = now_ns.saturating_add(self.config.clock_skew_allowance_ns);
+        if max_hour_ns < 0 {
+            return Ok(None);
+        }
+        let max_hour = u32::try_from(max_hour_ns.div_euclid(NS_PER_HOUR)).unwrap_or(u32::MAX);
+        let earliest_hour = max_hour.saturating_sub(Self::LATEST_HOUR_MAX_LOOKBACK_HOURS);
+
+        let generations = self
+            .read_scan_generations(tenant, signal, accounting)
+            .await?;
+        let scan_shards = crate::provisioning::scan_shards_over_range(
+            signal,
+            &generations,
+            earliest_hour,
+            max_hour,
+            crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
+        );
+
+        let shard_results: Vec<Result<Option<(u32, bool)>, CatalogError>> =
+            stream::iter(0..scan_shards)
+                .map(|shard| {
+                    self.latest_ingest_hour_for_shard(tenant, signal, shard, max_hour, accounting)
+                })
+                .buffered(self.config.resolve_get_concurrency)
+                .collect()
+                .await;
+
+        let mut latest: Option<(u32, bool)> = None;
+        for shard_result in shard_results {
+            if let Some((hour, has_ingest_part)) = shard_result? {
+                latest = Some(match latest {
+                    None => (hour, has_ingest_part),
+                    Some((cur_hour, _)) if hour > cur_hour => (hour, has_ingest_part),
+                    Some((cur_hour, cur_ingest)) if hour == cur_hour => {
+                        (cur_hour, cur_ingest || has_ingest_part)
+                    }
+                    Some(existing) => existing,
+                });
+            }
+        }
+        if latest.is_none() {
+            tracing::debug!(
+                tenant_hash = %tenant.to_hex(),
+                signal = ?signal,
+                max_lookback_hours = Self::LATEST_HOUR_MAX_LOOKBACK_HOURS,
+                "latest_ingest_hour: no ingest found for tenant/signal within max lookback"
+            );
+        }
+        Ok(latest)
+    }
+
+    /// One shard's contribution to [`Catalog::latest_ingest_hour`]: see that
+    /// method's doc comment for the probe/bound rationale. The LIST budget
+    /// in `self.config.max_catalog_list_requests` is applied PER SHARD here,
+    /// counted across every probe of this one shard (a dense window can
+    /// otherwise force many pages within a single probe); unlike
+    /// [`Catalog::list_window_by_prefix`], whose counter spans the whole
+    /// scan, the bound a start-up pays for one tenant and signal is
+    /// therefore `shard_count` times that budget.
+    async fn latest_ingest_hour_for_shard(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        max_hour: u32,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<(u32, bool)>, CatalogError> {
+        let tenant_prefix = format!("t/{}/", tenant.to_hex());
+        let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
+        let cap = self.config.max_catalog_list_requests;
+        // Shared rather than a plain local because the fetch hook's future
+        // cannot borrow from the hook itself (see `drain_pages`), and the
+        // counter spans every probe of this shard. An atomic, not a Cell, so
+        // the resolve future this sits inside stays `Send`.
+        let lists_issued = AtomicU64::new(0);
+        let prefix_ref = prefix.as_str();
+        for width_hours in Self::LATEST_HOUR_PROBE_WINDOWS_HOURS {
+            let floor_hour = max_hour.saturating_sub(width_hours);
+            let start_after = keys::commit_shard_hour_prefix(tenant, signal, shard, floor_hour)?;
+            let mut latest: Option<(u32, bool)> = None;
+            drain_pages(
+                prefix_ref,
+                Some(&start_after),
+                MAX_LIST_PAGES,
+                |start_after: Option<String>, page_token| {
+                    let lists_issued = &lists_issued;
+                    async move {
+                        // Refuse before issuing a page that would exceed the
+                        // ceiling, so at most `cap` LISTs are ever issued for
+                        // this shard across all its probes (the request bound).
+                        let issued = lists_issued.load(Ordering::Relaxed);
+                        if issued >= cap {
+                            return Err(CatalogError::WindowTooWide {
+                                estimate: issued.saturating_add(1),
+                                limit: cap,
+                            });
+                        }
+                        let _permit = self.request_semaphore.acquire().await.map_err(|_| {
+                            StoreError::Transient("catalog request semaphore closed".to_string())
+                        })?;
+                        let page = self
+                            .store
+                            .list_after(prefix_ref, start_after.as_deref(), page_token)
+                            .await;
+                        accounting.record_s3_request(AccountedOp::List);
+                        lists_issued.fetch_add(1, Ordering::Relaxed);
+                        Ok(page?)
+                    }
+                },
+                |meta: ObjectMeta| {
+                    // ADR-0050 §2 isolation assertion, identical to
+                    // `list_shard_hours` and `list_window_by_prefix`: every
+                    // returned key is under this tenant's prefix or the scan
+                    // hard-fails.
+                    if !meta.key.starts_with(&tenant_prefix) {
+                        self.record_isolation_breach();
+                        return Err(CatalogError::FieldMismatch {
+                            key: prefix.clone(),
+                            field: "list_prefix",
+                            expected: tenant_prefix.clone(),
+                            actual: meta.key.clone(),
+                        });
+                    }
+                    let (hour, is_tombstone) = match keys::partition_bucket_entry(&meta.key)? {
+                        BucketEntry::CommitRecord(k) => (k.ingest_hour_bucket, false),
+                        BucketEntry::CompactionRecord(k) => (k.ingest_hour_bucket, false),
+                        BucketEntry::RewriteRecord(k) => (k.ingest_hour_bucket, false),
+                        BucketEntry::Tombstone(k) => (k.ingest_hour_bucket, true),
+                    };
+                    // Keys sort chronologically, so the first hour past
+                    // `max_hour` (clock skew, a corrupt key) ends this probe:
+                    // paging on would spend the budget on the future tail at
+                    // every probe width, the same stop `list_shard_hours` takes.
+                    if hour > max_hour {
+                        return Ok(DrainStep::Stop);
+                    }
+                    latest = Some(match latest {
+                        None => (hour, !is_tombstone),
+                        Some((cur, _)) if hour > cur => (hour, !is_tombstone),
+                        Some((cur, cur_ingest)) if hour == cur => {
+                            (cur, cur_ingest || !is_tombstone)
+                        }
+                        Some(existing) => existing,
+                    });
+                    Ok(DrainStep::Continue)
+                },
+            )
+            .await?;
+            if latest.is_some() {
+                return Ok(latest);
+            }
+        }
+        Ok(None)
+    }
+
     /// The (start_hour, end_hour) ingest-hour bucket range the listing
     /// window covers, inclusive, or `None` if the window is empty. Applies
     /// to every shard alike; callers cross it with `0..shard_count`
@@ -1881,7 +2508,7 @@ impl Catalog {
     /// costs 8 LISTs, not 24.
     ///
     /// The per-shard LIST bound is the union scan set over the suffix
-    /// ([`crate::provisioning::max_scan_count_over_range`]): a per-shard LIST
+    /// ([`crate::provisioning::scan_shards_over_range`]): a per-shard LIST
     /// cannot vary its shard bound per hour, so it lists up to the max seen
     /// over the range. A bucket whose shard index is outside its OWN hour's
     /// `scan_count` is then dropped before `process_bucket`, so the INCLUDED
@@ -1904,8 +2531,10 @@ impl Catalog {
         accounting: &QueryAccounting,
     ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
         // Union scan set over the suffix: the widest per-shard bound any hour
-        // in the range needs (a per-shard LIST cannot vary per hour).
-        let scan_shards = crate::provisioning::max_scan_count_over_range(
+        // in the range needs (a per-shard LIST cannot vary per hour), floored
+        // at the signal's writer-pinned shards.
+        let scan_shards = crate::provisioning::scan_shards_over_range(
+            signal,
             generations,
             listing_start_hour,
             window_end_hour,
@@ -1925,7 +2554,7 @@ impl Catalog {
                     accounting,
                 )
             })
-            .buffered(MAX_CONCURRENT_REQUESTS)
+            .buffered(self.config.resolve_get_concurrency)
             .collect()
             .await;
         let mut grouped: ShardBuckets = HashMap::new();
@@ -1936,7 +2565,12 @@ impl Catalog {
                 // retiring generation's higher shards past their slack window).
                 // Drop those buckets so the included set matches the
                 // per-(shard, hour) loop exactly, which never listed them.
-                let hour_scan = crate::provisioning::scan_count(
+                // Floored at the signal's writer-pinned shards (ADR-1101
+                // decision 2), the same floor the union bound above applies:
+                // an unfloored check here would list an alerts/audit writer's
+                // pinned shard and then discard it.
+                let hour_scan = crate::provisioning::scan_shards_for_hour(
+                    signal,
                     generations,
                     hour,
                     crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
@@ -1958,7 +2592,7 @@ impl Catalog {
                     self.process_bucket(tenant, signal, shard, hour, objs, range, accounting)
                         .await
                 })
-                .buffered(MAX_CONCURRENT_REQUESTS)
+                .buffered(self.config.resolve_get_concurrency)
                 .collect()
                 .await;
         let mut out: HashMap<String, SegmentRef> = HashMap::new();
@@ -1998,21 +2632,23 @@ impl Catalog {
         let start_after =
             keys::commit_shard_hour_prefix(tenant, signal, shard, listing_start_hour)?;
         let mut grouped: ShardBuckets = HashMap::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut page_token = None;
-        'pages: loop {
-            let page = {
+        let prefix_ref = prefix.as_str();
+        drain_pages(
+            prefix_ref,
+            Some(&start_after),
+            MAX_LIST_PAGES,
+            |start_after: Option<String>, page_token| async move {
                 let _permit = self.request_semaphore.acquire().await.map_err(|_| {
                     StoreError::Transient("catalog request semaphore closed".to_string())
                 })?;
                 let page = self
                     .store
-                    .list_after(&prefix, Some(&start_after), page_token)
+                    .list_after(prefix_ref, start_after.as_deref(), page_token)
                     .await;
                 accounting.record_s3_request(AccountedOp::List);
-                page?
-            };
-            for meta in page.objects {
+                Ok(page?)
+            },
+            |meta: ObjectMeta| {
                 // ADR-0050 §2 isolation assertion, identical to
                 // `guarded_list_all`: every returned key is under this tenant's
                 // prefix or the scan hard-fails.
@@ -2021,15 +2657,9 @@ impl Catalog {
                     return Err(CatalogError::FieldMismatch {
                         key: prefix.clone(),
                         field: "list_prefix",
-                        expected: tenant_prefix,
+                        expected: tenant_prefix.clone(),
                         actual: meta.key,
                     });
-                }
-                // Dedup by key across pages (a key MAY repeat across pages),
-                // matching `guarded_list_all` so the grouped key set is
-                // identical to the per-bucket loop's.
-                if !seen.insert(meta.key.clone()) {
-                    continue;
                 }
                 let (bshard, bhour) = match keys::partition_bucket_entry(&meta.key)? {
                     BucketEntry::CommitRecord(k) => (k.shard, k.ingest_hour_bucket),
@@ -2040,21 +2670,19 @@ impl Catalog {
                 // Past the window's top hour: every later key in this shard is
                 // also past it, so stop paging (do not request the next page).
                 if bhour > window_end_hour {
-                    break 'pages;
+                    return Ok(DrainStep::Stop);
                 }
                 // `start_after` already excluded everything strictly below
                 // `listing_start_hour`; this guard is a belt for a marker key
                 // that shares the first page with in-window keys.
                 if bhour < listing_start_hour {
-                    continue;
+                    return Ok(DrainStep::Continue);
                 }
                 grouped.entry((bshard, bhour)).or_default().push(meta);
-            }
-            match page.next {
-                Some(next) => page_token = Some(next),
-                None => break,
-            }
-        }
+                Ok(DrainStep::Continue)
+            },
+        )
+        .await?;
         Ok(grouped)
     }
 
@@ -2351,8 +2979,10 @@ impl Catalog {
     /// That page-by-page ceiling, and the `list_after` start marker, are why
     /// this path records its own `AccountedOp::List` per page instead of
     /// calling [`Catalog::guarded_list_all`], which takes no start marker and
-    /// drains unconditionally. The permit, the accounting, and the ADR-0050
-    /// section 2 tenant-prefix assertion are the same either way
+    /// drains unconditionally. Both share the page loop itself
+    /// ([`ravel_object_store::drain_pages`]), so the permit, the accounting,
+    /// the ADR-0050 section 2 tenant-prefix assertion, the cross-page dedup,
+    /// and the typed refusal of a spinning backend are the same either way
     /// (docs/catalog-and-mvcc.md "Query cost accounting").
     #[allow(clippy::too_many_arguments)]
     async fn list_window_by_prefix(
@@ -2373,13 +3003,18 @@ impl Catalog {
         // the expensive per-bucket record GETs are what run concurrently below,
         // mirroring the per-bucket loop's concurrency model.
         let mut grouped: HashMap<(u32, u32), Vec<ObjectMeta>> = HashMap::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut lists_issued: u64 = 0;
+        // Shared rather than a plain local because the fetch hook's future
+        // cannot borrow from the hook itself (see `drain_pages`), and the
+        // counter spans every shard's drain. An atomic, not a Cell, so the
+        // resolve future this sits inside stays `Send`.
+        let lists_issued = AtomicU64::new(0);
         let cap = self.config.max_catalog_list_requests;
         let tenant_prefix = format!("t/{}/", tenant.to_hex());
         // Shard bound is the union scan set over every hour in the listing
         // suffix (ADR-0052 section 4), not the static
-        // `self.config.shard_count`. `max_scan_count_over_range` keeps a
+        // `self.config.shard_count`, and floored at the signal's
+        // writer-pinned shards (ADR-1101 decision 2).
+        // `scan_shards_over_range` (through `max_scan_count_over_range`) keeps a
         // retiring larger generation's higher shard indices in scope for
         // `DEFAULT_SCAN_SLACK_HOURS` past its successor's activation, so on a
         // shard-count decrease a straggler routed under the old count into an
@@ -2387,7 +3022,8 @@ impl Catalog {
         // ([`Catalog::list_window_bounded`]) uses this same bound; a per-shard
         // recursive LIST cannot vary the bound per hour, so it takes the max
         // over the range.
-        let scan_shards = crate::provisioning::max_scan_count_over_range(
+        let scan_shards = crate::provisioning::scan_shards_over_range(
+            signal,
             generations,
             listing_start_hour,
             window_end_hour,
@@ -2400,29 +3036,37 @@ impl Catalog {
             // key at or above it, so `list_after` resumes strictly past it.
             let start_after =
                 keys::commit_shard_hour_prefix(tenant, signal, shard, listing_start_hour)?;
-            let mut page_token = None;
-            loop {
-                // Refuse before issuing a page that would exceed the ceiling,
-                // so at most `cap` LISTs are ever issued (the request bound).
-                if lists_issued >= cap {
-                    return Err(CatalogError::WindowTooWide {
-                        estimate: lists_issued.saturating_add(1),
-                        limit: cap,
-                    });
-                }
-                let page = {
-                    let _permit = self.request_semaphore.acquire().await.map_err(|_| {
-                        StoreError::Transient("catalog request semaphore closed".to_string())
-                    })?;
-                    let page = self
-                        .store
-                        .list_after(&prefix, Some(&start_after), page_token)
-                        .await;
-                    accounting.record_s3_request(AccountedOp::List);
-                    lists_issued += 1;
-                    page?
-                };
-                for meta in page.objects {
+            let prefix_ref = prefix.as_str();
+            drain_pages(
+                prefix_ref,
+                Some(&start_after),
+                MAX_LIST_PAGES,
+                |start_after: Option<String>, page_token| {
+                    let lists_issued = &lists_issued;
+                    async move {
+                        // Refuse before issuing a page that would exceed the
+                        // ceiling, so at most `cap` LISTs are ever issued (the
+                        // request bound).
+                        let issued = lists_issued.load(Ordering::Relaxed);
+                        if issued >= cap {
+                            return Err(CatalogError::WindowTooWide {
+                                estimate: issued.saturating_add(1),
+                                limit: cap,
+                            });
+                        }
+                        let _permit = self.request_semaphore.acquire().await.map_err(|_| {
+                            StoreError::Transient("catalog request semaphore closed".to_string())
+                        })?;
+                        let page = self
+                            .store
+                            .list_after(prefix_ref, start_after.as_deref(), page_token)
+                            .await;
+                        accounting.record_s3_request(AccountedOp::List);
+                        lists_issued.fetch_add(1, Ordering::Relaxed);
+                        Ok(page?)
+                    }
+                },
+                |meta: ObjectMeta| {
                     // ADR-0050 §2 isolation assertion, identical to
                     // `guarded_list_all`: every returned key is under this
                     // tenant's prefix or the scan hard-fails.
@@ -2431,16 +3075,9 @@ impl Catalog {
                         return Err(CatalogError::FieldMismatch {
                             key: prefix.clone(),
                             field: "list_prefix",
-                            expected: tenant_prefix,
+                            expected: tenant_prefix.clone(),
                             actual: meta.key,
                         });
-                    }
-                    // Dedup by key across pages (the cross-page listing
-                    // guarantee: a key MAY repeat across pages), matching
-                    // `guarded_list_all` so the grouped key set is identical to
-                    // the per-bucket loop's.
-                    if !seen.insert(meta.key.clone()) {
-                        continue;
                     }
                     let (bshard, bhour) = match keys::partition_bucket_entry(&meta.key)? {
                         BucketEntry::CommitRecord(k) => (k.shard, k.ingest_hour_bucket),
@@ -2449,15 +3086,13 @@ impl Catalog {
                         BucketEntry::Tombstone(k) => (k.shard, k.ingest_hour_bucket),
                     };
                     if bhour < listing_start_hour || bhour > window_end_hour {
-                        continue;
+                        return Ok(DrainStep::Continue);
                     }
                     grouped.entry((bshard, bhour)).or_default().push(meta);
-                }
-                match page.next {
-                    Some(next) => page_token = Some(next),
-                    None => break,
-                }
-            }
+                    Ok(DrainStep::Continue)
+                },
+            )
+            .await?;
         }
 
         // Resolve each surviving bucket through the shared per-bucket path,
@@ -2471,7 +3106,7 @@ impl Catalog {
                     self.process_bucket(tenant, signal, shard, hour, objs, range, accounting)
                         .await
                 })
-                .buffered(MAX_CONCURRENT_REQUESTS)
+                .buffered(self.config.resolve_get_concurrency)
                 .collect()
                 .await;
         let mut out: HashMap<String, SegmentRef> = HashMap::new();
@@ -2502,11 +3137,26 @@ impl Catalog {
         // general enough" wall the prefetch closure in `ravel-query` hit).
         let loads: Vec<Result<(), CatalogError>> = stream::iter(keys.iter().cloned())
             .map(|key| async move {
-                self.load_and_validate(tenant, signal, shard, &key, accounting)
-                    .await
-                    .map(|_| ())
+                // The single per-resolve site that decides "served from cache"
+                // for a commit record. Prewarm is the first of the two touches
+                // every commit-record key gets in a resolve (this concurrent
+                // warming pass, then a sequential include), so a record already
+                // resident when prewarm reaches it was resident when the resolve
+                // began and is a cache serve; counting it here, not at the
+                // include touch, credits each record exactly once and never
+                // credits one this resolve fetched itself (a prewarm miss then
+                // an include hit off its own insert). The load reports the
+                // outcome of the lookup it actually performed, so nothing can
+                // fall between deciding and serving.
+                let (_, served_from_cache) = self
+                    .load_and_validate_reporting_cache(tenant, signal, shard, &key, accounting)
+                    .await?;
+                if served_from_cache {
+                    accounting.record_commit_record_cache_hit();
+                }
+                Ok(())
             })
-            .buffer_unordered(MAX_CONCURRENT_REQUESTS)
+            .buffer_unordered(self.config.resolve_get_concurrency)
             .collect()
             .await;
         for load in loads {
@@ -2531,7 +3181,7 @@ impl Catalog {
                     .await
                     .map(|_| ())
             })
-            .buffer_unordered(MAX_CONCURRENT_REQUESTS)
+            .buffer_unordered(self.config.resolve_get_concurrency)
             .collect()
             .await;
         for load in loads {
@@ -2589,7 +3239,7 @@ impl Catalog {
         }
         let got = self.guarded_get(key, GetRange::Full, accounting).await?;
         let bytes = got.data.len() as u64;
-        let record = CompactionRecord::decode(got.data.as_ref()).map_err(|e| {
+        let record = record::decode_compaction(got.data.as_ref()).map_err(|e| {
             CatalogError::CompactionRecordDecode {
                 key: key.to_string(),
                 source: e,
@@ -2858,6 +3508,16 @@ impl Catalog {
             rewrite_records.push((rkey.clone(), record));
         }
 
+        // Overlapping input sets in this bucket (issue #1171, the same
+        // hazard #1070 fixed on the listing path): without this, a token
+        // covered by a losing record's inputs is satisfied via that loser's
+        // parts even though `process_bucket` never serves them, so a snapshot
+        // can carry parts from both overlapping records. Pick one
+        // authoritative record per overlap component here too, and skip a
+        // loser below before testing whether it covers the token.
+        let losing_compaction_records =
+            select_authoritative_compaction_records(&compaction_records);
+
         // Which records a live rewrite superseded as a whole (their parts must
         // never be served). No rewrites -> empty set -> exactly the pre-ADR-0064
         // behavior below.
@@ -2896,7 +3556,9 @@ impl Catalog {
 
         // A live compaction record whose inputs cover the token: serve its parts.
         for (ckey, record) in &compaction_records {
-            if superseded_records.contains(ckey) {
+            if superseded_records.contains(ckey)
+                || losing_compaction_records.contains(ckey.as_str())
+            {
                 continue;
             }
             let covers = record.inputs.iter().any(|input| {
@@ -2970,9 +3632,29 @@ impl Catalog {
         key: &str,
         accounting: &QueryAccounting,
     ) -> Result<Arc<CommitRecord>, CatalogError> {
+        self.load_and_validate_reporting_cache(tenant, signal, shard, key, accounting)
+            .await
+            .map(|(record, _served_from_cache)| record)
+    }
+
+    /// [`Catalog::load_and_validate`], also reporting whether the record came
+    /// from the decoded-record cache rather than a GET.
+    ///
+    /// The flag is the same lookup that decides the outcome, not a separate
+    /// prediction of it, which is what makes it exact: a peek followed by a
+    /// load can be falsified in between by an eviction or an invalidation, and
+    /// would then count a serve for a record this call fetched.
+    pub(crate) async fn load_and_validate_reporting_cache(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        key: &str,
+        accounting: &QueryAccounting,
+    ) -> Result<(Arc<CommitRecord>, bool), CatalogError> {
         if let Some(cached) = self.cache.get(tenant, key, accounting) {
             validate_expected_fields(self, &cached, tenant, signal, shard, key)?;
-            return Ok(cached);
+            return Ok((cached, true));
         }
         let got = self.guarded_get(key, GetRange::Full, accounting).await?;
         let bytes = got.data.len() as u64;
@@ -2986,7 +3668,7 @@ impl Catalog {
             bytes,
             self.config.cache_capacity_per_tenant,
         );
-        Ok(record)
+        Ok((record, false))
     }
 }
 
@@ -3621,20 +4303,38 @@ fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, Cat
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use bytes::Bytes;
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::NewCommitRecord;
     use ravel_object_store::InstrumentedStore;
     use ravel_object_store::PutOptions;
     use ravel_object_store::fault::{
-        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
+        FaultKind, FaultPlan, FaultStore, GateHandle, Occurrence, Op, Rule, ScriptedFault, Sequence,
     };
     use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{Capabilities, DelimitedList, ListPage, PageToken, PutOutcome};
 
     use super::*;
 
     fn tenant() -> TenantHash {
         TenantHash([0xab; 16])
+    }
+
+    /// A `(range, now_ns)` pair whose [`Catalog::window_hour_bounds`] covers
+    /// hours `[0, 50]`: wide enough to intersect every single-part fixture
+    /// `install_stats` builds (`min_hour: 0, watermark_hour: 10`), for tests
+    /// that only care about column-stats reuse/fallback behavior and not
+    /// window-scoped part selection itself.
+    fn full_window() -> (TimeRange, i64) {
+        (
+            TimeRange {
+                start_ns: 0,
+                end_ns: 50 * NS_PER_HOUR,
+            },
+            50 * NS_PER_HOUR,
+        )
     }
 
     fn content_hash_for(payload: &[u8]) -> [u8; 32] {
@@ -3649,9 +4349,35 @@ mod tests {
     }
 
     /// Build, PUT the data object, and publish a fully self-consistent
-    /// commit record for one segment. Each call uses a fresh writer id.
+    /// commit record for one segment under [`Signal::Metrics`]. Each call uses
+    /// a fresh writer id. [`publish_segment_for`] is the same for any signal.
     async fn publish_segment(
         store: &MemoryStore,
+        shard: u32,
+        seq: u64,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+        min_event_ts_ns: i64,
+        max_event_ts_ns: i64,
+    ) -> CommitRecord {
+        publish_segment_for(
+            store,
+            Signal::Metrics,
+            shard,
+            seq,
+            ingest_hour_bucket,
+            created_unix_ns,
+            min_event_ts_ns,
+            max_event_ts_ns,
+        )
+        .await
+    }
+
+    /// [`publish_segment`] for an arbitrary signal.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_segment_for(
+        store: &MemoryStore,
+        signal: Signal,
         shard: u32,
         seq: u64,
         ingest_hour_bucket: u32,
@@ -3664,7 +4390,7 @@ mod tests {
         let content_hash = content_hash_for(&payload);
         let record = record::build(NewCommitRecord {
             tenant_hash: tenant(),
-            signal: Signal::Metrics,
+            signal,
             shard,
             writer_id,
             writer_epoch: 1,
@@ -3690,6 +4416,615 @@ mod tests {
             .await
             .expect("publish");
         record
+    }
+
+    /// ADR-1101 decision 2, the read-side shard floor: the audit writers pin
+    /// shards 0 (`AUDIT_HOLD_SHARD`) and 1 (`QUERY_AUDIT_SHARD`) by constant,
+    /// and audit is never provisioned, so a `--shards 1` process resolves it
+    /// through the implicit generation 0 at count 1. Without the floor the
+    /// scan set is shard 0 alone and every query-audit record is silently
+    /// missing from the snapshot. `resolve_pruned_with_admission` is the exact
+    /// entry point `ravel-sql`'s executor calls for every SQL query.
+    ///
+    /// FLIP (pre-fix demonstration): make `Signal::fixed_read_shards` return
+    /// `0` for `Signal::Audit` (crates/ravel-types/src/lib.rs, the
+    /// `Signal::Audit => 2` arm). The key-set assertion then sees only the
+    /// shard 0 key, and the LIST count drops from 3 to 2.
+    #[tokio::test]
+    async fn an_audit_resolve_under_one_configured_shard_lists_the_query_audit_shard() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let hour = 500_000u32;
+        let now = i64::from(hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        // One record on each shard the audit writers pin. Written as literals
+        // rather than the constants themselves: those live in ravel-maintain,
+        // which depends on this crate. `const _` assertions beside each
+        // constant pin them to this floor.
+        let hold =
+            publish_segment_for(&store, Signal::Audit, 0, 1, hour, now, now - 1_000, now).await;
+        let query_audit =
+            publish_segment_for(&store, Signal::Audit, 1, 1, hour, now, now - 1_000, now).await;
+
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+        let accounting = QueryAccounting::new();
+        let (snapshot, _origins) = catalog
+            .resolve_pruned_with_admission(
+                &tenant(),
+                Signal::Audit,
+                range,
+                &[],
+                now,
+                None,
+                &accounting,
+            )
+            .await
+            .expect("audit resolve");
+
+        let resolved: BTreeSet<String> = snapshot
+            .segments
+            .iter()
+            .map(|seg| seg.data_object_key.clone())
+            .collect();
+        let expected: BTreeSet<String> = [&hold, &query_audit]
+            .into_iter()
+            .map(|record| keys::reconstruct_data_key(record).expect("data key"))
+            .collect();
+        assert_eq!(resolved, expected);
+
+        // LIST derivation, config(1) with provisioning enforcement off:
+        //   - `read_scan_generations` issues no request (enforcement off, so
+        //     the single implicit generation 0 at shard_count 1 is synthesized
+        //     with no store read), and the snapshot window path only GETs.
+        //   - the window is hours 499998..=500000 (3 hours) and the floored
+        //     scan set is 2 shards, so 6 buckets, well under the 720-bucket
+        //     prefix crossover: `list_window_bounded` runs and issues one
+        //     bounded LIST per shard in `0..2`, one page each (MemoryStore's
+        //     default page size is 1000, and there are 2 objects total).
+        //   - `list_pending_erasure` drains the empty `del/` prefix in one
+        //     page: 1 LIST.
+        // Total: 2 + 1 = 3.
+        assert_eq!(accounting.snapshot().s3_requests(AccountedOp::List), 3);
+    }
+
+    /// The control for
+    /// `an_audit_resolve_under_one_configured_shard_lists_the_query_audit_shard`:
+    /// the floor is per signal, not a global widening. Logs has no pinned
+    /// writers, so the same store and the same `config(1)` scan shard 0 only,
+    /// leave a shard 1 record unlisted, and cost exactly one LIST less.
+    ///
+    /// FLIP (pre-fix demonstration): make `Signal::fixed_read_shards` return
+    /// `1` for `Signal::Logs` (add a `Signal::Logs => 1` arm in
+    /// crates/ravel-types/src/lib.rs). Nothing changes -- the floor 1 equals
+    /// the configured count. Returning `2` for `Signal::Logs` makes both
+    /// assertions fail (the shard 1 key appears and the LIST count rises to
+    /// 3), which is what pins the per-signal scoping.
+    #[tokio::test]
+    async fn a_logs_resolve_under_one_configured_shard_lists_only_shard_zero() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let hour = 500_000u32;
+        let now = i64::from(hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        let shard_zero =
+            publish_segment_for(&store, Signal::Logs, 0, 1, hour, now, now - 1_000, now).await;
+        let shard_one =
+            publish_segment_for(&store, Signal::Logs, 1, 1, hour, now, now - 1_000, now).await;
+
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+        let accounting = QueryAccounting::new();
+        let (snapshot, _origins) = catalog
+            .resolve_pruned_with_admission(
+                &tenant(),
+                Signal::Logs,
+                range,
+                &[],
+                now,
+                None,
+                &accounting,
+            )
+            .await
+            .expect("logs resolve");
+
+        let resolved: BTreeSet<String> = snapshot
+            .segments
+            .iter()
+            .map(|seg| seg.data_object_key.clone())
+            .collect();
+        let expected: BTreeSet<String> =
+            [keys::reconstruct_data_key(&shard_zero).expect("data key")]
+                .into_iter()
+                .collect();
+        assert_eq!(resolved, expected);
+        assert!(
+            !resolved.contains(&keys::reconstruct_data_key(&shard_one).expect("data key")),
+            "logs has no pinned writers, so shard 1 is outside a --shards 1 scan set"
+        );
+
+        // Same derivation as the audit case with an unfloored scan set of 1
+        // shard: 1 bounded LIST for shard 0, plus 1 for the empty `del/`
+        // prefix. Total 2, exactly one fewer than audit's 3.
+        assert_eq!(accounting.snapshot().s3_requests(AccountedOp::List), 2);
+    }
+
+    /// #1233 finding 7: the newest hour must be found regardless of which
+    /// shard holds it, and the count pins the floor's use, not merely the
+    /// early return. `hour_old` sits 40h before `max_hour` -- past the first
+    /// (24h) probe width, inside the second (48h) one -- so shard 0 must
+    /// widen once (2 list calls: a floored 24h miss, then a floored 48h hit)
+    /// while shard 1's fresh part hits its first probe (1 list call), for 3
+    /// total. An implementation that dropped the `start_after` floor would
+    /// still return the correct max (shard 0's unfloored first probe would
+    /// list its object directly, without needing to widen), but at 2 total
+    /// list calls, not 3 -- this test's exact count of 3 fails the moment
+    /// the floor is removed, which the bare early-return check on the
+    /// returned hour alone could not catch.
+    #[tokio::test]
+    async fn latest_ingest_hour_finds_the_newest_hour_across_shards() {
+        let memory = MemoryStore::new();
+        let max_hour = 500_010u32;
+        let hour_old = max_hour - 40;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        publish_segment(&memory, 0, 1, hour_old, now, now - 1_000, now).await;
+        publish_segment(&memory, 1, 1, max_hour, now, now - 1_000, now).await;
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let catalog = Catalog::new(instrumented.clone(), config(2)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("latest_ingest_hour");
+        assert_eq!(latest, Some((max_hour, true)));
+
+        // Provisioning enforcement is off (the default `Catalog::new`), so
+        // the generation-history read costs nothing: 3 list calls, 0 gets.
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 3);
+        assert_eq!(instrumented.metrics().snapshot().get.calls, 0);
+    }
+
+    /// #1233 finding 1: a tenant whose latest part is older than the first
+    /// probe width but inside the second must widen exactly once per shard,
+    /// costing 2 * shard_count listings, and still find the true max.
+    /// #1233 finding 5: also pins the new path's `AccountedOp::List`
+    /// bookkeeping -- one credit per page issued, exactly matching the
+    /// instrumented store's own list-call count.
+    #[tokio::test]
+    async fn latest_ingest_hour_widens_once_for_a_tenant_outside_the_first_probe() {
+        let memory = MemoryStore::new();
+        let max_hour = 500_010u32;
+        // 40h before max_hour: outside the 24h probe width, inside the 48h
+        // one, so the 24h probe must miss and the 48h probe must hit.
+        let hour = max_hour - 40;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        publish_segment(&memory, 0, 1, hour, now, now - 1_000, now).await;
+        publish_segment(&memory, 1, 1, hour, now, now - 1_000, now).await;
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let catalog = Catalog::new(instrumented.clone(), config(2)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("latest_ingest_hour");
+        assert_eq!(latest, Some((hour, true)));
+
+        // Each of the 2 shards misses its 24h probe and hits its 48h probe:
+        // 2 * shard_count listings, exactly.
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 4);
+        assert_eq!(accounting.snapshot().s3_requests(AccountedOp::List), 4);
+    }
+
+    /// #1233 finding 1: a tenant with no commit-record parts at all still
+    /// costs exactly the full 7-probe sweep per shard before giving up --
+    /// there is no cheaper way to prove "nothing newer than the cap exists"
+    /// than exhausting every probe width.
+    #[tokio::test]
+    async fn latest_ingest_hour_is_none_for_a_tenant_with_no_parts() {
+        let memory = MemoryStore::new();
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let catalog = Catalog::new(instrumented.clone(), config(2)).expect("catalog");
+        let now = 500_000i64 * NS_PER_HOUR;
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("latest_ingest_hour");
+        assert_eq!(latest, None);
+
+        // All 7 probe widths miss for each of the 2 shards: 7 * shard_count.
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 14);
+    }
+
+    /// #1233 finding 1: a part older than the widest (1536h / 64 day) probe
+    /// is indistinguishable from "no parts" -- it must not be found, and the
+    /// cap must still cost exactly the full 7-probe sweep, not an early
+    /// give-up.
+    #[tokio::test]
+    async fn latest_ingest_hour_ignores_a_part_older_than_the_lookback_cap() {
+        let memory = MemoryStore::new();
+        let max_hour = 500_010u32;
+        // 1600h before max_hour: past the widest (1536h) probe width.
+        let hour = max_hour - 1600;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        publish_segment(&memory, 0, 1, hour, now, now - 1_000, now).await;
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let catalog = Catalog::new(instrumented.clone(), config(1)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("latest_ingest_hour");
+        assert_eq!(latest, None);
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 7);
+    }
+
+    /// #1233 finding 1: pagination inside a hit window must not lose the
+    /// maximum. 5 hour buckets in one shard, all inside the 24h probe width,
+    /// with `with_page_size(2)` forcing 3 pages (2 + 2 + 1); the newest hour
+    /// is on the last page and must still win.
+    #[tokio::test]
+    async fn latest_ingest_hour_finds_the_max_across_pages_within_a_probe() {
+        let memory = MemoryStore::with_page_size(2);
+        let max_hour = 500_010u32;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+        let hours = [
+            max_hour - 4,
+            max_hour - 3,
+            max_hour - 2,
+            max_hour - 1,
+            max_hour,
+        ];
+        for (seq, hour) in hours.iter().enumerate() {
+            publish_segment(&memory, 0, seq as u64, *hour, now, now - 1_000, now).await;
+        }
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let catalog = Catalog::new(instrumented.clone(), config(1)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("latest_ingest_hour");
+        assert_eq!(latest, Some((max_hour, true)));
+
+        // 5 objects at page_size 2: 3 pages, all on the first (24h) probe.
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 3);
+    }
+
+    /// #1233 finding 1: a foreign-tenant key surfacing inside
+    /// `latest_ingest_hour`'s listing must hard-fail with the same typed
+    /// error and isolation-breach counter the sibling listing paths use
+    /// (`list_shard_hours`, `list_window_by_prefix`), not be silently
+    /// consumed as if it were this tenant's own key.
+    #[tokio::test]
+    async fn latest_ingest_hour_hard_fails_on_a_foreign_tenant_key() {
+        let memory = MemoryStore::new();
+        let max_hour = 500_010u32;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+        publish_segment(&memory, 0, 1, max_hour, now, now - 1_000, now).await;
+
+        let target_prefix =
+            keys::commit_shard_prefix(&tenant(), Signal::Metrics, 0).expect("commit shard prefix");
+        let store = Arc::new(ForeignKeyInjectingStore {
+            inner: memory,
+            target_prefix,
+            foreign_key: format!("t/{}/m/c/s0000/h{max_hour:08}/foreign-key", "f".repeat(32)),
+        });
+        let catalog = Catalog::new(store, config(1)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        assert_eq!(catalog.isolation_breaches(), 0);
+        let err = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect_err("foreign key must hard-fail");
+        match err {
+            CatalogError::FieldMismatch { field, .. } => assert_eq!(field, "list_prefix"),
+            other => panic!("expected a list_prefix FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 1);
+    }
+
+    /// #1233 finding 4: a shard whose newest probe window holds more commit
+    /// records than the configured `max_catalog_list_requests` budget must
+    /// refuse with `WindowTooWide` rather than paging unboundedly. 3 commit
+    /// records at `with_page_size(1)` force 3 pages; a budget of 2 refuses
+    /// on the 3rd page, having already issued exactly 2 lists.
+    #[tokio::test]
+    async fn latest_ingest_hour_refuses_past_the_list_request_budget() {
+        let memory = MemoryStore::with_page_size(1);
+        let max_hour = 500_010u32;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+        for (seq, hour) in [max_hour - 2, max_hour - 1, max_hour].iter().enumerate() {
+            publish_segment(&memory, 0, seq as u64, *hour, now, now - 1_000, now).await;
+        }
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let mut cfg = config(1);
+        cfg.max_catalog_list_requests = 2;
+        let catalog = Catalog::new(instrumented.clone(), cfg).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let err = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect_err("budget of 2 must refuse the 3rd page");
+        match err {
+            CatalogError::WindowTooWide { estimate, limit } => {
+                assert_eq!(estimate, 3);
+                assert_eq!(limit, 2);
+            }
+            other => panic!("expected WindowTooWide, got {other:?}"),
+        }
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 2);
+    }
+
+    /// #1233 finding 4: the mirror case, with the budget exactly sufficient
+    /// for the same 3-object scan -- must succeed, find the correct hour,
+    /// and issue exactly 4 list calls, not 3: `MemoryStore::list_after`
+    /// reports `next: Some` on any page that comes back completely full,
+    /// even when that page happened to hold the last object, so a 4th,
+    /// empty page is required before the shared drain sees a page with no
+    /// continuation token and concludes the listing is exhausted. A
+    /// budget of 3 refuses on the would-be 4th call (that is exactly
+    /// `latest_ingest_hour_refuses_past_the_list_request_budget`, one
+    /// object fewer into the same scan); 4 is the true boundary.
+    #[tokio::test]
+    async fn latest_ingest_hour_succeeds_at_the_list_request_budget_boundary() {
+        let memory = MemoryStore::with_page_size(1);
+        let max_hour = 500_010u32;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+        for (seq, hour) in [max_hour - 2, max_hour - 1, max_hour].iter().enumerate() {
+            publish_segment(&memory, 0, seq as u64, *hour, now, now - 1_000, now).await;
+        }
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let mut cfg = config(1);
+        cfg.max_catalog_list_requests = 4;
+        let catalog = Catalog::new(instrumented.clone(), cfg).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("budget of 4 must be exactly sufficient");
+        assert_eq!(latest, Some((max_hour, true)));
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 4);
+    }
+
+    /// Issue #1251: the exact per-resolve count of commit records served from
+    /// the local decoded-record cache. Five commit records in five distinct
+    /// recent hours, no fold, one catalog so its record cache persists across
+    /// resolves. A first resolve over the two most-recent hours warms K = 2
+    /// records (cold, so its own delta is 0); a second resolve over all five
+    /// then serves exactly those two from cache and fetches the other three, so
+    /// its delta is exactly K.
+    ///
+    /// FLIP: delete the `record_commit_record_cache_hit()` call in
+    /// `prewarm_commit_records` and the `full ..., 2` assertion fails (the
+    /// counter stays 0).
+    #[tokio::test]
+    async fn commit_record_cache_serves_are_counted_exactly_without_a_snapshot() {
+        let store = Arc::new(MemoryStore::new());
+        // Zero lag/skew so the listing window is exactly [range.start hour,
+        // now_ns hour]; range.start then selects how many recent hours (hence
+        // records) a resolve lists and prewarms.
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                max_ingest_lag_ns: 0,
+                clock_skew_allowance_ns: 0,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+
+        let base_hour = 500_000u32;
+        let record_count = 5u32;
+        for offset in 0..record_count {
+            let hour = base_hour + offset;
+            let event = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
+            publish_segment(
+                &store,
+                0,
+                u64::from(offset) + 1,
+                hour,
+                event,
+                event - 1_000,
+                event,
+            )
+            .await;
+        }
+        let now_ns = i64::from(base_hour + record_count - 1) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        // Warm the two most-recent hours (K = 2). Cold, so nothing is served
+        // from the cache yet: the new counter's delta is 0 even though the
+        // pooled cache_hits is not (each prewarmed key is hit on its include
+        // touch).
+        let warm_start_hour = base_hour + record_count - 2; // covers the last two hours
+        let warm_range = TimeRange {
+            start_ns: i64::from(warm_start_hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+        let warm_acc = QueryAccounting::new();
+        catalog
+            .resolve_with_accounting(
+                &tenant(),
+                Signal::Metrics,
+                warm_range,
+                &[],
+                now_ns,
+                &warm_acc,
+            )
+            .await
+            .expect("warm resolve");
+        assert_eq!(
+            warm_acc.snapshot().commit_record_cache_hits,
+            0,
+            "a cold resolve fetches every record it touches, so none is served from cache"
+        );
+        // Two records fetched cold plus the one non-record GET a resolve makes
+        // regardless, which is what fixes the constant the full-window
+        // assertion below subtracts.
+        assert_eq!(
+            warm_acc.snapshot().s3_requests[ravel_types::accounting::AccountedOp::Get.index()],
+            3,
+            "a cold resolve over two records issues two record GETs plus one fixed GET"
+        );
+
+        // Full window: the two warmed records are served from cache, the other
+        // three are fetched cold. Exactly K.
+        let full_range = TimeRange {
+            start_ns: i64::from(base_hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+        let full_acc = QueryAccounting::new();
+        catalog
+            .resolve_with_accounting(
+                &tenant(),
+                Signal::Metrics,
+                full_range,
+                &[],
+                now_ns,
+                &full_acc,
+            )
+            .await
+            .expect("full resolve");
+        let full_snap = full_acc.snapshot();
+        assert_eq!(
+            full_snap.commit_record_cache_hits, 2,
+            "exactly the two pre-warmed commit records are counted as cache serves"
+        );
+        // The counter's claim is that a counted record cost no GET, and the
+        // counter cannot witness that on its own: it is derived from the same
+        // lookup whose result it reports, so it agrees with itself either way.
+        // The GET count is the independent witness. Five records, two counted
+        // as serves, so exactly three record GETs. Anything that lets a counted
+        // serve issue a GET after all shows up here as a fourth, which the
+        // commit-record assertion above would not notice.
+        assert_eq!(
+            full_snap.s3_requests[ravel_types::accounting::AccountedOp::Get.index()],
+            4,
+            "the three unwarmed records are fetched, plus the same one fixed GET the cold \
+             resolve above showed, and the two counted serves fetch nothing"
+        );
+    }
+
+    /// Issue #1251, the case that broke the old `(hits - (misses - 1)) / 2`
+    /// inference: a tenant WITH a folded snapshot HEAD. The sealed hour is
+    /// served from the snapshot part; K = 2 commit records published above the
+    /// watermark are the only listed commit records. A first resolve warms them
+    /// and admits the HEAD to the head cache (its own delta is 0); a second
+    /// resolve, at the same `now_ns` so the HEAD probe is a cache hit, serves
+    /// both recent records from cache. The HEAD hit does NOT inflate the count:
+    /// the delta is exactly K.
+    ///
+    /// FLIP: add `accounting.record_commit_record_cache_hit()` to the head-cache
+    /// hit branch of `read_head` (snapshot_resolve.rs) and this test's
+    /// `commit_record_cache_hits, 2` assertion fails (it reads 3, the HEAD probe
+    /// folded in) -- the same off-by-one the old inference had.
+    #[tokio::test]
+    async fn commit_record_cache_serves_are_counted_exactly_with_a_folded_snapshot_head() {
+        let store = Arc::new(MemoryStore::new());
+        let fold_margin = crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + crate::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + crate::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+
+        // One sealed hour, folded into a snapshot (HEAD + one part).
+        let sealed_hour = 500_000u32;
+        let sealed_created = (i64::from(sealed_hour) + 1) * NS_PER_HOUR - 1_000;
+        publish_segment(
+            &store,
+            0,
+            1,
+            sealed_hour,
+            sealed_created,
+            sealed_created - 1_000,
+            sealed_created,
+        )
+        .await;
+        let fold_now = (i64::from(sealed_hour) + 1) * NS_PER_HOUR + fold_margin;
+        let fold_catalog = Catalog::new(store.clone(), config(1)).expect("fold catalog");
+        fold_catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                fold_now,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold produces a snapshot HEAD");
+
+        // K = 2 commit records above the watermark (published after the fold, in
+        // two later hours), the only listed commit records.
+        let recent_hours = [sealed_hour + 10, sealed_hour + 11];
+        for (i, &hour) in recent_hours.iter().enumerate() {
+            let event = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
+            publish_segment(&store, 0, 2 + i as u64, hour, event, event - 1_000, event).await;
+        }
+        let now_ns = (i64::from(sealed_hour + 11) + 1) * NS_PER_HOUR + fold_margin;
+
+        // A fresh catalog so both the head cache and the record cache start
+        // empty; the same instance across both resolves so they persist.
+        let catalog = Catalog::new(store.clone(), config(1)).expect("resolve catalog");
+        let range = TimeRange {
+            start_ns: i64::from(sealed_hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+
+        let warm_acc = QueryAccounting::new();
+        catalog
+            .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now_ns, &warm_acc)
+            .await
+            .expect("warm resolve");
+        assert_eq!(
+            warm_acc.snapshot().commit_record_cache_hits,
+            0,
+            "a cold resolve serves no commit record from cache"
+        );
+
+        let hit_acc = QueryAccounting::new();
+        catalog
+            .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now_ns, &hit_acc)
+            .await
+            .expect("second resolve");
+        let hit_snap = hit_acc.snapshot();
+        // Exactly why the pooled counter cannot serve as a commit-record figure.
+        // Six pooled hits: four from the two commit records, which each cost TWO
+        // pooled hits (the prewarm's `load_and_validate` and the sequential
+        // include both call `cache.get`), plus the decoded snapshot-HEAD probe
+        // and the folded part read. A `>` against the commit-record counter
+        // would be cleared by the record cache's double touch alone and could
+        // not show this; the exact total fails if any term moves.
+        assert_eq!(
+            hit_snap.cache_hits, 6,
+            "pooled hits are 2 per commit record plus the HEAD probe and the part \
+             cache, none of which the commit-record counter counts; got {} against \
+             {} commit-record serves",
+            hit_snap.cache_hits, hit_snap.commit_record_cache_hits
+        );
+        assert_eq!(
+            hit_snap.commit_record_cache_hits, 2,
+            "the two recent commit records are counted; the folded HEAD cache hit is not"
+        );
     }
 
     #[tokio::test]
@@ -3863,8 +5198,6 @@ mod tests {
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
             shard_generation_count: 1,
-            column_stats: None,
-            column_stats_part: None,
         }
     }
 
@@ -4111,16 +5444,42 @@ mod tests {
             .expect("seed provisioning record");
     }
 
-    /// With provisioning enforcement on (as `build_catalog` sets it), a resolve
-    /// for a (tenant, signal) whose record disagrees with the configured
-    /// shard_count fails with a typed error before the `0..shard_count` listing
-    /// loop, so a lower shard_count never serves a truncated shard range
-    /// (ADR-0050 section 5, S1-E6 query-path guard).
+    /// ADR-0082: with provisioning enforcement on (as `build_catalog` sets it),
+    /// a resolve for a (tenant, signal) whose recorded generation-0 shard_count
+    /// (4) differs from the configured default (2) no longer fails. The record
+    /// is present and decodable, so the resolve proceeds and routing uses the
+    /// record's own generation history. Before this change the enforcement gate
+    /// returned `CatalogError::Provisioning` and the `.expect(...)` on the `Ok`
+    /// value below panicked.
+    ///
+    /// A segment is published on shard 3, outside the configured `shard_count`
+    /// (2), and the snapshot is asserted to contain it: `resolve_fanout`
+    /// derives its scan width from the record's generation history
+    /// (`read_scan_generations`), not from the live config, so a resolver that
+    /// (bug) only scans the configured `0..2` shards would still pass a
+    /// weaker assertion that just checks the shard-0 segment or the segment
+    /// count. FLIP (pre-fix demonstration): in `read_scan_generations`
+    /// (this file), replace the `Some(generations) => Ok(generations)` arm's
+    /// body with `Ok(vec![implicit_generation_zero(self.config.shard_count)])`,
+    /// so a decoded generation history is discarded in favor of the live
+    /// `shard_count` (2). The GET for shard 3's segment then never happens,
+    /// `shard_3` below is `None`, and the `assert_eq!` on `segments.len()`
+    /// fails (1 vs the expected 2).
     #[tokio::test]
-    async fn resolve_enforces_provisioning_record_mismatch() {
+    async fn resolve_tolerates_provisioning_record_drift() {
+        // Reaches `validate_record` with recorded 4 against live 2, which
+        // increments the process-global drift counter; hold the same lock the
+        // exact-delta tests hold so a threaded run cannot interleave.
+        let _guard = crate::provisioning::tests::SHARD_COUNT_DRIFT_TEST_LOCK
+            .lock()
+            .await;
         let store = Arc::new(MemoryStore::new());
         let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
         publish_segment(&store, 0, 1, 500_000, now, now - 1_000, now).await;
+        // Also published on shard 3, at or above the configured shard_count
+        // (2) and reachable only because the record's own generation history
+        // (recorded shard_count 4) widens the scan.
+        publish_segment(&store, 3, 1, 500_000, now, now - 1_000, now).await;
         // The tenant's data was written under shard_count=4.
         seed_provisioning_record(&store, 4).await;
 
@@ -4132,13 +5491,25 @@ mod tests {
             start_ns: now - 1_000,
             end_ns: now,
         };
-        let err = catalog
+        let snapshot = catalog
             .resolve(&tenant(), Signal::Metrics, range, &[], now)
             .await
-            .expect_err("a lower configured shard_count must fail the resolve");
+            .expect("a drifted-but-decodable record must be tolerated (ADR-0082)");
+        assert_eq!(
+            snapshot.segments.len(),
+            2,
+            "the resolve serves both published segments rather than refusing"
+        );
+        let shard_3 = snapshot.segments.iter().find(|s| s.shard == 3);
         assert!(
-            matches!(err, CatalogError::Provisioning(_)),
-            "expected a provisioning failure, got: {err}"
+            shard_3.is_some(),
+            "shard 3 is outside the configured shard_count (2); it is only reachable by \
+             scanning the record's own generation history (ADR-0082), got shards: {:?}",
+            snapshot
+                .segments
+                .iter()
+                .map(|s| s.shard)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -4238,8 +5609,8 @@ mod tests {
     /// raw `validate_or_adopt(self.store.as_ref(), .., CheckOnly)` call (and
     /// `read_scan_generations` to `read_generations_from_store`). The held
     /// provisioning GET then holds no resolve permit, so `available_permits()`
-    /// stays at `MAX_CONCURRENT_REQUESTS` and the `== MAX_CONCURRENT_REQUESTS -
-    /// 1` assertion fails.
+    /// stays at `DEFAULT_RESOLVE_GET_CONCURRENCY` and the
+    /// `== DEFAULT_RESOLVE_GET_CONCURRENCY - 1` assertion fails.
     #[tokio::test]
     async fn provisioning_read_holds_a_resolve_semaphore_permit() {
         let mem = MemoryStore::new();
@@ -4266,7 +5637,7 @@ mod tests {
 
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            MAX_CONCURRENT_REQUESTS,
+            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY,
             "no permit is held before the resolve starts"
         );
 
@@ -4287,7 +5658,7 @@ mod tests {
         );
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            MAX_CONCURRENT_REQUESTS - 1,
+            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY - 1,
             "the held provisioning GET holds a resolve semaphore permit: it routed through \
              guarded_get, not a raw store.get"
         );
@@ -4314,6 +5685,374 @@ mod tests {
             1,
             "once unblocked the resolve returns the published segment"
         );
+    }
+
+    /// Issue #1238: the resolve path's per-bucket prewarm fan-out
+    /// (`Catalog::prewarm_commit_records`) issues commit-record GETs
+    /// concurrently up to `CatalogConfig::resolve_get_concurrency`, enforced
+    /// by the resolve-wide semaphore (`Catalog::request_semaphore`), not a
+    /// fixed constant. A `FaultStore` hold on every commit-record GET
+    /// (key suffix `.cmt`) lets the test observe the exact number in flight
+    /// at once; a plain counter over `MemoryStore` alone could never observe
+    /// more than one in flight, since nothing in that path ever yields
+    /// control back before completing.
+    ///
+    /// Checked at two different configured values (8 and 32) so a
+    /// coincidental match against one hardcoded fan-out width cannot pass
+    /// this test.
+    ///
+    /// FLIP (pre-fix demonstration): before this change, every one of these
+    /// sites read the fixed `MAX_CONCURRENT_REQUESTS = 16` constant
+    /// (catalog.rs:45 prior to this change) instead of
+    /// `self.config.resolve_get_concurrency`. Configuring 64 against that
+    /// code holds the fan-out at 16 in flight forever: `gate.wait_until_held(64)`
+    /// never returns and the test hangs instead of asserting `== 64`.
+    #[tokio::test]
+    async fn resolve_fan_out_reaches_the_configured_concurrency() {
+        assert_fan_out_peaks_at(8).await;
+        assert_fan_out_peaks_at(32).await;
+    }
+
+    /// Publishes `concurrency * 4` commit records into one `(shard, hour)`
+    /// bucket -- comfortably more than the configured concurrency, so the
+    /// prewarm fan-out has enough keys to saturate the semaphore twice over
+    /// -- then asserts the observed peak in-flight commit-record GET count
+    /// equals `concurrency` exactly, on two separate waves.
+    async fn assert_fan_out_peaks_at(concurrency: usize) {
+        let mem = MemoryStore::new();
+        let hour = 500_000u32;
+        let now = i64::from(hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+        let tail = concurrency * 4;
+        for seq in 1..=tail as u64 {
+            publish_segment(&mem, 0, seq, hour, now, now - 1_000, now).await;
+        }
+        let store = Arc::new(FaultStore::new(mem, FaultPlan::empty()));
+        // Hold every commit-record GET (".cmt"). The provisioning-record GET
+        // (`/prov`) and any HEAD/listing calls this resolve issues use a
+        // different key shape and pass straight through.
+        let gate = store.hold(Op::Get, Some(".cmt".to_string()), Occurrence::Always);
+
+        let catalog = Arc::new(
+            Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    resolve_get_concurrency: concurrency,
+                    ..config(1)
+                },
+            )
+            .expect("catalog"),
+        );
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+        let acc = QueryAccounting::new();
+        let cat_task = catalog.clone();
+        let task = tokio::spawn(async move {
+            cat_task
+                .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now, &acc)
+                .await
+        });
+
+        wait_until_held_bounded(&gate, concurrency).await;
+        assert_eq!(
+            gate.held_count(),
+            concurrency,
+            "exactly the configured number of commit-record GETs are in flight at once \
+             (concurrency = {concurrency})"
+        );
+
+        // Release the first wave and confirm the fan-out refills to exactly
+        // the same bound from the remaining keys, not just once by chance.
+        for id in gate.held() {
+            gate.release(id);
+        }
+        wait_until_held_bounded(&gate, concurrency).await;
+        assert_eq!(
+            gate.held_count(),
+            concurrency,
+            "the fan-out refills to exactly the configured bound on a second wave \
+             (concurrency = {concurrency})"
+        );
+
+        let mut spins = 0;
+        while !task.is_finished() {
+            for id in gate.held() {
+                gate.release(id);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            spins += 1;
+            assert!(
+                spins < 10_000,
+                "resolve did not finish after releasing every held commit-record GET \
+                 (concurrency = {concurrency})"
+            );
+        }
+        let snapshot = task.await.expect("join resolve task").expect("resolve");
+        assert_eq!(
+            snapshot.segments.len(),
+            tail,
+            "every published segment is present once the fan-out drained \
+             (concurrency = {concurrency})"
+        );
+    }
+
+    /// Waits until `n` calls are held, but bounded: `GateHandle::wait_until_held`
+    /// parks forever if the fan-out under test never reaches `n`, which turns a
+    /// regression (a fan-out site still reading a fixed constant, capped below
+    /// `n`) into a hung test run instead of a failing assertion. Panics naming
+    /// the observed count on timeout.
+    async fn wait_until_held_bounded(gate: &GateHandle, n: usize) {
+        if tokio::time::timeout(Duration::from_secs(5), gate.wait_until_held(n))
+            .await
+            .is_err()
+        {
+            panic!(
+                "held {}, expected {n}: fan-out never reached the configured concurrency \
+                 within 5s",
+                gate.held_count()
+            );
+        }
+    }
+
+    /// Second acceptance case for the same fix (Issue #1238 review round 2):
+    /// `assert_fan_out_peaks_at` above publishes every record into ONE
+    /// `(shard, hour)` bucket, so it only exercises
+    /// `Catalog::prewarm_commit_records` -- every other `.buffered`/
+    /// `buffer_unordered` fan-out site (both call sites inside
+    /// `Catalog::list_window_bounded`, `Catalog::list_window_by_prefix`,
+    /// `Catalog::prewarm_compaction_records`) iterates a single element
+    /// there and cannot prove anything about its width. This drives
+    /// `load_snapshot_parts`'s buffered fan-out (`snapshot_resolve.rs`,
+    /// the snapshot-part load, the hot path for a FOLDED tenant): fold the
+    /// tenant first with `snapshot_part_max_entries: 1` so `concurrency * 4`
+    /// distinct sealed hours each seal into their own snapshot part,
+    /// comfortably more parts than the configured concurrency, then resolve
+    /// over a fresh catalog (empty part cache) and observe the exact number
+    /// of part GETs in flight at once.
+    ///
+    /// FLIP (pre-fix demonstration): this proves only the lower direction --
+    /// `guarded_get` acquires `Catalog::request_semaphore`, sized from the
+    /// same knob, on every part GET, so a hardcoded width BELOW the
+    /// configured value at `load_snapshot_parts`'s fan-out site still fails
+    /// this test (revert it to a literal `.buffered(16)`; at
+    /// `concurrency = 32` the fan-out never exceeds 16 in flight, so this
+    /// fails with "held 16, expected 32" via `wait_until_held_bounded`
+    /// instead of hanging CI). A hardcoded width ABOVE the configured value
+    /// at that site is masked by the semaphore and still passes; this is
+    /// structural, not a gap this test closes.
+    #[tokio::test]
+    async fn resolve_fan_out_reaches_the_configured_concurrency_after_fold() {
+        assert_folded_snapshot_fan_out_peaks_at(32).await;
+    }
+
+    async fn assert_folded_snapshot_fan_out_peaks_at(concurrency: usize) {
+        let store = Arc::new(MemoryStore::new());
+        let part_count = concurrency * 4;
+        let base_hour = 500_000u32;
+        let last_hour = base_hour + part_count as u32 - 1;
+        let fold_margin = crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + crate::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + crate::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+        let now_ns = (i64::from(last_hour) + 1) * NS_PER_HOUR + fold_margin;
+
+        // One entry per hour: at `snapshot_part_max_entries = 1` the fold
+        // seals every hour into its own part (fold.rs's
+        // `ceiling_crossing_produces_multiple_parts` establishes this split
+        // rule), so `part_count` distinct sealed hours produce exactly
+        // `part_count` snapshot parts.
+        for offset in 0..part_count as u32 {
+            let hour = base_hour + offset;
+            let created = (i64::from(hour) + 1) * NS_PER_HOUR - 1_000;
+            publish_segment(
+                &store,
+                0,
+                u64::from(offset) + 1,
+                hour,
+                created,
+                created - 1_000,
+                created,
+            )
+            .await;
+        }
+
+        let fold_cfg = CatalogConfig {
+            snapshot_part_max_entries: 1,
+            ..config(1)
+        };
+        let fold_catalog = Catalog::new(store.clone(), fold_cfg).expect("fold catalog");
+        let fold_report = fold_catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(
+            fold_report.parts_total, part_count as u64,
+            "one entry per hour at snapshot_part_max_entries = 1 seals one part per hour"
+        );
+
+        // A fresh store handle (FaultStore around the same underlying
+        // MemoryStore) and a fresh Catalog (empty part cache), so
+        // `load_snapshot_parts` must fetch every part instead of serving any
+        // of them from cache.
+        let gated_store = Arc::new(FaultStore::new(store.clone(), FaultPlan::empty()));
+        let gate = gated_store.hold(Op::Get, Some(".csnap".to_string()), Occurrence::Always);
+        let resolve_catalog = Arc::new(
+            Catalog::new(
+                gated_store.clone(),
+                CatalogConfig {
+                    resolve_get_concurrency: concurrency,
+                    ..config(1)
+                },
+            )
+            .expect("resolve catalog"),
+        );
+
+        let range = TimeRange {
+            start_ns: i64::from(base_hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+        let acc = QueryAccounting::new();
+        let cat_task = resolve_catalog.clone();
+        let task = tokio::spawn(async move {
+            cat_task
+                .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now_ns, &acc)
+                .await
+        });
+
+        wait_until_held_bounded(&gate, concurrency).await;
+        assert_eq!(
+            gate.held_count(),
+            concurrency,
+            "exactly the configured number of snapshot-part GETs are in flight at once \
+             (concurrency = {concurrency})"
+        );
+
+        // Release the first wave and confirm the fan-out refills to exactly
+        // the same bound, not just once by chance.
+        for id in gate.held() {
+            gate.release(id);
+        }
+        wait_until_held_bounded(&gate, concurrency).await;
+        assert_eq!(
+            gate.held_count(),
+            concurrency,
+            "the fan-out refills to exactly the configured bound on a second wave \
+             (concurrency = {concurrency})"
+        );
+
+        let mut spins = 0;
+        while !task.is_finished() {
+            for id in gate.held() {
+                gate.release(id);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            spins += 1;
+            assert!(
+                spins < 10_000,
+                "resolve did not finish after releasing every held snapshot-part GET \
+                 (concurrency = {concurrency})"
+            );
+        }
+        task.await.expect("join resolve task").expect("resolve");
+    }
+
+    /// Issue #1238: `CatalogConfig::resolve_get_concurrency` defaults to 128,
+    /// not the old fixed `MAX_CONCURRENT_REQUESTS = 16`. Measured against
+    /// real S3 on a 10,000-record unsealed tail (one cold resolve each,
+    /// 10,001 GETs and 13 LISTs at every level -- concurrency-bound, not
+    /// request-count-bound): 23.157s at 16, 4.374s at 64, 2.341s at 128. A
+    /// silent revert of the default fails this assertion.
+    #[test]
+    fn resolve_get_concurrency_defaults_to_128() {
+        assert_eq!(CatalogConfig::default().resolve_get_concurrency, 128);
+    }
+
+    /// Issue #1238: a zero `resolve_get_concurrency` is rejected at
+    /// `Catalog::new` with a typed error, never silently clamped to 1 (a
+    /// zero-permit semaphore would deadlock every resolve forever, which is
+    /// far worse than a rejected startup).
+    ///
+    /// FLIP (pre-fix demonstration): before this change `Catalog::new` never
+    /// read `resolve_get_concurrency` at all (the semaphore was sized from
+    /// the fixed `MAX_CONCURRENT_REQUESTS` constant), so this construction
+    /// would return `Ok` instead of `Err(CatalogError::InvalidConfig(_))`.
+    #[test]
+    fn zero_resolve_get_concurrency_is_rejected() {
+        let store = Arc::new(MemoryStore::new());
+        let result = Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_get_concurrency: 0,
+                ..config(1)
+            },
+        );
+        match result {
+            Err(CatalogError::InvalidConfig(msg)) => {
+                assert_eq!(msg, "resolve_get_concurrency must be > 0");
+            }
+            Err(other) => panic!("expected CatalogError::InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected CatalogError::InvalidConfig, got Ok"),
+        }
+    }
+
+    /// Issue #1238: `resolve_get_concurrency` above
+    /// `MAX_RESOLVE_GET_CONCURRENCY` is rejected at `Catalog::new` with a
+    /// typed error (past that ceiling, `tokio::sync::Semaphore::new` panics
+    /// instead of failing typed).
+    ///
+    /// FLIP (pre-fix demonstration): deleting the upper-bound `if` block in
+    /// `Catalog::new` leaves this test failing with `Ok` instead of
+    /// `Err(CatalogError::InvalidConfig(_))`.
+    #[test]
+    fn resolve_get_concurrency_above_max_is_rejected() {
+        let store = Arc::new(MemoryStore::new());
+        let result = Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_get_concurrency: crate::config::MAX_RESOLVE_GET_CONCURRENCY + 1,
+                ..config(1)
+            },
+        );
+        match result {
+            Err(CatalogError::InvalidConfig(msg)) => {
+                assert_eq!(
+                    msg,
+                    "resolve_get_concurrency exceeds MAX_RESOLVE_GET_CONCURRENCY"
+                );
+            }
+            Err(other) => panic!("expected CatalogError::InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected CatalogError::InvalidConfig, got Ok"),
+        }
+    }
+
+    /// Issue #1238: `resolve_get_concurrency` exactly at
+    /// `MAX_RESOLVE_GET_CONCURRENCY` is accepted -- the check rejects past
+    /// the ceiling, not at it.
+    ///
+    /// FLIP (pre-fix demonstration): flipping the upper-bound comparison in
+    /// `Catalog::new` from `>` to `>=` leaves this test failing with
+    /// `Err(CatalogError::InvalidConfig(_))` instead of `Ok`.
+    #[test]
+    fn resolve_get_concurrency_at_max_is_accepted() {
+        let store = Arc::new(MemoryStore::new());
+        let result = Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_get_concurrency: crate::config::MAX_RESOLVE_GET_CONCURRENCY,
+                ..config(1)
+            },
+        );
+        match result {
+            Ok(_) => {}
+            Err(err) => panic!("expected Ok at the configured max, got Err({err})"),
+        }
     }
 
     /// End-to-end: an older HEAD (`shard_generation_count` lower
@@ -4356,13 +6095,12 @@ mod tests {
                 entry_count: 0,
                 watermark_hour: 10,
                 min_hour: 0,
+                column_stats: None,
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
             postings: None,
             shard_generation_count: 1,
-            column_stats: None,
-            column_stats_part: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         store
@@ -4455,13 +6193,12 @@ mod tests {
                 entry_count: 0,
                 watermark_hour: 10,
                 min_hour: 0,
+                column_stats: None,
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
             postings: None,
             shard_generation_count: 2,
-            column_stats: None,
-            column_stats_part: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         inner
@@ -4512,12 +6249,15 @@ mod tests {
         );
     }
 
-    /// Regression: a `FreshNoData` result (no record yet) must not be
-    /// cached as validated. A query-only catalog resolves an empty-record tenant
-    /// (passes as fresh), then a real record appears written under a higher
-    /// shard_count; the next resolve must re-check and surface the mismatch, not
-    /// serve a truncated shard range from a stale "already validated" cache
-    /// entry (records are immutable, so a wrongly-cached miss never re-checks).
+    /// Regression: a `FreshNoData` result (no record yet) must not be cached as
+    /// validated. A query-only catalog resolves an empty-record tenant (passes
+    /// as fresh), then a record appears; the next resolve must re-read it rather
+    /// than serve from a stale "already validated" cache entry (records are
+    /// immutable, so a wrongly-cached miss never re-checks). ADR-0082 makes a
+    /// shard_count difference tolerated, so the re-check is proved here with a
+    /// corrupt record, which still fails closed: if the earlier `FreshNoData`
+    /// had been cached as validated, this second resolve would skip the check
+    /// and succeed, so the `.expect_err(...)` below would fail.
     #[tokio::test]
     async fn resolve_rechecks_after_fresh_no_data_until_record_appears() {
         let store = Arc::new(MemoryStore::new());
@@ -4539,16 +6279,25 @@ mod tests {
             .expect("a fresh (no-record) tenant resolves cleanly");
         assert_eq!(snapshot.segments.len(), 1, "first resolve returns the data");
 
-        // A separate higher-shard_count process now writes the real record and
-        // (conceptually) lands data across shards 0..4. If the earlier
+        // A corrupt record now appears at the provisioning key. If the earlier
         // `FreshNoData` had been cached as validated, this resolve would skip the
-        // check and silently serve only shards 0..2.
-        seed_provisioning_record(&store, 4).await;
+        // check and serve data; instead it must re-read and fail closed on the
+        // undecodable record.
+        store
+            .put(
+                &crate::provisioning::provisioning_key(&tenant(), Signal::Metrics),
+                vec![0xFF, 0xFF, 0xFF, 0x07].into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed corrupt record");
 
         let err = catalog
             .resolve(&tenant(), Signal::Metrics, range, &[], now)
             .await
-            .expect_err("once the real record appears the resolve must re-check and refuse");
+            .expect_err(
+                "once a record appears the resolve must re-check and fail closed on corruption",
+            );
         assert!(
             matches!(err, CatalogError::Provisioning(_)),
             "expected a provisioning failure from the re-check, got: {err}"
@@ -5611,6 +7360,111 @@ mod tests {
         assert_eq!(catalog.isolation_breaches(), 1);
     }
 
+    /// Hands out the same continuation token on every `list` call, with one
+    /// in-order key per page: the spinning backend `guarded_list_all` used to
+    /// page against forever before it drained through
+    /// [`ravel_object_store::drain_pages`].
+    struct RepeatingTokenStore {
+        calls: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for RepeatingTokenStore {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: Bytes,
+            _opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            Err(StoreError::Permanent("put not supported".to_string()))
+        }
+
+        async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
+            Err(StoreError::NotFound)
+        }
+
+        async fn head(&self, _key: &str) -> Result<ObjectMeta, StoreError> {
+            Err(StoreError::NotFound)
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            _page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            let seq = self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ravel_object_store::ListPage {
+                objects: vec![ObjectMeta {
+                    key: format!("{prefix}{seq:08}"),
+                    size: 0,
+                    etag: ravel_object_store::Etag(String::new()),
+                    version: ravel_object_store::Version(String::new()),
+                    last_modified_unix_ms: 0,
+                }],
+                next: Some(ravel_object_store::PageToken("stuck".to_string())),
+            })
+        }
+
+        async fn list_delimited(
+            &self,
+            _prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            Err(StoreError::Permanent(
+                "list_delimited not supported".to_string(),
+            ))
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            ravel_object_store::Capabilities::mandatory()
+        }
+    }
+
+    impl RepeatingTokenStore {
+        fn list_calls(&self) -> u64 {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    /// #1448 finding 2: `guarded_list_all` is the sole LIST funnel for every
+    /// query (ADR-0044 decision 2), and it drained with no bound of its own.
+    /// A backend that repeats its continuation token must now stop it after
+    /// exactly two pages with the typed store error, having credited
+    /// `accounting` exactly one LIST per page issued.
+    #[tokio::test]
+    async fn guarded_list_all_refuses_a_repeated_continuation_token() {
+        let prefix = format!("t/{}/m/c/", tenant().to_hex());
+        let store = Arc::new(RepeatingTokenStore {
+            calls: AtomicU64::new(0),
+        });
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let err = catalog
+            .guarded_list_all(&tenant(), &prefix, &accounting)
+            .await
+            .expect_err("a repeated continuation token must be a typed error");
+        match err {
+            CatalogError::Store(StoreError::ListRepeatedToken { prefix: p }) => {
+                assert_eq!(p, prefix);
+            }
+            other => panic!("expected Store(ListRepeatedToken), got {other:?}"),
+        }
+        assert_eq!(
+            store.list_calls(),
+            2,
+            "the drain detects the repeat on the second page and issues no third"
+        );
+        assert_eq!(
+            accounting.snapshot().s3_requests(AccountedOp::List),
+            2,
+            "the per-page accounting hook fired once per page issued"
+        );
+    }
+
     /// ADR-0050 §2: a commit record and a compaction record whose
     /// tenant_hash disagrees with the prefix they were listed under are the
     /// highest-signal breach the metric must reflect. Both validators must
@@ -5703,113 +7557,22 @@ mod tests {
     async fn load_column_stats_charges_exactly_two_accounted_gets() {
         let store = Arc::new(MemoryStore::new());
         let signal = Signal::Logs;
-        let signal_num = signal::to_proto(signal) as u32;
-
-        // One empty snapshot part.
-        let part_bytes =
-            crate::snapshot_format::encode_part(tenant().0, signal_num, 8, 10, &[]).expect("part");
-        let part_hash = *blake3::hash(&part_bytes).as_bytes();
-        let part_key = format!("t/{}/catalog/l/snap/empty.csnap", tenant().to_hex());
-        store
-            .put(
-                &part_key,
-                Bytes::from(part_bytes.clone()),
-                PutOptions::default(),
-            )
-            .await
-            .expect("put part");
-
-        // A consistent single-segment column-stats object bound to that part.
-        let segments = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
-            ingest_hour_bucket: 1,
-            shard: 0,
-            writer_id: vec![0xAA; 16],
-            writer_epoch: 1,
-            writer_seq: 1,
-            columns: vec![ravel_proto::catalog::v1::ColumnStat {
-                name: "status".to_string(),
-                declared_type: 2,
-                non_null_count: 1,
-                null_count: 0,
-                min: Some(ravel_proto::catalog::v1::ColumnValue {
-                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
-                }),
-                max: Some(ravel_proto::catalog::v1::ColumnValue {
-                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
-                }),
-                dictionary_present: true,
-                dictionary: vec![ravel_proto::catalog::v1::DictEntry {
-                    value: Some(ravel_proto::catalog::v1::ColumnValue {
-                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
-                    }),
-                    count: 1,
-                }],
-                sum: Some(1),
-            }],
-        }];
-        let stats_bytes = crate::snapshot_format::encode_column_stats(
-            tenant().0,
-            signal_num,
-            vec![part_hash.to_vec()],
-            &segments,
-        )
-        .expect("encode column stats");
-        let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
-        let stats_key = format!("t/{}/catalog/l/cstat/one.cstat", tenant().to_hex());
-        store
-            .put(
-                &stats_key,
-                Bytes::from(stats_bytes.clone()),
-                PutOptions::default(),
-            )
-            .await
-            .expect("put stats");
-
-        let head = ravel_proto::catalog::v1::SnapshotHead {
-            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
-            tenant_hash: tenant().0.to_vec(),
-            signal: signal_num,
-            shard_count: 8,
-            watermark_hour: 10,
-            parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
-                key: part_key,
-                blake3: part_hash.to_vec(),
-                size: part_bytes.len() as u64,
-                entry_count: 0,
-                watermark_hour: 10,
-                min_hour: 0,
-            }],
-            folder_id: Uuid::new_v4().into_bytes().to_vec(),
-            created_unix_ns: 0,
-            postings: None,
-            shard_generation_count: 1,
-            column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsRef {
-                key: stats_key,
-                blake3: stats_hash.to_vec(),
-                size: stats_bytes.len() as u64,
-                segment_count: 1,
-                part_blake3: vec![part_hash.to_vec()],
-            }),
-            column_stats_part: None,
-        };
-        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
-        store
-            .put(
-                &crate::fold::head_object_key(&tenant(), signal),
-                Bytes::from(head_bytes),
-                PutOptions::default(),
-            )
-            .await
-            .expect("put head");
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        install_logs_stats(&store, part_hash, 1).await;
 
         let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
         let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, &acc)
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
             .await
             .expect("load ok")
             .expect("stats present");
-        assert_eq!(loaded.segments.len(), 1, "the one segment's stats loaded");
+        assert_eq!(
+            loaded.by_content_hash.len(),
+            1,
+            "the one segment's stats loaded"
+        );
 
         let snap = acc.snapshot();
         assert_eq!(
@@ -5829,19 +7592,21 @@ mod tests {
         );
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            MAX_CONCURRENT_REQUESTS,
+            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY,
             "every acquired permit was released"
         );
     }
 
-    /// Write a folded HEAD plus its `.cstat` object for `tenant`/`signal`, whose
-    /// one segment carries a single I64 `status` column with the exact value
-    /// `value` (min == max == `value`, one non-null row). `part_hash` binds the
-    /// HEAD's part set to the stats object; reusing the same `part_hash` across
-    /// calls keeps the part binding fixed so a re-resolve is driven purely by
-    /// the stats object's content hash changing with `value`. The object keys
-    /// are namespaced by tenant hex and signal prefix so distinct
-    /// `(tenant, signal)` installs never collide in one store.
+    /// Write a folded HEAD plus its per-part v3 `.cstat` object (ADR-1413
+    /// decision 6, #1600: the v3 per-part ref is the only surviving published
+    /// form) for `tenant`/`signal`, whose one segment carries a single I64
+    /// `status` column with the exact value `value` (min == max == `value`,
+    /// one non-null row). `part_hash` binds the HEAD's part set to the stats
+    /// object; reusing the same `part_hash` across calls keeps the part
+    /// binding fixed so a re-resolve is driven purely by the stats object's
+    /// content hash changing with `value`. The object keys are namespaced by
+    /// tenant hex and signal prefix so distinct `(tenant, signal)` installs
+    /// never collide in one store.
     async fn install_stats(
         store: &MemoryStore,
         tenant: TenantHash,
@@ -5855,7 +7620,7 @@ mod tests {
         let segments = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
             ingest_hour_bucket: 1,
             shard: 0,
-            writer_id: vec![0xAA; 16],
+            writer_id: part_hash.to_vec(),
             writer_epoch: 1,
             writer_seq: 1,
             columns: vec![ravel_proto::catalog::v1::ColumnStat {
@@ -5879,13 +7644,14 @@ mod tests {
                 sum: Some(value),
             }],
         }];
-        let stats_bytes = crate::snapshot_format::encode_column_stats(
+        let stats_bytes = crate::snapshot_format::encode_column_stats_v3(
             tenant.0,
             signal_num,
-            vec![part_hash.to_vec()],
+            part_hash,
             &segments,
+            crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
         )
-        .expect("encode column stats");
+        .expect("encode v3 column stats");
         let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
         let stats_key = format!("t/{}/catalog/{prefix}/cstat/one.cstat", tenant.to_hex());
         store
@@ -5910,19 +7676,18 @@ mod tests {
                 entry_count: 0,
                 watermark_hour: 10,
                 min_hour: 0,
+                column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                    key: stats_key,
+                    blake3: stats_hash.to_vec(),
+                    size: stats_bytes.len() as u64,
+                    segment_count: 1,
+                    part_blake3: vec![part_hash.to_vec()],
+                }),
             }],
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
             postings: None,
             shard_generation_count: 1,
-            column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsRef {
-                key: stats_key,
-                blake3: stats_hash.to_vec(),
-                size: stats_bytes.len() as u64,
-                segment_count: 1,
-                part_blake3: vec![part_hash.to_vec()],
-            }),
-            column_stats_part: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
         store
@@ -5944,11 +7709,455 @@ mod tests {
     /// The exact I64 `status` value carried by the one segment of a loaded
     /// column-stats object built by [`install_logs_stats`].
     fn loaded_value(loaded: &LoadedColumnStats) -> i64 {
-        let segment = loaded.segments.values().next().expect("one segment");
+        let segment = loaded.by_content_hash.values().next().expect("one segment");
         match &segment.columns[0].min.as_ref().expect("min present").kind {
             Some(ravel_proto::catalog::v1::column_value::Kind::I64(v)) => *v,
             other => panic!("expected an I64 min, got {other:?}"),
         }
+    }
+
+    /// Write a folded HEAD for `(tenant, signal)` whose one part's field-7
+    /// `column_stats` ref points at `stats_key`, holding the oversized-declared
+    /// v3 object [`frame_oversized_cstat_v3`] builds (ADR-1413 decision 6,
+    /// #1600: the per-part v3 ref is the only surviving published form). The
+    /// part's own blake3 binds correctly, so a load's blake3 gate passes and
+    /// decode is what refuses (issue #1400). No snapshot part object is
+    /// written: this path never fetches one.
+    async fn install_oversized_stats(
+        store: &MemoryStore,
+        tenant: TenantHash,
+        signal: Signal,
+        part_hash: [u8; 32],
+        stats_key: &str,
+        declared_len: u64,
+    ) {
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+        let stats_bytes = frame_oversized_cstat_v3(tenant, signal, part_hash, declared_len);
+        let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
+        store
+            .put(
+                stats_key,
+                Bytes::from(stats_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put oversized stats");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant.0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 10,
+            parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
+                key: format!("t/{}/catalog/{prefix}/snap/empty.csnap", tenant.to_hex()),
+                blake3: part_hash.to_vec(),
+                size: 1,
+                entry_count: 0,
+                watermark_hour: 10,
+                min_hour: 0,
+                column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                    key: stats_key.to_string(),
+                    blake3: stats_hash.to_vec(),
+                    size: stats_bytes.len() as u64,
+                    segment_count: 0,
+                    part_blake3: vec![part_hash.to_vec()],
+                }),
+            }],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant, signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+    }
+
+    /// The substring both decode-refusal WARN messages carry (issue #1400).
+    const DECODE_REFUSAL_WARN: &str = "the reader refused to decode";
+
+    /// A `tracing` layer that flattens every WARN event into one line -- message
+    /// first, then each field as `name=value` -- so a test can count WARN lines
+    /// and assert one carries the decimal figures a structured `u64` field
+    /// emitted.
+    #[derive(Clone, Default)]
+    struct WarnCapture {
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WarnCapture {
+        fn lines(&self) -> Vec<String> {
+            self.lines.lock().clone()
+        }
+
+        fn count_containing(&self, needle: &str) -> usize {
+            self.lines
+                .lock()
+                .iter()
+                .filter(|line| line.contains(needle))
+                .count()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = LineVisitor::default();
+            event.record(&mut visitor);
+            self.lines.lock().push(visitor.finish());
+        }
+    }
+
+    #[derive(Default)]
+    struct LineVisitor {
+        message: String,
+        fields: Vec<String>,
+    }
+
+    impl LineVisitor {
+        fn finish(self) -> String {
+            let mut line = self.message;
+            for field in self.fields {
+                line.push(' ');
+                line.push_str(&field);
+            }
+            line
+        }
+    }
+
+    impl tracing::field::Visit for LineVisitor {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields.push(format!("{}={}", field.name(), value));
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields.push(format!("{}={}", field.name(), value));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields.push(format!("{}={}", field.name(), value));
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            } else {
+                self.fields.push(format!("{}={:?}", field.name(), value));
+            }
+        }
+    }
+
+    /// The logs `.cstat` key [`install_oversized_stats`] uses for the default
+    /// [`tenant`], distinct across `name` so a re-fold's NEW key is a NEW object.
+    fn oversized_stats_key(name: &str) -> String {
+        format!(
+            "t/{}/catalog/{}/cstat/{name}.cstat",
+            tenant().to_hex(),
+            Signal::Logs.key_prefix()
+        )
+    }
+
+    /// Issue #1400, deliverables 1-3: a HEAD that references a column-stats
+    /// object whose header declares an uncompressed body over the 256 MiB decode
+    /// ceiling makes every load degrade to `Ok(None)`, logs the refusal exactly
+    /// ONCE across three loads, counts every one of the three, and names the
+    /// declared and cap bytes in the single WARN.
+    ///
+    /// Prove-the-test: the WARN and the count both flow from
+    /// `load_column_stats`'s `FetchOutcome::DecodeRefused` arm calling
+    /// `note_column_stats_decode_refusal`. Flip that arm to
+    /// `FetchOutcome::DecodeRefused(_) => return Ok(None)` (the pre-fix silent
+    /// degrade) and `count_containing` reads 0 against the expected 1 while
+    /// `column_stats_decode_refusals()` reads 0 against the expected 3.
+    #[tokio::test]
+    async fn column_stats_decode_refusal_warns_once_and_counts_each() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        let declared: u64 = 2_000_102_795;
+        let stats_key = oversized_stats_key("one");
+        install_oversized_stats(
+            &store,
+            tenant(),
+            Signal::Logs,
+            part_hash,
+            &stats_key,
+            declared,
+        )
+        .await;
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let (range, now_ns) = full_window();
+        for _ in 0..3 {
+            let got = catalog
+                .load_column_stats(
+                    &tenant(),
+                    Signal::Logs,
+                    range,
+                    now_ns,
+                    &QueryAccounting::new(),
+                )
+                .await
+                .expect("load ok");
+            assert!(got.is_none(), "a refused decode degrades to Ok(None)");
+        }
+
+        assert_eq!(
+            catalog.column_stats_decode_refusals(),
+            3,
+            "counted on every refusal, not once per key"
+        );
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            1,
+            "logged exactly once across three loads"
+        );
+
+        let cap = crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES;
+        let warn = capture
+            .lines()
+            .into_iter()
+            .find(|line| line.contains(DECODE_REFUSAL_WARN))
+            .expect("the one decode-refusal WARN");
+        assert!(
+            warn.contains(&declared.to_string()),
+            "WARN names the declared uncompressed bytes {declared}: {warn}"
+        );
+        assert!(
+            warn.contains(&cap.to_string()),
+            "WARN names the cap uncompressed bytes {cap}: {warn}"
+        );
+    }
+
+    /// Issue #1400, deliverable 2: after the idle-tenant sweep clears the
+    /// warn-once mark, the tenant's next refusal warns again. The tenant is new
+    /// state on its return and its operator must be able to see the condition
+    /// again.
+    #[tokio::test]
+    async fn column_stats_decode_refusal_warns_again_after_idle_eviction() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        let stats_key = oversized_stats_key("one");
+        install_oversized_stats(
+            &store,
+            tenant(),
+            Signal::Logs,
+            part_hash,
+            &stats_key,
+            2_000_102_795,
+        )
+        .await;
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let (range, now_ns) = full_window();
+        let first = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("load ok");
+        assert!(first.is_none());
+        assert_eq!(capture.count_containing(DECODE_REFUSAL_WARN), 1);
+
+        // This tenant reached `load_column_stats` directly and never resolved,
+        // so it has NO activity record: the sweep must still clear its mark,
+        // because a never-stamped tenant is not "active". `evicted` is 0 (no
+        // idle tenant was removed); the mark is swept on the activity check.
+        // A resolved tenant's mark, by contrast, must survive: stamp an
+        // unrelated tenant as active first and check its mark is kept.
+        // A DIFFERENT tenant from the fixture's `tenant()` ([0xAB; 16]); the
+        // sweep is keyed by tenant, so an equal hash would stamp the tenant
+        // under test and void the never-resolved case.
+        let other = TenantHash([0x5Cu8; 16]);
+        assert_ne!(
+            other,
+            tenant(),
+            "the active control tenant must be distinct"
+        );
+        catalog.tenant_activity.lock().insert(other, 1_000);
+        catalog.warned_decode_failures.lock().insert((
+            other,
+            Signal::Logs,
+            "other-key".to_string(),
+        ));
+        let evicted = catalog.evict_idle_tenants(1_000, 0);
+        assert_eq!(
+            evicted, 0,
+            "nothing was idle; the never-resolved tenant was never stamped"
+        );
+        {
+            let marks = catalog.warned_decode_failures.lock();
+            assert!(
+                !marks.iter().any(|(t, _, _)| *t == tenant()),
+                "the never-resolved tenant's mark is swept"
+            );
+            assert!(
+                marks.contains(&(other, Signal::Logs, "other-key".to_string())),
+                "an active tenant's mark survives the sweep"
+            );
+        }
+
+        let second = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("load ok");
+        assert!(second.is_none());
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            2,
+            "the returned tenant warns again after the sweep"
+        );
+        assert_eq!(catalog.column_stats_decode_refusals(), 2);
+    }
+
+    /// Issue #1400, deliverable 2: a re-fold that publishes a NEW object key for
+    /// the same `(tenant, signal)` warns independently of the old key's mark, so
+    /// a fresh bad object is never masked by an earlier one.
+    #[tokio::test]
+    async fn column_stats_decode_refusal_warns_per_object_key() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        install_oversized_stats(
+            &store,
+            tenant(),
+            Signal::Logs,
+            part_hash,
+            &oversized_stats_key("one"),
+            2_000_102_795,
+        )
+        .await;
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let (range, now_ns) = full_window();
+        let first = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("load ok");
+        assert!(first.is_none());
+        assert_eq!(capture.count_containing(DECODE_REFUSAL_WARN), 1);
+
+        // A re-fold publishes a HEAD pointing at a DIFFERENT key (a different
+        // declared length, so a different content hash too).
+        install_oversized_stats(
+            &store,
+            tenant(),
+            Signal::Logs,
+            part_hash,
+            &oversized_stats_key("two"),
+            3_000_000_000,
+        )
+        .await;
+
+        let second = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("load ok");
+        assert!(second.is_none());
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            2,
+            "the new key warns even though the tenant/signal already warned"
+        );
+        assert_eq!(catalog.column_stats_decode_refusals(), 2);
+    }
+
+    /// Issue #1400: the store-read arm stays silent. A `(tenant, signal)` with NO
+    /// HEAD object returns `Ok(None)` with zero WARN lines and a flat
+    /// decode-refusal counter, proving the change did not turn "no statistics"
+    /// into noise.
+    #[tokio::test]
+    async fn absent_head_stays_silent_and_uncounted() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let (range, now_ns) = full_window();
+        let got = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("load ok");
+        assert!(got.is_none(), "no HEAD means no statistics");
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            0,
+            "an absent store object is not a decode refusal"
+        );
+        assert_eq!(catalog.column_stats_decode_refusals(), 0);
     }
 
     /// Issue #888, deliverable 2: two consecutive loads against an UNCHANGED
@@ -5967,9 +8176,10 @@ mod tests {
 
         let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
 
+        let (range, now_ns) = full_window();
         let acc1 = QueryAccounting::new();
         let first = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &acc1)
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc1)
             .await
             .expect("load ok")
             .expect("stats present");
@@ -5981,7 +8191,7 @@ mod tests {
 
         let acc2 = QueryAccounting::new();
         let second = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &acc2)
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc2)
             .await
             .expect("load ok")
             .expect("stats present");
@@ -6015,9 +8225,10 @@ mod tests {
 
         let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
 
+        let (range, now_ns) = full_window();
         let acc1 = QueryAccounting::new();
         let first = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &acc1)
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc1)
             .await
             .expect("load ok")
             .expect("stats present");
@@ -6029,7 +8240,7 @@ mod tests {
 
         let acc2 = QueryAccounting::new();
         let second = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &acc2)
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc2)
             .await
             .expect("load ok")
             .expect("stats present");
@@ -6068,6 +8279,7 @@ mod tests {
         let part_blake3 = (0..parts).map(|i| [i as u8; 32]).collect();
         Arc::new(LoadedColumnStats {
             segments,
+            by_content_hash: HashMap::new(),
             part_blake3,
         })
     }
@@ -6096,7 +8308,11 @@ mod tests {
         );
 
         let cache = ColumnStatsCache::new(1 << 20);
-        cache.insert((tenant(), Signal::Logs), [1u8; 32], Arc::clone(&loaded));
+        cache.insert(
+            (tenant(), Signal::Logs, 0, 50),
+            [1u8; 32],
+            Arc::clone(&loaded),
+        );
         assert_eq!(
             cache.held_bytes(),
             expected,
@@ -6117,9 +8333,9 @@ mod tests {
         let b = entry.heap_bytes();
         let cache = ColumnStatsCache::new(2 * b);
 
-        let ka = (tenant_n(1), Signal::Logs);
-        let kb = (tenant_n(2), Signal::Logs);
-        let kc = (tenant_n(3), Signal::Logs);
+        let ka = (tenant_n(1), Signal::Logs, 0, 50);
+        let kb = (tenant_n(2), Signal::Logs, 0, 50);
+        let kc = (tenant_n(3), Signal::Logs, 0, 50);
         // Lookups still verify the part binding against the loaded object's
         // own copy; the cache stores no duplicate.
         let parts = entry.part_blake3.clone();
@@ -6162,14 +8378,26 @@ mod tests {
         let b = entry.heap_bytes();
 
         let cache = ColumnStatsCache::new(b);
-        cache.insert((tenant_n(1), Signal::Logs), [1u8; 32], Arc::clone(&entry));
-        cache.insert((tenant_n(2), Signal::Logs), [1u8; 32], Arc::clone(&entry));
+        cache.insert(
+            (tenant_n(1), Signal::Logs, 0, 50),
+            [1u8; 32],
+            Arc::clone(&entry),
+        );
+        cache.insert(
+            (tenant_n(2), Signal::Logs, 0, 50),
+            [1u8; 32],
+            Arc::clone(&entry),
+        );
         assert_eq!(cache.evictions(), 1, "one eviction, counted once");
         assert_eq!(cache.refusals(), 0, "an eviction is not a refusal");
 
         // An object larger than the whole budget: refused, not evicted.
         let refuse_cache = ColumnStatsCache::new(b - 1);
-        refuse_cache.insert((tenant_n(1), Signal::Logs), [1u8; 32], Arc::clone(&entry));
+        refuse_cache.insert(
+            (tenant_n(1), Signal::Logs, 0, 50),
+            [1u8; 32],
+            Arc::clone(&entry),
+        );
         assert_eq!(refuse_cache.refusals(), 1, "oversized object refused once");
         assert_eq!(
             refuse_cache.evictions(),
@@ -6211,8 +8439,9 @@ mod tests {
             },
         )
         .expect("catalog");
+        let (range, now_ns) = full_window();
         let fresh_a = disabled
-            .load_column_stats(&ta, Signal::Logs, &QueryAccounting::new())
+            .load_column_stats(&ta, Signal::Logs, range, now_ns, &QueryAccounting::new())
             .await
             .expect("load ok")
             .expect("stats present");
@@ -6235,7 +8464,7 @@ mod tests {
         .expect("catalog");
 
         catalog
-            .load_column_stats(&ta, Signal::Logs, &QueryAccounting::new())
+            .load_column_stats(&ta, Signal::Logs, range, now_ns, &QueryAccounting::new())
             .await
             .expect("load ok")
             .expect("stats present");
@@ -6246,7 +8475,7 @@ mod tests {
         );
 
         catalog
-            .load_column_stats(&tb, Signal::Logs, &QueryAccounting::new())
+            .load_column_stats(&tb, Signal::Logs, range, now_ns, &QueryAccounting::new())
             .await
             .expect("load ok")
             .expect("stats present");
@@ -6259,7 +8488,7 @@ mod tests {
         // Reload A: its entry was evicted, so this re-fetches (two GETs).
         let acc_reload = QueryAccounting::new();
         let reloaded_a = catalog
-            .load_column_stats(&ta, Signal::Logs, &acc_reload)
+            .load_column_stats(&ta, Signal::Logs, range, now_ns, &acc_reload)
             .await
             .expect("load ok")
             .expect("stats present");
@@ -6278,5 +8507,1329 @@ mod tests {
             "the covered part set is unchanged by eviction"
         );
         assert_eq!(loaded_value(&reloaded_a), 42, "and carry tenant A's value");
+    }
+
+    /// A compaction record stamped a future `format_version` is refused by the
+    /// resolve read path (`load_and_validate_compaction`, docs/catalog-and-mvcc.md
+    /// step 2), not read as version 1. The record is otherwise fully
+    /// self-consistent: its identity fields reconstruct its own key, so the
+    /// only thing that can reject it is the ADR-0066 decision 2 version gate.
+    /// Removing that gate (making `check_format_version` always `Ok`) makes
+    /// this test fail: the record then decodes and validates as version 1 and
+    /// the call returns `Ok`.
+    #[tokio::test]
+    async fn resolve_refuses_a_future_version_compaction_record() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let accounting = QueryAccounting::new();
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+
+        let record = ravel_proto::commit::v1::CompactionRecord {
+            format_version: 2,
+            tenant_hash: tenant.0.to_vec(),
+            signal: signal::to_proto(signal).into(),
+            shard: 0,
+            ingest_hour_bucket: 1,
+            input_set_hash: vec![0x11; 32],
+            ..Default::default()
+        };
+        let key = ravel_commit::keys::compaction_record_key_for(&record).expect("key");
+        store
+            .put(
+                &key,
+                ravel_commit::record::encode_compaction(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed put");
+
+        let err = catalog
+            .load_and_validate_compaction(&tenant, signal, 0, &key, &accounting)
+            .await
+            .expect_err("a version-2 compaction record must be refused, not read as v1");
+        assert!(
+            err.to_string().contains("compaction record"),
+            "the error names the record kind: {err}"
+        );
+        match err {
+            CatalogError::CompactionRecordDecode { source, .. } => match source {
+                ravel_commit::record::RecordError::UnsupportedRecordFormatVersion {
+                    actual,
+                    ..
+                } => assert_eq!(actual, 2, "the error carries the version seen"),
+                other => panic!("expected UnsupportedRecordFormatVersion, got {other:?}"),
+            },
+            other => panic!("expected CompactionRecordDecode, got {other:?}"),
+        }
+    }
+
+    /// Test-only decorator that records every `get()` key, in call order, so
+    /// a test can assert the EXACT set of objects a load fetched -- not just
+    /// how many, which `QueryAccounting`'s `AccountedOp::Get` counter alone
+    /// cannot distinguish (it counts, it does not name). Every method
+    /// delegates to `inner` unchanged; only `get` is observed.
+    struct KeyLoggingStore<S> {
+        inner: S,
+        get_keys: Mutex<Vec<String>>,
+    }
+
+    impl<S> KeyLoggingStore<S> {
+        fn new(inner: S) -> Self {
+            KeyLoggingStore {
+                inner,
+                get_keys: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Every key `get()` was called with, in call order.
+        fn get_keys(&self) -> Vec<String> {
+            self.get_keys.lock().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for KeyLoggingStore<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.get_keys.lock().push(key.to_string());
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Write a **v3** per-part column-stats object covering exactly
+    /// `part_hash` with one segment carrying an I64 `status` column at
+    /// min == max == `value` (one non-null row), content-hash-keyed at
+    /// `content_hash` (v3's 32-byte `writer_id` scheme). Returns the
+    /// `SnapshotColumnStatsPartRef` a `SnapshotPartRef.column_stats` (field 7)
+    /// entry should carry.
+    async fn install_v3_part_stats(
+        store: &impl ObjectStoreBackend,
+        tenant: TenantHash,
+        signal: Signal,
+        part_hash: [u8; 32],
+        content_hash: [u8; 32],
+        value: i64,
+        key: &str,
+    ) -> ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+        let signal_num = signal::to_proto(signal) as u32;
+        let segments = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: content_hash.to_vec(),
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                name: "status".to_string(),
+                declared_type: 2,
+                non_null_count: 1,
+                null_count: 0,
+                min: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(value)),
+                }),
+                max: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(value)),
+                }),
+                dictionary_present: true,
+                dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                    value: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(value)),
+                    }),
+                    count: 1,
+                }],
+                sum: Some(value),
+            }],
+        }];
+        let stats_bytes = crate::snapshot_format::encode_column_stats_v3(
+            tenant.0,
+            signal_num,
+            part_hash,
+            &segments,
+            crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
+        )
+        .expect("encode v3 column stats");
+        let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
+        store
+            .put(key, Bytes::from(stats_bytes.clone()), PutOptions::default())
+            .await
+            .expect("put v3 stats");
+        ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+            key: key.to_string(),
+            blake3: stats_hash.to_vec(),
+            size: stats_bytes.len() as u64,
+            segment_count: 1,
+            part_blake3: vec![part_hash.to_vec()],
+        }
+    }
+
+    /// Appends a length-delimited field to an already-encoded protobuf
+    /// message. Fields 11 and 13 on `SnapshotHead` (ADR-1413 decision 6,
+    /// #1600) are `reserved` and have no struct field to set, so this is the
+    /// only way to construct a HEAD that still carries one, the way a HEAD
+    /// folded before this change would. `SnapshotHead::decode` (a plain
+    /// `prost::Message::decode`) skips a field number it does not recognize,
+    /// so appending is equivalent to the field having been encoded in its
+    /// original position.
+    fn append_raw_field(
+        mut message_bytes: Vec<u8>,
+        field_number: u32,
+        field_value: &impl prost::Message,
+    ) -> Vec<u8> {
+        prost::encoding::encode_key(
+            field_number,
+            prost::encoding::WireType::LengthDelimited,
+            &mut message_bytes,
+        );
+        let payload = field_value.encode_to_vec();
+        prost::encoding::encode_varint(payload.len() as u64, &mut message_bytes);
+        message_bytes.extend_from_slice(&payload);
+        message_bytes
+    }
+
+    /// A well-framed **v3** column-statistics envelope (single `part_blake3`,
+    /// matching [`crate::snapshot_format::encode_column_stats_v3`]'s shape)
+    /// whose header DECLARES `declared_len` uncompressed body bytes over an
+    /// empty body -- the same issue #1400 shape [`frame_oversized_cstat`]
+    /// builds for v1, adapted to v3's single-part header so a per-part decode
+    /// refusal can be tested the same way a whole-tenant one already is.
+    fn frame_oversized_cstat_v3(
+        tenant: TenantHash,
+        signal: Signal,
+        part_hash: [u8; 32],
+        declared_len: u64,
+    ) -> Vec<u8> {
+        use crate::snapshot_format::{COLUMN_STATS_MAGIC, COLUMN_STATS_RESERVED, ZSTD_LEVEL};
+
+        let version: u8 = 3;
+        let body = zstd::bulk::compress(b"", ZSTD_LEVEL).expect("compress empty body");
+        let header = ravel_proto::catalog::v1::ColumnStatsHeader {
+            format_version: u32::from(version),
+            tenant_hash: tenant.0.to_vec(),
+            signal: signal::to_proto(signal) as u32,
+            part_blake3: vec![part_hash.to_vec()],
+            segment_count: 0,
+            body_uncompressed_len: declared_len,
+        };
+        let header_bytes = header.encode_to_vec();
+        let header_len = header_bytes.len() as u32;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&COLUMN_STATS_MAGIC);
+        out.push(version);
+        out.extend_from_slice(&COLUMN_STATS_RESERVED);
+        out.extend_from_slice(&header_len.to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        let header_crc = crc32c::crc32c(&out);
+
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(&body);
+        let body_crc = crc32c::crc32c(&body);
+        out.extend_from_slice(&body_crc.to_le_bytes());
+        out.extend_from_slice(&header_crc.to_le_bytes());
+        out
+    }
+
+    /// ADR-1413 decision 2 (#1600): a query window covering exactly K of a
+    /// tenant's N (here 3) snapshot parts issues exactly one per-part v3 GET
+    /// for each of the K covered parts, plus the one HEAD GET -- never a
+    /// whole-object (field 13 or field 11) GET, and never a GET for an
+    /// uncovered part. The HEAD also carries stale field-11 and field-13
+    /// whole-object poison refs, wire-injected with `append_raw_field` since
+    /// both fields are `reserved` and have no struct field to set: exactly
+    /// the shape a pre-#1600 fold would have produced. Retiring the fallback
+    /// ladder means neither is ever read, covered or not.
+    ///
+    /// Prove-the-test: the excluded part 'a' carries no field-7 ref at all
+    /// (`column_stats: None`), so neither flipping this loop's `for part in
+    /// &covered` to `for part in &head.parts` nor reintroducing the genuine
+    /// pre-#1600 `needs_fallback` ladder (verified directly against the
+    /// pre-#1600 tree, commit `5d40a50`'s parent) changes this fixture's
+    /// outcome: both covered parts (b, c) already resolve successfully, so no
+    /// fallback of any kind is ever consulted for either, whole-object
+    /// machinery present or not. This test instead pins the fixed
+    /// covered-part key set and GET count against a poisoned HEAD; the
+    /// mutation that DOES break it is `resolve_part_stats_ref`
+    /// (`column_stats_resolve.rs`) fabricating a ref from a part's own
+    /// blake3 when `column_stats` is absent instead of returning `None` --
+    /// verified directly, this leaves the assertions below unaffected too,
+    /// because the fabricated ref would only apply to excluded part 'a'; see
+    /// [`head_with_only_field_thirteen_yields_no_statistics_and_scans`] for
+    /// the fixture where that same mutation (and reintroducing genuine
+    /// pre-#1600 code) both do fail.
+    #[tokio::test]
+    async fn query_over_k_of_n_parts_issues_exactly_k_per_part_gets_and_no_whole_object_get() {
+        let inner = MemoryStore::new();
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_a_hash = *blake3::hash(b"part-a").as_bytes();
+        let part_b_hash = *blake3::hash(b"part-b").as_bytes();
+        let part_c_hash = *blake3::hash(b"part-c").as_bytes();
+        let content_b = *blake3::hash(b"content-b").as_bytes();
+        let content_c = *blake3::hash(b"content-c").as_bytes();
+
+        let b_key = format!(
+            "t/{}/catalog/{prefix}/cstat/part-b.cstat",
+            tenant().to_hex()
+        );
+        let c_key = format!(
+            "t/{}/catalog/{prefix}/cstat/part-c.cstat",
+            tenant().to_hex()
+        );
+        let b_ref =
+            install_v3_part_stats(&inner, tenant(), signal, part_b_hash, content_b, 10, &b_key)
+                .await;
+        let c_ref =
+            install_v3_part_stats(&inner, tenant(), signal, part_c_hash, content_c, 20, &c_key)
+                .await;
+
+        // Poison whole-tenant v1/v2 objects, bound to all three parts: if the
+        // reader ever fell back to either, its key would show up in the log
+        // below and the accounted GET count would climb past 3.
+        let all_parts = vec![
+            part_a_hash.to_vec(),
+            part_b_hash.to_vec(),
+            part_c_hash.to_vec(),
+        ];
+        let poison_segments_v1 = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: vec![0xAA; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![],
+        }];
+        let v1_bytes = crate::snapshot_format::encode_column_stats(
+            tenant().0,
+            signal_num,
+            all_parts.clone(),
+            &poison_segments_v1,
+        )
+        .expect("encode v1 poison");
+        let v1_hash = *blake3::hash(&v1_bytes).as_bytes();
+        let v1_key = format!(
+            "t/{}/catalog/{prefix}/cstat/poison-v1.cstat",
+            tenant().to_hex()
+        );
+        inner
+            .put(
+                &v1_key,
+                Bytes::from(v1_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v1 poison");
+
+        let poison_segments_v2 = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: vec![0xBB; 32],
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![],
+        }];
+        let v2_bytes = crate::snapshot_format::encode_column_stats_v2(
+            tenant().0,
+            signal_num,
+            all_parts.clone(),
+            &poison_segments_v2,
+        )
+        .expect("encode v2 poison");
+        let v2_hash = *blake3::hash(&v2_bytes).as_bytes();
+        let v2_key = format!(
+            "t/{}/catalog/{prefix}/cstat/poison-v2.cstat",
+            tenant().to_hex()
+        );
+        inner
+            .put(
+                &v2_key,
+                Bytes::from(v2_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v2 poison");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 29,
+            parts: vec![
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-a".to_string(),
+                    blake3: part_a_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 9,
+                    min_hour: 0,
+                    column_stats: None,
+                },
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-b".to_string(),
+                    blake3: part_b_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 19,
+                    min_hour: 10,
+                    column_stats: Some(b_ref),
+                },
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-c".to_string(),
+                    blake3: part_c_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 29,
+                    min_hour: 20,
+                    column_stats: Some(c_ref),
+                },
+            ],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        // Fields 11 and 13 are `reserved` (ADR-1413 decision 6, #1600) and have
+        // no struct field to set; wire-inject them raw so this HEAD is exactly
+        // the shape a pre-#1600 fold would have produced, still carrying both
+        // stale whole-object poison refs.
+        let stale_field_11 = ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+            key: v1_key.clone(),
+            blake3: v1_hash.to_vec(),
+            size: v1_bytes.len() as u64,
+            segment_count: 1,
+            part_blake3: all_parts.clone(),
+        };
+        let stale_field_13 = ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+            key: v2_key.clone(),
+            blake3: v2_hash.to_vec(),
+            size: v2_bytes.len() as u64,
+            segment_count: 1,
+            part_blake3: all_parts.clone(),
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        let head_bytes = append_raw_field(head_bytes, 11, &stale_field_11);
+        let head_bytes = append_raw_field(head_bytes, 13, &stale_field_13);
+        inner
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let store = Arc::new(KeyLoggingStore::new(inner));
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+
+        // window [12h, 29h] widens (2h max_ingest_lag_ns) to hours [10, 29]:
+        // covers parts b and c (watermark 19 and 29, both >= 10) but not a
+        // (watermark 9 < 10).
+        let range = TimeRange {
+            start_ns: 12 * NS_PER_HOUR,
+            end_ns: 29 * NS_PER_HOUR,
+        };
+        let now_ns = 29 * NS_PER_HOUR;
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+
+        let cstat_gets: Vec<String> = store
+            .get_keys()
+            .into_iter()
+            .filter(|k| k.ends_with(".cstat"))
+            .collect();
+        assert_eq!(
+            cstat_gets.len(),
+            2,
+            "exactly the two covered parts' v3 objects: {cstat_gets:?}"
+        );
+        let cstat_set: HashSet<&str> = cstat_gets.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            cstat_set,
+            HashSet::from([b_key.as_str(), c_key.as_str()]),
+            "the exact key set is the two covered parts, no more, no less"
+        );
+        assert!(
+            !cstat_set.contains(v1_key.as_str()),
+            "field 11 (v1) object never fetched"
+        );
+        assert!(
+            !cstat_set.contains(v2_key.as_str()),
+            "field 13 (v2) object never fetched"
+        );
+
+        assert_eq!(
+            acc.snapshot().s3_requests(AccountedOp::Get),
+            3,
+            "HEAD plus exactly two per-part GETs, no whole-object fallback"
+        );
+
+        assert_eq!(
+            loaded.by_content_hash.len(),
+            2,
+            "both covered parts' segments loaded, and only theirs"
+        );
+        assert!(loaded.by_content_hash.contains_key(&content_b));
+        assert!(loaded.by_content_hash.contains_key(&content_c));
+    }
+
+    /// BLOCKING regression (issue #1483 review, ADR-1413 T2): `fetch_stats_object`
+    /// is shared verbatim by field 11 (v1), field 13 (v2), and a part's field 7
+    /// (v3) refs, and `decode_column_stats` only checks an object's envelope
+    /// byte against its OWN header, never against which slot the caller read
+    /// it from. So a legacy **v1** object -- correctly hashed, correctly
+    /// tenant-scoped, and bound to exactly this part's blake3 -- planted under
+    /// this part's field-7 (v3) ref used to decode clean and land in the
+    /// identity-keyed `segments` map, which `LoadedColumnStats::stat_for`
+    /// consults as a GLOBAL fallback for every segment in the query: one
+    /// mis-versioned object under one part's v3 slot would silently defeat
+    /// per-part scoping for the whole tenant.
+    ///
+    /// This fixture has exactly one part, whose field-7 ref points at a v1-
+    /// encoded object with a matching `part_blake3` and no field 11/13 whole-
+    /// object ref anywhere on HEAD to fall back to.
+    ///
+    /// Prove-the-test: removing the `format_version` check in
+    /// `column_stats_resolve::fetch_stats_object`
+    /// (crates/ravel-catalog/src/column_stats_resolve.rs) makes this fail:
+    /// the v1 object decodes, passes tenant and part-binding checks, and
+    /// `load_column_stats` returns `Some` with the segment loaded under
+    /// `segments` (by `EntryIdentity`) instead of `None`.
+    #[tokio::test]
+    async fn v1_object_under_a_v3_field_seven_slot_is_rejected_not_loaded() {
+        let store = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_hash = *blake3::hash(b"part-mis-versioned").as_bytes();
+
+        // A well-formed v1 object: correctly hashed, correctly tenant-scoped,
+        // and bound to exactly this one part -- everything `fetch_stats_object`
+        // checks EXCEPT which slot it was read from.
+        let segments = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: vec![0xAA; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                name: "status".to_string(),
+                declared_type: 2,
+                non_null_count: 1,
+                null_count: 0,
+                min: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                }),
+                max: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                }),
+                dictionary_present: true,
+                dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                    value: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                    }),
+                    count: 1,
+                }],
+                sum: Some(1),
+            }],
+        }];
+        let v1_bytes = crate::snapshot_format::encode_column_stats(
+            tenant().0,
+            signal_num,
+            vec![part_hash.to_vec()],
+            &segments,
+        )
+        .expect("encode v1 stats");
+        let v1_hash = *blake3::hash(&v1_bytes).as_bytes();
+        let v1_key = format!(
+            "t/{}/catalog/{prefix}/cstat/mis-versioned.cstat",
+            tenant().to_hex()
+        );
+        store
+            .put(
+                &v1_key,
+                Bytes::from(v1_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v1 stats");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 10,
+            parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
+                key: "unused".to_string(),
+                blake3: part_hash.to_vec(),
+                size: 1,
+                entry_count: 0,
+                watermark_hour: 10,
+                min_hour: 0,
+                // The v1 object above wears a field-7 (v3) ref: same key,
+                // same blake3, same part binding a genuine v3 object would
+                // carry, but the object itself is v1-encoded.
+                column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                    key: v1_key.clone(),
+                    blake3: v1_hash.to_vec(),
+                    size: v1_bytes.len() as u64,
+                    segment_count: 1,
+                    part_blake3: vec![part_hash.to_vec()],
+                }),
+            }],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("load ok");
+
+        assert!(
+            loaded.is_none(),
+            "the mis-versioned v1 object must be rejected, and there is no \
+             whole-object ref to fall back to, so the part is simply \
+             uncovered: {loaded:?}"
+        );
+    }
+
+    /// ADR-1413 decision 6 (#1600): a part with no v3 ref (field 7 absent) is
+    /// simply uncovered -- the query scans it rather than falling back to a
+    /// whole-tenant object. This fixture plants a stale field 13 (v2
+    /// whole-tenant) ref bound to both parts, left over from before the
+    /// retirement, to prove it is never read: the field-13 GET must never
+    /// fire and part y must not appear in the loaded statistics.
+    ///
+    /// Prove-the-test: reintroducing the deleted field-13 fallback (resolving
+    /// `head.column_stats_part` when a part's own ref is absent) makes this
+    /// fail: `v2_gets` becomes 1 and part y's content hash appears in
+    /// `by_content_hash`.
+    #[tokio::test]
+    async fn a_part_without_field_seven_is_uncovered_even_with_a_stale_field_thirteen() {
+        let inner = MemoryStore::new();
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_x_hash = *blake3::hash(b"part-x").as_bytes();
+        let part_y_hash = *blake3::hash(b"part-y").as_bytes();
+        let content_x = *blake3::hash(b"content-x").as_bytes();
+        let content_y = *blake3::hash(b"content-y").as_bytes();
+
+        let x_key = format!(
+            "t/{}/catalog/{prefix}/cstat/part-x.cstat",
+            tenant().to_hex()
+        );
+        let x_ref =
+            install_v3_part_stats(&inner, tenant(), signal, part_x_hash, content_x, 1, &x_key)
+                .await;
+
+        // The whole-tenant v2 object, bound to BOTH parts (the binding is
+        // every part in HEAD, not just covered ones), carrying only part y's
+        // segment -- x already has its own v3 object and must not need this.
+        let y_segment = ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: content_y.to_vec(),
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                name: "status".to_string(),
+                declared_type: 2,
+                non_null_count: 1,
+                null_count: 0,
+                min: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                }),
+                max: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                }),
+                dictionary_present: true,
+                dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                    value: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                    }),
+                    count: 1,
+                }],
+                sum: Some(2),
+            }],
+        };
+        let v2_bytes = crate::snapshot_format::encode_column_stats_v2(
+            tenant().0,
+            signal_num,
+            vec![part_x_hash.to_vec(), part_y_hash.to_vec()],
+            &[y_segment],
+        )
+        .expect("encode v2");
+        let v2_hash = *blake3::hash(&v2_bytes).as_bytes();
+        let v2_key = format!("t/{}/catalog/{prefix}/cstat/whole.cstat", tenant().to_hex());
+        inner
+            .put(
+                &v2_key,
+                Bytes::from(v2_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v2");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 19,
+            parts: vec![
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-x".to_string(),
+                    blake3: part_x_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 9,
+                    min_hour: 0,
+                    column_stats: Some(x_ref),
+                },
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-y".to_string(),
+                    blake3: part_y_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 19,
+                    min_hour: 10,
+                    column_stats: None,
+                },
+            ],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        // Field 13 no longer exists on the generated struct, so a stale
+        // whole-tenant ref (as an old, pre-#1600 HEAD would carry) is
+        // planted directly on the wire: this is the only way to prove the
+        // retired field is ignored on read rather than merely unwritable.
+        let stale_field_13 = ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+            key: v2_key.clone(),
+            blake3: v2_hash.to_vec(),
+            size: v2_bytes.len() as u64,
+            segment_count: 1,
+            part_blake3: vec![part_x_hash.to_vec(), part_y_hash.to_vec()],
+        };
+        let head_bytes = append_raw_field(
+            crate::snapshot_format::encode_head(&head).expect("encode head"),
+            13,
+            &stale_field_13,
+        );
+        inner
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let store = Arc::new(KeyLoggingStore::new(inner));
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+
+        let v2_gets = store.get_keys().iter().filter(|k| *k == &v2_key).count();
+        assert_eq!(
+            v2_gets, 0,
+            "the stale field-13 object is never fetched: field 13 is retired"
+        );
+        assert_eq!(
+            acc.snapshot().s3_requests(AccountedOp::Get),
+            2,
+            "HEAD plus part x's own v3 object only; no whole-object GET"
+        );
+
+        assert!(
+            loaded.by_content_hash.contains_key(&content_x),
+            "part x's own v3 record loaded"
+        );
+        assert!(
+            !loaded.by_content_hash.contains_key(&content_y),
+            "part y has no field-7 ref, so it is uncovered rather than answered \
+             from the stale field-13 fallback"
+        );
+        assert_eq!(
+            loaded.by_content_hash.len(),
+            1,
+            "only part x's own object contributes statistics"
+        );
+    }
+
+    /// Issue #1400 extended per part (ADR-1413 decision 2): a covered part
+    /// whose own v3 object fails to DECODE (not merely absent) subtracts
+    /// that part's coverage from the loaded statistics, while the query
+    /// still succeeds -- and the well-formed sibling part's statistics still
+    /// load. The refusal warns once and counts once, exactly like the
+    /// whole-tenant case (`column_stats_decode_refusal_warns_once_and_counts_each`).
+    ///
+    /// Prove-the-test: this pins the per-part loop's
+    /// `FetchOutcome::DecodeRefused(err) => { self.note_column_stats_decode_refusal(...);
+    /// needs_fallback.push(part); }` arm actually excluding the refused
+    /// part's records. Flip that arm to a bare `needs_fallback.push(part)`
+    /// with no `note_column_stats_decode_refusal` call and the refusal-count
+    /// and WARN assertions below both fail: `column_stats_decode_refusals()`
+    /// reads 0 against the expected 1 and `count_containing` reads 0 against
+    /// the expected 1.
+    #[tokio::test]
+    async fn a_part_whose_v3_object_fails_to_decode_subtracts_its_coverage_and_warns() {
+        let store = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_p_hash = *blake3::hash(b"part-p").as_bytes();
+        let part_q_hash = *blake3::hash(b"part-q").as_bytes();
+        let content_q = *blake3::hash(b"content-q").as_bytes();
+
+        let p_key = format!(
+            "t/{}/catalog/{prefix}/cstat/part-p.cstat",
+            tenant().to_hex()
+        );
+        let corrupt_bytes = frame_oversized_cstat_v3(tenant(), signal, part_p_hash, 2_000_102_795);
+        let corrupt_hash = *blake3::hash(&corrupt_bytes).as_bytes();
+        store
+            .put(
+                &p_key,
+                Bytes::from(corrupt_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put corrupt v3");
+
+        let q_key = format!(
+            "t/{}/catalog/{prefix}/cstat/part-q.cstat",
+            tenant().to_hex()
+        );
+        let q_ref = install_v3_part_stats(
+            store.as_ref(),
+            tenant(),
+            signal,
+            part_q_hash,
+            content_q,
+            7,
+            &q_key,
+        )
+        .await;
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 19,
+            parts: vec![
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-p".to_string(),
+                    blake3: part_p_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 9,
+                    min_hour: 0,
+                    column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                        key: p_key.clone(),
+                        blake3: corrupt_hash.to_vec(),
+                        size: corrupt_bytes.len() as u64,
+                        segment_count: 0,
+                        part_blake3: vec![part_p_hash.to_vec()],
+                    }),
+                },
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-q".to_string(),
+                    blake3: part_q_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 19,
+                    min_hour: 10,
+                    column_stats: Some(q_ref),
+                },
+            ],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let (range, now_ns) = full_window();
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &QueryAccounting::new())
+            .await
+            .expect("load ok")
+            .expect("part q's statistics still load");
+
+        assert_eq!(
+            loaded.by_content_hash.len(),
+            1,
+            "only part q's segment loaded; part p's coverage was subtracted"
+        );
+        assert!(loaded.by_content_hash.contains_key(&content_q));
+
+        assert_eq!(
+            catalog.column_stats_decode_refusals(),
+            1,
+            "counted once for the one refused part"
+        );
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            1,
+            "warned once for the one refused part"
+        );
+        let warn = capture
+            .lines()
+            .into_iter()
+            .find(|line| line.contains(DECODE_REFUSAL_WARN))
+            .expect("the one decode-refusal WARN");
+        assert!(
+            warn.contains(&p_key),
+            "WARN names the refused part's own key: {warn}"
+        );
+    }
+
+    /// ADR-1413 decision 6 (#1600): a HEAD carrying ONLY a stale field 13
+    /// (the retired whole-tenant v2 ref), no field 7 on either part, yields
+    /// NO statistics -- the query scans instead, and the field-13 object is
+    /// never fetched. Field 13 has no struct field to set (it is `reserved`
+    /// on the wire), so the ref is planted with a raw wire append
+    /// (`append_raw_field`), the way a HEAD folded before this change would
+    /// actually carry one.
+    ///
+    /// Prove-the-test: verified two ways. (1) Reintroducing the genuine
+    /// pre-#1600 `needs_fallback` ladder and its real `head.v1`/`head.v2`
+    /// fields (the pre-#1600 tree, commit `5d40a50`'s parent, run with this
+    /// exact test body) makes this fail: `loaded` becomes `Some` with both
+    /// parts' statistics, at 2 accounted GETs (HEAD plus the one whole-object
+    /// fallback), not 1. (2) Against CURRENT code, mutating
+    /// `resolve_part_stats_ref` (`column_stats_resolve.rs`) to fabricate a
+    /// ref from a part's own blake3 when `column_stats` is absent, instead of
+    /// returning `None`, also makes this fail: the accounted GET count climbs
+    /// to 3 (HEAD plus one fabricated-ref attempt per part), not 1.
+    #[tokio::test]
+    async fn head_with_only_field_thirteen_yields_no_statistics_and_scans() {
+        let inner = MemoryStore::new();
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_1_hash = *blake3::hash(b"legacy-part-1").as_bytes();
+        let part_2_hash = *blake3::hash(b"legacy-part-2").as_bytes();
+        let content_1 = *blake3::hash(b"legacy-content-1").as_bytes();
+        let content_2 = *blake3::hash(b"legacy-content-2").as_bytes();
+
+        let segments = vec![
+            ravel_proto::catalog::v1::ColumnStatsSegment {
+                ingest_hour_bucket: 1,
+                shard: 0,
+                writer_id: content_1.to_vec(),
+                writer_epoch: 1,
+                writer_seq: 1,
+                columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                    name: "status".to_string(),
+                    declared_type: 2,
+                    non_null_count: 1,
+                    null_count: 0,
+                    min: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                    }),
+                    max: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                    }),
+                    dictionary_present: true,
+                    dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                        value: Some(ravel_proto::catalog::v1::ColumnValue {
+                            kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                        }),
+                        count: 1,
+                    }],
+                    sum: Some(1),
+                }],
+            },
+            ravel_proto::catalog::v1::ColumnStatsSegment {
+                ingest_hour_bucket: 1,
+                shard: 0,
+                writer_id: content_2.to_vec(),
+                writer_epoch: 1,
+                writer_seq: 1,
+                columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                    name: "status".to_string(),
+                    declared_type: 2,
+                    non_null_count: 1,
+                    null_count: 0,
+                    min: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                    }),
+                    max: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                    }),
+                    dictionary_present: true,
+                    dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                        value: Some(ravel_proto::catalog::v1::ColumnValue {
+                            kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                        }),
+                        count: 1,
+                    }],
+                    sum: Some(2),
+                }],
+            },
+        ];
+        let v2_bytes = crate::snapshot_format::encode_column_stats_v2(
+            tenant().0,
+            signal_num,
+            vec![part_1_hash.to_vec(), part_2_hash.to_vec()],
+            &segments,
+        )
+        .expect("encode v2");
+        let v2_hash = *blake3::hash(&v2_bytes).as_bytes();
+        let v2_key = format!(
+            "t/{}/catalog/{prefix}/cstat/legacy.cstat",
+            tenant().to_hex()
+        );
+        inner
+            .put(
+                &v2_key,
+                Bytes::from(v2_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v2");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 19,
+            parts: vec![
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-1".to_string(),
+                    blake3: part_1_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 9,
+                    min_hour: 0,
+                    column_stats: None,
+                },
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-2".to_string(),
+                    blake3: part_2_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 19,
+                    min_hour: 10,
+                    column_stats: None,
+                },
+            ],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        let stale_field_13 = ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+            key: v2_key.clone(),
+            blake3: v2_hash.to_vec(),
+            size: v2_bytes.len() as u64,
+            segment_count: 2,
+            part_blake3: vec![part_1_hash.to_vec(), part_2_hash.to_vec()],
+        };
+        let head_bytes = append_raw_field(
+            crate::snapshot_format::encode_head(&head).expect("encode head"),
+            13,
+            &stale_field_13,
+        );
+        let store = Arc::new(KeyLoggingStore::new(inner));
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("load ok");
+
+        assert!(
+            loaded.is_none(),
+            "field 13 is retired: no per-part ref anywhere yields no statistics, not a \
+             whole-object fallback: {loaded:?}"
+        );
+        assert_eq!(
+            acc.snapshot().s3_requests(AccountedOp::Get),
+            1,
+            "HEAD only; the stale field-13 object is never fetched"
+        );
+        let v2_gets = store.get_keys().iter().filter(|k| *k == &v2_key).count();
+        assert_eq!(v2_gets, 0, "the field-13 object is never fetched");
+    }
+
+    /// ADR-1413 decision 6 (#1600): a genuinely pre-#1413 HEAD -- carrying
+    /// only the whole-tenant **v1** ref (field 11), no field 13 and no field
+    /// 7 anywhere, the only shape a fold from that era could have written --
+    /// yields NO statistics under the new reader, and the query scans
+    /// instead. `SnapshotColumnStatsRef` (the v1 ref's original message type)
+    /// no longer exists in the generated code at all, so the ref is planted
+    /// with a raw wire append (`append_raw_field`) using
+    /// `SnapshotColumnStatsPartRef`'s identical field shape (key, blake3,
+    /// size, segment_count, part_blake3) -- the wire bytes this produces for
+    /// field 11 are indistinguishable from what the original v1 message type
+    /// would have encoded.
+    ///
+    /// Prove-the-test: reintroducing a `head.column_stats` (field 11)
+    /// fallback read in the per-part resolution loop makes this fail:
+    /// `loaded` becomes `Some` with both legacy parts' statistics, and the
+    /// v1 object is fetched once instead of never.
+    #[tokio::test]
+    async fn head_with_only_field_eleven_yields_no_statistics_and_scans() {
+        let inner = MemoryStore::new();
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_1_hash = *blake3::hash(b"pre-1413-part-1").as_bytes();
+        let part_2_hash = *blake3::hash(b"pre-1413-part-2").as_bytes();
+
+        // v1 records are identity-keyed (16-byte writer_id), not
+        // content-hash-keyed: distinct `writer_seq` tells the two segments
+        // apart the way a real pre-#1413 fold would.
+        let segments = vec![
+            ravel_proto::catalog::v1::ColumnStatsSegment {
+                ingest_hour_bucket: 1,
+                shard: 0,
+                writer_id: vec![0xAA; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+                columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                    name: "status".to_string(),
+                    declared_type: 2,
+                    non_null_count: 1,
+                    null_count: 0,
+                    min: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                    }),
+                    max: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                    }),
+                    dictionary_present: true,
+                    dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                        value: Some(ravel_proto::catalog::v1::ColumnValue {
+                            kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                        }),
+                        count: 1,
+                    }],
+                    sum: Some(1),
+                }],
+            },
+            ravel_proto::catalog::v1::ColumnStatsSegment {
+                ingest_hour_bucket: 1,
+                shard: 0,
+                writer_id: vec![0xAA; 16],
+                writer_epoch: 1,
+                writer_seq: 2,
+                columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                    name: "status".to_string(),
+                    declared_type: 2,
+                    non_null_count: 1,
+                    null_count: 0,
+                    min: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                    }),
+                    max: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                    }),
+                    dictionary_present: true,
+                    dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                        value: Some(ravel_proto::catalog::v1::ColumnValue {
+                            kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                        }),
+                        count: 1,
+                    }],
+                    sum: Some(2),
+                }],
+            },
+        ];
+        let v1_bytes = crate::snapshot_format::encode_column_stats(
+            tenant().0,
+            signal_num,
+            vec![part_1_hash.to_vec(), part_2_hash.to_vec()],
+            &segments,
+        )
+        .expect("encode v1");
+        let v1_hash = *blake3::hash(&v1_bytes).as_bytes();
+        let v1_key = format!(
+            "t/{}/catalog/{prefix}/cstat/pre-1413.cstat",
+            tenant().to_hex()
+        );
+        inner
+            .put(
+                &v1_key,
+                Bytes::from(v1_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v1");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 19,
+            parts: vec![
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-1".to_string(),
+                    blake3: part_1_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 9,
+                    min_hour: 0,
+                    column_stats: None,
+                },
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-2".to_string(),
+                    blake3: part_2_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 19,
+                    min_hour: 10,
+                    column_stats: None,
+                },
+            ],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        let stale_field_11 = ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+            key: v1_key.clone(),
+            blake3: v1_hash.to_vec(),
+            size: v1_bytes.len() as u64,
+            segment_count: 2,
+            part_blake3: vec![part_1_hash.to_vec(), part_2_hash.to_vec()],
+        };
+        let head_bytes = append_raw_field(
+            crate::snapshot_format::encode_head(&head).expect("encode head"),
+            11,
+            &stale_field_11,
+        );
+        let store = Arc::new(KeyLoggingStore::new(inner));
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("load ok");
+
+        assert!(
+            loaded.is_none(),
+            "field 11 is retired: no per-part ref anywhere yields no statistics, not a \
+             whole-object fallback: {loaded:?}"
+        );
+        assert_eq!(
+            acc.snapshot().s3_requests(AccountedOp::Get),
+            1,
+            "HEAD only; the stale field-11 object is never fetched"
+        );
+        let v1_gets = store.get_keys().iter().filter(|k| *k == &v1_key).count();
+        assert_eq!(v1_gets, 0, "the field-11 object is never fetched");
     }
 }

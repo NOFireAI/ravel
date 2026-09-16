@@ -538,18 +538,33 @@ impl<'a> PostingsSection<'a> {
     ///   prune on this arm) but should also record that a corruption was
     ///   seen, mirroring `bloom_degraded`.
     pub fn probe(&self, column_id: u32, term: &[u8]) -> Result<Option<Vec<u32>>, LogSegError> {
+        self.probe_accounted(column_id, term)
+            .map(|(blocks, _)| blocks)
+    }
+
+    /// [`PostingsSection::probe`], additionally returning the bytes zstd
+    /// produced decompressing the term block this probe touched (issue
+    /// #1401 finding 1). Zero when the probe resolved without decompressing
+    /// a block: an uncapped field with no entry, a capped field, an empty
+    /// dictionary, or a term that sorts before the first block's
+    /// `first_term`.
+    pub fn probe_accounted(
+        &self,
+        column_id: u32,
+        term: &[u8],
+    ) -> Result<(Option<Vec<u32>>, u64), LogSegError> {
         let Ok(idx) = self
             .fields
             .binary_search_by(|f| f.column_id.cmp(&column_id))
         else {
-            return Ok(None);
+            return Ok((None, 0));
         };
         let field = &self.fields[idx];
         if field.capped {
-            return Ok(None);
+            return Ok((None, 0));
         }
         if field.blocks.is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok((Some(Vec::new()), 0));
         }
         // The last block whose first_term <= term; if term sorts before the
         // very first block's first_term, it cannot be in the dictionary.
@@ -558,7 +573,7 @@ impl<'a> PostingsSection<'a> {
             .binary_search_by(|b| b.first_term.as_slice().cmp(term))
         {
             Ok(i) => i,
-            Err(0) => return Ok(Some(Vec::new())),
+            Err(0) => return Ok((Some(Vec::new()), 0)),
             Err(i) => i - 1,
         };
         let block = &field.blocks[block_idx];
@@ -584,7 +599,24 @@ impl<'a> PostingsSection<'a> {
                 "postings block decompressed length".into(),
             ));
         }
+        let decompressed_len = payload.len() as u64;
         find_term_in_block(&payload, term, &block.first_term, upper_bound)
+            .map(|blocks| (blocks, decompressed_len))
+    }
+
+    /// Test-only: the sum of every term block's `uncompressed_len` across
+    /// every field in the section, read straight from the parsed sparse-index
+    /// headers rather than through `probe`'s block-selection or decompression
+    /// path. A fixture with one indexed field and few enough distinct terms to
+    /// fit inside one `DEFAULT_STRIDE`-sized term block makes this exactly the
+    /// byte count one probe into that field decompresses (issue #1401).
+    #[cfg(test)]
+    pub(crate) fn total_block_uncompressed_len(&self) -> u64 {
+        self.fields
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .map(|b| b.uncompressed_len as u64)
+            .sum()
     }
 }
 

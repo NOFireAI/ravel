@@ -120,11 +120,46 @@ pipeline's own boundaries rather than transplanted by analogy from the other.
 | route | router | seam | both |
 | merge | shard actor | seam | both, different impls |
 | encode | flush task | seam | both, different impls |
+| bloom | flush task, nested inside `encode` | seam | logs only |
 | PUT | flush task, object store | `InstrumentedStore` (decision 5) | both |
 
 Decode and normalize need no seam: the bench drives them and can time them
-directly. Only `admit`, `route`, `merge` and `encode` need instrumentation,
-which keeps the seam's surface small.
+directly. Five stages need instrumentation: `admit`, `route`, `merge`,
+`encode`, and, on the logs pipeline only, `bloom`. That keeps the seam's
+surface small.
+
+**These stages are not a partition, and summing them double-counts.** The
+first four are measured over disjoint, consecutive code boundaries, so no
+nanosecond is counted under two of `admit`, `route`, `merge`, and `encode`.
+That does not make their sum wall-clock time: `route` and `admit` are
+recorded per `LogIngestRouter::write` call, of which many can be in flight
+concurrently across shards, and `encode` is recorded inside a flush task
+spawned off the shard actor (`log_shard.rs:1660`, `self.flushes.spawn(...)`)
+rather than on the actor itself, with up to `max_inflight_flushes` such tasks
+running at once per shard (`log_shard.rs:6-14`). The four figures are
+per-stage busy time summed across overlapping tasks, not samples of a single
+timeline, so their sum can already exceed wall time before `bloom` enters
+the picture. `bloom` is not a fifth slice alongside them either: it is
+measured *inside* `encode`, with the enclosing `encode` timer still running
+(issue #1516). The `RlogWriter` block-write loop times each block's
+`BloomBuilder` insert-plus-`finish` window and reports the per-object sum
+and block count through `WriteStats::bloom_total_ns` and
+`WriteStats::bloom_blocks`, which `log_shard` folds into the `bloom`
+accumulator as one batch of `bloom_blocks` samples; every one of those
+nanoseconds is also counted in `encode`. So
+`bloom` adds double-counting on top of the four stages' own lack of a
+wall-clock relationship. Read `bloom` as a breakdown of `encode`, never as a
+term in a total, and do not read the four disjoint-boundary stages as
+summing to wall time either. The table lists `bloom` after `encode` because
+it is contained by it, not because it runs after it.
+
+The nesting is deliberate rather than an artefact. A disjoint `bloom` slice
+would make `encode` mean something different from what it meant before this
+stage existed: readers who compare an `encode` figure across a build with
+`bloom` split out and one without would be comparing "encode minus bloom" to
+"encode including bloom" without any signal that the basis changed. Nesting
+keeps `encode` reporting the same thing it always has, with `bloom` as a
+breakdown of part of it.
 
 **Caveat on `admit` — CORRECTED after T1 (#504) measured it.** The original
 text here said the bulk-load path bypasses the per-tenant
@@ -247,20 +282,31 @@ flowchart LR
     end
     RTE --> MRG
     subgraph actor["shard actor (stage-timing seam)"]
-        MRG[merge] --> ENC[encode]
+        MRG[merge] --> ENCBOX
+        subgraph ENCBOX["encode (one timer spans this whole box)"]
+            BLM["bloom (logs only)<br/>inner timer, not a slice of encode"]
+        end
     end
-    ENC --> PUT[PUT]
+    ENCBOX --> PUT[PUT]
     PUT --> STORE[(object store)]
     PUT -.->|"latency, counts, bytes"| INST[InstrumentedStore]
     ADM -.-> ACC["per-stage ns accumulator<br/>(read only by the reporter)"]
     RTE -.-> ACC
     MRG -.-> ACC
-    ENC -.-> ACC
+    ENCBOX -.-> ACC
+    BLM -.->|"also counted in encode"| ACC
     ACC --> REP[bench report JSON]
     INST --> REP
     ALLOC["stats_alloc: e2e ingest + query"] --> REP
     REP -->|"consumed by, not built here"| CMP["epic #51 bench_compare"]
 ```
+
+The left-to-right arrows are pipeline order and the boxes they connect are
+disjoint code boundaries, so no nanosecond is counted under two of them; that
+is not the same as summing to wall time under concurrency (see decision 2).
+`bloom` is drawn inside the `encode` box rather than on the chain because it
+is contained by `encode`, not sequenced with it; see decision 2 on why
+summing all five double-counts.
 
 ## Rejected alternatives
 

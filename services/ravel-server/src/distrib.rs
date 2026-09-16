@@ -30,7 +30,9 @@
 //!   through: it is never retried and never masked by a local fallback.
 //! * [`spawn_heartbeat`] -- the membership loop. It writes this process's
 //!   `sys/query/workers/<uuid>` heartbeat every interval and refreshes the
-//!   shared live-worker set the router reads.
+//!   shared live-worker set the router reads. On graceful shutdown it deletes
+//!   its own record so a draining process drops out of every coordinator's live
+//!   set immediately.
 //!
 //! # Observability
 //!
@@ -492,6 +494,11 @@ struct FragmentServiceInner {
     cache: Option<ReadCache>,
     clock: Arc<dyn Clock>,
     metrics: Arc<FragmentMetrics>,
+    /// ADR-1195: the process-wide GET concurrency limiter, shared with every
+    /// other fetcher this process builds. The distributed fragment path's
+    /// `SegmentFetcher` (`resolve_and_run`) is wired to this same `Arc`, not a
+    /// private pool sized from `--fetch-concurrency`.
+    get_limiter: Arc<ravel_query::GetLimiter>,
 }
 
 /// The boxed frame stream the generated `SeriesFetch` server trait requires.
@@ -509,6 +516,7 @@ impl FragmentService {
         cache: Option<ReadCache>,
         clock: Arc<dyn Clock>,
         metrics: Arc<FragmentMetrics>,
+        get_limiter: Arc<ravel_query::GetLimiter>,
     ) -> Self {
         FragmentService {
             inner: Arc::new(FragmentServiceInner {
@@ -520,6 +528,7 @@ impl FragmentService {
                 cache,
                 clock,
                 metrics,
+                get_limiter,
             }),
             // Backward-compatible default: a directly-constructed service serves
             // both scopes. `lib.rs` sets an explicit role per listener via
@@ -793,7 +802,8 @@ impl FragmentService {
                 (request, resolver)
             }
         };
-        let mut fetcher = SegmentFetcher::new(self.inner.store.clone());
+        let mut fetcher = SegmentFetcher::new(self.inner.store.clone())
+            .with_get_limiter(self.inner.get_limiter.clone());
         if let Some(cache) = &self.inner.cache {
             fetcher = fetcher.with_cache(cache.clone());
         }
@@ -1485,11 +1495,19 @@ fn decode_tenant_hash(bytes: &[u8]) -> Option<TenantHash> {
 /// the [`RoutingSliceFetcher`] always reads a recent membership view. The first
 /// write/read happens before the first sleep, so membership converges promptly
 /// after startup.
+///
+/// The loop stops when `shutdown` fires (graceful shutdown holds the sender on
+/// `Running`). On stop it DELETES its own `sys/query/workers/<uuid>` record
+/// before returning, so a draining process drops out of every sibling
+/// coordinator's live set at once rather than lingering until its stamp ages
+/// past the `3 * H` staleness window. Without this a coordinator keeps dialing
+/// a worker that has already stopped serving for up to the staleness window.
 pub fn spawn_heartbeat(
     workers: Arc<QueryWorkers>,
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<dyn Clock>,
     live_workers: Arc<RwLock<Arc<Vec<QueryWorkerRecord>>>>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = workers.heartbeat_interval();
@@ -1504,7 +1522,18 @@ pub fn spawn_heartbeat(
                     tracing::warn!(error = %err, "query worker live_set read failed; keeping prior membership")
                 }
             }
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = &mut shutdown => {
+                    // Draining: remove our own record so coordinators stop
+                    // dialing us immediately. A failed delete self-corrects as
+                    // the stamp ages out, so it is a warning, not fatal.
+                    if let Err(err) = workers.delete_heartbeat(store.as_ref()).await {
+                        tracing::warn!(error = %err, "query worker heartbeat delete on shutdown failed");
+                    }
+                    return;
+                }
+            }
         }
     })
 }
@@ -1696,6 +1725,7 @@ mod tests {
             None,
             clock,
             metrics,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
     }
 
@@ -1794,6 +1824,7 @@ mod tests {
             None,
             Arc::new(FixedClock(now_ns)),
             metrics,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
     }
 
@@ -2085,6 +2116,7 @@ mod tests {
             let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: "192.0.2.1:9".to_string(),
+                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: version,
                 started_unix_ns: 0,
             }])));
@@ -2157,6 +2189,7 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
+                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2165,6 +2198,7 @@ mod tests {
                 // Reserved-for-docs TEST-NET address that never accepts a
                 // connection, so any slice mapped here fails at transport.
                 fragment_endpoint: "192.0.2.1:9".to_string(),
+                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2275,12 +2309,14 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
+                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: "192.0.2.1:9".to_string(),
+                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2314,6 +2350,7 @@ mod tests {
         *live.write() = Arc::new(vec![QueryWorkerRecord {
             process_id: self_id.to_string(),
             fragment_endpoint: "127.0.0.1:1".to_string(),
+            flight_sql_endpoint: "127.0.0.1:1".to_string(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         }]);
@@ -2373,6 +2410,7 @@ mod tests {
         let self_record = QueryWorkerRecord {
             process_id: self_id.to_string(),
             fragment_endpoint: "127.0.0.1:1".to_string(),
+            flight_sql_endpoint: "127.0.0.1:1".to_string(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         };
@@ -2381,6 +2419,7 @@ mod tests {
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
+                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2472,6 +2511,7 @@ mod tests {
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
+                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 1_000,
             },
@@ -2523,12 +2563,14 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
+                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
+                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2590,6 +2632,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::metrics::MemoryBudgetSnapshot::default(),
         );
         assert!(
             body.contains("ravel_distrib_quarantine_marks_total{mode=\"query\"} 1"),
@@ -2618,6 +2667,7 @@ mod tests {
         let self_record = QueryWorkerRecord {
             process_id: self_id.to_string(),
             fragment_endpoint: "127.0.0.1:1".to_string(),
+            flight_sql_endpoint: "127.0.0.1:1".to_string(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         };
@@ -2626,6 +2676,7 @@ mod tests {
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: dead_endpoint.to_string(),
+                flight_sql_endpoint: dead_endpoint.to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2676,7 +2727,11 @@ mod tests {
     #[tokio::test]
     async fn worker_registration_appears_then_ages_out() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let workers = QueryWorkers::with_defaults("127.0.0.1:7000", codec::PROTOCOL_VERSION);
+        let workers = QueryWorkers::with_defaults(
+            "127.0.0.1:7000",
+            "127.0.0.1:7100",
+            codec::PROTOCOL_VERSION,
+        );
         let interval_ns =
             i64::try_from(workers.heartbeat_interval().as_nanos()).expect("interval fits i64");
 
@@ -2697,7 +2752,11 @@ mod tests {
         // Far past the staleness window (3x the interval by default): the record
         // is no longer live. `self` is always included by `live_set`, so read
         // from a different identity to observe the aged-out record's absence.
-        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION);
+        let observer = QueryWorkers::with_defaults(
+            "127.0.0.1:7001",
+            "127.0.0.1:7101",
+            codec::PROTOCOL_VERSION,
+        );
         let stale_now = 1_000 + interval_ns * 10;
         let live = observer
             .live_set(store.as_ref(), stale_now)
@@ -2736,12 +2795,14 @@ mod tests {
             QueryWorkerRecord {
                 process_id: self_id.to_string(),
                 fragment_endpoint: "127.0.0.1:1".to_string(),
+                flight_sql_endpoint: "127.0.0.1:1".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
             QueryWorkerRecord {
                 process_id: other_id.to_string(),
                 fragment_endpoint: "192.0.2.1:9".to_string(),
+                flight_sql_endpoint: "192.0.2.1:9".to_string(),
                 protocol_version: codec::PROTOCOL_VERSION,
                 started_unix_ns: 0,
             },
@@ -2928,6 +2989,7 @@ mod tests {
             None,
             Arc::new(FixedClock(now_ns)),
             metrics,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
     }
 
@@ -3070,6 +3132,7 @@ mod tests {
             None,
             Arc::new(FixedClock(now_ns)),
             metrics,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
     }
 

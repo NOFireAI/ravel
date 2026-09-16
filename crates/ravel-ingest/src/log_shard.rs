@@ -9,10 +9,15 @@
 //! waiters and its ADR-0069 byte charges) into a task spawned onto
 //! [`LogFlushCtx::run_flush`], then keeps draining its channel.
 //! `max_inflight_flushes` (ADR-0067 decision 2) bounds how many such tasks may
-//! run at once per shard via a semaphore acquired before spawning; at the
-//! bound, the acquire blocks the flush trigger (and therefore the actor's
-//! ability to pull its next message), which is exactly where backpressure is
-//! meant to propagate. This ports ADR-0067 decisions 1 and 2 from the metrics
+//! run at once per shard via a semaphore acquired INSIDE the spawned task
+//! (issue #1641): the actor spawns and returns, so a stalled flush -- a tenant
+//! whose S3 key prefix is being throttled -- parks only its own task on the
+//! permit, never the actor, so every co-resident tenant's age tick and channel
+//! drain keep running. Backpressure at the bound propagates through the
+//! ADR-0069 byte budget (charges held until a flush completes), not through
+//! parking the actor; ADR-1642 supersedes ADR-0067 decision 2 with that. The
+//! permit wait is measured as its own span (`flush_permit_wait_ns`, issue #865)
+//! inside the task. This ports ADR-0067 decisions 1 and 2 from the metrics
 //! [`crate::shard`]; the adaptive flush delay (decision 3) is metrics-only and
 //! deliberately absent here (the age trigger stays the fixed
 //! `max_flush_delay`/`max_flush_delay_idle` in [`LogShardActor::age_threshold_ns`]).
@@ -53,9 +58,12 @@ use tokio::task::JoinSet;
 use tokio::time::Duration;
 use uuid::Uuid;
 
-use crate::budget::IngestByteCharge;
+use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
-use crate::config::{IngestConfig, LOG_SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket};
+use crate::config::{
+    DrainIntent, FlushClockError, IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_ALL_PASSES,
+    MAX_FLUSH_CLOCK_HOLD_NS, checked_ingest_hour_bucket, size_trigger_fires,
+};
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
 use crate::log_metrics::LogIngestMetrics;
@@ -100,8 +108,8 @@ pub(crate) enum LogShardMsg {
     Shutdown { done: oneshot::Sender<()> },
 }
 
-/// Estimated buffered byte cost of one attribute value, for the `est_bytes`
-/// flush-trigger heuristic and the process-wide ingest byte budget it feeds
+/// Estimated buffered byte cost of one attribute value, for the process-wide
+/// ingest byte budget it feeds
 /// (ADR-0069). Every container charges its per-element struct header at its own
 /// nesting level, not only at the top: a `Map` charges
 /// `size_of::<(String, AttrValue)>()` per entry and a `List` charges
@@ -191,6 +199,93 @@ pub(crate) fn est_columnar_bytes(batch: &ColumnarLogBatch) -> usize {
     body + severity_text + stream_attrs + attr_bytes + 32 * batch.num_rows
 }
 
+/// Fixed per-record cost in the object a log flush writes: the two i64
+/// timestamps, severity_num, flags, and the 16-byte trace id with its 8-byte
+/// span id. Above `est_record_bytes`'s own fixed 32 on purpose: that one
+/// registers buffered memory, where the ids sit inside the record struct this
+/// estimator must instead account for in stored form.
+const LOG_RECORD_OBJECT_FIXED_BYTES: usize = 48;
+
+/// Object-side length of one attribute value, the size-trigger counterpart of
+/// [`attr_value_len`] (issue #1305): the same leaf bytes, without the
+/// `AttrValue` and `(String, AttrValue)` struct headers the buffer holds and
+/// the object never stores.
+fn attr_value_object_len(value: &AttrValue) -> usize {
+    match value {
+        AttrValue::Str(s) => s.len(),
+        AttrValue::Bytes(b) => b.len(),
+        AttrValue::I64(_) | AttrValue::F64(_) => 8,
+        AttrValue::Bool(_) => 1,
+        AttrValue::List(items) => items.iter().map(attr_value_object_len).sum(),
+        AttrValue::Map(entries) => entries
+            .iter()
+            .map(|(k, v)| k.len() + attr_value_object_len(v))
+            .sum(),
+    }
+}
+
+/// Estimated bytes one record contributes to the object a log flush writes,
+/// for the size trigger only (`target_bytes` and `min_flush_bytes`, issue
+/// #1305). The memory-side figure stays [`est_record_bytes`], which the
+/// ADR-0069 ceiling charges.
+///
+/// Model: the record's stored payload -- body, severity text, stream attribute
+/// blob, and every attribute key and value byte -- plus
+/// [`LOG_RECORD_OBJECT_FIXED_BYTES`] for the fixed columns. No
+/// `(String, AttrValue)` header appears, because none reaches the object; a
+/// ten-attribute record charges about 560 bytes of struct headers to the
+/// ceiling that the object does not hold, which is what made the size trigger
+/// fire at a fraction of `target_bytes`.
+///
+/// Direction: an upper bound on the bytes the flush writes, for the reason
+/// [`crate::value::IngestPoint::est_object_sample_bytes`] states. RLOG
+/// dictionary-encodes repeated attribute keys and zstd-compresses its column
+/// blocks, both strictly below the raw bytes counted here.
+pub(crate) fn est_record_object_bytes(rec: &NormalizedLogRecord) -> usize {
+    let attr_bytes: usize = rec
+        .attrs
+        .iter()
+        .map(|(k, v)| k.len() + attr_value_object_len(v))
+        .sum();
+    rec.body.len()
+        + rec.severity_text.len()
+        + rec.stream_attrs.len()
+        + attr_bytes
+        + LOG_RECORD_OBJECT_FIXED_BYTES
+}
+
+/// [`est_record_object_bytes`] computed column-wise over a
+/// [`ColumnarLogBatch`] (ADR-0109 decision 6), term for term as
+/// [`est_columnar_bytes`] mirrors [`est_record_bytes`]: the two representations
+/// must give the same size trigger the same number for the same records, or a
+/// tenant's object size would depend on which wire path admitted it.
+pub(crate) fn est_columnar_object_bytes(batch: &ColumnarLogBatch) -> usize {
+    let body = batch.body.data().len();
+    let severity_text = batch.severity_text.data().len();
+    let stream_attrs: usize = batch
+        .stream_refs
+        .iter()
+        .map(|&r| batch.stream_attrs[r as usize].len())
+        .sum();
+
+    let mut attr_bytes = 0usize;
+    for col in &batch.dyn_columns {
+        for cell in &col.cells {
+            attr_bytes += col.name.len() + attr_value_object_len(cell);
+        }
+    }
+    for row in &batch.residual_attrs {
+        for (k, v) in row {
+            attr_bytes += k.len() + attr_value_object_len(v);
+        }
+    }
+
+    body + severity_text
+        + stream_attrs
+        + attr_bytes
+        + LOG_RECORD_OBJECT_FIXED_BYTES * batch.num_rows
+}
+
 /// Type-level bridge from the OTLP-independent [`NormalizedLogRecord`] to the
 /// writer's [`LogRecord`]. Every field maps one to one; there is no data
 /// transformation, only a struct rename.
@@ -231,6 +326,11 @@ enum BufContent {
 struct LogTenantBuf {
     content: BufContent,
     est_bytes: usize,
+    /// Estimated bytes the object this buffer's flush writes will hold, the
+    /// size trigger's own figure (issue #1305, [`est_record_object_bytes`]).
+    /// `est_bytes` above stays the buffered-memory charge behind the ADR-0069
+    /// ceiling.
+    flush_est_bytes: usize,
     oldest_arrival_ns: Option<i64>,
     min_ingest_ts_ns: Option<i64>,
     max_ingest_ts_ns: Option<i64>,
@@ -271,6 +371,7 @@ impl LogTenantBuf {
         arrival_ns: i64,
     ) -> Result<usize, LogWriteError> {
         let bytes_added: usize = records.iter().map(est_record_bytes).sum();
+        let object_bytes_added: usize = records.iter().map(est_record_object_bytes).sum();
         // ADR-0873 wave 5a: fold this write's eligible declared-column extrema
         // in the one pass that already visits the records, on the accepted arms
         // only. Extrema folded for a refused write would be stamped onto the
@@ -293,6 +394,7 @@ impl LogTenantBuf {
         }
         self.note_arrival(arrival_ns);
         self.est_bytes += bytes_added;
+        self.flush_est_bytes += object_bytes_added;
         Ok(bytes_added)
     }
 
@@ -308,6 +410,7 @@ impl LogTenantBuf {
         arrival_ns: i64,
     ) -> Result<usize, LogWriteError> {
         let bytes_added = est_columnar_bytes(&batch);
+        let object_bytes_added = est_columnar_object_bytes(&batch);
         // ADR-0873 wave 5a, on the accepted arms only, for the reason
         // [`Self::merge_rows`] gives: a refused batch's extrema would otherwise
         // be stamped onto a flush that does not carry its rows (issue #1036).
@@ -328,6 +431,7 @@ impl LogTenantBuf {
         }
         self.note_arrival(arrival_ns);
         self.est_bytes += bytes_added;
+        self.flush_est_bytes += object_bytes_added;
         Ok(bytes_added)
     }
 
@@ -550,8 +654,26 @@ impl LogFlushCtx {
             self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
             return;
         }
-        let bytes = match writer.finish_with_stats() {
+        let finish_result = writer.finish_with_stats();
+        // `Encode` closes here, immediately after `finish_with_stats` returns:
+        // the bloom-sample fold and `record_postings` below are bookkeeping on
+        // an already-finished object, not part of RLOG serialization, and must
+        // not grow the figure this stage exists to attribute precisely.
+        #[cfg(feature = "stage-timing")]
+        let encode_elapsed = encode_start.elapsed();
+        let bytes = match finish_result {
             Ok((bytes, stats)) => {
+                // Per-block bloom-construction time (issue #1516). The measurement
+                // itself is nested inside the `Encode` window, taken inside
+                // `finish_with_stats`; this fold is not, and runs after
+                // `encode_elapsed` was read. Folded in as one `bloom_blocks`-sample
+                // batch, read before `record_postings` moves `stats`.
+                #[cfg(feature = "stage-timing")]
+                self.stage_timings.record_n(
+                    LogStage::Bloom,
+                    u64::from(stats.bloom_blocks),
+                    Duration::from_nanos(stats.bloom_total_ns),
+                );
                 // Write-side POSTINGS metrics: section bytes, per-field distinct
                 // counts, and the cap-exceeded counter.
                 self.metrics.record_postings(stats);
@@ -569,8 +691,7 @@ impl LogFlushCtx {
             }
         };
         #[cfg(feature = "stage-timing")]
-        self.stage_timings
-            .record(LogStage::Encode, encode_start.elapsed());
+        self.stage_timings.record(LogStage::Encode, encode_elapsed);
 
         let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
         let data = Bytes::from(bytes);
@@ -677,6 +798,24 @@ impl LogFlushCtx {
         for waiter in waiters {
             let _ = waiter.send(result.clone());
         }
+    }
+
+    /// Abandons a flush whose flush-open deadline already elapsed while it was
+    /// queued for a permit, before it took one or attempted any store call
+    /// (issue #1739). Its waiters are acked with a retryable `Abandoned` error
+    /// and its byte charges are dropped, refunding the ADR-0069 budget.
+    fn abandon_in_queue(&self, pinned: LogPinnedFlush) {
+        let LogPinnedFlush {
+            waiters, charges, ..
+        } = pinned;
+        self.metrics.record_abandoned_queue_deadline();
+        self.ack_waiters(
+            waiters,
+            Err(LogWriteError::Abandoned(
+                "flush lifetime elapsed while queued for a shard flush permit".into(),
+            )),
+        );
+        drop(charges);
     }
 
     /// Races `fut` against the remaining budget to `deadline_ns` on the injected
@@ -811,14 +950,34 @@ fn handle_flush_join_result(shard: u32, result: Result<(), tokio::task::JoinErro
     }
 }
 
-/// RAII in-flight-flush accounting: incremented when a flush task is spawned,
-/// decremented on `Drop` when it ends, including on panic. Moved into the
-/// spawned task itself (not held by the actor) so the decrement fires exactly
-/// once, whenever that task's future is finally dropped, with no separate
-/// bookkeeping the actor could get out of sync with.
+/// RAII in-flight-flush accounting, the log-pipeline counterpart of
+/// [`crate::shard`]'s guard. [`InFlightFlushGuard::new`] is the only way to
+/// construct one and it performs the `+1`; `Drop` performs the `-1`. Pairing
+/// them in one value is what keeps the gauge unbiased: an increment written as
+/// a separate statement inside the spawned task never runs for a task dropped
+/// before its first poll (a `JoinSet` dropped with tasks still queued, when the
+/// actor unwinds out of `handle_flush_join_result` or the router drops the
+/// actor), while dropping that task's future still fires the `Drop`. The gauge
+/// clamps at 0 on read so nothing underflows, but the negative bias persists in
+/// the map, and the router hands the same [`LogIngestMetrics`] to the respawned
+/// actor for that shard index, so a shard biased to -2 would report 0 in flight
+/// while two real flushes ran.
+///
+/// The guard is constructed on the actor, in the same non-awaiting region that
+/// moves the buffer into the flush task, so the gauge counts a flush from the
+/// moment its memory leaves the actor: a task still waiting for a permit holds
+/// its buffer and its ADR-0069 byte charge exactly as an executing one does, and
+/// that memory is what ADR-0067's in-flight consequence is about.
 struct InFlightFlushGuard {
     metrics: Arc<LogIngestMetrics>,
     shard: u32,
+}
+
+impl InFlightFlushGuard {
+    fn new(metrics: Arc<LogIngestMetrics>, shard: u32) -> Self {
+        metrics.record_inflight_flush_delta(shard, 1);
+        InFlightFlushGuard { metrics, shard }
+    }
 }
 
 impl Drop for InFlightFlushGuard {
@@ -832,6 +991,15 @@ pub(crate) struct LogShardActor {
     writer_id: Uuid,
     epoch: u64,
     next_seq: u64,
+    /// Per-writer monotonic floor for the flush-open stamp (ADR-1307): the
+    /// largest `created_unix_ns` this actor has stamped. `flush_tenant` raises
+    /// each raw clock reading to this floor before stamping, so a backwards
+    /// wall-clock step never mints a `created_unix_ns` below one already
+    /// committed. In-process state only, never persisted: it resets to 0 on
+    /// restart by construction (a fresh actor starts the floor at 0). The
+    /// guarantee is therefore per-process; ADR-1307 records the cross-restart
+    /// limitation (see [`LogShardActor::monotonic_flush_open_ns`]).
+    last_flush_open_ns: i64,
     clock: Arc<dyn Clock>,
     config: IngestConfig,
     metrics: Arc<LogIngestMetrics>,
@@ -847,6 +1015,11 @@ pub(crate) struct LogShardActor {
     flushes: JoinSet<()>,
     rx: mpsc::Receiver<LogShardMsg>,
     tenants: HashMap<TenantId, LogTenantBuf>,
+    /// The configured ADR-0069 ceiling, shared live with the router so the
+    /// per-buffer memory backstop is a fraction of the limit the operator set.
+    /// Read at trigger time rather than resolved once, because the router
+    /// installs the budget after the actors are spawned.
+    backstop_ceiling: BufferBudgetCeiling,
 }
 
 impl LogShardActor {
@@ -862,6 +1035,7 @@ impl LogShardActor {
         metrics: Arc<LogIngestMetrics>,
         rx: mpsc::Receiver<LogShardMsg>,
         indexed_fields: Arc<IndexedFieldsOverlay>,
+        backstop_ceiling: BufferBudgetCeiling,
         #[cfg(feature = "stage-timing")] stage_timings: Arc<LogStageTimings>,
     ) -> Self {
         let ctx = Arc::new(LogFlushCtx {
@@ -882,6 +1056,7 @@ impl LogShardActor {
             writer_id,
             epoch,
             next_seq: 0,
+            last_flush_open_ns: 0,
             clock,
             config,
             metrics,
@@ -890,6 +1065,7 @@ impl LogShardActor {
             flushes: JoinSet::new(),
             rx,
             tenants: HashMap::new(),
+            backstop_ceiling,
         }
     }
 
@@ -911,40 +1087,37 @@ impl LogShardActor {
                         Some(LogShardMsg::Write { tenant, records, ack, charge }) => {
                             // Per-shard skew (issue #865), identical bracketing
                             // to `crate::shard::ShardActor::run`: time the
-                            // serial on-actor section only. `handle_write`
-                            // returns once the flush task is spawned, so this
-                            // delta excludes the flush -- but NOT the
-                            // `max_inflight_flushes` acquire that precedes the
-                            // spawn, which at the bound parks here for a prior
-                            // flush's remaining duration. That wait is
-                            // backpressure, not actor work, and is already
-                            // counted (once) as `flush_permit_wait_ns`, so
-                            // subtract it rather than let it read as "the actor
-                            // is busy" whenever flushing is the real bottleneck.
+                            // serial on-actor section only. The flush this may
+                            // open runs in a spawned task, timed off-actor, and
+                            // the `max_inflight_flushes` acquire now parks that
+                            // task rather than the actor (issue #1641), so there
+                            // is no on-actor permit wait left to exclude: this
+                            // delta is pure merge-and-pin work.
                             let started_ns = self.clock.now_ns();
-                            let permit_wait_ns =
-                                self.handle_write(tenant, records, ack, charge).await;
-                            let elapsed_ns =
+                            self.handle_write(tenant, records, ack, charge).await;
+                            let on_actor_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
-                            let on_actor_ns = elapsed_ns.saturating_sub(permit_wait_ns);
                             self.metrics.record_shard_processed(self.shard, on_actor_ns);
                         }
                         Some(LogShardMsg::WriteColumnar { tenant, batch, ack, charge }) => {
                             let started_ns = self.clock.now_ns();
-                            let permit_wait_ns = self
-                                .handle_write_columnar(tenant, *batch, ack, charge)
+                            self.handle_write_columnar(tenant, *batch, ack, charge)
                                 .await;
-                            let elapsed_ns =
+                            let on_actor_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
-                            let on_actor_ns = elapsed_ns.saturating_sub(permit_wait_ns);
                             self.metrics.record_shard_processed(self.shard, on_actor_ns);
                         }
                         Some(LogShardMsg::FlushNow { done }) => {
-                            self.flush_all(FlushTrigger::Manual).await;
+                            // Not a teardown: this arm does not break, so the
+                            // actor keeps running and anything the drain could
+                            // not stamp is retried by a later trigger.
+                            self.flush_all(FlushTrigger::Manual, DrainIntent::Retryable)
+                                .await;
                             let _ = done.send(());
                         }
                         Some(LogShardMsg::Shutdown { done }) => {
-                            self.flush_all(FlushTrigger::Manual).await;
+                            self.flush_all(FlushTrigger::Manual, DrainIntent::Teardown)
+                                .await;
                             let _ = done.send(());
                             break;
                         }
@@ -965,7 +1138,8 @@ impl LogShardActor {
                                      flushing buffered tenants before stopping"
                                 );
                             }
-                            self.flush_all(FlushTrigger::Manual).await;
+                            self.flush_all(FlushTrigger::Manual, DrainIntent::Teardown)
+                                .await;
                             break;
                         }
                     }
@@ -981,24 +1155,23 @@ impl LogShardActor {
         }
     }
 
-    /// Returns the injected-`Clock` nanoseconds this call spent parked on the
-    /// `max_inflight_flushes` semaphore (0 when it opened no flush), so the
-    /// actor loop can subtract that wait from the `on_actor_ns` it reports
-    /// (issue #865).
+    /// Buffers `records` for `tenant` and opens a size-triggered flush if the
+    /// buffer crossed its threshold. Everything here runs on the actor and
+    /// returns once the flush task is spawned; the `max_inflight_flushes`
+    /// acquire happens inside that task (ADR-1642).
     async fn handle_write(
         &mut self,
         tenant: TenantId,
         records: Vec<NormalizedLogRecord>,
         ack: Option<LogAck>,
         charge: Option<Arc<IngestByteCharge>>,
-    ) -> u64 {
+    ) {
         if records.is_empty() && ack.is_none() {
             // Nothing buffered: dropping `charge` here refunds its bytes.
-            return 0;
+            return;
         }
         let arrival_ns = self.clock.now_ns();
         let records_len = records.len() as u64;
-        let target_bytes = self.config.target_bytes;
 
         // Grab the timing handle before the mutable buffer borrow so recording
         // `merge` does not clash with the `&mut self.tenants` borrow held below.
@@ -1018,7 +1191,7 @@ impl LogShardActor {
                 if let Some(ack) = ack {
                     let _ = ack.send(Err(err));
                 }
-                return 0;
+                return;
             }
         };
         #[cfg(feature = "stage-timing")]
@@ -1037,34 +1210,39 @@ impl LogShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| b.est_bytes >= target_bytes)
+            .map(|b| {
+                size_trigger_fires(
+                    b.flush_est_bytes,
+                    b.est_bytes,
+                    &self.config,
+                    self.backstop_ceiling.get(),
+                )
+            })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
         }
-        0
     }
 
     /// The columnar counterpart of [`Self::handle_write`] (ADR-0109 decision 5):
     /// buffers one already-partitioned [`ColumnarLogBatch`] for `tenant`,
     /// refusing fail-loud if the buffer already holds row-major records. The
-    /// flush-trigger accounting (`est_bytes >= target_bytes`), the charge and
-    /// waiter handling, and the size-flush path are identical to the row path,
-    /// as is the flush-permit wait it returns (see [`Self::handle_write`]).
+    /// flush-trigger accounting (`flush_est_bytes >= target_bytes`, or
+    /// `est_bytes` past the memory backstop), the charge and waiter handling,
+    /// and the size-flush path are identical to the row path.
     async fn handle_write_columnar(
         &mut self,
         tenant: TenantId,
         batch: ColumnarLogBatch,
         ack: Option<LogAck>,
         charge: Option<Arc<IngestByteCharge>>,
-    ) -> u64 {
+    ) {
         if batch.is_empty() && ack.is_none() {
             // Nothing buffered: dropping `charge` here refunds its bytes.
-            return 0;
+            return;
         }
         let arrival_ns = self.clock.now_ns();
         let records_len = batch.num_rows as u64;
-        let target_bytes = self.config.target_bytes;
 
         #[cfg(feature = "stage-timing")]
         let merge_timings = Arc::clone(&self.ctx.stage_timings);
@@ -1081,7 +1259,7 @@ impl LogShardActor {
                 if let Some(ack) = ack {
                     let _ = ack.send(Err(err));
                 }
-                return 0;
+                return;
             }
         };
         #[cfg(feature = "stage-timing")]
@@ -1098,22 +1276,32 @@ impl LogShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| b.est_bytes >= target_bytes)
+            .map(|b| {
+                size_trigger_fires(
+                    b.flush_est_bytes,
+                    b.est_bytes,
+                    &self.config,
+                    self.backstop_ceiling.get(),
+                )
+            })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            return self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
         }
-        0
     }
 
-    /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
+    /// A buffer with a strict-mode waiter, or one whose flush would write at
+    /// least `min_flush_bytes` of object,
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
     /// else is idle and waits for the slower `max_flush_delay_idle` instead
-    /// (ADR-0051 section 7). Strict-mode ack latency is unaffected:
+    /// (ADR-0051 section 7). "Worth a PUT" is a claim about the object, so this
+    /// reads the object-bytes estimate, not the buffered-memory charge (issue
+    /// #1305). Strict-mode ack latency is unaffected:
     /// a strict write always leaves `waiters` non-empty for its whole flush
     /// window.
     fn age_threshold_ns(&self, buf: &LogTenantBuf) -> i64 {
-        let has_priority = !buf.waiters.is_empty() || buf.est_bytes >= self.config.min_flush_bytes;
+        let has_priority =
+            !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if has_priority {
             self.config.max_flush_delay.as_nanos() as i64
         } else {
@@ -1135,10 +1323,7 @@ impl LogShardActor {
             .collect();
         for tenant in due {
             if let Some(buf) = self.tenants.remove(&tenant) {
-                // The permit wait is reported by `flush_tenant` itself; there is
-                // no `on_actor_ns` span to subtract it from here, because an age
-                // tick is not a `Write` message.
-                let _permit_wait_ns = self.flush_tenant(tenant, buf, FlushTrigger::Age).await;
+                self.flush_tenant(tenant, buf, FlushTrigger::Age).await;
             }
         }
     }
@@ -1150,11 +1335,63 @@ impl LogShardActor {
         (self.tenants.len(), records)
     }
 
-    async fn flush_all(&mut self, trigger: FlushTrigger) {
-        let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
-        for tenant in tenants {
-            if let Some(buf) = self.tenants.remove(&tenant) {
-                let _permit_wait_ns = self.flush_tenant(tenant, buf, trigger).await;
+    /// Drains every buffered tenant, then awaits durability (ADR-1307 finding
+    /// F1). A clock-refused flush re-buffers its tenant (`flush_tenant`'s
+    /// `RegressionRefused` arm), so a single snapshot of the key set is not
+    /// exhaustive: a tenant re-inserted after the snapshot consumed its key
+    /// would never be retried in this call. On the `Shutdown` and channel-close
+    /// paths there is no later actor tick to retry it, so the re-buffered
+    /// tenant would drop on teardown -- the exact loss the channel-close arm
+    /// forbids. Retry over fresh snapshots until the map empties, bounded by
+    /// [`MAX_FLUSH_ALL_PASSES`]. This terminates because a refusal re-anchors
+    /// the monotonic floor to the raw reading, so the next pass stamps it and
+    /// proceeds; the bound only guards a pathological clock stepping back on
+    /// every reading.
+    ///
+    /// Residue left by the bound is never dropped silently, but it is only a
+    /// durability defect when nothing will retry it, so `intent` decides how it
+    /// is reported: an ERROR and the `flush_all_residue_tenants` bump on a
+    /// [`DrainIntent::Teardown`], a WARN on [`DrainIntent::Retryable`], where
+    /// the residue is still in the tenant map with its arrival bookkeeping and
+    /// the actor is still running to flush it.
+    async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
+        let mut passes = 0;
+        while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
+            let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
+            for tenant in tenants {
+                if let Some(buf) = self.tenants.remove(&tenant) {
+                    self.flush_tenant(tenant, buf, trigger).await;
+                }
+            }
+            passes += 1;
+        }
+        if !self.tenants.is_empty() {
+            let (tenant_count, buffered_records) = self.buffered_summary();
+            match intent {
+                DrainIntent::Teardown => {
+                    self.metrics.record_flush_all_residue(tenant_count as u64);
+                    tracing::error!(
+                        shard = self.shard,
+                        tenant_count,
+                        buffered_records,
+                        passes,
+                        "ravel-ingest: flush_all left buffered tenants unflushed after \
+                         exhausting retry passes; acknowledged buffered-mode rows lost \
+                         on this graceful drain"
+                    );
+                }
+                DrainIntent::Retryable => {
+                    tracing::warn!(
+                        shard = self.shard,
+                        tenant_count,
+                        buffered_records,
+                        passes,
+                        "ravel-ingest: flush_all left buffered tenants unflushed after \
+                         exhausting retry passes; the actor keeps running and these \
+                         tenants stay buffered, so the next trigger (age tick or \
+                         explicit flush) retries them"
+                    );
+                }
             }
         }
         self.join_all_flushes().await;
@@ -1175,29 +1412,159 @@ impl LogShardActor {
         }
     }
 
+    /// The flush-open stamp for this flush: `raw_ns` (the single flush-open
+    /// clock reading) raised to this writer's monotonic floor (ADR-1307),
+    /// mirroring [`crate::shard::ShardActor::monotonic_flush_open_ns`].
+    ///
+    /// `raw_ns` is plausibility-checked here first
+    /// (`checked_ingest_hour_bucket`), so a sub-floor or otherwise garbage
+    /// reading fails loud before the floor can hide it: raising a garbage
+    /// reading to an armed floor would defeat that check.
+    ///
+    /// The reading carries no ordering guarantee on its own: a backwards
+    /// wall-clock step (an NTP correction, a manual set) can read below a stamp
+    /// this writer already committed. Stamping that raw reading as
+    /// `created_unix_ns` would let a stale duplicate entry outrank its own
+    /// correction under the query-time dedup order (docs/catalog-and-mvcc.md
+    /// "Cross-segment duplicate samples"), whose primary key is
+    /// `created_unix_ns`. Raising each reading to `last_flush_open_ns` keeps
+    /// stamps non-decreasing within this writer's process lifetime and counts
+    /// every step it absorbs (`clock_regressions`).
+    ///
+    /// A backwards step is absorbed only up to [`MAX_FLUSH_CLOCK_HOLD_NS`].
+    /// Beyond that the flush is refused with a typed error rather than stamped
+    /// (`clock_regressions_refused`) and the floor re-anchors to `raw_ns`, so a
+    /// single spurious forward glitch that ratcheted the floor into a future
+    /// ingest hour cannot pin every later flush there.
+    ///
+    /// The floor is in-process state, never persisted, so it resets to 0 on
+    /// restart by construction. The guarantee is per-process; ADR-1307 records
+    /// the cross-restart limitation.
+    fn monotonic_flush_open_ns(&mut self, raw_ns: i64) -> Result<i64, FlushClockError> {
+        checked_ingest_hour_bucket(raw_ns).map_err(FlushClockError::InvalidReading)?;
+        if raw_ns >= self.last_flush_open_ns {
+            self.last_flush_open_ns = raw_ns;
+            return Ok(raw_ns);
+        }
+        let held_ns = self.last_flush_open_ns - raw_ns;
+        if held_ns > MAX_FLUSH_CLOCK_HOLD_NS {
+            self.last_flush_open_ns = raw_ns;
+            self.metrics.record_clock_regression_refused();
+            tracing::warn!(
+                shard = self.shard,
+                held_ns,
+                bound_ns = MAX_FLUSH_CLOCK_HOLD_NS,
+                "ravel-ingest: flush clock regressed beyond the monotonic hold bound; refusing the flush and re-anchoring the floor"
+            );
+            return Err(FlushClockError::RegressionRefused(format!(
+                "flush clock regressed {held_ns} ns below the previous flush-open stamp, \
+                 beyond the monotonic hold bound of {MAX_FLUSH_CLOCK_HOLD_NS} ns; \
+                 refusing the flush (ADR-1307)"
+            )));
+        }
+        self.metrics.record_clock_regression();
+        tracing::warn!(
+            shard = self.shard,
+            regression_ns = held_ns,
+            "ravel-ingest: flush clock stepped backwards; held flush-open stamp to per-writer monotonic floor"
+        );
+        Ok(self.last_flush_open_ns)
+    }
+
     /// Pins `buf`'s flush identity, then moves `buf`'s payload, waiters, and
     /// ADR-0069 charges into a task spawned onto [`LogFlushCtx::run_flush`]
     /// (ADR-0067 decision 1), mirroring [`crate::shard::ShardActor::flush_tenant`].
-    /// Everything up to and including the semaphore acquire runs here, on the
-    /// actor; nothing after it does, so a slow encode or a slow PUT never blocks
-    /// the actor from processing its next message once a permit is free (true
-    /// even at `max_inflight_flushes == 1`: the actor still returns from this
-    /// call, and therefore drains its channel, the moment the task is spawned).
+    /// Everything up to the spawn runs here, on the actor; nothing after it
+    /// does. The `max_inflight_flushes` acquire is inside the spawned task
+    /// (ADR-1642), so neither a slow encode, a slow PUT, nor a wait for a permit
+    /// blocks the actor from processing its next message. True even at
+    /// `max_inflight_flushes == 1`: the actor returns from this call, and
+    /// therefore drains its channel and keeps ticking its age trigger, the
+    /// moment the task is spawned.
     ///
-    /// An empty buffer never reaches the semaphore or a spawned task: there is
-    /// nothing to encode, and a flush identity pinned for nothing would burn a
-    /// `seq` for no object.
-    ///
-    /// Returns the injected-`Clock` nanoseconds spent parked on the
-    /// `max_inflight_flushes` semaphore (0 on every path that returns before
-    /// reaching it), which the caller subtracts from its own `on_actor_ns`
-    /// (issue #865).
+    /// An empty buffer never reaches a spawned task: there is nothing to encode,
+    /// and a flush identity pinned for nothing would burn a `seq` for no object.
     async fn flush_tenant(
         &mut self,
         tenant: TenantId,
-        buf: LogTenantBuf,
+        mut buf: LogTenantBuf,
         trigger: FlushTrigger,
-    ) -> u64 {
+    ) {
+        // `waiters` is empty on the record-less path below by construction: the
+        // log router mints a strict-mode ack only for a shard that actually
+        // received records (`by_shard`/the columnar partition only holds shards
+        // with at least one row, and the ack rides that same shard message), so
+        // a record-less buffer has nobody to answer. If that ever changes, this
+        // returns without acking and the router reads the dropped oneshot as a
+        // dead shard; the assert makes the invariant loud rather than silently
+        // dropping. Dropping `charges` on that path is the ADR-0069 refund.
+        //
+        // Emptiness is checked by reference, before the flush clock is read and
+        // before the buffer is consumed: an empty buffer must neither advance the
+        // monotonic floor nor be re-buffered on the refuse arm below, and the
+        // retryable arm re-inserts `buf` whole (ADR-1307 finding 1).
+        let is_empty = match &buf.content {
+            BufContent::Empty => true,
+            BufContent::Rows(records) => records.is_empty(),
+            BufContent::Columnar(batches) => batches.iter().all(|b| b.is_empty()),
+        };
+        if is_empty {
+            drop(buf.charges);
+            debug_assert!(buf.waiters.is_empty());
+            return;
+        }
+        let raw_ns = self.clock.now_ns();
+        // The flush-open stamp is decided before the buffer is consumed and before
+        // `record_flush`: a refused flush never touched the store, so it must not
+        // be counted as a flush that happened, and (on the retryable arm) its rows
+        // must be re-buffered rather than dropped (ADR-1307 finding 1).
+        let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns) {
+            Ok(ns) => ns,
+            Err(FlushClockError::InvalidReading(msg)) => {
+                // A grossly broken raw reading is fail-loud and non-retryable
+                // (`SegmentBuild`, 400): the buffer is dropped, `charges` refund
+                // on drop.
+                self.metrics.record_abandoned_input_rejected();
+                self.ctx
+                    .ack_waiters(buf.waiters, Err(LogWriteError::SegmentBuild(msg)));
+                return;
+            }
+            Err(FlushClockError::RegressionRefused(msg)) => {
+                // Already counted as `clock_regressions_refused` inside the
+                // helper; a clock regression is a transient server condition the
+                // next flush recovers from, so it is retryable (`Abandoned`, 503),
+                // not a client `SegmentBuild` (400) that would drop the buffered
+                // rows on a conformant exporter. The floor re-anchored to `raw_ns`
+                // inside the helper, so the next reading at or above `raw_ns`
+                // proceeds: the bound is per backwards step, not global, and a
+                // single backwards step refuses exactly one flush. It is not a
+                // guarantee that only one flush is refused over the process
+                // lifetime (ADR-1307 Consequences). A clock that keeps stepping
+                // back beyond the bound refuses every flush for as long as that
+                // continues, and within one drain the absorb path returns the held
+                // stamp without advancing the floor, so a receding clock can refuse
+                // one tenant, absorb the next few against the re-anchored value,
+                // and refuse again. Re-buffer the rows
+                // so that next trigger flushes them (finding 1): `charges` ride
+                // back with the buffer (the byte budget is not refunded, the bytes
+                // are still held), and the whole buffer -- content, declared-column
+                // stats, and the trigger bookkeeping (`flush_est_bytes`, which
+                // drives the size trigger, `est_bytes`, which drives the memory
+                // backstop, and `oldest_arrival_ns`) -- is preserved intact. Only `waiters` are
+                // acked here and taken out of the re-inserted buffer: a waiter left
+                // in it would be re-acked by the next flush against an
+                // already-answered oneshot. A strict-mode waiter that retries on the
+                // 503 re-enqueues records this buffer still holds; logs do not dedup
+                // at query time, so the retry can duplicate a record, which is the
+                // at-least-once contract strict mode already carries on any retry.
+                let waiters = std::mem::take(&mut buf.waiters);
+                self.ctx
+                    .ack_waiters(waiters, Err(LogWriteError::Abandoned(msg)));
+                self.tenants.insert(tenant, buf);
+                return;
+            }
+        };
+        let tenant_hash = tenant.hash();
         let LogTenantBuf {
             content,
             min_ingest_ts_ns,
@@ -1207,54 +1574,57 @@ impl LogShardActor {
             declared_stats,
             ..
         } = buf;
-        // `waiters` is empty on the record-less paths below by construction: the
-        // log router mints a strict-mode ack only for a shard that actually
-        // received records (`by_shard`/the columnar partition only holds shards
-        // with at least one row, and the ack rides that same shard message), so
-        // a record-less buffer has nobody to answer. If that ever changes, this
-        // returns without acking and the router reads the dropped oneshot as a
-        // dead shard; the assert makes the invariant loud rather than silently
-        // dropping. Dropping `charges` on those paths is the ADR-0069 refund.
         let payload = match content {
+            BufContent::Rows(records) => FlushPayload::Rows(records),
+            BufContent::Columnar(batches) => FlushPayload::Columnar(batches),
             BufContent::Empty => {
+                // Emptiness (including `BufContent::Empty`) returned at the top
+                // of this function, so this arm is dead today. It is defence in
+                // depth for a future content variant that reaches here empty,
+                // and it fails closed with a typed error rather than panicking:
+                // a panic in a shard actor kills the actor and every tenant it
+                // serves, so a defensive residue here should cost one refused
+                // flush, not the shard. Refund `charges` on drop and ack any
+                // waiter with a typed error rather than dropping its oneshot
+                // (which the router reads as a dead shard).
+                self.metrics.record_abandoned_input_rejected();
                 drop(charges);
-                debug_assert!(waiters.is_empty());
-                return 0;
-            }
-            BufContent::Rows(records) => {
-                if records.is_empty() {
-                    drop(charges);
-                    debug_assert!(waiters.is_empty());
-                    return 0;
-                }
-                FlushPayload::Rows(records)
-            }
-            BufContent::Columnar(batches) => {
-                if batches.iter().all(|b| b.is_empty()) {
-                    drop(charges);
-                    debug_assert!(waiters.is_empty());
-                    return 0;
-                }
-                FlushPayload::Columnar(batches)
+                self.ctx.ack_waiters(
+                    waiters,
+                    Err(LogWriteError::SegmentBuild(
+                        "empty log buffer reached the flush payload stage".to_string(),
+                    )),
+                );
+                return;
             }
         };
-        self.metrics.record_flush(self.shard, trigger);
-
-        let tenant_hash = tenant.hash();
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        let flush_open_ns = self.clock.now_ns();
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
             Ok(bucket) => bucket,
             Err(msg) => {
+                // Defensive: `flush_open_ns` was already hour-bucket-validated;
+                // if it ever fails here it is fail-loud like InvalidReading.
                 self.metrics.record_abandoned_input_rejected();
                 self.ctx
                     .ack_waiters(waiters, Err(LogWriteError::SegmentBuild(msg)));
-                return 0;
+                return;
             }
         };
-        let deadline_ns =
-            flush_open_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
+        // Last, after every arm that can refuse this flush: a `seq` is a flush
+        // identity, and an empty or unbucketable buffer must not burn one for an
+        // object that is never written.
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.metrics.record_flush(self.shard, trigger);
+        // The deadline pinned here is the flush-open deadline. It bounds how
+        // long the flush may sit queued for a permit: the spawned task checks it
+        // before acquiring and abandons a flush already past it without taking a
+        // permit (issue #1739 part 2). The budget for the flush's own store
+        // calls is re-derived from the moment the permit is granted (part 1), so
+        // a flush that waited behind a stalled prefix does not spend its lifetime
+        // in the queue and drop already-acked rows with no PUT.
+        // ADR-1307 finding 4: it derives from the raw clock reading, not the
+        // (possibly floor-raised) stamp.
+        let deadline_ns = raw_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
 
         let identity = ObjectIdentity {
             tenant_hash: tenant_hash.0,
@@ -1281,61 +1651,91 @@ impl LogShardActor {
             declared_stats,
         };
 
-        // ADR-0067 decision 2: the only place a flush trigger blocks. At
-        // `max_inflight_flushes` already-spawned tasks, this await parks until
-        // one ends and releases its permit; because `flush_tenant` is itself
-        // awaited from `handle_write`/`flush_aged`/`flush_all`, that park keeps
-        // the actor from pulling its next channel message, exactly the
-        // backpressure path the bounded mpsc already relies on.
+        // ADR-0067 decision 2, amended for tenant isolation (issue #1641): the
+        // `max_inflight_flushes` acquire runs INSIDE the spawned flush task, not
+        // on the actor. Acquiring on the actor parked the whole `select!` loop at
+        // the bound -- it stopped pulling channel messages, stopped the age-flush
+        // tick, and stopped reaping finished flushes -- so one tenant whose
+        // key prefix was throttled (S3 `503 SlowDown` is per-prefix) stalled
+        // every co-resident tenant on the shard, including their age triggers.
+        // Handing the acquire to the task keeps the actor draining and ticking no
+        // matter how long a flush is stalled. Backpressure now propagates through
+        // the ADR-0069 global byte budget: each flush's `charges` are held until
+        // it completes, so a shard wedged on a throttled prefix drains the budget
+        // and `try_charge` sheds at the ceiling, rather than parking the actor and
+        // filling the bounded channel. ADR-1642 supersedes ADR-0067 decision 2
+        // with exactly this, for all three ingest pipelines.
         //
-        // Per-shard skew (issue #865), same bracketing as
-        // `crate::shard::ShardActor::flush_tenant`: that park is its own span,
-        // and it belongs to neither the actor's merge-and-pin work nor the
-        // spawned flush's own span. What elapses here is a PRIOR flush's
-        // remaining duration, so folding it into `on_actor_ns` would report an
-        // actor bottleneck at exactly the moment flushing is the bottleneck.
-        // This is the figure that says whether `max_inflight_flushes` is the
-        // binding window on a bulk load (issue #800): it stays at zero unless a
-        // shard is actually asked for a second concurrent flush.
-        let permit_wait_start_ns = self.clock.now_ns();
-        let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => panic!(
-                "ravel-ingest: log flush semaphore closed unexpectedly on shard {}",
-                self.shard
-            ),
-        };
-        let permit_wait_ns = self
-            .clock
-            .now_ns()
-            .saturating_sub(permit_wait_start_ns)
-            .max(0) as u64;
-        self.metrics
-            .record_shard_flush_permit_wait_ns(self.shard, permit_wait_ns);
-        self.metrics.record_inflight_flush_delta(self.shard, 1);
-        let guard = InFlightFlushGuard {
-            metrics: Arc::clone(&self.metrics),
-            shard: self.shard,
-        };
+        // The in-flight gauge is incremented here, by the guard's constructor,
+        // and decremented by its `Drop` inside the task: see
+        // [`InFlightFlushGuard`] for why the two must be one value. A flush
+        // still waiting for a permit counts as in flight, because it is holding
+        // a flush window of memory.
+        let guard = InFlightFlushGuard::new(Arc::clone(&self.metrics), self.shard);
+        let semaphore = Arc::clone(&self.semaphore);
         let ctx = Arc::clone(&self.ctx);
         // Per-shard skew (issue #865): time the whole flush, which runs here off
         // the actor (ADR-0067). Bracketing `run_flush` from outside, rather than
         // inside it, keeps the measurement out of the pinned-identity path and
         // captures every exit `run_flush` takes, abandonment included. The
-        // bracket opens inside the spawned task, with the permit already held,
-        // so the wait for that permit is not counted twice.
+        // permit wait is bracketed separately, before the flush's own span, so
+        // the two never overlap.
         let clock = Arc::clone(&self.clock);
         let metrics = Arc::clone(&self.metrics);
         let shard = self.shard;
         self.flushes.spawn(async move {
-            let _permit = permit;
             let _guard = guard;
+            let mut pinned = pinned;
+            // Issue #1739 part 2: a flush whose flush-open deadline already
+            // elapsed while it sat in the spawn queue must not take a permit only
+            // to fail the deadline check inside `run_flush` and waste the slot.
+            // Check the pinned flush-open deadline here, before the acquire; if
+            // it has passed, abandon in the queue with no permit taken. In normal
+            // operation the deadline is a full `max_flush_lifetime` ahead of
+            // flush-open, so this fires only when this task is scheduled
+            // pathologically late.
+            if ctx
+                .bound_to_deadline(pinned.deadline_ns, std::future::ready(()))
+                .await
+                .is_none()
+            {
+                ctx.abandon_in_queue(pinned);
+                return;
+            }
+            // Wait for a flush permit here, off the actor. At the bound this task
+            // parks; the actor does not. The wait is this shard's
+            // `flush_permit_wait_ns` (issue #865), measured on the injected clock
+            // and no longer subtracted from any on-actor figure because it is no
+            // longer on-actor time. It is the figure that says whether
+            // `max_inflight_flushes` is the binding window on a bulk load (issue
+            // #800): it stays at zero unless a shard is actually asked for a
+            // second concurrent flush.
+            let permit_wait_start_ns = clock.now_ns();
+            let permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    panic!("ravel-ingest: log flush semaphore closed unexpectedly on shard {shard}")
+                }
+            };
+            let permit_wait_ns = clock.now_ns().saturating_sub(permit_wait_start_ns).max(0) as u64;
+            metrics.record_shard_flush_permit_wait_ns(shard, permit_wait_ns);
+            let _permit = permit;
+            // Issue #1739 part 1: re-derive the abandonment deadline from the
+            // moment the permit is granted, not from flush-open. A flush that
+            // queued behind a stalled prefix must get its full
+            // `max_flush_lifetime` for its own store calls; pinning at flush-open
+            // spent that budget in the queue and dropped already-acked buffered
+            // rows with no PUT. The re-derived value only ever moves the deadline
+            // later (grant is at or after open), so it never shortens a flush's
+            // store budget.
+            pinned.deadline_ns = clock
+                .now_ns()
+                .saturating_add(ctx.config.max_flush_lifetime.as_nanos() as i64);
             let started_ns = clock.now_ns();
             ctx.run_flush(pinned).await;
             let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
             metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });
-        permit_wait_ns
     }
 }
 
@@ -1471,6 +1871,7 @@ mod tests {
                 Arc::new(IndexedFieldsOverlay::new(Arc::new(
                     crate::log_router::NoIndexedFields,
                 ))),
+                BufferBudgetCeiling::unlimited(),
                 #[cfg(feature = "stage-timing")]
                 Arc::new(LogStageTimings::new()),
             );
@@ -2330,6 +2731,7 @@ mod tests {
             Arc::new(IndexedFieldsOverlay::new(Arc::new(
                 crate::log_router::NoIndexedFields,
             ))),
+            BufferBudgetCeiling::unlimited(),
             #[cfg(feature = "stage-timing")]
             Arc::new(LogStageTimings::new()),
         );
@@ -2708,10 +3110,15 @@ mod tests {
             records in proptest::collection::vec(record_strategy(), 0..12)
         ) {
             let row_total: usize = records.iter().map(est_record_bytes).sum();
+            let object_total: usize = records.iter().map(est_record_object_bytes).sum();
             let logrecords: Vec<LogRecord> =
                 records.iter().map(|r| to_logseg_record(r.clone())).collect();
             let batch = ColumnarLogBatch::from_records(&logrecords);
             prop_assert_eq!(est_columnar_bytes(&batch), row_total);
+            // The same equality for the size trigger's object-bytes estimate:
+            // a tenant's object size must not depend on which wire path
+            // admitted its records.
+            prop_assert_eq!(est_columnar_object_bytes(&batch), object_total);
         }
     }
 
@@ -2756,8 +3163,10 @@ mod tests {
             attrs,
         };
         let row_total = est_record_bytes(&rec);
+        let object_total = est_record_object_bytes(&rec);
         let batch = ColumnarLogBatch::from_records(&[to_logseg_record(rec)]);
         assert_eq!(est_columnar_bytes(&batch), row_total);
+        assert_eq!(est_columnar_object_bytes(&batch), object_total);
     }
 
     /// ADR-0109 decision 5: a tenant's shard buffer is columnar or row-major,
@@ -2898,5 +3307,40 @@ mod tests {
         assert_eq!(snap.acks_ok, 1);
         assert_eq!(snap.stream_id_collisions, 0);
         h.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod inflight_guard_tests {
+    use super::*;
+
+    /// The log-pipeline counterpart of
+    /// `crate::shard::inflight_guard_tests::a_flush_task_dropped_before_its_first_poll_leaves_the_gauge_balanced`.
+    /// A flush task spawned and then dropped before its first poll has to leave
+    /// the gauge exactly where it found it; pairing the `+1` and the `-1` in one
+    /// value is what makes that hold, and the public reader's clamp at 0 is why
+    /// this asserts on the raw signed count.
+    #[test]
+    fn a_flush_task_dropped_before_its_first_poll_leaves_the_gauge_balanced() {
+        let metrics = Arc::new(LogIngestMetrics::new(1));
+        assert_eq!(metrics.in_flight_flushes_signed(0), 0);
+
+        let guard = InFlightFlushGuard::new(Arc::clone(&metrics), 0);
+        assert_eq!(
+            metrics.in_flight_flushes_signed(0),
+            1,
+            "the buffer has left the actor, so the flush counts as in flight"
+        );
+
+        let flush_task = async move {
+            let _guard = guard;
+        };
+        drop(flush_task);
+
+        assert_eq!(
+            metrics.in_flight_flushes_signed(0),
+            0,
+            "the guard's own Drop ran, so the pair balanced"
+        );
     }
 }

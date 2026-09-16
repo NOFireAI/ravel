@@ -102,7 +102,10 @@ pub use publish::{
     ConservationPredicate, PublishOutcome, conserve_exact, publish_record,
     publish_record_with_conservation,
 };
-pub use query_audit::{QUERY_AUDIT_SHARD, QueryStatus, query_audit_event, write_query_audit};
+pub use query_audit::{
+    AuditTextPolicy, QUERY_AUDIT_SHARD, QueryStatus, QueryTextRedactor, RedactingAuditSink,
+    query_audit_event, write_query_audit,
+};
 pub use ravel_fleet::worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};
 pub use request_ledger::{PhaseRequests, RequestLedger, RequestPhase, RunRequestReport};
 pub use retention::{
@@ -122,11 +125,11 @@ pub use scrub::{
 };
 pub use sweep::{
     CatalogSweepOutcome, ErasureRequestSweepOutcome, HeldBucket, IdemSweepOutcome, LeaseCheck,
-    NoLeases, OrphanSweepOutcome, SupersededHolds, SupersededSweepOutcome, SweepReport,
-    sweep_erasure_requests, sweep_erasure_requests_with_holds, sweep_idempotency_markers,
-    sweep_orphans, sweep_shard, sweep_shard_with_holds, sweep_shard_zoned,
-    sweep_shard_zoned_with_holds, sweep_superseded, sweep_unreferenced_catalog_objects,
-    sweep_unreferenced_parts,
+    NoLeases, OrphanSweepOutcome, QuarantineSweepOutcome, SupersededHolds, SupersededSweepOutcome,
+    SweepReport, sweep_erasure_requests, sweep_erasure_requests_with_holds,
+    sweep_idempotency_markers, sweep_orphans, sweep_quarantine, sweep_shard,
+    sweep_shard_with_holds, sweep_shard_zoned, sweep_shard_zoned_with_holds, sweep_superseded,
+    sweep_unreferenced_catalog_objects, sweep_unreferenced_parts,
 };
 
 #[cfg(test)]

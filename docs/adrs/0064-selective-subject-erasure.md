@@ -235,6 +235,31 @@ and sweep in `crates/ravel-maintain`), driven per tenant by the same loop:
    construction happens only after no resolvable snapshot can still
    reference any pre-rewrite input. Correctness therefore never depends on
    the race not happening; the serialization is an efficiency measure.
+   **Amended:** that last clause is wrong for the producer side. The
+   query-time filter bounds what a query returns while a request is pending,
+   but it does not stop a compactor from publishing a second record set over
+   a bucket a rewrite already covers, and once both records are live the
+   bucket serves two part sets for good -- including after the `.dreq` is
+   removed and the filter stops applying, which is exactly when the erased
+   records become returnable again. Compaction
+   (`crate::compact::compact_bucket`) and format migration
+   (`crate::rewrite::migrate_bucket_format`) now refuse a bucket whose listing
+   already holds a rewrite record, reporting `RewritePresent` and leaving the
+   bucket untouched. This closes the case where the rewrite record is already
+   durable by the time the compactor lists the bucket, and that closure is a
+   correctness requirement, not an efficiency measure. It does not replace the
+   driver's per-bucket serialization of compaction and rewrite, which stays
+   load-bearing for the concurrent case: both the guard and the rewrite pass
+   list-then-act with no compare-and-swap, and the two passes publish under
+   different keys, so neither can observe the other's record before it
+   commits. An interleaving where compaction lists first (no rewrite record
+   yet), then the rewrite pass lists, resolves, and publishes before
+   compaction publishes, still ends with both records live and neither
+   superseding the other -- worse than the original hazard, because every
+   later rewrite pass over that bucket then fails on multiple live records
+   and the pending request's marker is never removed. That window is closed
+   only by a compare-and-swap or an explicit claim on the bucket, and this
+   change does not close it.
 6. **Physical removal**: the rewrite's inputs become superseded inputs to
    the existing sweep (`sweep_superseded`), deleted after
    `protection_horizon`, under the same `LegalHoldCheck` gate as every
@@ -441,6 +466,51 @@ clear. docs/consistency-model.md's `.done` row and "Scope and interactions"
 section are narrowed to state this proof explicitly. The two honest
 residuals are unchanged and already tracked: the out-of-window folded
 snapshot (§4 open item, above) and the query-audit keyspace (ADR-0062).
+
+## Amendment: completion waits for a bucket that was open at the acknowledgement
+
+2026-09-07. Section 3 point 1 defers an unsealed bucket to the next pass. The
+completion gate in section 4 read that deferral as an exclusion from scope and
+let a request complete while such a bucket was still open. Completion now
+blocks instead: no `.done` is written while any bucket that was in the
+request's scope at acknowledgement is unsealed.
+
+"In scope at acknowledgement" includes the hour open at the ack even before its
+first commit record is published. Bucket discovery is a listing of the
+commit-record prefix, and a flush still buffering at the ack has not published a
+commit record, so that hour has no entry in the listing yet -- "nothing
+committed yet" is exactly the state such a flush leaves behind. A pass that
+examined only the listed hours would never see the bucket, complete the request,
+and leave the hour to seal carrying the subject's pre-ack records that no later
+pass revisits: the same resurrection this amendment prevents, reached by never
+discovering the bucket rather than by deferring an examined one. The pass
+therefore derives the ack hour from the request's `created_unix_ns` and
+considers its bucket whether or not the listing returned it; the scope test that
+then judges the bucket is the same one it applies to a listed bucket, so the two
+paths cannot disagree about what "in scope" means.
+
+The two readings differ in outcome, not in wording. Deferral is a statement
+about which pass does the rewrite, and it holds only while a later pass will
+still run. A `.done` is what stops the request being pending, so completing on
+a deferred bucket turns "the next pass rewrites it" into "no pass rewrites
+it": the bucket seals carrying the subject's pre-ack records, nothing revisits
+it, and the records are served again as soon as the `.dreq` and its query-time
+exclusion filter are released under section 5.
+
+Blocking does not reintroduce the section 5 failure it was thought to. A
+request's scope is fixed at its acknowledgement (section 1), so a record
+ingested afterwards is not data the request can erase, and the bucket that
+receives it is not a bucket the request waits on. Only the bucket open at the
+acknowledgement can impose the wait, and it seals within `max_ingest_lag` plus
+one bucket span plus the seal margin (`max_flush_lifetime +
+clock_skew_allowance`): 4 h 5 min with defaults, far inside
+`erasure_rewrite_deadline`. A tenant that never stops ingesting therefore
+still completes, and its `.dreq` is still released on schedule; the wait ends
+on its own rather than on ingest stopping.
+
+Section 3 point 1 is unchanged: the rewrite pass still defers an unsealed
+bucket, and the data stays unreturnable through section 2 while it waits.
+docs/consistency-model.md's `.done` row carries the normative wording.
 
 ### 5. Erasing the erasure request itself
 

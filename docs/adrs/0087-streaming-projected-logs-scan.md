@@ -114,6 +114,38 @@ flowchart LR
     end
 ```
 
+## Amendment (2026-09-14): per-key `attrs['k']` projection is now in scope
+
+Decision 3 above says "per-key projection through `attrs['k']` expressions is
+out of scope for this ADR and left for the typed-attribute-columns epic", so a
+query naming `attrs` at all resolved every dynamic column plus `attrs_raw`.
+Issue #1768 implements that projection, which overtakes the exclusion.
+
+What changed the answer is a measurement rather than a preference. On 40
+objects, 200,000 rows and 33 record attributes, `attrs['attr_3']` and a declared
+`"attr_3"` move identical bytes over the wire and decode 84,691 versus 3,531
+stored page bytes, costing 1070.7 ms against 4.8 ms. The exclusion's own
+rationale -- "any query referencing `attrs` already pulls every dynamic column,
+so a declared key's page is decoded regardless" (decision 6 of ADR-0090) -- is
+what that 24x is: it is a real cost, not an accounting artifact, and it is CPU
+rather than I/O, since whole-object reads make the byte count
+projection-independent under the shipped `cost-based` policy.
+
+The rule that replaces the exclusion: when every reference to `attrs` in the
+chain above the scan is a `get_field` with a literal key, the scan resolves only
+those keys' columns plus `attrs_raw`, and renders each key with the MAP form's
+own rules. Any other use of the column -- a bare `attrs`, `SELECT *`, an
+aggregate argument, a grouping set, a projected filter, or any plan node the
+rule does not recognise -- keeps the whole-map behaviour decision 3 describes.
+The rewrite is therefore a narrowing of which columns resolve, never a change to
+what a query returns; the per-key column reproduces the map's rendering,
+including the case where a declared column of the same name would read NULL
+(ADR-0090 decision 7).
+
+Unchanged: the resolved-column rule for content predicates and erasure
+predicates, `read_block`'s decode scope, skip-index and bloom evaluation, and
+the whole-object GET policy.
+
 ## Rejected alternatives
 
 - **Raise the pool ceiling instead of changing the reservation model.**

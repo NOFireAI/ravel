@@ -16,12 +16,14 @@ const TOKEN: &str = "testtoken";
 
 /// Mirrors `health_endpoints.rs`'s helper: an in-process server backed by
 /// `MemoryStore`, parameterized by mode.
-async fn start_test_server(mode: Mode) -> ravel_server::Running {
+async fn start_test_server(mode: Mode, process_memory_budget_bytes: u64) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
@@ -45,6 +47,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
@@ -57,11 +60,17 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
         typed_attr_columns: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes,
+        process_memory_budget_is_fallback: false,
         cache_dir: None,
+        catalog_resolve_concurrency: None,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
         remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: std::time::Duration::ZERO,
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
@@ -82,7 +91,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
 #[tokio::test]
 async fn metrics_served_in_every_mode() {
     for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
-        let running = start_test_server(mode).await;
+        let running = start_test_server(mode, u64::MAX).await;
         let base = format!("http://{}", running.http_addr);
         let client = reqwest::Client::new();
 
@@ -133,7 +142,7 @@ async fn metrics_ingest_family_present_only_in_ingest_modes() {
         (Mode::Query, false),
         (Mode::Maintain, false),
     ] {
-        let running = start_test_server(mode).await;
+        let running = start_test_server(mode, u64::MAX).await;
         let base = format!("http://{}", running.http_addr);
         let client = reqwest::Client::new();
 
@@ -154,6 +163,48 @@ async fn metrics_ingest_family_present_only_in_ingest_modes() {
 
         running.shutdown().await.expect("graceful shutdown");
     }
+}
+
+/// ADR-1170 decision 4: the three process memory budget gauges must render
+/// with real values read from the same `MemoryBudget` the server was started
+/// with, not zeroed placeholders. `component="fetch"` reads `0` because
+/// decision 2 (fetch-layer reservation) has not landed upstream.
+#[tokio::test]
+async fn metrics_memory_budget_family_reflects_configured_budget() {
+    const BUDGET_BYTES: u64 = 123_456_789;
+    let running = start_test_server(Mode::All, BUDGET_BYTES).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let body = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+
+    assert!(
+        body.contains(&format!(
+            "ravel_memory_budget_bytes{{mode=\"all\"}} {BUDGET_BYTES}"
+        )),
+        "metrics body missing budget gauge at the configured value:\n{body}"
+    );
+    assert!(
+        body.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"sql\"} 0"),
+        "metrics body missing sql reserved gauge:\n{body}"
+    );
+    assert!(
+        body.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"fetch\"} 0"),
+        "metrics body missing fetch reserved gauge (must be 0 until decision 2 lands):\n{body}"
+    );
+    assert!(
+        body.contains("ravel_memory_handoff_overlap_bytes{mode=\"all\"} 0"),
+        "metrics body missing handoff overlap gauge:\n{body}"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
 }
 
 // --- ADR-0051 section 6: the /metrics admission family ---
@@ -294,6 +345,8 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
@@ -328,14 +381,21 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
         typed_attr_columns: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_is_fallback: false,
         cache_dir: None,
+        catalog_resolve_concurrency: None,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
         remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: std::time::Duration::ZERO,
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         limits: LimitsConfig {
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,
@@ -511,6 +571,8 @@ async fn start_attribution_server() -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
@@ -545,14 +607,21 @@ async fn start_attribution_server() -> ravel_server::Running {
         typed_attr_columns: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_is_fallback: false,
         cache_dir: None,
+        catalog_resolve_concurrency: None,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
         remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: std::time::Duration::ZERO,
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         limits: LimitsConfig {
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,

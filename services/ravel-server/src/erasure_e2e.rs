@@ -122,6 +122,21 @@ impl TickHarness {
         self.compactor.protection_horizon_ns
     }
 
+    /// The first tick clock at or past which the ingest hour open at `ack_ns`
+    /// has sealed under this harness's compactor config. A request acknowledged
+    /// at `ack_ns` has that hour open at its ack, and ADR-0064 (issue #1290)
+    /// blocks the request's completion until the hour seals: an hour open at the
+    /// ack may still receive the subject's pre-ack records, so a `.done` written
+    /// before it seals would resurrect them. A tick at this instant is the first
+    /// that can write the request's `.done`.
+    fn ack_hour_sealed_ns(&self, ack_ns: i64) -> i64 {
+        let hour = ack_ns / NS_PER_HOUR;
+        (hour + 1)
+            .saturating_mul(NS_PER_HOUR)
+            .saturating_add(self.compactor.seal_margin_ns())
+            .saturating_add(1)
+    }
+
     /// Drive one real maintenance tick at `now_ns` over `shard_count` shards --
     /// the same `run_tick_with_clock` the running service calls, only with the
     /// clock injected so the `.dreq` sweep's `protection_horizon` wait is
@@ -367,8 +382,10 @@ fn build_metrics_app(
         Arc::clone(&store),
         shard_count,
         cli.disable_cache,
-        cli.cache_max_bytes,
+        crate::config::DEFAULT_CACHE_MAX_BYTES,
         cli.cache_dir.clone(),
+        cli.catalog_resolve_concurrency,
+        None,
     )
     .expect("catalog");
     let mut tokens = std::collections::HashMap::new();
@@ -379,6 +396,7 @@ fn build_metrics_app(
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         Some(cache),
         ravel_query::EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         Arc::new(crate::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),
@@ -460,8 +478,11 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
     let data_key_s0 = publish_metrics_bucket(store.as_ref(), &tenant_id, 0, "a").await;
     let data_key_s1 = publish_metrics_bucket(store.as_ref(), &tenant_id, 1, "b").await;
 
-    let cache = build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli"))
-        .expect("cache enabled by default");
+    let cache = build_cache(
+        &Cli::try_parse_from(["ravel-server"]).expect("cli"),
+        crate::config::DEFAULT_CACHE_MAX_BYTES,
+    )
+    .expect("cache enabled by default");
     // The default CLI sets no --cache-dir, so this is the RAM-only variant; hold
     // its concrete `Cache` handle to assert warming (is_empty / hit counters).
     let ReadCache::Ram(ram) = cache.clone() else {
@@ -531,8 +552,11 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
          bytes at this point, so the query filtered them, it did not read an emptied store"
     );
 
-    // A real tick: the rewrite runs in both shards and the request completes
-    // (every in-scope bucket now carries a rewrite naming it).
+    // A real tick at TEST_NOW_NS: ingest hour 0 is long sealed, so the rewrite
+    // runs in both shards. But TEST_NOW_NS is the opening instant of ingest hour
+    // 10_000, the hour open at this request's ack, and that hour is still
+    // unsealed here, so ADR-0064 (issue #1290) blocks completion: the rewrite
+    // lands, the `.done` does not.
     let mut harness = TickHarness::new();
     harness
         .tick(store.as_ref(), &tenant, TEST_NOW_NS, SHARD_COUNT)
@@ -563,9 +587,30 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
         );
     }
 
+    // Completion is blocked BECAUSE the ack-open hour (10_000) is unsealed at
+    // TEST_NOW_NS, not because the rewrite is missing: the records above prove it
+    // ran. No `.done` yet, and the request stays pending with its `.dreq`.
+    assert!(
+        !object_exists(store.as_ref(), &done_key).await,
+        "the ack-open ingest hour 10_000 is unsealed at TEST_NOW_NS, so completion is blocked: \
+         the rewrite landed in both shards but no .done is written this tick (ADR-0064, #1290)"
+    );
+    assert!(
+        object_exists(store.as_ref(), &dreq_key).await,
+        "the request stays pending on the unsealed ack-open hour, so its .dreq survives"
+    );
+
+    // Advance past that hour's seal bound; the request now completes (every
+    // in-scope bucket, including the once-open ack hour, is accounted for).
+    let ack_sealed_ns = harness.ack_hour_sealed_ns(TEST_NOW_NS);
+    harness
+        .tick(store.as_ref(), &tenant, ack_sealed_ns, SHARD_COUNT)
+        .await;
+
     assert!(
         object_exists(store.as_ref(), &done_key).await,
-        "every in-scope bucket carries the request, so the tick writes .done"
+        "once the ack-open hour seals, every in-scope bucket carries the request, so the tick \
+         writes .done"
     );
     assert!(
         object_exists(store.as_ref(), &dreq_key).await,
@@ -574,7 +619,7 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
 
     // Past the horizon: the `.dreq` (which carries the subject identifier) is
     // swept, and the superseded input objects are physically deleted.
-    let past_horizon = TEST_NOW_NS + harness.protection_horizon_ns() + 1;
+    let past_horizon = ack_sealed_ns + harness.protection_horizon_ns() + 1;
     harness
         .tick(store.as_ref(), &tenant, past_horizon, SHARD_COUNT)
         .await;
@@ -597,8 +642,11 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
     // Post-sweep, the `.dreq` is gone, so exclusion now rests PURELY on the
     // physical rewrite: a fresh query still excludes the subject and returns the
     // bystander's sample value bit-exact.
-    let cold_cache =
-        build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli")).expect("cache");
+    let cold_cache = build_cache(
+        &Cli::try_parse_from(["ravel-server"]).expect("cli"),
+        crate::config::DEFAULT_CACHE_MAX_BYTES,
+    )
+    .expect("cache");
     let fresh_app = build_metrics_app(Arc::clone(&store), cold_cache, &tenant_id, SHARD_COUNT);
     let post_sweep = query_metric_subjects(&fresh_app).await;
     assert_eq!(
@@ -747,8 +795,10 @@ mod logs {
             Arc::clone(&store),
             1,
             cli.disable_cache,
-            cli.cache_max_bytes,
+            crate::config::DEFAULT_CACHE_MAX_BYTES,
             cli.cache_dir.clone(),
+            cli.catalog_resolve_concurrency,
+            None,
         )
         .expect("catalog");
         let mut tokens = std::collections::HashMap::new();
@@ -759,6 +809,7 @@ mod logs {
             Arc::new(StaticBearerTokenResolver::new(tokens)),
             Some(cache),
             ravel_query::EngineConfig::default(),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             crate::query::DEFAULT_MAX_TENANT_BYTES,
             false,
@@ -769,6 +820,7 @@ mod logs {
                 ravel_query::QueryConcurrencyLimit::Unlimited,
             ),
             None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         )
         .expect("sql state");
         sql_state.clock = Arc::new(FixedQueryClock);
@@ -822,8 +874,11 @@ mod logs {
 
         let data_key = publish_logs_bucket(store.as_ref(), &tenant_id).await;
 
-        let cache = build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli"))
-            .expect("cache enabled by default");
+        let cache = build_cache(
+            &Cli::try_parse_from(["ravel-server"]).expect("cli"),
+            crate::config::DEFAULT_CACHE_MAX_BYTES,
+        )
+        .expect("cache enabled by default");
         // Default CLI: no --cache-dir, so the RAM-only variant; hold its concrete
         // `Cache` handle to assert warming (is_empty / hit counters).
         let ReadCache::Ram(ram) = cache.clone() else {
@@ -881,7 +936,10 @@ mod logs {
             "the durable RLOG input still holds the subject's bytes: exclusion was logical"
         );
 
-        // A real tick: the logs bucket is rewritten and the request completes.
+        // A real tick at TEST_NOW_NS: ingest hour 0 is long sealed, so the logs
+        // bucket is rewritten. But TEST_NOW_NS is the opening instant of ingest
+        // hour 10_000, the hour open at this request's ack, and that hour is
+        // still unsealed here, so ADR-0064 (issue #1290) blocks completion.
         let mut harness = TickHarness::new();
         harness.tick(store.as_ref(), &tenant, TEST_NOW_NS, 1).await;
 
@@ -898,8 +956,24 @@ mod logs {
             "exactly the subject's one log record is dropped"
         );
         assert!(
+            !object_exists(store.as_ref(), &done_key).await,
+            "the ack-open ingest hour 10_000 is unsealed at TEST_NOW_NS, so completion is blocked: \
+             the rewrite landed but no .done is written this tick (ADR-0064, #1290)"
+        );
+        assert!(
+            object_exists(store.as_ref(), &dreq_key).await,
+            "the request stays pending on the unsealed ack-open hour, so its .dreq survives"
+        );
+
+        // Advance past that hour's seal bound; the request now completes.
+        let ack_sealed_ns = harness.ack_hour_sealed_ns(TEST_NOW_NS);
+        harness
+            .tick(store.as_ref(), &tenant, ack_sealed_ns, 1)
+            .await;
+        assert!(
             object_exists(store.as_ref(), &done_key).await,
-            "every in-scope bucket carries the request, so the tick writes .done"
+            "once the ack-open hour seals, every in-scope bucket carries the request, so the tick \
+             writes .done"
         );
         assert!(
             object_exists(store.as_ref(), &dreq_key).await,
@@ -907,7 +981,7 @@ mod logs {
         );
 
         // Past the horizon: `.dreq` swept, input physically gone.
-        let past_horizon = TEST_NOW_NS + harness.protection_horizon_ns() + 1;
+        let past_horizon = ack_sealed_ns + harness.protection_horizon_ns() + 1;
         harness.tick(store.as_ref(), &tenant, past_horizon, 1).await;
 
         assert!(
@@ -925,8 +999,11 @@ mod logs {
 
         // Post-sweep, `.dreq` gone: exclusion rests purely on the physical
         // rewrite, and the bystander's line survives.
-        let cold_cache =
-            build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli")).expect("cache");
+        let cold_cache = build_cache(
+            &Cli::try_parse_from(["ravel-server"]).expect("cli"),
+            crate::config::DEFAULT_CACHE_MAX_BYTES,
+        )
+        .expect("cache");
         let fresh_app = build_logs_app(Arc::clone(&store), cold_cache, &tenant_id);
         let post_sweep = query_log_bodies(&fresh_app).await;
         assert_eq!(
@@ -1050,8 +1127,10 @@ mod spans {
             Arc::clone(store),
             1,
             cli.disable_cache,
-            cli.cache_max_bytes,
+            crate::config::DEFAULT_CACHE_MAX_BYTES,
             cli.cache_dir.clone(),
+            cli.catalog_resolve_concurrency,
+            None,
         )
         .expect("catalog");
         let snapshot = catalog
@@ -1144,7 +1223,10 @@ mod spans {
             "the durable RSPAN input still holds the subject's bytes: exclusion was logical"
         );
 
-        // A real tick: the spans bucket is rewritten and the request completes.
+        // A real tick at TEST_NOW_NS: ingest hour 0 is long sealed, so the spans
+        // bucket is rewritten. But TEST_NOW_NS is the opening instant of ingest
+        // hour 10_000, the hour open at this request's ack, and that hour is
+        // still unsealed here, so ADR-0064 (issue #1290) blocks completion.
         let mut harness = TickHarness::new();
         harness.tick(store.as_ref(), &tenant, TEST_NOW_NS, 1).await;
 
@@ -1165,8 +1247,24 @@ mod spans {
             "exactly the subject's one span is dropped"
         );
         assert!(
+            !object_exists(store.as_ref(), &done_key).await,
+            "the ack-open ingest hour 10_000 is unsealed at TEST_NOW_NS, so completion is blocked: \
+             the rewrite landed but no .done is written this tick (ADR-0064, #1290)"
+        );
+        assert!(
+            object_exists(store.as_ref(), &dreq_key).await,
+            "the request stays pending on the unsealed ack-open hour, so its .dreq survives"
+        );
+
+        // Advance past that hour's seal bound; the request now completes.
+        let ack_sealed_ns = harness.ack_hour_sealed_ns(TEST_NOW_NS);
+        harness
+            .tick(store.as_ref(), &tenant, ack_sealed_ns, 1)
+            .await;
+        assert!(
             object_exists(store.as_ref(), &done_key).await,
-            "every in-scope bucket carries the request, so the tick writes .done"
+            "once the ack-open hour seals, every in-scope bucket carries the request, so the tick \
+             writes .done"
         );
         assert!(
             object_exists(store.as_ref(), &dreq_key).await,
@@ -1174,7 +1272,7 @@ mod spans {
         );
 
         // Past the horizon: `.dreq` swept, input physically gone.
-        let past_horizon = TEST_NOW_NS + harness.protection_horizon_ns() + 1;
+        let past_horizon = ack_sealed_ns + harness.protection_horizon_ns() + 1;
         harness.tick(store.as_ref(), &tenant, past_horizon, 1).await;
 
         assert!(
@@ -1285,7 +1383,12 @@ mod fault {
              erasure is fully recoverable after the fault"
         );
 
-        // Tick 2, past the one-shot fault: the rewrite completes.
+        // Tick 2, past the one-shot fault but still at TEST_NOW_NS: the rewrite
+        // publish now succeeds, so the record lands. Completion is a separate
+        // gate: the ack-open ingest hour 10_000 is unsealed at TEST_NOW_NS, so
+        // ADR-0064 (issue #1290) still blocks the `.done`. The retry proves the
+        // fault cleared (record published); the missing `.done` proves the seal
+        // gate, not the fault, now holds the request pending.
         harness.tick(&store, &tenant, TEST_NOW_NS, 1).await;
         assert_eq!(
             rewrite_records(&store, &tenant, Signal::Metrics, 0, 0)
@@ -1295,17 +1398,30 @@ mod fault {
             "the fault-free retry publishes the rewrite record"
         );
         assert!(
+            !object_exists(&store, &done_key).await,
+            "the ack-open ingest hour 10_000 is unsealed at TEST_NOW_NS, so completion is blocked: \
+             the retry republished the rewrite but no .done is written this tick (ADR-0064, #1290)"
+        );
+        assert!(
+            object_exists(&store, &dreq_key).await,
+            "the request stays pending on the unsealed ack-open hour, so its .dreq survives"
+        );
+
+        // Tick 3, past the ack-open hour's seal bound: the request completes.
+        let ack_sealed_ns = harness.ack_hour_sealed_ns(TEST_NOW_NS);
+        harness.tick(&store, &tenant, ack_sealed_ns, 1).await;
+        assert!(
             object_exists(&store, &done_key).await,
-            "the fault-free retry completes the request"
+            "once the ack-open hour seals, the fault-free retry completes the request"
         );
         assert!(
             object_exists(&store, &dreq_key).await,
             ".dreq is kept until protection_horizon elapses past .done"
         );
 
-        // Tick 3, past the horizon: the request is swept and the input physically
+        // Tick 4, past the horizon: the request is swept and the input physically
         // removed -- the erasure the fault deferred is now durably complete.
-        let past_horizon = TEST_NOW_NS + harness.protection_horizon_ns() + 1;
+        let past_horizon = ack_sealed_ns + harness.protection_horizon_ns() + 1;
         harness.tick(&store, &tenant, past_horizon, 1).await;
         assert!(
             object_exists(&store, &done_key).await,

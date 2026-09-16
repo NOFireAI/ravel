@@ -44,6 +44,40 @@ UNATTENDED TASK: never ask for confirmation or approval; when your work
 passes the gates, commit it and end with a report. Committing
 (git commit -s) is part of the deliverable.
 
+DEGRADED-BOX TRIPWIRE, your very first command, before reading anything:
+
+    time git config user.email "fleet-executor@nofire.ai"
+    time git config user.name "Ravel Fleet Executor"
+
+You need both of these before your first commit anyway. Read the elapsed
+time on the FIRST one before running the second: if it took more than 30
+seconds, stop there. Waiting for both doubles the worst case, since the
+box this exists for takes 90 to 120 seconds per command, and two of them
+is three to four minutes rather than the two this paragraph used to
+claim.
+
+On a breach, STOP: do not read a file, do not start the work. Report
+
+    DEGRADED EXECUTOR: git config took <N>s
+    <the output of `uname -a`>
+    <the output of `nproc`>
+
+and end the task. The two extra lines are what make the report
+actionable: one lost task tells the orchestrator the pool has a bad box,
+and the box's identity is what lets it be quarantined instead of
+rediscovered next week by a different task.
+
+The four-hour ceiling arrives on that box before a first commit does, so
+COMMIT EARLY below cannot save you. Ending in two minutes with a report
+costs a redispatch; carrying on costs the whole task, and 2h50m and
+3h29m have each been lost that way.
+
+COMMIT EARLY: `git commit -s` the first state that compiles, before you
+go on to the rest. Never put any command in the background and never end
+your turn waiting for one. Nothing will wake you -- your turn ending ends
+the task, and anything uncommitted is lost with no result ref. A slow cold
+build here is expected; wait for it in the foreground.
+
 Implement <issue ref> for the Ravel project: <one sentence>. Work ONLY
 inside <crates/dirs>.
 
@@ -63,7 +97,15 @@ Gates: format and lint IN PLACE before the commit you will gate -- run
 `cargo fmt --all` (not just --check) and, where it applies, scoped
 `cargo clippy --fix -p <crate>` -- then verify with `cargo fmt --all
 --check`; cargo clippy --workspace --all-targets -- -D warnings;
-scripts/affected-tests.sh -p <crate> [-p <crate2>]. Do NOT run
+scripts/affected-tests.sh -p <crate> [-p <crate2>]. Cap cargo's build
+parallelism through the environment, not a flag, because
+`scripts/affected-tests.sh` accepts no `--jobs` and runs cargo at the
+default otherwise: find your executor class with `uname -m` and `nproc`
+(x86_64 with 16 cores is the amd64 class, aarch64 with 4 cores is the
+arm64 Pi class), then prefix every cargo command and every script that
+runs cargo with `CARGO_BUILD_JOBS=4` on amd64 or `CARGO_BUILD_JOBS=2` on
+arm64. `scripts/gates.sh` caps jobs on an 8 GB host by itself; nothing
+else does. Do NOT run
 `cargo test --workspace`: full-workspace tests are verified at merge
 time (verify-dispatch cold gate and PR CI); your job is the blast
 radius of your own change, and affected-tests.sh computes it (the
@@ -77,6 +119,41 @@ tool-result can report a false "affected-tests passed" while a test
 actually failed. If the output is long, redirect it to a file and grep or
 read the file separately; the exit code check and the output-size problem
 are independent, solve them independently.
+Where that file goes is itself a rule, because both wrong answers have
+already cost a task. Run this first, as ONE command, substituting
+nothing:
+
+    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 5 && df -h /tmp . "$HOME"
+
+Every step is joined with `&&` so a failure anywhere fails the command:
+`git check-ignore -q .gate-logs` proves the tracked `.gitignore` covers
+the directory before a single log is written there. The path is literal
+text rather than built from `$HOME` or the checkout's basename because
+each tool call is its own shell and a variable set in one call is empty
+in the next.
+
+If the guard exits non-zero, say so in your report and stop rather than
+picking another directory: a host without 5 GB for a log has no room for
+the gate either, and the run would die mid-link with a fake compiler
+error. Then redirect every long gate to `.gate-logs/<step>.log`.
+
+HOME on the amd64 executor class is a 1 GB tmpfs: pointing the log
+directory there makes the disk-headroom guard report 0 GB free and fail
+before any gate runs, and three tasks died exactly that way on
+2026-09-12. `/tmp` is the harness's own capture filesystem (issue
+#1526): a run that fills it fails every later Bash call, including
+`true` and `df`, while the host's own disk figures still look healthy.
+Inside the checkout is the only volume with room on that class. The
+repository's tracked `.gitignore` lists `.gate-logs/` and `.dd-tools/`
+(the latter for any `cargo install --root "$PWD/.dd-tools"` tree), next
+to the disk-watchdog marker it already ignores for the same reason: the
+harness's commit-on-death `git add -A` must not sweep them into a wip
+commit that the merge script would then fold forward into the PR. Quote
+all three `df` lines (`/tmp`, `.`, and `"$HOME"`) in your report.
+`CLAUDE_CODE_TMPDIR` is NOT the executor's lever: the harness reads it
+when it creates the per-call capture directory, before the task's first
+Bash call, so exporting it from inside a task changes nothing. Setting it
+on the executor image is the real fix and is tracked on #1526.
 Commit with trailer "Refs: #N".
 Self-check before the commit (see the checklist below): no tool-call
 artifacts in files, no debug_assert-only guards, generated docs
@@ -107,7 +184,9 @@ commit:
   demonstrate the new test failing against the pre-fix code and name the
   flipped line in your report. A test that cannot fail proves nothing.
 - **Stray files**: nothing staged that the deliverables do not name
-  (scratch scripts, logs, `__pycache__/`, editor droppings).
+  (scratch scripts, logs, `__pycache__/`, editor droppings). `.gate-logs/`
+  and `.dd-tools/` are covered by the tracked `.gitignore`; never
+  force-add them (`git add -f`) into a commit.
 
 ## Commit before the slow gates, not after
 
@@ -125,15 +204,42 @@ orders the work commit-first:
 A kill during step 3 then costs a re-run of the gates, not a re-run of
 the whole task. Two tasks in that window were lost the other way round.
 
-Never tell an executor to start a long gate in the background and wait
-for a notification: the task ends when the agent's turn ends, and a task
-that ended waiting for a background test run pushed nothing.
+Every spec must forbid the executor from backgrounding ANY command and
+must name the consequence, because an executor that only reads "never
+background a gate" will reason its way around it correctly and still die.
+
+An earlier version of this section said exactly that, and a task was lost
+to the gap: 3h29m, 205 turns and $18.29 on a Pi-class ARM host, with zero
+`git commit` calls anywhere in its transcript. It backgrounded a plain
+`cargo check` as a diagnostic, not one of the four named gates, wrote
+"letting it run in the background, waiting for that now instead of polling
+further", and ended its turn. Nothing resumed it: the fleet harness has no
+notification that wakes an executor's own turn the way it wakes an
+orchestrator's. It sat until something outside killed it at the 3.5h mark.
+`git ls-remote` showed only the `start` ref -- no checkpoint, no result, no
+rescue bundle, nothing to recover.
+
+So state it as an absolute and give the reason, in the spec itself:
+
+> Never put any command in the background and never end your turn waiting
+> for one. Nothing will wake you: your turn ending ends the task, and
+> anything not committed is lost with no result ref. A slow cold build on a
+> Pi-class executor is expected -- wait for it in the foreground.
+
+Pair it with an explicit COMMIT EARLY instruction rather than relying on
+the ordering above being followed: the first state that compiles gets
+committed immediately, before any further deliverable. On a host where a
+single cold `cargo check` can run for hours, "commit after step 1" and
+"commit the moment anything works" are different instructions, and only
+the second survives a kill mid-build.
 
 ## Executor test scope
 
 The Gates template scopes executor tests with affected-tests.sh on
 purpose. A fleet task used to end with `cargo test --workspace` on an
-8 GB 4-core host: 1-2 hours of cold compile and test time per task,
+8 GB 4-core host (the arm64 Pi class; the 16 vCPU amd64 class is roughly
+four times faster, so size by the slower class): 1-2 hours of cold
+compile and test time per task,
 almost all of it re-verifying crates the change cannot affect, and all
 of it re-verified anyway at merge (the orchestrator's cold
 verify-dispatch run and the PR's required CI checks are the trust
@@ -238,6 +344,13 @@ if it is missing?
   dependent only on the design decision (the ADR), not on the code
   landing. Merge order handles any cross-references.
 
+fleet-cp rejects any spec whose text contains a dollar-paren command
+substitution (`$(...)`) or a backtick command substitution with `400 bad
+request: spec contains an unexpanded shell substitution`. Write every
+path in a spec as fixed text, never built from a substitution at
+dispatch time. This is why the Gates template's log-directory command
+above uses a literal `.gate-logs` instead of computing a path.
+
 ## Before dispatch: two mechanical preflights
 
 Both failure modes below have burned real dispatches. Run both checks in
@@ -268,7 +381,45 @@ the same turn as the `fleet_dispatch` call, every time.
 
 Record the returned task_id, arm the watch command from the dispatch
 response as a persistent Monitor, and merge with the merge-fleet-result
-skill when it lands. `fleet_status` needs the full task UUID; an 8-char
+skill when it lands.
+
+**Watch the transcript size, not just the status, and read the HTTP code
+beside it.** A task on a degraded box reports `running` for its whole
+life, then dies at the ceiling with an empty `result_ref` and only a
+start ref. An authorized, empty transcript separates it from a hard task
+within minutes:
+
+    curl -s -o /dev/null -w "http=%{http_code} bytes=%{size_download}\n" \
+      "$FLEET_CP/v1/tasks/<id>/transcript?token=<per-task-jwt>"
+
+Save the per-task JWT from the dispatch response; without it this check
+cannot be made. Healthy live task: `http=200 bytes=784005`. Dead box:
+`http=200 bytes=0`. Sample every few minutes for the first quarter hour
+and cancel-and-redispatch on an authorized zero rather than waiting for
+the ceiling.
+
+Read the status code, and do not use the size alone. Fetched with the
+operator token rather than the task's own JWT, the endpoint refuses, and
+the refusal body is the 13-byte string `unauthorized`. Through `wc -c`
+that is a plausible small measurement rather than an error, so a probe
+built on the size alarms on its first sample against every task, healthy
+or dead. It was caught only because a task that had finished SUCCESSFULLY
+also read 13 bytes; two tasks in opposite states with identical readings
+is not a measurement. The status code is what separates a refusal from an
+authorized empty transcript, which is why the command above prints it
+first. The MCP `fleet_transcript` returning nothing carries the same
+ambiguity with no code to inspect, so prefer the HTTP form.
+
+A start-only ref after hours is suggestive, not conclusive: an executor
+commits locally and pushes once at the end, so it can mean a lost final
+push rather than no work. Confirm with the authorized-empty transcript
+before cancelling, because cancelling on the weaker signal destroys
+committed work.
+
+Placement cannot be pre-checked: `GET /v1/tasks/<id>` carries no executor
+field while a task runs, and the executor name appears only in the
+terminal event's `results.executor`. That is why the tripwire in the spec
+and this probe both exist, rather than a label selector. `fleet_status` needs the full task UUID; an 8-char
 short form returns "not found". Result branches appear at
 refs/heads/task/<task-id>/result.
 

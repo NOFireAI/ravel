@@ -13,7 +13,7 @@ use ravel_ingest::{
     WriteError, WriteMode, plausible_ingest_clock,
 };
 use ravel_otlp::normalize::normalize_metrics_with_metadata;
-use ravel_otlp::{IngestLimits, Rejection};
+use ravel_otlp::{IngestLimits, NormalizeRejectCounts, Rejection};
 use ravel_types::{CommitToken, ExemplarCap, SeriesId, TenantId};
 
 pub struct IngestState {
@@ -39,6 +39,12 @@ pub struct IngestState {
     /// normalization decoded, synchronously and off the acknowledgement path.
     /// `None` in a unit test or a mode that captures no metadata.
     pub metadata_sink: Option<Arc<MetadataSink>>,
+    /// Per-tenant counter for normalization's own admission decisions
+    /// (ADR-0051 section 3, layer 3), rendered as the `skew` and `structural`
+    /// reasons of `ravel_admission_rejected_total`. Every ingest surface shares
+    /// this one `Arc`, so the counter does not move when a fleet switches
+    /// transport.
+    pub normalize_metrics: Arc<crate::normalize_reject_metrics::NormalizeRejectMetrics>,
 }
 
 pub struct IngestOutcome {
@@ -105,6 +111,14 @@ impl IngestRequestError {
 /// messages (each well under 200 bytes) while staying far under typical
 /// HTTP header/body sanity limits.
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
+
+/// How many recent rejection groups [`collapse_rejection_variants`] compares a
+/// new rejection against before giving up and starting a new group. Comfortably
+/// above the number of distinct reasons a real request produces (the metrics
+/// [`Rejection`] enum has under thirty variants in total), and small enough that
+/// the scan stays a constant factor rather than turning the collapse quadratic
+/// on a request whose reasons genuinely are all distinct.
+const MAX_PREGROUPED_VARIANTS: usize = 16;
 
 pub async fn handle_export(
     state: &IngestState,
@@ -175,6 +189,16 @@ pub async fn handle_export(
         .collect();
     let normalized = result.output;
     let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
+    // Layer 3's rejections, counted where they are observed rather than inside
+    // the normalizer, which knows no tenant. Classified per point, so the
+    // counter moves by exactly the normalization share of the
+    // `rejected_data_points` reported below; the layer-4 cap count is added to
+    // that field separately and counted by the admission controller.
+    state.normalize_metrics.record(
+        &tenant,
+        ravel_types::Signal::Metrics,
+        NormalizeRejectCounts::from_metric_rejections(&normalized.rejected),
+    );
 
     // Scalar and native-histogram points arrive in separate vectors; both
     // feed one ingest write so a request's points share a single receipt.
@@ -232,14 +256,22 @@ pub async fn handle_export(
             IngestRequestError::Write(err)
         })?;
 
-    let partial_success = if rejected_count > 0 {
+    // Gate on whether anything was rejected at all, never on the unit count: a
+    // zero-count rejection still has to reach the sender. The rule and the
+    // reasoning are in docs/guides/ingest.md, "Zero-count partial success".
+    //
+    // Metrics carry a second term because layer 4's active-series-cap count is
+    // tracked outside `normalized.rejected` and never appears in it, so a gate
+    // reading only that list would report a fully clean write on a request whose
+    // points normalized cleanly and were then turned away by the cap.
+    let partial_success = if normalized.rejected.is_empty() && series_cap_rejected == 0 {
+        None
+    } else {
         let error_message = build_error_message(&normalized.rejected, series_cap_rejected);
         Some(ExportMetricsPartialSuccess {
             rejected_data_points: rejected_count as i64,
             error_message,
         })
-    } else {
-        None
     };
 
     Ok(IngestOutcome {
@@ -248,12 +280,50 @@ pub async fn handle_export(
     })
 }
 
+/// Collapse `rejected` into one entry per distinct rejection value, in
+/// first-appearance order, each carrying the data-point count summed over the
+/// entries it stands for.
+///
+/// This runs before anything is rendered, which is the point of it: normalize
+/// pushes one rejection per data point, so a request of
+/// `max_data_points_per_request` histogram points whose SDK records `min`/`max`
+/// arrives with that many entries, all of them the same variant. Rendering
+/// first would allocate two strings and hash them per point to produce a
+/// message that collapses to a single entry. Collapsing first ties the
+/// rendering work to the number of distinct reasons instead.
+///
+/// The scan is a bounded linear search over the most recent
+/// [`MAX_PREGROUPED_VARIANTS`] groups rather than a hash lookup, because
+/// [`Rejection`] is `Eq` but not `Hash` and the only key available without one
+/// is the rendered text this pass exists to avoid producing. A rejection that
+/// matches nothing in the window simply becomes its own group, which is not a
+/// correctness question: [`build_error_message`] folds groups together by
+/// rendered text afterwards, so an unmatched group costs one extra render and
+/// changes no output.
+fn collapse_rejection_variants(rejected: &[Rejection]) -> Vec<(&Rejection, usize)> {
+    let mut groups: Vec<(&Rejection, usize)> = Vec::new();
+    for rejection in rejected {
+        let n = rejection.rejected_count();
+        let window_start = groups.len().saturating_sub(MAX_PREGROUPED_VARIANTS);
+        let hit = groups[window_start..]
+            .iter()
+            .position(|(seen, _)| *seen == rejection)
+            .map(|offset| window_start + offset);
+        match hit {
+            Some(index) => groups[index].1 += n,
+            None => groups.push((rejection, n)),
+        }
+    }
+    groups
+}
+
 /// Build the OTLP partial-success `error_message` from `rejected`: one entry
 /// per distinct reason with the total point count it covers, rather than
-/// joining one string per rejected point. Distinct reasons are rare relative
-/// to rejected points in the pathological case this guards against (a
-/// whole-resource or whole-metric rejection covering a huge batch collapses
-/// to a single reason), so this stays cheap even when `rejected` is large.
+/// joining one string per rejected point. Identical rejections are collapsed by
+/// [`collapse_rejection_variants`] before any of them is rendered, so the
+/// rendering and hashing cost tracks distinct reasons rather than
+/// `rejected.len()`; two rejection values that differ but render alike are
+/// still folded together here, by their rendered text.
 /// The assembled message is capped at [`MAX_ERROR_MESSAGE_BYTES`]; if more
 /// distinct reasons exist than fit, the message is truncated with a count of
 /// how many were omitted.
@@ -261,29 +331,32 @@ pub async fn handle_export(
 /// `series_cap_rejected` folds in the layer-4 active-series-cap count (0
 /// when nothing was capped) as one more reason, aggregated the same way as
 /// every normalization rejection.
+///
+/// A reason whose `rejected_count()` is 0 still gets an entry, rendered
+/// without a count suffix. That is an informational drop: the point landed
+/// and only a field of it was dropped, so the message is the only channel
+/// that can name it, and filtering zero-count reasons out here would leave
+/// the partial success with an empty `error_message`.
 fn build_error_message(rejected: &[Rejection], series_cap_rejected: usize) -> String {
     let mut order: Vec<String> = Vec::new();
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for r in rejected {
-        let key = r.to_string();
-        let n = r.rejected_count();
-        counts
-            .entry(key.clone())
-            .and_modify(|count| *count += n)
-            .or_insert_with(|| {
-                order.push(key);
-                n
-            });
+    for (rejection, n) in collapse_rejection_variants(rejected) {
+        let key = rejection.to_string();
+        if let Some(count) = counts.get_mut(&key) {
+            *count += n;
+        } else {
+            counts.insert(key.clone(), n);
+            order.push(key);
+        }
     }
     if series_cap_rejected > 0 {
         let key = "active series cap exceeded".to_string();
-        counts
-            .entry(key.clone())
-            .and_modify(|count| *count += series_cap_rejected)
-            .or_insert_with(|| {
-                order.push(key);
-                series_cap_rejected
-            });
+        if let Some(count) = counts.get_mut(&key) {
+            *count += series_cap_rejected;
+        } else {
+            counts.insert(key.clone(), series_cap_rejected);
+            order.push(key);
+        }
     }
 
     let mut message = String::new();
@@ -321,10 +394,12 @@ fn build_error_message(rejected: &[Rejection], series_cap_rejected: usize) -> St
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-    use ravel_ingest::{AdmissionLimits, IngestConfig, SystemClock};
+    use ravel_ingest::{AdmissionLimits, CountLimit, IngestConfig, SystemClock};
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::Signal;
+
+    use crate::normalize_reject_metrics::NormalizeRejectMetrics;
 
     /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
     /// (ADR-0051 amendment): the fixture ingest clock anchors to it so
@@ -333,6 +408,13 @@ mod tests {
     const BASE_TS_NS: i64 = 1_767_225_600_000_000_000;
 
     fn state() -> IngestState {
+        state_with_admission_limits(AdmissionLimits::default())
+    }
+
+    /// The same fixture state as [`state`], with the tenant admission limits
+    /// (layer 4, ADR-0051) supplied, so a test can bound the active-series cap
+    /// low enough to reach the per-series partial-success path.
+    fn state_with_admission_limits(limits: AdmissionLimits) -> IngestState {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let router = Arc::new(IngestRouter::new(
             IngestConfig::default(),
@@ -344,13 +426,11 @@ mod tests {
             router,
             limits: IngestLimits::default(),
             ack_deadline: Duration::from_secs(5),
-            admission: Arc::new(AdmissionController::new(
-                Arc::new(SystemClock),
-                AdmissionLimits::default(),
-            )),
+            admission: Arc::new(AdmissionController::new(Arc::new(SystemClock), limits)),
             recovery: None,
             provisioning: None,
             metadata_sink: None,
+            normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         }
     }
 
@@ -381,6 +461,7 @@ mod tests {
             recovery: None,
             provisioning: None,
             metadata_sink: Some(sink.clone()),
+            normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         };
         (state, store, sink)
     }
@@ -389,6 +470,151 @@ mod tests {
         ExportMetricsServiceRequest {
             resource_metrics: vec![],
         }
+    }
+
+    /// `(skew, structural)` summed over the metrics rows of the
+    /// normalize-reject counters, so a test can read the same figures before
+    /// and after an export and assert the delta rather than the total.
+    fn metrics_normalize_totals(state: &IngestState) -> (u64, u64) {
+        state
+            .normalize_metrics
+            .snapshot()
+            .into_iter()
+            .filter(|row| row.signal == Signal::Metrics)
+            .fold((0, 0), |acc, row| {
+                (acc.0 + row.skew_total, acc.1 + row.structural_total)
+            })
+    }
+
+    /// A delta-temporality Sum with `point_count` points, which the normalize
+    /// layer rejects whole (`aggregation_temporality` is a field of the Sum
+    /// message, not of a data point, so every point under it shares one
+    /// temporality).
+    pub(crate) fn delta_sum_request(point_count: usize) -> ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric::Data as MetricData,
+        };
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "requests".to_string(),
+                        data: Some(MetricData::Sum(Sum {
+                            data_points: (0..point_count)
+                                .map(|i| NumberDataPoint {
+                                    time_unix_nano: BASE_TS_NS as u64,
+                                    value: Some(NumberValue::AsDouble(i as f64)),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            // AGGREGATION_TEMPORALITY_DELTA.
+                            aggregation_temporality: 1,
+                            is_monotonic: true,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// Delta temporality is a structural rejection, and the operator-visible
+    /// counter must move by exactly the number of points the response reports
+    /// rejected.
+    #[tokio::test]
+    async fn delta_sum_export_counts_every_point_as_structural() {
+        const POINT_COUNT: usize = 3;
+
+        let state = state();
+        let before = metrics_normalize_totals(&state);
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Buffered,
+            delta_sum_request(POINT_COUNT),
+            BASE_TS_NS,
+        )
+        .await
+        .expect("buffered write with zero admitted points never fails");
+        let after = metrics_normalize_totals(&state);
+
+        let partial_success = outcome
+            .response
+            .partial_success
+            .expect("the whole delta metric was rejected");
+        assert_eq!(partial_success.rejected_data_points, POINT_COUNT as i64);
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (0, POINT_COUNT as u64),
+            "every rejected point counts once under structural, none under skew"
+        );
+    }
+
+    /// Event-time rejections land under the skew reason, one per rejected
+    /// point, and move nothing else.
+    #[tokio::test]
+    async fn stale_points_count_as_skew() {
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+            metric::Data as MetricData,
+        };
+
+        const POINT_COUNT: usize = 4;
+
+        let state = state();
+        let too_old = BASE_TS_NS - state.limits.max_ingest_lag_ns - 1;
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "requests".to_string(),
+                        data: Some(MetricData::Gauge(Gauge {
+                            data_points: (0..POINT_COUNT)
+                                .map(|i| NumberDataPoint {
+                                    time_unix_nano: (too_old - i as i64) as u64,
+                                    value: Some(NumberValue::AsDouble(i as f64)),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let before = metrics_normalize_totals(&state);
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Buffered,
+            request,
+            BASE_TS_NS,
+        )
+        .await
+        .expect("buffered write with zero admitted points never fails");
+        let after = metrics_normalize_totals(&state);
+
+        assert_eq!(
+            outcome
+                .response
+                .partial_success
+                .expect("every point was too old")
+                .rejected_data_points,
+            POINT_COUNT as i64
+        );
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (POINT_COUNT as u64, 0),
+            "every rejected point counts once under skew, none under structural"
+        );
     }
 
     #[test]
@@ -420,6 +646,188 @@ mod tests {
             message.contains("more distinct rejection reason(s) omitted"),
             "expected a truncation indicator, got: {message}"
         );
+    }
+
+    /// The pre-collapse implementation: render every entry, then fold by the
+    /// rendered text. Kept as a test-only oracle so the collapse can be shown
+    /// to change cost and nothing else. Any input for which this and
+    /// [`build_error_message`] disagree is a sender-visible change.
+    fn render_first_reference(rejected: &[Rejection], series_cap_rejected: usize) -> String {
+        let mut order: Vec<String> = Vec::new();
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for r in rejected {
+            let key = r.to_string();
+            let n = r.rejected_count();
+            counts
+                .entry(key.clone())
+                .and_modify(|count| *count += n)
+                .or_insert_with(|| {
+                    order.push(key);
+                    n
+                });
+        }
+        if series_cap_rejected > 0 {
+            let key = "active series cap exceeded".to_string();
+            counts
+                .entry(key.clone())
+                .and_modify(|count| *count += series_cap_rejected)
+                .or_insert_with(|| {
+                    order.push(key);
+                    series_cap_rejected
+                });
+        }
+
+        let mut message = String::new();
+        let mut shown = 0usize;
+        for reason in &order {
+            let count = counts[reason];
+            let entry = if count > 1 {
+                format!("{reason} (x{count})")
+            } else {
+                reason.clone()
+            };
+            let sep_len = if message.is_empty() { 0 } else { 2 };
+            if message.len() + sep_len + entry.len() > MAX_ERROR_MESSAGE_BYTES {
+                break;
+            }
+            if !message.is_empty() {
+                message.push_str("; ");
+            }
+            message.push_str(&entry);
+            shown += 1;
+        }
+        if shown < order.len() {
+            message.push_str(&format!(
+                "; ... {} more distinct rejection reason(s) omitted",
+                order.len() - shown
+            ));
+        }
+        message
+    }
+
+    /// A corpus built to exercise every way the collapse could diverge from
+    /// [`render_first_reference`]: more distinct values than the collapse
+    /// window holds, repeats separated by other reasons, a long run of one
+    /// value, and two values that are unequal yet render identically
+    /// (`HistogramMinMaxDropped` does not print its `count`).
+    fn divergence_corpus() -> Vec<Rejection> {
+        let mut rejected = Vec::new();
+        for i in 0..(MAX_PREGROUPED_VARIANTS * 3) {
+            rejected.push(Rejection::DuplicateLabelName(format!("label_{i}")));
+            rejected.push(Rejection::HistogramMinMaxDropped { count: 1 });
+            rejected.push(Rejection::ZeroTimestamp);
+            rejected.push(Rejection::HistogramMinMaxDropped { count: 7 });
+            rejected.push(Rejection::MissingValue);
+        }
+        rejected.extend(
+            std::iter::repeat_n(Rejection::ComplexAttributeValue, 1_000)
+                .chain(std::iter::once(Rejection::ZeroTimestamp)),
+        );
+        rejected
+    }
+
+    #[test]
+    fn build_error_message_renders_one_entry_for_a_request_full_of_one_informational_drop() {
+        // The reviewer's case: every point in a full request carries a min/max
+        // the SDK recorded, so normalize pushes one rejection per point. The
+        // rendered message is one entry, and it carries no count, because an
+        // informational drop costs the sender no data point
+        // (`Rejection::rejected_count` is 0 for this variant) and the renderer
+        // only appends a count above 1.
+        let points = IngestLimits::default().max_data_points_per_request;
+        assert_eq!(points, 100_000, "the limit this case is sized against");
+        let rejected: Vec<Rejection> =
+            std::iter::repeat_n(Rejection::HistogramMinMaxDropped { count: 1 }, points).collect();
+
+        assert_eq!(
+            build_error_message(&rejected, 0),
+            "histogram min/max field(s) dropped: no Prometheus-convention representation"
+        );
+    }
+
+    #[test]
+    fn build_error_message_renders_the_summed_total_for_a_request_full_of_one_reason() {
+        // The same shape for a reason that does cost the sender points: the
+        // 100_000 entries collapse to one entry whose count is their total.
+        let points = IngestLimits::default().max_data_points_per_request;
+        let rejected: Vec<Rejection> =
+            std::iter::repeat_n(Rejection::ZeroTimestamp, points).collect();
+
+        assert_eq!(
+            build_error_message(&rejected, 0),
+            "event timestamp is zero (x100000)"
+        );
+    }
+
+    #[test]
+    fn collapse_rejection_variants_is_sized_by_distinct_reasons_not_by_entries() {
+        // The shape assertion. One group means one render and one hash for the
+        // whole request; a collapse that reverted to per-entry keying would
+        // return `max_data_points_per_request` groups here.
+        let points = IngestLimits::default().max_data_points_per_request;
+        let one_reason: Vec<Rejection> =
+            std::iter::repeat_n(Rejection::HistogramMinMaxDropped { count: 1 }, points).collect();
+        assert_eq!(collapse_rejection_variants(&one_reason).len(), 1);
+
+        // K distinct reasons, interleaved rather than run-length ordered, so
+        // the collapse cannot be passing by only comparing against the group it
+        // just pushed.
+        let distinct = [
+            Rejection::HistogramMinMaxDropped { count: 1 },
+            Rejection::HistogramExemplarsDropped { count: 1 },
+            Rejection::ZeroTimestamp,
+            Rejection::MissingValue,
+            Rejection::ComplexAttributeValue,
+        ];
+        let mixed: Vec<Rejection> = (0..points)
+            .map(|i| distinct[i % distinct.len()].clone())
+            .collect();
+        assert_eq!(
+            collapse_rejection_variants(&mixed).len(),
+            distinct.len(),
+            "one group per distinct reason, whatever the entry count"
+        );
+    }
+
+    #[test]
+    fn collapse_rejection_variants_sums_the_point_count_of_the_entries_it_folds() {
+        // Grouping is on the whole value, so two `EmptyMetricName`s fold only
+        // when their counts match; they render differently otherwise and are
+        // distinct reasons. The folded group carries their summed point count.
+        let rejected = vec![
+            Rejection::EmptyMetricName { count: 3 },
+            Rejection::ZeroTimestamp,
+            Rejection::EmptyMetricName { count: 3 },
+            Rejection::EmptyMetricName { count: 4 },
+        ];
+        let groups = collapse_rejection_variants(&rejected);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0], (&Rejection::EmptyMetricName { count: 3 }, 6));
+        assert_eq!(groups[1], (&Rejection::ZeroTimestamp, 1));
+        assert_eq!(groups[2], (&Rejection::EmptyMetricName { count: 4 }, 4));
+    }
+
+    #[test]
+    fn build_error_message_is_byte_identical_to_rendering_every_entry_first() {
+        for series_cap_rejected in [0usize, 1, 4_096] {
+            for rejected in [
+                Vec::new(),
+                vec![Rejection::ZeroTimestamp],
+                std::iter::repeat_n(Rejection::HistogramMinMaxDropped { count: 1 }, 10_000)
+                    .collect(),
+                (0..10_000)
+                    .map(|i| Rejection::DuplicateLabelName(format!("label_{i}")))
+                    .collect(),
+                divergence_corpus(),
+            ] {
+                assert_eq!(
+                    build_error_message(&rejected, series_cap_rejected),
+                    render_first_reference(&rejected, series_cap_rejected),
+                    "collapsing changed the message for {} entries with cap {series_cap_rejected}",
+                    rejected.len()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -562,6 +970,180 @@ mod tests {
         assert_eq!(entries[0].unit, "bytes");
     }
 
+    /// A cumulative explicit-bucket histogram whose data point carries
+    /// `min`/`max`, which the Prometheus-convention mapping has nowhere to
+    /// store (ADR-0047 decision 6). The point itself is admitted, so the
+    /// rejection's `rejected_count()` is 0.
+    fn histogram_with_min_max_request() -> ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Histogram, HistogramDataPoint, Metric, ResourceMetrics, ScopeMetrics,
+            metric::Data as MetricData,
+        };
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "latency".to_string(),
+                        data: Some(MetricData::Histogram(Histogram {
+                            data_points: vec![HistogramDataPoint {
+                                time_unix_nano: BASE_TS_NS as u64,
+                                count: 3,
+                                sum: Some(6.0),
+                                bucket_counts: vec![1, 2],
+                                explicit_bounds: vec![1.0],
+                                min: Some(0.5),
+                                max: Some(4.0),
+                                ..Default::default()
+                            }],
+                            // AGGREGATION_TEMPORALITY_CUMULATIVE.
+                            aggregation_temporality: 2,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// `count` cleanly normalizing gauge points, one distinct series each, so
+    /// a bounded active-series cap turns away exactly `count - cap` of them
+    /// and nothing appears in `normalized.rejected`.
+    fn multi_series_gauge_request(count: usize) -> ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+            metric::Data as MetricData,
+        };
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: (0..count)
+                        .map(|i| Metric {
+                            name: format!("flood_series_{i}"),
+                            data: Some(MetricData::Gauge(Gauge {
+                                data_points: vec![NumberDataPoint {
+                                    time_unix_nano: BASE_TS_NS as u64,
+                                    value: Some(NumberValue::AsDouble(i as f64)),
+                                    ..Default::default()
+                                }],
+                            })),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// An informational drop costs no point, so `rejected_data_points` is 0
+    /// and `error_message` is the only channel that can tell the sender the
+    /// min/max fields are gone. A response that omitted the partial success
+    /// would be byte-identical to a clean write.
+    #[tokio::test]
+    async fn one_dropped_min_max_is_reported_and_the_point_still_lands() {
+        let state = state();
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            histogram_with_min_max_request(),
+            BASE_TS_NS,
+        )
+        .await
+        .expect("strict write publishes");
+
+        let partial_success = outcome
+            .response
+            .partial_success
+            .expect("the dropped min/max is reported");
+        assert_eq!(
+            partial_success.rejected_data_points, 0,
+            "no point was lost, only the histogram's min/max fields"
+        );
+        assert!(
+            partial_success.error_message.contains("min/max"),
+            "got: {}",
+            partial_success.error_message
+        );
+        assert!(
+            !outcome.tokens.is_empty(),
+            "the point itself is admitted, so at least one shard commits"
+        );
+    }
+
+    /// Every point normalizes cleanly and the layer-4 active-series cap turns
+    /// some away. Capped points never enter `normalized.rejected`, so a gate
+    /// reading only that list would report a fully clean write while real
+    /// points were lost. `admission_e2e.rs`'s `fresh_series_flood_capped_
+    /// per_tenant` covers the same shape over HTTP; this is the unit-level
+    /// guard on the gate itself.
+    #[tokio::test]
+    async fn a_series_cap_rejection_alone_is_reported() {
+        const CAP: usize = 3;
+        const FLOOD: usize = 10;
+
+        let state = state_with_admission_limits(AdmissionLimits {
+            max_active_series: CountLimit::Bounded(CAP as u64),
+            ..AdmissionLimits::default()
+        });
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            multi_series_gauge_request(FLOOD),
+            BASE_TS_NS,
+        )
+        .await
+        .expect("strict write publishes the admitted points");
+
+        let partial_success = outcome
+            .response
+            .partial_success
+            .expect("the capped series are reported");
+        assert_eq!(
+            partial_success.rejected_data_points,
+            (FLOOD - CAP) as i64,
+            "exactly the points beyond the cap are rejected"
+        );
+        assert!(
+            partial_success
+                .error_message
+                .contains("active series cap exceeded"),
+            "got: {}",
+            partial_success.error_message
+        );
+    }
+
+    /// Nothing rejected and nothing dropped: the response carries no partial
+    /// success at all. This is what a gate widened into always-`Some` breaks,
+    /// telling every sender its clean write was partial.
+    #[tokio::test]
+    async fn a_fully_clean_export_reports_no_partial_success() {
+        let state = state();
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            multi_series_gauge_request(3),
+            BASE_TS_NS,
+        )
+        .await
+        .expect("strict write publishes");
+
+        assert!(
+            outcome.response.partial_success.is_none(),
+            "nothing was rejected or dropped, got: {:?}",
+            outcome.response.partial_success
+        );
+        assert!(!outcome.tokens.is_empty(), "the points landed");
+    }
+
     #[tokio::test]
     async fn handle_export_reports_no_partial_success_when_nothing_rejected() {
         let state = state();
@@ -611,6 +1193,7 @@ mod tests {
             recovery: Some(writer),
             provisioning: None,
             metadata_sink: None,
+            normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         };
 
         let tenant = TenantId::new("acme");

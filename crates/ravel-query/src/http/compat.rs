@@ -24,11 +24,12 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
-use ravel_catalog::MetricKind;
+use ravel_catalog::{MetricKind, MetricMetadataEntry};
 
 use crate::http::json::ApiResponse;
 use crate::http::params::Params;
 use crate::http::{AppState, MetadataSnapshot};
+use crate::log_series::{LOG_BYTES_METRIC, LOG_LINES_METRIC};
 
 /// Git revision of the build, when the build environment provided one.
 ///
@@ -151,8 +152,41 @@ async fn metadata(State(state): State<AppState>, req: Request) -> Response {
         .and_then(|raw| raw.parse::<usize>().ok());
 
     let snapshot: MetadataSnapshot = cache.get(tenant.hash()).await;
-    let data = project(&snapshot, metric_filter.as_deref(), limit);
+    let mut entries: Vec<MetricMetadataEntry> = snapshot.to_vec();
+    entries.extend(log_metric_entries());
+    let data = project(&entries, metric_filter.as_deref(), limit);
     Json(ApiResponse::success(data)).into_response()
+}
+
+/// The two reserved log metric names' metadata (ADR-1103), synthesized
+/// here rather than ever stored in the cache: they are query-time derived
+/// series, not an ingested family, so no ingest sink ever writes a
+/// `MetricMetadataEntry` for them. Always present on the normal path
+/// (a tenant that resolves and has a cache attached), subject to the same
+/// `metric`/`limit` projection as any cached entry. `updated_unix_ns` plays
+/// no part in `project`'s output, so `0` is fine here.
+fn log_metric_entries() -> [MetricMetadataEntry; 2] {
+    [
+        MetricMetadataEntry {
+            family_name: LOG_LINES_METRIC.to_string(),
+            kind: MetricKind::Gauge,
+            help: "One sample per log line, value 1, derived from the logs \
+                   signal at query time (ADR-1103); count_over_time counts \
+                   lines."
+                .to_string(),
+            unit: String::new(),
+            updated_unix_ns: 0,
+        },
+        MetricMetadataEntry {
+            family_name: LOG_BYTES_METRIC.to_string(),
+            kind: MetricKind::Gauge,
+            help: "One sample per log line whose value is the line body's \
+                   length in bytes (ADR-1103); sum_over_time sums bytes."
+                .to_string(),
+            unit: "bytes".to_string(),
+            updated_unix_ns: 0,
+        },
+    ]
 }
 
 /// Project a cached record into Prometheus' `data` map: one length-1 array per
@@ -416,7 +450,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let data = json["data"].as_object().expect("data object");
-        assert_eq!(data.len(), 3);
+        // 3 seeded families plus the 2 reserved log metrics (ADR-1103),
+        // always present alongside whatever the cache holds.
+        assert_eq!(data.len(), 5);
+        assert!(data.contains_key("ravel_log_lines"));
+        assert!(data.contains_key("ravel_log_bytes"));
         assert_eq!(json["data"]["bbb_bytes"][0]["type"], "gauge");
         assert_eq!(json["data"]["bbb_bytes"][0]["unit"], "bytes");
         assert_eq!(json["data"]["ccc_seconds"][0]["help"], "c help");

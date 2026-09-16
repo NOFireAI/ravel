@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ravel_types::TenantHash;
 
 use crate::attribution::TenantPutAttribution;
-use crate::metrics::FlushTrigger;
+use crate::metrics::{FlushTrigger, ShardSkew, ShardSkewStats};
 
 #[derive(Debug, Default)]
 pub struct SpanIngestMetrics {
@@ -48,10 +48,18 @@ pub struct SpanIngestMetrics {
     /// paths. Excludes each path's first attempt.
     put_retries: AtomicU64,
     /// Flushes abandoned because a PUT exhausted its retry budget or
-    /// `max_flush_lifetime` elapsed first
-    /// ([`crate::SpanWriteError::Abandoned`]). A durability signal: the input
-    /// was fine, the object store did not accept it in time.
+    /// `max_flush_lifetime` elapsed while the flush's own store calls were in
+    /// flight ([`crate::SpanWriteError::Abandoned`]). A durability signal about
+    /// the object store: the flush held a permit and its PUTs did not land in
+    /// time. Split from `abandoned_queue_deadline`, which never reached a store
+    /// call.
     abandoned_retry_exhausted: AtomicU64,
+    /// Flushes abandoned because their flush-open deadline elapsed while still
+    /// queued for a `max_inflight_flushes` permit, before any store call
+    /// ([`crate::SpanWriteError::Abandoned`], issue #1739). A contention signal,
+    /// distinct from `abandoned_retry_exhausted` so a deadline reached in the
+    /// queue is not read as the store failing to accept a PUT.
+    abandoned_queue_deadline: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the RSPAN build, data-key derivation, or commit-record
     /// build failed ([`crate::SpanWriteError::SegmentBuild`]). A client
@@ -69,6 +77,25 @@ pub struct SpanIngestMetrics {
     /// Distinct span shard actors observed dead by the router. Counted once
     /// per shard on the first observation, so it never exceeds `shard_count`.
     shard_deaths: AtomicU64,
+    /// Flush-open stamps raised to this writer's monotonic floor because the
+    /// injected clock read below the previous stamp (ADR-1307), the
+    /// span-pipeline counterpart of [`crate::IngestMetrics`]'s own counter.
+    /// Intended for Prometheus export under the name
+    /// `ravel_ingest_clock_regressions_total` (#1473).
+    clock_regressions: AtomicU64,
+    /// Flushes refused because the backwards step exceeded the monotonic hold
+    /// bound `MAX_FLUSH_CLOCK_HOLD_NS` (ADR-1307): counted separately from
+    /// `clock_regressions` (absorbed). Intended for Prometheus export under the
+    /// name `ravel_ingest_clock_regressions_refused_total` (#1473).
+    clock_regressions_refused: AtomicU64,
+    /// Tenants still buffered after a TEARDOWN `flush_all` (`Shutdown`, channel
+    /// close) exhausted its bounded retry passes (ADR-1307 finding F1): a lost
+    /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
+    /// durability defect, logged at ERROR beside this bump. Residue on a
+    /// `FlushNow` drain is not counted here: the actor keeps running with those
+    /// tenants buffered, so the next trigger retries them and nothing is lost
+    /// (logged at WARN instead).
+    flush_all_residue_tenants: AtomicU64,
     /// Multi-shard Strict writes that returned
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably and at least one sibling then failed in the same
@@ -90,12 +117,28 @@ pub struct SpanIngestMetrics {
     grace_extended_stale_flushes: AtomicU64,
     /// Per-shard count of flushes whose flush task has been spawned but has
     /// not yet acked its waiters (ADR-0067 decisions 1-2, the span-pipeline
-    /// counterpart of [`crate::IngestMetrics`]'s own gauge). Keyed by shard
+    /// counterpart of [`crate::IngestMetrics`]'s own gauge), counted from the
+    /// moment the buffer leaves the actor: a task still waiting for its
+    /// `max_inflight_flushes` permit is included, because it holds a flush
+    /// window of memory and its ADR-0069 byte charge exactly as an executing
+    /// one does (ADR-1642). So this can exceed `max_inflight_flushes` per
+    /// shard: the bound caps concurrent execution, not how many flushes are
+    /// spawned and waiting. Keyed by shard
     /// index; a shard with no flush in flight has no entry, equivalent to 0.
     /// Not part of [`SpanIngestMetricsSnapshot`]'s flat counters because it is
     /// a gauge with a per-shard dimension, unlike everything else here; read it
     /// via [`SpanIngestMetrics::in_flight_flushes_by_shard`].
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
+    /// Per-shard ingest-skew accounting (issue #865), the span-pipeline
+    /// counterpart of [`crate::IngestMetrics`]'s own and
+    /// [`crate::LogIngestMetrics`]'s own. Only the flush-permit-wait span is
+    /// recorded on this pipeline today, at the `max_inflight_flushes` acquire
+    /// in `span_shard.rs`; the on-actor and off-actor spans issue #865 never
+    /// wired up here.
+    ///
+    /// Preallocated by [`SpanIngestMetrics::new`]; `default()` allocates none
+    /// and therefore records nothing, exactly as [`crate::IngestMetrics`] does.
+    shard_skew: ShardSkew,
     /// Bounded-cardinality per-tenant PUT attribution (ADR-0076 decision 2),
     /// the span-pipeline counterpart of [`crate::IngestMetrics`]'s own. Carries
     /// a per-tenant dimension, so it stays bounded by a top-K cap rather than
@@ -114,21 +157,84 @@ pub struct SpanIngestMetricsSnapshot {
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
+    /// Flushes abandoned by their flush-open deadline while queued for a permit,
+    /// before any store call (issue #1739). Distinct from
+    /// `abandoned_retry_exhausted` (a store failure).
+    pub abandoned_queue_deadline: u64,
     pub abandoned_input_rejected: u64,
     pub buffered_bytes_total: u64,
     pub buffered_spans_total: u64,
     pub acks_ok: u64,
     pub acks_err: u64,
     pub shard_deaths: u64,
+    /// Flush-open stamps raised to this writer's monotonic floor after a
+    /// backwards clock step (ADR-1307). Intended for export as
+    /// `ravel_ingest_clock_regressions_total` (#1473).
+    pub clock_regressions: u64,
+    /// Flushes refused because the backwards step exceeded the monotonic hold
+    /// bound (ADR-1307). Intended for export as
+    /// `ravel_ingest_clock_regressions_refused_total` (#1473).
+    pub clock_regressions_refused: u64,
+    /// Tenants left buffered after a teardown `flush_all` (`Shutdown`, channel
+    /// close) exhausted its retry passes (ADR-1307 finding F1): a lost
+    /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
+    /// durability defect. A `FlushNow` drain does not bump it (the actor keeps
+    /// running and retries the residue).
+    pub flush_all_residue_tenants: u64,
     /// Multi-shard Strict writes returned as
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): a partial
     /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
     pub partial_writes: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
+    /// Sum across shards of [`SpanIngestMetrics::in_flight_flushes_by_shard`]
+    /// at snapshot time. The per-shard breakdown does not fit this struct's
+    /// flat Copy shape; call `in_flight_flushes_by_shard` directly for that.
+    pub in_flight_flushes_total: u64,
+    /// Sum across shards of `flush_permit_wait_ns` from
+    /// [`SpanIngestMetrics::shard_skew_by_shard`] at snapshot time: total
+    /// injected-`Clock` nanoseconds every flush task has spent waiting on its
+    /// shard's `max_inflight_flushes` semaphore. The per-shard breakdown does
+    /// not fit this struct's flat Copy shape; call `shard_skew_by_shard`
+    /// directly for that.
+    pub flush_permit_wait_ns_total: u64,
 }
 
 impl SpanIngestMetrics {
+    /// Metrics for a span router whose generation-0 set has `shard_count`
+    /// shards. Preallocates the lock-free per-shard skew accumulator (issue
+    /// #865) so the flush-permit-wait record indexes straight into the slice
+    /// with no lock; see [`crate::metrics::SHARD_SKEW_CAPACITY`] for why the
+    /// capacity is not `shard_count`.
+    ///
+    /// `SpanIngestMetrics::default()` allocates none, matching
+    /// [`crate::IngestMetrics::default`], which suits the tests and sinks that
+    /// never read the per-shard counters.
+    pub fn new(shard_count: u32) -> Self {
+        SpanIngestMetrics {
+            shard_skew: ShardSkew::with_capacity(shard_count),
+            ..Default::default()
+        }
+    }
+
+    /// One flush task's injected-`Clock` wait on shard `shard`'s
+    /// `max_inflight_flushes` semaphore (issue #865), the span-pipeline
+    /// counterpart of [`crate::LogIngestMetrics`]'s own. Recorded inside the
+    /// spawned flush task, where the acquire happens: a rising figure means
+    /// tasks are queuing for a permit while the actor keeps draining.
+    pub(crate) fn record_shard_flush_permit_wait_ns(&self, shard: u32, wait_ns: u64) {
+        self.shard_skew.record_flush_permit_wait_ns(shard, wait_ns);
+    }
+
+    /// Point-in-time per-shard skew figures, sorted by shard index (issue
+    /// #865), the span counterpart of
+    /// [`crate::IngestMetrics::shard_skew_by_shard`]. A shard with no recorded
+    /// activity is simply absent. Only `flush_permit_wait_ns` is ever nonzero
+    /// on this pipeline today; see the field doc on `shard_skew`.
+    pub fn shard_skew_by_shard(&self) -> Vec<(u32, ShardSkewStats)> {
+        self.shard_skew.by_shard()
+    }
+
     pub(crate) fn record_flush(&self, trigger: FlushTrigger) {
         let counter = match trigger {
             FlushTrigger::Size => &self.flushes_by_size,
@@ -160,10 +266,20 @@ impl SpanIngestMetrics {
         self.put_retries.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A flush abandoned by retry-budget or lifetime exhaustion
-    /// ([`crate::SpanWriteError::Abandoned`]): a durability signal, retryable.
+    /// A flush abandoned by retry-budget or lifetime exhaustion while its own
+    /// store calls were in flight ([`crate::SpanWriteError::Abandoned`]): a
+    /// durability signal, retryable.
     pub(crate) fn record_abandoned_retry_exhausted(&self) {
         self.abandoned_retry_exhausted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A flush abandoned because its flush-open deadline elapsed while it was
+    /// queued for a permit, before any store call
+    /// ([`crate::SpanWriteError::Abandoned`], issue #1739): a contention signal,
+    /// retryable.
+    pub(crate) fn record_abandoned_queue_deadline(&self) {
+        self.abandoned_queue_deadline
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -191,6 +307,28 @@ impl SpanIngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush whose flush-open stamp was raised to this writer's monotonic
+    /// floor because the clock read below the previous stamp (ADR-1307).
+    pub(crate) fn record_clock_regression(&self) {
+        self.clock_regressions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush refused because the backwards step exceeded the monotonic hold
+    /// bound `MAX_FLUSH_CLOCK_HOLD_NS` (ADR-1307).
+    pub(crate) fn record_clock_regression_refused(&self) {
+        self.clock_regressions_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `count` tenants still buffered after a teardown `flush_all` drained
+    /// (ADR-1307 finding F1). Called once per teardown drain that leaves a
+    /// residue; never from the `FlushNow` drain, which retries its residue on
+    /// the next trigger.
+    pub(crate) fn record_flush_all_residue(&self, count: u64) {
+        self.flush_all_residue_tenants
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     /// One multi-shard Strict write returned as
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably before a sibling failed. Recorded once per such write,
@@ -199,9 +337,10 @@ impl SpanIngestMetrics {
         self.partial_writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Adjusts shard `shard`'s in-flight-flush gauge by `delta` (+1 when a
-    /// flush task is spawned, -1 when it ends, including on panic via
-    /// `span_shard`'s `InFlightFlushGuard`). Poison recovery rather than a
+    /// Adjusts shard `shard`'s in-flight-flush gauge by `delta`. Both deltas
+    /// belong to `span_shard`'s `InFlightFlushGuard`: +1 in its constructor, -1
+    /// in its `Drop`, including on panic. Nothing else may call this, or the
+    /// two can disagree. Poison recovery rather than a
     /// panic on a poisoned lock: a gauge is best-effort self-observability, not
     /// a durability path, so a prior panicked holder must not take this one
     /// down with it.
@@ -229,6 +368,20 @@ impl SpanIngestMetrics {
         counts
     }
 
+    /// Shard `shard`'s raw signed in-flight-flush count, before the clamp
+    /// [`SpanIngestMetrics::in_flight_flushes_by_shard`] applies on read. Tests
+    /// only: the clamp is what hides an unbalanced increment/decrement pair
+    /// from the public reader, so a test that the pair cannot come apart has
+    /// to see the sign.
+    #[cfg(test)]
+    pub(crate) fn in_flight_flushes_signed(&self, shard: u32) -> i64 {
+        let map = self
+            .in_flight_flushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&shard).copied().unwrap_or(0)
+    }
+
     pub(crate) fn record_stale_provisioning_flush(&self) {
         self.stale_provisioning_flushes
             .fetch_add(1, Ordering::Relaxed);
@@ -248,15 +401,29 @@ impl SpanIngestMetrics {
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
+            abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
             abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
             buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),
             buffered_spans_total: self.buffered_spans_total.load(Ordering::Relaxed),
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
             acks_err: self.acks_err.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
+            clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
+            clock_regressions_refused: self.clock_regressions_refused.load(Ordering::Relaxed),
+            flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
+            in_flight_flushes_total: self
+                .in_flight_flushes_by_shard()
+                .into_iter()
+                .map(|(_, count)| count)
+                .sum(),
+            flush_permit_wait_ns_total: self
+                .shard_skew_by_shard()
+                .into_iter()
+                .map(|(_, stats)| stats.flush_permit_wait_ns)
+                .sum(),
         }
     }
 }
@@ -278,7 +445,10 @@ mod tests {
     /// the expected one, so an increment leaking into a second counter fails
     /// here rather than being read as a plausible number later.
     fn assert_only(record: impl FnOnce(&SpanIngestMetrics), expected: SpanIngestMetricsSnapshot) {
-        let metrics = SpanIngestMetrics::default();
+        // shard_skew needs a preallocated cell for shard 0 to record anything
+        // (see `ShardSkew::with_capacity`), so this builds through `new` rather
+        // than `default`; every other counter here is unaffected by shard count.
+        let metrics = SpanIngestMetrics::new(1);
         record(&metrics);
         assert_eq!(metrics.snapshot(), expected);
     }
@@ -321,6 +491,13 @@ mod tests {
             },
         );
         assert_only(
+            SpanIngestMetrics::record_abandoned_queue_deadline,
+            SpanIngestMetricsSnapshot {
+                abandoned_queue_deadline: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
             SpanIngestMetrics::record_abandoned_input_rejected,
             SpanIngestMetricsSnapshot {
                 abandoned_input_rejected: 1,
@@ -335,9 +512,37 @@ mod tests {
             },
         );
         assert_only(
+            SpanIngestMetrics::record_clock_regression,
+            SpanIngestMetricsSnapshot {
+                clock_regressions: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            SpanIngestMetrics::record_clock_regression_refused,
+            SpanIngestMetricsSnapshot {
+                clock_regressions_refused: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_flush_all_residue(3),
+            SpanIngestMetricsSnapshot {
+                flush_all_residue_tenants: 3,
+                ..Default::default()
+            },
+        );
+        assert_only(
             SpanIngestMetrics::record_partial_write,
             SpanIngestMetricsSnapshot {
                 partial_writes: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_shard_flush_permit_wait_ns(0, 700),
+            SpanIngestMetricsSnapshot {
+                flush_permit_wait_ns_total: 700,
                 ..Default::default()
             },
         );

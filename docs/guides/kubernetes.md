@@ -108,13 +108,14 @@ request signatures.
 
 ### Secrets
 
-`kind-up.sh` creates the two Secrets that the `RavelCluster` references, rather
-than commit them as manifests. A committed Secret manifest puts credentials in
-git and invites someone to copy it into a real cluster.
+`kind-up.sh` creates the three Secrets that the `RavelCluster` references,
+rather than commit them as manifests. A committed Secret manifest puts
+credentials in git and invites someone to copy it into a real cluster.
 
 - `ravel-s3-credentials`, keys `accessKeyId` and `secretAccessKey`.
 - `ravel-tenant-tokens`, where each key is a tenant name and its value is that
   tenant's bearer token.
+- `ravel-audit-token-key`, key `key` holding the query-audit token key.
 
 ### The same environment in CI
 
@@ -168,9 +169,46 @@ Services in whatever namespace each `RavelCluster` lives in. Its ClusterRole
 grants the full lifecycle of Deployments, Services, Ingresses,
 `gateway.networking.k8s.io` HTTPRoutes/GRPCRoutes, and the ServiceAccounts,
 Roles, and RoleBindings it renders for the `ravelNative` ingest router,
-plus `RavelCluster` and its status subresource, `get` on Secrets, and
+plus `RavelCluster` and its status subresource, `get` on Secrets,
 `get`/`list`/`watch` on `endpointslices` (needed to create the router's own
-least-privilege Role). It never lists, writes, or watches Secrets.
+least-privilege Role), and `get` on the non-resource URL `/version`. It
+never lists, writes, or watches Secrets.
+
+**Minimum Kubernetes version: 1.30.** Every rendered ravel-server container
+carries a `preStop` `SleepAction`, gated by Kubernetes'
+`PodLifecycleSleepAction` feature (KEP-3960): alpha and off by default in
+1.29, beta and **on by default** from 1.30, stable (and no longer gateable)
+from 1.34. Below 1.30 the field is dropped, by one of two mechanisms
+depending on how far below: on 1.29 the field exists in the apiserver's
+type but the gate is off, so `dropDisabledFields` zeroes it out on
+admission and the Pod comes up with no error and no preStop sleep at all;
+on 1.28 and earlier the field is unrecognized by that apiserver's older
+type, and with the default `fieldValidation` of `Warn` the apiserver drops
+it and returns a Warning response header rather than rejecting the
+request -- not silent at the API, but nothing in the operator surfaces
+that header today. Either way the Pod looks healthy in isolation, but it
+means every rolling update can drop in-flight ingest for that pod across
+the endpoint-propagation window, since nothing holds the container open
+while its endpoint is withdrawn. The operator reads the cluster's version
+once at startup (via the `/version` grant above) so this has somewhere to
+surface: on a cluster below the floor it raises a
+`KubernetesVersionUnsupported` condition on every `RavelCluster` rather
+than leaving the drop silent -- see "Status" below. It fails open (raises
+nothing) when it cannot read the version at all, so an RBAC gap or a
+`/version` blip never produces a false warning. The version is read once at
+process startup, not per reconcile, so a control-plane upgrade across the
+floor does not clear the condition on its own -- it clears only once the
+operator pod itself restarts and re-reads `/version`. Note the floor only
+asserts the gate's default: a control-plane operator can still have
+disabled `PodLifecycleSleepAction` manually on a 1.30-1.33 cluster, and this
+check, which only reads the apiserver version, cannot detect that. The gate
+also lives in the kubelet, not only the apiserver, and Kubernetes' supported
+skew policy allows a kubelet up to three minors behind the control plane: a
+1.32 apiserver with a 1.29 node pool reports 1.32 to this check and passes
+it, but `PodLifecycleSleepAction` is off by default on those nodes, so the
+preStop hook is dropped for pods scheduled there -- a kubelet below the
+floor within the supported skew window is equally invisible to a check that
+only reads the apiserver version.
 
 ## `RavelCluster` reference
 
@@ -194,10 +232,12 @@ A minimal example is in
 | `spec.storage.s3.credentialsSecretRef.name` | string | required | Secret with keys `accessKeyId` and `secretAccessKey`. |
 | `spec.tenantTokensSecretRef.name` | string | none | Secret whose keys are tenant names and whose values are bearer tokens. |
 | `spec.deploymentKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters or 32 raw bytes): the deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
+| `spec.auditTokenKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters): the query-audit token key. Omit on a cluster with `deploymentKeySecretRef` set. See "Query-audit token key" below. |
 | `spec.gateway.replicas` | integer | `1` | |
 | `spec.gateway.resources` | object | none | `requests` / `limits` maps, as in a Pod spec. |
 | `spec.gateway.fold.disabled` | boolean | `false` | `--disable-fold`. Fold is a query-cost optimization only; disabling it never changes results. |
 | `spec.gateway.fold.intervalSecs` | integer | none | `--fold-interval-secs`. |
+| `spec.gateway.maxInflightFlushes` | integer | `1` | `--max-inflight-flushes`. Per-shard cap on concurrent flushes. This is the cross-tenant flush isolation control, not only a throughput knob: at `1` one tenant's stalled flush blocks co-resident tenants' flushes on that shard, so raise it to bound that. Gateway-only (ingest runs in no other tier). Omit to keep the server default of `1`; `0` is rejected at admission. |
 | `spec.gateway.ingestAffinity` | object | none | Layer-7 ingest affinity. Omit and nothing is rendered. Present, it pins tenant identity to a stable subset of gateway replicas, cutting flush PUTs by `replicas / subsetSize`, via one of two backends. Full reference, backend comparison, and sizing guidance in [ingest-affinity.md](ingest-affinity.md). |
 | `spec.gateway.ingestAffinity.enabled` | boolean | `true` | `false` deletes the rendered objects and returns to the affinity-absent render. |
 | `spec.gateway.ingestAffinity.backend` | string | `ingressNginx` | `ingressNginx` (deprecated, renders Ingress objects) or `ravelNative` (renders the `ravel-ingest-router` service). Omitting it keeps an existing CR's backend. |
@@ -213,6 +253,7 @@ A minimal example is in
 | `spec.query.replicas` | integer | `1` | |
 | `spec.query.resources` | object | none | |
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. |
+| `spec.maintain.replicas` | integer | `1` | |
 | `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. |
 | `spec.maintain.resources` | object | none | |
 | `spec.gc.protectionHorizon` | string | none | `--gc-protection-horizon` on the maintain pods, a duration such as `25h5m`. It must equal the protection horizon stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
@@ -274,27 +315,136 @@ subcommands, see
 [operations/configuration.md](operations/configuration.md#tenancy-setup) and
 the [CLI flag reference](../reference/ravel-cli-flags.md).
 
+### Query-audit token key
+
+The query Deployment reads `RAVEL_AUDIT_TOKEN_KEY` from a Secret's `key`
+field when audit logging is enabled. Gateway and maintain Deployments never
+read this key.
+
+Set `spec.auditTokenKeySecretRef` to a Secret the platform owner creates,
+the same way they create the S3 credentials and tenant-tokens Secrets:
+
+```sh
+kubectl create secret generic ravel-audit-token-key \
+  --namespace ravel-system \
+  --from-literal="key=$(openssl rand -hex 32)"
+```
+
+Its `key` field must hold exactly 64 hex characters (32 bytes).
+
+Omit `auditTokenKeySecretRef` when `spec.deploymentKeySecretRef` is set: the
+server derives the key from the deployment key, and nothing further is
+needed.
+
+Omit both and the query Deployment cannot start with audit tokenization
+enabled: the operator does not generate this Secret (its `secrets` RBAC
+grants `get` only, so it cannot create or patch one), so the `RavelCluster`
+reports a `Degraded` condition with reason `AuditTokenKeyMissing` and
+leaves the query Deployment exactly as it is -- any existing query pods
+keep serving on their current spec -- until `auditTokenKeySecretRef` (or
+`deploymentKeySecretRef`) is set.
+
 ### Managed objects
 
 For a `RavelCluster` named `dev`:
 
 | Object | Kind | Notes |
 |---|---|---|
+| `dev-qualify` | Job | One-shot `ravel-cli store qualify` run, before any serving Deployment exists. Recreated when its inputs change; see [store qualification](#store-qualification). |
 | `dev-gateway` | Deployment | `--mode gateway`, RollingUpdate. |
 | `dev-gateway` | Service | Ports 4318 (HTTP/OTLP/query API) and 4317 (OTLP/gRPC). |
 | `dev-query` | Deployment | `--mode query`, RollingUpdate. |
 | `dev-query` | Service | Port 4318. |
-| `dev-maintain` | Deployment | `--mode maintain`, one replica, `Recreate` strategy. Absent when `maintain.enabled` is `false`. |
+| `dev-maintain` | Deployment | `--mode maintain`, `spec.maintain.replicas` replicas (default 1), `RollingUpdate` strategy. Absent when `maintain.enabled` is `false`. |
 | `dev-gateway-ingest` | Ingress | OTLP/HTTP ingest under the tenant-affinity hash. Only under `ingestAffinity` enabled on `backend: ingressNginx`. |
 | `dev-gateway-ingest-grpc` | Ingress | The same for OTLP/gRPC. Additionally absent when `ingestAffinity.grpc` is `false`. |
 | `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative`. See [ingest-affinity.md](ingest-affinity.md). |
 | `dev-gateway-route` | HTTPRoute | Gateway API exposure. Only under `gateway.exposure.gatewayApi`, independent of the backend. |
 | `dev-gateway-route-grpc` | GRPCRoute | The same for OTLP/gRPC. Absent when `exposure.gatewayApi.grpc` is `false`. |
 
-Maintain is pinned to one replica with `Recreate` to avoid rolling-update
-overlap. This is not an at-most-one guarantee, and correctness does not need
-one. Because of the CAS commit protocol, a second concurrent maintainer cannot
-corrupt committed state; it only wastes work.
+Maintain renders `RollingUpdate`, the same as gateway and query, and defaults
+to one replica but is not pinned there. Maintenance ownership is heartbeat
+membership plus rendezvous hashing, deliberately not a lease: each maintain
+process overwrites a self-owned heartbeat key under
+`sys/maintain/workers/<process_id>` in object storage on a heartbeat
+interval, every process lists that prefix to compute the live set of workers
+whose heartbeat is recent enough, and all of them partition the
+`(tenant, signal, shard)` unit space over that live set by rendezvous
+(highest-random-weight) hashing. Nothing is renewed and nothing expires:
+once a heartbeat falls outside the staleness window its owner is treated as
+gone and its units are taken over on the next interval, and a process that
+comes back rejoins by writing its heartbeat again. The keyspace, the
+heartbeat interval, and the staleness window are specified in
+[catalog-and-mvcc.md](../catalog-and-mvcc.md#key-layout-all-under-one-bucket-root);
+the `LeaseCheck` trait in the codebase is an unrelated garbage-collection
+reader-protection gate and plays no part here. A rolling restart can leave
+an old and a new pod briefly claiming overlapping units at once. That only
+duplicates work. It does not corrupt committed state, so scaling
+`spec.maintain.replicas` above one is safe.
+
+### Store qualification
+
+Before it creates any serving Deployment, the operator renders a one-shot
+`<cluster>-qualify` Job that runs `ravel-cli store qualify` against the
+cluster's bucket, and holds the gateway, query, and maintain Deployments until
+it succeeds. This is the same check the [deployment
+guide](operations/deployment.md#qualify-the-store) has you run by hand
+against a bucket you manage yourself; the operator runs it for you so a fresh
+`RavelCluster` never comes up as three tiers crash-looping on a backend that
+fails the [object-store contract](../object-store-contract.md). On a fresh
+cluster no serving pod is created until the Job passes, so there is no
+crash-loop to observe: the Deployments do not exist yet. On a cluster
+that is already serving and re-qualifying after a config edit, the existing
+Deployments are left running the previous spec while the new Job proves the
+new inputs. During that hold `observedGeneration` advances to the edited
+generation and `Available` stays `True` on the previous spec's ready
+replicas, so after a spec edit that changed a qualified input (the server
+image, for one) do not treat `Available` alone as "the new spec has rolled
+out": wait for `StoreQualified=True` at
+`observedGeneration == .metadata.generation` as well, because `Available`
+can report ready before any pod has moved to the new spec.
+
+The Job is recreated only when its inputs change: the bucket, region,
+endpoint, server image, or the shared credentials Secret's name or
+`resourceVersion`. Rotating that Secret in place bumps its `resourceVersion`,
+so a rotation to credentials that no longer pass qualification re-qualifies
+too, within one resync interval; an unrelated spec edit (a replica count, a
+fold interval) does not. Qualification itself stays once-per-bucket: passing
+it durably records `sys/qualification` in the bucket, so a qualified bucket
+handed to a new `RavelCluster` with the same inputs still gets its own Job
+run (the gate reads this `RavelCluster`'s own status, not the bucket record).
+That run re-runs the full conformance suite rather than short-circuiting on
+the existing record: the suite issues dozens of object operations against
+the bucket, several of them concurrent rather than sequential, so the Job
+can sit for minutes even on a bucket you know is qualified. It passes if the
+backend still satisfies the contract, and the final `sys/qualification`
+write is then a no-op, unless the stored record predates this binary's
+suite version, in which case the run overwrites it in place and reports
+that it upgraded the record. Because qualification now runs on every input
+change rather than only when you run it by hand, the transient scratch each
+run leaves under `sys/qualify/<run-id>/` accumulates without you choosing
+to; the [deployment guide](operations/deployment.md#qualify-the-store)
+describes that scratch and why nothing deletes it.
+
+Progress and failure surface on the `StoreQualified` condition below, not as
+a Job failure you have to go find: `Pending` while the Job is being created
+or is still running, `Succeeded` once it passes, `Failed` once a qualify Job
+reports failure (the message names the consecutive-attempt count and the
+next retry time, so `Failed` on its own is not terminal). A failing Job is
+recreated on a capped exponential backoff (30 s doubling to 480 s) for the
+first five consecutive failures; after six it holds for an hour before
+trying again, and only a qualified-input change clears that hold early.
+Fixing the backend outside the `RavelCluster` spec (a bucket policy, an IAM
+grant, a network route) does not shorten the hold, because no hashed input
+changed. `kubectl describe job <cluster>-qualify` and its pod logs give the
+underlying `store qualify` failure, but only for about an hour:
+the Job and its pod are garbage-collected an hour after they finish, on the
+success and failure paths alike, so the `StoreQualified` condition message is
+the durable record and the Job is best-effort within that window.
+
+None of this applies if you run `ravel-server` against a bucket outside a
+`RavelCluster`: nothing qualifies it for you, and you are on the hand-run
+path in the deployment guide.
 
 ### Status
 
@@ -303,16 +453,35 @@ kubectl get -n ravel-system ravelcluster dev -o jsonpath='{.status}'
 ```
 
 `status` carries `observedGeneration`, `gatewayReadyReplicas`,
-`queryReadyReplicas`, `maintainReadyReplicas`, and conditions. The operator
-writes two condition types: `Available` and `Degraded`. It emits no
-`Progressing` condition, so do not wait on one.
+`queryReadyReplicas`, `maintainReadyReplicas`, `storeQualifiedHash`,
+`qualifyFailureCount`, `qualifyNextRetryTime`, `qualifyRetryHash`,
+`gcBootstrapWaitingSince`, and conditions. `qualifyFailureCount` and
+`qualifyNextRetryTime` are the machine-readable form of the retry-budget
+state the `StoreQualified` message describes in prose. Besides `Available`
+and `Degraded`, the operator writes a `StoreQualified` condition on every
+pass: `True` with reason `Succeeded` once the store is qualified for the
+current inputs, `False` with `Pending` or `Failed` while it is not. A steady,
+healthy cluster therefore always shows `StoreQualified=True`; it is not a
+transient the gate sets only during a hold. It emits no `Progressing`
+condition, so do not wait on one.
 
 `Available=True` means the gateway and query Deployments both report ready
 replicas. `kubectl wait --for=condition=Available` is therefore a usable
-readiness gate for scripts and CI. If a reconcile fails (a missing Secret,
+readiness gate for scripts and CI, with one caveat after a spec edit: during
+a re-qualification `Available` stays `True` on the previous spec's replicas
+while `observedGeneration` advances, so a `wait` on `Available` alone can
+return before the new spec has rolled out. Gate on `StoreQualified=True` at
+`observedGeneration == .metadata.generation` as well, as described under
+Store qualification above. If a reconcile fails (a missing Secret,
 an apply error), the operator writes a `Degraded=True` condition with the
 reason and flips `Available` to `False`. A `kubectl wait` then fails with an
 explanation instead of timing out silently.
+
+On a cluster below the Kubernetes 1.30 floor (see "Installing the operator
+yourself" above), every `RavelCluster` also carries a
+`KubernetesVersionUnsupported=True` condition naming the floor and the
+detected version, alongside `Available`/`Degraded` rather than instead of
+them.
 
 ## Probe semantics
 
@@ -323,10 +492,16 @@ service and gets no probe.
 - `/healthz` (liveness): 200 whenever the HTTP listener is serving. It means
   the event loop is alive, and it never depends on store reachability, so a
   store outage cannot get healthy pods killed.
-- `/readyz` (readiness): 200 after startup completes (config parsed, the store
-  capability gate passed, listeners bound) and while the background
-  store-reachability probe is healthy. 503 before startup completes, and after
-  four consecutive failed probes until the next successful one.
+- `/readyz` (readiness): the AND of four conditions. 200 once startup completes
+  (config parsed, the store capability gate passed, listeners bound), while the
+  background store-reachability probe is healthy, while no ingest shard has been
+  condemned, and until SIGTERM flips the drain latch. 503 before startup
+  completes, after four consecutive failed probes until the next successful one,
+  once a shard actor exhausts its respawn budget, and for the whole drain. Only
+  the store-probe condition recovers on its own; a condemned shard holds the pod
+  out of its Service until someone rolls it, because readiness sheds traffic and
+  never restarts or reschedules a pod
+  ([troubleshooting](operations/troubleshooting.md)).
 
 `/-/healthy` and `/-/ready` are aliases for `/healthz` and `/readyz`, served by
 the same handlers for clients that probe Prometheus' own paths. Either
@@ -349,7 +524,10 @@ cluster.
 - Point `spec.storage.s3.endpoint` at real S3 (or omit it) and supply real
   credentials in the Secret.
 - Bucket lifecycle is the platform owner's job. The operator provisions no
-  buckets; the create-bucket Jobs exist only in the dev manifests.
+  buckets; the create-bucket Jobs exist only in the dev manifests. Store
+  qualification is not: the operator runs `ravel-cli store qualify` itself
+  for every `RavelCluster` (see [store qualification](#store-qualification)),
+  so a real bucket needs no hand-run qualify step before you apply one.
 - The operator does not expose the query Service outside the cluster. It renders
   ingest exposure only when you ask for it: `gateway.ingestAffinity` on
   `backend: ingressNginx` renders an ingest Ingress, `backend: ravelNative`
@@ -499,4 +677,6 @@ The operator's design, its condition set and its reconcile model are
 [ADR-0034](../adrs/0034-k8s-operator.md). The per-mode storage credential
 roles are ADR-0055; the deployment key and `sys/auth` ownership are ADR-0072;
 per-tenant resharding is ADR-0052; ingest affinity and the Gateway API
-exposure are ADR-0076 decision 1 and ADR-0080.
+exposure are ADR-0076 decision 1 and ADR-0080. Idempotent maintenance
+ownership by heartbeat membership and rendezvous hashing, deliberately not a
+lease, which is why maintain can run more than one replica, is ADR-0065.

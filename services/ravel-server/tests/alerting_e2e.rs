@@ -1423,6 +1423,7 @@ async fn evaluator_with_dead_remote(
         name: "west".to_string(),
         endpoint: endpoint.clone(),
         credential: "operator-cred".to_string(),
+        tenant: None,
         tls: false,
         tls_ca_file: None,
         skip_unavailable: true,
@@ -1433,6 +1434,7 @@ async fn evaluator_with_dead_remote(
     let federation = Federation::new(vec![RemoteCluster {
         name: "west".to_string(),
         fetcher: Arc::new(fetcher),
+        tenant: None,
         skip_unavailable: true,
         soft_timeout: Duration::from_secs(2),
     }]);

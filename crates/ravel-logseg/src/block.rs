@@ -872,6 +872,7 @@ pub struct DecodedBlock {
     pages_skipped: usize,
     page_bytes_fetched: u64,
     page_bytes_decoded: u64,
+    decompressed_bytes: u64,
 }
 
 impl DecodedBlock {
@@ -908,6 +909,16 @@ impl DecodedBlock {
     /// decode; strictly less whenever a projection skipped any present page.
     pub fn page_bytes_decoded(&self) -> u64 {
         self.page_bytes_decoded
+    }
+
+    /// Bytes zstd produced decompressing this block's pages: the sum, over
+    /// every page this decode actually decompressed (a raw/`COMP_NONE` page
+    /// counts nothing, it was never decompressed), of the decompressed buffer's
+    /// own length. A projection that skips a page decompresses nothing for it,
+    /// so this follows the column filter exactly as `page_bytes_decoded` does,
+    /// but in decompressed rather than stored units (issue #1401).
+    pub fn decompressed_bytes(&self) -> u64 {
+        self.decompressed_bytes
     }
 
     /// Whether this block carries any page for the `attrs_raw` overflow column.
@@ -1180,6 +1191,10 @@ pub struct PageCounters {
     pub skipped: usize,
     pub bytes_fetched: u64,
     pub bytes_decoded: u64,
+    /// Bytes zstd produced decompressing this block's pages (issue #1401). Only
+    /// a `COMP_ZSTD` page contributes, and it contributes its decompressed
+    /// buffer's actual length, so a short frame is counted as what it produced.
+    pub decompressed_bytes: u64,
 }
 
 /// Turns a block's page descriptors and their decompressed bytes into a
@@ -1231,6 +1246,7 @@ fn decode_columns(
         pages_skipped: counters.skipped,
         page_bytes_fetched: counters.bytes_fetched,
         page_bytes_decoded: counters.bytes_decoded,
+        decompressed_bytes: counters.decompressed_bytes,
     };
 
     for column_id in order {
@@ -1409,6 +1425,7 @@ mod tests {
                 pages_skipped: 0,
                 page_bytes_fetched: 0,
                 page_bytes_decoded: 0,
+                decompressed_bytes: 0,
             }
         }
 

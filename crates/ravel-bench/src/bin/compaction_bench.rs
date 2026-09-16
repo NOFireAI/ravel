@@ -301,7 +301,7 @@ async fn fetch_compaction_record(
         .first()
         .expect("a compaction record exists");
     let got = store.get(key, GetRange::Full).await.expect("get record");
-    CompactionRecord::decode(got.data.as_ref()).expect("decode record")
+    record::decode_compaction(got.data.as_ref()).expect("decode record")
 }
 
 /// Stored-byte + object-count scenario (§9 gate).

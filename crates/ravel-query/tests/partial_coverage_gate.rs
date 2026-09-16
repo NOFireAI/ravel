@@ -74,6 +74,7 @@ fn app(federated: bool) -> Router {
         let federation = Federation::new(vec![RemoteCluster {
             name: CLUSTER.to_string(),
             fetcher: Arc::new(AlwaysUnavailable),
+            tenant: None,
             skip_unavailable: true,
             soft_timeout: Duration::from_secs(5),
         }]);

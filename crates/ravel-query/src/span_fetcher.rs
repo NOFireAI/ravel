@@ -43,6 +43,7 @@
 use std::sync::Arc;
 
 use crate::fetcher::ReadCache;
+use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
@@ -161,6 +162,18 @@ pub enum SpanFetchError {
     },
     #[error("span segment {key} belongs to a different tenant than the query")]
     TenantMismatch { key: String },
+    /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
+    /// reservation for the bytes this GET would materialize. Carries only the
+    /// three accounting figures, never a key or tenant value. Mirrors
+    /// [`crate::FetchError::FetchMemoryExhausted`].
+    #[error(
+        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget already reserved"
+    )]
+    FetchMemoryExhausted {
+        requested: u64,
+        reserved: u64,
+        limit: u64,
+    },
 }
 
 /// Fetches and scans one RSPAN span segment at a time. Constructed with the
@@ -181,6 +194,20 @@ pub struct SpanSegmentFetcher {
     /// builds the RAM or RAM-over-disk variant the same way the metric and log
     /// fetchers do.
     cache: Option<ReadCache>,
+    /// Bounds in-flight object-store GETs (ADR-1195). This is this fetcher's
+    /// FIRST-EVER concurrency bound: before ADR-1195, `SpanSegmentFetcher` held
+    /// no semaphore at all and its GET concurrency was limited only by its
+    /// caller. `new` gives it a private limiter at
+    /// [`crate::fetcher::DEFAULT_MAX_CONCURRENT_GETS`]; [`Self::with_get_limiter`]
+    /// wires it to the one process-shared limiter every query-side fetcher can
+    /// hold instead.
+    get_limiter: Arc<crate::GetLimiter>,
+    /// The process-wide fetch memory budget (ADR-1170 decision 2). Each
+    /// whole-object GET reserves the object's size against it before the GET,
+    /// and the reservation travels with the returned bytes. Default unlimited
+    /// (never refuses); [`Self::with_memory_budget`] wires the shared one,
+    /// mirroring [`Self::with_get_limiter`].
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
 }
 
 impl SpanSegmentFetcher {
@@ -189,7 +216,69 @@ impl SpanSegmentFetcher {
             store,
             cfg: RspanConfig::default(),
             cache: None,
+            get_limiter: Arc::new(crate::GetLimiter::new_unchecked(
+                crate::fetcher::DEFAULT_MAX_CONCURRENT_GETS,
+            )),
+            memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         }
+    }
+
+    /// Wires this fetcher to a caller-owned [`ravel_memory::MemoryBudget`]
+    /// (ADR-1170 decision 2), so its whole-object GETs reserve against the same
+    /// budget as every other fetcher (and, via
+    /// [`crate::QueryEngine::with_memory_budget`], every other engine) holding
+    /// the same `Arc`. Mirrors [`Self::with_get_limiter`].
+    #[must_use]
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    /// This fetcher's current memory budget, for a test to `Arc::ptr_eq`.
+    #[cfg(test)]
+    pub(crate) fn memory_budget_for_test(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
+    }
+
+    /// Reserves `n` bytes against this fetcher's budget before a whole-object
+    /// GET, mapping a refusal to [`SpanFetchError::FetchMemoryExhausted`]. The
+    /// guard is owned for the fetched buffer's lifetime (ADR-1170 decision 2).
+    fn reserve_fetch(&self, n: u64) -> Result<ravel_memory::Reservation, SpanFetchError> {
+        self.memory_budget
+            .reserve(n)
+            .map_err(|e| SpanFetchError::FetchMemoryExhausted {
+                requested: e.requested,
+                reserved: e.reserved,
+                limit: e.limit,
+            })
+    }
+
+    /// Sets the in-flight GET bound by building a new private limiter. Shared
+    /// across this fetcher's clones; not shared with any other fetcher unless
+    /// [`Self::with_get_limiter`] is used instead.
+    #[must_use]
+    pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
+        self.get_limiter = Arc::new(crate::GetLimiter::new_unchecked(n.max(1)));
+        self
+    }
+
+    /// Wires this fetcher to a caller-owned [`crate::GetLimiter`] (ADR-1195),
+    /// so it draws GET permits from the same pool as every other fetcher (and,
+    /// via [`crate::QueryEngine::with_get_limiter`], every other engine)
+    /// holding the same `Arc`.
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: Arc<crate::GetLimiter>) -> Self {
+        self.get_limiter = limiter;
+        self
+    }
+
+    /// This fetcher's `GetLimiter` permit count (ADR-1195): the process-wide
+    /// GET concurrency bound, shared with every other fetcher and engine that
+    /// took the same `Arc` via [`Self::with_get_limiter`]. Mirrors
+    /// [`SegmentFetcher::get_limiter_permits`](crate::fetcher::SegmentFetcher::get_limiter_permits).
+    #[must_use]
+    pub fn get_limiter_permits(&self) -> usize {
+        self.get_limiter.permits()
     }
 
     /// Overrides the [`RspanConfig`] used for section-size caps when decoding.
@@ -282,14 +371,33 @@ impl SpanSegmentFetcher {
         }
 
         let key = &seg_ref.data_object_key;
-        let got = self
-            .store
-            .get(key, GetRange::Full)
-            .await
-            .map_err(|source| SpanFetchError::Store {
-                key: key.to_string(),
-                source,
-            })?;
+        // Reserve the whole object's bytes before the GET (ADR-1170 decision 2):
+        // a refusal fails typed with zero GETs. Held to the end of this call,
+        // covering the decode below; released when the fully-decoded rows are
+        // returned.
+        let _reservation = self.reserve_fetch(seg_ref.object_size)?;
+        // The permit covers the GET only; decode below runs without it, as on
+        // every other funnel.
+        let got = async {
+            let _permit = self
+                .get_limiter
+                .acquire()
+                .await
+                .map_err(|_| SpanFetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(
+                        "GetLimiter semaphore closed unexpectedly".to_string(),
+                    ),
+                })?;
+            self.store
+                .get(key, GetRange::Full)
+                .await
+                .map_err(|source| SpanFetchError::Store {
+                    key: key.to_string(),
+                    source,
+                })
+        }
+        .await?;
 
         // Unaccounted entry point: the page-byte fold lands in a throwaway
         // handle, exactly as the logs side routes `fetch` through
@@ -508,8 +616,23 @@ impl SpanSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Bytes, SpanFetchError> {
         let key = &seg_ref.data_object_key;
+        // Reserve the whole object's bytes before the direct whole-object GET
+        // (ADR-1170 decision 2): a refusal fails typed with zero GETs. The guard
+        // travels with the returned bytes, owned for the fetched buffer's
+        // lifetime rather than released when the GET completes.
+        let reservation = self.reserve_fetch(seg_ref.object_size)?;
 
         let Some(cache) = &self.cache else {
+            let _permit = self
+                .get_limiter
+                .acquire()
+                .await
+                .map_err(|_| SpanFetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(
+                        "GetLimiter semaphore closed unexpectedly".to_string(),
+                    ),
+                })?;
             let got = self
                 .store
                 .get(key, GetRange::Full)
@@ -520,7 +643,7 @@ impl SpanSegmentFetcher {
                 })?;
             accounting.record_s3_request(AccountedOp::Get);
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
-            return Ok(got.data);
+            return Ok(attach_reservation(got.data, reservation));
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
@@ -529,6 +652,9 @@ impl SpanSegmentFetcher {
         // tiered tier (see `ReadCache::get_or_fetch`).
         let (bytes, source) = cache
             .get_or_fetch(cache_key, || async move {
+                let _permit = self.get_limiter.acquire().await.map_err(|_| {
+                    StoreError::Transient("GetLimiter semaphore closed unexpectedly".to_string())
+                })?;
                 let got = self.store.get(key, GetRange::Full).await?;
                 accounting.record_s3_request(AccountedOp::Get);
                 accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
@@ -542,18 +668,30 @@ impl SpanSegmentFetcher {
             // error type.
             .map_err(|err| from_cache_error(key, err))?;
 
+        let mut reservation = reservation;
         match source {
             Source::Cache => {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
+                // Same two-ledger overlap as the log fetcher's hit path: the
+                // returned `Bytes` clones the cache entry's allocation, so the
+                // cache cap and this guard both cover it until the caller drops
+                // it (ADR-1170 decision 2).
+                reservation.mark_handed_off();
             }
             // A miss issues one store GET for the resulting bytes, recorded
             // by the closure above.
             Source::Upstream => {
                 accounting.record_cache_miss();
+                // Admitted to the read cache, which has its own byte ledger:
+                // mark the reservation handed off so the transient overlap is
+                // visible while both this buffer and the cache entry hold the
+                // same bytes (ADR-1170 decision 2). Cleared when this guard
+                // drops.
+                reservation.mark_handed_off();
             }
         }
-        Ok(bytes)
+        Ok(attach_reservation(bytes, reservation))
     }
 
     /// Candidate selection over one whole-object's bytes, with no block decoded:
@@ -1089,6 +1227,23 @@ mod tests {
 
     const TENANT: TenantHash = TenantHash([9u8; 16]);
 
+    /// Deliverable 1: `SpanSegmentFetcher::new` defaults to an unlimited budget
+    /// (inert accounting) and `with_memory_budget` installs the shared one the
+    /// engine hands every fetcher.
+    #[test]
+    fn with_memory_budget_installs_the_shared_budget() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let fetcher = SpanSegmentFetcher::new(store);
+        assert_eq!(
+            fetcher.memory_budget_for_test().limit(),
+            u64::MAX,
+            "the default budget is unlimited, so the accounting is inert"
+        );
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let fetcher = fetcher.with_memory_budget(budget.clone());
+        assert!(Arc::ptr_eq(fetcher.memory_budget_for_test(), &budget));
+    }
+
     /// The columnar exit's projection for these tests: every FIXED column, and
     /// nothing dynamic. It decodes `trace_id`, `span_id`, `parent_span_id`,
     /// `name`, `start_ts`, `end_ts`, `status_code`, `status_message`, and
@@ -1586,5 +1741,180 @@ mod tests {
             row_out.records.len(),
             "both exits select the identical surviving-row multiset under a trace filter"
         );
+    }
+
+    /// ADR-1195: `SpanSegmentFetcher` had no GET concurrency bound at all
+    /// before this change. `with_max_concurrent_gets(1)` must cap in-flight
+    /// GETs at exactly 1 -- proven the same way as the RSEG/RLOG shared-bound
+    /// tests (`crate::fetcher`'s `shared_get_limiter_bounds_peak_concurrent_gets_to_one`):
+    /// a `FaultStore` hold gate observes the store's own in-flight GET count
+    /// directly, so this pins the fetcher's own bookkeeping against the
+    /// store's view, not just against itself.
+    #[tokio::test]
+    async fn get_limiter_bounds_peak_concurrent_gets_to_permit_count() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence};
+
+        let memory = MemoryStore::new();
+        let records = vec![span_with_attrs_and_events(trace(1), span(1), 100, 200)];
+        let seg = write_object(&memory, 0, &records).await;
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle =
+            fault.hold(ravel_object_store::fault::Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let fetcher = SpanSegmentFetcher::new(backend).with_max_concurrent_gets(1);
+        let query = all_query();
+
+        let fetcher_a = fetcher.clone();
+        let seg_a = seg.clone();
+        let query_a = query;
+        let handle_a =
+            tokio::spawn(async move { fetcher_a.fetch(&seg_a, &query_a, None, None, &[]).await });
+        let fetcher_b = fetcher.clone();
+        let seg_b = seg.clone();
+        let query_b = query;
+        let handle_b =
+            tokio::spawn(async move { fetcher_b.fetch(&seg_b, &query_b, None, None, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("one of the two fetches issues its GET within 30 s");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(2)
+            )
+            .await
+            .is_err(),
+            "the second GET must never become in-flight while the one permit is held"
+        );
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "one permit must cap in-flight GETs at exactly 1"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing the first permit lets the second GET proceed within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must be the only one held once the first releases"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a")
+            .expect("fetch a found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
+    }
+
+    /// The permits=1 test above cannot distinguish "at most 1", "exactly 1",
+    /// and "exactly the permit count": all three coincide at 1. This pins the
+    /// count itself: three concurrent fetches from two INDEPENDENTLY
+    /// constructed `SpanSegmentFetcher`s sharing one `GetLimiter::new(2)`
+    /// (ADR-1195) must peak at EXACTLY 2 in-flight GETs, never all 3.
+    #[tokio::test]
+    async fn shared_get_limiter_bounds_three_fetches_to_permit_count_two() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence};
+
+        let memory = MemoryStore::new();
+        let records = vec![span_with_attrs_and_events(trace(1), span(1), 100, 200)];
+        let seg = write_object(&memory, 0, &records).await;
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle =
+            fault.hold(ravel_object_store::fault::Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let shared = Arc::new(crate::GetLimiter::new(2).expect("2 permits is valid"));
+        let fetcher_a = SpanSegmentFetcher::new(backend.clone()).with_get_limiter(shared.clone());
+        let fetcher_b = SpanSegmentFetcher::new(backend).with_get_limiter(shared);
+        let query = all_query();
+
+        let seg_a = seg.clone();
+        let query_a = query;
+        let fa1 = fetcher_a.clone();
+        let handle_a1 =
+            tokio::spawn(async move { fa1.fetch(&seg_a, &query_a, None, None, &[]).await });
+        let seg_a2 = seg.clone();
+        let query_a2 = query;
+        let fa2 = fetcher_a.clone();
+        let handle_a2 =
+            tokio::spawn(async move { fa2.fetch(&seg_a2, &query_a2, None, None, &[]).await });
+        let seg_b = seg.clone();
+        let query_b = query;
+        let handle_b =
+            tokio::spawn(async move { fetcher_b.fetch(&seg_b, &query_b, None, None, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(2))
+            .await
+            .expect("two of the three fetches issue their GET within 30 s");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(3)
+            )
+            .await
+            .is_err(),
+            "two permits must cap in-flight GETs at exactly 2, never all 3"
+        );
+        assert_eq!(
+            gate.held_count(),
+            2,
+            "peak in-flight GETs must be exactly 2, not 1 and not 3"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing two permits lets the third GET proceed within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the third GET must be the only one held once the first two release"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a1 = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a1)
+            .await
+            .expect("fetch a1 completes within 30 s")
+            .expect("join fetch a1")
+            .expect("fetch a1")
+            .expect("fetch a1 found the segment relevant");
+        let a2 = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a2)
+            .await
+            .expect("fetch a2 completes within 30 s")
+            .expect("join fetch a2")
+            .expect("fetch a2")
+            .expect("fetch a2 found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a1.records.len(), 1);
+        assert_eq!(a2.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
     }
 }

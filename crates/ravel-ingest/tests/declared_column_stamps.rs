@@ -33,7 +33,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_proto::commit::v1::CommitRecord;
-use ravel_query::LogSegmentFetcher;
+use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision, SqlConfig,
     TenantMemoryAccountant, build_session,
@@ -70,11 +70,71 @@ fn flush_on_first() -> IngestConfig {
 /// One log record under a fixed stream, carrying whichever declared attributes
 /// `attrs` names (absent when the list omits the key: a NULL for that column).
 fn record(ts_ns: i64, attrs: Vec<(&str, AttrValue)>) -> NormalizedLogRecord {
-    let res: Vec<(String, AttrValue)> = vec![(
+    record_on(&[], ts_ns, attrs)
+}
+
+/// The same, on a stream whose resource attributes carry `res_extra` beyond the
+/// fixed `service.name`. A declared key placed there is the stream-level half of
+/// the merged attribute view: it is what a record that does not set the key
+/// reads.
+fn record_on(
+    res_extra: &[(&str, AttrValue)],
+    ts_ns: i64,
+    attrs: Vec<(&str, AttrValue)>,
+) -> NormalizedLogRecord {
+    let mut res: Vec<(String, AttrValue)> = vec![(
         "service.name".to_string(),
         AttrValue::Str("api".to_string()),
     )];
+    res.extend(
+        res_extra
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect::<Vec<_>>(),
+    );
     let scope_attrs: Vec<(String, AttrValue)> = Vec::new();
+    let stream_id = log_stream_id(&res, "scope", "", &scope_attrs);
+    let stream_attrs = ravel_logseg::stream_attrs_bytes(&res, "scope", "", &scope_attrs);
+    NormalizedLogRecord {
+        stream_id,
+        stream_attrs,
+        ts_ns,
+        observed_ts_ns: ts_ns,
+        severity_num: 9,
+        severity_text: "INFO".to_string(),
+        body: "row".to_string(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+    }
+}
+
+/// The same as [`record_on`], but the stream's SCOPE attributes also carry
+/// `scope_extra` beyond an otherwise-empty scope set, so a declared column's
+/// stream-level fallback can be exercised on either half of the merged view
+/// in one stream (issue #1057 finding 1: a List/Map resource occurrence must
+/// not shadow a matching-typed scope occurrence behind it).
+fn record_on_scoped(
+    res_extra: &[(&str, AttrValue)],
+    scope_extra: &[(&str, AttrValue)],
+    ts_ns: i64,
+    attrs: Vec<(&str, AttrValue)>,
+) -> NormalizedLogRecord {
+    let mut res: Vec<(String, AttrValue)> = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    res.extend(
+        res_extra
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect::<Vec<_>>(),
+    );
+    let scope_attrs: Vec<(String, AttrValue)> = scope_extra
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
     let stream_id = log_stream_id(&res, "scope", "", &scope_attrs);
     let stream_attrs = ravel_logseg::stream_attrs_bytes(&res, "scope", "", &scope_attrs);
     NormalizedLogRecord {
@@ -239,7 +299,7 @@ async fn min_max_count_answered_from_ingest_stamps_with_zero_gets() {
         .expect("resolve logs snapshot");
 
     let declared = vec![DeclaredColumn::new(COL, DeclaredType::I64)];
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let provider = LogsTableProvider::new(
         snapshot,
         tenant_hash(),
@@ -454,4 +514,236 @@ async fn two_flushes_stamp_from_their_own_buffers() {
         objects.iter().any(|m| m.key == c2.object_key),
         "second flush's data object is durable"
     );
+}
+
+/// Write `records` through the real router, then answer
+/// `MIN`/`MAX`/`COUNT` over `COL` from the resolved snapshot. Returns the
+/// commit record of the single flush, the three answers, the plan text, and the
+/// GETs the measured query window cost.
+async fn stamped_min_max_count(
+    records: Vec<NormalizedLogRecord>,
+) -> (
+    CommitRecord,
+    (Option<i64>, Option<i64>, Option<i64>),
+    String,
+    u64,
+) {
+    let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+    let clock = TestClock::new(BASE_NS);
+    declare_columns(backend.as_ref(), i64_col_decl()).await;
+
+    let router = LogIngestRouter::new(flush_on_first(), Arc::clone(&backend), clock.clone());
+    let receipt = router
+        .write(
+            tenant(),
+            records,
+            WriteMode::Strict,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("strict write flushes");
+    assert_eq!(receipt.tokens.len(), 1, "one object for one flush");
+    router.shutdown().await;
+
+    let commit = commit_record_for(backend.as_ref(), &receipt.tokens[0]).await;
+
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog"));
+    let snapshot = catalog
+        .resolve(
+            &tenant_hash(),
+            Signal::Logs,
+            TimeRange {
+                start_ns: 0,
+                end_ns: i64::MAX,
+            },
+            &[],
+            BASE_NS + 1_000,
+        )
+        .await
+        .expect("resolve logs snapshot");
+
+    let provider = LogsTableProvider::new(
+        snapshot,
+        tenant_hash(),
+        LogSegmentFetcher::new(Arc::clone(&backend)),
+        PhaseAccounting::new(),
+    )
+    .with_declared_columns(vec![DeclaredColumn::new(COL, DeclaredType::I64)]);
+    let ctx = logs_session(provider);
+
+    let gets_before = store.metrics().snapshot().get.calls;
+    let sql = format!(r#"SELECT MIN("{COL}"), MAX("{COL}"), COUNT("{COL}") FROM logs"#);
+    let plan = ctx
+        .sql(&sql)
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let plan_text = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    let gets = store.metrics().snapshot().get.calls - gets_before;
+
+    let answers = (
+        single_i64_value(&batches, 0),
+        single_i64_value(&batches, 1),
+        single_i64_value(&batches, 2),
+    );
+    (commit, answers, plan_text, gets)
+}
+
+/// Issue #1057, end to end: a declared column whose value lives on the stream's
+/// RESOURCE attributes, set by no record, is the value every record reads. The
+/// flush stamps it, and `MIN`/`MAX` answer with it off the stamp alone.
+///
+/// Prove-the-test: fold only the record's own attributes (drop the stream-level
+/// fallback from `DeclaredStatAccum::build_stamps`) and the stamp becomes
+/// `min == None, max == None, null_count == 3`, the affirmative all-NULL claim
+/// issue #1057 is about. DataFusion's aggregate-statistics rule declines that
+/// NULL min/max scalar, so `MIN`/`MAX` would still fall back to a scan and
+/// answer correctly; only `COUNT` trusts the stamp outright and would answer
+/// 0 against a true 3.
+#[tokio::test]
+async fn stream_level_declared_value_answers_min_max_end_to_end() {
+    let records = (0..3)
+        .map(|i| record_on(&[(COL, AttrValue::I64(7))], BASE_NS + i, vec![]))
+        .collect::<Vec<_>>();
+
+    let (commit, (min, max, count), plan_text, gets) = stamped_min_max_count(records).await;
+
+    let read = read_commit_record(&commit);
+    assert!(
+        read.dropped().is_empty(),
+        "the flush's own reader drops nothing it stamped"
+    );
+    assert_eq!(commit.sample_count, 3);
+    let ev = read.column(COL).expect("EventDate stamped");
+    assert_eq!(
+        ev.min(),
+        Some(ravel_types::declared_stats::DeclaredStatValue::I64(7)),
+        "the resource attribute is the value all three rows read"
+    );
+    assert_eq!(
+        ev.max(),
+        Some(ravel_types::declared_stats::DeclaredStatValue::I64(7))
+    );
+    assert_eq!(
+        ev.null_count(),
+        0,
+        "no row is NULL: the stream supplies the value"
+    );
+
+    assert_eq!(min, Some(7), "MIN answered from the stamp");
+    assert_eq!(max, Some(7), "MAX answered from the stamp");
+    assert_eq!(count, Some(3), "every row counts as non-NULL");
+    assert!(
+        !plan_text.contains("LogsScanExec"),
+        "the scan is elided, which is what makes the answer exact:\n{plan_text}"
+    );
+    assert_eq!(gets, 0, "a statement answered from stamps reads no data");
+}
+
+/// The override half of the merged view, end to end: one record sets the
+/// declared key itself, the other two read the stream's value. The extrema span
+/// both.
+///
+/// Prove-the-test: count the stream-level value for every row instead of
+/// `rows - overrides` and the answers stay `7`/`7`, losing the record's `2`.
+#[tokio::test]
+async fn record_override_of_a_stream_level_value_answers_end_to_end() {
+    let stream_res = [(COL, AttrValue::I64(7))];
+    let records = vec![
+        record_on(&stream_res, BASE_NS, vec![]),
+        record_on(&stream_res, BASE_NS + 1, vec![(COL, AttrValue::I64(2))]),
+        record_on(&stream_res, BASE_NS + 2, vec![]),
+    ];
+
+    let (commit, (min, max, count), plan_text, gets) = stamped_min_max_count(records).await;
+
+    let read = read_commit_record(&commit);
+    assert!(read.dropped().is_empty(), "nothing dropped");
+    assert_eq!(commit.sample_count, 3);
+    let ev = read.column(COL).expect("EventDate stamped");
+    assert_eq!(
+        ev.min(),
+        Some(ravel_types::declared_stats::DeclaredStatValue::I64(2)),
+        "the record's own value wins for its row"
+    );
+    assert_eq!(
+        ev.max(),
+        Some(ravel_types::declared_stats::DeclaredStatValue::I64(7)),
+        "the two rows that set nothing still read the stream's 7"
+    );
+    assert_eq!(ev.null_count(), 0);
+
+    assert_eq!(min, Some(2), "MIN answered from the stamp");
+    assert_eq!(max, Some(7), "MAX answered from the stamp");
+    assert_eq!(count, Some(3));
+    assert!(
+        !plan_text.contains("LogsScanExec"),
+        "the scan is elided:\n{plan_text}"
+    );
+    assert_eq!(gets, 0, "a statement answered from stamps reads no data");
+}
+
+/// Issue #1057 finding 1, end to end: a stream whose RESOURCE attributes carry
+/// the declared column as a List (the shape `ravel_otlp::logs_normalize::
+/// convert_attrs` produces from real OTLP input) and whose SCOPE attributes
+/// carry it as a matching-typed I64 must answer from the scope value for the
+/// rows that do not set the key themselves -- the List occurrence must not
+/// shadow the scope occurrence behind it, exactly as the reader's decoder
+/// (which never decodes a List entry at all) resolves it.
+///
+/// Prove-the-test: drop the `AttrValue::List(_) | AttrValue::Map(_)` skip from
+/// `stream_state` (`crates/ravel-ingest/src/log_declared_stats.rs`) and this
+/// answers `2, 2, 1` (the base's wrong answer, with a data scan needed to even
+/// get COUNT right) instead of `2, 7, 3` with the scan elided and zero GETs.
+#[tokio::test]
+async fn list_resource_attribute_falls_back_to_scope_value_end_to_end() {
+    let stream_res = [(COL, AttrValue::List(vec![AttrValue::I64(1)]))];
+    let stream_scope = [(COL, AttrValue::I64(7))];
+    let records = vec![
+        record_on_scoped(
+            &stream_res,
+            &stream_scope,
+            BASE_NS,
+            vec![(COL, AttrValue::I64(2))],
+        ),
+        record_on_scoped(&stream_res, &stream_scope, BASE_NS + 1, vec![]),
+        record_on_scoped(&stream_res, &stream_scope, BASE_NS + 2, vec![]),
+    ];
+
+    let (commit, (min, max, count), plan_text, gets) = stamped_min_max_count(records).await;
+
+    let read = read_commit_record(&commit);
+    assert!(
+        read.dropped().is_empty(),
+        "the flush's own reader drops nothing it stamped"
+    );
+    assert_eq!(commit.sample_count, 3);
+    let ev = read.column(COL).expect("EventDate stamped");
+    assert_eq!(
+        ev.min(),
+        Some(ravel_types::declared_stats::DeclaredStatValue::I64(2)),
+        "the record's own value wins for its row"
+    );
+    assert_eq!(
+        ev.max(),
+        Some(ravel_types::declared_stats::DeclaredStatValue::I64(7)),
+        "the two rows that set nothing read the scope's 7, not the List"
+    );
+    assert_eq!(ev.null_count(), 0);
+
+    assert_eq!(min, Some(2), "MIN answered from the stamp");
+    assert_eq!(max, Some(7), "MAX answered from the stamp");
+    assert_eq!(count, Some(3), "every row counts as non-NULL");
+    assert!(
+        !plan_text.contains("LogsScanExec"),
+        "the scan is elided:\n{plan_text}"
+    );
+    assert_eq!(gets, 0, "a statement answered from stamps reads no data");
 }

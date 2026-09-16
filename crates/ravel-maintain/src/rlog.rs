@@ -190,9 +190,10 @@
 //! `sum(part.series_count)`, which counts a straddling stream once per part it
 //! appears in; it is reported, never used as a gate.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys;
@@ -207,7 +208,7 @@ use ravel_logseg::record::{
 use ravel_logseg::skip_index::SkipIndex;
 use ravel_logseg::{
     AttrValue, FieldType, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter,
-    StreamBlockLoc, StreamBlockRows, decode_section,
+    StreamBlockLoc, StreamBlockRows, decode_section, stream_attr_pairs,
     writer::{ObjectIdentity, WriteStats},
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
@@ -775,6 +776,11 @@ pub(crate) async fn merge_catalogs(
     // under version 4 (ADR-0699 decision 1, a block's pages are spread across
     // its group's column chunks) -- so raw resident bytes stay bounded to one
     // such unit per input, never a whole stream or the whole bucket.
+    // Resolve the merged attribute view's stream-level half once for the whole
+    // output (ADR-0873 decision 3, issue #1057): every stream's blob is right
+    // here, decoded once, rather than re-derived per record in the fold.
+    let declared = Arc::new(DeclaredSchema::build(&declared, &merged));
+
     let identity = compactor_identity(bucket, config);
     let tracker = config.merge_memory_tracker.as_ref();
     let mut sink = PartSink {
@@ -894,9 +900,10 @@ struct PartSink<'a> {
     identity: ObjectIdentity,
     indexed_fields: Vec<String>,
     /// The declared eligible columns each output part recomputes stamps for
-    /// (ADR-0873 decision 3). Empty on the erasure-rewrite route, whose parts
-    /// stay unstamped (the wave-3 staleness rule), and on metrics/spans buckets.
-    declared: Vec<(String, DeclaredStatType)>,
+    /// (ADR-0873 decision 3), with each stream's stream-level values for them.
+    /// Empty on the erasure-rewrite route, whose parts stay unstamped (the
+    /// wave-3 staleness rule), and on metrics/spans buckets.
+    declared: Arc<DeclaredSchema>,
     tracker: Option<&'a MergeMemoryTracker>,
     /// Whether a closed part is encoded but not PUT. Not read from `config`:
     /// the erasure rewrite defers every part PUT to its own publish path (which
@@ -922,7 +929,7 @@ impl PartSink<'_> {
             self.current = Some(PartBuilder::new(
                 &self.identity,
                 &self.indexed_fields,
-                &self.declared,
+                Arc::clone(&self.declared),
             ));
         }
         let mut over_memory = false;
@@ -1118,25 +1125,158 @@ impl<T: Ord + Copy> Running<T> {
 }
 
 /// One declared column's running extrema over the records pushed to a part. Only
-/// the [`Running`] matching `ty` is ever populated: a declared I64 column counts
-/// an I64 value as non-null and reads a same-named BOOL value (or an absent one)
-/// as NULL, and vice versa -- the wave-5a `(name, value kind)` rule.
+/// the [`Running`] matching the column's declared type is ever populated: a
+/// declared I64 column counts an I64 value as non-null and reads a same-named
+/// BOOL value (or an absent one) as NULL, and vice versa -- the wave-5a
+/// `(name, value kind)` rule.
+///
+/// The column's name and type live in the per-object [`DeclaredSchema`] rather
+/// than here: a name compare per record per column is what made the fold
+/// O(attrs x cols) in String comparisons.
+#[derive(Default)]
 struct ColumnAccum {
-    name: String,
-    ty: DeclaredStatType,
     i64_run: Option<Running<i64>>,
     bool_run: Option<Running<bool>>,
-    /// First-occurrence-wins within the record currently being folded: set once
-    /// this column has taken a value from that record, cleared before the next.
-    seen_this_record: bool,
+    /// The epoch of the record that last set this column's key, at any value
+    /// kind. A record that sets the key overrides its stream's attribute of the
+    /// same name, so this suppresses the fallback for that record.
+    mention_epoch: u64,
+    /// The record layer's winner for this column within the record being folded:
+    /// the LAST occurrence of the declared name in [`LogRecord::attrs`],
+    /// whatever its kind. Read only while the column is in
+    /// [`DeclaredStatAccum::touched`], so a value left from an earlier record is
+    /// never folded twice.
+    pending: Option<PendingValue>,
+}
+
+/// One record-layer occurrence of a declared name, reduced to what the stamp
+/// needs: the value when its kind is one a declared column can be stamped at,
+/// and otherwise only the fact that an occurrence exists. A `Str`, `Bytes`,
+/// `F64`, `List` or `Map` occurrence wins the record layer exactly like any
+/// other and then reads NULL for either declarable type, so it is kept as
+/// [`PendingValue::Other`] rather than dropped: dropping it would let a
+/// shadowed same-named I64 or BOOL occurrence claim the row.
+#[derive(Clone, Copy, Debug)]
+enum PendingValue {
+    I64(i64),
+    Bool(bool),
+    Other,
+}
+
+/// The declared eligible columns a compaction output stamps, indexed for the
+/// per-record fold, plus the stream-level half of the merged view each of the
+/// object's streams supplies.
+///
+/// Built once per merge from the STREAM_DIR blobs the merge already collected
+/// (one decode per stream in the object, never one per record) and shared by
+/// every part through an [`Arc`], since every part of a compaction stamps the
+/// same column set over the same streams.
+#[derive(Default)]
+struct DeclaredSchema {
+    /// The declared columns, in the order stamps are emitted.
+    cols: Vec<(String, DeclaredStatType)>,
+    /// Declared name to index into `cols`. A record's attribute costs one hash
+    /// lookup here instead of a String compare against every declared column.
+    index: HashMap<String, usize>,
+    /// Per stream, the declared columns its resource or scope attributes supply
+    /// a matching-typed value for, as `(column index, value)`. A stream
+    /// carrying none has no entry, which is the common shape (resource
+    /// attributes are service identity strings), and its records pay nothing.
+    fallbacks: HashMap<LogStreamId, Vec<(usize, DeclaredStatValue)>>,
+    /// Set when a stream's attribute blob did not decode, which leaves the
+    /// merged view unknown for that stream's records. Every part of the merge
+    /// then stamps nothing rather than an affirmative statement over a view the
+    /// fold could not resolve.
+    unresolved: bool,
+}
+
+impl DeclaredSchema {
+    /// Index `declared` and resolve each stream's fallbacks from its STREAM_DIR
+    /// blob. `streams` is the merge's own stream map, so each blob is decoded
+    /// exactly once per output object.
+    fn build(
+        declared: &[(String, DeclaredStatType)],
+        streams: &BTreeMap<LogStreamId, Vec<u8>>,
+    ) -> Self {
+        let mut schema = DeclaredSchema {
+            cols: declared.to_vec(),
+            index: declared
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _))| (name.clone(), i))
+                .collect(),
+            fallbacks: HashMap::new(),
+            unresolved: false,
+        };
+        if declared.is_empty() {
+            return schema;
+        }
+        for (stream_id, blob) in streams {
+            let pairs = match stream_attr_pairs(blob) {
+                Ok(pairs) => pairs,
+                Err(_) => {
+                    schema.unresolved = true;
+                    continue;
+                }
+            };
+            let mut claimed: BTreeSet<usize> = BTreeSet::new();
+            let mut values: Vec<(usize, DeclaredStatValue)> = Vec::new();
+            for (name, value) in pairs {
+                // The reader's decoder (`ravel_sql::rlog_attrs::decode_value`)
+                // never pushes a List or Map entry into the pairs `find_attr`
+                // resolves over, so such an occurrence must not claim the key
+                // here either: skip it and let a later occurrence of the same
+                // name compete.
+                if matches!(value, AttrValue::List(_) | AttrValue::Map(_)) {
+                    continue;
+                }
+                let Some(&i) = schema.index.get(name.as_str()) else {
+                    continue;
+                };
+                // First occurrence whose value is not a List or Map wins,
+                // matching the reader's `find_attr` over the resource set
+                // then the scope set: an ineligible (but decoded) or
+                // wrong-typed first occurrence shadows a same-named eligible
+                // one behind it, and reads NULL.
+                if !claimed.insert(i) {
+                    continue;
+                }
+                let typed = match (schema.cols[i].1, value) {
+                    (DeclaredStatType::I64, AttrValue::I64(v)) => DeclaredStatValue::I64(v),
+                    (DeclaredStatType::Bool, AttrValue::Bool(b)) => DeclaredStatValue::Bool(b),
+                    _ => continue,
+                };
+                values.push((i, typed));
+            }
+            if !values.is_empty() {
+                schema.fallbacks.insert(*stream_id, values);
+            }
+        }
+        schema
+    }
+
+    /// The stream-level values a record of `stream_id` falls back to.
+    fn fallbacks_for(&self, stream_id: LogStreamId) -> &[(usize, DeclaredStatValue)] {
+        self.fallbacks
+            .get(&stream_id)
+            .map_or(&[][..], |values| values.as_slice())
+    }
 }
 
 /// The per-part fold of declared-column extrema for the compaction output
 /// (ADR-0873 decision 3, the L1 half of wave 5). It mirrors the ingest-side
 /// wave-5a accumulator (`ravel_ingest`'s `DeclaredStatAccum`): eligible I64/BOOL
-/// declared columns only, first-occurrence-wins per record, and a stamp whose
+/// declared columns only, last-occurrence-wins per record (issue #1182), and a
+/// stamp whose
 /// `null_count` is derived as `sample_count - non_null` so the part's own reader
 /// ([`ravel_commit::declared_stats::read_compaction_part`]) never drops it.
+///
+/// Like the ingest side it folds the MERGED attribute view, not the record's
+/// own attributes: a record that does not set a declared key reads its stream's
+/// resource or scope attribute of that name, so the part's stamp describes what
+/// a reader resolves rather than what the record literally carries (issue
+/// #1057). The stream-level half comes from the per-object [`DeclaredSchema`],
+/// which decoded each stream's blob once for the whole merge.
 ///
 /// Unlike the ingest side it is seeded with the declared column set up front
 /// (from [`declared_columns_from_inputs`]), so it tracks only the columns it
@@ -1150,63 +1290,126 @@ struct ColumnAccum {
 /// the next [`PartBuilder`] and is folded only there.
 #[derive(Default)]
 struct DeclaredStatAccum {
+    /// The declared column set and the merged view's stream-level half, shared
+    /// with every other part of the same merge.
+    schema: Arc<DeclaredSchema>,
+    /// Running extrema, positionally aligned with `schema.cols`.
     cols: Vec<ColumnAccum>,
+    /// Indices into `cols` the record being folded mentions, so the pass that
+    /// folds each column's winner costs one step per mention rather than one per
+    /// declared column. Reused across records; cleared as each record's winners
+    /// are folded.
+    touched: Vec<usize>,
+    /// Monotonic per-record counter driving the override epochs. Incremented
+    /// before each record, so a live epoch is never 0.
+    epoch: u64,
 }
 
 impl DeclaredStatAccum {
-    /// Build a fold over the declared eligible columns. The set comes from
+    /// Build a fold over a merge's declared eligible columns. The set comes from
     /// [`declared_columns_from_inputs`], which reads each input's decoded
     /// stamps through the commit-side reader whose type tags admit only I64
     /// and BOOL, so every column here is one of the two.
-    fn new(declared: &[(String, DeclaredStatType)]) -> Self {
-        let cols = declared
-            .iter()
-            .map(|(name, ty)| ColumnAccum {
-                name: name.clone(),
-                ty: *ty,
-                i64_run: None,
-                bool_run: None,
-                seen_this_record: false,
-            })
-            .collect();
-        DeclaredStatAccum { cols }
+    fn new(schema: Arc<DeclaredSchema>) -> Self {
+        let mut cols = Vec::new();
+        cols.resize_with(schema.cols.len(), ColumnAccum::default);
+        DeclaredStatAccum {
+            schema,
+            cols,
+            touched: Vec::new(),
+            epoch: 0,
+        }
     }
 
-    /// Fold one record's attributes. Each declared column takes at most one
-    /// non-null row from the record: the first attribute matching its name AND
-    /// its declared value kind wins, and a repeat (or a same-named value of the
-    /// other kind, or an absence) is a NULL for the declaration, so no column's
-    /// non-null count can exceed the part's row count and the derived
-    /// `null_count` can never go negative.
-    fn observe_record(&mut self, attrs: &[(String, AttrValue)]) {
+    /// Fold one record's merged attribute view. Each declared column takes at
+    /// most one non-null row from the record: the record layer's single winning
+    /// occurrence of the declared name, which is non-null only when its kind
+    /// matches the declaration. A shadowed occurrence, a winner of the other
+    /// kind, and an absence with no stream-level value are all NULL for the
+    /// declaration, so no column's non-null count can exceed the part's row
+    /// count and the derived `null_count` can never go negative.
+    ///
+    /// Which occurrence wins is LAST-occurrence-wins over
+    /// [`LogRecord::attrs`], the rule docs/log-segment-format.md pins ("Within
+    /// the record layer") and `ravel_sql::rlog_attrs::merged_attrs` implements.
+    /// The list this reads is the one `rebuild_record` produced for the input
+    /// object, so its order already IS the format's resolution order (columnar
+    /// occurrences ascending by FIELD_DIR type byte, then the `attrs_raw`
+    /// overflow occurrences in canonical order): folding it last-wins is the
+    /// reader's answer, not an approximation of it.
+    ///
+    /// A column the record does not name at all takes its stream's resource or
+    /// scope value, when the stream supplies one of the declared kind. A record
+    /// that names the column at ANY value kind suppresses that fallback, which
+    /// is the reader's override order.
+    ///
+    /// Cost is one hash lookup per record attribute, one pass over the columns
+    /// this record mentions, and one pass over the record's stream's fallback
+    /// list, with no String comparison per (attribute, column) pair.
+    fn observe_record(&mut self, r: &LogRecord) {
         if self.cols.is_empty() {
             return;
         }
-        for c in &mut self.cols {
-            c.seen_this_record = false;
+        let Self {
+            schema,
+            cols,
+            touched,
+            epoch,
+        } = self;
+        *epoch += 1;
+        touched.clear();
+        for (name, value) in &r.attrs {
+            let Some(&i) = schema.index.get(name.as_str()) else {
+                continue;
+            };
+            let Some(c) = cols.get_mut(i) else {
+                continue;
+            };
+            if c.mention_epoch != *epoch {
+                c.mention_epoch = *epoch;
+                touched.push(i);
+            }
+            // Last occurrence wins: overwrite whatever an earlier occurrence of
+            // the same name left here.
+            c.pending = Some(match value {
+                AttrValue::I64(v) => PendingValue::I64(*v),
+                AttrValue::Bool(b) => PendingValue::Bool(*b),
+                _ => PendingValue::Other,
+            });
         }
-        for (name, value) in attrs {
-            for c in &mut self.cols {
-                if c.seen_this_record || c.name != *name {
-                    continue;
-                }
-                match (c.ty, value) {
-                    (DeclaredStatType::I64, AttrValue::I64(v)) => {
-                        match &mut c.i64_run {
-                            Some(r) => r.observe(*v),
-                            None => c.i64_run = Some(Running::start(*v)),
-                        }
-                        c.seen_this_record = true;
-                    }
-                    (DeclaredStatType::Bool, AttrValue::Bool(b)) => {
-                        match &mut c.bool_run {
-                            Some(r) => r.observe(*b),
-                            None => c.bool_run = Some(Running::start(*b)),
-                        }
-                        c.seen_this_record = true;
-                    }
-                    _ => {}
-                }
+        for &i in touched.iter() {
+            let Some(c) = cols.get_mut(i) else {
+                continue;
+            };
+            let winner = c.pending.take();
+            match (schema.cols[i].1, winner) {
+                (DeclaredStatType::I64, Some(PendingValue::I64(v))) => match &mut c.i64_run {
+                    Some(run) => run.observe(v),
+                    None => c.i64_run = Some(Running::start(v)),
+                },
+                (DeclaredStatType::Bool, Some(PendingValue::Bool(b))) => match &mut c.bool_run {
+                    Some(run) => run.observe(b),
+                    None => c.bool_run = Some(Running::start(b)),
+                },
+                _ => {}
+            }
+        }
+        for (i, value) in schema.fallbacks_for(r.stream_id) {
+            let Some(c) = cols.get_mut(*i) else {
+                continue;
+            };
+            if c.mention_epoch == *epoch {
+                continue;
+            }
+            match value {
+                DeclaredStatValue::I64(v) => match &mut c.i64_run {
+                    Some(run) => run.observe(*v),
+                    None => c.i64_run = Some(Running::start(*v)),
+                },
+                DeclaredStatValue::Bool(b) => match &mut c.bool_run {
+                    Some(run) => run.observe(*b),
+                    None => c.bool_run = Some(Running::start(*b)),
+                },
             }
         }
     }
@@ -1218,9 +1421,12 @@ impl DeclaredStatAccum {
     /// `null_count = sample_count - non_null`), so `read_compaction_part` drops
     /// none of them.
     fn build_stamps(&self, sample_count: u64) -> Vec<DeclaredColumnStat> {
+        if self.schema.unresolved {
+            return Vec::new();
+        }
         let mut out = Vec::new();
-        for c in &self.cols {
-            let observed = match c.ty {
+        for (c, (name, ty)) in self.cols.iter().zip(self.schema.cols.iter()) {
+            let observed = match ty {
                 DeclaredStatType::I64 => c.i64_run.map(|r| {
                     (
                         DeclaredStatValue::I64(r.min),
@@ -1236,7 +1442,7 @@ impl DeclaredStatAccum {
                     )
                 }),
             };
-            if let Some(stat) = build_one(&c.name, c.ty, observed, sample_count) {
+            if let Some(stat) = build_one(name, *ty, observed, sample_count) {
                 out.push(stat);
             }
         }
@@ -1337,7 +1543,7 @@ impl PartBuilder {
     fn new(
         identity: &ObjectIdentity,
         indexed_fields: &[String],
-        declared: &[(String, DeclaredStatType)],
+        declared: Arc<DeclaredSchema>,
     ) -> Self {
         PartBuilder {
             identity: *identity,
@@ -1384,7 +1590,7 @@ impl PartBuilder {
         // estimates ride (ADR-0873 decision 3). Done here, once per pushed
         // record, so the exact-encode probe -- which clones `records` without
         // re-pushing -- never double-counts a record.
-        self.declared_accum.observe_record(&r.attrs);
+        self.declared_accum.observe_record(&r);
         self.records.push(r);
         if let Some(t) = tracker {
             t.set_writer_bytes(self.estimate);
@@ -1685,9 +1891,14 @@ impl<'a> StreamCursor<'a> {
     /// about to be decoded BEFORE the decode starts, and a growth that would
     /// cross the budget refuses instead, so a later, larger block cannot be
     /// materialized past a budget the reconcile has already lowered the charge
-    /// below. `None` is for the first refill of a freshly admitted cursor,
-    /// whose reservation already covers every block it can decode, and for
-    /// tests driving a cursor with no budget in play.
+    /// below. A second gate point covers the raw two-block prefetch the same
+    /// way: BEFORE `next_raw_block`'s `try_join!` issues the fetch of the
+    /// current and "ahead" locs, the charge rises to cover the cursor's
+    /// metadata, its already-retained raw bytes, and the fetch's own byte
+    /// count, and a growth that would cross the budget refuses there instead,
+    /// before either GET lands. `None` is for the first refill of a freshly
+    /// admitted cursor, whose reservation already covers every block it can
+    /// decode, and for tests driving a cursor with no budget in play.
     async fn refill(
         &mut self,
         store: &dyn ObjectStoreBackend,
@@ -1711,7 +1922,18 @@ impl<'a> StreamCursor<'a> {
             if self.decode_next_block(tracker)? {
                 continue;
             }
-            // The current loc is fully decoded: fetch the next one.
+            // The current loc is fully decoded: fetch the next one. Gate the
+            // fetch on the budget BEFORE `next_raw_block`'s `try_join!` issues
+            // the two GETs (ADR-0979 decision 4 as amended): the refusal then
+            // costs nothing but the run, since no byte was moved and nothing
+            // was allocated. Nothing `.await`s between this check and the
+            // `try_join!` it gates.
+            if let (Some(b), Some((first, count, bytes))) =
+                (budget.as_deref_mut(), self.pending_raw_fetch())
+            {
+                let required = self.raw_fetch_charge_requirement(bytes);
+                b.grow_to_raw_fetch(&mut self.charged, first, count, bytes, required)?;
+            }
             match self.next_raw_block(store, tracker, ledger).await? {
                 Some((loc, data)) => {
                     self.group_raw_bytes = data.len() as u64;
@@ -1857,6 +2079,37 @@ impl<'a> StreamCursor<'a> {
         self.next_loc += 1;
         Some(loc)
     }
+
+    /// The fetch [`Self::next_raw_block`] would issue right now, or `None` if
+    /// a prefetch already covers the next loc (nothing to fetch, so nothing
+    /// to gate) or the candidate list is exhausted. Returns the first loc's
+    /// index, how many locs the fetch reads (one, or two when
+    /// `try_join!`'s look-ahead prefetch applies, issue #711), and their
+    /// combined raw byte count -- read-only, so calling this never advances
+    /// `next_loc` the way `take_next_loc` does.
+    fn pending_raw_fetch(&self) -> Option<(usize, usize, u64)> {
+        if self.prefetched.is_some() {
+            return None;
+        }
+        let first = self.locs.get(self.next_loc)?;
+        let ahead = self.locs.get(self.next_loc + 1);
+        let loc_count = if ahead.is_some() { 2 } else { 1 };
+        let fetch_bytes = first
+            .byte_len()
+            .saturating_add(ahead.map_or(0, |l| l.byte_len()));
+        Some((self.next_loc, loc_count, fetch_bytes))
+    }
+
+    /// What this cursor must be charged before [`Self::next_raw_block`] lands
+    /// `fetch_bytes` of raw loc data: everything it already holds plus the
+    /// fetch about to land, priced from metadata and the fetch's own byte
+    /// count alone (ADR-0979 decision 4 as amended). No decoded term:
+    /// fetching raw bytes decodes nothing, so there is no ceiling to add.
+    fn raw_fetch_charge_requirement(&self, fetch_bytes: u64) -> u64 {
+        loc_metadata_bytes(&self.locs)
+            .saturating_add(self.raw_resident_bytes())
+            .saturating_add(fetch_bytes)
+    }
 }
 
 /// One block's raw bytes by range. Named (not an inline `async` block) so its
@@ -1932,6 +2185,73 @@ impl CursorBudget<'_> {
         let Some(grow) = required.checked_sub(*cursor_charged).filter(|g| *g > 0) else {
             return Ok(());
         };
+        self.grow_by(
+            cursor_charged,
+            required,
+            grow,
+            MergeCursorBudgetSite::BlockGrow {
+                block_index: block,
+                grow_bytes: grow,
+            },
+        )
+    }
+
+    /// Raise one cursor's charge to `required` before [`StreamCursor::next_raw_block`]
+    /// issues the two-block raw fetch, refusing with
+    /// [`MaintainError::MergeCursorBudgetExceeded`] if the stream's running
+    /// charge cannot take the growth (ADR-0979 decision 4 as amended: the
+    /// same fail-closed check [`Self::grow_to`] runs before a decode, moved
+    /// to the point before the raw GETs are issued, so the fetch is refused
+    /// rather than allocated-then-accounted).
+    ///
+    /// Same non-`.await` adjacency guarantee as [`Self::grow_to`]: this runs
+    /// inside [`StreamCursor::refill`] immediately before the `try_join!`
+    /// it gates, with nothing else able to admit a cursor or grow a charge in
+    /// between.
+    fn grow_to_raw_fetch(
+        &mut self,
+        cursor_charged: &mut u64,
+        first_loc_index: usize,
+        loc_count: usize,
+        fetch_bytes: u64,
+        required: u64,
+    ) -> Result<()> {
+        let Some(grow) = required.checked_sub(*cursor_charged).filter(|g| *g > 0) else {
+            return Ok(());
+        };
+        self.grow_by(
+            cursor_charged,
+            required,
+            grow,
+            MergeCursorBudgetSite::RawFetch {
+                first_loc_index,
+                loc_count,
+                fetch_bytes,
+            },
+        )
+    }
+
+    /// Shared grow-and-check body for both gate points (ADR-0979 decision 4
+    /// as amended): raise the stream's running charge and this cursor's own
+    /// charge to `required`, refusing with
+    /// [`MaintainError::MergeCursorBudgetExceeded`] at `site` if the
+    /// stream's running charge cannot take `grow`.
+    ///
+    /// A `try_join!` that lands after this succeeds and then fails leaves
+    /// the charge grown to `required`: the fetch it was gating never
+    /// completed, so the growth overstates the cursor's real residency by
+    /// `grow` until the cursor is dropped. This is unobservable, because
+    /// `refill(..).await?` at the merge's call site
+    /// (`merge_stream_into_parts`) propagates that error out of the whole
+    /// run before anything -- another admission, another growth -- reads
+    /// the charge again.
+    fn grow_by(
+        &mut self,
+        cursor_charged: &mut u64,
+        required: u64,
+        grow: u64,
+        site: MergeCursorBudgetSite,
+    ) -> Result<()> {
         let charged_bytes = *self.charged;
         let required_bytes = charged_bytes.saturating_add(grow);
         if required_bytes > self.budget {
@@ -1942,10 +2262,7 @@ impl CursorBudget<'_> {
                 budget_bytes: self.budget,
                 required_bytes,
                 inputs_carrying_stream: self.inputs_carrying_stream,
-                site: MergeCursorBudgetSite::BlockGrow {
-                    block_index: block,
-                    grow_bytes: grow,
-                },
+                site,
             });
         }
         *self.charged = required_bytes;
@@ -2947,6 +3264,141 @@ mod tests {
             .await
             .expect("put commit");
         bytes
+    }
+
+    /// Issue #1182, consumer 4: the compaction recompute must resolve a record
+    /// that carries one attribute name more than once to the SAME value the
+    /// readers do.
+    ///
+    /// The record table and the resolved values are the ones
+    /// `ravel_sql::logs_scan::columnar_lookup_tests::a_duplicate_key_resolves_last_occurrence_wins_on_both_reader_paths`
+    /// pins for the two reader paths and
+    /// `ravel_ingest::log_declared_stats::tests::duplicate_key_stamp_follows_the_readers_rule`
+    /// pins for the ingest fold:
+    ///
+    /// | record's own attributes         | resolved `k`  |
+    /// |---------------------------------|---------------|
+    /// | `I64(5)` then `Str("x")`        | `I64(5)`      |
+    /// | `Str("x")` then `I64(5)`        | `I64(5)`      |
+    /// | `Bool(true)` then `I64(9)`      | `Bool(true)`  |
+    /// | `I64(1)` then `Bytes([0xab])`   | `Bytes(..)`   |
+    /// | `Str("y")`                      | `Str("y")`    |
+    ///
+    /// The records are written with the real `RlogWriter` and read back with the
+    /// real `RlogReader`, so the attribute list the fold sees is the one
+    /// `rebuild_record` produces for a compaction input, in the order
+    /// docs/log-segment-format.md pins. Nothing here hand-orders the
+    /// occurrences: the writer and reader do, and last-occurrence-wins over
+    /// that list is `merged_attrs`'s answer verbatim.
+    ///
+    /// Prove-the-test: restore the base's first-occurrence-of-the-declared-kind
+    /// rule in `observe_record` -- keep the first `pending` a record sets at a
+    /// declarable kind instead of letting a later occurrence overwrite it -- and
+    /// the I64 stamp reads min 1, max 9, null_count 1: the third and fourth rows
+    /// claim the 9 and the 1 that the Bool and the Bytes occurrence shadow, and
+    /// the first assertion below fails with `left: Some(I64(1))`.
+    #[test]
+    fn duplicate_key_stamp_follows_the_readers_rule() {
+        let cfg = RlogConfig::default();
+        let dup = |ts: i64, attrs: Vec<(String, AttrValue)>| record(1, ts, "b", attrs);
+        let written = vec![
+            dup(
+                100,
+                vec![
+                    ("k".to_string(), AttrValue::I64(5)),
+                    ("k".to_string(), AttrValue::Str("x".into())),
+                ],
+            ),
+            dup(
+                101,
+                vec![
+                    ("k".to_string(), AttrValue::Str("x".into())),
+                    ("k".to_string(), AttrValue::I64(5)),
+                ],
+            ),
+            dup(
+                102,
+                vec![
+                    ("k".to_string(), AttrValue::Bool(true)),
+                    ("k".to_string(), AttrValue::I64(9)),
+                ],
+            ),
+            dup(
+                103,
+                vec![
+                    ("k".to_string(), AttrValue::I64(1)),
+                    ("k".to_string(), AttrValue::Bytes(vec![0xab])),
+                ],
+            ),
+            dup(104, vec![("k".to_string(), AttrValue::Str("y".into()))]),
+        ];
+        let mut w = RlogWriter::new(
+            cfg,
+            ObjectIdentity {
+                tenant_hash: [0; 16],
+                shard: 0,
+                writer_id: [0; 16],
+                writer_epoch: 0,
+                writer_seq: 0,
+            },
+        );
+        for r in &written {
+            w.push(r.clone()).expect("push");
+        }
+        let obj = w.finish().expect("finish");
+        let rebuilt = decode_all(&obj);
+        assert_eq!(rebuilt.len(), written.len(), "every record round-trips");
+
+        let (stream_id, blob) = stream_ident(1);
+        let mut streams = BTreeMap::new();
+        streams.insert(stream_id, blob);
+        // `DeclaredSchema` indexes by name, so each declared type is folded in
+        // its own pass rather than declaring `k` twice in one schema.
+        let stamp_at = |ty: DeclaredStatType| -> DeclaredColumnStat {
+            let schema = Arc::new(DeclaredSchema::build(&[("k".to_string(), ty)], &streams));
+            let mut accum = DeclaredStatAccum::new(schema);
+            for r in &rebuilt {
+                accum.observe_record(r);
+            }
+            let mut stamps = accum.build_stamps(5);
+            assert_eq!(stamps.len(), 1, "one declared column, one stamp");
+            stamps.remove(0)
+        };
+        let stamps = [
+            stamp_at(DeclaredStatType::I64),
+            stamp_at(DeclaredStatType::Bool),
+        ];
+
+        let i64_stat = stamps
+            .iter()
+            .find(|s| s.declared_type() == DeclaredStatType::I64)
+            .expect("I64 stamp");
+        assert_eq!(
+            i64_stat.min(),
+            Some(DeclaredStatValue::I64(5)),
+            "I64 min is the two rows resolving to 5, not the shadowed 1"
+        );
+        assert_eq!(
+            i64_stat.max(),
+            Some(DeclaredStatValue::I64(5)),
+            "I64 max is the two rows resolving to 5, not the shadowed 9"
+        );
+        assert_eq!(
+            i64_stat.null_count(),
+            3,
+            "the Bool, Bytes and Str winners are NULL for a declared I64"
+        );
+        let bool_stat = stamps
+            .iter()
+            .find(|s| s.declared_type() == DeclaredStatType::Bool)
+            .expect("BOOL stamp");
+        assert_eq!(bool_stat.min(), Some(DeclaredStatValue::Bool(true)));
+        assert_eq!(bool_stat.max(), Some(DeclaredStatValue::Bool(true)));
+        assert_eq!(
+            bool_stat.null_count(),
+            4,
+            "only the record whose winner is a Bool is non-null"
+        );
     }
 
     /// Decode every record of an RLOG object (no predicate), in the object's
@@ -7308,6 +7760,488 @@ mod tests {
             .expect("compact");
         let (rec, _parts) = read_output(&store).await;
         rec.parts.iter().map(|p| p.content_hash.clone()).collect()
+    }
+
+    /// Deterministic, non-repeating bytes so a large loc's stored
+    /// `byte_len()` reflects real payload size rather than a handful of
+    /// compressed tokens: an LCG stream has none of `"x".repeat(n)`'s
+    /// run-length structure for `zstd` to fold away.
+    fn raw_fetch_lcg_body(seed: u64, len: usize) -> String {
+        let mut state = seed.wrapping_add(1);
+        let mut out = String::with_capacity(len);
+        while out.len() < len {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let byte = (state >> 33) as u8;
+            out.push((32 + (byte % 95)) as char);
+        }
+        out
+    }
+
+    /// 16 records across four four-record blocks, one loc per block
+    /// ([`raw_fetch_fixture_cfg`]): eight tiny bodies (blocks 0 and 1), then
+    /// eight large, poorly-compressible LCG bodies (blocks 2 and 3), so the
+    /// SECOND two-block raw fetch (locs 2 and 3) moves real bytes, not a
+    /// vacuous growth.
+    fn raw_fetch_fixture_records(base: i64) -> Vec<LogRecord> {
+        (0..8i64)
+            .map(|i| record(0, base + i * 2, "tiny", Vec::new()))
+            .chain((0..8i64).map(|i| {
+                record(
+                    0,
+                    base + 16 + i * 2,
+                    &raw_fetch_lcg_body(i as u64, 4_000),
+                    Vec::new(),
+                )
+            }))
+            .collect()
+    }
+
+    /// Four-record blocks, ONE block per row group: every candidate block is
+    /// its own loc, so `next_raw_block`'s two-block prefetch always reads two
+    /// DIFFERENT locs, and `pending_block_index` goes `None` between every
+    /// pair of blocks -- the new raw-fetch gate, not the existing decode
+    /// gate, is what a refill reaches first there.
+    fn raw_fetch_fixture_cfg() -> RlogConfig {
+        RlogConfig {
+            block_target_records: 4,
+            group_target_blocks: 1,
+            ..RlogConfig::default()
+        }
+    }
+
+    /// Seed one [`raw_fetch_fixture_records`] input and load its catalog.
+    async fn raw_fetch_fixture_catalog(
+        store: &MemoryStore,
+        writer_id: Uuid,
+        seq: u64,
+        records: &[LogRecord],
+    ) -> RlogInputCatalog {
+        let bytes = seed_l0(store, writer_id, seq, records, raw_fetch_fixture_cfg(), &[]).await;
+        stream_catalog(store, writer_id, seq, &bytes).await
+    }
+
+    /// Open a [`raw_fetch_fixture_catalog`] cursor and drive it exactly to
+    /// the point where the NEW raw-fetch gate is the first budget check a
+    /// refill reaches: block 0 decoded and drained by the initial
+    /// (budget-`None`) refill inside [`open_cursor`], then block 1 drained
+    /// after a refill under a deliberately generous budget (block 1's decode
+    /// goes through the EXISTING [`CursorBudget::grow_to`] gate, which this
+    /// test does not pin). Returns the cursor, the stream's running charge at
+    /// that point, and the eight timestamps blocks 0 and 1 yielded, in order.
+    async fn raw_fetch_fixture_cursor_before_second_fetch<'a>(
+        store: &'a MemoryStore,
+        catalog: &'a RlogInputCatalog,
+        stream_id: &LogStreamId,
+        tracker: &MergeMemoryTracker,
+        ledger: &RequestLedger,
+    ) -> (StreamCursor<'a>, u64, Vec<i64>) {
+        let mut cursor = open_cursor(store, catalog, 0, stream_id, Some(tracker), Some(ledger))
+            .await
+            .expect("open cursor")
+            .expect("input carries stream 0");
+        let reservation = cursor_reservation_bytes(catalog, stream_id)
+            .expect("reservation")
+            .expect("input carries stream 0");
+        cursor.reservation = reservation;
+        cursor.charged = reservation;
+        let mut charged = reservation;
+        reconcile_cursor_charge(&mut cursor, &mut charged);
+        let mut yielded = Vec::new();
+        for _ in 0..4 {
+            yielded.push(cursor.next_record().expect("record").expect("a row").ts_ns);
+        }
+        assert!(
+            cursor.peek_ts().is_none(),
+            "block 0 is drained but not yet released"
+        );
+
+        let mut generous = CursorBudget {
+            budget: u64::MAX / 2,
+            charged: &mut charged,
+            stream_id,
+            open_cursors: 1,
+            inputs_carrying_stream: 1,
+        };
+        cursor
+            .refill(store, Some(tracker), Some(ledger), Some(&mut generous))
+            .await
+            .expect("block 1 must decode under a generous budget");
+        reconcile_cursor_charge(&mut cursor, &mut charged);
+        for _ in 0..4 {
+            yielded.push(cursor.next_record().expect("record").expect("a row").ts_ns);
+        }
+        assert!(
+            cursor.peek_ts().is_none(),
+            "block 1 is drained but not yet released"
+        );
+        assert!(
+            cursor.group.is_none() && cursor.prefetched.is_none(),
+            "block 1 drained: the cursor must hold neither a group nor a prefetched loc, so \
+             the next refill's first budget check is the new raw-fetch gate"
+        );
+        (cursor, charged, yielded)
+    }
+
+    /// ADR-0979 decision 4 as amended, the raw-fetch clause: BEFORE
+    /// `next_raw_block` issues its two-block `try_join!`, an open cursor's
+    /// charge GROWS to `metadata + retained raw + the fetch's own byte
+    /// count`, and the growth is checked against the budget before the
+    /// `try_join!` runs -- a refusal there costs zero bytes moved, because
+    /// the gate sits ahead of the GETs, not after them.
+    ///
+    /// [`raw_fetch_fixture_records`] lays out four four-record blocks, one
+    /// loc per block. [`raw_fetch_fixture_cursor_before_second_fetch`]
+    /// replays a cursor's life up to the point where block 1 is drained and
+    /// the cursor holds neither a `group` nor a `prefetched` loc, so a
+    /// refill's first budget check is the NEW gate, over the fetch of locs 2
+    /// and 3 -- the two large, LCG-bodied blocks, so the growth this test
+    /// pins is a real one, not a vacuous pass.
+    ///
+    /// Both arms below replay that identical setup on a fresh store, then
+    /// diverge only on the budget over the locs-2/3 fetch: one byte below
+    /// [`StreamCursor::raw_fetch_charge_requirement`]'s figure refuses with
+    /// `MergeCursorBudgetSite::RawFetch` naming the refused fetch, with the
+    /// ledger's `block_read` counters UNCHANGED from right after the initial
+    /// open (proving neither GET of the refused fetch was issued); at
+    /// exactly that figure plus block 2's decode ceiling, the same refill
+    /// call both fetches locs 2 and 3 (the ledger's `block_read` requests
+    /// grow by exactly 2, its bytes by exactly locs 2 and 3's combined
+    /// `byte_len()`) and decodes block 2, and the cursor goes on to drain
+    /// blocks 2 and 3 to exhaustion in order.
+    ///
+    /// On this fixture the raw-fetch requirement before locs 2 and 3 land is
+    /// 26,801 B (location metadata plus their combined 26,577 B of stored
+    /// LCG bytes, against 50 B of tiny bytes for locs 0 and 1 combined),
+    /// against nothing already charged for a raw term (block 1 left no
+    /// group or prefetched loc resident), so the whole figure is the
+    /// growth. Block 2's decode ceiling is 22,255 B, so the admitted arm's
+    /// budget is 49,056 B, which the same refill call also grows the charge
+    /// to in full (block 2's decode-grow check finds the raw-fetch charge
+    /// covers only the fetch, not its own ceiling, and grows again up to
+    /// the budget).
+    ///
+    /// Demonstrated red by deleting the new gate arm entirely (the
+    /// `if let (Some(b), Some((first, count, bytes))) = ...` block in
+    /// `StreamCursor::refill`, immediately before the call into
+    /// `next_raw_block`): `expect_err` itself does NOT panic, because an
+    /// error still occurs -- but too late, and for the wrong reason. With
+    /// the new gate gone, the fetch of locs 2 and 3 succeeds unchecked, and
+    /// it is the pre-existing, unmodified `BlockGrow` decode-grow check
+    /// (over block 2's decode, run after the fetch) that trips instead, so
+    /// `err` is still `MergeCursorBudgetExceeded` but with the wrong `site`
+    /// and the wrong `required_bytes`. The match on `err`'s fields then
+    /// panics at the `required_bytes` assertion:
+    /// `assertion `left == right` failed: the number a retry must budget \
+    /// for is the raw-fetch requirement` with `left: 49056, right: 26801`
+    /// (49,056 is `admitted_budget`, i.e. block 2's decode requirement
+    /// including the raw-fetch bytes it now finds already resident, not the
+    /// raw-fetch-only figure of 26,801 this test pins).
+    ///
+    /// Demonstrated red for ORDERING by moving ONLY the
+    /// `grow_to_raw_fetch` call (keeping the SAME pre-fetch-snapshotted
+    /// `first`/`count`/`bytes`/`required`, computed before the fetch, so
+    /// every field the `err` match asserts on still lines up) to run after
+    /// `next_raw_block(store, tracker, ledger).await?` resolves, inside its
+    /// `Some((loc, data)) => { .. }` arm, instead of before the call: the
+    /// refusal still fires with the right `site` and `required_bytes`
+    /// (`expect_err` and the whole `err` match still pass), because
+    /// `required` was captured before the fetch ran, not recomputed after
+    /// it. What the relocated check can no longer prevent is the fetch
+    /// itself: `next_raw_block`'s `try_join!` has already issued and landed
+    /// both GETs of locs 2 and 3 by the time the refusal fires. The test's
+    /// "no byte moved" assertion catches exactly that, panicking at
+    /// `assertion `left == right` failed: a refused raw-fetch gate must
+    /// move zero requests and zero bytes` with
+    /// `left: PhaseRequests { requests: 4, wire_bytes_received: 26627, \
+    /// wire_bytes_sent: 0 }, right: PhaseRequests { requests: 2, \
+    /// wire_bytes_received: 50, wire_bytes_sent: 0 }` -- two more requests
+    /// and locs 2 and 3's combined bytes, moved by a "refused" fetch that
+    /// ran anyway because the gate was checked too late.
+    #[tokio::test]
+    async fn raw_fetch_refused_before_the_two_block_prefetch_lands() {
+        let recs = raw_fetch_fixture_records(0);
+        let (stream_id, _) = stream_ident(0);
+
+        // ---- Derive the fixture's real figures from a throwaway probe, via
+        // the same production methods the gate itself calls. ----
+        let probe_store = MemoryStore::new();
+        let probe_catalog =
+            raw_fetch_fixture_catalog(&probe_store, Uuid::from_u128(1), 1, &recs).await;
+        assert_eq!(
+            probe_catalog.pricing.block_rows,
+            vec![4, 4, 4, 4],
+            "the fixture must be four four-record blocks"
+        );
+        let locs = probe_catalog
+            .reader
+            .stream_blocks(&stream_id)
+            .expect("stream blocks")
+            .expect("input carries stream 0")
+            .clone();
+        assert_eq!(
+            locs.len(),
+            4,
+            "one loc per block under group_target_blocks: 1"
+        );
+        for (i, loc) in locs.iter().enumerate() {
+            assert_eq!(
+                loc.block_indices(),
+                [i],
+                "loc {i} must hold exactly its own block"
+            );
+        }
+        let tiny_bytes = locs[0].byte_len().saturating_add(locs[1].byte_len());
+        let probe_tracker = MergeMemoryTracker::new();
+        let probe_ledger = RequestLedger::new();
+        let (mut probe_cursor, _, _) = raw_fetch_fixture_cursor_before_second_fetch(
+            &probe_store,
+            &probe_catalog,
+            &stream_id,
+            &probe_tracker,
+            &probe_ledger,
+        )
+        .await;
+        let block1_heap = probe_cursor.decoded_bytes();
+        let (first_loc_index, loc_count, fetch_bytes) = probe_cursor
+            .pending_raw_fetch()
+            .expect("locs 2 and 3 remain, with no prefetch to cover them");
+        assert_eq!(
+            (first_loc_index, loc_count),
+            (2, 2),
+            "the second fetch reads locs 2 and 3 together"
+        );
+        let two_max_locs = 2 * locs.iter().map(|l| l.byte_len()).max().unwrap_or(0);
+        assert_eq!(
+            fetch_bytes,
+            locs[2].byte_len().saturating_add(locs[3].byte_len()),
+            "the pending fetch's bytes ({fetch_bytes} B) are exactly locs 2 and 3's stored \
+             lengths, not merely bounded by twice the largest loc ({two_max_locs} B)"
+        );
+        // Compose the requirement independently of
+        // `raw_fetch_charge_requirement`, the function under test, so an
+        // over-charge in that function cannot slip past its own assertion.
+        // Mirror `refill`'s own release of the drained block right before it
+        // computes this figure (`StreamCursor::refill`, immediately before
+        // the raw-fetch gate): the gate runs with nothing resident.
+        probe_cursor.release_block(Some(&probe_tracker));
+        assert_eq!(
+            probe_cursor.raw_resident_bytes(),
+            0,
+            "no raw loc is held between the locs-0/1 fetch and the locs-2/3 fetch"
+        );
+        assert_eq!(
+            probe_cursor.decoded_bytes(),
+            0,
+            "the gate runs with nothing resident: block 1 is released before it"
+        );
+        let required = loc_metadata_bytes(&locs) + probe_cursor.raw_resident_bytes() + fetch_bytes;
+        let ceiling_2 =
+            block_decode_ceiling_bytes(&probe_catalog.pricing, 2).expect("block 2 ceiling");
+
+        // ---- Arm 1: a budget one byte below `required` refuses, before
+        // either GET of the locs-2/3 fetch is issued. ----
+        let store = MemoryStore::new();
+        let catalog = raw_fetch_fixture_catalog(&store, Uuid::from_u128(1), 1, &recs).await;
+        let tracker = MergeMemoryTracker::new();
+        let ledger = RequestLedger::new();
+        let (mut cursor, charged, _prefix_ts) = raw_fetch_fixture_cursor_before_second_fetch(
+            &store, &catalog, &stream_id, &tracker, &ledger,
+        )
+        .await;
+        let before_gate = ledger.report().block_read;
+        assert_eq!(
+            before_gate.requests, 2,
+            "only the initial locs-0/1 fetch has run so far"
+        );
+        assert_eq!(
+            before_gate.wire_bytes_received, tiny_bytes,
+            "the initial fetch's bytes are locs 0 and 1 alone"
+        );
+
+        let charge_before = charged;
+        assert_eq!(
+            charge_before,
+            loc_metadata_bytes(&locs) + block1_heap,
+            "the charge before the gate is exactly what block 1 left resident: its metadata \
+             plus the drained-but-unreleased block's heap"
+        );
+        assert!(
+            required > charge_before,
+            "the raw-fetch requirement ({required} B) must exceed what block 1 left charged \
+             ({charge_before} B) by {} B, or the gate never has anything to refuse",
+            required - charge_before
+        );
+        let cursor_charged_before = cursor.charged;
+        let peak_before_refusal = tracker.peak_transient_bytes();
+
+        let mut refused_charged = charged;
+        let mut budget = CursorBudget {
+            budget: required - 1,
+            charged: &mut refused_charged,
+            stream_id: &stream_id,
+            open_cursors: 1,
+            inputs_carrying_stream: 1,
+        };
+        let err = cursor
+            .refill(&store, Some(&tracker), Some(&ledger), Some(&mut budget))
+            .await
+            .expect_err("a budget below the raw-fetch requirement must refuse the fetch");
+        match err {
+            MaintainError::MergeCursorBudgetExceeded {
+                stream_id: got_stream,
+                open_cursors,
+                charged_bytes,
+                budget_bytes,
+                required_bytes,
+                inputs_carrying_stream,
+                site,
+            } => {
+                assert_eq!(got_stream, stream_id.to_hex());
+                assert_eq!(open_cursors, 1, "the growing cursor is itself open");
+                assert_eq!(
+                    charged_bytes, charged,
+                    "the charge at refusal is what block 1 left it at"
+                );
+                assert_eq!(budget_bytes, required - 1);
+                assert_eq!(
+                    required_bytes, required,
+                    "the number a retry must budget for is the raw-fetch requirement"
+                );
+                assert_eq!(inputs_carrying_stream, 1);
+                assert_eq!(
+                    site,
+                    MergeCursorBudgetSite::RawFetch {
+                        first_loc_index: 2,
+                        loc_count: 2,
+                        fetch_bytes,
+                    },
+                    "the refusal names the fetch it refused: both locs, starting at index 2"
+                );
+            }
+            other => panic!("expected MergeCursorBudgetExceeded, got {other:?}"),
+        }
+        // The fetch never ran: no GET was issued, no loc was consumed, no
+        // group or prefetch was populated, and the charge never grew.
+        let after_gate = ledger.report().block_read;
+        assert_eq!(
+            after_gate, before_gate,
+            "a refused raw-fetch gate must move zero requests and zero bytes"
+        );
+        assert_eq!(
+            cursor.next_loc, 2,
+            "loc 2 is still unconsumed after a refusal"
+        );
+        assert!(
+            cursor.prefetched.is_none(),
+            "nothing was prefetched by a refused fetch"
+        );
+        assert!(
+            cursor.group.is_none(),
+            "no group was fetched by a refused fetch"
+        );
+        assert_eq!(refused_charged, charged, "a refused grow charges nothing");
+        assert_eq!(
+            cursor.charged, cursor_charged_before,
+            "a refused grow leaves the cursor's own charge unchanged too"
+        );
+        assert_eq!(
+            tracker.peak_transient_bytes(),
+            peak_before_refusal,
+            "a refused raw fetch must not move the transient high-water mark: nothing was \
+             fetched, decoded, or released beyond what block 1 already left behind"
+        );
+
+        // ---- Arm 2: a budget at exactly `required + ceiling(block 2)`
+        // admits both the fetch and block 2's decode in the same refill
+        // call. ----
+        let store = MemoryStore::new();
+        let catalog = raw_fetch_fixture_catalog(&store, Uuid::from_u128(1), 1, &recs).await;
+        let tracker = MergeMemoryTracker::new();
+        let ledger = RequestLedger::new();
+        let (mut cursor, mut charged, mut got) = raw_fetch_fixture_cursor_before_second_fetch(
+            &store, &catalog, &stream_id, &tracker, &ledger,
+        )
+        .await;
+        let before_admit = ledger.report().block_read;
+
+        let admitted_budget = required + ceiling_2;
+        let mut budget = CursorBudget {
+            budget: admitted_budget,
+            charged: &mut charged,
+            stream_id: &stream_id,
+            open_cursors: 1,
+            inputs_carrying_stream: 1,
+        };
+        cursor
+            .refill(&store, Some(&tracker), Some(&ledger), Some(&mut budget))
+            .await
+            .expect("a budget at required + block 2's ceiling admits the fetch and its decode");
+        let after_admit = ledger.report().block_read;
+        assert_eq!(
+            after_admit.requests,
+            before_admit.requests + 2,
+            "the admitted fetch issues exactly the two locs-2/3 GETs"
+        );
+        assert_eq!(
+            after_admit.wire_bytes_received,
+            before_admit.wire_bytes_received + fetch_bytes,
+            "the admitted fetch's bytes are exactly locs 2 and 3"
+        );
+        assert_eq!(
+            cursor.charged, admitted_budget,
+            "the same refill call also grows the charge past the raw-fetch requirement to cover \
+             block 2's decode, via the EXISTING decode-grow gate, right up to the budget"
+        );
+        assert_eq!(
+            *budget.charged, admitted_budget,
+            "the stream's running charge moved with the cursor's growth"
+        );
+
+        // Block 2 decoded in the SAME refill call; block 3 follows on drain
+        // through the EXISTING decode-grow gate, trivially, since its
+        // requirement (only loc 3's raw bytes) is already covered by the
+        // charge the raw-fetch gate left behind. `got` already carries blocks
+        // 0 and 1's eight timestamps from the fixture helper.
+        while cursor.peek_ts().is_some() {
+            got.push(cursor.next_record().expect("record").expect("a row").ts_ns);
+            cursor
+                .refill(&store, Some(&tracker), Some(&ledger), Some(&mut budget))
+                .await
+                .expect("refill");
+        }
+        assert_eq!(
+            got,
+            recs.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
+            "all 16 records, across all four blocks, are yielded in order once the raw fetch is \
+             admitted"
+        );
+        let final_read = ledger.report().block_read;
+        assert_eq!(
+            final_read.requests, 4,
+            "four block_read GETs total: the initial locs-0/1 fetch plus the admitted locs-2/3 \
+             fetch"
+        );
+        assert_eq!(
+            final_read.wire_bytes_received,
+            locs.iter().map(|l| l.byte_len()).sum::<u64>(),
+            "the ledger's total wire bytes are exactly the four locs' combined stored length"
+        );
+        reconcile_cursor_charge(&mut cursor, &mut charged);
+        assert_eq!(
+            charged,
+            cursor.resident_bytes(),
+            "reconciling after a full drain leaves the charge at exactly what the exhausted \
+             cursor holds"
+        );
+        assert!(
+            charged < required + ceiling_2,
+            "the reconciled charge ({charged} B) must fall back below the admitted budget \
+             ({} B = required {required} B + block 2's ceiling {ceiling_2} B), or the reconcile \
+             after drain did nothing",
+            required + ceiling_2
+        );
     }
 
     /// Rewrite `obj` with its PAGE_DIR descriptor dropped from the footer,

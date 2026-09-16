@@ -157,6 +157,7 @@ async fn max_flush_lifetime_zero_seals_the_finished_hour_a_default_fold_leaves_a
         SignalArg::Metrics,
         None,
         now,
+        false,
     )
     .await
     .expect("default fold succeeds");
@@ -197,6 +198,7 @@ async fn max_flush_lifetime_zero_seals_the_finished_hour_a_default_fold_leaves_a
         SignalArg::Metrics,
         OVERRIDE,
         now,
+        false,
     )
     .await
     .expect("override fold succeeds");
@@ -248,6 +250,7 @@ async fn a_default_fold_after_an_override_fold_is_a_no_op_at_the_reached_waterma
         SignalArg::Metrics,
         Some(0),
         now,
+        false,
     )
     .await
     .expect("override fold succeeds");
@@ -262,6 +265,7 @@ async fn a_default_fold_after_an_override_fold_is_a_no_op_at_the_reached_waterma
         SignalArg::Metrics,
         None,
         now,
+        false,
     )
     .await
     .expect("second, default fold succeeds");
@@ -378,6 +382,7 @@ async fn a_lifetime_that_overflows_the_seal_margin_is_refused() {
         SignalArg::Metrics,
         Some(i64::MAX),
         now,
+        false,
     )
     .await
     .expect_err("an overflowing seal margin must be refused");

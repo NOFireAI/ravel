@@ -137,18 +137,25 @@ struct Harness {
     executor: Arc<SqlExecutor>,
 }
 
-fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) -> Harness {
+fn harness(
+    store: Arc<dyn ObjectStoreBackend>,
+    configured: HashSet<TenantHash>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+) -> Harness {
     let query_accounting = Arc::new(QueryAccountingMetrics::new(configured));
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
-    let executor = Arc::new(SqlExecutor::new(
-        Arc::clone(&catalog),
-        SegmentFetcher::new(store.clone()),
-        LogSegmentFetcher::new(store.clone()),
-        ravel_sql::SpanSegmentFetcher::new(store.clone()),
-        SqlConfig::default(),
-        1 << 30,
-    ));
+    let executor = Arc::new(
+        SqlExecutor::new(
+            Arc::clone(&catalog),
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            ravel_sql::SpanSegmentFetcher::new(store.clone()),
+            SqlConfig::default(),
+            1 << 30,
+        )
+        .with_process_memory_budget(Arc::clone(&process_memory_budget)),
+    );
     let tokens: HashMap<String, TenantId> =
         HashMap::from([("acme-token".to_string(), TenantId::new("acme".to_string()))]);
 
@@ -186,6 +193,7 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
             Arc::new(SystemClock),
             AdmissionLimits::default(),
         )),
+        reconcile_cycle: Arc::new(crate::admission_reconcile::ReconcileCycleMetrics::default()),
         metrics_tenant_labels: false,
         metrics_tenant_allowlist: Arc::new(HashSet::new()),
         query_accounting,
@@ -200,7 +208,16 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         ingest_byte_metrics: std::sync::Arc::new(
             crate::ingest_byte_metrics::IngestByteMetrics::new(),
         ),
+        normalize_reject_metrics: std::sync::Arc::new(
+            crate::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+        ),
         metadata_cache: None,
+        cache: None,
+        cache_max_bytes: 0,
+        catalog_cache_max_bytes: 0,
+        audit_pipeline: None,
+        process_memory_budget,
+        process_memory_budget_is_fallback: false,
     });
 
     Harness {
@@ -261,7 +278,11 @@ async fn query_accounting_reaches_response_stats_and_metrics_endpoint() {
     let tenant = TenantId::new("acme".to_string());
     publish_segment(store.as_ref(), &tenant, &[(100, 1.0), (200, 2.5)]).await;
     // No tenant configured, so `acme` folds into `tenant_hash="other"`.
-    let h = harness(Arc::clone(&store), HashSet::new());
+    let h = harness(
+        Arc::clone(&store),
+        HashSet::new(),
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
+    );
 
     // Half one: the response carries a `stats` object with this query's
     // accounting and estimate beside its data.
@@ -324,7 +345,11 @@ async fn query_result_is_byte_identical_with_and_without_accounting() {
         &[(100, 1.0), (200, 2.5), (300, 4.0)],
     )
     .await;
-    let h = harness(Arc::clone(&store), HashSet::new());
+    let h = harness(
+        Arc::clone(&store),
+        HashSet::new(),
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
+    );
 
     let query = "SELECT ts, value FROM samples ORDER BY ts";
 
@@ -344,6 +369,9 @@ async fn query_result_is_byte_identical_with_and_without_accounting() {
         min_tokens: Vec::new(),
         now_ns: NOW_NS,
         deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     };
     let outcome = h
         .executor
@@ -356,5 +384,72 @@ async fn query_result_is_byte_identical_with_and_without_accounting() {
         serde_json::to_string(&handler_data).unwrap(),
         serde_json::to_string(&raw_data).unwrap(),
         "attaching accounting must not change the result payload"
+    );
+}
+
+/// ACCEPTANCE TEST (e): a query whose real execution outgrows the ADR-1170
+/// process-wide memory budget is refused typed (`ResourcesExhausted`, HTTP
+/// 422), never a panic, and the refusal rolls its charge back off the shared
+/// process counter so the very next query, through the SAME executor and the
+/// same tenant mutex, is still answered. This exercises the budget through
+/// the real HTTP handler and the real `SqlExecutor::new`/
+/// `with_process_memory_budget` wiring `crate::start` uses, not just the
+/// ravel-sql unit tests that drive `TenantDelegatingPool` directly.
+///
+/// Prove-the-test for the rollback half: add an early `return;` to
+/// `TenantMemoryAccountant::release_process_at_most`
+/// (crates/ravel-sql/src/memory.rs), so a refused query's charge stays on the
+/// shared counter. `budget.reserved()` then reads 64,000 against the expected
+/// 0. The `SELECT 1` assertion below does NOT catch that: a query that
+/// reserves nothing issues no `try_grow`, so it answers 200 against a counter
+/// left fully saturated just as it does against one rolled back to 0. It is
+/// here for the second half of the claim (the executor and the tenant mutex
+/// are still usable), and the counter assertion is here for the first.
+///
+/// The budget is 256 KiB rather than a token 1 KiB for the same reason. This
+/// statement needs 460,200 bytes to complete and takes them in increments no
+/// larger than the 64,000-byte table itself, so a 256 KiB ceiling is crossed
+/// only after several reservations have really been charged. Against a 1 KiB
+/// or 16 KiB ceiling the FIRST `try_grow` is refused, which reserves nothing
+/// by `MemoryBudget::try_reserve`'s all-or-nothing rule, and the counter never
+/// leaves 0 for a rollback to return it to: the assertion then holds whether
+/// or not the rollback exists (measured: `reserved()` reads 0 under both
+/// ceilings with the rollback disabled).
+#[tokio::test]
+async fn a_query_over_the_process_budget_is_refused_and_the_process_keeps_serving() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let samples: Vec<(i64, f64)> = (0..4_000)
+        .map(|i| (i as i64 * 1_000_000, i as f64))
+        .collect();
+    publish_segment(store.as_ref(), &tenant, &samples).await;
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(256 * 1024));
+    let h = harness(Arc::clone(&store), HashSet::new(), Arc::clone(&budget));
+
+    // A real sort over 4,000 rows outgrows a 256 KiB process budget: refused
+    // typed, not a panic and not a hang.
+    let (status, body) = post_sql(&h.sql, "SELECT ts, value FROM samples ORDER BY ts").await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a sort over 4,000 rows must outgrow a 256 KiB process budget: {body}"
+    );
+
+    // The refused query's charge rolled back off the SHARED process counter.
+    // This is what makes the cross-tenant cascade survivable: the counter is
+    // process-wide, so a charge left behind by one tenant's abort refuses
+    // every other tenant's next reservation for as long as it sits there.
+    assert_eq!(
+        budget.reserved(),
+        0,
+        "the refused query must leave no charge on the shared process counter"
+    );
+
+    // And the executor itself is still usable through the same tenant mutex.
+    let (status, body) = post_sql(&h.sql, "SELECT 1").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the process must keep answering after a refusal: {body}"
     );
 }

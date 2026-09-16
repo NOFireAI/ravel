@@ -385,3 +385,16 @@ flowchart TD
     MS --> EV["ravel_promql::Evaluator\n(unchanged)"]
     EV --> J["Prometheus JSON envelope\nwith per-phase cost split"]
 ```
+
+## Amendment 2026-09-06 (issue #1202): `__body__` literal bloom pruning
+
+The follow-up decision 3 anticipated ("extraction into `Predicate::HasWord`
+for bloom pruning") has landed, for the subset of `__body__` matchers a
+literal can be proven a superset of: an equality matcher, and an anchored
+regex matcher whose pattern has a token-bounded mandatory literal run. A
+bare `.*word.*` regex, and any pattern with a `+`-quantified character, are
+deliberately not extracted -- token matching is not a superset of substring
+matching, so pushing an unproven literal as a bloom-pruning `HasWord` could
+drop a matching row. The per-record `__body__` check is unchanged and still
+runs on every decoded record; the extracted literal only prunes blocks
+before decode, it never replaces that check.

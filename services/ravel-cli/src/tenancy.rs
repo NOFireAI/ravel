@@ -51,6 +51,14 @@ pub fn configured_scheme_from_flags(
     Ok(ConfiguredScheme::Unspecified)
 }
 
+/// Exact wording of ravel-server's `TenancyError::FreshBucketNeedsKey`
+/// (services/ravel-server/src/tenancy.rs), reused verbatim so a writing CLI
+/// command refuses in the same words the server would refuse to start with
+/// (issue #1184).
+const FRESH_BUCKET_NEEDS_KEY: &str = "this is a fresh bucket and the tenant hash is keyed by \
+     default, but no --tenant-hash-key-file was configured: pass --tenant-hash-key-file to key \
+     the bucket, or --tenant-hash-unkeyed to opt out permanently";
+
 /// Resolve the tenant-hash scheme the CLI must hash tenants under, reading the
 /// bucket's real `sys/tenancy` marker and validating the configured scheme
 /// against it through the same fail-closed decision the server uses at startup
@@ -64,9 +72,39 @@ pub fn configured_scheme_from_flags(
 /// bucket with no marker is refused (the bucket is not pinned to that key),
 /// while an unkeyed or unspecified config falls back to the v1 derivation (the
 /// only scheme a pre-ADR, not-yet-adopted bucket ever used).
+///
+/// This lenient absent-marker default is only safe for a command that never
+/// writes: use [`resolve_scheme_for_write`] ahead of any write, since a fresh
+/// bucket defaults to keyed on the server and this fallback would otherwise
+/// write under the wrong (unkeyed) prefix silently (issue #1184).
 pub async fn resolve_scheme(
     store: &dyn ObjectStoreBackend,
     configured: ConfiguredScheme,
+) -> anyhow::Result<TenantHashScheme> {
+    resolve_scheme_inner(store, configured, false).await
+}
+
+/// The scheme resolution a writing subcommand must use ahead of its first
+/// write (issue #1184). Identical to [`resolve_scheme`] except that an absent
+/// marker with no scheme flag given (`ConfiguredScheme::Unspecified`) refuses
+/// with the same [`FRESH_BUCKET_NEEDS_KEY`] message the server's own startup
+/// refusal uses, instead of silently defaulting to the v1-unkeyed derivation.
+/// A bucket in that state is one the server itself refuses to start against
+/// (it defaults to keyed and has no key configured), so a CLI write there
+/// writes data under a prefix nothing will ever address once the bucket is
+/// eventually bootstrapped keyed. `--tenant-hash-unkeyed` remains a valid
+/// explicit opt-out: only the flag-less default is refused.
+pub async fn resolve_scheme_for_write(
+    store: &dyn ObjectStoreBackend,
+    configured: ConfiguredScheme,
+) -> anyhow::Result<TenantHashScheme> {
+    resolve_scheme_inner(store, configured, true).await
+}
+
+async fn resolve_scheme_inner(
+    store: &dyn ObjectStoreBackend,
+    configured: ConfiguredScheme,
+    refuse_unspecified_on_fresh_bucket: bool,
 ) -> anyhow::Result<TenantHashScheme> {
     let outcome = match store.get("sys/tenancy", GetRange::Full).await {
         Ok(outcome) => outcome,
@@ -78,6 +116,9 @@ pub async fn resolve_scheme(
                      refusing to hash tenants under a key this bucket is not pinned to. Drop the \
                      key file to inspect it unkeyed."
                 ),
+                ConfiguredScheme::Unspecified if refuse_unspecified_on_fresh_bucket => {
+                    anyhow::bail!(FRESH_BUCKET_NEEDS_KEY)
+                }
                 ConfiguredScheme::Unkeyed | ConfiguredScheme::Unspecified => {
                     Ok(TenantHashScheme::V1Unkeyed)
                 }
@@ -110,6 +151,16 @@ pub async fn resolve_scheme(
     };
     resolve_scheme_against_marker(marker_scheme, &marker.key_fingerprint, &configured)
         .map_err(|err| anyhow::anyhow!("{err}"))
+}
+
+/// `tenancy resolve` (issue #1180): hash `tenant` under an already-resolved
+/// `scheme` and return its object-store prefix. `scheme` comes from the same
+/// [`resolve_scheme`] call and [`TenantHashScheme::hash`] method every other
+/// tenant-hashing subcommand uses, so the prefix cannot drift from what the
+/// rest of the CLI, or the server, would derive for the same tenant.
+pub fn resolve(scheme: &TenantHashScheme, tenant: &str) -> String {
+    let hash = scheme.hash(&ravel_types::TenantId::new(tenant));
+    format!("t/{}/", hash.to_hex())
 }
 
 /// `tenancy show`: GET `sys/tenancy`, decode it, and render the scheme and (for
@@ -375,5 +426,98 @@ mod tests {
         let err = configured_scheme_from_flags(Some(Path::new("/some/key")), true)
             .expect_err("both flags must be rejected");
         assert!(err.to_string().contains("mutually exclusive"), "err: {err}");
+    }
+
+    /// Issue #1184: a writing subcommand's scheme resolution refuses a fresh
+    /// (marker-less) bucket when no scheme flag was given, with the exact
+    /// wording of the server's own `TenancyError::FreshBucketNeedsKey`
+    /// startup refusal. Before this fix, [`resolve_scheme`] was the only
+    /// resolution a writing subcommand had, and its `Unspecified` arm
+    /// returned `Ok(TenantHashScheme::V1Unkeyed)` here instead: flipping
+    /// `resolve_scheme_for_write` back to call plain `resolve_scheme`
+    /// reproduces that pre-fix behavior and turns this `expect_err` into a
+    /// panic on `Ok(V1Unkeyed)`.
+    #[tokio::test]
+    async fn write_resolution_refuses_unspecified_config_on_fresh_bucket() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let configured = configured_scheme_from_flags(None, false).expect("no flags is valid");
+        let err = resolve_scheme_for_write(store.as_ref(), configured)
+            .await
+            .expect_err("a fresh bucket with no scheme flag must refuse, not default to unkeyed");
+        assert_eq!(err.to_string(), FRESH_BUCKET_NEEDS_KEY);
+    }
+
+    /// The explicit `--tenant-hash-unkeyed` opt-out still works against a
+    /// fresh bucket: only the flag-less default is refused.
+    #[tokio::test]
+    async fn write_resolution_allows_explicit_unkeyed_on_fresh_bucket() {
+        use ravel_types::TenantId;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let configured = configured_scheme_from_flags(None, true).expect("valid flags");
+        let scheme = resolve_scheme_for_write(store.as_ref(), configured)
+            .await
+            .expect("explicit --tenant-hash-unkeyed must still be honored");
+        let tenant = TenantId::new("acme");
+        assert_eq!(
+            scheme.hash(&tenant),
+            TenantHashScheme::V1Unkeyed.hash(&tenant)
+        );
+    }
+
+    /// `--tenant-hash-key-file` against a fresh bucket still refuses under
+    /// write resolution too, same as it already does for [`resolve_scheme`].
+    #[tokio::test]
+    async fn write_resolution_still_refuses_keyed_config_on_fresh_bucket() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let configured = ConfiguredScheme::Keyed(Box::new([0x55u8; 32]));
+        let err = resolve_scheme_for_write(store.as_ref(), configured)
+            .await
+            .expect_err("a keyed config against a marker-less bucket must refuse");
+        assert!(
+            err.to_string().contains("no sys/tenancy marker"),
+            "err: {err}"
+        );
+    }
+
+    /// Read-only resolution is unchanged by the write-path fix: it still
+    /// falls back to v1-unkeyed on a fresh bucket with no scheme flag, so a
+    /// read-only command keeps working exactly as before (issue #1184's
+    /// requirement that read-only subcommands keep working).
+    #[tokio::test]
+    async fn read_resolution_still_defaults_unspecified_on_fresh_bucket() {
+        use ravel_types::TenantId;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let configured = configured_scheme_from_flags(None, false).expect("no flags is valid");
+        let scheme = resolve_scheme(store.as_ref(), configured)
+            .await
+            .expect("read-only resolution still defaults rather than refuses");
+        let tenant = TenantId::new("acme");
+        assert_eq!(
+            scheme.hash(&tenant),
+            TenantHashScheme::V1Unkeyed.hash(&tenant)
+        );
+    }
+
+    /// Issue #1180: `tenancy resolve` prints exactly `t/<hash>/`, computed
+    /// through the same [`TenantHashScheme::hash`] every other subcommand
+    /// calls, so a change to the derivation on either side fails this test.
+    #[test]
+    fn resolve_prints_exact_prefix_for_known_tenant_and_scheme() {
+        use ravel_types::TenantId;
+
+        let scheme = TenantHashScheme::V1Unkeyed;
+        let expected = format!("t/{}/", scheme.hash(&TenantId::new("acme")).to_hex());
+        assert_eq!(resolve(&scheme, "acme"), expected);
+
+        let key = [0x66u8; 32];
+        let keyed_scheme = TenantHashScheme::v2_from_deployment_key(&key);
+        let expected_keyed = format!("t/{}/", keyed_scheme.hash(&TenantId::new("acme")).to_hex());
+        assert_eq!(resolve(&keyed_scheme, "acme"), expected_keyed);
+        assert_ne!(
+            expected, expected_keyed,
+            "the two schemes must resolve different prefixes for the same tenant"
+        );
     }
 }

@@ -53,6 +53,18 @@ async fn main() -> anyhow::Result<()> {
 
     ravel_server::warn_dev_insecure_tenant_header(cli.dev_insecure_tenant_header);
 
+    // Host-derived performance defaults (ADR-0088 as amended by issue #1141).
+    // The host is read exactly once, here, and the six settings are resolved
+    // from it once; every consumer below takes the resolved value, so no later
+    // code re-reads the host and nothing can enforce a number the startup log
+    // did not name. An explicit flag wins over every derived value, unchanged
+    // in meaning.
+    let host = ravel_server::config::HostProfile::detect();
+    let performance = cli
+        .resolve_performance(host)
+        .context("failed to resolve the host-derived performance defaults")?;
+    performance.emit(host);
+
     // OTAP (ADR-0011) is opt-in even in a build with the `otap` feature: the
     // feature links the arrow decode stack, `--otap` decides whether this
     // process registers the ArrowMetricsService (ServerConfig::otap, read by
@@ -83,7 +95,8 @@ async fn main() -> anyhow::Result<()> {
         cache,
         kms: tenant_kms,
         classed: _classed,
-    } = ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
+    } = ravel_server::store::build_store(&cli, performance.cache_max_bytes)
+        .context("failed to build object store backend")?;
 
     // Store-backend qualification gate (ADR-0050 section 6, EC7). On any
     // production store kind, refuse to start unless a `sys/qualification` record
@@ -93,9 +106,13 @@ async fn main() -> anyhow::Result<()> {
     // the tenancy marker and GC config, an absent record is NOT a
     // bootstrap-and-continue case: a fresh production deployment must run `store
     // qualify` first, by design (see `qualification` and the operations guide).
-    ravel_server::qualification::enforce(store.as_ref(), cli.store)
-        .await
-        .context("store backend is not qualified (sys/qualification); refusing to start")?;
+    ravel_server::qualification::enforce(
+        store.as_ref(),
+        cli.store,
+        cli.backend_identity().as_deref(),
+    )
+    .await
+    .context("store backend is not qualified (sys/qualification); refusing to start")?;
 
     // Bucket-protection contract gate (ADR-0072 decision 3), off by default:
     // see docs/object-store-contract.md's "Required bucket configuration"
@@ -130,6 +147,17 @@ async fn main() -> anyhow::Result<()> {
     // only on a keyed bucket. `start` builds the writer from it and wires it
     // into every ingest path.
     let deployment_key = resolved_tenancy.deployment_key;
+
+    // ADR-0062 decision 2e: how a query-audit record carries `query.text`.
+    // Resolved here, beside the deployment key its token key can be derived
+    // from. Under `redacted` with no key available, this refuses to start
+    // only in the modes that install the query-audit pipeline (`all` and
+    // `query`; `Mode::installs_query_audit_pipeline`): a process that will
+    // actually write audit records and cannot tokenize them must not start,
+    // but `gateway` and `maintain` write none and so read no key.
+    let audit_text = cli
+        .resolve_audit_text_policy(deployment_key.as_deref())
+        .context("failed to resolve --audit-text")?;
 
     // Per-tenant SSE-KMS routing (ADR-0062 decision 1,
     // ADR-0072 decision 2). Deferred to here, not folded into `build_store`
@@ -217,6 +245,45 @@ async fn main() -> anyhow::Result<()> {
     }
     ravel_server::warn_mtls_trusted_header(auth.mtls_header.as_deref());
 
+    // Federation TLS is on by default (ADR-0071 amendment), so a remote with
+    // `tls` off is a deliberate operator choice; log it by name once here,
+    // where the resolved remote-cluster config first exists. Parsed before
+    // `build_auth_resolver` consumes `tenant_tokens` and `auth`, so the
+    // tenant-mapping check can read every resolver input.
+    let remote_clusters = cli
+        .parse_remote_clusters()
+        .context("failed to resolve --remote-cluster settings")?;
+    // Alert rules are static per-tenant config loaded once at startup
+    // (ADR-0043 decision 2), and every validation the rules can fail happens
+    // here rather than once per evaluation tick. Alerting stays off unless a
+    // rules file was named and it holds at least one rule.
+    //
+    // Parsed here, above the tenant-mapping check below, because that check
+    // needs its tenant set: `alerting::spawn` starts one evaluator
+    // per tenant in this document against the same engine federation is
+    // installed on, so a tenant named only here still federates and is a local
+    // tenant for that check's purposes. The two real constraints on where this
+    // sits: after `install_tenant_hash_scheme`, so `TenantId::hash()` inside
+    // resolves under the scheme the request path uses, and before
+    // `ensure_federation_tenant_mapping` and any listener bind.
+    let alert_rules = match cli.alert_rules_file.as_deref() {
+        Some(path) => load_rules_file(path)?,
+        None => HashMap::new(),
+    };
+    let alert_rule_tenants: Vec<ravel_types::TenantHash> = alert_rules.keys().copied().collect();
+    // A remote cluster's credential belongs to one local tenant. Refuse a spec
+    // that names none on a coordinator that runs queries for more than one,
+    // before any listener binds, rather than silently fanning every tenant's
+    // queries out under the same credential.
+    ravel_server::ensure_federation_tenant_mapping(
+        &remote_clusters,
+        &tenant_tokens,
+        &alert_rule_tenants,
+        cli.dev_insecure_tenant_header,
+        &auth,
+    )?;
+    ravel_server::warn_plaintext_federation(&remote_clusters);
+
     let resolver_bundle = ravel_server::tenant::build_auth_resolver(
         tenant_tokens,
         cli.dev_insecure_tenant_header,
@@ -239,7 +306,7 @@ async fn main() -> anyhow::Result<()> {
     // any set to non-default values permanently bricked those modes; these are
     // the documented remediation (docs/guides/operations.md).
     let gc_runtime = cli
-        .resolve_gc_runtime()
+        .resolve_gc_runtime(performance.query_deadline)
         .context("failed to parse the --gc-* GC-config flags")?;
     let interior_reverify_ns = cli
         .parse_maintain_interior_reverify()
@@ -251,7 +318,19 @@ async fn main() -> anyhow::Result<()> {
         interior_reverify_ns,
         ..CompactorConfig::default()
     };
-    let catalog_max_ingest_lag_ns = ravel_catalog::CatalogConfig::default().max_ingest_lag_ns;
+    // The catalog listing window and the OTLP admission bound are one
+    // coordinated value (ADR-0051 section 4), from `--max-ingest-lag`. Resolve
+    // the pair here so the retention floor below is validated against the SAME
+    // window the catalog actually resolves with, not the compiled-in 2h default:
+    // a deployment that raised the flag would otherwise validate retention
+    // against the wrong lag. `ravel_server::start` resolves it again from the
+    // `max_ingest_lag` duration threaded onto `ServerConfig`.
+    let max_ingest_lag = cli
+        .parse_max_ingest_lag()
+        .context("failed to parse --max-ingest-lag")?;
+    let ingest_lag =
+        ravel_server::resolve_ingest_lag(max_ingest_lag).context("invalid --max-ingest-lag")?;
+    let catalog_max_ingest_lag_ns = ingest_lag.catalog_window_ns;
     let retention_policy = cli
         .parse_retention_policy()
         .context("failed to parse retention flags")?;
@@ -283,14 +362,6 @@ async fn main() -> anyhow::Result<()> {
         })?;
     }
 
-    // Alert rules are static per-tenant config loaded once at startup
-    // (ADR-0043 decision 2), and every validation the rules can fail happens
-    // here rather than once per evaluation tick. Alerting stays off unless a
-    // rules file was named and it holds at least one rule.
-    let alert_rules = match cli.alert_rules_file.as_deref() {
-        Some(path) => load_rules_file(path)?,
-        None => HashMap::new(),
-    };
     let alert_sinks = cli
         .parse_alert_sinks()
         .context("failed to parse alert sink flags")?;
@@ -394,14 +465,6 @@ async fn main() -> anyhow::Result<()> {
         .zip(resolver_bundle.mtls_resolver)
         .map(|(addr, resolver)| ravel_server::MtlsListenerConfig { addr, resolver });
 
-    // Federation TLS is on by default (ADR-0071 amendment), so a remote with
-    // `tls` off is a deliberate operator choice; log it by name once here,
-    // where the resolved remote-cluster config first exists.
-    let remote_clusters = cli
-        .parse_remote_clusters()
-        .context("failed to resolve --remote-cluster settings")?;
-    ravel_server::warn_plaintext_federation(&remote_clusters);
-
     let flush_cadence = cli
         .resolve_flush_cadence()
         .context("failed to resolve flush-cadence flags")?;
@@ -461,7 +524,7 @@ async fn main() -> anyhow::Result<()> {
             .resolve_max_s3_requests()
             .context("failed to resolve --max-s3-requests")?,
         query_budgets: cli
-            .query_budgets()
+            .query_budgets(&performance)
             .context("failed to resolve the query budgets and logs fetch policy")?,
         scrub_period: cli
             .parse_scrub_period()
@@ -469,8 +532,13 @@ async fn main() -> anyhow::Result<()> {
         indexed_fields,
         typed_attr_columns,
         disable_cache: cli.disable_cache,
-        cache_max_bytes: cli.cache_max_bytes,
+        cache_max_bytes: performance.cache_max_bytes,
+        catalog_cache_max_bytes: performance.catalog_cache_max_bytes,
+        process_memory_budget_bytes: performance.memory_remainder_bytes,
+        process_memory_budget_is_fallback: performance.sources.memory_budget_bytes
+            == ravel_server::config::PERF_SOURCE_FALLBACK,
         cache_dir: cli.cache_dir.clone(),
+        catalog_resolve_concurrency: cli.catalog_resolve_concurrency,
         ingest_concurrency_limit: cli
             .parse_ingest_concurrency_limit()
             .context("failed to parse --max-inflight-ingest-requests")?,
@@ -484,6 +552,15 @@ async fn main() -> anyhow::Result<()> {
             .parse_distrib_settings()
             .context("failed to resolve --distributed-query settings")?,
         remote_clusters,
+        audit_pipeline: cli
+            .resolve_audit_pipeline_config()
+            .context("failed to resolve --audit-mode/--audit-max-batch/--audit-max-age")?,
+        audit_text,
+        shutdown_timeout: cli
+            .parse_shutdown_timeout()
+            .context("failed to parse --shutdown-timeout")?,
+        drain_settle_interval: ravel_server::DEFAULT_DRAIN_SETTLE_INTERVAL,
+        max_ingest_lag,
     };
 
     let running =
@@ -492,7 +569,14 @@ async fn main() -> anyhow::Result<()> {
 
     wait_for_shutdown_signal().await;
     tracing::info!("shutdown signal received, draining");
-    running.shutdown().await?;
+    // A drain that overran `--shutdown-timeout`, a listener error, or a failed
+    // query-audit drain each return `Err`: log it at error level and propagate
+    // so the process exits non-zero, rather than falling through to the
+    // "shutdown complete" line and a clean exit it did not earn.
+    if let Err(err) = running.shutdown().await {
+        tracing::error!(error = %err, "graceful shutdown did not complete cleanly");
+        return Err(err);
+    }
     tracing::info!("shutdown complete");
     // Flush the OTLP trace exporter AFTER draining (ADR-0060 decision 7): a
     // span for the last request the server handled closes as that request

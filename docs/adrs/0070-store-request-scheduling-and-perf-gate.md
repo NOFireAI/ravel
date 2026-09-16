@@ -145,10 +145,61 @@ decision).
 - Every store construction site changes once (handle selection); new
   callers must choose a class, which is the point.
 - The reference runner becomes CI infrastructure (self-hosted runner
-  labels on the existing dual-role box); Tier B is skipped, not failed,
-  when the runner is offline.
+  labels on the existing dual-role box); Tier B never fails the build.
+  (Correction: an offline runner leaves the job queued until one appears or
+  GitHub times the queue out, not skipped. See the amendment below.)
 - The panel is local-only work (MinIO + toxiproxy on a workstation, per
   the depth-panel methodology); code legs are fleet-dispatchable, the
   workflow leg iterates on live Actions runs.
 - The benchmark discipline holds: every number states its
   environment; loopback panels stay labeled as loopback.
+
+## Proposed amendment (issue #533): make tier B advisory-that-can-block
+
+Status: Proposed. Needs an owner's decision; not adopted by the change that
+adds this text.
+
+Issue #533 asks for a tier B that is "advisory-that-can-block, not silently
+informational". That is a different decision from decision 3 above, which
+records tier B as advisory only: "posting a PR comment, never failing the
+build". This section records the tension rather than resolving it silently.
+
+The machinery landed for #533 makes both behaviours reachable from one tool.
+`scripts/bench-compare.py compare` (driven by `scripts/bench-tier-b.sh`) is
+advisory by default and exits non-zero only with `--enforce`. The
+`bench-compare.yml` workflow exposes the enforcing path only on a manual
+dispatch. Nothing can block a merge today.
+
+The workflow carries no pull_request trigger yet, and that is a deployment
+fact rather than a change to decision 3. No runner carrying the
+`ravel-reference` label is registered on this repository, and a job whose
+labels match no online runner is queued for about 24 hours and then failed,
+not skipped. Wiring the PR path before the runner exists would put a
+permanently pending check on every pull request in the repository. The
+trigger goes in with the runner. Two things that must hold when it does: the
+job stays gated on the head repository matching this one, because this
+repository is public and the job runs pull request code on persistent
+hardware; and the baseline must be re-recorded on that runner, since the
+committed one is labelled as a demonstration and its sampling knobs are not
+recorded, which an enforcing compare now refuses.
+
+What decision 3 already requires before enforcing, unchanged by this proposal:
+
+- Enforcement turns on only after a probation window shows an acceptable
+  false-positive rate. On shared and self-hosted runners under co-resident
+  load, a raw +15% single-run threshold will fire on noise; the probation
+  window is what measures how often.
+- Even then, a regression blocks only when it is beyond 15% and sustained
+  across two consecutive runs of the same PR head. The current
+  `bench-compare.py` compares a single run to the baseline; the two-consecutive
+  -runs-of-the-same-head condition is not yet implemented and is a prerequisite
+  for wiring `--enforce` onto pull_request.
+
+Recommendation: keep the automatic path advisory until the probation data
+exists, then promote by (a) implementing the two-consecutive-runs condition in
+the compare tool, (b) recording a real baseline on the reference runner, and
+(c) switching the pull_request step to `--enforce`. The threshold, the named
+bench set, and the reference-runner-only constraint stay as decision 3 sets
+them. This is a policy change on a required-check surface and needs an owner's
+call, not a fleet executor's; it is filed here so the decision is made with the
+probation condition in view rather than by default.

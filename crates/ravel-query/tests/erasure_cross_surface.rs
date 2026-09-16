@@ -760,6 +760,7 @@ async fn federated_instant_user_ids(
     let federation = Arc::new(Federation::new(vec![RemoteCluster {
         name: "remote-1".to_string(),
         fetcher: remote,
+        tenant: None,
         skip_unavailable: false,
         soft_timeout: Duration::from_secs(10),
     }]));

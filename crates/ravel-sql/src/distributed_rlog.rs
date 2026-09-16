@@ -108,7 +108,16 @@ pub const LOGS_ORDER_COLS: &[&str] = &[
 
 /// The `alerts` table's total-order key: the orderable public columns in schema
 /// order (ADR-0040). `attrs` excluded, as above.
-pub const ALERTS_ORDER_COLS: &[&str] = &["ts_ns", "alert_id", "rule_id", "state", "generation"];
+pub const ALERTS_ORDER_COLS: &[&str] = &[
+    "ts_ns",
+    "alert_id",
+    "rule_id",
+    "state",
+    "generation",
+    "writer_id",
+    "writer_epoch",
+    "writer_seq",
+];
 
 /// The `audit` table's total-order key: the orderable public columns in schema
 /// order (ADR-0040). `attrs` excluded, as above.
@@ -317,16 +326,22 @@ impl ExecutionPlan for DistributedSliceScanExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let endpoint = self.endpoints.get(partition).ok_or_else(|| {
             DataFusionError::Internal(format!(
                 "DistributedSliceScanExec: partition {partition} out of range"
             ))
         })?;
-        let inner = self
-            .client
-            .fetch_slice(&endpoint.location, &endpoint.ticket, self.limit)?;
+        // Threaded rather than defaulted for the reason on
+        // `WorkerSliceClient::fetch_slice`: a client that decodes in this
+        // process must reserve against this query's memory pool. This lane has
+        // no coordinator-local fallback today, so every client here is remote
+        // and ignores it, and passing the real context keeps that a property of
+        // the client rather than of the call site.
+        let inner =
+            self.client
+                .fetch_slice(&endpoint.location, &endpoint.ticket, self.limit, &context)?;
 
         // Validate every worker batch against this exec's declared schema, then
         // fold its bytes into the coordinator's accounting and enforce the

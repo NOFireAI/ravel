@@ -400,13 +400,12 @@ async fn head_ahead_of_reader_fails_closed() {
             entry_count: 0,
             watermark_hour: watermark,
             min_hour: 0,
+            column_stats: None,
         }],
         postings: None,
         folder_id: vec![0x22; 16],
         created_unix_ns: 0,
         shard_generation_count: 2,
-        column_stats: None,
-        column_stats_part: None,
     };
     store
         .put(

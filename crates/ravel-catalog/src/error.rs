@@ -10,21 +10,22 @@ use crate::snapshot_format::SnapshotFormatError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
-    #[error("catalog config invalid: shard_count must be > 0")]
-    InvalidConfig,
+    #[error("catalog config invalid: {0}")]
+    InvalidConfig(&'static str),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
     #[error("key error: {0}")]
     Key(#[from] KeyError),
     #[error("commit record decode/validation error: {0}")]
     Record(#[from] RecordError),
-    /// A compaction record failed protobuf decode (docs/catalog-and-mvcc.md
-    /// step 2). Fatal: layout drift or corruption, never silently skipped.
+    /// A compaction record failed decode or its `format_version` gate
+    /// (docs/catalog-and-mvcc.md step 2, ADR-0066 decision 2). Fatal: layout
+    /// drift, corruption, or an unsupported version, never silently skipped.
     #[error("compaction record at {key:?} failed to decode: {source}")]
     CompactionRecordDecode {
         key: String,
         #[source]
-        source: prost::DecodeError,
+        source: RecordError,
     },
     /// Fatal: a commit record's own identity fields do not reconstruct to
     /// its stored `object_key` (ADR-0010 §7). Never silently prefer either
@@ -146,4 +147,22 @@ pub enum CatalogError {
     /// revisited.
     #[error("rewrite record supersession cycle detected at key {key:?}")]
     RewriteSupersessionCycle { key: String },
+    /// A fold-built per-part column-statistics object (ADR-1413, `.cstat` v3,
+    /// `SnapshotPartRef.column_stats` field 7) still exceeds the ceiling after
+    /// the fold dropped every dictionary it could (largest first): its
+    /// dictionary-free statistics (min/max/count/sum, never truncated) alone
+    /// are over `DEFAULT_MAX_COLUMN_STATS_BYTES`. Fatal for that part: the
+    /// fold must not publish a truncated or over-ceiling v3 object, and must
+    /// not silently skip it and carry on with only the whole-tenant v1/v2
+    /// objects, so this fails the whole fold for the (tenant, signal) rather
+    /// than the generic [`CatalogError::SnapshotFormat`] conversion, which
+    /// carries no part key.
+    #[error(
+        "column-stats part object for part {part_key:?} would be {declared} bytes, over the ceiling of {ceiling} with no dictionary left to drop"
+    )]
+    ColumnStatsPartOverBound {
+        part_key: String,
+        declared: u64,
+        ceiling: u64,
+    },
 }

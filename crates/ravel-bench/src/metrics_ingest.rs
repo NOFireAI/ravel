@@ -45,12 +45,71 @@
 //!
 //! Report-only: like the rest of `ravel-bench`, this lane never changes library
 //! behaviour, it only measures it.
+//!
+//! ## `profile` and `substrate` (ADR-0927 decision 11, issue #1352)
+//!
+//! [`MetricsIngestReport`] carries two blocks so a reader never mistakes a
+//! non-comparable or unbilled run for a publishable result:
+//!
+//! [`ProfileRecord`] (`profile`), the workload's own pre-registered figures,
+//! this run's actual scope, and the comparability verdict:
+//! - `name`: the `--profile` name.
+//! - `comparable`: whether these figures may be published (decision 11).
+//!   Forced `false` when `steps_run != steps_declared`, regardless of the
+//!   profile's own verdict: a run that stopped short or ran long is not that
+//!   profile.
+//! - `comparability_reason`: why not, present exactly when `comparable` is
+//!   `false`, absent when `true`. The workload's own `Comparability` reason,
+//!   never a second hand-written copy of it, unless the run's step count is
+//!   off the profile's, in which case this states that instead.
+//! - `active_series`: series alive at any one instant, as declared.
+//! - `steps_run`: steps this run actually generated (the `--steps` flag, or
+//!   `steps_declared` when unset).
+//! - `steps_declared`: the profile's full declared step count
+//!   (`samples_per_series`).
+//! - `samples_per_series`, `scrape_interval_secs`, `duration_secs`,
+//!   `total_samples`, `churn_basis_points_per_hour`: as declared.
+//! - `label_cardinalities`: distinct values per FIXED label dimension, name
+//!   to count, read from the manifest. The scaling label is not a dimension
+//!   (the manifest gate refuses to let it be declared as one) and is never
+//!   in this map; its cardinality depends on the run's churn epochs, so it
+//!   is reported separately below.
+//! - `scaling_label`: the scaling label's name and its declared cardinality:
+//!   - `name`: the scaling label ([`crate::metrics_workload::GeneratorConfig::scaling_label`]).
+//!   - `cardinality_declared`: distinct scaling-label values the profile's
+//!     full declared run (`steps_declared`) would emit, the generator's
+//!     exact count.
+//! - `families`: one [`FamilyRecord`] per metric family (`name`, `instances`,
+//!   `series_per_instance`), as declared.
+//! - `run`: a [`RunRecord`], scoped to `steps_run`, never the declared full
+//!   profile:
+//!   - `steps`: equal to `steps_run`.
+//!   - `total_series_created`: distinct series the generator actually
+//!     created over these steps, the generator's exact count.
+//!   - `logical_input_bytes`: uncompressed input bytes the generator
+//!     produced over these steps, the generator's exact count.
+//!   - `total_samples_generated`: samples the generator emitted over these
+//!     steps, the generator's exact count.
+//!   - `scaling_label_cardinality`: distinct scaling-label values this run
+//!     actually emitted over `steps_run`, the generator's exact count.
+//!
+//! [`Substrate`] (`substrate`), the storage backend a run replayed against:
+//! - `store_backend`: the `--store` kind (`memory` or `s3`).
+//! - `endpoint_host`: the configured S3 endpoint's host, when `--store s3`
+//!   and `RAVEL_S3_ENDPOINT` is set; absent for `MemoryStore` regardless of
+//!   the env var, and absent when the var is unset. A scheme-less endpoint
+//!   (`localhost:9000`) still resolves to its host. Host only, never the
+//!   scheme, path, or credentials.
+//! - `backend_bills_requests`: true only for real S3 with no endpoint
+//!   override (decision 10); false on `MemoryStore` and on any store behind a
+//!   configured endpoint, such as the nightly lane's local MinIO.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::metrics_workload::{Profile, WorkloadFile};
 use prost::Message;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{
@@ -394,10 +453,215 @@ pub struct SystemQueryResult {
     pub elapsed_secs: f64,
 }
 
+/// The ADR-0927 decision-11 profile figures, plus the workload's own
+/// comparability verdict. Every figure here is the profile's pre-registered
+/// value, the generator's exact count for a run-scoped one (under `run`), or
+/// derived from either -- never from the offered sample count, so a reader
+/// can compare this row against the workload definition directly instead of
+/// trusting the run that produced it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProfileRecord {
+    /// The `--profile` name (`cardinality`, `history`, `churn`, `ci`, ...).
+    pub name: String,
+    /// Whether this profile's figures may be compared across runs or
+    /// systems (ADR-0927 decision 11). `ci` is `false`: it exists for
+    /// reachability, not for a performance or cost claim. Also `false`,
+    /// regardless of the profile's own verdict, when `steps_run <
+    /// steps_declared`: a truncated run's figures are not that profile's.
+    pub comparable: bool,
+    /// Why `comparable` is `false`; absent when it is `true`. The workload's
+    /// own [`crate::metrics_workload::Comparability::reason`], never a
+    /// second, hand-written copy of it, unless the run itself was
+    /// truncated, in which case this states that instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparability_reason: Option<String>,
+    /// Active series the profile declares.
+    pub active_series: u64,
+    /// Steps this run actually generated (the `--steps` flag, or
+    /// `steps_declared` when unset).
+    pub steps_run: u64,
+    /// The profile's full, declared step count (`samples_per_series`).
+    pub steps_declared: u64,
+    /// Samples per series per scrape, as declared.
+    pub samples_per_series: u64,
+    /// Scrape interval, as declared.
+    pub scrape_interval_secs: u64,
+    /// Run duration, as declared.
+    pub duration_secs: u64,
+    /// Total samples the profile declares over its full duration.
+    pub total_samples: u64,
+    /// Distinct values per FIXED label dimension, name to count, straight
+    /// from the workload manifest (`WorkloadFile::label_cardinalities`). The
+    /// scaling label is never in this map -- the manifest gate refuses to
+    /// let it be declared as an ordinary dimension -- and is reported
+    /// instead under `scaling_label` and `run.scaling_label_cardinality`.
+    pub label_cardinalities: BTreeMap<String, u64>,
+    /// The scaling label's name and its declared (full-run) cardinality.
+    pub scaling_label: ScalingLabelRecord,
+    /// Declared series churn, in basis points per hour.
+    pub churn_basis_points_per_hour: u64,
+    /// Per-family instance counts, as declared.
+    pub families: Vec<FamilyRecord>,
+    /// Figures scoped to this run's actual `steps_run`, never the declared
+    /// full profile: the generator's exact counts over exactly the steps
+    /// this run generated.
+    pub run: RunRecord,
+}
+
+/// Figures scoped to the run's actual step count (`ProfileRecord::steps_run`),
+/// as opposed to the profile's declared full-run figures: the generator's
+/// exact counts, never derived from the offered sample count.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunRecord {
+    /// Steps this run generated. Equal to `ProfileRecord::steps_run`.
+    pub steps: u64,
+    /// Distinct series the generator actually created over these steps.
+    pub total_series_created: u64,
+    /// Logical (uncompressed, pre-wire) input bytes the generator produced
+    /// over these steps.
+    pub logical_input_bytes: u64,
+    /// Samples the generator emitted over these steps (after omissions and
+    /// stale markers; the generator's exact count).
+    pub total_samples_generated: u64,
+    /// Distinct scaling-label values the generator actually emitted over
+    /// these steps (`Generator::scaling_label_cardinality`), across every
+    /// family and every churn epoch these steps span.
+    pub scaling_label_cardinality: u64,
+}
+
+/// The scaling label's identity and its cardinality over a profile's full
+/// declared run. Named separately from `label_cardinalities` because the
+/// scaling label is not a dimension: the manifest gate refuses to let it be
+/// declared as one, and its cardinality depends on churn epochs rather than
+/// being a fixed, manifest-only count.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScalingLabelRecord {
+    /// The scaling label's name (`GeneratorConfig::scaling_label`).
+    pub name: String,
+    /// Distinct scaling-label values the profile's full declared run
+    /// (`steps_declared`) would emit, across every family and every churn
+    /// epoch it spans (`Generator::scaling_label_cardinality`).
+    pub cardinality_declared: u64,
+}
+
+/// One metric family's exact instance count under the run's profile, and the
+/// series each instance emits (`WorkloadFile::family_instances`,
+/// `WorkloadFile::series_per_instance`) -- the generator's own counts, never a
+/// formula re-typed against the manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FamilyRecord {
+    /// The family name.
+    pub name: String,
+    /// Instances (histograms, or plain series) the family emits under this
+    /// profile.
+    pub instances: u64,
+    /// Series one instance emits: 1 for a gauge, a counter, or a native
+    /// histogram; bounds-plus-3 for a classic histogram.
+    pub series_per_instance: u64,
+}
+
+/// Builds the ADR-0927 decision-11 profile block for one run.
+///
+/// `comparable` is forced `false` whenever `steps_run` differs from
+/// `profile`'s declared `samples_per_series`, regardless of the profile's
+/// own verdict: a run that stopped short or ran long is not that profile's
+/// figures either way. `comparability_reason` then states the step counts,
+/// not the profile's own (possibly `None`) reason. When the run matches the
+/// declared count, `comparable` and `comparability_reason` come straight
+/// from `profile.comparability`.
+///
+/// A caller passes `steps_run` and `logical_input_bytes` separately from
+/// `gen_report` because both are known before the report is built: the
+/// former is the `--steps` the run resolved to, the latter is the encoded
+/// stream's length before it is parsed back into [`LogicalSample`]s.
+pub fn build_profile_record(
+    workload: &WorkloadFile,
+    profile: &Profile,
+    steps_run: u64,
+    logical_input_bytes: u64,
+    gen_report: &crate::metrics_gen::GenerationReport,
+) -> ProfileRecord {
+    let families = workload
+        .families
+        .iter()
+        .map(|family| FamilyRecord {
+            name: family.name.clone(),
+            instances: workload.family_instances(profile, family),
+            series_per_instance: workload.series_per_instance(family.kind),
+        })
+        .collect();
+    let steps_declared = profile.samples_per_series;
+    // Any step count other than the profile's own: a short run is not that
+    // profile's figures, and an over-long one is not either.
+    let off_profile = steps_run != steps_declared;
+    let comparable = profile.is_publishable() && !off_profile;
+    let comparability_reason = if off_profile {
+        Some(format!(
+            "this run generated {steps_run} steps against profile `{}`'s {steps_declared}, so it \
+             is not that profile and its figures cannot be published",
+            profile.name
+        ))
+    } else {
+        profile.comparability.reason().map(String::from)
+    };
+    let generator = crate::metrics_gen::Generator::for_profile(workload, profile, 0);
+    ProfileRecord {
+        name: profile.name.clone(),
+        comparable,
+        comparability_reason,
+        active_series: profile.active_series,
+        steps_run,
+        steps_declared,
+        samples_per_series: profile.samples_per_series,
+        scrape_interval_secs: profile.scrape_interval_secs,
+        duration_secs: profile.duration_secs,
+        total_samples: profile.total_samples,
+        label_cardinalities: workload.label_cardinalities(),
+        scaling_label: ScalingLabelRecord {
+            name: workload.generator.scaling_label.clone(),
+            cardinality_declared: generator.scaling_label_cardinality(steps_declared),
+        },
+        churn_basis_points_per_hour: profile.churn_basis_points_per_hour,
+        families,
+        run: RunRecord {
+            steps: steps_run,
+            total_series_created: gen_report.total_series_created,
+            logical_input_bytes,
+            total_samples_generated: gen_report.emitted_samples,
+            scaling_label_cardinality: generator.scaling_label_cardinality(steps_run),
+        },
+    }
+}
+
+/// The storage backend a run replayed against, and whether it bills for
+/// requests (ADR-0927 decision 10): named at the top level so a reader never
+/// mistakes a MinIO-backed `ci` run's request counts for a real S3 cost.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Substrate {
+    /// The `--store` kind (`memory` or `s3`), as `StoreKind`'s `Display`.
+    pub store_backend: String,
+    /// The configured S3 endpoint's host, when `RAVEL_S3_ENDPOINT` is set.
+    /// Host only: never the scheme, path, or embedded credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_host: Option<String>,
+    /// Whether this substrate bills for requests: false on `MemoryStore` and
+    /// on any store behind a configured endpoint, true only for real S3 with
+    /// no endpoint override (`harness::backend_bills_requests`).
+    pub backend_bills_requests: bool,
+}
+
 /// The whole ingest-lane report: one row per participating system, plus the
 /// separately-recorded query-phase rows.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MetricsIngestReport {
+    /// The profile this run replayed, and its ADR-0927 decision-11 figures.
+    /// Absent only for the internal unit-test rows built directly from
+    /// `SystemIngestResult`s with no profile context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileRecord>,
+    /// The storage substrate this run replayed against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub substrate: Option<Substrate>,
     /// Report rows, in the order the systems were replayed.
     pub systems: Vec<SystemIngestResult>,
     /// Query-phase rows, recorded separately from ingest (ADR-0927 decision 9).
@@ -407,9 +671,12 @@ pub struct MetricsIngestReport {
 }
 
 impl MetricsIngestReport {
-    /// Assemble a report from its ingest rows, with no query phase yet.
+    /// Assemble a report from its ingest rows, with no query phase, profile,
+    /// or substrate attached yet.
     pub fn new(systems: Vec<SystemIngestResult>) -> Self {
         MetricsIngestReport {
+            profile: None,
+            substrate: None,
             systems,
             queries: Vec::new(),
         }
@@ -419,6 +686,18 @@ impl MetricsIngestReport {
     /// figures in separate columns.
     pub fn with_query(mut self, query: SystemQueryResult) -> Self {
         self.queries.push(query);
+        self
+    }
+
+    /// Attach the ADR-0927 decision-11 profile record (builder style).
+    pub fn with_profile(mut self, profile: ProfileRecord) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Attach the storage substrate record (builder style).
+    pub fn with_substrate(mut self, substrate: Substrate) -> Self {
+        self.substrate = Some(substrate);
         self
     }
 
@@ -1708,6 +1987,210 @@ mod tests {
                 ("instance".to_string(), "mb-instance-0".to_string()),
                 ("job".to_string(), "api".to_string()),
             ]
+        );
+    }
+
+    fn ci_workload() -> WorkloadFile {
+        crate::metrics_workload::load_workload(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/metrics/workload.json"
+        )))
+        .expect("load the checked-in workload manifest")
+    }
+
+    /// Covers the nightly full-steps path that the JSON smoke test's
+    /// `--steps 5` run cannot reach: with `steps_run == steps_declared`, the
+    /// truncation branch never fires, so `comparable == false` can only be
+    /// explained by the `ci` profile's own manifest verdict. Before this test
+    /// existed, `--steps 5` forced `comparable` false through truncation on
+    /// every run, and the profile's-own-reason branch in
+    /// `build_profile_record` had zero coverage.
+    #[test]
+    fn profile_record_is_non_comparable_for_the_profiles_own_reason_when_not_truncated() {
+        use crate::metrics_gen::Generator;
+
+        let workload = ci_workload();
+        let ci = workload.profile("ci").expect("ci profile declared");
+        // Small enough to generate fast; steps_run below is set equal to this
+        // so the truncation branch never fires.
+        let steps = 3;
+        let profile = Profile {
+            samples_per_series: steps,
+            ..ci.clone()
+        };
+
+        let (bytes, gen_report) = Generator::new(&workload, "ci", 0)
+            .expect("generator builds")
+            .generate_bytes(steps)
+            .expect("generates steps");
+        let logical_input_bytes = bytes.len() as u64;
+
+        let record =
+            build_profile_record(&workload, &profile, steps, logical_input_bytes, &gen_report);
+
+        assert_eq!(
+            record.steps_run, record.steps_declared,
+            "this test's premise is steps_run == steps_declared"
+        );
+        assert!(
+            !record.comparable,
+            "the ci profile is non-comparable by its own manifest verdict, not by truncation"
+        );
+        assert_eq!(
+            record.comparability_reason.as_deref(),
+            ci.comparability.reason(),
+            "the reason must be the manifest's own reason, not a truncation message, since \
+             this run was not truncated"
+        );
+
+        assert_eq!(
+            record.scaling_label.name, workload.generator.scaling_label,
+            "scaling_label.name must name the manifest's own scaling label"
+        );
+        let generator = Generator::for_profile(&workload, &profile, 0);
+        assert_eq!(
+            record.scaling_label.cardinality_declared,
+            generator.scaling_label_cardinality(record.steps_declared),
+            "cardinality_declared must be the generator's own figure at steps_declared"
+        );
+        assert_eq!(
+            record.run.scaling_label_cardinality,
+            generator.scaling_label_cardinality(steps),
+            "run.scaling_label_cardinality must be the generator's own figure at steps_run"
+        );
+    }
+
+    /// The other direction: a run PAST the profile's declared step count is
+    /// not that profile either, and `--steps` takes any value. Without this
+    /// the rule would read `steps_run < steps_declared` and an over-long run
+    /// of a comparable profile would publish as that profile.
+    #[test]
+    fn profile_record_is_non_comparable_when_the_run_exceeds_the_declared_steps() {
+        use crate::metrics_gen::Generator;
+        use crate::metrics_workload::Comparability;
+
+        let workload = ci_workload();
+        let ci = workload.profile("ci").expect("ci profile declared");
+        let steps_declared = 10;
+        let steps_run = 12;
+        let profile = Profile {
+            comparability: Comparability::Comparable,
+            samples_per_series: steps_declared,
+            ..ci.clone()
+        };
+        assert!(
+            profile.is_publishable(),
+            "this test's premise is a profile that IS comparable"
+        );
+        assert!(
+            steps_run > steps_declared,
+            "this test's premise is a run PAST the declared step count"
+        );
+
+        let (bytes, gen_report) = Generator::new(&workload, "ci", 0)
+            .expect("generator builds")
+            .generate_bytes(steps_run)
+            .expect("generates steps");
+        let record = build_profile_record(
+            &workload,
+            &profile,
+            steps_run,
+            bytes.len() as u64,
+            &gen_report,
+        );
+
+        assert!(
+            !record.comparable,
+            "a run past the declared step count is never comparable, even when the profile is"
+        );
+        let expected_reason = format!(
+            "this run generated {steps_run} steps against profile `{}`'s {steps_declared}, so it \
+             is not that profile and its figures cannot be published",
+            profile.name
+        );
+        assert_eq!(
+            record.comparability_reason,
+            Some(expected_reason),
+            "the reason names both step counts"
+        );
+        assert_eq!(
+            record.run.steps, steps_run,
+            "run.steps is what this run generated, not the declared count"
+        );
+    }
+
+    /// The mirror case: a profile whose own verdict IS comparable, but the
+    /// run truncates it. `comparable` must still be `false`, and the reason
+    /// must be the truncation message, not the (absent) profile reason --
+    /// the forcing rule in `build_profile_record` applies regardless of the
+    /// profile's own verdict.
+    #[test]
+    fn profile_record_is_non_comparable_from_truncation_even_when_the_profile_is_comparable() {
+        use crate::metrics_gen::Generator;
+        use crate::metrics_workload::Comparability;
+
+        let workload = ci_workload();
+        let ci = workload.profile("ci").expect("ci profile declared");
+        let steps_declared = 10;
+        let steps_run = 3;
+        let profile = Profile {
+            comparability: Comparability::Comparable,
+            samples_per_series: steps_declared,
+            ..ci.clone()
+        };
+        assert!(
+            profile.is_publishable(),
+            "this test's premise is a profile that IS comparable"
+        );
+
+        let (bytes, gen_report) = Generator::new(&workload, "ci", 0)
+            .expect("generator builds")
+            .generate_bytes(steps_run)
+            .expect("generates steps");
+        let logical_input_bytes = bytes.len() as u64;
+
+        let record = build_profile_record(
+            &workload,
+            &profile,
+            steps_run,
+            logical_input_bytes,
+            &gen_report,
+        );
+
+        assert!(
+            steps_run < steps_declared,
+            "this test's premise is a truncated run"
+        );
+        assert!(
+            !record.comparable,
+            "a truncated run is never comparable, even when the profile itself is"
+        );
+        let expected_reason = format!(
+            "this run generated {steps_run} steps against profile `{}`'s {steps_declared}, so it \
+             is not that profile and its figures cannot be published",
+            profile.name
+        );
+        assert_eq!(
+            record.comparability_reason,
+            Some(expected_reason),
+            "the truncation reason must state the run's actual vs declared step counts"
+        );
+
+        let generator = Generator::for_profile(&workload, &profile, 0);
+        assert_eq!(
+            record.scaling_label.name, workload.generator.scaling_label,
+            "scaling_label.name must name the manifest's own scaling label"
+        );
+        assert_eq!(
+            record.scaling_label.cardinality_declared,
+            generator.scaling_label_cardinality(steps_declared),
+            "cardinality_declared must be the generator's own figure at steps_declared"
+        );
+        assert_eq!(
+            record.run.scaling_label_cardinality,
+            generator.scaling_label_cardinality(steps_run),
+            "run.scaling_label_cardinality must be the generator's own figure at steps_run, \
+             not steps_declared"
         );
     }
 }

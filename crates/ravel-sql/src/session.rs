@@ -119,7 +119,11 @@ use datafusion::object_store::ObjectStore;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use url::Url;
 
+use crate::alerts_provider::AlertsTableProvider;
+use crate::attrs_per_key::AttrsPerKeyProjection;
+use crate::audit_provider::AuditTableProvider;
 use crate::avg::sequential_avg_udaf;
+use crate::bounded_topk::BoundedTopKAggregate;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
 use crate::late_materialization::TopKLateMaterialization;
@@ -141,11 +145,17 @@ pub const LOGS_TABLE: &str = "logs";
 /// The spans table name (`Signal::Spans`, ADR-0045 decision 5).
 pub const SPANS_TABLE: &str = "spans";
 
+/// The alerts table name (`Signal::Alerts`, ADR-1101 decision 1).
+pub const ALERTS_TABLE: &str = "alerts";
+
+/// The audit table name (`Signal::Audit`, ADR-1101 decision 1).
+pub const AUDIT_TABLE: &str = "audit";
+
 /// The single table a query's session registers. ADR-0033 decision C admits
 /// exactly one signal per query in v1, so the executor resolves one snapshot
 /// and hands [`build_session`] one provider; the enum keeps the provider
-/// types (metrics vs logs vs spans) apart without a `dyn TableProvider`
-/// erasure.
+/// types (metrics vs logs vs spans vs alerts vs audit) apart without a
+/// `dyn TableProvider` erasure.
 pub enum SessionTable {
     /// The `samples` table over a resolved `Signal::Metrics` snapshot.
     Metrics(Arc<RavelTableProvider>),
@@ -157,6 +167,12 @@ pub enum SessionTable {
     /// this ships (ts, trace_id, duration, status_code, service_name) is a
     /// plain column comparison.
     Spans(Arc<SpansTableProvider>),
+    /// The `alerts` table over a resolved `Signal::Alerts` snapshot (ADR-1101
+    /// decision 1).
+    Alerts(Arc<AlertsTableProvider>),
+    /// The `audit` table over a resolved `Signal::Audit` snapshot (ADR-1101
+    /// decision 1).
+    Audit(Arc<AuditTableProvider>),
 }
 
 /// The v1 SQL aggregate allowlist (ADR-0022 decision 2). [`build_session`]
@@ -523,7 +539,7 @@ pub fn session_config(
     let repartition_free = repartition_free(spill);
     let mut session = SessionConfig::new()
         .with_information_schema(false)
-        .with_target_partitions(config.engine.fetch_concurrency.max(1))
+        .with_target_partitions(config.engine.sql_partition_count())
         // ADR-0094: the only knob that is ever true, and only for a query whose
         // aggregates and group keys are all exact-typed. See the module docs.
         // ADR-0954 takes it back for a spill-enabled query.
@@ -546,6 +562,17 @@ pub fn session_config(
             .execution
             .skip_partial_aggregation_probe_ratio_threshold = SKIP_PARTIAL_AGGREGATION_PROBE_RATIO;
     }
+
+    // Issue #1402. DataFusion's own `TopKAggregation` rule defaults ON
+    // (`enable_topk_aggregation`), and it admits two shapes ravel must not
+    // take: a float `min`/`max`, whose answer would come from the priority
+    // map's ordering instead of ADR-0023's total order, and an arbitrarily
+    // large `LIMIT`, where the bound is no longer worth its per-row
+    // comparison. It is turned off here for every query and
+    // `crate::BoundedTopKAggregate`, installed by `build_session`, re-admits
+    // exactly the vetted shape. Written as a typed field for the same reason
+    // the knobs above are.
+    session.options_mut().optimizer.enable_topk_aggregation = false;
 
     if repartition_free {
         // The `repartition_*` knobs above do not cover DataFusion's round-robin
@@ -644,7 +671,19 @@ pub fn build_session(
         // default rules for the same reason `DictionaryGroupKeysAsViews` is:
         // it must see the final partial/final aggregation split
         // `EnforceDistribution` chose. See `crate::metadata_agg`.
-        .with_physical_optimizer_rule(Arc::new(MetadataOnlyAggregate));
+        .with_physical_optimizer_rule(Arc::new(MetadataOnlyAggregate))
+        // Issue #1768: rewrite a `logs` scan whose `attrs` map is read only
+        // through literal-key `attrs['k']` subscripts into one that
+        // materializes those keys as per-key `Utf8` columns, so the scan
+        // decodes one key's pages instead of every dynamic column and stays on
+        // the columnar path. Appended after the default rules for the same
+        // reason the rules above are: it must see the final
+        // projection/filter/aggregate shape the default rules chose (projection
+        // pushdown decides which columns the scan projects, and this rewrite
+        // keys off the `attrs` map being one of them). It is fail-safe: any
+        // shape it does not recognize is left on the existing row path. See
+        // `crate::attrs_per_key`.
+        .with_physical_optimizer_rule(Arc::new(AttrsPerKeyProjection));
     // ADR-0774: split a wide `logs` TopK into a narrow scan carrying row refs
     // and a `k`-row block fetch. Appended after `DictionaryGroupKeysAsViews`
     // for the same reason that one is appended after the defaults: it must see
@@ -655,6 +694,16 @@ pub fn build_session(
     if let Some(extra_columns) = config.late_materialization_extra_columns {
         builder = builder
             .with_physical_optimizer_rule(Arc::new(TopKLateMaterialization::new(extra_columns)));
+    }
+    // Issue #1402: bound a grouped aggregate whose only consumer is a top-k
+    // sort. Appended after the default rules for the same reason the rules
+    // above are: the shape it matches is the partial/final aggregation split
+    // `EnforceDistribution` chose, under the `SortExec` fetch DataFusion's
+    // limit pushdown produced. `None` does not install it at all, which is the
+    // operator opt-out and the "before" side of the regression fixture.
+    if let Some(max_limit) = config.bounded_topk_max_limit {
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(BoundedTopKAggregate::new(max_limit)));
     }
     let state = builder.build();
     let mut ctx = SessionContext::new_with_state(state);
@@ -776,6 +825,16 @@ pub fn build_session(
         SessionTable::Spans(provider) => {
             ctx.register_table(SPANS_TABLE, provider)?;
         }
+        // Neither RLOG-backed table registers a scalar UDF: every predicate
+        // their pushdown extractors accept is a plain column comparison or an
+        // `attrs['k']` subscript, which the map-field planner registered above
+        // already serves.
+        SessionTable::Alerts(provider) => {
+            ctx.register_table(ALERTS_TABLE, provider)?;
+        }
+        SessionTable::Audit(provider) => {
+            ctx.register_table(AUDIT_TABLE, provider)?;
+        }
     }
     Ok(ctx)
 }
@@ -786,6 +845,7 @@ mod tests {
     use ravel_catalog::Snapshot;
     use ravel_object_store::memory::MemoryStore;
 
+    use ravel_query::PhaseAccounting;
     use ravel_types::accounting::QueryAccounting;
 
     use super::*;
@@ -882,6 +942,23 @@ mod tests {
         assert_eq!(pushdown.service_name, Some("checkout".to_string()));
     }
 
+    /// ADR-1195: `target_partitions` follows the resolved
+    /// `sql_partition_count` knob, not the legacy `fetch_concurrency` field
+    /// directly, once an explicit override is set.
+    #[test]
+    fn target_partitions_follows_the_resolved_sql_partition_count() {
+        let config = SqlConfig {
+            engine: ravel_query::EngineConfig {
+                fetch_concurrency: 9,
+                sql_partition_count: Some(5),
+                ..ravel_query::EngineConfig::default()
+            },
+            ..SqlConfig::default()
+        };
+        let session = session_config(&config, false, SpillDecision::Disabled);
+        assert_eq!(session.options().execution.target_partitions, 5);
+    }
+
     #[test]
     fn information_schema_is_disabled_and_repartitioning_is_off() {
         let config = session_config(&SqlConfig::default(), false, SpillDecision::Disabled);
@@ -895,6 +972,24 @@ mod tests {
         assert!(!options.optimizer.repartition_sorts);
         assert!(!options.optimizer.repartition_windows);
         assert!(!options.optimizer.repartition_file_scans);
+    }
+
+    /// Issue #1402: DataFusion's own ungated top-k aggregation rule is off in
+    /// every session, whatever the other per-query inputs say. It defaults ON
+    /// upstream, so this is the assertion that a DataFusion upgrade cannot
+    /// quietly restore it: `crate::BoundedTopKAggregate` is the only path to a
+    /// bounded grouped aggregate here, and it is the only one whose gate has
+    /// been argued.
+    #[test]
+    fn datafusion_topk_aggregation_is_off_in_every_session() {
+        for exact_typed in [false, true] {
+            let config =
+                session_config(&SqlConfig::default(), exact_typed, SpillDecision::Disabled);
+            assert!(
+                !config.options().optimizer.enable_topk_aggregation,
+                "exact_typed_aggregates={exact_typed}"
+            );
+        }
     }
 
     /// ADR-0094 decision 2: `exact_typed_aggregates = true` flips ONLY
@@ -1089,7 +1184,7 @@ mod tests {
             ravel_types::TenantHash([0u8; 16]),
             ravel_query::SegmentFetcher::new(store.clone()),
             SqlConfig::default(),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )))
     }
 
@@ -1098,7 +1193,7 @@ mod tests {
             empty_snapshot(),
             ravel_types::TenantHash([0u8; 16]),
             ravel_query::LogSegmentFetcher::new(store.clone()),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )))
     }
 
@@ -1107,6 +1202,24 @@ mod tests {
             empty_snapshot(),
             ravel_types::TenantHash([0u8; 16]),
             SpanSegmentFetcher::new(store.clone()),
+            QueryAccounting::new(),
+        )))
+    }
+
+    fn alerts_table(store: &Arc<dyn ravel_object_store::ObjectStoreBackend>) -> SessionTable {
+        SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
+            empty_snapshot(),
+            ravel_types::TenantHash([0u8; 16]),
+            ravel_query::LogSegmentFetcher::new(store.clone()),
+            QueryAccounting::new(),
+        )))
+    }
+
+    fn audit_table(store: &Arc<dyn ravel_object_store::ObjectStoreBackend>) -> SessionTable {
+        SessionTable::Audit(Arc::new(AuditTableProvider::new(
+            empty_snapshot(),
+            ravel_types::TenantHash([0u8; 16]),
+            ravel_query::LogSegmentFetcher::new(store.clone()),
             QueryAccounting::new(),
         )))
     }
@@ -1217,6 +1330,11 @@ mod tests {
             ),
             ("logs", logs_table(&store), set(["has_word"].iter())),
             ("spans", spans_table(&store), empty.clone()),
+            // ADR-1101 decision 1: neither RLOG-backed table registers a scalar
+            // UDF of its own, so a leaked `has_word` (or any other per-table
+            // addendum) on one of them fails here.
+            ("alerts", alerts_table(&store), empty.clone()),
+            ("audit", audit_table(&store), empty.clone()),
         ] {
             let ctx = build_session(
                 &SqlConfig::default(),

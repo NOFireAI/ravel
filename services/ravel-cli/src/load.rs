@@ -642,6 +642,19 @@ fn print_flush_mix(report: &LoadReport) {
     }
 }
 
+/// Display name for the stage-timings table (ADR-0104 decision 1). `Bloom` is
+/// nested inside `Encode`'s window rather than a disjoint fifth slice, so its
+/// row is marked as contained: a reader summing the printed column would
+/// otherwise double-count it against `Encode`. Every other stage renders its
+/// bare [`ravel_ingest::LogStage::name`].
+#[cfg(feature = "stage-timing")]
+fn stage_display_name(stage: ravel_ingest::LogStage) -> &'static str {
+    match stage {
+        ravel_ingest::LogStage::Bloom => "bloom (in encode)",
+        other => other.name(),
+    }
+}
+
 /// Print the logs pipeline's per-stage timing breakdown (ADR-0104 decision 1)
 /// after [`print_summary`]'s totals. A stage with zero samples (never wired,
 /// or never reached) is omitted rather than printed as zero, matching
@@ -658,8 +671,8 @@ fn print_stage_timings(report: &LoadReport) {
         };
         let avg_us = (totals.total_ns as f64 / totals.samples.max(1) as f64) / 1e3;
         println!(
-            "    {name:<8} samples={samples:<10} total_ms={total_ms:<12.3} avg_us={avg_us:.3}",
-            name = stage.name(),
+            "    {name:<18} samples={samples:<10} total_ms={total_ms:<12.3} avg_us={avg_us:.3}",
+            name = stage_display_name(stage),
             samples = totals.samples,
             total_ms = totals.total_ns as f64 / 1e6,
         );
@@ -4211,9 +4224,10 @@ type = "i64"
     }
 
     /// A real `load --parquet` run wires and records every stage of the logs
-    /// pipeline, not a subset: admit, route, merge, and encode all recorded at
-    /// least one sample. Drop `#[cfg(feature = "stage-timing")]` from
-    /// `LogIngestRouter::stage_timings` (or from any one stage boundary) and
+    /// pipeline, not a subset: admit, route, merge, encode, and bloom all
+    /// recorded at least one sample. Drop `#[cfg(feature = "stage-timing")]`
+    /// from `LogIngestRouter::stage_timings` (or from any one stage boundary,
+    /// including the `LogStage::Bloom` recording added for issue #1516) and
     /// this fails, either at compile time or on an empty/partial stage set.
     #[cfg(feature = "stage-timing")]
     #[tokio::test]
@@ -4227,6 +4241,7 @@ type = "i64"
                 ravel_ingest::LogStage::Route,
                 ravel_ingest::LogStage::Merge,
                 ravel_ingest::LogStage::Encode,
+                ravel_ingest::LogStage::Bloom,
             ],
             "a real load must wire and record every stage, not a subset"
         );
@@ -4237,6 +4252,25 @@ type = "i64"
                 .expect("a stage in `stages()` has totals");
             assert!(totals.samples > 0, "{stage:?} recorded zero samples");
         }
+    }
+
+    /// `bloom` is nested inside `encode`'s timing window, not a disjoint fifth
+    /// stage (ADR-0104 decision 1): its printed row must say so, or an
+    /// operator summing the `stage timings` table's `total_ms` column
+    /// double-counts it against `encode`. This pins the exact rendered name
+    /// for every stage, not a substring, so a later rename of the marker text
+    /// cannot quietly drop it.
+    #[cfg(feature = "stage-timing")]
+    #[test]
+    fn stage_display_name_marks_bloom_as_nested_in_encode() {
+        assert_eq!(stage_display_name(ravel_ingest::LogStage::Admit), "admit");
+        assert_eq!(stage_display_name(ravel_ingest::LogStage::Route), "route");
+        assert_eq!(stage_display_name(ravel_ingest::LogStage::Merge), "merge");
+        assert_eq!(stage_display_name(ravel_ingest::LogStage::Encode), "encode");
+        assert_eq!(
+            stage_display_name(ravel_ingest::LogStage::Bloom),
+            "bloom (in encode)"
+        );
     }
 
     /// A load whose object crosses the 1000-column dynamic budget produces the
@@ -6053,25 +6087,55 @@ type = "i64"
     /// triggered by a LATER batch (or by the age trigger), not by the write
     /// itself, so the ack now waits for one.
     ///
-    /// Pinned without a timing band: under a `FixedClock` the age trigger can
-    /// never fire, and at an 8 MiB target no write in this 16-row fixture can
-    /// reach the size trigger either. With no trigger reachable, the load
-    /// cannot finish and -- the part that would be false under the old
-    /// semantics -- the store holds zero data objects while it is suspended.
-    /// The store is read with the load future still alive and pinned, so no
-    /// shutdown flush from dropping the router can race the observation.
+    /// Pinned without a timing band: under a [`TestClock`] this test never
+    /// advances, the age trigger can never fire (the shard actor's flush tick
+    /// waits on that clock's own `sleep`, which only returns on an advance),
+    /// and at an 8 MiB target no write in this 16-row fixture can reach the
+    /// size trigger either. With no trigger reachable, the load cannot finish
+    /// and -- the part that would be false under the old semantics -- the
+    /// store holds zero data objects while it is suspended. The store is read
+    /// with the load future still alive and pinned, so no shutdown flush from
+    /// dropping the router can race the observation.
     ///
-    /// Prove-the-test: hardcode `target_bytes: 1` back into the `IngestConfig`
-    /// in `load_instrumented` and the load completes inside the window, hitting
+    /// The suspension is observed off the pipeline's own progress, not off a
+    /// wall-clock window and not off a yield count: the decoder's
+    /// `on_batch_queued` hook gates on every batch having been queued (that
+    /// hook runs on the `spawn_blocking` decode thread, so no filesystem read
+    /// of the fixture can still be outstanding), and
+    /// [`yield_until_router_is_quiet`] then waits for `clock.reads()` to
+    /// settle (so no routed write can still be moving toward its shard
+    /// buffer). A yield count would bound neither, since yields on this task
+    /// do not wait on the blocking decode thread.
+    ///
+    /// Prove-the-test: pass `1` as `target_bytes` to the
+    /// `build_ingest_config` call in `load_instrumented` (that function has
+    /// other callers, so change the call, not the function) and every write
+    /// triggers its own flush, so the
+    /// acks are answered, the load runs to completion while the driver is
+    /// still waiting for the router to go quiet, and the `biased` select hits
     /// the `panic!` arm ("the load must not complete...").
     #[tokio::test]
     async fn a_strict_ack_above_target_one_waits_for_a_later_batchs_flush() {
         use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let shards = 4u32;
         let rows_per_group = 4usize;
+        // The fixture holds one row group of `rows_per_group` rows per shard and
+        // `--batch-rows` is `rows_per_group`, so the decoder queues exactly
+        // `shards` batches of `rows_per_group` rows each.
+        let batches = shards as usize;
         let (_dir, pq, m) = sorted_by_shard_fixture(shards, rows_per_group);
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = TestClock::new(NOW_NS);
+
+        let queued = Arc::new(AtomicUsize::new(0));
+        let (gate_tx, mut gate_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let on_batch_queued: BuildStartHook = Arc::new(move || {
+            if queued.fetch_add(1, Ordering::SeqCst) + 1 == batches {
+                let _ = gate_tx.send(());
+            }
+        });
 
         let load_fut = load_instrumented(
             Arc::clone(&store),
@@ -6087,20 +6151,28 @@ type = "i64"
             8 * 1024 * 1024,
             None,
             NOW_NS,
-            Arc::new(FixedClock(NOW_NS)),
+            Arc::clone(&clock) as Arc<dyn Clock>,
             LoadPath::Columnar,
             None,
-            None,
+            Some(on_batch_queued),
         );
         tokio::pin!(load_fut);
 
+        // Wait for the pipeline to run out of work, then confirm the load is
+        // still parked and nothing was made durable. `biased` polls the load
+        // first on every round, so a load that does complete trips the panic
+        // rather than losing the race to the driver.
         let stored = tokio::select! {
+            biased;
             _ = &mut load_fut => panic!(
                 "the load must not complete: at an 8 MiB target no write reaches the size \
-                 trigger, and a FixedClock never fires the age trigger, so no ack can be \
-                 answered"
+                 trigger, and a TestClock this test never advances cannot fire the age \
+                 trigger, so no ack can be answered"
             ),
-            () = tokio::time::sleep(Duration::from_millis(300)) => {
+            () = async {
+                let () = gate_rx.recv().await.expect("every batch is queued");
+                yield_until_router_is_quiet(&clock).await;
+            } => {
                 list_data_objects(store.as_ref()).await
             }
         };
@@ -6202,31 +6274,59 @@ type = "i64"
     /// pair. Every argument of the load is fixed here, so the only thing the
     /// two calls differ in is `max_flush_delay`.
     ///
-    /// The injected clock advances 5s of load time every 20ms of real time and
-    /// stops once it has advanced `GATE_NS`; the decoder is gated on that same
-    /// point, blocking after the first batch is queued until the clock reaches
-    /// it. So batch 1's write sits alone in the shard buffer across the whole
-    /// advance, and batch 2's write arrives only once the clock has stopped
-    /// moving. Whether the first buffer survives that window is the delay's
-    /// decision and nothing else's.
+    /// Pacing comes only from the injected [`TestClock`], modelled on
+    /// [`load_with_released_tail`]: the decoder is held on a two-phase gate
+    /// (`on_batch_queued` reports each batch's ordinal on `gate_tx`, then
+    /// blocks on `release_rx.recv()`) so batch 1's write reaches the shard
+    /// buffer alone, the driver advances the clock by a single `ADVANCE_NS`
+    /// (5s) once the router has gone quiet, then releases the decoder for
+    /// batch 2. Quiescence is read off [`TestClock::reads`] via
+    /// [`yield_until_router_is_quiet`]; there is no wall-clock sleep, poll, or
+    /// timeout anywhere in this path.
+    ///
+    /// 5s clears `SHORT`'s 1s delay (so the first buffer always ages out on
+    /// that side) while staying far under `LONG`'s 3600s delay, under
+    /// `max_flush_lifetime`'s 3600s default, and unreachable by the real-time
+    /// 60s Strict ack deadline, so exactly one deadline can come due on the
+    /// jump.
+    ///
+    /// The bounded wait for a published object before the second quiesce
+    /// proves different things on each side, which is why both sides share
+    /// this one helper instead of diverging: on `LONG` the only object that
+    /// can exist there is write 2's size flush, so the wait pins that write 2
+    /// reached the shard buffer before `Done` and the end-of-input
+    /// `flush_all` could split it. On `SHORT` the aged object from the
+    /// advance already satisfies it; a `SHORT`-side write 2 published as a
+    /// straggler and one published as an ordered tail both count as the same
+    /// `final_drain` flush, so that side's expected layout does not depend on
+    /// the ordering.
     async fn load_two_writes_across_one_clock_advance(
         store: Arc<dyn ObjectStoreBackend>,
         pq: &Path,
         m: &Mapping,
         max_flush_delay: Duration,
     ) -> LoadReport {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         // TARGET between one 4.1 KB slice and two, with margin on both sides,
         // so one write never reaches it and two always do.
         const TARGET: usize = 6_000;
-        const ADVANCE_STEP_NS: i64 = 5 * 1_000_000_000;
-        const GATE_NS: i64 = 100 * 1_000_000_000;
+        const ADVANCE_NS: i64 = 5 * 1_000_000_000;
 
         let clock = TestClock::new(NOW_NS);
-        let gate = Arc::clone(&clock);
+        let probe: Arc<dyn ObjectStoreBackend> = Arc::clone(&store);
+
+        let ordinal = Arc::new(AtomicUsize::new(0));
+        let (gate_tx, mut gate_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
         let on_batch_queued: BuildStartHook = Arc::new(move || {
-            while gate.now_ns() < NOW_NS + GATE_NS {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            let n = ordinal.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = gate_tx.send(n);
+            let guard = release_rx
+                .lock()
+                .expect("the release channel is not poisoned");
+            let _ = guard.recv();
         });
 
         let load_fut = load_instrumented(
@@ -6248,17 +6348,59 @@ type = "i64"
             None,
             Some(on_batch_queued),
         );
-        tokio::pin!(load_fut);
-        loop {
-            tokio::select! {
-                report = &mut load_fut => break report.expect("the load completes"),
-                () = tokio::time::sleep(Duration::from_millis(20)) => {
-                    if clock.now_ns() < NOW_NS + GATE_NS {
-                        clock.advance_ns(ADVANCE_STEP_NS);
-                    }
-                }
+
+        let driver = async {
+            assert_eq!(
+                gate_rx.recv().await,
+                Some(1),
+                "the first batch reaches the decoder before anything else runs"
+            );
+            yield_until_router_is_quiet(&clock).await;
+            assert_eq!(
+                list_data_objects(probe.as_ref()).await.len(),
+                0,
+                "one write alone is under TARGET and the clock has not moved: nothing can \
+                 have flushed yet"
+            );
+            clock.advance_ns(ADVANCE_NS);
+            yield_until_router_is_quiet(&clock).await;
+            release_tx
+                .send(())
+                .expect("the hook is still waiting on its first release");
+            assert_eq!(
+                gate_rx.recv().await,
+                Some(2),
+                "the second batch reaches the decoder once released"
+            );
+
+            const MAX_SETTLE_ROUNDS: usize = 10_000;
+            let mut rounds = 0;
+            while list_data_objects(probe.as_ref()).await.is_empty() {
+                rounds += 1;
+                assert!(
+                    rounds < MAX_SETTLE_ROUNDS,
+                    "issue #1235: settle loop exceeded {MAX_SETTLE_ROUNDS} rounds \
+                     without a published object"
+                );
+                tokio::task::yield_now().await;
             }
-        }
+            yield_until_router_is_quiet(&clock).await;
+            drop(release_tx);
+            std::future::pending::<()>().await
+        };
+
+        let report = tokio::select! {
+            report = load_fut => report.expect("the load completes"),
+            () = driver => unreachable!("the driver parks once the decoder is released"),
+        };
+
+        assert_eq!(
+            clock.now_ns(),
+            NOW_NS + ADVANCE_NS,
+            "the driver advances the injected clock exactly once, by exactly ADVANCE_NS"
+        );
+
+        report
     }
 
     /// The `--max-flush-delay` lever decides an object layout, not just a config
@@ -6267,10 +6409,10 @@ type = "i64"
     /// `--target-bytes`, same `--pipeline-depth`, same injected clock advanced
     /// by the same pattern, only the delay flipped.
     ///
-    /// - `LONG` (1h) outlasts the 100s the clock ever advances, so nothing can
-    ///   age out. The second write merges into the first's buffer, pushes it
-    ///   past the target and flushes both as ONE object by size.
-    /// - `SHORT` (1s) is shorter than a single 5s advance step, so the first
+    /// - `LONG` (1h) outlasts the single 5s advance the driver ever makes, so
+    ///   nothing can age out. The second write merges into the first's buffer,
+    ///   pushes it past the target and flushes both as ONE object by size.
+    /// - `SHORT` (1s) is shorter than the single 5s advance, so the first
     ///   write's buffer ages out while the decoder is gated: one object by age.
     ///   The second write then lands in a fresh buffer with the clock already
     ///   stopped, so nothing can age it either, and the loader's end-of-input
@@ -6285,6 +6427,15 @@ type = "i64"
     /// `LONG` to the split side fails at `left: 1, right: 2`, with its mix at
     /// `size: 1, age: 0, final: 0` where `size: 0, age: 1, final: 1` is
     /// required.
+    ///
+    /// Inside the helper itself: removing its single `clock.advance_ns` call
+    /// fails the helper's own post-select clock assertion on the first
+    /// (coalesced) call, at `left: 1700000000000000000, right:
+    /// 1700000005000000000`, before the split side ever runs; calling it
+    /// twice fails the same assertion at
+    /// `left: 1700000010000000000, right: 1700000005000000000`; and lowering
+    /// the helper's `TARGET` to `3_000` (so write 1 flushes by size alone)
+    /// fails the pre-advance zero-object assertion at `left: 1, right: 0`.
     #[tokio::test]
     async fn max_flush_delay_decides_whether_two_writes_coalesce() {
         use ravel_object_store::memory::MemoryStore;
@@ -8079,7 +8230,7 @@ type = "i64"
                 watch_completed: Arc::new(AtomicUsize::new(0)),
             });
 
-            let started = Instant::now();
+            let started = Instant::now(); // allow-wall-clock: measures real wall for the diagnostic printed below, never asserted on; the test's claim is the exact peak-concurrency count, not any elapsed time
             let report = load_instrumented(
                 store as Arc<dyn ObjectStoreBackend>,
                 &pq,
@@ -8101,7 +8252,7 @@ type = "i64"
             )
             .await
             .expect("the load succeeds");
-            let wall = started.elapsed();
+            let wall = started.elapsed(); // allow-wall-clock: real elapsed for the printed diagnostic only; the peak-concurrency assertions below carry the whole claim
             assert_eq!(
                 report.rows_processed, BATCHES as u64,
                 "every row is written at depth {depth} / flushes {flushes}"

@@ -47,11 +47,50 @@ use ravel_proto::sys::v1 as sysproto;
 use ravel_types::TenantHash;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Format floor written into every metadata record this build emits, and the
-/// highest record version it understands. A record declaring a higher version is
-/// refused rather than misread under this layout, matching the `config` / `prov`
-/// / `enc` records' version guards.
-pub const METRICS_META_FORMAT_VERSION: u32 = 1;
+/// Format version written into every metadata record this build emits: the
+/// writer, including the CAS-loser re-merge rewrite, stamps exactly this. It is
+/// also the highest version the read-merge-write rewrite can reproduce
+/// byte-for-byte, so [`read_metrics_meta`] (the read that feeds that rewrite)
+/// refuses any record declaring a version above it rather than let a whole-record
+/// re-encode strip a field it does not model (ADR-0066 decision 5).
+///
+/// ADR-0066 R2 raised this from 1 to 2, the writer half of the
+/// readers-before-writers sequence R1 opened. Version 2 carries the same field
+/// set as version 1; the bump is a floor signal, so a binary predating R1 --
+/// whose gate ceiling is 1 -- refuses these records instead of rewriting them
+/// whole and stripping the additive fields it does not model. That fail-closed
+/// refusal is the point (issue #1300), and it is safe only because R1's decode
+/// gate accepts 2 fleet-wide already.
+pub const METRICS_META_FORMAT_VERSION: u32 = 2;
+
+/// Highest record version the decode gate accepts: the supported read set is
+/// `METRICS_META_MIN_READ_VERSION..=METRICS_META_MAX_READ_VERSION` (ADR-0066
+/// decision 4). A record declaring a higher version is refused rather than
+/// misread under this layout, matching the `config` / `prov` / `enc` records'
+/// version guards.
+///
+/// R1 raised this to 2 one release ahead of the writer (readers-before-writers),
+/// so a serve-only reader that models only the v1 fields read a v2 record's v1
+/// fields rather than failing closed. R2 flipped the writer into that
+/// already-accepted ceiling, so the read set is unchanged here and now ends
+/// exactly at what the writer stamps. A future additive field repeats the
+/// sequence: raise this ceiling first, ship it, then raise the writer. While the
+/// two differ, [`read_metrics_meta`] is the stricter of the pair: because it
+/// returns the CAS version a caller writes back with, it doubles as the read for
+/// the CAS-loser re-merge rewrite and refuses anything above
+/// [`METRICS_META_FORMAT_VERSION`] (decision 5), which
+/// [`read_metrics_meta_for_serve`] accepts.
+pub const METRICS_META_MAX_READ_VERSION: u32 = 2;
+
+/// Lowest record version the decode gate accepts: the supported read set is a
+/// closed interval `METRICS_META_MIN_READ_VERSION..=METRICS_META_MAX_READ_VERSION`,
+/// a set with a floor and not a ceiling. Version 0 is an unstamped record from a
+/// writer that never set `format_version`; admitting it would let a valid-shaped
+/// but unstamped record be served as this tenant's metadata and rewritten by the
+/// CAS-loser re-merge, so it is refused with
+/// [`MetricsMetaError::VersionBelowFloor`] -- a distinct error from the ceiling's,
+/// because the remediation is distinct (ADR-0066 decision 4).
+pub const METRICS_META_MIN_READ_VERSION: u32 = 1;
 
 /// zstd level for the record body. 3 is the level
 /// [`crate::snapshot_format`] already uses for its compressed bodies and zstd's
@@ -218,11 +257,43 @@ pub enum MetricsMetaError {
         #[source]
         source: prost::DecodeError,
     },
+    /// The record declares a version ABOVE the decode gate's ceiling: a newer
+    /// writer produced it, and this build cannot know which fields it carries.
+    /// Refused rather than misread. The remediation is to upgrade this binary,
+    /// which is why this is a separate variant from
+    /// [`MetricsMetaError::VersionBelowFloor`] (a below-floor record is not a
+    /// future format and upgrading fixes nothing).
     #[error(
-        "metadata record {key:?} declares format_version {got}, but this build only understands \
-         version {METRICS_META_FORMAT_VERSION}: refusing rather than misread a future record format"
+        "metadata record {key:?} declares format_version {got}, above the highest version this \
+         build reads ({ceiling}): a newer writer produced it, so refusing rather than misread it. \
+         Upgrade this binary to one whose reader accepts version {got}"
     )]
-    UnsupportedVersion { key: String, got: u32 },
+    UnsupportedVersion { key: String, got: u32, ceiling: u32 },
+    /// The record declares a version BELOW the decode gate's floor. Version 0 is
+    /// the case that occurs in practice: an unstamped record from a writer that
+    /// never set `format_version`. This is not a future format, so upgrading
+    /// changes nothing; the record itself has to be migrated or rewritten by a
+    /// writer of a supported version.
+    #[error(
+        "metadata record {key:?} declares format_version {got}, below the lowest version this \
+         build reads ({floor}): the record is unstamped or predates the supported floor, not a \
+         future format. Refusing rather than admit a record no supported writer produced"
+    )]
+    VersionBelowFloor { key: String, got: u32, floor: u32 },
+    /// [`read_metrics_meta`] read a record declaring a version this build's writer
+    /// cannot reproduce (> [`METRICS_META_FORMAT_VERSION`]). That read feeds the
+    /// CAS-loser re-merge, which re-encodes the whole record through this build's
+    /// field set, so a field a newer writer added would be silently dropped on the
+    /// write-back; the read is refused so the merge never runs and nothing is
+    /// stripped (ADR-0066 decision 5). This is what separates the strict reader
+    /// from [`read_metrics_meta_for_serve`], which never writes and so accepts
+    /// every version the decode gate does.
+    #[error(
+        "metadata record {key:?} declares format_version {got}, newer than this build's writer \
+         version {METRICS_META_FORMAT_VERSION}: refusing to read it for a whole-record rewrite that \
+         would strip fields this build does not model (ADR-0066 decision 5)"
+    )]
+    RefusingToRewriteNewerRecord { key: String, got: u32 },
     /// The record records a different tenant than the key it was read under. It
     /// is another tenant's metadata misfiled here; serving it would leak one
     /// tenant's metric names to another, so it is refused (the
@@ -409,6 +480,43 @@ fn build_record(
     }
 }
 
+/// Classify a record's declared `format_version` against a closed supported read
+/// interval `min_read_version..=max_read_version` (ADR-0066 decision 4). The one
+/// gate every reader of this record goes through.
+///
+/// Below the floor and above the ceiling are separate errors because the
+/// remediation is opposite: an above-ceiling record needs a newer binary, a
+/// below-floor record needs the record migrated and would not be helped by any
+/// upgrade.
+///
+/// The bounds are parameters rather than direct reads of the two constants so a
+/// test can instantiate the gate another release of this code carries. Under
+/// readers-before-writers sequencing two adjacent releases hold different bounds
+/// over this same gate, and reproducing an older binary's refusal is exactly what
+/// proves the version bump fails closed instead of stripping fields.
+fn check_read_version(
+    format_version: u32,
+    min_read_version: u32,
+    max_read_version: u32,
+    key: &str,
+) -> Result<(), MetricsMetaError> {
+    if format_version < min_read_version {
+        return Err(MetricsMetaError::VersionBelowFloor {
+            key: key.to_string(),
+            got: format_version,
+            floor: min_read_version,
+        });
+    }
+    if format_version > max_read_version {
+        return Err(MetricsMetaError::UnsupportedVersion {
+            key: key.to_string(),
+            got: format_version,
+            ceiling: max_read_version,
+        });
+    }
+    Ok(())
+}
+
 /// Decode a proto record into domain entries, validating the version, the
 /// misfile guard, and every entry's structure fail-closed. A record from a
 /// future format, one misfiled under the wrong tenant's key, one with an empty
@@ -419,12 +527,12 @@ fn decode_record(
     key: &str,
     tenant_hash: &TenantHash,
 ) -> Result<Vec<MetricMetadataEntry>, MetricsMetaError> {
-    if record.format_version > METRICS_META_FORMAT_VERSION {
-        return Err(MetricsMetaError::UnsupportedVersion {
-            key: key.to_string(),
-            got: record.format_version,
-        });
-    }
+    check_read_version(
+        record.format_version,
+        METRICS_META_MIN_READ_VERSION,
+        METRICS_META_MAX_READ_VERSION,
+        key,
+    )?;
     if record.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
         return Err(MetricsMetaError::MisfiledTenant {
             key: key.to_string(),
@@ -522,20 +630,39 @@ fn decompress_body(key: &str, body: &[u8]) -> Result<Vec<u8>, MetricsMetaError> 
     Ok(out)
 }
 
-/// Decode a stored body into domain entries: decompress, prost-decode, validate.
-fn decode_body(
+/// Decompress and prost-decode a stored body into the proto record, with no
+/// validation beyond "these bytes are a record". Split out of [`decode_body`] so
+/// a rewrite caller can read the declared `format_version` and refuse a record
+/// newer than it can reproduce BEFORE the read gate speaks (ADR-0066 decision 5):
+/// on a write path the operator needs to hear that nothing was persisted, not
+/// that the record could not be read.
+fn decode_proto(
     body: &[u8],
     key: &str,
-    tenant_hash: &TenantHash,
-) -> Result<Vec<MetricMetadataEntry>, MetricsMetaError> {
+) -> Result<sysproto::MetricMetadataRecord, MetricsMetaError> {
     let raw = decompress_body(key, body)?;
-    let record = sysproto::MetricMetadataRecord::decode(raw.as_slice()).map_err(|source| {
+    sysproto::MetricMetadataRecord::decode(raw.as_slice()).map_err(|source| {
         MetricsMetaError::Decode {
             key: key.to_string(),
             source,
         }
-    })?;
-    decode_record(&record, key, tenant_hash)
+    })
+}
+
+/// Decode a stored body into domain entries plus the record's declared
+/// `format_version`: decompress, prost-decode, validate. The version is returned
+/// alongside the entries so a caller can reason about it; the entry validation
+/// here accepts the full supported read set
+/// (`METRICS_META_MIN_READ_VERSION..=METRICS_META_MAX_READ_VERSION`).
+fn decode_body(
+    body: &[u8],
+    key: &str,
+    tenant_hash: &TenantHash,
+) -> Result<(Vec<MetricMetadataEntry>, u32), MetricsMetaError> {
+    let record = decode_proto(body, key)?;
+    let format_version = record.format_version;
+    let entries = decode_record(&record, key, tenant_hash)?;
+    Ok((entries, format_version))
 }
 
 /// Refuse an entry set that would make a corrupt record before it is written. A
@@ -576,7 +703,58 @@ pub async fn read_metrics_meta(
     let key = metrics_meta_key(tenant_hash);
     match store.get(&key, GetRange::Full).await {
         Ok(outcome) => {
-            let entries = decode_body(outcome.data.as_ref(), &key, tenant_hash)?;
+            let record = decode_proto(outcome.data.as_ref(), &key)?;
+            // Rewrite refusal (ADR-0066 decision 5): the returned version is what a
+            // caller CAS-writes back against after a re-merge, so this read feeds a
+            // whole-record rewrite. A record a newer writer wrote may carry a field
+            // this build does not model, which the re-encode would strip; refuse it
+            // here so the merge never runs. A read failure makes the sink drop the
+            // window (no write, no strip) and the serve path fall back to an empty
+            // record for one horizon, both fail-safe.
+            //
+            // Checked BEFORE the decode gate, whose ceiling is the read ceiling:
+            // this caller is about to write, so it must hear that nothing was
+            // persisted and why. The two ceilings are equal today and the read gate
+            // would refuse the same records with the wrong diagnostic; they part
+            // again the moment a future additive field raises the read ceiling
+            // ahead of the writer.
+            if record.format_version > METRICS_META_FORMAT_VERSION {
+                return Err(MetricsMetaError::RefusingToRewriteNewerRecord {
+                    key,
+                    got: record.format_version,
+                });
+            }
+            let entries = decode_record(&record, &key, tenant_hash)?;
+            Ok(Some((entries, outcome.version)))
+        }
+        Err(StoreError::NotFound) => Ok(None),
+        Err(err) => Err(MetricsMetaError::store(&key, err)),
+    }
+}
+
+/// Read a tenant's metric metadata for a read-only serve caller (the query
+/// metadata cache), returning the decoded entries and the store version.
+///
+/// Unlike [`read_metrics_meta`], this does NOT apply the rewrite refusal
+/// (ADR-0066 decision 5): a serve caller never writes the record back, so a
+/// record it cannot reproduce byte-for-byte is still safe to read for the fields
+/// this build does model. The decode gate is the shared `decode_body`, so the
+/// accepted read set is the full
+/// `METRICS_META_MIN_READ_VERSION..=METRICS_META_MAX_READ_VERSION`.
+/// [`read_metrics_meta`] stays strict for the CAS-loser re-merge rewrite, which
+/// does feed a whole-record re-encode and must refuse a version it would strip.
+/// Without this split the shared reader would turn every record from a newer
+/// writer into an empty metadata snapshot for one horizon during that writer's
+/// rollout, which is exactly what the R2 rollout of the version-2 writer would
+/// have done to every serve path.
+pub async fn read_metrics_meta_for_serve(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+) -> Result<Option<(Vec<MetricMetadataEntry>, Version)>, MetricsMetaError> {
+    let key = metrics_meta_key(tenant_hash);
+    match store.get(&key, GetRange::Full).await {
+        Ok(outcome) => {
+            let (entries, _format_version) = decode_body(outcome.data.as_ref(), &key, tenant_hash)?;
             Ok(Some((entries, outcome.version)))
         }
         Err(StoreError::NotFound) => Ok(None),
@@ -1176,31 +1354,180 @@ mod tests {
         assert_eq!(out.merged, out2.merged, "order-independent, byte-stable");
     }
 
-    /// A record declaring a future format_version is refused rather than misread
-    /// under this layout.
-    #[tokio::test]
-    async fn read_rejects_future_format_version() {
-        let store = mem();
-        let mut record = build_record(&tenant(), &[entry("a", MetricKind::Counter, "h", "", 1)]);
-        record.format_version = METRICS_META_FORMAT_VERSION + 1;
-        let body = zstd::bulk::compress(&record.encode_to_vec(), ZSTD_LEVEL).expect("compress");
-        store
-            .put(
-                &metrics_meta_key(&tenant()),
-                body.into(),
-                PutOptions::default(),
-            )
-            .await
-            .expect("seed future record");
-        let err = read_metrics_meta(store.as_ref(), &tenant())
-            .await
-            .expect_err("a future format_version must be refused");
+    /// ADR-0066 R2: the writer now stamps 2, inside the {1, 2} set R1 shipped to
+    /// every reader one release earlier. The exact values are pinned, not a
+    /// relation: a silent third bump has to edit this test.
+    #[test]
+    fn metrics_meta_version_constants() {
+        let built = build_record(&tenant(), &[entry("a", MetricKind::Counter, "h", "", 1)]);
+        assert_eq!(built.format_version, 2, "writer stamps version 2 (R2)");
+        assert_eq!(METRICS_META_FORMAT_VERSION, 2);
+        assert_eq!(METRICS_META_MIN_READ_VERSION, 1);
+        assert_eq!(METRICS_META_MAX_READ_VERSION, 2);
+    }
+
+    /// Compress a record at an explicit `format_version` into a stored body,
+    /// bypassing the writer's version stamp, so a test can seed exactly the record
+    /// a newer or too-new writer would leave on disk.
+    fn body_at_version(version: u32, entries: &[MetricMetadataEntry]) -> Vec<u8> {
+        let mut record = build_record(&tenant(), entries);
+        record.format_version = version;
+        zstd::bulk::compress(&record.encode_to_vec(), ZSTD_LEVEL).expect("compress")
+    }
+
+    /// The decode gate's supported set is exactly {1, 2}, a set with a floor and a
+    /// ceiling: a version-1 and a version-2 body both decode through `decode_body`;
+    /// both a version-0 body (below the floor: an unstamped record from a writer
+    /// that never set format_version) and a version-3 body (above the ceiling) are
+    /// refused with a typed UnsupportedVersion. Pins ADR-0066 decision 4 for the
+    /// metrics-metadata reader gate (decode_record, exercised through decode_body).
+    #[test]
+    fn reader_accepts_version_one_and_two_and_refuses_zero_and_three() {
+        let key = metrics_meta_key(&tenant());
+        let entries = vec![entry("a", MetricKind::Counter, "h", "", 1)];
+
+        for version in [1u32, 2u32] {
+            let body = body_at_version(version, &entries);
+            let (decoded, fv) = decode_body(&body, &key, &tenant())
+                .unwrap_or_else(|e| panic!("version {version} must decode: {e}"));
+            assert_eq!(
+                decoded, entries,
+                "version {version} entries decode unchanged"
+            );
+            assert_eq!(fv, version, "decode reports the record's own version");
+        }
+
+        let body = body_at_version(3, &entries);
+        let err = decode_body(&body, &key, &tenant()).expect_err("version 3 must be refused");
         assert!(
             matches!(
                 err,
-                MetricsMetaError::UnsupportedVersion { got, .. } if got == METRICS_META_FORMAT_VERSION + 1
+                MetricsMetaError::UnsupportedVersion {
+                    got: 3,
+                    ceiling: 2,
+                    ..
+                }
             ),
             "got: {err}"
+        );
+
+        // Version 0 (below the floor: an unstamped record) is refused too, and
+        // with the OTHER diagnostic: an operator reading "above the ceiling" for
+        // an unstamped record would go looking for a newer writer that does not
+        // exist. A supported set has a floor as well as a ceiling.
+        let body = body_at_version(0, &entries);
+        let err = decode_body(&body, &key, &tenant()).expect_err("version 0 must be refused");
+        assert!(
+            matches!(
+                err,
+                MetricsMetaError::VersionBelowFloor {
+                    got: 0,
+                    floor: 1,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// ADR-0066 item 2: the read-only serve reader and the strict rewrite reader
+    /// take different paths on a record newer than this build's writer. Both
+    /// refuse a version-3 record, but with different typed errors, and that
+    /// difference is the point: the serve path reports a read it cannot satisfy
+    /// (`UnsupportedVersion`), while the rewrite path reports that it declined to
+    /// write (`RefusingToRewriteNewerRecord`) so the operator knows nothing was
+    /// persisted. Version 2 (what this build's writer stamps, R2) is served
+    /// normally.
+    #[tokio::test]
+    async fn serve_and_strict_readers_report_a_newer_record_differently() {
+        let store = mem();
+        let key = metrics_meta_key(&tenant());
+        let entries = vec![entry("a", MetricKind::Counter, "h", "u", 1)];
+
+        let current = body_at_version(2, &entries);
+        store
+            .put(&key, current.into(), PutOptions::default())
+            .await
+            .expect("seed a version-2 record");
+        let (served, _version) = read_metrics_meta_for_serve(store.as_ref(), &tenant())
+            .await
+            .expect("serve reader must not error on the version this build writes")
+            .expect("a present record is Some");
+        assert_eq!(served, entries, "the serve reader returns the v2 entries");
+
+        let seeded = body_at_version(3, &entries);
+        store
+            .put(&key, seeded.clone().into(), PutOptions::default())
+            .await
+            .expect("seed a version-3 record");
+
+        let err = read_metrics_meta_for_serve(store.as_ref(), &tenant())
+            .await
+            .expect_err("the serve reader refuses a record above its ceiling");
+        assert!(
+            matches!(
+                err,
+                MetricsMetaError::UnsupportedVersion {
+                    got: 3,
+                    ceiling: 2,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+
+        let err = read_metrics_meta(store.as_ref(), &tenant())
+            .await
+            .expect_err("the strict rewrite reader must refuse a version-3 record");
+        assert!(
+            matches!(
+                err,
+                MetricsMetaError::RefusingToRewriteNewerRecord { got: 3, .. }
+            ),
+            "got: {err}"
+        );
+
+        let after = store.get(&key, GetRange::Full).await.expect("re-read").data;
+        assert_eq!(
+            after.as_ref(),
+            seeded.as_slice(),
+            "neither read mutated the stored record"
+        );
+    }
+
+    /// The merge-and-rewrite equivalent of the tenant-config test: reading a
+    /// record from a newer writer for the CAS-loser re-merge is REFUSED, not
+    /// decoded into entries this writer would re-encode and strip.
+    /// `read_metrics_meta` returns the CAS version a caller writes back with, so
+    /// it is the read that feeds the rewrite; it refuses the newer record. The
+    /// stored bytes must be exactly unchanged (the read errored before any merge
+    /// or write). ADR-0066 decision 5.
+    #[tokio::test]
+    async fn rewrite_refuses_a_record_from_a_newer_writer() {
+        let store = mem();
+        let key = metrics_meta_key(&tenant());
+        let seeded = body_at_version(3, &[entry("a", MetricKind::Counter, "h", "u", 1)]);
+        store
+            .put(&key, seeded.clone().into(), PutOptions::default())
+            .await
+            .expect("seed a version-3 record");
+
+        let err = read_metrics_meta(store.as_ref(), &tenant())
+            .await
+            .expect_err("reading a newer record for a rewrite must be refused");
+        assert!(
+            matches!(
+                err,
+                MetricsMetaError::RefusingToRewriteNewerRecord { got: 3, .. }
+            ),
+            "got: {err}"
+        );
+
+        let after = store.get(&key, GetRange::Full).await.expect("re-read").data;
+        assert_eq!(
+            after.as_ref(),
+            seeded.as_slice(),
+            "the stored version-3 record must be byte-for-byte unchanged"
         );
     }
 
@@ -1466,8 +1793,9 @@ mod tests {
         fn encode_decode_round_trip_is_identity(entries in entries_strategy(24)) {
             let key = metrics_meta_key(&tenant());
             let body = encode_body(&tenant(), &entries, &key).expect("encode");
-            let decoded = decode_body(&body, &key, &tenant()).expect("decode");
+            let (decoded, format_version) = decode_body(&body, &key, &tenant()).expect("decode");
             prop_assert_eq!(decoded, entries);
+            prop_assert_eq!(format_version, METRICS_META_FORMAT_VERSION);
         }
 
         /// The merge is idempotent: applying the same incoming set to its own
@@ -1500,5 +1828,148 @@ mod tests {
             sorted.dedup();
             prop_assert_eq!(&names, &sorted);
         }
+    }
+
+    // ---- ADR-0066 R2: the writer flip, and what it does to a lagging binary ----
+
+    /// A field a newer writer added and this build does not model, on the wire:
+    /// protobuf field 15, varint. prost keeps no unknown fields, so any whole
+    /// record round-trip through the generated type drops it. This is the exact
+    /// mechanism issue #1300 names, and it works for `MetricMetadataRecord`, which
+    /// has no additive field past version 1 to borrow for the test.
+    const UNMODELED_FIELD_TAG: u8 = 15 << 3;
+    const UNMODELED_FIELD_VALUE: u8 = 0x2A;
+
+    /// Append the unmodeled field to an encoded (pre-compression) record.
+    fn with_unmodeled_field(mut encoded: Vec<u8>) -> Vec<u8> {
+        encoded.push(UNMODELED_FIELD_TAG);
+        encoded.push(UNMODELED_FIELD_VALUE);
+        encoded
+    }
+
+    /// Compress an already-encoded record body the way the writer does.
+    fn compress(raw: &[u8]) -> Vec<u8> {
+        zstd::bulk::compress(raw, ZSTD_LEVEL).expect("compress")
+    }
+
+    /// The read-modify-write a binary that predates ADR-0066 R1 performs: decode
+    /// the stored record, gate it against the pre-R1 supported set (exactly {1}),
+    /// and re-encode it whole. Built from the shared [`check_read_version`] gate
+    /// with the pre-R1 bounds rather than by running a second binary, so the
+    /// refusal this test asserts is the same code path a real old build runs.
+    fn pre_r1_rewrite(stored: &[u8], key: &str) -> Result<Vec<u8>, MetricsMetaError> {
+        let raw = decompress_body(key, stored)?;
+        let record = sysproto::MetricMetadataRecord::decode(raw.as_slice()).map_err(|source| {
+            MetricsMetaError::Decode {
+                key: key.to_string(),
+                source,
+            }
+        })?;
+        check_read_version(record.format_version, 1, 1, key)?;
+        Ok(record.encode_to_vec())
+    }
+
+    /// Issue #1300's own test for the metric-metadata family. A record written by
+    /// the current writer (version 2, carrying a field an older binary does not
+    /// model) is handed to a binary whose accepted set is exactly {1}. That binary
+    /// must REFUSE it with the above-ceiling error rather than decode-and-re-encode
+    /// it, and the stored object must be byte-for-byte untouched. The second half
+    /// proves the strip is real: the same decode-and-re-encode, when it is allowed
+    /// to run, comes back missing the field.
+    #[tokio::test]
+    async fn a_pre_r1_binary_refuses_a_current_record_instead_of_stripping_it() {
+        let store = mem();
+        let key = metrics_meta_key(&tenant());
+        let entries = vec![entry("a", MetricKind::Counter, "h", "u", 1)];
+
+        let raw = with_unmodeled_field(build_record(&tenant(), &entries).encode_to_vec());
+        let seeded = compress(&raw);
+        store
+            .put(&key, seeded.clone().into(), PutOptions::default())
+            .await
+            .expect("seed a current-writer record carrying an unmodeled field");
+
+        let stored = store.get(&key, GetRange::Full).await.expect("read").data;
+        let decoded = decode_proto(stored.as_ref(), &key).expect("decode");
+        assert_eq!(
+            decoded.format_version, 2,
+            "the current writer stamps version 2"
+        );
+
+        let err = pre_r1_rewrite(stored.as_ref(), &key)
+            .expect_err("a binary that reads only {1} must refuse a version-2 record");
+        assert!(
+            matches!(
+                err,
+                MetricsMetaError::UnsupportedVersion {
+                    got: 2,
+                    ceiling: 1,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+
+        let after = store.get(&key, GetRange::Full).await.expect("re-read").data;
+        assert_eq!(
+            after.as_ref(),
+            seeded.as_slice(),
+            "the refused rewrite left the stored record byte-for-byte unchanged"
+        );
+
+        // The flip, in one assertion: had the old binary been allowed to proceed
+        // (a version-1 stamp, which is what this writer emitted before R2), its
+        // re-encode drops the trailing unmodeled field.
+        let mut older = build_record(&tenant(), &entries);
+        older.format_version = 1;
+        let older_raw = with_unmodeled_field(older.encode_to_vec());
+        let re_encoded =
+            pre_r1_rewrite(&compress(&older_raw), &key).expect("a version-1 record is accepted");
+        assert_eq!(
+            re_encoded.as_slice(),
+            &older_raw[..older_raw.len() - 2],
+            "the accepted rewrite stripped exactly the two unmodeled-field bytes"
+        );
+    }
+
+    /// The writer stamps 2 on the wire, on every path that produces a stored
+    /// record: the create and the CAS-replace. Asserted on the bytes read back
+    /// from the store, not on the in-memory record, so a version lost between
+    /// encode and PUT would fail here.
+    #[tokio::test]
+    async fn every_writer_stamps_version_two_on_the_wire() {
+        let store = mem();
+        let key = metrics_meta_key(&tenant());
+        let entries = vec![entry("a", MetricKind::Counter, "h", "u", 1)];
+
+        async fn stamped(store: &dyn ObjectStoreBackend, key: &str) -> u32 {
+            let body = store.get(key, GetRange::Full).await.expect("read").data;
+            decode_proto(body.as_ref(), key)
+                .expect("decode")
+                .format_version
+        }
+
+        write_metrics_meta(store.as_ref(), &tenant(), &entries, None)
+            .await
+            .expect("create");
+        assert_eq!(stamped(store.as_ref(), &key).await, 2, "create stamps 2");
+
+        // A CAS-replace over a record a version-1 writer left behind comes back as
+        // version 2: this is the upgrade path, not just the fresh-write path.
+        let seeded = body_at_version(1, &entries);
+        let seeded_version = store
+            .put(&key, seeded.into(), PutOptions::default())
+            .await
+            .expect("seed a version-1 record")
+            .version;
+        assert_eq!(stamped(store.as_ref(), &key).await, 1, "seeded at 1");
+        write_metrics_meta(store.as_ref(), &tenant(), &entries, Some(seeded_version))
+            .await
+            .expect("CAS-replace");
+        assert_eq!(
+            stamped(store.as_ref(), &key).await,
+            2,
+            "a CAS-replace over a version-1 record rewrites it as version 2"
+        );
     }
 }

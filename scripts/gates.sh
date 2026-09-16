@@ -7,9 +7,16 @@
 #                                     # more than one crate
 #   scripts/gates.sh -p CRATE ...     # scope clippy/test to one or more
 #                                     # crates -- fast local iteration
+#   scripts/gates.sh --flag-doc-guard-only [FILE]
+#                                     # run only the ingest-memory flag-doc
+#                                     # overclaim guard, against FILE or the
+#                                     # committed config.rs, and exit with its
+#                                     # code (so the guard itself is testable)
 set -euo pipefail
 
 crate_args=()
+flag_doc_guard_only=0
+flag_doc_guard_file=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -p)
@@ -21,12 +28,104 @@ while [[ $# -gt 0 ]]; do
       crate_args+=("-p" "$1")
       shift
       ;;
+    --flag-doc-guard-only)
+      shift
+      flag_doc_guard_only=1
+      if [[ $# -gt 0 ]]; then
+        flag_doc_guard_file="$1"
+        shift
+      fi
+      ;;
     *)
       echo "gates.sh: unknown argument: $1" >&2
       exit 64
       ;;
   esac
 done
+
+# Ingest-memory flag-doc overclaim guard (issue #1297). The two ingest memory
+# flags (--max-inflight-ingest-requests, --max-ingest-buffer-bytes) once
+# documented a memory bound that silently excluded the transient gzip inflate,
+# so the flags claimed a ceiling they did not enforce. Each flag's own doc block
+# must therefore both state what ingest memory it bounds and name the gzip
+# inflate/decompression term that qualifies the claim.
+#
+# The check is scoped to the two flags' `///` blocks, not to config.rs as a
+# whole: a file-wide scan passes on any file that mentions inflate anywhere,
+# including a regression test's own doc comments, so both flag descriptions
+# could lose the inflate wording while keeping their memory claim and the guard
+# would still be green.
+#
+# Each block is flattened to one line (the `///` prefixes stripped, newlines
+# turned into spaces) before matching, so a wording that wraps across two
+# comment lines is still seen as one sentence. grep -q reports its own exit
+# code (no pipe), per the script's own conventions.
+config_rs="${flag_doc_guard_file:-$(dirname "$0")/../services/ravel-server/src/config.rs}"
+
+# The contiguous `///` block immediately above `pub <ident>:`, flattened to a
+# single line. The flag's own `#[arg(...)]` attribute lines are skipped so they
+# do not break the block; any other line resets it. Exit 1 when the identifier
+# is not found at all, so a renamed field fails the guard instead of emptying
+# it.
+flag_doc_block() {
+  awk -v ident="$1" '
+    /^[[:space:]]*\/\/\// {
+      line = $0
+      sub(/^[[:space:]]*\/\/\/[[:space:]]?/, "", line)
+      block = block line " "
+      next
+    }
+    /^[[:space:]]*#\[/ { next }
+    $0 ~ "pub[[:space:]]+" ident "[[:space:]]*:" { print block; found = 1; exit }
+    { block = "" }
+    END { if (!found) exit 1 }
+  ' "$2"
+}
+
+check_ingest_memory_flag_docs() {
+  local file="$1"
+  local failed=0
+  local pair ident flag block tmp
+  for pair in \
+    "max_inflight_ingest_requests:--max-inflight-ingest-requests" \
+    "max_ingest_buffer_bytes:--max-ingest-buffer-bytes"; do
+    ident="${pair%%:*}"
+    flag="${pair##*:}"
+    block="$(flag_doc_block "${ident}" "${file}")" || block=""
+    if [[ -z "${block// /}" ]]; then
+      echo "gates.sh: no /// doc block found for ${flag} (${ident}) in ${file}; \
+the guard cannot check a flag whose doc it cannot find (issue #1297)" >&2
+      failed=1
+      continue
+    fi
+    tmp="$(mktemp)"
+    printf '%s\n' "${block}" >"${tmp}"
+    if ! grep -qiE '(buffered|resident|ingest)[^.]*memory' "${tmp}"; then
+      echo "gates.sh: ${flag}'s doc no longer says which ingest memory it \
+bounds, so the inflate qualification below has nothing to qualify (issue \
+#1297)" >&2
+      failed=1
+    fi
+    # The term must be the gzip inflate, in one sentence with the word gzip: an
+    # unqualified "decompress" matches Remote Write's own post-decompression cap,
+    # which these flags mention for unrelated reasons and which would satisfy a
+    # looser pattern while the gzip qualification was gone.
+    if ! grep -qiE '(gzip[^.]*(inflate|decompress)|(inflate|decompress)[^.]*gzip)' "${tmp}"; then
+      echo "gates.sh: ${flag}'s doc claims an ingest memory bound without \
+naming the gzip inflate/decompression term (issue #1297); no sentence in \
+the doc block pairs gzip with inflate or decompress" >&2
+      failed=1
+    fi
+    rm -f "${tmp}"
+  done
+  return "${failed}"
+}
+
+if [[ ${flag_doc_guard_only} -eq 1 ]]; then
+  guard_code=0
+  check_ingest_memory_flag_docs "${config_rs}" || guard_code=$?
+  exit "${guard_code}"
+fi
 
 # Linker OOM guard. On low-memory hosts (fleet executors run with 8 GB)
 # the default parallelism links several multi-GB test binaries at once and
@@ -61,6 +160,91 @@ cargo --locked fmt --all --check
 # ahead of the expensive lanes and fails at authoring time.
 echo "==> scripts/guards/check-test-hygiene.sh"
 "$(dirname "$0")/guards/check-test-hygiene.sh"
+
+# Every workflow declares a top-level permissions floor (issue #1717). No local
+# gate compiles .github/, so nothing else here would notice a workflow added
+# without one, and the repository default workflow permission is write. Its own
+# cases run first, so a guard broken into always-passing fails here rather than
+# going quiet. A file scan, no build, so it sits with the other cheap guards.
+echo "==> scripts/guards/check-workflow-permissions.test.sh"
+bash "$(dirname "$0")/guards/check-workflow-permissions.test.sh"
+echo "==> scripts/guards/check-workflow-permissions.sh"
+"$(dirname "$0")/guards/check-workflow-permissions.sh"
+
+# "No wall-clock wait in an injected-clock test helper" cost two gate reruns
+# (issue #1260: the flaky pair test, then its rewrite under #1235). Another
+# check rather than another paragraph, same reasoning as the hygiene guard
+# above: a source scan, no build, ahead of the expensive lanes.
+echo "==> scripts/check-injected-clock-helpers.sh"
+"$(dirname "$0")/check-injected-clock-helpers.sh"
+
+# Format-lifecycle docs drifted from the shipped reader once already (issue
+# #531). This ties each bulk-format doc's declared supported-version marker to
+# its crate's SUPPORTED_VERSIONS. A source scan, no build, and it runs its own
+# mismatch self-check first so it cannot go vacuous.
+echo "==> scripts/check_format_version_docs.py"
+python3 "$(dirname "$0")/check_format_version_docs.py"
+
+# Every parse of caller text in ravel-sql runs the pre-parse complexity guard,
+# because the walks over the parsed tree abort the process on a statement the
+# parser's own recursion limit does not bound (issue #1680). That was a
+# convention until issue #1760 made it a property: one guarded parse, and this
+# check refuses any other. A source scan, no build, same placement reasoning as
+# the two above.
+echo "==> scripts/guards/check-guarded-sql-parse.sh"
+"$(dirname "$0")/guards/check-guarded-sql-parse.sh"
+
+# A parsed tenant query could reach an evaluator unreachable!() arm and abort
+# the process instead of rejecting the query (issue #1701). That round
+# converted every reachable arm to Error::Unsupported and left only the arms
+# an exhaustive prior match already narrows out of reach, each carrying a
+# one-line justification. This guard keeps new unreachable! arms honest: a
+# source scan, no build, same placement reasoning as the two above.
+echo "==> scripts/guards/check-promql-unreachable.sh"
+"$(dirname "$0")/guards/check-promql-unreachable.sh"
+
+# A user guide must not keep a figure a later record superseded, or an operator
+# picks a flag value from a retired number (issue #1736). This scans the guides
+# tree for the retired ADR-0996 ClickBench pair. Cases first, same reason as the
+# guards above: a source scan, no build, and it passes everything if its anchor
+# page is gone.
+echo "==> scripts/guards/check-superseded-figures.test.sh"
+bash "$(dirname "$0")/guards/check-superseded-figures.test.sh"
+echo "==> scripts/guards/check-superseded-figures.sh"
+"$(dirname "$0")/guards/check-superseded-figures.sh"
+
+# deny.toml's quick-xml ignore comment records the direct Cargo.lock parents
+# of RUSTSEC-2026-0194/-0195 (issue #1718); this checks the comment still
+# names every one of them. Cases first, same reason as the guards above. A
+# Cargo.lock/deny.toml scan, no build, so it sits with the other cheap
+# guards.
+echo "==> scripts/guards/check-quick-xml-entry-points.test.sh"
+bash "$(dirname "$0")/guards/check-quick-xml-entry-points.test.sh"
+echo "==> scripts/guards/check-quick-xml-entry-points.sh"
+"$(dirname "$0")/guards/check-quick-xml-entry-points.sh"
+
+# check-quick-xml-shipped-reachability.sh itself needs a real cargo toolchain
+# and dependency graph (it stays CI-only, in the supply-chain job and
+# supply-chain-nightly.yml), but its own cases run against a stubbed cargo
+# and cost nothing here, same reason as the entry-points cases above.
+echo "==> scripts/guards/check-quick-xml-shipped-reachability.test.sh"
+bash "$(dirname "$0")/guards/check-quick-xml-shipped-reachability.test.sh"
+
+# Every shell test suite must be run by some workflow (issue #1834). Here as
+# well as in CI, because the person this guard exists for is the one who just
+# added a suite and has not wired it: they run gates.sh before committing, per
+# the gate list in CLAUDE.md, and would otherwise learn it from a red pull
+# request instead. Cases first, so a guard broken into always-passing fails
+# here rather than going quiet. A git and grep scan, no build.
+echo "==> scripts/tests/check-test-suites-run.test.sh"
+bash "$(dirname "$0")/tests/check-test-suites-run.test.sh"
+echo "==> scripts/guards/check-test-suites-run.sh"
+"$(dirname "$0")/guards/check-test-suites-run.sh"
+
+# The flag-doc overclaim guard defined above, in the ordinary gate run: a source
+# scan, no build, so it fails before the expensive lanes.
+echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"
+check_ingest_memory_flag_docs "${config_rs}"
 
 # Match CI's `check` job: it runs `cargo nextest run --workspace
 # --cargo-profile ci`. Use nextest when it is installed so a local run
@@ -132,9 +316,11 @@ run_feature_lane() {
 
 want_features=0
 want_bench=0
+want_stage_timing=0
 if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_features=1
   want_bench=1
+  want_stage_timing=1
 else
   for arg in "${crate_args[@]}"; do
     case "${arg}" in
@@ -144,6 +330,11 @@ else
     # scope should pay for the bench lanes.
     case "${arg}" in
       ravel-bench | ravel-sql | ravel-query | ravel-ingest) want_bench=1 ;;
+    esac
+    # The crates that DECLARE stage-timing, and whose own cfg-gated tests the
+    # ravel-bench lane below cannot reach.
+    case "${arg}" in
+      ravel-bench | ravel-ingest | ravel-logseg) want_stage_timing=1 ;;
     esac
   done
 fi
@@ -164,6 +355,19 @@ if [[ ${want_bench} -eq 1 ]]; then
   cargo check --locked -p ravel-bench --features stage-timing --all-targets
   echo "==> cargo test --locked -p ravel-bench --features stage-timing"
   cargo test --locked -p ravel-bench --features stage-timing
+fi
+
+# stage-timing tests in the crates that declare the feature. The ravel-bench
+# lane above enables ravel-logseg/stage-timing and ravel-ingest/stage-timing
+# transitively, so it type-checks their production code, but a `-p ravel-bench`
+# selection builds both as library dependencies and cargo never compiles a
+# dependency's `#[cfg(test)]` module. Every `#[cfg(feature = "stage-timing")]`
+# test in those two crates was therefore unreachable from any lane. This runs
+# them. Not extended to services/ravel-cli: its stage-timing test is broken on
+# main under issue #1522, and a lane running it would be red for an unrelated
+# reason.
+if [[ ${want_stage_timing} -eq 1 ]]; then
+  run_feature_lane stage-timing -p ravel-logseg -p ravel-ingest
 fi
 
 # --- Gates-pass receipt ---------------------------------------------------

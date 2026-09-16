@@ -172,6 +172,27 @@ checks against the real object-key layout in CI. Replace `my-ravel-bucket` with
 your bucket in each file, then attach each document to the principal whose
 access key that role's deployment uses.
 
+The KMS statement's `Resource` value is a JSON array, shipped with exactly one
+entry: the placeholder `arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-TENANT-KEY-ID`.
+That single-entry array is correct as shipped only for a deployment with one
+KMS key. Two independent flags put keys in play (see
+[Encrypting objects with SSE-KMS](#encrypting-objects-with-sse-kms)), and each
+role's policy must authorize every key its own writes and reads can reach, so
+that array needs an exact ARN for each of:
+
+- the key configured with `--s3-kms-key`, if the deployment sets it. It is
+  applied to the default store, so it encrypts every PUT the process makes that
+  no per-tenant key overrides. Omit it and Gateway, Query and Maintain PUTs fail
+  with `AccessDenied`, and reads of objects already written under it fail KMS
+  decryption for every role including Admin.
+- every key configured in the `--tenant-kms-config` file, one entry each.
+
+Add each ARN as its own entry, rather than replacing the single placeholder with
+your one key and calling it done. A configured key missing from the array
+does not fail at startup: the process starts normally, and the gap surfaces
+only when a request first uses that key, as `AccessDenied` on that KMS call, at
+runtime rather than at deploy time.
+
 Three facts about those documents are worth knowing before you edit them.
 
 **Every role denies delete on the protected prefixes.** Gateway, Query and Admin
@@ -184,8 +205,14 @@ undeletable even by Maintain.
 shard (`t/*/u/*/0000/*`) is deny-delete for every role including Maintain, so a
 legal hold cannot be destroyed. The query-audit shard (`t/*/u/*/0001/*`) is
 compacted and age-swept on a 90-day window by the Maintain process, so Maintain
-alone grants delete on it. The two are disjoint key paths, so neither grant
-reaches the other shard.
+alone grants delete on it. The two shard paths are disjoint, but Maintain's
+level-based delete grants are not confined to them: an audit object is keyed
+`t/<hash>/u/<level>/<shard>/...`, so `t/*/*/l0/*`, `t/*/*/c/*` and
+`t/*/*/l1/*` match legal-hold keys too. What keeps a legal hold safe is the
+explicit `Deny`, which names both `s3:DeleteObject` and
+`s3:DeleteObjectVersion` on that shard, and a `Deny` overrides an `Allow` only
+for the actions it names. If you edit these policies, keep the deny's action
+list at least as wide as every delete action an `Allow` grants on those keys.
 
 **Tenant discovery needs a bare prefix entry.** Discovery lists the bare,
 delimited `t/` prefix rather than a per-tenant subpath, and under AWS
@@ -356,8 +383,15 @@ to narrow.
 }
 ```
 
-The matching role-side statement in each `deploy/iam/*.json` template is scoped
-to the tenant key ARNs rather than to every key:
+The matching role-side statement in each `deploy/iam/*.json` template holds a
+placeholder tenant key ARN that you must replace with your own (see
+[the shipped policy documents](#the-shipped-policy-documents)), scoped to real
+keys rather than to every key. Replace it with the exact ARN configured with
+`--s3-kms-key`, if the deployment sets that flag, plus one exact ARN for every
+key in the `--tenant-kms-config` file. The two flags are independent: the
+`--s3-kms-key` ARN covers every PUT that no per-tenant key overrides, and its
+absence from a role's array fails that role's PUTs, and every role's reads of
+objects written under it, with `AccessDenied`. With the keys in place:
 
 - Gateway and Maintain write tenant data through the routing store and read some
   of what they write, so they hold encrypt, generate-data-key and decrypt.
@@ -462,7 +496,23 @@ ravel-server --store s3 --s3-bucket my-bucket --cache-dir /var/cache/ravel
 ```
 
 There is no separate capacity flag for the disk tier. Each tier is bounded by
-the single `--cache-max-bytes` number, read once at startup with no live resize.
+`--cache-max-bytes`, read once at startup with no live resize.
+
+The fetcher cache and the catalog byte cache are two independent LRU caches.
+When `--cache-max-bytes` is **set**, both are bounded at that one value. When it
+is **unset**, the two derive separately from the process memory budget (see
+"Per-query budgets" below): the fetcher cache at 25% and the catalog byte
+cache at a smaller 5% (`7516192768` and `1503238553` on the 30 GB reference
+host), so deriving both cannot commit more than 30% of the budget between
+them. Startup refuses to start, rather than silently clamping, if an explicit
+`--cache-max-bytes` pushes the two resolved hard caps above the process
+memory budget. Both ceilings are LRU caps, not reservations: neither
+pre-allocates, each holds only the bytes it has admitted, and the sum of the
+two cache ceilings and the SQL memory pools (which derive from raw host
+memory, not the process memory budget) may exceed physical RAM by design (the
+caches fill only under a working set that large, and a SQL query aborts
+rather than growing past its own pool). `--disable-cache` turns both off and
+holds no read-cache memory.
 
 The disk tier is disposable by design. The directory is created lazily on first
 admission and is never required to exist. A missing, full or corrupt cache
@@ -602,11 +652,24 @@ process that runs no maintenance loop configures nothing.
 Repeated `--tenant-token TOKEN=TENANT` flags configure tenants entirely. There is
 no tenant database and no admin API. To add, remove or rotate a token, restart
 with a different flag set. That is safe: every process is stateless, so a
-restart has no data migration to do. With no `--tenant-token` and no OIDC or
-mTLS resolver configured, every request to a tenant-protected route is
-rejected; the health and `/metrics` routes carry no tenant, and
-`--dev-insecure-tenant-header` on a loopback listener is the development
-exception.
+restart has no data migration to do. With no `--tenant-token`, no
+`--tenant-token-file`, and no OIDC or mTLS resolver configured, every request
+to a tenant-protected route is rejected; the health and `/metrics` routes
+carry no tenant, and `--dev-insecure-tenant-header` on a loopback listener is
+the development exception.
+
+`--tenant-token-file PATH` (env `RAVEL_TENANT_TOKEN_FILE` for the path only,
+never a token value) is a file-based alternative to repeating `--tenant-token`,
+so a token never has to sit in argv or a process listing: one `TOKEN=TENANT`
+pair per line, blank lines and `#` comments skipped, each line split on the
+first `=` the same way `--tenant-token` is. A leading UTF-8 byte order mark is
+stripped before parsing. `--tenant-token` and `--tenant-token-file` are
+mutually exclusive; startup refuses if both are set. An empty or
+comment-only file parses to an empty map, the same as passing no
+`--tenant-token` at all: that authenticates nothing, and unless
+`--maintain-tenant` names tenants, background fold, compaction and retention
+widen to every tenant storage discovers rather than refusing startup. A Secret
+mount that failed to populate produces exactly this, with no error at startup.
 
 Tenant identity affects only key prefixing and authorization. It carries no
 other per-tenant configuration.
@@ -696,22 +759,38 @@ schemes starts a new bucket and drains into it.
 
 ## Durable shard count
 
-`--shards` is immutable per tenant and signal. Once a tenant's data for a signal
-is written across N shards, resolution iterates `0..N`, so serving that tenant
-with a lower `--shards` would silently omit every series in the missing shards.
-It also sets both the ingest router's shard count and the query-side catalog's
-shard count, which is why there is no separate query-side flag.
+`--shards` is a default for tenants that have not yet been provisioned. It is
+not a per-tenant setting you can change after the fact for existing data:
+generation 0's shard count is fixed forever once a tenant's data for a signal
+is written across it. The flag sets both the ingest router's shard count and
+the query-side catalog's shard count for new tenants, which is why there is no
+separate query-side flag.
 
-To make a mismatch loud instead of silent, the first write for a tenant and
-signal records the value in a durable provisioning record at
-`t/<tenant_hash>/<signal>/prov`, and every later ingest, query and maintenance
-touch validates against it. Lowering `--shards` for a tenant that has data in
-higher shards is refused by construction.
+The first write for a tenant and signal records its shard count as generation 0
+of a durable, append-only shard-generation history in a provisioning record at
+`t/<tenant_hash>/<signal>/prov`. Every later ingest, query, and maintenance
+touch reads that history and routes each hour over the shard count active for
+that hour, not over a single fixed count: `ravel-cli provision reshard` appends
+a new generation with a different shard count, taking effect at a future
+activation hour, without moving or re-keying existing data. Relying on
+generation 0's count alone misses any later reshard; always route from the
+persisted generation history.
+
+An already-provisioned tenant keeps its own generation history: changing the
+global `--shards` default (for example, lowering it for new tenants) does not
+affect a tenant that already has a record, and does not refuse startup, fail its
+queries, or skip its maintenance. This drift between a tenant's generation-0
+recorded count and the live default is expected and is surfaced as an
+informational metric, not an error.
+
+The one case still refused is a record whose shard count would hide existing
+data if adopted, and an unreadable (corrupt or future-format) record whose true
+shard count cannot be trusted; both fail closed.
 
 A brand-new tenant with no prior writes has no record yet, so a fresh
 deployment, including an operator-managed cluster that starts with zero data and
 configured tokens, starts normally. The record is created on the tenant's first
-write.
+write and pins the live `--shards` default as that tenant's count.
 
 **Adopting data written before the record existed.** A tenant and signal that
 already had data is adopted the first time a server ingests or maintains it, or
@@ -735,7 +814,7 @@ deployment transfer is free and the bill is requests, so a ranged read spends a
 billed request to save bytes that cost nothing. Elsewhere the reverse holds.
 Three flags size this, all read at startup only.
 
-`--logs-fetch-policy` takes one of three values, spelled exactly as here. Its
+`--logs-fetch-policy` takes one of four values, spelled exactly as here. Its
 default is `cost-based`.
 
 | Value | Optimizes for | Pick it when |
@@ -743,9 +822,28 @@ default is `cost-based`.
 | `request-minimal` | Fewest object-store requests. An object at or under the fetch bound is read whole in one covering request with no footer probe; a larger object is read as covering sub-range requests. | The backend bills requests and not transfer, so a saved request is a saved dollar and the bytes it costs are free. |
 | `byte-minimal` | Fewest transferred bytes. Ranged reads wherever they save more bytes than a request is worth. | The backend bills egress, or the network is the constraint, so moved bytes are the cost that matters. |
 | `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved from the profile's prices at startup. | You want the shape the deployment's own prices imply. At the reference intra-region profile this resolves to request-minimal. |
+| `latency-first` | Fewest transferred bytes, exactly like `byte-minimal`. An intent, not a tuning constant: it says spend requests to save wall time, and leaves how up to the concurrency you configure. | Cold wall-clock matters more than the request bill, and you are willing to raise the object-store GET concurrency and the SQL scan width explicitly to cash in the trade: measured over 3 reps on a 42-statement reference corpus, true cold in the warm-up-empty state, at GET concurrency 256: 5.30x the GET requests (570,752 against 107,781) for 52% less cold time, with a per-rep range of 50.3% to 54.2%. That ratio is a measurement of two code paths at one point in the project's history, not a property of the policy, and it has already moved once as the cost-based side changed; the decision record for the fetch objective names the exact build it was taken on. Re-measure against the build you run rather than treating it as a constant. |
 
 For any policy value a query returns exactly the same rows. Only request counts
 and timing differ.
+
+`latency-first` resolves `--store-get-concurrency`, `--sql-partition-count`,
+and `--promql-fetch-fanout` the same way every other policy does -- it sets no
+default of its own. The measured trade above only pays off once you raise
+the GET permits and the SQL scan width together to the concurrency the
+measurement used; `--fetch-concurrency` raises all three at once. Selecting
+the policy on its own is not inert: the byte quantities change immediately, so
+a logs read is routed the way `byte-minimal` routes it, taking ranged reads
+wherever they save more bytes than a request costs and whole-object reads
+where they do not. On the reference corpus that shape at the default
+concurrency measured slower than the default policy, not faster. Treat the
+concurrency as a precondition, not a suggestion. The startup line says which
+side of it this process is on, and it reports the precondition met only when
+both the GET permits and the scan width have been raised.
+Raising concurrency also raises in-flight fetch memory, and that memory is not
+yet bounded by a process-wide budget: watch process memory yourself when
+trying this policy, since an under-provisioned raise can end in an
+out-of-memory kill instead of a faster query.
 
 The policy is an operator surface only. It is never derivable from query text, a
 header or a ticket: under request billing, a tenant that could force
@@ -929,17 +1027,105 @@ overflow column and lose columnar access. Watch for that in
 
 ## Per-query budgets
 
-Four flags bound what one query may spend. Each defaults to the compiled-in
-value.
+Six flags bound what one query may spend. Unset, each resolves at startup, but
+only some resolve from host resources: `--store-get-concurrency`,
+`--sql-partition-count`, and `--promql-fetch-fanout` (or the legacy
+`--fetch-concurrency`, which sets all three) follow the core count, and the two
+SQL ceilings follow memory (shares of `MemTotal`, capped by the cgroup memory
+limit when the process runs in a container), while `--max-segments` is a fixed
+1,000,000 on every host. Set, the flag value is used verbatim, with one
+reconciliation: the per-query SQL pool is clamped to an explicit per-tenant
+ceiling set below it, and the startup log says so. The reference-host column
+is a 16-core, 30 GB host, the shape the published ClickBench run used.
 
-| Flag | Default | Choose against |
-|---|---|---|
-| `--fetch-concurrency` | 8 | Host cores and the store's request budget. One knob with three coupled effects: it also sets the SQL scan partition count and the object-store request concurrency. |
-| `--max-segments` | 1024 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. |
-| `--sql-max-query-bytes` | 256 MiB | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. |
-| `--sql-tenant-max-bytes` | 1 GiB | The multi-tenant isolation bound: SQL memory one tenant may hold across its concurrent queries. Process-wide, and not itself per-tenant-overridable. |
+| Flag | Default (unset) | Reference host | Choose against |
+|---|---|---|---|
+| `--fetch-concurrency` | derived: `max(8, 2 x cores)` | 32 | Legacy combined knob: sets `--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout` together (source `legacy-flag`). Combining it with any of the three is a startup error naming both flags. |
+| `--store-get-concurrency` | derived: `max(8, 2 x cores)` | 32 | Permit count for the one process-wide `GetLimiter` every fetcher (RSEG, RLOG, RSPAN) shares. Host cores and the store's request budget. |
+| `--sql-partition-count` | derived: `max(8, 2 x cores)` | 32 | DataFusion `target_partitions` for every SQL session the server builds. Host cores and query parallelism vs. per-partition overhead. |
+| `--promql-fetch-fanout` | derived: `max(8, 2 x cores)` | 32 | PromQL/analytics per-query segment fetch fan-out. Host cores and the store's request budget. |
+| `--max-segments` | fixed: 1,000,000 (host-independent) | 1,000,000 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. Lower it to bound plan width on a host you share with something else. |
+| `--sql-max-query-bytes` | derived: 25% of MemTotal, 256 MiB if memory is unknown | 8,053,063,680 | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. Held at or below `--sql-tenant-max-bytes`: an explicit value here raises a non-explicit (derived or fallback) tenant ceiling to fit, but an explicit tenant ceiling clamps this down and warns. |
+| `--sql-tenant-max-bytes` | derived: 50% of MemTotal, 1 GiB if memory is unknown | 16,106,127,360 | The multi-tenant isolation bound: SQL memory one tenant may hold across its concurrent queries. Process-wide, and not itself per-tenant-overridable. |
 
-The last two are meaningful only in a build with the `sql` feature. See
+A value of `0` in any of `--fetch-concurrency`, `--store-get-concurrency`,
+`--sql-partition-count`, or `--promql-fetch-fanout` is a startup error naming
+that flag, raised before any fetcher, engine, or SQL session exists.
+
+Two more settings are derived the same way: `--cache-max-bytes` (fetcher cache
+25%, catalog byte cache a separate 5% ceiling, 256 MiB each if memory is
+unknown; an explicit flag bounds both at that one value) and
+`--gc-max-query-duration` (11 minutes). Memory is read from `/proc/meminfo`'s
+`MemTotal` on Linux and is "unknown" everywhere else; cores come from the
+process's available parallelism, floored at 1. Percentages truncate.
+
+Unlike the two SQL ceilings above, `--cache-max-bytes` does not derive from
+raw `MemTotal`: it derives from a process-wide memory budget, itself
+`MemTotal` (capped by the cgroup memory limit) minus a fixed 2 GiB overhead
+reserve for the allocator and everything outside this accounting. Whatever
+of that budget the two resolved cache ceilings do not claim sizes a shared
+memory accountant the SQL executor's per-tenant tracking reserves against, so
+raising `--cache-max-bytes` on a memory-constrained host leaves less headroom
+for concurrent SQL queries even though the two are configured by separate
+flags. This budget, its two carves, and the remainder are computed once at
+startup from the host profile observed at that moment; nothing about it
+changes while the process runs, and a container whose cgroup limit changes
+later is not noticed until the next restart. Startup refuses outright when
+the two cache ceilings leave no strictly positive remainder, naming both
+figures; `--disable-cache` is exempt, because a process that builds neither
+cache claims nothing against the budget and the remainder is all of it. The current state is visible
+live at `/metrics`: `ravel_memory_budget_bytes` (the ceiling of that shared
+accountant, which is the startup log's `memory_remainder_bytes`, the budget
+MINUS the two cache ceilings, not the pre-carve `memory_budget_bytes` figure
+logged beside it; `u64::MAX` means unlimited, which is what any host with
+unreadable memory reports regardless of the caps set on it),
+`ravel_memory_reserved_bytes` split by a
+`component` label (`sql` or `fetch`; `fetch` reads `0` today because no
+fetcher this process builds reserves against this budget, an honest gap
+rather than a bug, and `sql` is correspondingly the whole reserved total
+rather than one component's share of it), and `ravel_memory_handoff_overlap_bytes` (the bytes a
+handoff between components would double-count in the budget's accounting
+window; inactive, always `0`, until fetch handoff accounting reaches this
+budget).
+`--cache-max-bytes` changes less than it used to about how many times a logs
+statement moves a given object's bytes: a query's plan-phase whole-object
+read (the `has_word`/text and other skip-index-undecidable fallback) is now
+carried into the scan for a bounded number of segments regardless of cache
+size, so those objects cross the wire once. The bound is the SQL partition
+count times object size, not the corpus, so undersizing this flag can
+still turn the remaining segments' one wire GET into two; removing that
+residual duplication needs the carry to stream per partition instead of
+being held at the plan barrier, which is a separate, not-yet-shipped change.
+
+Every resolved value is logged once at startup with the source it came from:
+`flag` (the operator set it, used verbatim), `legacy-flag` (no flag for this
+setting, but the legacy `--fetch-concurrency` was set and its value is used),
+`derived` (computed from the host profile, or from a host-independent rule),
+`budget-carve` (a fixed share of `memory_budget_bytes` rather than of raw
+`MemTotal`, which is what the two cache ceilings resolve to on a host whose
+memory could be read), or `fallback` (no flag and no readable `MemTotal`, so
+the compiled-in constant is used). So `journalctl -u ravel-server | grep
+'performance default resolved'` answers "what is this process actually running
+with" without reading the unit file:
+
+```
+INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
+INFO performance default resolved setting="store_get_concurrency" value=32 source="derived"
+INFO performance default resolved setting="sql_partition_count" value=32 source="derived"
+INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
+INFO performance default resolved setting="max_segments" value=1000000 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=7516192768 source="budget-carve"
+INFO performance default resolved setting="catalog_cache_max_bytes" value=1503238553 source="budget-carve"
+INFO performance default resolved setting="memory_budget_bytes" value=30064771072 source="derived"
+INFO performance default resolved setting="memory_overhead_reserve_bytes" value=2147483648 source="derived"
+INFO performance default resolved setting="memory_hard_caps_bytes" value=9019431321 source="derived"
+INFO performance default resolved setting="memory_remainder_bytes" value=21045339751 source="derived"
+INFO performance default resolved setting="sql_max_query_bytes" value=8053063680 source="derived" clamped=false
+INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived" raised=false
+INFO performance default resolved setting="gc_max_query_duration" value_ms=660000 source="derived"
+```
+
+The last two flags are meaningful only in a build with the `sql` feature. See
 [the query guide](../query.md#operator-configurable-budgets-server-flags) for
 worked sizing.
 

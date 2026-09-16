@@ -14,15 +14,19 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
+use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction, KeyToPath, PodSpec,
-    PodTemplateSpec, Probe, ResourceRequirements, SecretKeySelector, SecretVolumeSource, Service,
-    ServiceAccount, ServicePort, ServiceSpec, Volume, VolumeMount,
+    Affinity, Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
+    KeyToPath, Lifecycle, LifecycleHandler, PodAffinityTerm, PodAntiAffinity, PodSecurityContext,
+    PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecretKeySelector,
+    SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServicePort, ServiceSpec,
+    SleepAction, Volume, VolumeMount, WeightedPodAffinityTerm,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
     IngressServiceBackend, IngressSpec, IngressTLS, ServiceBackendPort,
 };
+use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -56,8 +60,10 @@ pub enum RenderError {
     /// `key.source: canonicalTenant` is selected but no resolver is configured.
     /// `ravel-ingest-router`'s own CLI refuses to start with `--key-source
     /// canonical-tenant` unless at least one resolver flag is set (a
-    /// `--tenant-token`, `--oidc-issuer`/`--oidc-jwks-url`, `--mtls-enabled`, or
-    /// `--dev-insecure-tenant-header`). The only resolver surface this CRD
+    /// `--tenant-token`, or `--oidc-issuer`/`--oidc-jwks-url`, or
+    /// `--dev-insecure-tenant-header`; `--mtls-enabled` is refused
+    /// unconditionally on this router, ADR-0050 decision 1 shape, so it is
+    /// never a usable resolver here). The only resolver surface this CRD
     /// exposes today is `tenantTokensSecretRef`, which renders the
     /// `--tenant-token` flags; with it absent the rendered command line would
     /// crashloop the router at startup, so the operator renders no router
@@ -94,6 +100,54 @@ pub const HTTP_PORT: i32 = 4318;
 
 /// gRPC listener port (OTLP/gRPC), exposed by the gateway tier only.
 pub const GRPC_PORT: i32 = 4317;
+
+/// `preStop` sleep, in seconds, on every ravel-server pod.
+///
+/// Endpoint deregistration and SIGTERM are concurrent, not ordered: when a pod
+/// is deleted the kubelet sends SIGTERM at the same time the EndpointSlice
+/// removal begins propagating to every node's kube-proxy (and to any external
+/// load balancer). Without a delay the server can start draining while new
+/// requests are still being routed to it. This `preStop` sleep holds the
+/// container up before SIGTERM so endpoint removal has time to propagate; 10s
+/// covers kube-proxy iptables/IPVS reprogramming across nodes and typical cloud
+/// load-balancer drain under load.
+pub const PRE_STOP_DRAIN_DELAY_SECONDS: i64 = 10;
+
+/// Minimum Kubernetes minor version (1.x) the operator supports.
+///
+/// What this asserts: the `preStop` `SleepAction` above
+/// ([`pre_stop_lifecycle`]) is `PodLifecycleSleepAction` (KEP-3960), beta and
+/// **enabled by default** from 1.30 onward, so a cluster at or above this
+/// floor honours the hook under its default feature gates. It does not
+/// assert more than that: below 1.34 (where the gate goes stable and
+/// locked on) an operator of the control plane can still have disabled the
+/// gate manually, and this check -- which only reads the apiserver version
+/// -- cannot detect that. The gate also lives in the kubelet, not only the
+/// apiserver, and Kubernetes' supported skew policy allows a kubelet up to
+/// three minors behind the control plane: a 1.32 apiserver with a 1.29 node
+/// pool reads as 32 here and passes, but PodLifecycleSleepAction is off by
+/// default on those nodes, so the preStop hook is dropped there and this
+/// check -- which only reads the apiserver version -- cannot see it.
+pub const MIN_KUBERNETES_MINOR_VERSION: u32 = 30;
+
+/// `terminationGracePeriodSeconds` on every ravel-server pod.
+///
+/// Kubernetes runs `preStop` inside the grace period and only sends SIGTERM
+/// after it returns, so the grace period must cover the `preStop` sleep plus the
+/// server's own SIGTERM-to-exit budget plus headroom. The server budget is fixed
+/// by ravel-server's compiled defaults, not chosen here: the operator renders no
+/// `--shutdown-timeout`, so the server uses `DEFAULT_SHUTDOWN_TIMEOUT` (25s), and
+/// `services/ravel-server/src/lib.rs` pins the SIGTERM-to-exit worst case at
+/// 32.5s (25s drain + max(2.5s heartbeat stop, 0.5s readiness settle) + 5s OTLP
+/// trace-exporter flush cap) in
+/// `default_shutdown_timeout_is_below_the_kubernetes_grace_period`.
+///
+/// 10s `preStop` + 32.5s server budget = 42.5s, plus 2.5s headroom for kubelet
+/// exec/SIGTERM-delivery latency, rounded to 45s. The error is deliberately on
+/// the long side: a grace period shorter than `preStop` + the server budget lets
+/// SIGKILL land mid-drain and lose buffered-mode ingest data, an irreversible
+/// loss, while a longer one only slows a rolling update's pod turnover.
+pub const POD_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 45;
 
 /// Secret key holding the S3 access key id.
 pub(crate) const S3_ACCESS_KEY_ID_KEY: &str = "accessKeyId";
@@ -148,6 +202,15 @@ pub struct RenderCtx {
     /// credential or tenant-token rotation does; folded into
     /// [`secrets_checksum`] alongside the other two.
     pub deployment_key_resource_version: Option<String>,
+
+    /// `resourceVersion` of the Secret named by `auditTokenKeySecretRef`
+    /// (#1487), or `None` when the cluster has a `deploymentKeySecretRef`
+    /// (the server derives the key from it, no Secret to read) or when
+    /// neither ref is set (nothing to read; the query tier's apply is
+    /// withheld for that pass, see [`crate::controller`]). Folded only into
+    /// the query tier's checksum: gateway and maintain never read this
+    /// Secret, so their checksums must not move when it rotates.
+    pub audit_token_key_resource_version: Option<String>,
 }
 
 /// Resolve the credential Secret name a tier consumes: its own
@@ -175,32 +238,68 @@ fn tier_credentials_secret_name<'a>(
 /// content changes and are stable otherwise, so this value is stable across
 /// reconciles that see the same Secrets (no pod churn) and changes the moment a
 /// token is rotated, the tier's credential is rewritten, or the deployment key
-/// is rotated. The hash is `DefaultHasher` (SipHash with fixed keys),
-/// deterministic across processes, so an operator restart does not roll pods.
-/// It is not a security boundary, only a signal. Stamped onto the tier's pod
-/// template as [`SECRETS_CHECKSUM_ANNOTATION`]; when tiers resolve to
-/// different credential Secrets, a change to one rolls only the tier(s) that
-/// consume it.
+/// is rotated. The hash is `blake3`, a fixed algorithm, so the value depends
+/// only on the inputs and is stable across processes AND Rust toolchain
+/// versions: an operator restart or a compiler upgrade does not roll pods.
+/// (std's `DefaultHasher` is not stable across Rust releases, so an upgrade
+/// would have rolled every tier Deployment for unchanged inputs.) It is not a
+/// security boundary, only a signal. Stamped onto the tier's pod template as
+/// [`SECRETS_CHECKSUM_ANNOTATION`]; when tiers resolve to different credential
+/// Secrets, a change to one rolls only the tier(s) that consume it.
 pub fn secrets_checksum(
     token_rv: Option<&str>,
     credentials_rv: Option<&str>,
     deployment_key_rv: Option<&str>,
+    audit_token_key_rv: Option<&str>,
 ) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    token_rv.unwrap_or("").hash(&mut hasher);
-    credentials_rv.unwrap_or("").hash(&mut hasher);
-    deployment_key_rv.unwrap_or("").hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    // The audit-token-key field is folded in only when `Some` (#1487 rework):
+    // a cluster with no audit-token-key Secret in play must hash the same
+    // three fields main did before this field existed, or every such
+    // gateway/maintain checksum (and every unkeyed query checksum) would
+    // change on the operator upgrade alone and roll pods for no Secret
+    // rotation. `blake3_hex`'s `0xff` separator makes the three- and
+    // four-field forms genuinely different hashes, not just cosmetically
+    // different calls, so this is not a no-op either way.
+    let mut fields = vec![
+        token_rv.unwrap_or(""),
+        credentials_rv.unwrap_or(""),
+        deployment_key_rv.unwrap_or(""),
+    ];
+    if let Some(rv) = audit_token_key_rv {
+        fields.push(rv);
+    }
+    blake3_hex(&fields)
+}
+
+/// A stable hex digest of an ordered list of string fields, using `blake3`
+/// (finding 3, issue #36). Each field is fed followed by a `0xff` separator
+/// byte, which cannot appear in UTF-8, so no concatenation of adjacent fields
+/// can collide with a different split (`"ab" + "c"` differs from `"a" + "bc"`).
+/// The digest is rendered as lowercase hex. Used by [`secrets_checksum`] and
+/// [`qualify_job_input_hash`]; both are change signals, not security
+/// boundaries.
+fn blake3_hex(fields: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for field in fields {
+        hasher.update(field.as_bytes());
+        hasher.update(&[0xff]);
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 /// The [`SECRETS_CHECKSUM_ANNOTATION`] value for a tier, resolving which
 /// credential Secret the tier consumes and hashing its `resourceVersion`
 /// together with the token Secret's and the deployment-key Secret's.
+///
+/// `audit_key_rv` is folded in only by the query tier's call site (#1487):
+/// gateway and maintain always pass `None` here regardless of
+/// `ctx.audit_token_key_resource_version`, so a rotation of that Secret never
+/// moves their checksum.
 fn tier_secrets_checksum(
     spec: &RavelClusterSpec,
     ctx: &RenderCtx,
     tier_override: Option<&LocalSecretRef>,
+    audit_key_rv: Option<&str>,
 ) -> String {
     let secret_name = tier_credentials_secret_name(spec, tier_override);
     let credentials_rv = ctx
@@ -211,6 +310,7 @@ fn tier_secrets_checksum(
         ctx.token_resource_version.as_deref(),
         credentials_rv,
         ctx.deployment_key_resource_version.as_deref(),
+        audit_key_rv,
     )
 }
 
@@ -342,6 +442,63 @@ pub(crate) const DEPLOYMENT_KEY_MOUNT_DIR: &str = "/etc/ravel/deployment-key";
 /// reconciliation, so the mounted path and the value the operator hashes
 /// with can never name two different Secret keys.
 pub(crate) const DEPLOYMENT_KEY_SECRET_KEY: &str = "key";
+
+/// Env var the query tier reads the query-audit token key from (#1487).
+/// Gateway and maintain never render this: only the query tier records
+/// query text for audit.
+pub(crate) const AUDIT_TOKEN_KEY_ENV: &str = "RAVEL_AUDIT_TOKEN_KEY";
+
+/// Key within an explicit `auditTokenKeySecretRef` Secret holding the 64 hex
+/// characters, mirroring [`DEPLOYMENT_KEY_SECRET_KEY`]'s naming for the
+/// deployment-key Secret.
+pub(crate) const AUDIT_TOKEN_KEY_SECRET_KEY: &str = "key";
+
+/// `Degraded` reason when a cluster has neither `deploymentKeySecretRef` nor
+/// `auditTokenKeySecretRef` set (#1487 rework): the operator does not
+/// generate a Secret for this (issue #126's `secrets get`-only posture
+/// forbids the create/patch a generated Secret would need), so the platform
+/// owner must provide one, the same way they provide the S3 credentials and
+/// tenant-tokens Secrets.
+pub(crate) const AUDIT_TOKEN_KEY_MISSING_REASON: &str = "AuditTokenKeyMissing";
+
+/// Message for [`AUDIT_TOKEN_KEY_MISSING_REASON`], naming the field to set
+/// and the shape the Secret it points at must have.
+pub(crate) const AUDIT_TOKEN_KEY_MISSING_MESSAGE: &str = "no deploymentKeySecretRef is set, and spec.auditTokenKeySecretRef is not set; reference a \
+     Secret whose \"key\" field holds 64 hex characters (32 bytes) to enable \
+     query-audit token key derivation, or set deploymentKeySecretRef to derive it from the \
+     deployment key. The query tier's Deployment is left unchanged until then";
+
+/// The query tier's `RAVEL_AUDIT_TOKEN_KEY` env var, or `None` when no
+/// Secret should be read (#1487).
+///
+/// An explicit `spec.audit_token_key_secret_ref` always wins, even when
+/// `deploymentKeySecretRef` is also set. Otherwise, when
+/// `deploymentKeySecretRef` is set, the server derives the key from the
+/// deployment key and needs no env var at all. Otherwise there is nothing to
+/// source the env var from: [`audit_token_key_missing`] is true and the
+/// controller withholds the query tier's Deployment apply entirely, so this
+/// return value never actually reaches a rendered, applied Pod spec in that
+/// case.
+fn audit_token_key_env(spec: &RavelClusterSpec) -> Option<EnvVar> {
+    let explicit = spec.audit_token_key_secret_ref.as_ref()?;
+    Some(EnvVar {
+        name: AUDIT_TOKEN_KEY_ENV.to_string(),
+        value_from: Some(secret_key_env(&explicit.name, AUDIT_TOKEN_KEY_SECRET_KEY)),
+        ..Default::default()
+    })
+}
+
+/// Whether a cluster has no way to source a query-audit token key this pass
+/// (#1487 rework): true only when neither `auditTokenKeySecretRef` nor
+/// `deploymentKeySecretRef` is set. The operator no longer generates a
+/// Secret for this case (issue #126: `secrets get` only, no create/patch), so
+/// `true` here means the query tier's Deployment apply is withheld and a
+/// `Degraded` condition with reason [`AUDIT_TOKEN_KEY_MISSING_REASON`] is
+/// recorded, rather than the operator ever picking a key on the cluster's
+/// behalf.
+pub fn audit_token_key_missing(spec: &RavelClusterSpec) -> bool {
+    spec.audit_token_key_secret_ref.is_none() && spec.deployment_key_secret_ref.is_none()
+}
 
 /// Args shared by every mode: store selection, shard count, and the S3
 /// bucket/region/endpoint flags. Access/secret keys are NOT here (they are env
@@ -476,6 +633,98 @@ fn probes_on(port: i32) -> (Probe, Probe) {
     (liveness, readiness)
 }
 
+/// The hardened container-level SecurityContext stamped on every container the
+/// operator renders (issue #126, ADR-0034 hardening amendment). Runs non-root,
+/// forbids privilege escalation, drops every Linux capability, and mounts the
+/// root filesystem read-only.
+///
+/// `read_only_root_filesystem` is correct for every container the operator
+/// renders: ravel-server's only local-disk write path is the opt-in ADR-0046
+/// disk cache tier (`--cache-dir`), which the operator renders no flag for, so
+/// the server and the ingest-router run RAM-only and write nothing outside the
+/// read-only mounts the pod already carries (the deployment-key Secret, mounted
+/// read-only). Object storage is the only durable backend, so no rendered
+/// container needs a writable root. A future CRD field that wires `--cache-dir`
+/// must back it with its own writable volume mount, which is writable
+/// independently of the root filesystem.
+fn container_security_context() -> SecurityContext {
+    SecurityContext {
+        run_as_non_root: Some(true),
+        allow_privilege_escalation: Some(false),
+        read_only_root_filesystem: Some(true),
+        capabilities: Some(Capabilities {
+            drop: Some(vec!["ALL".to_string()]),
+            add: None,
+        }),
+        ..Default::default()
+    }
+}
+
+/// The `preStop` hook stamped on every ravel-server container, holding it up for
+/// [`PRE_STOP_DRAIN_DELAY_SECONDS`] before SIGTERM so Service endpoint removal
+/// has time to propagate (see that constant).
+///
+/// Uses the native `sleep` lifecycle action (`SleepAction`, beta and on by
+/// default from Kubernetes 1.30, stable in 1.34; the operator pins
+/// `k8s-openapi` at `v1_34`) rather than an
+/// `exec: ["/bin/sleep", ...]`: the rendered container runs with a read-only
+/// root filesystem, non-root, and every Linux capability dropped
+/// ([`container_security_context`]), so an image without a `sleep` binary must
+/// not be assumed.
+fn pre_stop_lifecycle() -> Lifecycle {
+    Lifecycle {
+        pre_stop: Some(LifecycleHandler {
+            sleep: Some(SleepAction {
+                seconds: PRE_STOP_DRAIN_DELAY_SECONDS,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The hardened pod-level SecurityContext stamped on every PodSpec the operator
+/// renders (issue #126): run as non-root and confine every container to the
+/// `RuntimeDefault` seccomp profile.
+fn pod_security_context() -> PodSecurityContext {
+    PodSecurityContext {
+        run_as_non_root: Some(true),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "RuntimeDefault".to_string(),
+            localhost_profile: None,
+        }),
+        ..Default::default()
+    }
+}
+
+/// Preferred (soft) pod anti-affinity spreading a component's replicas across
+/// nodes (issue #126). Preferred, never required: a required rule leaves a
+/// single-node cluster (a `kind` dev cluster, the reference environment) unable
+/// to schedule a second replica, wedging every multi-replica tier. The term
+/// selects the component's own pods by the standard `instance`+`component`
+/// labels and spreads on `kubernetes.io/hostname`.
+fn pod_anti_affinity(instance: &str, component: &str) -> Affinity {
+    Affinity {
+        pod_anti_affinity: Some(PodAntiAffinity {
+            preferred_during_scheduling_ignored_during_execution: Some(vec![
+                WeightedPodAffinityTerm {
+                    weight: 100,
+                    pod_affinity_term: PodAffinityTerm {
+                        label_selector: Some(LabelSelector {
+                            match_labels: Some(labels(instance, component)),
+                            ..Default::default()
+                        }),
+                        topology_key: "kubernetes.io/hostname".to_string(),
+                        ..Default::default()
+                    },
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Build a Deployment for `component` from its rendered args, env, container
 /// ports, replica count, and strategy. The single place the common container
 /// shape (image, probes, resources) is assembled, so gateway/query/maintain
@@ -506,8 +755,10 @@ fn deployment(
         ports: if ports.is_empty() { None } else { Some(ports) },
         liveness_probe: Some(liveness),
         readiness_probe: Some(readiness),
+        lifecycle: Some(pre_stop_lifecycle()),
         resources: resources(resources_spec),
         volume_mounts: volume_mount.map(|m| vec![m]),
+        security_context: Some(container_security_context()),
         ..Default::default()
     };
     Deployment {
@@ -540,6 +791,9 @@ fn deployment(
                 spec: Some(PodSpec {
                     containers: vec![container],
                     volumes: volume.map(|v| vec![v]),
+                    termination_grace_period_seconds: Some(POD_TERMINATION_GRACE_PERIOD_SECONDS),
+                    security_context: Some(pod_security_context()),
+                    affinity: Some(pod_anti_affinity(instance, component)),
                     ..Default::default()
                 }),
             },
@@ -575,6 +829,13 @@ pub fn desired_gateway_deployment(
             args.push(secs.to_string());
         }
     }
+    // Ingest runs only in the gateway tier, so this per-shard flush-isolation
+    // bound is pushed here and nowhere else. Unset leaves the argv byte for byte
+    // as before, and ravel-server keeps its own default of 1.
+    if let Some(max_inflight) = spec.gateway.max_inflight_flushes {
+        args.push("--max-inflight-flushes".to_string());
+        args.push(max_inflight.to_string());
+    }
 
     let tier_override = spec.gateway.credentials_secret_ref.as_ref();
     let mut env = s3_credential_env(spec, tier_override);
@@ -603,7 +864,7 @@ pub fn desired_gateway_deployment(
         spec.gateway.replicas,
         spec.gateway.resources.as_ref(),
         "RollingUpdate",
-        &tier_secrets_checksum(spec, ctx, tier_override),
+        &tier_secrets_checksum(spec, ctx, tier_override, None),
     )
 }
 
@@ -626,6 +887,9 @@ pub fn desired_query_deployment(
     let tier_override = spec.query.credentials_secret_ref.as_ref();
     let mut env = s3_credential_env(spec, tier_override);
     env.extend(tenant_token_env(spec, ctx));
+    if let Some(audit_env) = audit_token_key_env(spec) {
+        env.push(audit_env);
+    }
 
     let ports = vec![ContainerPort {
         name: Some("http".to_string()),
@@ -643,7 +907,12 @@ pub fn desired_query_deployment(
         spec.query.replicas,
         spec.query.resources.as_ref(),
         "RollingUpdate",
-        &tier_secrets_checksum(spec, ctx, tier_override),
+        &tier_secrets_checksum(
+            spec,
+            ctx,
+            tier_override,
+            ctx.audit_token_key_resource_version.as_deref(),
+        ),
     )
 }
 
@@ -746,7 +1015,7 @@ pub fn desired_maintain_deployment(
         spec.maintain.replicas,
         spec.maintain.resources.as_ref(),
         "RollingUpdate",
-        &tier_secrets_checksum(spec, ctx, tier_override),
+        &tier_secrets_checksum(spec, ctx, tier_override, None),
     )))
 }
 
@@ -1182,15 +1451,18 @@ fn router_key_source_value(source: AffinityKeySource) -> &'static str {
 /// `--gateway-service-name`/`--gateway-service-namespace` name this
 /// `RavelCluster`'s own gateway Service (the router watches its EndpointSlices);
 /// `--subset-size` and `--key-source` come from the affinity spec. The
-/// OIDC/mTLS/tenant-token/dev-header flags are REJECTED by the router's own CLI
+/// OIDC/tenant-token/dev-header flags are REJECTED by the router's own CLI
 /// unless `--key-source canonical-tenant`, so the only such flag rendered here
 /// (`--tenant-token`, when a `tenantTokensSecretRef` exists) is gated on that
-/// source. The router's OIDC and mTLS configuration has NO operator-side CRD
-/// surface today -- `ravel-server`'s own OIDC/mTLS config is CLI-flag-only with
-/// no CRD field the operator threads -- so those flags are intentionally not
-/// rendered; giving the canonical-tenant resolver its OIDC/mTLS config is a
-/// separate, larger CRD design task (documented in the task report), not
-/// invented here.
+/// source. `--mtls-enabled` is refused by the router under every key source
+/// (it builds one resolver chain shared by every listener and cannot trust a
+/// client-supplied identity header), so no CRD field could ever render it;
+/// `--mtls-header` only names the identity header the router strips before
+/// forwarding and is never rendered either. The router's OIDC configuration
+/// has NO operator-side CRD surface today -- `ravel-server`'s own OIDC config
+/// is CLI-flag-only with no CRD field the operator threads -- so those flags
+/// are intentionally not rendered; giving the canonical-tenant resolver its
+/// OIDC config is a separate CRD design task, not invented here.
 fn router_args(
     affinity: &IngestAffinitySpec,
     instance: &str,
@@ -1302,6 +1574,7 @@ pub fn desired_router_deployment(
         }]),
         liveness_probe: Some(liveness),
         readiness_probe: Some(readiness),
+        security_context: Some(container_security_context()),
         ..Default::default()
     };
     Ok(Some(Deployment {
@@ -1330,6 +1603,8 @@ pub fn desired_router_deployment(
                     // The router reads EndpointSlices/Services under its own
                     // least-privilege ServiceAccount (deliverable 7).
                     service_account_name: Some(child_name(instance, ROUTER_COMPONENT)),
+                    security_context: Some(pod_security_context()),
+                    affinity: Some(pod_anti_affinity(instance, ROUTER_COMPONENT)),
                     ..Default::default()
                 }),
             },
@@ -1828,6 +2103,719 @@ pub fn gc_bootstrap_plan(spec: &RavelClusterSpec) -> GcBootstrapPlan {
     }
 }
 
+/// Component suffix of the one-shot store-qualification Job (issue #36): its
+/// child name is `<cluster>-qualify`.
+pub const QUALIFY_COMPONENT: &str = "qualify";
+
+/// Annotation on the qualify Job carrying [`qualify_job_input_hash`], so a
+/// change to the inputs qualification proves against (bucket, region, endpoint,
+/// image, credentials Secret name and its resourceVersion) re-runs it and a
+/// no-op reconcile does not.
+pub const QUALIFY_SPEC_HASH_ANNOTATION: &str = "ravel.nofire.ai/qualify-spec-hash";
+
+/// `backoffLimit` for the qualify Job: one retry absorbs a transient S3 error
+/// (a backend still coming up) without spinning on a genuine qualification
+/// failure (a backend that fails conditional-create atomicity or list
+/// consistency). Two attempts total (the initial run plus one retry), then the
+/// Job reports `Failed` and the controller surfaces it on the `StoreQualified`
+/// condition.
+///
+/// Kept small deliberately: `activeDeadlineSeconds` is a Job-WIDE bound on the
+/// total active time across every retry (it takes precedence over
+/// `backoffLimit`), so the two knobs must be sized together. A larger retry
+/// count would either not fit under the deadline (a slow-but-healthy attempt
+/// plus a retry would trip `DeadlineExceeded` before the retry budget was
+/// spent) or force the deadline so high that a hung Job ran for many minutes
+/// before it was cut off. Two attempts is the value that lets one retry
+/// complete a full slow-but-healthy run within
+/// [`QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS`].
+pub const QUALIFY_JOB_BACKOFF_LIMIT: i32 = 1;
+
+/// `ttlSecondsAfterFinished` for the qualify Job: one hour, so a finished Job
+/// does not accumulate across reconciles or re-qualifications. The qualified
+/// state itself is durable in `status.storeQualifiedHash`, so a Job
+/// garbage-collected after success does not re-trigger qualification.
+pub const QUALIFY_JOB_TTL_SECONDS: i32 = 3600;
+
+/// `activeDeadlineSeconds` for the qualify Job: a wall-clock bound so a qualify
+/// pod that hangs (an S3 endpoint that accepts the TCP connection and then
+/// never answers) becomes a `Failed` Job with reason `DeadlineExceeded`
+/// instead of running indefinitely. `backoffLimit` bounds only how many
+/// *failed* attempts run; it does nothing for one attempt that never
+/// terminates, which leaves `StoreQualified` stuck at `Pending` forever.
+///
+/// This deadline is JOB-WIDE, not per-attempt: Kubernetes counts it against
+/// the Job's total active time summed across every retry, and it takes
+/// precedence over `backoffLimit` (whichever limit is hit first fails the
+/// Job). So the value must fit the intended retries end to end, not just one
+/// attempt, or a slow-but-healthy first attempt plus a retry would trip
+/// `DeadlineExceeded` before the retry budget ([`QUALIFY_JOB_BACKOFF_LIMIT`])
+/// was ever spent.
+///
+/// Arithmetic. `ravel-cli store qualify` runs 28 sequential object operations
+/// against the bucket: probe create-if-absent (put, put, get = 3), probe CAS
+/// version (put, put, put, get = 4), probe read-after-write ([`super`]'s
+/// `CONSISTENCY_CYCLES` = 5 put+get = 10), probe list-after-write (5 put+list
+/// = 10), and the final `sys/qualification` create-if-absent write (1); the two
+/// informational probes issue no request through the `ObjectStoreBackend`
+/// contract. Each operation's per-request ceiling is the S3 client's 20 s
+/// `request_timeout` (ravel-object-store `S3HttpConfig::default`), so one
+/// slow-but-healthy attempt whose every operation approaches that ceiling
+/// without retrying is bounded by 28 * 20 s = 560 s. Adding ~140 s per attempt
+/// for pod scheduling and image pull gives a 700 s per-attempt budget. With
+/// `QUALIFY_JOB_BACKOFF_LIMIT` = 1 the Job runs at most two attempts, so the
+/// Job-wide deadline is 2 * 700 s = 1400 s: a slow-but-healthy initial attempt
+/// AND a full retry both complete before it fires. A single hung attempt still
+/// terminates, at the 1400 s Job-wide bound rather than running forever
+/// (a hung endpoint stalls each operation at ~200 s = `retry_timeout` 180 s +
+/// `request_timeout` 20 s).
+///
+/// Not part of [`qualify_job_input_hash`]: tuning this deadline (or the backoff
+/// limit) must not re-run a qualification that already passed.
+pub const QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS: i64 = 1400;
+
+/// `StoreQualified` reason while the qualify Job is being created or is still
+/// running: serving is held until it reports success.
+pub const STORE_QUALIFIED_PENDING_REASON: &str = "Pending";
+
+/// `StoreQualified` reason once the store has been qualified for the current
+/// inputs; serving proceeds.
+pub const STORE_QUALIFIED_SUCCEEDED_REASON: &str = "Succeeded";
+
+/// `StoreQualified` reason when the qualify Job exhausted its `backoffLimit`
+/// without succeeding; serving stays held and the pass requeues on backoff.
+pub const STORE_QUALIFIED_FAILED_REASON: &str = "Failed";
+
+/// Message paired with [`STORE_QUALIFIED_PENDING_REASON`].
+pub const STORE_QUALIFYING_MESSAGE: &str = "running store qualification (ravel-cli store qualify) against the cluster's bucket; the \
+     gateway, query, and maintain Deployments are held until it succeeds so the cluster never \
+     serves on a backend that fails the object-store contract (docs/object-store-contract.md)";
+
+/// Message paired with [`STORE_QUALIFIED_SUCCEEDED_REASON`].
+pub const STORE_QUALIFIED_MESSAGE: &str =
+    "the object store passed ravel-cli store qualify; serving Deployments may be created";
+
+/// A deterministic change-detection hash over the inputs store qualification
+/// proves against (issue #36): the bucket, region, endpoint, server image, the
+/// credentials Secret NAME, and that credentials Secret's `resourceVersion`.
+/// When any of these changes the store the cluster would serve on, or the
+/// credentials it would serve with, is different, so qualification is re-run; an
+/// unrelated spec edit (a replica count, a fold interval) leaves this stable and
+/// does not re-qualify.
+///
+/// The `resourceVersion` is what makes a fixed-name credential ROTATION
+/// re-qualify (finding, issue #36): rotating the Secret in place keeps its name
+/// but bumps its `resourceVersion`, so without it a rotation to credentials that
+/// no longer pass the object-store contract would skip qualification entirely
+/// once the prior Job had been TTL-garbage-collected. Only the `resourceVersion`
+/// (opaque API metadata) enters the hash, never any Secret DATA: the operator
+/// never reads the credential values here (it resolves only the
+/// `resourceVersion`, see `controller::resolve_credential_resource_versions`),
+/// and this value reaches neither the status nor a log line. The operator does
+/// not watch Secrets (the per-namespace `ravel-operator-secrets` RoleBinding
+/// grants `get` only, not `watch`), so a rotation is noticed on the next
+/// periodic requeue (`controller::RESYNC`, 300 s): that pass reads the new
+/// `resourceVersion`, this hash changes, and the gate recreates the Job. The
+/// bound on noticing a rotation is therefore one `RESYNC` interval.
+///
+/// `blake3` is a fixed algorithm, so the hash depends only on the inputs and is
+/// stable across processes AND Rust toolchain versions: neither an operator
+/// restart nor a compiler upgrade spuriously re-qualifies. (std's
+/// `DefaultHasher` is not stable across Rust releases, so an upgrade would have
+/// re-run qualification for every cluster on unchanged inputs.) It is a change
+/// signal, not a security boundary, exactly like [`secrets_checksum`].
+pub fn qualify_job_input_hash(
+    spec: &RavelClusterSpec,
+    credentials_resource_version: Option<&str>,
+) -> String {
+    // Endpoint presence is significant (finding 3, issue #36): common_store_args
+    // and desired_qualify_job emit the endpoint flag/env only when Some, so
+    // endpoint: null and endpoint: "" select different stores, yet
+    // as_deref().unwrap_or("") fed the hasher the same "" for both and hashed
+    // them identically. A distinct presence byte in front of the value keeps the
+    // two forms apart, so editing between them re-qualifies: 0x01 then the value
+    // for Some, a lone 0x00 for None. The 0xff field separator fixes the field
+    // boundary; this byte fixes presence, which the separator alone cannot.
+    let endpoint = match spec.storage.s3.endpoint.as_deref() {
+        Some(value) => format!("\u{1}{value}"),
+        None => "\u{0}".to_string(),
+    };
+    // The credentials resourceVersion carries the same presence byte as the
+    // endpoint (finding 3, issue #36): an unresolved Secret (None) and a Secret
+    // whose resourceVersion resolved to the empty string are different states,
+    // yet unwrap_or("") fed the hasher the same "" for both and hashed them
+    // identically. 0x01 then the value for Some, a lone 0x00 for None keeps the
+    // two apart, so the field separator's boundary is joined by a presence byte
+    // the separator alone cannot supply.
+    let credentials_rv = match credentials_resource_version {
+        Some(value) => format!("\u{1}{value}"),
+        None => "\u{0}".to_string(),
+    };
+    blake3_hex(&[
+        spec.storage.s3.bucket.as_str(),
+        spec.storage.s3.region.as_str(),
+        endpoint.as_str(),
+        spec.image.as_str(),
+        spec.storage.s3.credentials_secret_ref.name.as_str(),
+        credentials_rv.as_str(),
+    ])
+}
+
+/// The one-shot store-qualification Job for a cluster (issue #36).
+///
+/// Runs `ravel-cli store qualify` (the same `ravel-cli` binary the server image
+/// ships) against the cluster's bucket before any serving Deployment is created,
+/// so a backend that fails the object-store contract is caught at deploy time
+/// rather than crash-looping every server pod on a fresh bucket. Image and
+/// credentials mirror the server Deployment's shared
+/// `storage.s3.credentialsSecretRef`; the bucket, region, and endpoint reach
+/// `ravel-cli` through the same `RAVEL_S3_*` env vars it reads (clap `env`), the
+/// exact shape the kind lane's hand-run Job used.
+///
+/// The Job carries [`QUALIFY_SPEC_HASH_ANNOTATION`] so the controller re-runs it
+/// when its inputs change and skips it when they do not, and sets
+/// `restartPolicy: Never`, a small [`QUALIFY_JOB_BACKOFF_LIMIT`],
+/// [`QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS`] so a hung attempt fails rather than
+/// runs forever, and [`QUALIFY_JOB_TTL_SECONDS`] so a finished Job does not
+/// accumulate.
+///
+/// `credentials_resource_version` is the shared credentials Secret's resolved
+/// `resourceVersion` (the controller reads it before the gate); it flows into
+/// [`qualify_job_input_hash`] so the recorded annotation matches the gate's
+/// desired hash and a fixed-name credential rotation re-qualifies.
+pub fn desired_qualify_job(
+    spec: &RavelClusterSpec,
+    instance: &str,
+    credentials_resource_version: Option<&str>,
+) -> Job {
+    let labels = labels(instance, QUALIFY_COMPONENT);
+    let mut env = vec![
+        EnvVar {
+            name: "RAVEL_S3_BUCKET".to_string(),
+            value: Some(spec.storage.s3.bucket.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "RAVEL_S3_REGION".to_string(),
+            value: Some(spec.storage.s3.region.clone()),
+            ..Default::default()
+        },
+    ];
+    if let Some(endpoint) = &spec.storage.s3.endpoint {
+        env.push(EnvVar {
+            name: "RAVEL_S3_ENDPOINT".to_string(),
+            value: Some(endpoint.clone()),
+            ..Default::default()
+        });
+    }
+    // Credentials mirror the server Deployment exactly: sourced from the shared
+    // credentials Secret via secretKeyRef, never literal values.
+    env.extend(s3_credential_env(spec, None));
+
+    let container = Container {
+        name: "qualify".to_string(),
+        image: Some(spec.image.clone()),
+        image_pull_policy: spec.image_pull_policy.clone(),
+        command: Some(vec!["/usr/local/bin/ravel-cli".to_string()]),
+        args: Some(vec![
+            "--store".to_string(),
+            "s3".to_string(),
+            "store".to_string(),
+            "qualify".to_string(),
+        ]),
+        env: Some(env),
+        security_context: Some(container_security_context()),
+        ..Default::default()
+    };
+
+    Job {
+        metadata: ObjectMeta {
+            name: Some(child_name(instance, QUALIFY_COMPONENT)),
+            labels: Some(labels.clone()),
+            annotations: Some(BTreeMap::from([(
+                QUALIFY_SPEC_HASH_ANNOTATION.to_string(),
+                qualify_job_input_hash(spec, credentials_resource_version),
+            )])),
+            ..Default::default()
+        },
+        spec: Some(JobSpec {
+            backoff_limit: Some(QUALIFY_JOB_BACKOFF_LIMIT),
+            active_deadline_seconds: Some(QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS),
+            ttl_seconds_after_finished: Some(QUALIFY_JOB_TTL_SECONDS),
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    restart_policy: Some("Never".to_string()),
+                    containers: vec![container],
+                    security_context: Some(pod_security_context()),
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+/// The terminal state of the live qualify Job this reconcile pass observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualifyJobPhase {
+    /// Neither `Complete` nor `Failed` reported yet.
+    Running,
+    /// The Job reported `Complete=True`.
+    Succeeded,
+    /// The Job reported `Failed=True` (its `backoffLimit` was exhausted). Carries
+    /// the Job's terminal condition message for the `StoreQualified` condition.
+    Failed(String),
+}
+
+/// What the controller observed about the live qualify Job for a cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualifyJobObservation {
+    /// No qualify Job exists (a fresh cluster, or one whose finished Job has been
+    /// TTL-garbage-collected).
+    Absent,
+    /// A qualify Job exists. `spec_hash` is its [`QUALIFY_SPEC_HASH_ANNOTATION`]
+    /// value (`None` if the annotation is missing), `phase` its terminal state.
+    Present {
+        /// The Job's recorded input hash, or `None` when the annotation is
+        /// absent.
+        spec_hash: Option<String>,
+        /// The Job's terminal state this pass.
+        phase: QualifyJobPhase,
+    },
+}
+
+/// The gate decision one reconcile pass takes on store qualification (issue #36).
+///
+/// [`crate::controller`] acts on exactly this, so a test asserting on a decision
+/// here is asserting on the operator's real gating behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualificationDecision {
+    /// The store is qualified for the current inputs: create the serving
+    /// Deployments. No qualify-Job write this pass.
+    Proceed,
+    /// (Re)run qualification and hold the serving Deployments. `recreate` is
+    /// true when a Job for stale inputs must be deleted first (a config edit
+    /// landed); the controller deletes it and lets the next pass create a fresh
+    /// one. False when no Job exists and one must be created now.
+    Qualify {
+        /// Whether a stale Job must be deleted before a fresh one is created.
+        recreate: bool,
+    },
+    /// The qualify Job is still running: hold the serving Deployments, no write.
+    Waiting,
+    /// The qualify Job failed: hold the serving Deployments and requeue on
+    /// backoff. Carries the Job's terminal message.
+    Failed(String),
+}
+
+/// Decide the qualification gate for a pass, purely from the desired input hash,
+/// the durably-recorded qualified hash (`status.storeQualifiedHash`), and the
+/// live Job observation.
+///
+/// A recorded qualified hash equal to the desired one short-circuits to
+/// [`QualificationDecision::Proceed`]: qualification already passed for these
+/// inputs and is never re-run on a schedule, so the Job's absence (after TTL GC)
+/// is not a reason to re-qualify. Otherwise the decision follows the live Job:
+/// absent means create one; a Job for a different (or missing) hash means a
+/// config edit landed and the stale Job is recreated; a Job for the current hash
+/// reports the qualification's progress.
+pub fn qualification_decision(
+    desired_hash: &str,
+    qualified_hash: Option<&str>,
+    observation: &QualifyJobObservation,
+) -> QualificationDecision {
+    if qualified_hash == Some(desired_hash) {
+        return QualificationDecision::Proceed;
+    }
+    match observation {
+        QualifyJobObservation::Absent => QualificationDecision::Qualify { recreate: false },
+        QualifyJobObservation::Present { spec_hash, phase } => {
+            if spec_hash.as_deref() != Some(desired_hash) {
+                QualificationDecision::Qualify { recreate: true }
+            } else {
+                match phase {
+                    QualifyJobPhase::Running => QualificationDecision::Waiting,
+                    QualifyJobPhase::Succeeded => QualificationDecision::Proceed,
+                    QualifyJobPhase::Failed(message) => {
+                        QualificationDecision::Failed(message.clone())
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Base delay of the qualify-Job recreation backoff (issue #36, finding 3): the
+/// first consecutive failure holds this long before a fresh Job is created. Equal
+/// to the controller's failure requeue, so a single failure behaves as it did
+/// before the backoff existed.
+pub const QUALIFY_RETRY_BASE_SECONDS: i64 = 30;
+
+/// Ceiling of the capped exponential qualify-Job recreation backoff: the
+/// per-failure hold doubles from [`QUALIFY_RETRY_BASE_SECONDS`] but never exceeds
+/// this, so a persistently failing store is retried at most this often before the
+/// terminal cooldown takes over.
+pub const QUALIFY_RETRY_CEILING_SECONDS: i64 = 480;
+
+/// Consecutive failures after which the gate stops recreating on the exponential
+/// backoff and holds in the terminal cooldown ([`QUALIFY_RETRY_COOLDOWN_SECONDS`])
+/// instead. Bounds cross-Job churn: `backoffLimit` and `activeDeadlineSeconds`
+/// bound attempts WITHIN one Job only, so without this an unchanged store that
+/// keeps failing qualification would be re-Jobbed forever on the backoff.
+pub const QUALIFY_RETRY_TERMINAL_THRESHOLD: i32 = 6;
+
+/// Terminal-cooldown hold once [`QUALIFY_RETRY_TERMINAL_THRESHOLD`] consecutive
+/// failures are reached: one hour. During it the gate creates no Job; only an
+/// input change (the qualified-input hash moving, which resets the count) or the
+/// cooldown's own expiry lets qualification run again. Equal to the qualify Job's
+/// [`QUALIFY_JOB_TTL_SECONDS`], so the Failed Job that records which inputs are
+/// failing survives most of the hold and a config edit during the cooldown is
+/// seen as a stale Job and resets at once.
+pub const QUALIFY_RETRY_COOLDOWN_SECONDS: i64 = 3600;
+
+/// Seconds to hold before the next qualify-Job recreation after `failure_count`
+/// consecutive failures (issue #36, finding 3).
+///
+/// Capped exponential for the first [`QUALIFY_RETRY_TERMINAL_THRESHOLD`] - 1
+/// failures: [`QUALIFY_RETRY_BASE_SECONDS`] doubling each failure, clamped to
+/// [`QUALIFY_RETRY_CEILING_SECONDS`]. At or beyond the threshold the hold is the
+/// terminal cooldown [`QUALIFY_RETRY_COOLDOWN_SECONDS`]. `failure_count` is the
+/// number of failures INCLUDING the one just observed (1 for the first). The
+/// exact sequence for counts 1..=7 is 30, 60, 120, 240, 480, 3600, 3600.
+pub fn qualify_retry_backoff_seconds(failure_count: i32) -> i64 {
+    if failure_count >= QUALIFY_RETRY_TERMINAL_THRESHOLD {
+        return QUALIFY_RETRY_COOLDOWN_SECONDS;
+    }
+    let doublings = u32::try_from(failure_count - 1).unwrap_or(0).min(31);
+    let scaled = QUALIFY_RETRY_BASE_SECONDS
+        .checked_shl(doublings)
+        .unwrap_or(QUALIFY_RETRY_CEILING_SECONDS);
+    scaled.clamp(QUALIFY_RETRY_BASE_SECONDS, QUALIFY_RETRY_CEILING_SECONDS)
+}
+
+/// The qualify-Job mutation a non-Proceed pass performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualifyJobAction {
+    /// Create the qualify Job for the current inputs: none exists and the backoff
+    /// (if any) has elapsed.
+    Create,
+    /// Delete the existing Job with foreground propagation. Used when a config
+    /// edit made the Job's inputs stale, and when a Failed Job's backoff has
+    /// elapsed and it must be recreated.
+    DeleteStale,
+    /// Leave the Job untouched: it is running, or it is the Failed record kept in
+    /// place during the backoff hold.
+    None,
+}
+
+/// The `StoreQualified` reason a non-Proceed pass records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualifyStoreReason {
+    /// Qualification is in progress (creating or running the Job).
+    Pending,
+    /// The last attempt failed; the gate is holding on the retry backoff or the
+    /// terminal cooldown.
+    Failed,
+}
+
+/// The retry-aware plan for a reconcile pass that did NOT reach
+/// [`QualificationDecision::Proceed`] (issue #36, finding 3). Pure over the
+/// persisted retry state and an injected `now_unix`, so the backoff schedule, the
+/// terminal cooldown, and the input-change reset are unit-tested without a clock.
+/// The controller performs `action`, records a `StoreQualified=False` condition
+/// from `reason`/`job_message`, persists `failure_count`/`next_retry_unix`, and
+/// requeues after `requeue_seconds`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifyGatePlan {
+    /// The Job mutation to perform.
+    pub action: QualifyJobAction,
+    /// The `StoreQualified` reason.
+    pub reason: QualifyStoreReason,
+    /// The failed Job's terminal message when this pass observed it, carried onto
+    /// the condition; `None` on the Pending arms and while holding without a Job
+    /// to read.
+    pub job_message: Option<String>,
+    /// Failure count to persist (`None` clears the field, on the input-change
+    /// reset and on a fresh cluster).
+    pub failure_count: Option<i32>,
+    /// Next-retry instant to persist as RFC3339 (`None` clears the field).
+    pub next_retry_unix: Option<i64>,
+    /// The qualified-input hash the persisted retry state is keyed to (`None`
+    /// clears the field). Set whenever `failure_count` is, so a later pass can
+    /// tell whether the desired inputs still match the ones the failures were
+    /// recorded against.
+    pub retry_hash: Option<String>,
+    /// Requeue delay in seconds.
+    pub requeue_seconds: i64,
+}
+
+/// Map a non-Proceed [`QualificationDecision`] plus the persisted retry state to
+/// its [`QualifyGatePlan`], bounding cross-Job churn (issue #36, finding 3).
+///
+/// The naive gate deleted a Failed Job, requeued on the failure backoff, saw the
+/// Job Absent next pass, and created a fresh one, forever: the Job's own
+/// `backoffLimit`/`activeDeadlineSeconds` bound attempts WITHIN one Job, never the
+/// number of Jobs. This function bounds the recreations. Each consecutive failure
+/// schedules the next recreation on a capped exponential backoff
+/// ([`qualify_retry_backoff_seconds`]); after [`QUALIFY_RETRY_TERMINAL_THRESHOLD`]
+/// failures the gate holds in a terminal cooldown that only an input change (which
+/// resets the count) or the cooldown's expiry clears.
+///
+/// The persisted retry state is keyed by `retry_hash`, the qualified-input hash
+/// the failures were recorded against. An input change resets the budget and
+/// qualifies the new inputs at once whether or not the failing Job still exists:
+/// when `desired_hash` differs from `retry_hash` the count and next-retry are
+/// dropped before the decision is planned, so a config edit made AFTER the Failed
+/// Job's TTL collected it (both a changed and an unchanged pass then observe the
+/// Job absent, so the Job's presence cannot distinguish them) qualifies at once
+/// rather than waiting out the old inputs' cooldown and inheriting their count.
+/// The cooldown is kept only while the hashes match. A stale Job that is still
+/// present ([`QualificationDecision::Qualify`] `recreate: true`) is deleted on the
+/// same pass. The retry hash is set in the plan whenever the failure count is, so
+/// the controller persists the two together.
+///
+/// Deleting the Job clears no retry state: the count is cleared only on the
+/// success path (in the controller) or on an input change, and `next_retry_unix`
+/// is cleared only when the replacement Job is actually created (the Absent
+/// recreation arm), never in the delete arm, so a failed Job that lingers under
+/// foreground deletion is not counted twice.
+pub fn plan_qualify_gate(
+    decision: &QualificationDecision,
+    desired_hash: &str,
+    retry_hash: Option<&str>,
+    failure_count: i32,
+    next_retry_unix: Option<i64>,
+    now_unix: i64,
+    poll_seconds: i64,
+) -> QualifyGatePlan {
+    // The persisted retry budget was recorded against `retry_hash`. If the desired
+    // inputs have moved since, that budget belongs to inputs no longer desired:
+    // drop it so the new inputs qualify from a clean slate at once, independent of
+    // whether the failing Job survives. Keep it only when the hashes match.
+    let (failure_count, next_retry_unix) = if retry_hash == Some(desired_hash) {
+        (failure_count, next_retry_unix)
+    } else {
+        (0, None)
+    };
+    let kept_count = (failure_count > 0).then_some(failure_count);
+    let mut plan = match decision {
+        // A Job for stale inputs is present: a config edit landed. Delete it and
+        // reset the retry budget so the fresh inputs qualify from a clean slate,
+        // at once (the next pass sees Absent with a zero count and creates one).
+        QualificationDecision::Qualify { recreate: true } => QualifyGatePlan {
+            action: QualifyJobAction::DeleteStale,
+            reason: QualifyStoreReason::Pending,
+            job_message: None,
+            failure_count: None,
+            next_retry_unix: None,
+            retry_hash: None,
+            requeue_seconds: poll_seconds,
+        },
+        // No Job exists: a fresh cluster (count 0) creates one now; after a failure
+        // this is the recreation point, gated on the backoff having elapsed.
+        QualificationDecision::Qualify { recreate: false } => match next_retry_unix {
+            Some(due) if now_unix < due => QualifyGatePlan {
+                action: QualifyJobAction::None,
+                reason: QualifyStoreReason::Failed,
+                job_message: None,
+                failure_count: kept_count,
+                next_retry_unix: Some(due),
+                retry_hash: None,
+                requeue_seconds: (due - now_unix).max(1),
+            },
+            // Backoff elapsed (or never set): create the replacement Job and clear
+            // next_retry so the new attempt's failure is counted afresh. The count
+            // is kept; only success or an input change resets it.
+            _ => QualifyGatePlan {
+                action: QualifyJobAction::Create,
+                reason: if failure_count > 0 {
+                    QualifyStoreReason::Failed
+                } else {
+                    QualifyStoreReason::Pending
+                },
+                job_message: None,
+                failure_count: kept_count,
+                next_retry_unix: None,
+                retry_hash: None,
+                requeue_seconds: poll_seconds,
+            },
+        },
+        // The Job is still running: hold, touch neither the Job nor the retry
+        // state.
+        QualificationDecision::Waiting => QualifyGatePlan {
+            action: QualifyJobAction::None,
+            reason: QualifyStoreReason::Pending,
+            job_message: None,
+            failure_count: kept_count,
+            next_retry_unix,
+            retry_hash: None,
+            requeue_seconds: poll_seconds,
+        },
+        // The Job for the current inputs Failed and is Present.
+        QualificationDecision::Failed(message) => match next_retry_unix {
+            // A newly-observed failure (no backoff scheduled): count it once and
+            // schedule the backoff. Keep the Job as the failure record.
+            None => {
+                let count = failure_count.saturating_add(1);
+                let delay = qualify_retry_backoff_seconds(count);
+                QualifyGatePlan {
+                    action: QualifyJobAction::None,
+                    reason: QualifyStoreReason::Failed,
+                    job_message: Some(message.clone()),
+                    failure_count: Some(count),
+                    next_retry_unix: Some(now_unix + delay),
+                    retry_hash: None,
+                    requeue_seconds: delay,
+                }
+            }
+            // Still holding: keep the Job and the count, do not re-count.
+            Some(due) if now_unix < due => QualifyGatePlan {
+                action: QualifyJobAction::None,
+                reason: QualifyStoreReason::Failed,
+                job_message: Some(message.clone()),
+                failure_count: kept_count,
+                next_retry_unix: Some(due),
+                retry_hash: None,
+                requeue_seconds: (due - now_unix).max(1),
+            },
+            // Backoff elapsed: delete the Failed Job so a later pass sees Absent
+            // and recreates. Keep next_retry set (the Absent arm clears it on the
+            // actual create) so a Job lingering under foreground deletion is not
+            // counted a second time.
+            Some(due) => QualifyGatePlan {
+                action: QualifyJobAction::DeleteStale,
+                reason: QualifyStoreReason::Failed,
+                job_message: Some(message.clone()),
+                failure_count: kept_count,
+                next_retry_unix: Some(due),
+                retry_hash: None,
+                requeue_seconds: poll_seconds,
+            },
+        },
+        QualificationDecision::Proceed => {
+            unreachable!("Proceed is handled on the success path, never planned as a hold")
+        }
+    };
+    // Key the persisted retry state to the inputs it was recorded against: set the
+    // hash exactly when a failure count is persisted, so a later pass can compare
+    // the desired hash against it and reset on an input change even after the
+    // Failed Job's TTL collected it.
+    plan.retry_hash = plan.failure_count.map(|_| desired_hash.to_string());
+    plan
+}
+
+/// The [`QualifyJobPhase`] a live Job reports, read from its status conditions:
+/// `Complete=True` is success, `Failed=True` is failure, anything else is still
+/// running.
+///
+/// A `Failed` condition's `reason` is prepended to its `message` (`"<reason>:
+/// <message>"`) so the `StoreQualified` condition names why the Job failed, not
+/// only the human message. This matters for a deadline-exceeded Job: the Job
+/// controller sets reason `DeadlineExceeded` with a generic message ("Job was
+/// active longer than specified deadline"), and the reason is the part an
+/// operator needs to see. When only one of reason/message is present that one
+/// is used verbatim; when neither is, a fixed fallback is.
+pub fn qualify_job_phase(job: &Job) -> QualifyJobPhase {
+    let Some(conditions) = job.status.as_ref().and_then(|s| s.conditions.as_ref()) else {
+        return QualifyJobPhase::Running;
+    };
+    for c in conditions {
+        if c.status != "True" {
+            continue;
+        }
+        match c.type_.as_str() {
+            "Complete" => return QualifyJobPhase::Succeeded,
+            "Failed" => {
+                let reason = c.reason.clone().filter(|r| !r.is_empty());
+                let message = c.message.clone().filter(|m| !m.is_empty());
+                let text = match (reason, message) {
+                    (Some(reason), Some(message)) => format!("{reason}: {message}"),
+                    (Some(reason), None) => reason,
+                    (None, Some(message)) => message,
+                    (None, None) => "the store qualification Job failed".to_string(),
+                };
+                return QualifyJobPhase::Failed(text);
+            }
+            _ => {}
+        }
+    }
+    QualifyJobPhase::Running
+}
+
+/// A tier's PodDisruptionBudget (issue #126, deliverable 4), capping how many of
+/// its pods a voluntary disruption (a node drain, a cluster upgrade) may take
+/// down at once.
+///
+/// `maxUnavailable: 1` rather than a `minAvailable`: it protects a multi-replica
+/// tier (gateway/query) during a rolling node drain while never blocking a drain
+/// on a single-replica tier (maintain, or a one-replica gateway on a single-node
+/// `kind` cluster). A `minAvailable` equal to the replica count would wedge a
+/// node drain on such a cluster, the same failure the preferred (not required)
+/// anti-affinity avoids. The selector matches the tier's own pods by the
+/// standard `instance`+`component` labels, exactly as its Deployment selector
+/// does.
+fn pod_disruption_budget(instance: &str, component: &str) -> PodDisruptionBudget {
+    let labels = labels(instance, component);
+    PodDisruptionBudget {
+        metadata: ObjectMeta {
+            name: Some(child_name(instance, component)),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        },
+        spec: Some(PodDisruptionBudgetSpec {
+            max_unavailable: Some(IntOrString::Int(1)),
+            selector: Some(LabelSelector {
+                match_labels: Some(labels),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+/// One PodDisruptionBudget per rendered tier (issue #126, deliverable 4): always
+/// gateway and query, plus maintain when `maintain.enabled`. The count equals
+/// the number of tiers the reconcile renders a Deployment for. The controller
+/// applies and sweeps these exactly like the Deployments, so a manual patch does
+/// not survive a reconcile. The router is an optional affinity backend, not a
+/// tier, and gets no PDB (its Deployment is swept as a unit with its other
+/// objects when the backend is switched away).
+pub fn desired_pod_disruption_budgets(
+    spec: &RavelClusterSpec,
+    instance: &str,
+) -> Vec<PodDisruptionBudget> {
+    let mut tiers = vec![DeploymentTier::Gateway, DeploymentTier::Query];
+    if spec.maintain.enabled {
+        tiers.push(DeploymentTier::Maintain);
+    }
+    tiers
+        .into_iter()
+        .map(|tier| pod_disruption_budget(instance, tier.component()))
+        .collect()
+}
+
+/// Every PodDisruptionBudget name the render can produce for `instance`, in a
+/// fixed order, whether or not the current spec renders that tier. The
+/// controller applies the ones [`desired_pod_disruption_budgets`] returns and
+/// deletes every other name here, so disabling `maintain` removes its PDB
+/// instead of orphaning one that guards a Deployment that no longer exists.
+pub fn possible_pod_disruption_budget_names(instance: &str) -> Vec<String> {
+    [
+        DeploymentTier::Gateway,
+        DeploymentTier::Query,
+        DeploymentTier::Maintain,
+    ]
+    .into_iter()
+    .map(|tier| child_name(instance, tier.component()))
+    .collect()
+}
+
 /// Everything one `RavelCluster` reconcile applies, rendered in one place.
 ///
 /// [`crate::controller`] builds this and applies exactly its contents, so a
@@ -1876,6 +2864,10 @@ pub struct DesiredObjects {
     /// The maintain Deployment, or `None` when `maintain.enabled` is false (the
     /// controller deletes it in that case).
     pub maintain_deployment: Option<Deployment>,
+    /// One PodDisruptionBudget per rendered tier (issue #126, deliverable 4).
+    /// The controller applies and sweeps these like the Deployments, so a manual
+    /// patch does not survive a reconcile.
+    pub pod_disruption_budgets: Vec<PodDisruptionBudget>,
     /// The order this pass applies the three Deployments in, and the condition
     /// it records while an ordering constraint holds the request-serving tiers
     /// back.
@@ -1949,6 +2941,7 @@ pub fn desired_objects(
         query_deployment: desired_query_deployment(spec, instance, ctx),
         query_service: desired_query_service(spec, instance),
         maintain_deployment: desired_maintain_deployment(spec, instance, ctx)?,
+        pod_disruption_budgets: desired_pod_disruption_budgets(spec, instance),
         gc_bootstrap,
     })
 }
@@ -1986,6 +2979,7 @@ mod tests {
                 name: "ravel-tokens".to_string(),
             }),
             deployment_key_secret_ref: None,
+            audit_token_key_secret_ref: None,
             gateway: GatewaySpec {
                 replicas: 3,
                 resources: None,
@@ -1996,6 +2990,7 @@ mod tests {
                 }),
                 ingest_affinity: None,
                 exposure: None,
+                max_inflight_flushes: None,
             },
             query: QuerySpec {
                 replicas: 2,
@@ -2030,6 +3025,7 @@ mod tests {
                 "cred-1".to_string(),
             )]),
             deployment_key_resource_version: None,
+            audit_token_key_resource_version: None,
         }
     }
 
@@ -2098,6 +3094,55 @@ mod tests {
             .expect("no gc render error")
             .expect("maintain enabled");
         assert_eq!(arg_value(&args_of(&m), "--shards").as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn max_inflight_flushes_renders_onto_the_gateway_only() {
+        // #1743: spec.gateway.maxInflightFlushes renders --max-inflight-flushes
+        // with its value on the gateway container, and on no other tier. Ingest
+        // runs only in the gateway mode, so the flag is inert on query/maintain
+        // and must not appear there.
+        let mut spec = base_spec();
+        spec.gateway.max_inflight_flushes = Some(4);
+
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        assert_eq!(
+            arg_value(&args_of(&g), "--max-inflight-flushes").as_deref(),
+            Some("4"),
+            "gateway must render the flush bound verbatim: {:?}",
+            args_of(&g)
+        );
+
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
+        assert!(
+            !args_of(&q).iter().any(|a| a == "--max-inflight-flushes"),
+            "query must not carry the flush bound: {:?}",
+            args_of(&q)
+        );
+        assert!(
+            !args_of(&m).iter().any(|a| a == "--max-inflight-flushes"),
+            "maintain must not carry the flush bound: {:?}",
+            args_of(&m)
+        );
+
+        // Unset: no tier emits the flag at all.
+        let mut none_spec = base_spec();
+        none_spec.gateway.max_inflight_flushes = None;
+        let g = desired_gateway_deployment(&none_spec, "prod", &ctx());
+        let q = desired_query_deployment(&none_spec, "prod", &ctx());
+        let m = desired_maintain_deployment(&none_spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
+        for (tier, dep) in [("gateway", &g), ("query", &q), ("maintain", &m)] {
+            assert!(
+                !args_of(dep).iter().any(|a| a == "--max-inflight-flushes"),
+                "{tier} must omit the flush bound when unset: {:?}",
+                args_of(dep)
+            );
+        }
     }
 
     #[test]
@@ -2701,6 +3746,62 @@ mod tests {
     }
 
     #[test]
+    fn every_server_tier_sets_grace_period_and_prestop_drain_delay() {
+        // Issue #1291: every ravel-server pod must give the graceful-shutdown
+        // drain room to finish. The three server tiers are rendered by the
+        // shared `deployment` builder, so this asserts on the builder's output
+        // through all three call paths (gateway/query/maintain): a field set on
+        // only some tiers regresses the ones it misses silently.
+        //
+        // Exact values, not "is set": `terminationGracePeriodSeconds` is sized
+        // against ravel-server's 32.5s SIGTERM-to-exit worst case (see
+        // POD_TERMINATION_GRACE_PERIOD_SECONDS) and the `preStop` sleep against
+        // endpoint propagation (PRE_STOP_DRAIN_DELAY_SECONDS). Either drifting
+        // silently is the failure this pins.
+        let spec = base_spec();
+        let ctx = ctx();
+        for dep in [
+            desired_gateway_deployment(&spec, "prod", &ctx),
+            desired_query_deployment(&spec, "prod", &ctx),
+            desired_maintain_deployment(&spec, "prod", &ctx)
+                .expect("no gc render error")
+                .expect("enabled"),
+        ] {
+            assert_eq!(
+                pod_spec_of(&dep).termination_grace_period_seconds,
+                Some(45),
+                "every server tier must set terminationGracePeriodSeconds to the \
+                 value derived from ravel-server's shutdown budget"
+            );
+            let lifecycle = container_of(&dep)
+                .lifecycle
+                .as_ref()
+                .expect("every server tier must set a lifecycle hook");
+            let pre_stop = lifecycle
+                .pre_stop
+                .as_ref()
+                .expect("every server tier must set a preStop hook");
+            let sleep = pre_stop
+                .sleep
+                .as_ref()
+                .expect("the preStop hook must use the native sleep action");
+            assert_eq!(
+                sleep.seconds, 10,
+                "the preStop sleep must cover endpoint propagation exactly"
+            );
+            // The native sleep action carries the whole hook: no exec/httpGet/
+            // tcpSocket variant, which would need a binary the hardened
+            // read-only-root container is not guaranteed to have.
+            assert!(
+                pre_stop.exec.is_none()
+                    && pre_stop.http_get.is_none()
+                    && pre_stop.tcp_socket.is_none(),
+                "the preStop hook must be sleep-only"
+            );
+        }
+    }
+
+    #[test]
     fn secrets_checksum_is_stamped_on_every_pod_template() {
         // The checksum annotation on the pod template is what makes the
         // Deployment controller roll pods when a Secret value changes
@@ -2709,7 +3810,7 @@ mod tests {
         // so all three carry the same checksum (they roll together).
         let spec = base_spec();
         let ctx = ctx();
-        let expected = secrets_checksum(Some("tok-1"), Some("cred-1"), None);
+        let expected = secrets_checksum(Some("tok-1"), Some("cred-1"), None, None);
         for dep in [
             desired_gateway_deployment(&spec, "prod", &ctx),
             desired_query_deployment(&spec, "prod", &ctx),
@@ -2813,19 +3914,34 @@ mod tests {
         // The pure hash behind every tier's pod-template annotation (ADR-0055
         // section 5): stable for the same inputs (no pod churn), and changing
         // when either the token or the credential resourceVersion moves.
-        let a = secrets_checksum(Some("100"), Some("200"), Some("300"));
-        assert_eq!(a, secrets_checksum(Some("100"), Some("200"), Some("300")));
-        assert_ne!(a, secrets_checksum(Some("101"), Some("200"), Some("300")));
-        assert_ne!(a, secrets_checksum(Some("100"), Some("201"), Some("300")));
+        let a = secrets_checksum(Some("100"), Some("200"), Some("300"), Some("400"));
+        assert_eq!(
+            a,
+            secrets_checksum(Some("100"), Some("200"), Some("300"), Some("400"))
+        );
         assert_ne!(
             a,
-            secrets_checksum(Some("100"), Some("200"), Some("301")),
+            secrets_checksum(Some("101"), Some("200"), Some("300"), Some("400"))
+        );
+        assert_ne!(
+            a,
+            secrets_checksum(Some("100"), Some("201"), Some("300"), Some("400"))
+        );
+        assert_ne!(
+            a,
+            secrets_checksum(Some("100"), Some("200"), Some("301"), Some("400")),
             "the deployment-key resourceVersion must also feed the checksum, \
              so its rotation rolls pods that mount it"
         );
+        assert_ne!(
+            a,
+            secrets_checksum(Some("100"), Some("200"), Some("300"), Some("401")),
+            "the audit-token-key resourceVersion must also feed the checksum, \
+             so its rotation rolls pods that mount it"
+        );
         // Absent versions collapse to a distinct, stable value.
-        let none = secrets_checksum(None, Some("200"), None);
-        assert_eq!(none, secrets_checksum(None, Some("200"), None));
+        let none = secrets_checksum(None, Some("200"), None, None);
+        assert_eq!(none, secrets_checksum(None, Some("200"), None, None));
         assert_ne!(none, a);
     }
 
@@ -2857,6 +3973,7 @@ mod tests {
                 ("mt-creds".to_string(), "cred-mt".to_string()),
             ]),
             deployment_key_resource_version: None,
+            audit_token_key_resource_version: None,
         };
 
         let g = desired_gateway_deployment(&spec, "prod", &ctx);
@@ -2943,7 +4060,7 @@ mod tests {
         let m = desired_maintain_deployment(&none_spec, "prod", &ctx)
             .expect("no gc render error")
             .expect("enabled");
-        let shared_checksum = secrets_checksum(Some("tok-1"), Some("cred-1"), None);
+        let shared_checksum = secrets_checksum(Some("tok-1"), Some("cred-1"), None, None);
         assert_eq!(checksum_of(&g).as_deref(), Some(shared_checksum.as_str()));
         assert_eq!(checksum_of(&q).as_deref(), Some(shared_checksum.as_str()));
         assert_eq!(checksum_of(&m).as_deref(), Some(shared_checksum.as_str()));
@@ -2977,6 +4094,7 @@ mod tests {
             token_resource_version: Some("tok-1".to_string()),
             credential_resource_versions: base_versions.clone(),
             deployment_key_resource_version: Some("dk-1".to_string()),
+            audit_token_key_resource_version: None,
         };
         // Rotate ONLY the gateway credential Secret.
         let mut after_versions = base_versions.clone();
@@ -2986,6 +4104,7 @@ mod tests {
             token_resource_version: Some("tok-1".to_string()),
             credential_resource_versions: after_versions,
             deployment_key_resource_version: Some("dk-1".to_string()),
+            audit_token_key_resource_version: None,
         };
 
         let g_before = desired_gateway_deployment(&over_spec, "prod", &before);
@@ -3025,6 +4144,7 @@ mod tests {
                 "shared-1".to_string(),
             )]),
             deployment_key_resource_version: Some("dk-1".to_string()),
+            audit_token_key_resource_version: None,
         };
         let shared_after = RenderCtx {
             tenant_names: vec!["acme".to_string()],
@@ -3034,6 +4154,7 @@ mod tests {
                 "shared-2".to_string(),
             )]),
             deployment_key_resource_version: Some("dk-1".to_string()),
+            audit_token_key_resource_version: None,
         };
         let gb = desired_gateway_deployment(&shared_spec, "prod", &shared_before);
         let ga = desired_gateway_deployment(&shared_spec, "prod", &shared_after);
@@ -3048,6 +4169,234 @@ mod tests {
         assert_ne!(checksum_of(&gb), checksum_of(&ga), "gateway must roll");
         assert_ne!(checksum_of(&qb), checksum_of(&qa), "query must roll");
         assert_ne!(checksum_of(&mb), checksum_of(&ma), "maintain must roll");
+    }
+
+    /// #1487 rework: a cluster with neither `auditTokenKeySecretRef` nor
+    /// `deploymentKeySecretRef` set renders no `RAVEL_AUDIT_TOKEN_KEY` at all
+    /// -- the operator does not generate a Secret for this case (issue #126's
+    /// `secrets get`-only posture). [`crate::controller`] reads
+    /// [`audit_token_key_missing`] to decide the `Degraded` condition and
+    /// withhold the query tier's Deployment apply; see
+    /// `unkeyed_cluster_without_audit_key_ref_reports_missing_and_skips_the_query_tier`
+    /// there. Flip [`audit_token_key_missing`]'s `&&` to `||` and this fails:
+    /// a keyed-only or ref-only cluster would also report missing.
+    #[test]
+    fn unkeyed_cluster_without_audit_key_ref_renders_no_env_and_is_reported_missing() {
+        let spec = base_spec(); // both refs unset
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        assert!(
+            env_secret_name(&q, AUDIT_TOKEN_KEY_ENV).is_none(),
+            "no Secret to source RAVEL_AUDIT_TOKEN_KEY from: the operator generates none"
+        );
+        assert!(
+            audit_token_key_missing(&spec),
+            "a cluster with neither ref set must be reported missing"
+        );
+    }
+
+    /// #1487: a cluster with an explicit `auditTokenKeySecretRef` and no
+    /// `deploymentKeySecretRef` renders `RAVEL_AUDIT_TOKEN_KEY` from that
+    /// Secret's `key` field, required (`optional: Some(false)`). Flip
+    /// [`audit_token_key_env`]'s `AUDIT_TOKEN_KEY_SECRET_KEY` to a different
+    /// literal and the key assertion fails; flip `secret_key_env`'s
+    /// `optional: Some(false)` to `None` and the optional assertion fails.
+    #[test]
+    fn unkeyed_cluster_with_audit_key_ref_renders_the_env_from_that_secret() {
+        let mut spec = base_spec(); // no deploymentKeySecretRef
+        spec.audit_token_key_secret_ref = Some(LocalSecretRef {
+            name: "audit-key".to_string(),
+        });
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        let env = container_of(&q)
+            .env
+            .as_ref()
+            .expect("query renders env vars")
+            .iter()
+            .find(|e| e.name == AUDIT_TOKEN_KEY_ENV)
+            .expect("RAVEL_AUDIT_TOKEN_KEY must be present");
+        let secret_ref = env
+            .value_from
+            .as_ref()
+            .expect("valueFrom")
+            .secret_key_ref
+            .as_ref()
+            .expect("secretKeyRef");
+        assert_eq!(secret_ref.name, "audit-key");
+        assert_eq!(secret_ref.key, "key");
+        assert_eq!(secret_ref.optional, Some(false));
+        assert!(
+            !audit_token_key_missing(&spec),
+            "an explicit ref means the key is not missing"
+        );
+    }
+
+    /// #1487: a cluster with `deploymentKeySecretRef` set and no
+    /// `auditTokenKeySecretRef` renders no `RAVEL_AUDIT_TOKEN_KEY` at all --
+    /// the server derives the key from the deployment key. Flip
+    /// [`audit_token_key_env`] to fall through to some other source instead
+    /// of returning `None`, and this fails: the env var appears, sourced
+    /// from a Secret the operator never creates.
+    #[test]
+    fn keyed_cluster_without_audit_key_ref_renders_no_env() {
+        let mut spec = base_spec();
+        spec.deployment_key_secret_ref = Some(LocalSecretRef {
+            name: "dk".to_string(),
+        });
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        assert!(
+            env_secret_name(&q, AUDIT_TOKEN_KEY_ENV).is_none(),
+            "a keyed cluster must render no RAVEL_AUDIT_TOKEN_KEY env var"
+        );
+        assert!(
+            !audit_token_key_missing(&spec),
+            "deploymentKeySecretRef alone must not be reported missing"
+        );
+    }
+
+    /// #1487: an explicit `auditTokenKeySecretRef` wins even when
+    /// `deploymentKeySecretRef` is ALSO set. Flip [`audit_token_key_env`]'s
+    /// field order so the `deployment_key_secret_ref.is_some()` check runs
+    /// before the explicit-ref check and this fails: the env var disappears
+    /// even though an explicit ref was given.
+    #[test]
+    fn explicit_audit_key_ref_wins_on_a_keyed_cluster() {
+        let mut spec = base_spec();
+        spec.deployment_key_secret_ref = Some(LocalSecretRef {
+            name: "dk".to_string(),
+        });
+        spec.audit_token_key_secret_ref = Some(LocalSecretRef {
+            name: "explicit-audit".to_string(),
+        });
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        assert_eq!(
+            env_secret_name(&q, AUDIT_TOKEN_KEY_ENV).as_deref(),
+            Some("explicit-audit"),
+            "an explicit auditTokenKeySecretRef must win over the deployment-key derivation"
+        );
+    }
+
+    /// #1487: gateway and maintain never read a query-audit token, whether
+    /// the cluster has an explicit ref or not. Flip
+    /// [`desired_gateway_deployment`] (or [`desired_maintain_deployment`]) to
+    /// also push `audit_token_key_env(spec)` into its env list, the same as
+    /// query, and this fails: one of the two non-query tiers would carry the
+    /// env var.
+    #[test]
+    fn gateway_and_maintain_carry_no_audit_token_key_env() {
+        let mut spec = base_spec();
+        spec.audit_token_key_secret_ref = Some(LocalSecretRef {
+            name: "audit-key".to_string(),
+        });
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("enabled");
+        assert!(
+            env_secret_name(&g, AUDIT_TOKEN_KEY_ENV).is_none(),
+            "gateway must never carry RAVEL_AUDIT_TOKEN_KEY"
+        );
+        assert!(
+            env_secret_name(&m, AUDIT_TOKEN_KEY_ENV).is_none(),
+            "maintain must never carry RAVEL_AUDIT_TOKEN_KEY"
+        );
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        assert!(
+            env_secret_name(&q, AUDIT_TOKEN_KEY_ENV).is_some(),
+            "sanity: query itself does carry it when a ref is set"
+        );
+    }
+
+    /// #1487: the query tier's checksum must move when the audit-token-key
+    /// Secret's resourceVersion changes, and gateway/maintain's checksums must
+    /// NOT move -- proving the new field is isolated to the one tier that
+    /// reads that Secret. Flip [`tier_secrets_checksum`]'s query call site to
+    /// pass `None` instead of `ctx.audit_token_key_resource_version.as_deref()`
+    /// and the first assertion fails: the query checksum stops moving.
+    #[test]
+    fn query_tier_checksum_changes_with_the_audit_key_secret() {
+        let spec = base_spec();
+        let before = RenderCtx {
+            audit_token_key_resource_version: Some("a1".to_string()),
+            ..ctx()
+        };
+        let after = RenderCtx {
+            audit_token_key_resource_version: Some("a2".to_string()),
+            ..ctx()
+        };
+
+        let q_before = desired_query_deployment(&spec, "prod", &before);
+        let q_after = desired_query_deployment(&spec, "prod", &after);
+        assert_ne!(
+            checksum_of(&q_before),
+            checksum_of(&q_after),
+            "query checksum must move with the audit-token-key Secret's resourceVersion"
+        );
+
+        let g_before = desired_gateway_deployment(&spec, "prod", &before);
+        let g_after = desired_gateway_deployment(&spec, "prod", &after);
+        assert_eq!(
+            checksum_of(&g_before),
+            checksum_of(&g_after),
+            "gateway checksum must NOT move with the audit-token-key Secret"
+        );
+        let m_before = desired_maintain_deployment(&spec, "prod", &before)
+            .expect("no gc render error")
+            .expect("enabled");
+        let m_after = desired_maintain_deployment(&spec, "prod", &after)
+            .expect("no gc render error")
+            .expect("enabled");
+        assert_eq!(
+            checksum_of(&m_before),
+            checksum_of(&m_after),
+            "maintain checksum must NOT move with the audit-token-key Secret"
+        );
+    }
+
+    /// #1487: with no audit-token-key resourceVersion set, every tier's
+    /// checksum (not just gateway/maintain's) must equal exactly the
+    /// pre-#1487 three-field `blake3_hex` composition -- the field must be
+    /// folded in only when `Some`, never as an empty fourth field, or an
+    /// operator upgrade alone would roll every unkeyed cluster's pods with no
+    /// Secret having changed. Flip [`secrets_checksum`] back to always
+    /// appending `audit_token_key_rv.unwrap_or("")` as a fourth field and
+    /// this fails: the computed checksum stops matching the pre-#1487
+    /// three-field literal.
+    #[test]
+    fn gateway_and_maintain_checksums_are_unchanged_when_no_audit_key_is_set() {
+        let spec = base_spec();
+        let render_ctx = ctx(); // audit_token_key_resource_version: None
+
+        // The pre-#1487 algorithm, recomputed directly: exactly three fields,
+        // never a fourth empty one.
+        let expected = blake3_hex(&[
+            render_ctx.token_resource_version.as_deref().unwrap_or(""),
+            "cred-1",
+            render_ctx
+                .deployment_key_resource_version
+                .as_deref()
+                .unwrap_or(""),
+        ]);
+
+        let gateway = desired_gateway_deployment(&spec, "prod", &render_ctx);
+        let maintain = desired_maintain_deployment(&spec, "prod", &render_ctx)
+            .expect("no gc render error")
+            .expect("enabled");
+        let query = desired_query_deployment(&spec, "prod", &render_ctx);
+        assert_eq!(
+            checksum_of(&gateway),
+            Some(expected.clone()),
+            "gateway checksum must equal main's pre-#1487 algorithm when no audit key is set"
+        );
+        assert_eq!(
+            checksum_of(&maintain),
+            Some(expected.clone()),
+            "maintain checksum must equal main's pre-#1487 algorithm when no audit key is set"
+        );
+        assert_eq!(
+            checksum_of(&query),
+            Some(expected),
+            "query checksum must also equal main's pre-#1487 algorithm when no audit key is set"
+        );
     }
 
     /// `base_spec` with a per-mode credential Secret on every tier: the
@@ -3861,6 +5210,7 @@ mod tests {
                 "shared-1".to_string(),
             )]),
             deployment_key_resource_version: Some("dk-1".to_string()),
+            audit_token_key_resource_version: None,
         };
         let after = RenderCtx {
             deployment_key_resource_version: Some("dk-2".to_string()),
@@ -4709,5 +6059,1335 @@ mod tests {
         // The name the previous mode created is still in the sweep list, so the
         // controller deletes it on this pass.
         assert!(possible_router_object_names("prod").contains(&"prod-ingest-router".to_string()));
+    }
+
+    /// Every Deployment the reconciler can render for a fully-populated spec,
+    /// paired with a label naming its container: the three tiers plus the
+    /// ravel-native ingest router. The hardening sweeps assert over this exact
+    /// set, so a newly added rendered container or pod cannot escape the
+    /// SecurityContext unnoticed. `AuthorizationHeader` affinity is used because
+    /// it needs no tenant-token resolver, so the router renders even with
+    /// `tenant_tokens_secret_ref` cleared.
+    fn every_rendered_deployment() -> Vec<(&'static str, Deployment)> {
+        let mut spec = ravel_native_spec(3, AffinityKeySource::AuthorizationHeader);
+        spec.maintain.enabled = true;
+        let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
+        let deployments = vec![
+            ("gateway", objects.gateway_deployment),
+            ("query", objects.query_deployment),
+            (
+                "maintain",
+                objects
+                    .maintain_deployment
+                    .expect("maintain.enabled renders a maintain Deployment"),
+            ),
+            (
+                "ingest-router",
+                objects
+                    .router_deployment
+                    .expect("ravelNative renders a router Deployment"),
+            ),
+        ];
+        // Guard against a future render path silently dropping out of this
+        // enumeration: the four names above are every container the operator
+        // ships today.
+        assert_eq!(
+            deployments.len(),
+            4,
+            "expected exactly four rendered Deployments to sweep"
+        );
+        deployments
+    }
+
+    fn pod_spec_of(dep: &Deployment) -> &PodSpec {
+        dep.spec
+            .as_ref()
+            .expect("deployment spec")
+            .template
+            .spec
+            .as_ref()
+            .expect("pod spec")
+    }
+
+    #[test]
+    fn every_rendered_container_drops_all_capabilities_and_runs_non_root() {
+        // Deliverable 1: the container-level SecurityContext is on EVERY
+        // container the reconciler can render, not just the shared tier builder.
+        // Render-level assertion: it checks the object the operator applies, not
+        // a live pod (the k8s CI lane covers the runtime effect).
+        for (tier, dep) in every_rendered_deployment() {
+            for container in &pod_spec_of(&dep).containers {
+                let sc = container
+                    .security_context
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{tier}: container has no SecurityContext"));
+                assert_eq!(
+                    sc.run_as_non_root,
+                    Some(true),
+                    "{tier}: runAsNonRoot must be true"
+                );
+                assert_eq!(
+                    sc.allow_privilege_escalation,
+                    Some(false),
+                    "{tier}: allowPrivilegeEscalation must be false"
+                );
+                assert_eq!(
+                    sc.read_only_root_filesystem,
+                    Some(true),
+                    "{tier}: readOnlyRootFilesystem must be true"
+                );
+                let dropped = sc
+                    .capabilities
+                    .as_ref()
+                    .and_then(|c| c.drop.as_ref())
+                    .unwrap_or_else(|| panic!("{tier}: capabilities.drop unset"));
+                assert_eq!(
+                    dropped,
+                    &vec!["ALL".to_string()],
+                    "{tier}: every capability must be dropped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_rendered_pod_spec_sets_a_non_root_security_context() {
+        // Deliverable 2: the pod-level SecurityContext (runAsNonRoot + the
+        // RuntimeDefault seccomp profile) is on EVERY rendered PodSpec.
+        // Render-level assertion.
+        for (tier, dep) in every_rendered_deployment() {
+            let pod = pod_spec_of(&dep);
+            let sc = pod
+                .security_context
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tier}: PodSpec has no securityContext"));
+            assert_eq!(
+                sc.run_as_non_root,
+                Some(true),
+                "{tier}: pod runAsNonRoot must be true"
+            );
+            let profile = sc
+                .seccomp_profile
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tier}: no seccompProfile"));
+            assert_eq!(
+                profile.type_, "RuntimeDefault",
+                "{tier}: seccompProfile must be RuntimeDefault"
+            );
+        }
+    }
+
+    #[test]
+    fn each_tier_renders_a_pod_disruption_budget_and_anti_affinity() {
+        // Deliverable 3 and 4, render-level. The PDB count equals the number of
+        // tiers the reconcile renders a Deployment for, and every tier PodSpec
+        // carries preferred (soft) anti-affinity keyed on its own labels.
+        //
+        // With maintain enabled: three tiers, three PDBs. Disabling maintain
+        // drops it to two, proving the count tracks the rendered tiers rather
+        // than a constant.
+        let mut spec = base_spec();
+        spec.maintain.enabled = true;
+        let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
+        assert_eq!(
+            objects.pod_disruption_budgets.len(),
+            3,
+            "one PDB per rendered tier (gateway, query, maintain)"
+        );
+        // Each PDB caps voluntary disruption at one pod and selects its tier's
+        // own labels.
+        for (pdb, component) in objects
+            .pod_disruption_budgets
+            .iter()
+            .zip(["gateway", "query", "maintain"])
+        {
+            let pdb_spec = pdb.spec.as_ref().expect("pdb spec");
+            assert_eq!(
+                pdb_spec.max_unavailable,
+                Some(IntOrString::Int(1)),
+                "{component}: maxUnavailable must be 1"
+            );
+            assert_eq!(
+                pdb.metadata.name.as_deref(),
+                Some(child_name("prod", component).as_str()),
+                "{component}: PDB name must match the tier"
+            );
+            assert_eq!(
+                pdb_spec
+                    .selector
+                    .as_ref()
+                    .and_then(|s| s.match_labels.clone()),
+                Some(labels("prod", component)),
+                "{component}: PDB selects its tier labels"
+            );
+        }
+
+        // Preferred, not required: a required term would wedge scheduling on a
+        // single-node cluster. Assert the preferred list is populated and the
+        // required list is empty, on every tier.
+        for (tier, dep) in [
+            ("gateway", objects.gateway_deployment),
+            ("query", objects.query_deployment),
+            (
+                "maintain",
+                objects.maintain_deployment.expect("maintain enabled"),
+            ),
+        ] {
+            let anti = pod_spec_of(&dep)
+                .affinity
+                .as_ref()
+                .and_then(|a| a.pod_anti_affinity.as_ref())
+                .unwrap_or_else(|| panic!("{tier}: no podAntiAffinity"));
+            assert!(
+                anti.required_during_scheduling_ignored_during_execution
+                    .as_ref()
+                    .map(|r| r.is_empty())
+                    .unwrap_or(true),
+                "{tier}: anti-affinity must be preferred, never required"
+            );
+            let preferred = anti
+                .preferred_during_scheduling_ignored_during_execution
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tier}: no preferred anti-affinity term"));
+            assert_eq!(preferred.len(), 1, "{tier}: one preferred term");
+            assert_eq!(
+                preferred[0].pod_affinity_term.topology_key, "kubernetes.io/hostname",
+                "{tier}: spread across nodes"
+            );
+            assert_eq!(
+                preferred[0]
+                    .pod_affinity_term
+                    .label_selector
+                    .as_ref()
+                    .and_then(|s| s.match_labels.clone()),
+                Some(labels("prod", tier)),
+                "{tier}: term selects the tier's own pods"
+            );
+        }
+
+        // Disabling maintain drops its PDB, proving the count tracks tiers.
+        let mut disabled = base_spec();
+        disabled.maintain.enabled = false;
+        let objects = desired_objects(&disabled, "prod", "default", &ctx()).expect("render");
+        assert_eq!(
+            objects.pod_disruption_budgets.len(),
+            2,
+            "maintain disabled: only gateway and query PDBs"
+        );
+    }
+
+    #[test]
+    fn rbac_manifest_never_grants_secrets_cluster_wide() {
+        // Issue #126 manifest lint. A dependency-free text scan of the shipped
+        // rbac.yaml, run by the existing `cargo test -p ravel-operator` gate.
+        // The operator must hold no standing cluster-wide Secret read: the
+        // cluster-wide ClusterRole (ravel-operator, the one the
+        // ClusterRoleBinding binds) grants no `secrets`, the secrets read lives
+        // in a separate ravel-operator-secrets ClusterRole, and NO
+        // ClusterRoleBinding may reference that secrets ClusterRole (a
+        // ClusterRoleBinding would make it cluster-wide; only RoleBindings, which
+        // are namespace-scoped, may bind it).
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/k8s/operator/rbac.yaml");
+        let manifest = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        // Split into YAML documents and classify each by its `kind:` line. A
+        // ClusterRoleBinding also contains the text "ClusterRole", so match the
+        // kind line exactly rather than with a substring. `has_name` matches a
+        // metadata (or roleRef) name line exactly, so `ravel-operator` does not
+        // also match `ravel-operator-secrets`.
+        let docs: Vec<&str> = manifest.split("\n---").collect();
+        let kind_is =
+            |doc: &str, kind: &str| doc.lines().any(|l| l.trim() == format!("kind: {kind}"));
+        let has_name =
+            |doc: &str, name: &str| doc.lines().any(|l| l.trim() == format!("name: {name}"));
+
+        // No ClusterRoleBinding may bind the secrets ClusterRole cluster-wide.
+        for doc in &docs {
+            if kind_is(doc, "ClusterRoleBinding") {
+                assert!(
+                    !doc.contains("ravel-operator-secrets"),
+                    "the secrets read must never be bound cluster-wide by a \
+                     ClusterRoleBinding; bind it per namespace with a RoleBinding"
+                );
+            }
+        }
+
+        // The cluster-wide operator ClusterRole grants no secrets.
+        let main_cluster_role = docs
+            .iter()
+            .find(|d| kind_is(d, "ClusterRole") && has_name(d, "ravel-operator"))
+            .expect("rbac.yaml defines the ravel-operator ClusterRole");
+        assert!(
+            !main_cluster_role.contains("secrets"),
+            "the cluster-wide ravel-operator ClusterRole must not grant a secrets rule"
+        );
+
+        // The secrets read lives in its own ClusterRole, get only, bound per
+        // namespace by a RoleBinding (ravel-system ships one).
+        let secrets_cluster_role = docs
+            .iter()
+            .find(|d| kind_is(d, "ClusterRole") && has_name(d, "ravel-operator-secrets"))
+            .expect("rbac.yaml defines the ravel-operator-secrets ClusterRole");
+        assert!(
+            secrets_cluster_role.contains("secrets")
+                && secrets_cluster_role.contains("verbs: [\"get\"]"),
+            "the ravel-operator-secrets ClusterRole grants secrets get only"
+        );
+        let secrets_binding = docs
+            .iter()
+            .find(|d| kind_is(d, "RoleBinding") && d.contains("ravel-operator-secrets"))
+            .expect("a RoleBinding binds the secrets ClusterRole in a namespace");
+        assert!(
+            secrets_binding.contains("namespace: ravel-system"),
+            "the shipped secrets RoleBinding binds ravel-system, the operator's own namespace"
+        );
+    }
+
+    /// Does any `verbs:` list in the manifest grant `update`?
+    ///
+    /// Scans the comment-stripped `verbs:` lines and, when a `verbs:` line opens
+    /// a block sequence, its items, for a bare `update` token. Flow style
+    /// (`verbs: ["create", "update"]`) and block style (`- update`, quoted or
+    /// not) both count; a comment or a blank line inside a block sequence does
+    /// not end it. Nothing outside a verbs list is scanned, so a resource named
+    /// `updates` or the word in a comment cannot fail the caller's assertion for
+    /// the wrong reason.
+    fn verbs_grant_update(manifest: &str) -> bool {
+        let has_update = |text: &str| {
+            text.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|token| token == "update")
+        };
+        let mut in_verbs_block = false;
+        for raw in manifest.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if let Some(rest) = line.strip_prefix("verbs:") {
+                if has_update(rest) {
+                    return true;
+                }
+                // A `verbs:` key with nothing after it opens a block sequence
+                // whose items are the verbs.
+                in_verbs_block = rest.trim().is_empty();
+                continue;
+            }
+            if in_verbs_block && !line.is_empty() {
+                match line.strip_prefix("- ") {
+                    Some(item) if has_update(item) => return true,
+                    Some(_) => {}
+                    // The next key ends the sequence.
+                    None => in_verbs_block = false,
+                }
+            }
+        }
+        false
+    }
+
+    /// [`verbs_grant_update`] catches the `update` verb in both YAML spellings a
+    /// rules list can use, and reports nothing for an `update` outside a verbs
+    /// list. The block-style cases are the ones a quoted-substring check missed;
+    /// the negative cases are why the scan is narrowed to verbs lines instead of
+    /// running over every line in the file.
+    #[test]
+    fn the_update_verb_scan_covers_both_yaml_styles_and_nothing_else() {
+        // Flow style, the shape rbac.yaml ships.
+        assert!(verbs_grant_update("    verbs: [\"create\", \"update\"]\n"));
+        // Block style, quoted and unquoted.
+        assert!(verbs_grant_update(
+            "    verbs:\n      - create\n      - update\n      - delete\n"
+        ));
+        assert!(verbs_grant_update("    verbs:\n      - \"update\"\n"));
+        // A comment or a blank line inside the sequence does not end it.
+        assert!(verbs_grant_update(
+            "    verbs:\n      - create\n      # rationale\n\n      - update\n"
+        ));
+
+        // Narrowed: an `update` outside a verbs list is not a grant.
+        assert!(!verbs_grant_update("    resources: [\"updates\"]\n"));
+        assert!(!verbs_grant_update("    verbs: [\"get\"] # never update\n"));
+        assert!(!verbs_grant_update("    # verbs: [\"update\"]\n"));
+        assert!(!verbs_grant_update("    strategy: update\n"));
+        // The next key ends a block sequence, so a later value is out of scope.
+        assert!(!verbs_grant_update(
+            "    verbs:\n      - get\n    resources: [\"update\"]\n"
+        ));
+    }
+
+    /// Finding 1 verb sweep. Every operator write is server-side apply (a PATCH,
+    /// with `create` for objects that do not yet exist) or a delete, never a
+    /// PUT, so no rule grants the `update` verb. Each rule grants exactly the
+    /// verbs the reconcile loop calls (or that RBAC escalation prevention forces
+    /// for the router Role): the table below pins the exact verbs line for every
+    /// rule in rbac.yaml, so any verb change to any rule (a reintroduced dead
+    /// verb, a dropped read, a widened grant) fails the gate, not only the
+    /// batch/jobs rule. A rule's first element is the `apiGroups:` line
+    /// immediately above its identifying line, or `None` for a non-resource
+    /// rule (`nonResourceURLs:`), which carries the `- ` dash itself and has
+    /// no `apiGroups:` line at all.
+    #[test]
+    fn rbac_grants_only_the_verbs_the_reconcile_loop_calls() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/k8s/operator/rbac.yaml");
+        let manifest = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        // No rule anywhere grants `update`. The scan covers the verbs lines only
+        // (the same lines the count assertion below identifies) and their block
+        // sequence items, so a reformat of any rule to block style (`- update`,
+        // unquoted) cannot make it go quiet while an `update` anywhere else in
+        // the file cannot fail it for the wrong reason.
+        assert!(
+            !verbs_grant_update(&manifest),
+            "server-side apply is a PATCH, not a PUT: no rule may grant the update verb"
+        );
+
+        // Every rule's apiGroups/resources (or nonResourceURLs)/verbs lines, in
+        // rbac.yaml's fixed ordering: the identifying line uniquely identifies
+        // each rule, with its `apiGroups:` line immediately before (resource
+        // rules only) and its `verbs:` line immediately after.
+        let rules: &[(Option<&str>, &str, &str)] = &[
+            (
+                Some("- apiGroups: [\"apps\"]"),
+                "resources: [\"deployments\"]",
+                "verbs: [\"create\", \"patch\", \"get\", \"list\", \"watch\", \"delete\"]",
+            ),
+            (
+                Some("- apiGroups: [\"\"]"),
+                "resources: [\"services\"]",
+                "verbs: [\"create\", \"patch\", \"get\", \"list\", \"watch\", \"delete\"]",
+            ),
+            (
+                Some("- apiGroups: [\"networking.k8s.io\"]"),
+                "resources: [\"ingresses\"]",
+                "verbs: [\"create\", \"patch\", \"list\", \"watch\", \"delete\"]",
+            ),
+            (
+                Some("- apiGroups: [\"gateway.networking.k8s.io\"]"),
+                "resources: [\"httproutes\", \"grpcroutes\"]",
+                "verbs: [\"create\", \"patch\", \"delete\"]",
+            ),
+            (
+                Some("- apiGroups: [\"\"]"),
+                "resources: [\"serviceaccounts\"]",
+                "verbs: [\"create\", \"patch\", \"delete\"]",
+            ),
+            (
+                Some("- apiGroups: [\"rbac.authorization.k8s.io\"]"),
+                "resources: [\"roles\", \"rolebindings\"]",
+                "verbs: [\"create\", \"patch\", \"delete\"]",
+            ),
+            (
+                Some("- apiGroups: [\"discovery.k8s.io\"]"),
+                "resources: [\"endpointslices\"]",
+                "verbs: [\"get\", \"list\", \"watch\"]",
+            ),
+            (
+                Some("- apiGroups: [\"ravel.nofire.ai\"]"),
+                "resources: [\"ravelclusters\"]",
+                "verbs: [\"list\", \"watch\"]",
+            ),
+            (
+                Some("- apiGroups: [\"ravel.nofire.ai\"]"),
+                "resources: [\"ravelclusters/status\"]",
+                "verbs: [\"patch\"]",
+            ),
+            (
+                Some("- apiGroups: [\"policy\"]"),
+                "resources: [\"poddisruptionbudgets\"]",
+                "verbs: [\"create\", \"patch\", \"delete\"]",
+            ),
+            (
+                Some("- apiGroups: [\"batch\"]"),
+                "resources: [\"jobs\"]",
+                "verbs: [\"create\", \"patch\", \"get\", \"delete\"]",
+            ),
+            (
+                // /version detection (issue #1714): a non-resource rule, so it
+                // carries its own `- ` dash and has no apiGroups line above it.
+                None,
+                "- nonResourceURLs: [\"/version\"]",
+                "verbs: [\"get\"]",
+            ),
+            (
+                Some("- apiGroups: [\"\"]"),
+                "resources: [\"secrets\"]",
+                "verbs: [\"get\"]",
+            ),
+        ];
+
+        let lines: Vec<&str> = manifest.lines().map(str::trim).collect();
+
+        // Exhaustiveness: the table must pin every rule in the manifest. Count the
+        // `verbs:` lines and require the table length to match, so a fourteenth
+        // rule cannot be added without a matching table row.
+        let verbs_lines = lines.iter().filter(|l| l.starts_with("verbs:")).count();
+        assert_eq!(
+            verbs_lines,
+            rules.len(),
+            "the table must pin every rule: rbac.yaml has {verbs_lines} verbs lines, \
+             the table has {} rows",
+            rules.len()
+        );
+
+        for rule in rules {
+            let (apigroups_line, identifying_line, expected_verbs) = *rule;
+            // The identifying line identifies the rule; assert it occurs exactly
+            // once so a duplicated line with wider verbs cannot hide behind the
+            // first match.
+            let occurrences = lines.iter().filter(|l| **l == identifying_line).count();
+            assert_eq!(
+                occurrences, 1,
+                "the {identifying_line} rule must appear exactly once"
+            );
+            let idx = lines
+                .iter()
+                .position(|l| *l == identifying_line)
+                .unwrap_or_else(|| panic!("rbac.yaml defines a rule for {identifying_line}"));
+            if let Some(apigroups_line) = apigroups_line {
+                assert_eq!(
+                    idx.checked_sub(1).and_then(|i| lines.get(i)).copied(),
+                    Some(apigroups_line),
+                    "the {identifying_line} rule must be under {apigroups_line}"
+                );
+            }
+            assert_eq!(
+                lines.get(idx + 1).copied(),
+                Some(expected_verbs),
+                "the {identifying_line} rule must grant exactly {expected_verbs}"
+            );
+        }
+
+        // The `/version` rule (issue #1714) carries no `apiGroups:` line to pin
+        // it under, since it is a non-resource rule; anchor it between the two
+        // ClusterRole headers instead, so it cannot silently drift into
+        // `ravel-operator-secrets` (which must stay `secrets get` only).
+        fn cluster_role_header_index(lines: &[&str], name: &str) -> usize {
+            let target = format!("name: {name}");
+            lines
+                .windows(3)
+                .position(|w| w[0] == "kind: ClusterRole" && w[2] == target)
+                .unwrap_or_else(|| panic!("rbac.yaml defines a ClusterRole named {name}"))
+        }
+        let operator_role_idx = cluster_role_header_index(&lines, "ravel-operator");
+        let secrets_role_idx = cluster_role_header_index(&lines, "ravel-operator-secrets");
+        let version_idx = lines
+            .iter()
+            .position(|l| *l == "- nonResourceURLs: [\"/version\"]")
+            .expect("rbac.yaml defines the /version rule");
+        assert!(
+            operator_role_idx < version_idx && version_idx < secrets_role_idx,
+            "the /version grant must live in the ravel-operator ClusterRole, \
+             before the ravel-operator-secrets ClusterRole"
+        );
+    }
+
+    /// A job condition of the given type/status, the shape
+    /// [`qualify_job_phase`] reads.
+    fn job_with_condition(type_: &str, status: &str, message: Option<&str>) -> Job {
+        use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};
+        Job {
+            status: Some(JobStatus {
+                conditions: Some(vec![JobCondition {
+                    type_: type_.to_string(),
+                    status: status.to_string(),
+                    message: message.map(str::to_string),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A Job reporting `Failed=True` with the given `reason` and `message`, the
+    /// shape the Kubernetes Job controller sets when it fails a Job (a
+    /// deadline-exceeded Job carries reason `DeadlineExceeded`).
+    fn job_with_failed_reason(reason: &str, message: Option<&str>) -> Job {
+        use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};
+        Job {
+            status: Some(JobStatus {
+                conditions: Some(vec![JobCondition {
+                    type_: "Failed".to_string(),
+                    status: "True".to_string(),
+                    reason: Some(reason.to_string()),
+                    message: message.map(str::to_string),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The input hash is stable for one spec and changes for each of the five
+    /// inputs it covers, and only those. Pins the exact set of fields that
+    /// re-trigger qualification (issue #36): a change to any of them is a
+    /// different store to prove, an unrelated change is not.
+    #[test]
+    fn qualify_input_hash_tracks_exactly_the_qualified_inputs() {
+        let spec = base_spec();
+        let base = qualify_job_input_hash(&spec, Some("rv-1"));
+        assert_eq!(
+            base,
+            qualify_job_input_hash(&spec, Some("rv-1")),
+            "the hash is deterministic for one spec and resourceVersion"
+        );
+
+        let mut bucket = spec.clone();
+        bucket.storage.s3.bucket = "other-bucket".to_string();
+        let mut region = spec.clone();
+        region.storage.s3.region = "us-east-1".to_string();
+        let mut endpoint = spec.clone();
+        endpoint.storage.s3.endpoint = Some("http://other:9000".to_string());
+        let mut image = spec.clone();
+        image.image = "registry.example/ravel:v2".to_string();
+        let mut creds = spec.clone();
+        creds.storage.s3.credentials_secret_ref.name = "other-s3".to_string();
+        for (label, changed) in [
+            ("bucket", &bucket),
+            ("region", &region),
+            ("endpoint", &endpoint),
+            ("image", &image),
+            ("credentials secret", &creds),
+        ] {
+            assert_ne!(
+                base,
+                qualify_job_input_hash(changed, Some("rv-1")),
+                "a change to {label} re-triggers qualification"
+            );
+        }
+
+        // A fixed-name credential rotation (same Secret name, new
+        // resourceVersion) is a different credential and must re-trigger
+        // qualification, even though every spec field is unchanged.
+        assert_ne!(
+            base,
+            qualify_job_input_hash(&spec, Some("rv-2")),
+            "a new credentials resourceVersion (rotation in place) re-qualifies"
+        );
+
+        // A field qualification does not depend on leaves the hash unchanged, so
+        // an unrelated spec edit does not re-run qualification.
+        let mut replicas = spec.clone();
+        replicas.gateway.replicas = spec.gateway.replicas + 5;
+        assert_eq!(
+            base,
+            qualify_job_input_hash(&replicas, Some("rv-1")),
+            "an unrelated spec edit (replica count) does not re-qualify"
+        );
+
+        // Endpoint presence is significant (finding 3): endpoint: null and
+        // endpoint: "" emit a different qualify Job and run the servers against a
+        // different store (the flag/env is omitted only for None), so the two must
+        // hash differently. as_deref().unwrap_or("") fed the hasher "" for both.
+        let mut endpoint_none = spec.clone();
+        endpoint_none.storage.s3.endpoint = None;
+        let mut endpoint_empty = spec.clone();
+        endpoint_empty.storage.s3.endpoint = Some(String::new());
+        assert_ne!(
+            qualify_job_input_hash(&endpoint_none, Some("rv-1")),
+            qualify_job_input_hash(&endpoint_empty, Some("rv-1")),
+            "endpoint: null and endpoint: \"\" are different stores and must hash differently"
+        );
+
+        // Credentials resourceVersion presence is significant the same way
+        // (finding 3): an unresolved Secret (None) and a resolved empty
+        // resourceVersion (Some("")) are different states, so they must hash
+        // differently. unwrap_or("") fed the hasher "" for both.
+        assert_ne!(
+            qualify_job_input_hash(&spec, None),
+            qualify_job_input_hash(&spec, Some("")),
+            "credentials resourceVersion None and Some(\"\") are different states and \
+             must hash differently"
+        );
+    }
+
+    /// The rendered qualify Job: name, image, command/args, credentials, the
+    /// spec-hash annotation, and the one-shot execution shape. Exact values, so
+    /// the Job the operator applies is pinned (issue #36).
+    #[test]
+    fn qualify_job_renders_a_one_shot_store_qualify() {
+        let spec = base_spec();
+        let job = desired_qualify_job(&spec, "prod", Some("rv-1"));
+
+        assert_eq!(job.metadata.name.as_deref(), Some("prod-qualify"));
+        assert_eq!(
+            job.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(QUALIFY_SPEC_HASH_ANNOTATION))
+                .map(String::as_str),
+            Some(qualify_job_input_hash(&spec, Some("rv-1")).as_str()),
+            "the annotation records the input hash so a change re-runs the Job"
+        );
+
+        let job_spec = job.spec.as_ref().expect("qualify Job has a spec");
+        assert_eq!(job_spec.backoff_limit, Some(QUALIFY_JOB_BACKOFF_LIMIT));
+        assert_eq!(
+            job_spec.ttl_seconds_after_finished,
+            Some(QUALIFY_JOB_TTL_SECONDS)
+        );
+        let pod = job_spec
+            .template
+            .spec
+            .as_ref()
+            .expect("qualify Job has a pod spec");
+        assert_eq!(pod.restart_policy.as_deref(), Some("Never"));
+        assert_eq!(pod.containers.len(), 1, "one qualify container");
+        let container = &pod.containers[0];
+        assert_eq!(
+            container.image.as_deref(),
+            Some("registry.example/ravel:v1")
+        );
+        assert_eq!(
+            container.command.as_deref(),
+            Some(["/usr/local/bin/ravel-cli".to_string()].as_slice())
+        );
+        assert_eq!(
+            container.args.as_deref(),
+            Some(
+                [
+                    "--store".to_string(),
+                    "s3".to_string(),
+                    "store".to_string(),
+                    "qualify".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+        let env = container.env.as_ref().expect("qualify container has env");
+        let env_value = |name: &str| {
+            env.iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value.clone())
+        };
+        assert_eq!(env_value("RAVEL_S3_BUCKET").as_deref(), Some("ravel-data"));
+        assert_eq!(env_value("RAVEL_S3_REGION").as_deref(), Some("eu-west-1"));
+        assert_eq!(
+            env_value("RAVEL_S3_ENDPOINT").as_deref(),
+            Some("http://minio:9000")
+        );
+        // Credentials come from the shared Secret via secretKeyRef, never a
+        // literal value in the pod spec.
+        let access = env
+            .iter()
+            .find(|e| e.name == "RAVEL_S3_ACCESS_KEY")
+            .expect("access key env present");
+        assert!(access.value.is_none(), "the access key is never a literal");
+        assert_eq!(
+            access
+                .value_from
+                .as_ref()
+                .and_then(|s| s.secret_key_ref.as_ref())
+                .map(|r| (r.name.as_str(), r.key.as_str())),
+            Some(("ravel-s3", S3_ACCESS_KEY_ID_KEY)),
+        );
+    }
+
+    /// `qualify_job_phase` reads the Job's terminal condition: `Complete=True`
+    /// is success, `Failed=True` carries its message, nothing terminal is still
+    /// running.
+    #[test]
+    fn qualify_job_phase_reads_the_terminal_condition() {
+        assert_eq!(
+            qualify_job_phase(&Job::default()),
+            QualifyJobPhase::Running,
+            "a Job with no status is still running"
+        );
+        assert_eq!(
+            qualify_job_phase(&job_with_condition("Complete", "True", None)),
+            QualifyJobPhase::Succeeded
+        );
+        assert_eq!(
+            qualify_job_phase(&job_with_condition(
+                "Failed",
+                "True",
+                Some("backend rejected CAS")
+            )),
+            QualifyJobPhase::Failed("backend rejected CAS".to_string()),
+            "the failure carries the Job's own terminal message"
+        );
+        // A condition that is not True does not count as terminal.
+        assert_eq!(
+            qualify_job_phase(&job_with_condition("Failed", "False", None)),
+            QualifyJobPhase::Running
+        );
+    }
+
+    /// The rendered qualify Job sets `activeDeadlineSeconds` to the chosen value,
+    /// so a hung attempt (an endpoint that accepts the connection and never
+    /// answers) becomes a `Failed` Job rather than running forever. `backoffLimit`
+    /// bounds only failed attempts, not one attempt that never terminates.
+    #[test]
+    fn qualify_job_bounds_a_hung_attempt() {
+        let spec = base_spec();
+        let job = desired_qualify_job(&spec, "prod", None);
+        let job_spec = job.spec.as_ref().expect("qualify Job has a spec");
+        assert_eq!(
+            job_spec.active_deadline_seconds,
+            Some(QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS),
+            "the qualify Job bounds its total active time with activeDeadlineSeconds"
+        );
+        assert_eq!(
+            job_spec.backoff_limit,
+            Some(QUALIFY_JOB_BACKOFF_LIMIT),
+            "the qualify Job caps its retries with backoffLimit"
+        );
+        // activeDeadlineSeconds is Job-wide (summed across every retry) and takes
+        // precedence over backoffLimit, so the deadline must fit the intended
+        // attempts end to end: 700 s per attempt (560 s of ops + ~140 s pod
+        // scheduling/pull) * (backoffLimit + 1) attempts.
+        assert_eq!(
+            QUALIFY_JOB_BACKOFF_LIMIT, 1,
+            "one retry (two attempts total)"
+        );
+        assert_eq!(
+            QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS, 1400,
+            "the Job-wide deadline is 1400 s = 700 s per attempt * 2 attempts, so a \
+             slow-but-healthy first attempt plus one full retry both fit before it fires"
+        );
+        assert_eq!(
+            QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS,
+            700 * i64::from(QUALIFY_JOB_BACKOFF_LIMIT + 1),
+            "the deadline and the backoff limit are sized together"
+        );
+    }
+
+    /// A Job the Kubernetes Job controller failed for exceeding its
+    /// `activeDeadlineSeconds` reports `Failed=True` with reason
+    /// `DeadlineExceeded`. That reads as [`QualificationDecision::Failed`] (which
+    /// the controller renders as `StoreQualified=False`), and its message names
+    /// the reason exactly so an operator sees why qualification did not finish.
+    #[test]
+    fn a_deadline_exceeded_job_reads_as_failed_with_its_reason() {
+        let job = job_with_failed_reason(
+            "DeadlineExceeded",
+            Some("Job was active longer than specified deadline"),
+        );
+        let phase = qualify_job_phase(&job);
+        let message = match &phase {
+            QualifyJobPhase::Failed(message) => message.clone(),
+            other => panic!("a Failed=True Job reads as Failed, got {other:?}"),
+        };
+        assert!(
+            message.contains("DeadlineExceeded"),
+            "the failure message names the DeadlineExceeded reason exactly: {message:?}"
+        );
+
+        // The gate reports a Present Job for the current inputs in the Failed
+        // phase as Failed, carrying that message; the controller turns Failed
+        // into StoreQualified=False with STORE_QUALIFIED_FAILED_REASON.
+        let decision = qualification_decision(
+            "h",
+            None,
+            &QualifyJobObservation::Present {
+                spec_hash: Some("h".to_string()),
+                phase,
+            },
+        );
+        assert_eq!(decision, QualificationDecision::Failed(message));
+    }
+
+    /// The `activeDeadlineSeconds` and `backoffLimit` are tuning knobs, not
+    /// store-identity inputs: [`qualify_job_input_hash`] covers exactly the
+    /// bucket, region, endpoint, image, credentials Secret name, and credentials
+    /// `resourceVersion`, and never either knob, so tuning them leaves the hash
+    /// equal and does not re-run a qualification that already passed.
+    #[test]
+    fn the_deadline_is_not_part_of_the_qualified_input_hash() {
+        let spec = base_spec();
+
+        // Recompute the hash over exactly the six qualified inputs, deliberately
+        // excluding both knobs, through the same `blake3_hex` composition the
+        // production hasher uses. If it folded either knob in, this reference
+        // would diverge and the assertion would fail.
+        let endpoint = match spec.storage.s3.endpoint.as_deref() {
+            Some(value) => format!("\u{1}{value}"),
+            None => "\u{0}".to_string(),
+        };
+        let credentials_rv = format!("\u{1}{}", "rv-1");
+        let expected = blake3_hex(&[
+            spec.storage.s3.bucket.as_str(),
+            spec.storage.s3.region.as_str(),
+            endpoint.as_str(),
+            spec.image.as_str(),
+            spec.storage.s3.credentials_secret_ref.name.as_str(),
+            credentials_rv.as_str(),
+        ]);
+
+        assert_eq!(
+            qualify_job_input_hash(&spec, Some("rv-1")),
+            expected,
+            "the qualified-input hash covers exactly the six store-identity inputs, never the \
+             deadline or the backoff limit"
+        );
+    }
+
+    /// Golden value for [`blake3_hex`] (finding 3): a fixed input set hashes to
+    /// a fixed literal. This pins the algorithm (blake3), the `0xff` field
+    /// separator, and the lowercase-hex rendering by construction, so a future
+    /// change to any of them fails here instead of silently re-running
+    /// qualification and rolling every tier Deployment on a toolchain upgrade.
+    #[test]
+    fn blake3_hex_golden_is_stable_by_construction() {
+        assert_eq!(
+            blake3_hex(&["field-a", "field-b", "field-c"]),
+            "cef8162179abe2fd9467777a9e0957f18af3abff59960b15b0210ee312836274",
+        );
+        // The `0xff` separator makes the field split significant: no other
+        // grouping of the same bytes collides.
+        assert_ne!(
+            blake3_hex(&["field-a", "field-b", "field-c"]),
+            blake3_hex(&["field-afield-b", "field-c"]),
+        );
+    }
+
+    /// Golden value for [`secrets_checksum`] (finding 3): a fixed set of
+    /// resourceVersions hashes to a fixed literal, so a toolchain upgrade that
+    /// changed the algorithm would fail here rather than roll every tier's pods.
+    #[test]
+    fn secrets_checksum_golden_is_stable_by_construction() {
+        // This literal pins the all-`Some` four-field case: #1487 added the
+        // audit-token-key resourceVersion as a 4th field, folded in only
+        // when it is `Some`. A `None` audit-token-key composes exactly the
+        // pre-#1487 three fields instead (see
+        // `gateway_and_maintain_checksums_are_unchanged_when_no_audit_key_is_set`),
+        // so this literal is unaffected by that case and did not need to
+        // change from what #1487 originally pinned here.
+        assert_eq!(
+            secrets_checksum(Some("100"), Some("200"), Some("300"), Some("400")),
+            "35396940142d0f2998ba074acda24baf7f660d6e4b300d74f4e828d4707f3168",
+        );
+    }
+
+    /// Golden value for [`qualify_job_input_hash`] (finding 3): the six
+    /// store-identity inputs of [`base_spec`] plus a fixed credentials
+    /// `resourceVersion` hash to a fixed literal, stable by construction across
+    /// Rust releases. The literal changed when the endpoint slot gained a
+    /// presence byte (0x01 before a Some value) so endpoint: null and
+    /// endpoint: "" no longer collide, and again when the credentials
+    /// `resourceVersion` slot gained the same presence byte so an unresolved
+    /// Secret (None) and a resolved empty version (Some("")) no longer collide.
+    #[test]
+    fn qualify_job_input_hash_golden_is_stable_by_construction() {
+        assert_eq!(
+            qualify_job_input_hash(&base_spec(), Some("rv-golden")),
+            "9dbbf674caab21157d312101c70e8d6947f8d86b14d075910a1e02779d7610fd",
+        );
+    }
+
+    /// The qualify retry backoff is a capped exponential for the first
+    /// [`QUALIFY_RETRY_TERMINAL_THRESHOLD`] - 1 consecutive failures and the
+    /// terminal cooldown at or past the threshold (issue #36, finding 3). The
+    /// exact per-failure sequence is asserted, not a monotonicity band.
+    #[test]
+    fn qualify_retry_backoff_sequence_is_exact() {
+        let sequence: Vec<i64> = (1..=7).map(qualify_retry_backoff_seconds).collect();
+        assert_eq!(sequence, vec![30, 60, 120, 240, 480, 3600, 3600]);
+        // The ceiling caps the exponential region: the fifth failure is 480, the
+        // sixth crosses into the cooldown, never a doubled 960.
+        assert_eq!(
+            qualify_retry_backoff_seconds(5),
+            QUALIFY_RETRY_CEILING_SECONDS
+        );
+        assert_eq!(
+            qualify_retry_backoff_seconds(QUALIFY_RETRY_TERMINAL_THRESHOLD),
+            QUALIFY_RETRY_COOLDOWN_SECONDS
+        );
+    }
+
+    /// A newly-observed failure (no backoff scheduled) is counted exactly once,
+    /// schedules the next retry at `now + backoff(count)`, keeps the Failed Job in
+    /// place (no Job mutation), and requeues at the backoff. A second pass still
+    /// inside the window does not re-count.
+    #[test]
+    fn plan_first_failure_counts_once_and_schedules_backoff() {
+        let msg = "backend rejected CAS".to_string();
+        let first = plan_qualify_gate(
+            &QualificationDecision::Failed(msg.clone()),
+            "h",
+            Some("h"),
+            0,
+            None,
+            1_000,
+            10,
+        );
+        assert_eq!(first.action, QualifyJobAction::None);
+        assert_eq!(first.reason, QualifyStoreReason::Failed);
+        assert_eq!(first.failure_count, Some(1));
+        assert_eq!(first.next_retry_unix, Some(1_030));
+        assert_eq!(first.requeue_seconds, 30);
+        assert_eq!(first.job_message.as_deref(), Some("backend rejected CAS"));
+
+        // Still holding at count 1: no re-count, requeue shrinks to time remaining.
+        let holding = plan_qualify_gate(
+            &QualificationDecision::Failed(msg),
+            "h",
+            Some("h"),
+            1,
+            Some(1_030),
+            1_020,
+            10,
+        );
+        assert_eq!(holding.action, QualifyJobAction::None);
+        assert_eq!(holding.failure_count, Some(1));
+        assert_eq!(holding.next_retry_unix, Some(1_030));
+        assert_eq!(holding.requeue_seconds, 10);
+    }
+
+    /// Once the backoff elapses, the Failed Job is deleted (foreground) so a later
+    /// pass sees it Absent and recreates it; `next_retry_unix` is NOT cleared on
+    /// the delete, so a Job lingering under foreground deletion is not counted a
+    /// second time. The Absent recreation then creates the Job and clears
+    /// `next_retry_unix`, keeping the count.
+    #[test]
+    fn plan_recreates_after_backoff_without_double_counting() {
+        let msg = "still failing".to_string();
+        // Backoff elapsed with the Failed Job still present: delete it, keep the
+        // retry state so the recreation is not re-counted.
+        let deleting = plan_qualify_gate(
+            &QualificationDecision::Failed(msg),
+            "h",
+            Some("h"),
+            2,
+            Some(1_030),
+            1_030,
+            10,
+        );
+        assert_eq!(deleting.action, QualifyJobAction::DeleteStale);
+        assert_eq!(deleting.failure_count, Some(2));
+        assert_eq!(deleting.next_retry_unix, Some(1_030));
+
+        // Next pass, Job Absent, backoff elapsed: create and clear next_retry so the
+        // new attempt's failure counts afresh; count is kept, reason stays Failed.
+        let creating = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            "h",
+            Some("h"),
+            2,
+            Some(1_030),
+            1_030,
+            10,
+        );
+        assert_eq!(creating.action, QualifyJobAction::Create);
+        assert_eq!(creating.reason, QualifyStoreReason::Failed);
+        assert_eq!(creating.failure_count, Some(2));
+        assert_eq!(creating.next_retry_unix, None);
+        assert_eq!(creating.requeue_seconds, 10);
+    }
+
+    /// At the terminal threshold the gate holds in the cooldown: it creates NO Job
+    /// before the cooldown expires and DOES recreate one at (and after) expiry. The
+    /// hold is expressed on both the Failed-present and Absent arms.
+    #[test]
+    fn plan_terminal_hold_blocks_recreation_until_cooldown_expiry() {
+        let due = 1_000 + QUALIFY_RETRY_COOLDOWN_SECONDS;
+
+        // Failed Job present, before expiry: no mutation.
+        let held_present = plan_qualify_gate(
+            &QualificationDecision::Failed("terminal".to_string()),
+            "h",
+            Some("h"),
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            1_000,
+            10,
+        );
+        assert_eq!(held_present.action, QualifyJobAction::None);
+
+        // Job Absent, before expiry: still no Create.
+        let held_absent = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            "h",
+            Some("h"),
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            due - 1,
+            10,
+        );
+        assert_eq!(held_absent.action, QualifyJobAction::None);
+        assert_eq!(held_absent.reason, QualifyStoreReason::Failed);
+
+        // Job Absent, at expiry: recreate.
+        let released = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            "h",
+            Some("h"),
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            due,
+            10,
+        );
+        assert_eq!(released.action, QualifyJobAction::Create);
+    }
+
+    /// An input change during any hold (a `recreate: true` decision, meaning a Job
+    /// for stale inputs is present) resets the retry budget and deletes the stale
+    /// Job at once: `failure_count` and `next_retry_unix` are cleared, so the next
+    /// pass creates a fresh Job immediately rather than waiting out the cooldown.
+    #[test]
+    fn plan_input_change_resets_count_and_recreates_at_once() {
+        let due = 1_000 + QUALIFY_RETRY_COOLDOWN_SECONDS;
+        let reset = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: true },
+            "h",
+            Some("h"),
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            1_000,
+            10,
+        );
+        assert_eq!(reset.action, QualifyJobAction::DeleteStale);
+        assert_eq!(reset.reason, QualifyStoreReason::Pending);
+        assert_eq!(reset.failure_count, None);
+        assert_eq!(reset.next_retry_unix, None);
+
+        // Next pass sees the fresh inputs' Job Absent with a zero count: create now.
+        let fresh = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            "h",
+            Some("h"),
+            0,
+            None,
+            1_000,
+            10,
+        );
+        assert_eq!(fresh.action, QualifyJobAction::Create);
+        assert_eq!(fresh.reason, QualifyStoreReason::Pending);
+        assert_eq!(fresh.failure_count, None);
+        assert_eq!(fresh.requeue_seconds, 10);
+    }
+
+    /// An input change observed AFTER the Failed Job's TTL collected it (the Job is
+    /// Absent, so the decision is `Qualify { recreate: false }` for a changed and an
+    /// unchanged hash alike) still resets and qualifies at once (issue #36): the
+    /// desired hash no longer matches the hash the failures were recorded against,
+    /// so the terminal cooldown is dropped, a Job is created this pass, and the
+    /// persisted retry state is cleared. Without the recorded-hash comparison this
+    /// pass would hold out the remaining cooldown and inherit the old count.
+    #[test]
+    fn plan_absent_changed_hash_qualifies_at_once() {
+        let due = 1_000 + QUALIFY_RETRY_COOLDOWN_SECONDS;
+        let changed = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            "new",
+            Some("old"),
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            1_000,
+            10,
+        );
+        assert_eq!(changed.action, QualifyJobAction::Create);
+        assert_eq!(changed.reason, QualifyStoreReason::Pending);
+        assert_eq!(changed.failure_count, None);
+        assert_eq!(changed.next_retry_unix, None);
+        assert_eq!(changed.retry_hash, None);
+        assert_eq!(changed.requeue_seconds, 10);
+    }
+
+    /// The converse of the reset (issue #36): with the Job Absent, the desired hash
+    /// still equal to the recorded retry hash, and the cooldown not yet expired, the
+    /// plan holds exactly as before. The count is kept, no Job is created, and the
+    /// requeue is the exact time remaining. This is the case the recorded-hash
+    /// comparison must NOT flip.
+    #[test]
+    fn plan_absent_unchanged_hash_holds_in_cooldown() {
+        let due = 1_000 + QUALIFY_RETRY_COOLDOWN_SECONDS;
+        let held = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            "same",
+            Some("same"),
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            1_000,
+            10,
+        );
+        assert_eq!(held.action, QualifyJobAction::None);
+        assert_eq!(held.reason, QualifyStoreReason::Failed);
+        assert_eq!(held.failure_count, Some(QUALIFY_RETRY_TERMINAL_THRESHOLD));
+        assert_eq!(held.next_retry_unix, Some(due));
+        assert_eq!(held.retry_hash.as_deref(), Some("same"));
+        assert_eq!(held.requeue_seconds, due - 1_000);
+    }
+
+    /// A newly-observed failure records the desired hash as the retry key alongside
+    /// the count (issue #36), so a later pass can compare against it once the Job is
+    /// gone. The key is the desired hash, not the (absent) prior one.
+    #[test]
+    fn plan_first_failure_records_retry_hash() {
+        let first = plan_qualify_gate(
+            &QualificationDecision::Failed("boom".to_string()),
+            "desired",
+            None,
+            0,
+            None,
+            1_000,
+            10,
+        );
+        assert_eq!(first.failure_count, Some(1));
+        assert_eq!(first.retry_hash.as_deref(), Some("desired"));
+    }
+
+    /// The persisted retry bookkeeping (failure count, next-retry time) is NOT part
+    /// of the qualified-input hash (issue #36, finding 3): the hash is recomputed
+    /// here over exactly the store-identity inputs, so folding either retry field
+    /// into it would diverge from this reconstruction and fail the test. Keeping
+    /// them out is what lets a retry converge instead of reading every backoff pass
+    /// as a new input.
+    #[test]
+    fn qualify_input_hash_excludes_retry_state() {
+        let spec = base_spec();
+        let endpoint = match spec.storage.s3.endpoint.as_deref() {
+            Some(value) => format!("\u{1}{value}"),
+            None => "\u{0}".to_string(),
+        };
+        let credentials_rv = format!("\u{1}{}", "rv");
+        let expected = blake3_hex(&[
+            spec.storage.s3.bucket.as_str(),
+            spec.storage.s3.region.as_str(),
+            endpoint.as_str(),
+            spec.image.as_str(),
+            spec.storage.s3.credentials_secret_ref.name.as_str(),
+            credentials_rv.as_str(),
+        ]);
+        assert_eq!(qualify_job_input_hash(&spec, Some("rv")), expected);
+    }
+
+    /// A cluster already qualified for the current inputs proceeds without
+    /// re-running qualification, whatever the live Job says -- even absent
+    /// (TTL-garbage-collected). This is what keeps qualification from re-running
+    /// on a schedule.
+    #[test]
+    fn qualified_inputs_proceed_without_rerunning() {
+        let hash = "abc123".to_string();
+        for observation in [
+            QualifyJobObservation::Absent,
+            QualifyJobObservation::Present {
+                spec_hash: Some(hash.clone()),
+                phase: QualifyJobPhase::Succeeded,
+            },
+        ] {
+            assert_eq!(
+                qualification_decision(&hash, Some(&hash), &observation),
+                QualificationDecision::Proceed,
+                "recorded qualified inputs short-circuit to Proceed"
+            );
+        }
+    }
+
+    /// A fresh cluster (nothing qualified, no Job) creates the qualify Job
+    /// without recreating anything, and holds serving until it completes.
+    #[test]
+    fn fresh_cluster_creates_the_qualify_job() {
+        assert_eq!(
+            qualification_decision("h", None, &QualifyJobObservation::Absent),
+            QualificationDecision::Qualify { recreate: false },
+        );
+    }
+
+    /// A running Job for the current inputs holds serving; a completed one lets
+    /// it proceed; a failed one surfaces the Job's message and stays held.
+    #[test]
+    fn matching_job_reports_its_progress() {
+        let present = |phase| QualifyJobObservation::Present {
+            spec_hash: Some("h".to_string()),
+            phase,
+        };
+        assert_eq!(
+            qualification_decision("h", None, &present(QualifyJobPhase::Running)),
+            QualificationDecision::Waiting,
+        );
+        assert_eq!(
+            qualification_decision("h", None, &present(QualifyJobPhase::Succeeded)),
+            QualificationDecision::Proceed,
+        );
+        assert_eq!(
+            qualification_decision(
+                "h",
+                None,
+                &present(QualifyJobPhase::Failed("boom".to_string()))
+            ),
+            QualificationDecision::Failed("boom".to_string()),
+        );
+    }
+
+    /// When the inputs change on an already-qualified cluster, a Job for the old
+    /// inputs (or one missing the annotation) is recreated, not read as the
+    /// current one. The old qualified hash does not short-circuit because it no
+    /// longer equals the desired hash.
+    #[test]
+    fn changed_inputs_recreate_a_stale_job() {
+        let stale = QualifyJobObservation::Present {
+            spec_hash: Some("old".to_string()),
+            phase: QualifyJobPhase::Succeeded,
+        };
+        assert_eq!(
+            qualification_decision("new", Some("old"), &stale),
+            QualificationDecision::Qualify { recreate: true },
+        );
+        // A Job with no recorded hash is also stale against any desired hash.
+        let unannotated = QualifyJobObservation::Present {
+            spec_hash: None,
+            phase: QualifyJobPhase::Succeeded,
+        };
+        assert_eq!(
+            qualification_decision("new", Some("old"), &unannotated),
+            QualificationDecision::Qualify { recreate: true },
+        );
+    }
+
+    /// Fixed-name credential rotation (issue #36): the credentials Secret keeps
+    /// its name but its content is rotated in place, so its `resourceVersion`
+    /// bumps. The qualified-input hash changes, so an already-qualified cluster
+    /// whose last Job succeeded is driven back to `Qualify { recreate: true }`
+    /// (the controller renders `StoreQualified=Pending` and recreates the Job).
+    /// The converse: an unchanged `resourceVersion` yields the same hash and
+    /// `Proceed`, so a steady-state reconcile never re-runs qualification.
+    #[test]
+    fn fixed_name_credential_rotation_re_qualifies() {
+        let spec = base_spec();
+        let before = qualify_job_input_hash(&spec, Some("rv-1"));
+        let after = qualify_job_input_hash(&spec, Some("rv-2"));
+        assert_ne!(
+            before, after,
+            "a rotated credentials Secret (new resourceVersion) is a new qualified input"
+        );
+
+        // Rotation: the durable qualified hash is the pre-rotation one, the
+        // desired hash is the post-rotation one, and the live Job (if not yet
+        // GC'd) still carries the pre-rotation hash and succeeded.
+        let rotated = qualification_decision(
+            &after,
+            Some(&before),
+            &QualifyJobObservation::Present {
+                spec_hash: Some(before.clone()),
+                phase: QualifyJobPhase::Succeeded,
+            },
+        );
+        assert_eq!(
+            rotated,
+            QualificationDecision::Qualify { recreate: true },
+            "a fixed-name rotation must recreate the Job and flip StoreQualified to Pending"
+        );
+        // Even after the prior Job's TTL GC (Absent) a rotation re-runs.
+        assert_eq!(
+            qualification_decision(&after, Some(&before), &QualifyJobObservation::Absent),
+            QualificationDecision::Qualify { recreate: false },
+            "a rotation after TTL GC creates a fresh Job"
+        );
+
+        // Converse: same resourceVersion, same hash, no re-run.
+        assert_eq!(
+            qualification_decision(
+                &before,
+                Some(&before),
+                &QualifyJobObservation::Present {
+                    spec_hash: Some(before.clone()),
+                    phase: QualifyJobPhase::Succeeded,
+                },
+            ),
+            QualificationDecision::Proceed,
+            "an unchanged resourceVersion must not re-run qualification"
+        );
     }
 }

@@ -32,6 +32,17 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Workflow-level permissions floor (issue #1717). Every job here checks out the
+# tree and then runs cargo, which runs a dependency build script for each
+# crate in the graph with this token in the environment. `contents: read` is
+# all any of them needs; none files an issue, pushes a package or writes a
+# release. Every checkout carries `persist-credentials: false` for the same
+# reason from the other side: no job here runs git against the remote after
+# checking out, so the token must not sit in .git/config where that
+# build-script code could read it.
+permissions:
+  contents: read
+
 jobs:
   # Mirrors ci.yml's k8s-build. See that job's own comments for the full
   # rationale (ADR-0034 decision 7, ADR-0053 D5); this copy omits
@@ -47,6 +58,8 @@ jobs:
       RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
@@ -94,6 +107,8 @@ jobs:
       RAVEL_KIND_CLUSTER: ravel-ci
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Download the assembled images
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -164,3 +179,60 @@ jobs:
       - name: Delete the kind cluster
         if: always()
         run: scripts/kind-down.sh
+
+  # ADR-0077 section 4's process-kill chaos-evidence lane. Deliberately not part
+  # of ravel-sim and not run in PR CI (it needs a real MinIO, real binaries, a
+  # real multi-threaded runtime, a real clock, and a real `kill -9`); this
+  # nightly workflow is its home. Both scenarios carry the release-blocking
+  # exit-code contract they declare themselves: scenario 1 exits nonzero on a
+  # strict-ack violation, scenario 2 exits 2 on any pinned-oracle failure (a
+  # release-blocking bug, not a flaky test). A nonzero exit from either script
+  # fails this job.
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Build the real binaries the chaos scripts drive and put them on PATH, so
+      # `ravel_server_cmd`/`ravel_cli` use the prebuilt binaries rather than a
+      # per-invocation `cargo run`.
+      - name: Build the release binaries the chaos lane drives
+        run: cargo build --release --locked -p ravel-server -p ravel-cli
+      - name: Put the release binaries on PATH
+        run: echo "${GITHUB_WORKSPACE}/target/release" >> "$GITHUB_PATH"
+      # Scenario 1: kill ingest mid-flush. The script brings up MinIO itself via
+      # docker compose, qualifies the store, drives strict-ack load, SIGKILLs the
+      # server mid-flush, restarts, and asserts the pinned oracle.
+      # Each scenario gets its own tenant, so its custody and catalog
+      # assertions are attributable to it. The store is also emptied per
+      # scenario, which is a separate requirement: see
+      # `assert_single_tenant_universe` in scripts/chaos/lib.sh.
+      - name: Chaos scenario 1 -- kill ingest mid-flush
+        env:
+          CHAOS_TENANT_NAME: chaos-ingest-flush
+          CHAOS_TENANT_TOKEN: chaos-token-ingest-flush
+        run: scripts/chaos/kill-ingest-flush.sh
+      # Scenario 2: kill a maintain worker mid-compaction, sibling running.
+      # RELEASE-BLOCKING (ADR-0077 section 4): exit 2 on any oracle failure.
+      - name: Chaos scenario 2 -- kill maintain worker mid-compaction
+        env:
+          CHAOS_TENANT_NAME: chaos-maintain-worker
+          CHAOS_TENANT_TOKEN: chaos-token-maintain-worker
+        run: scripts/chaos/kill-maintain-worker.sh
+      - name: Dump MinIO logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose/minio.yml logs --no-color || true
+      - name: Tear down MinIO
+        if: always()
+        run: docker compose -f deploy/docker-compose/minio.yml down -v || true

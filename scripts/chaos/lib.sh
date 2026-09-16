@@ -171,7 +171,7 @@ chaos_minio_client_available() {
     return 0
   fi
   if chaos_have_command docker; then
-    # demo.sh drives mc via `docker run minio/mc`; docker presence is the
+    # demo.sh drives mc via `docker run quay.io/minio/mc`; docker presence is the
     # gate for that path. We do not pull the image here (that would touch the
     # network); we only report the capability exists.
     return 0
@@ -317,9 +317,25 @@ minio_up() {
   fi
 
   log "ensuring bucket ${RAVEL_S3_BUCKET} exists"
+  # quay.io, not Docker Hub: Docker Hub's anonymous pull allowance is per-IP
+  # and shared across every project on a runner, so an unauthenticated pull
+  # from there fails unpredictably.
   docker run --rm --network host \
     -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
-    minio/mc:latest mb -p "local/${RAVEL_S3_BUCKET}" >/dev/null 2>&1 || true
+    quay.io/minio/mc:latest mb -p "local/${RAVEL_S3_BUCKET}" >/dev/null 2>&1 || true
+
+  # Start every scenario on an empty store. The compose file bind-mounts
+  # ../../minio-data, so `docker compose down` leaves the objects on the host
+  # and the next scenario, or a re-run of this one, inherits them. Why that
+  # breaks the takeover oracles rather than merely being untidy: see
+  # `assert_single_tenant_universe` below. Emptied through mc rather than rm
+  # because the container writes the host directory as root. RAVEL_S3_BUCKET
+  # defaults to a chaos-only bucket.
+  log "emptying bucket ${RAVEL_S3_BUCKET} so this scenario starts clean"
+  docker run --rm --network host \
+    -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
+    quay.io/minio/mc:latest rm --recursive --force "local/${RAVEL_S3_BUCKET}" \
+    >/dev/null 2>&1 || true
 
   # ADR-0050 EC7: a non-Memory store refuses to serve until `sys/qualification`
   # exists, and there is no bootstrap-and-continue path. Qualify before any
@@ -328,6 +344,42 @@ minio_up() {
   local rc=0
   run_capture ravel_cli --store s3 store qualify || rc=$?
   return "$rc"
+}
+
+# Count the tenants the maintain tier would discover, and record a pinned
+# oracle failure when it is not exactly one.
+#
+# NORMATIVE: this is the one place the single-tenant precondition is explained.
+# Other sites point here rather than restating it.
+#
+# `discover_tenants` (crates/ravel-maintain/src/discover.rs) lists every tenant
+# under `t/` and ignores --tenant-token, and `ravel_maintain_units_owned` is a
+# single store-wide gauge. The takeover oracles compare that gauge against one
+# scenario's worth of units with >=. So a tenant left in the store from another
+# scenario inflates the reading while the expected value stays put, and the
+# survivor clears the threshold owning only its pre-kill share: the oracle
+# passes with no takeover having happened.
+#
+# Two things keep that from happening, and they are not interchangeable.
+# `minio_up` empties the bucket so the precondition holds. This function
+# asserts that it did, because the violated-precondition case is a PASS rather
+# than an error and nothing else would mark it.
+assert_single_tenant_universe() {
+  local listing count
+  listing="$(docker run --rm --network host \
+    -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
+    quay.io/minio/mc:latest ls "local/${RAVEL_S3_BUCKET}/t/" 2>/dev/null)" || {
+    oracle_bad "single_tenant_universe" "could not list t/ in ${RAVEL_S3_BUCKET}"
+    return 1
+  }
+  count="$(printf '%s\n' "$listing" | grep -c '/$' || true)"
+  if [[ "$count" -ne 1 ]]; then
+    oracle_bad "single_tenant_universe" \
+      "expected exactly 1 tenant prefix under t/, found ${count}"
+    return 1
+  fi
+  oracle_ok "single_tenant_universe"
+  return 0
 }
 
 # Tear MinIO down only if this library started it.
@@ -386,16 +438,34 @@ sigkill_pid() {
 # parsed from the variable; no pipeline sits between a gate and its exit code.
 # ---------------------------------------------------------------------------
 
-# Read a single no-label counter/gauge value from a server's /metrics. Prints
-# the value on stdout, or the empty string if the metric is absent. Returns 1
-# only when the scrape itself fails (server unreachable).
+# Read a counter/gauge value from a server's /metrics, summed across every
+# label combination of the family. Prints the sum on stdout, or the empty
+# string if the metric is absent. Returns 1 only when the scrape itself fails
+# (server unreachable).
+#
+# Label-aware: a Prometheus sample renders as `name` or `name{labels} value`,
+# and every metric this lane reads carries at least a `mode`/`signal` label
+# (e.g. `ravel_maintain_units_owned{mode="maintain"} 4`,
+# `ravel_ingest_flushes_by_size_total{mode="all",signal="metrics"} 5`). An
+# exact `$1 == name` match is therefore label-blind and never fires, so a
+# family is matched by `$1 == name` OR `$1` beginning with `name{`. The literal
+# brace is what keeps `ravel_maintain_units_owned` from also matching
+# `ravel_maintain_units_owned_total`. Samples of one family are summed, which
+# for a labeled counter is its total across signals and for a single-series
+# gauge is just its value.
 metric_value() {
   local base_url="$1"
   local name="$2"
   local body
   body="$(curl --silent --fail --max-time 5 "${base_url}/metrics")" || return 1
-  # $body is data, not a gate; awk selects the sample line by exact metric name.
-  awk -v n="$name" '$1 == n { print $2; hit = 1 } END { if (!hit) print "" }' \
+  # $body is data, not a gate; awk sums the family's samples by label-aware name.
+  # The value is $(NF), not $2: a label value holding a space splits the label
+  # set across fields, and $2 would then be part of the label set rather than
+  # the sample. No metric this lane reads carries such a label today.
+  awk -v n="$name" '
+    $1 == n            { sum += $(NF); hit = 1; next }
+    index($1, n "{") == 1 { sum += $(NF); hit = 1 }
+    END { if (hit) print sum; else print "" }' \
     <<<"$body"
 }
 
@@ -558,17 +628,35 @@ query_series_visible() {
 
 # 1. strict-ack-implies-durable.
 #    Every write acked under strict ack before the kill is durable and
-#    queryable after restart, and no partial flush is visible (no commit
-#    token beyond the last strict ack becomes queryable).
+#    queryable after restart.
 #
-#    Args: http_addr, series, highest_acked_token, <acked_token...>
+#    Commit tokens are opaque, versioned, URL-safe-base64 strings
+#    (`v2:<shard>:<writer>:<epoch>:<seq>:<hour>`, base64-encoded --
+#    crates/ravel-types CommitToken), NOT integers. They are matched and passed
+#    through as strings; nothing here does arithmetic on a token or tests one
+#    with a numeric regex. A prior version computed `highest_token + 1` to probe
+#    for a leaked partial flush "one past" the last ack: that assumed an integer
+#    frontier the token type has never had (base64 has no numeric successor, and
+#    the catalog resolves `min_commit_token` by an exact GET of the pinned
+#    commit key, so a fabricated token would resolve nothing). The
+#    partial-visibility guarantee is instead discharged by the two oracles that
+#    can express it against opaque tokens: custody-and-catalog verify (no live
+#    record references an unacked/partial object) and, for scenario 2, the
+#    conservation gate. This oracle asserts the direction a per-token query CAN
+#    prove: acked implies durable-and-queryable after restart.
+#
+#    Args: http_addr, series, <acked_token...>
 oracle_strict_ack_implies_durable() {
   local http_addr="$1"
   local series="$2"
-  local highest_acked_token="$3"
-  shift 3
+  shift 2
   local acked_tokens=("$@")
   local name="strict-ack-implies-durable"
+
+  if [[ "${#acked_tokens[@]}" -eq 0 ]]; then
+    oracle_bad "$name" "no strict-acked tokens recorded before the kill"
+    return 1
+  fi
 
   local missing=0
   local token
@@ -581,17 +669,6 @@ oracle_strict_ack_implies_durable() {
   if [[ "$missing" -gt 0 ]]; then
     oracle_bad "$name" \
       "${missing}/${#acked_tokens[@]} strict-acked write(s) not durable after restart"
-    return 1
-  fi
-
-  # No partial flush visible: a query gated at one-past the highest strict-ack
-  # must NOT surface a higher committed token. If the store advanced the
-  # visible commit frontier past the last strict ack, an unacked partial flush
-  # leaked -- the exact failure this scenario exists to catch.
-  local beyond=$(( highest_acked_token + 1 ))
-  if query_series_visible "$http_addr" "$series" "$beyond"; then
-    oracle_bad "$name" \
-      "partial flush visible: data queryable at commit token ${beyond} > highest strict-ack ${highest_acked_token}"
     return 1
   fi
 

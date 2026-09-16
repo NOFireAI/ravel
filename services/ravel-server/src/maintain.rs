@@ -75,10 +75,12 @@
 //! ([`crate::maintain::seed_memo_from_snapshots`],
 //! [`crate::maintain::persist_memo_snapshot`]).
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures::FutureExt;
 use ravel_commit::keys;
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_ingest::{Clock as _, SystemClock};
@@ -167,6 +169,9 @@ pub struct MaintenanceSafetyMetrics {
     orphan_breaker_trips: [AtomicU64; MAINTAINED_SIGNALS.len()],
     orphans_withheld: [AtomicU64; MAINTAINED_SIGNALS.len()],
     orphans_present: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphans_quarantined: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphans_quarantine_refused: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    quarantine_reaped: [AtomicU64; MAINTAINED_SIGNALS.len()],
 }
 
 impl MaintenanceSafetyMetrics {
@@ -193,8 +198,12 @@ impl MaintenanceSafetyMetrics {
     }
 
     /// Orphan candidates the most recent sweep pass for `signal` found,
-    /// whether the breaker tripped or not: `orphans_deleted + orphans_withheld`
-    /// (exactly one of those is nonzero per pass). This is the signal for
+    /// whether the breaker tripped or not, summing `orphans_deleted`,
+    /// `orphans_withheld` and `orphans_quarantine_refused`. No one term is
+    /// guaranteed nonzero and more than one can be: a pass whose every copy
+    /// faulted has `deleted` and `withheld` both `0` with `refused` nonzero,
+    /// and a partially faulting pass has `deleted` and `refused` both nonzero.
+    /// This is the signal for
     /// small-scale commit-record loss the breaker's ratio/count thresholds are
     /// deliberately too coarse to catch (ADR-0058 decision 1): delete a handful
     /// of commit records for one shard and the breaker never trips, so
@@ -214,6 +223,50 @@ impl MaintenanceSafetyMetrics {
         self.orphans_present[signal_index(signal)].load(Ordering::Relaxed)
     }
 
+    /// Orphan candidates moved to `quarantine/` since this process started
+    /// (ADR-0058 amendment), summed over every sweep pass for `signal`.
+    ///
+    /// A counter, not a gauge like [`orphans_present`]: quarantining is an
+    /// event, not a state a later pass can undo, and the operator question is
+    /// the rate at which orphans are being taken out of the live set. Reading
+    /// only the last pass's count would answer that with `0` on every quiet
+    /// pass between two busy ones.
+    ///
+    /// [`orphans_present`]: Self::orphans_present
+    pub fn orphans_quarantined(&self, signal: Signal) -> u64 {
+        self.orphans_quarantined[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Orphan candidates whose copy to `quarantine/` failed, summed over every
+    /// sweep pass for `signal`. The live object was left in place, so the
+    /// candidate is still present and is counted in [`orphans_present`] too;
+    /// this counter is what separates a store fault on the quarantine prefix
+    /// from ordinary orphan presence.
+    ///
+    /// Steady state is a flat line at whatever value it reached. Alert on
+    /// `increase(...) > 0`, the same shape as the breaker-trip counter: a
+    /// refusal means quarantine cannot make progress, and the next pass
+    /// retrying the same candidate refuses again.
+    ///
+    /// [`orphans_present`]: Self::orphans_present
+    pub fn orphans_quarantine_refused(&self, signal: Signal) -> u64 {
+        self.orphans_quarantine_refused[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Objects physically deleted from `quarantine/` past the quarantine
+    /// horizon, summed over every sweep pass for `signal`. This is the only
+    /// place orphan-GC'd data is ever physically removed.
+    ///
+    /// A counter for the same reason as [`orphans_quarantined`], and it is
+    /// read against that one: a quarantined total that climbs while this one
+    /// stays flat is a quarantine prefix that is filling and never being
+    /// reaped, which no single-pass gauge can show.
+    ///
+    /// [`orphans_quarantined`]: Self::orphans_quarantined
+    pub fn quarantine_reaped(&self, signal: Signal) -> u64 {
+        self.quarantine_reaped[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
     pub fn record_legal_hold_refresh_failure(&self) {
         self.legal_hold_refresh_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -223,24 +276,34 @@ impl MaintenanceSafetyMetrics {
         self.conservation_aborts[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One `sweep_shard` result for `signal`: increments the trip counter
-    /// when `tripped`, and always overwrites the withheld and present gauges
-    /// with this pass's counts (both `store`, never `fetch_add` -- these are
-    /// gauges), matching [`orphans_withheld`]'s and [`orphans_present`]'s docs
-    /// on why neither gauge alone can be read as "resolved". `present` is the
-    /// pass's total orphan-candidate count (`orphans_deleted +
-    /// orphans_withheld`, exactly one of which is nonzero); `withheld` is `0`
-    /// unless the breaker tripped.
+    /// One `sweep_shard` result for `signal`, taken whole so no figure the
+    /// pass reported can be left behind at the call site.
+    ///
+    /// Two different accumulations, and which one a field gets is the whole of
+    /// its metric type. The withheld and present gauges are overwritten with
+    /// this pass's counts (`store`, never `fetch_add`), matching
+    /// [`orphans_withheld`]'s and [`orphans_present`]'s docs on why neither
+    /// gauge alone can be read as "resolved". The trip counter and the three
+    /// quarantine counters accumulate (`fetch_add`): each counts events the
+    /// pass performed, which a later quiet pass does not undo, and
+    /// [`SweepReport`] reports them per pass rather than as running totals, so
+    /// the running total has to be kept here.
     ///
     /// [`orphans_withheld`]: Self::orphans_withheld
     /// [`orphans_present`]: Self::orphans_present
-    pub fn record_sweep(&self, signal: Signal, tripped: bool, withheld: usize, present: usize) {
+    /// [`SweepReport`]: ravel_maintain::SweepReport
+    pub fn record_sweep(&self, signal: Signal, report: &ravel_maintain::SweepReport) {
         let index = signal_index(signal);
-        if tripped {
+        if report.orphan_breaker_tripped {
             self.orphan_breaker_trips[index].fetch_add(1, Ordering::Relaxed);
         }
-        self.orphans_withheld[index].store(withheld as u64, Ordering::Relaxed);
-        self.orphans_present[index].store(present as u64, Ordering::Relaxed);
+        self.orphans_withheld[index].store(report.orphans_withheld as u64, Ordering::Relaxed);
+        self.orphans_present[index].store(orphans_present_total(report) as u64, Ordering::Relaxed);
+        self.orphans_quarantined[index]
+            .fetch_add(report.orphans_quarantined as u64, Ordering::Relaxed);
+        self.orphans_quarantine_refused[index]
+            .fetch_add(report.orphans_quarantine_refused as u64, Ordering::Relaxed);
+        self.quarantine_reaped[index].fetch_add(report.quarantine_reaped as u64, Ordering::Relaxed);
     }
 }
 
@@ -323,6 +386,18 @@ pub struct MaintenanceOwnershipMetrics {
     memo_warm_start_units: AtomicU64,
     full_sweep_passes_total: AtomicU64,
     units_stalled: AtomicU64,
+    /// Unix nanoseconds the supervised maintenance loop last completed a full
+    /// cycle, from the injected clock; `0` until the first cycle completes.
+    /// This is the liveness signal the discovery/safety/ownership gauges lack:
+    /// they are all written at the end of a cycle that completed, so a dead
+    /// loop freezes them at their last healthy values, while the age of this
+    /// gauge grows without bound once the loop stops cycling (issue #1683,
+    /// mirroring `ravel_catalog_fold_last_success_timestamp_seconds`).
+    last_cycle_completed_unix_ns: AtomicI64,
+    /// Panics caught in the loop body and restarted by the supervisor. Its
+    /// only record: the supervisor swallows the panic so the pod stays up, so
+    /// this counter is how an operator learns the loop is crash-looping.
+    loop_panics_total: AtomicU64,
     stalls: UnitStallTracker,
     /// This cycle's owned-unit accumulator, paired with `set_units_owned(0)`:
     /// cleared in `begin_cycle`, filled by `note_owned_unit` as `run_tick`
@@ -340,6 +415,8 @@ impl MaintenanceOwnershipMetrics {
             memo_warm_start_units: AtomicU64::new(0),
             full_sweep_passes_total: AtomicU64::new(0),
             units_stalled: AtomicU64::new(0),
+            last_cycle_completed_unix_ns: AtomicI64::new(0),
+            loop_panics_total: AtomicU64::new(0),
             stalls: UnitStallTracker::new(stalled_after_intervals),
             owned_this_cycle: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
@@ -391,6 +468,19 @@ impl MaintenanceOwnershipMetrics {
         self.full_sweep_passes_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Stamps `now_ns` (from the injected clock) as the completion time of the
+    /// cycle that just finished. Called once at the end of every completed
+    /// cycle in [`run_loop`], never on a cycle the supervisor caught panicking.
+    fn set_last_cycle_completed(&self, now_ns: i64) {
+        self.last_cycle_completed_unix_ns
+            .store(now_ns, Ordering::Relaxed);
+    }
+
+    /// Records one panic the supervisor caught and restarted the loop after.
+    fn inc_loop_panics(&self) {
+        self.loop_panics_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records one tick outcome for the given owned unit, updating the
     /// stalled-unit count if this tick crossed (or cleared) the threshold.
     fn observe_unit_tick(&self, tenant: TenantHash, signal: Signal, shard: u32, ok: bool) {
@@ -416,6 +506,14 @@ impl MaintenanceOwnershipMetrics {
 
     pub fn units_stalled(&self) -> u64 {
         self.units_stalled.load(Ordering::Relaxed)
+    }
+
+    pub fn last_cycle_completed_unix_ns(&self) -> i64 {
+        self.last_cycle_completed_unix_ns.load(Ordering::Relaxed)
+    }
+
+    pub fn loop_panics_total(&self) -> u64 {
+        self.loop_panics_total.load(Ordering::Relaxed)
     }
 }
 
@@ -548,33 +646,45 @@ pub fn spawn(
     };
 
     let (tx, rx) = oneshot::channel();
-    let interval = config.interval;
-    let shard_count = config.shard_count;
-    let handle = tokio::spawn(async move {
-        run_loop(
-            store,
-            fallback_allow,
-            compactor,
-            retention,
-            shard_count,
-            interval,
-            metrics,
-            safety,
-            ownership,
-            worker,
-            rng,
-            rx,
-        )
-        .await;
-    });
+    let ctx = LoopContext {
+        store,
+        fallback_allow,
+        compactor,
+        retention,
+        shard_count: config.shard_count,
+        interval: config.interval,
+        metrics,
+        safety,
+        ownership,
+        worker,
+        rng,
+        // The one blessed wall clock in this process; tests inject a
+        // `FixedClock` here instead.
+        clock: Arc::new(WallClock),
+        // Production has no test seam, so the per-cycle hook is a no-op. Tests
+        // pass a closure that panics to exercise the supervisor's restart path.
+        cycle_hook: Arc::new(|| {}),
+    };
+    let handle = tokio::spawn(run_supervisor(
+        ctx,
+        rx,
+        RESTART_BACKOFF_INITIAL,
+        RESTART_BACKOFF_MAX,
+    ));
     Ok(MaintenanceTasks {
         shutdown: vec![tx],
         handles: vec![handle],
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_loop(
+/// Everything one maintenance-loop attempt needs, bundled so the supervisor can
+/// clone it and re-spawn a fresh attempt after a panic. Every field is cheap to
+/// clone (an `Arc`, a `Copy`, or a small owned value): a restart rebuilds the
+/// attempt task from the same context, and each attempt's [`run_loop`] builds
+/// its own fresh memo and heartbeat, so a torn in-memory state from a panicked
+/// cycle is discarded rather than carried into the restart.
+#[derive(Clone)]
+struct LoopContext {
     store: Arc<dyn ObjectStoreBackend>,
     fallback_allow: Option<Vec<TenantHash>>,
     compactor: Arc<CompactorConfig>,
@@ -586,8 +696,143 @@ async fn run_loop(
     ownership: Arc<MaintenanceOwnershipMetrics>,
     worker: Arc<WorkerSet>,
     rng: Arc<dyn RngSource>,
+    clock: Arc<dyn Clock>,
+    /// Called once at the top of every cycle body, inside the `catch_unwind`
+    /// boundary. A no-op in production; a test seam for driving a panic through
+    /// the supervisor.
+    cycle_hook: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Backoff before the first restart after a panic. Doubles up to
+/// [`RESTART_BACKOFF_MAX`] across consecutive panics, and resets once an
+/// attempt completes at least one cycle before dying, so a genuinely healthy
+/// loop that hits a single transient panic restarts promptly while a
+/// crash-looping one is bounded rather than spinning.
+const RESTART_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+
+/// Ceiling for the panic-restart backoff.
+const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Why one supervised [`run_loop`] attempt returned.
+enum LoopExit {
+    /// The shutdown channel fired: the supervisor must stop, not restart.
+    Shutdown,
+    /// A cycle body panicked and was caught. The supervisor restarts the loop.
+    Panicked,
+}
+
+/// The outcome of one [`run_loop`] attempt: why it ended, and how many cycles
+/// it completed first (so the supervisor can reset its backoff after a healthy
+/// run).
+struct LoopOutcome {
+    exit: LoopExit,
+    completed_cycles: u64,
+}
+
+/// Owns the loop's `JoinHandle` and restarts a fresh attempt after a caught
+/// panic, so a panic anywhere in the discovery or sweep call graph no longer
+/// leaves a Running/Ready pod with a dead maintenance loop (issue #1683).
+///
+/// Each attempt is a spawned [`run_loop`] whose cycle body is guarded by
+/// `catch_unwind`: a panic is caught inside the attempt, counted on
+/// [`MaintenanceOwnershipMetrics::inc_loop_panics`], and returned as
+/// [`LoopExit::Panicked`] so the attempt still runs its own heartbeat cleanup
+/// before ending (no leaked heartbeat task across restarts). The supervisor
+/// then backs off (bounded, [`RESTART_BACKOFF_INITIAL`]..=[`RESTART_BACKOFF_MAX`])
+/// and spawns the next attempt. Shutdown is still the existing oneshot: on it
+/// the supervisor signals the current attempt and joins it cleanly, and the
+/// backoff wait races the same receiver so a drain is never held behind it.
+async fn run_supervisor(
+    ctx: LoopContext,
     mut shutdown: oneshot::Receiver<()>,
+    initial_backoff: Duration,
+    max_backoff: Duration,
 ) {
+    let mut backoff = initial_backoff;
+    let mut pending_backoff: Option<Duration> = None;
+    loop {
+        // The backoff waits here, raced against shutdown, rather than in the
+        // resolved `select!` arm below: there the shutdown receiver is no
+        // longer polled, so a drain arriving during a 60 s backoff would wait
+        // it out and then pay for one more throwaway attempt before being
+        // observed.
+        if let Some(wait) = pending_backoff.take() {
+            tokio::select! {
+                _ = &mut shutdown => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+
+        let (attempt_tx, attempt_rx) = oneshot::channel();
+        let mut attempt = tokio::spawn(run_loop(ctx.clone(), attempt_rx));
+
+        tokio::select! {
+            // Server shutdown: stop the current attempt and join it so its
+            // heartbeat task is not left running, then return without restart.
+            _ = &mut shutdown => {
+                let _ = attempt_tx.send(());
+                let _ = attempt.await;
+                return;
+            }
+            joined = &mut attempt => {
+                match joined {
+                    Ok(LoopOutcome { exit: LoopExit::Shutdown, .. }) => return,
+                    Ok(LoopOutcome { exit: LoopExit::Panicked, completed_cycles }) => {
+                        // The panic counter was already bumped inside the
+                        // attempt. Reset the backoff if the attempt was
+                        // otherwise healthy (it completed at least one cycle).
+                        if completed_cycles > 0 {
+                            backoff = initial_backoff;
+                        }
+                        tracing::error!(
+                            completed_cycles,
+                            backoff_ms = backoff.as_millis(),
+                            "maintenance: loop task panicked; restarting after backoff \
+                             (see ravel_maintain_loop_panics_total)"
+                        );
+                    }
+                    Err(join_err) => {
+                        // A panic escaped the cycle-body guard (or the task was
+                        // aborted). Count it too so the panic total never
+                        // undercounts, then restart.
+                        ctx.ownership.inc_loop_panics();
+                        tracing::error!(
+                            error = %join_err,
+                            backoff_ms = backoff.as_millis(),
+                            "maintenance: loop task died outside the cycle guard; restarting \
+                             after backoff (see ravel_maintain_loop_panics_total)"
+                        );
+                    }
+                }
+
+                pending_backoff = Some(backoff);
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
+/// One supervised attempt of the maintenance loop. Runs discovery cycles until
+/// either the shutdown channel fires (returns [`LoopExit::Shutdown`]) or a
+/// cycle body panics and is caught (returns [`LoopExit::Panicked`], after
+/// counting the panic and cleaning up the heartbeat task). The supervisor
+/// ([`run_supervisor`]) owns this task's handle and restarts it on a panic.
+async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> LoopOutcome {
+    let LoopContext {
+        store,
+        fallback_allow,
+        compactor,
+        retention,
+        shard_count,
+        interval,
+        metrics,
+        safety,
+        ownership,
+        worker,
+        rng,
+        clock,
+        cycle_hook,
+    } = ctx;
     // One memo for the whole process, held across every tick and every
     // discovered tenant until shutdown. Its key includes
     // the tenant and signal, so this single instance safely spans every
@@ -620,7 +865,11 @@ async fn run_loop(
     let mut reseed = true;
     let mut last_memo_body: Option<Vec<u8>> = None;
 
-    let clock = WallClock;
+    // `clock` is the injected [`Clock`] from the context (the real [`WallClock`]
+    // in the running service, a `FixedClock` in tests). Every cycle-completion
+    // stamp, memo timestamp, reseed "now", and heartbeat timestamp below reads
+    // it, so the liveness gauge and worker membership both advance by the same
+    // clock a test drives.
 
     // Worker membership (ADR-0065 decision 1) runs on its own heartbeat cadence
     // `H`, independent of the (coarser) discovery interval, and in its OWN
@@ -650,8 +899,13 @@ async fn run_loop(
         let store = Arc::clone(&store);
         let worker = Arc::clone(&worker);
         let ownership = Arc::clone(&ownership);
+        // The injected clock, not a fresh `WallClock`: this task writes the
+        // timestamp siblings judge this process by AND judges theirs, so both
+        // halves of the membership decision must read the clock the rest of
+        // the loop reads (issue #1756). The cadence stays on
+        // `tokio::time::interval`, which a paused runtime already controls.
+        let clock = Arc::clone(&clock);
         tokio::spawn(async move {
-            let clock = WallClock;
             let mut heartbeat = tokio::time::interval(worker.heartbeat_interval());
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -664,8 +918,22 @@ async fn run_loop(
                                 "maintenance: worker heartbeat write failed; self-corrects next interval"
                             );
                         }
-                        match worker.live_set(store.as_ref(), now).await {
-                            Ok(computed) => {
+                        match worker.live_set_read(store.as_ref(), now).await {
+                            Ok(read) => {
+                                // One listing serves both: the live set the
+                                // discovery loop reads, and the keys past the
+                                // reap horizon. Reaping from the same read is
+                                // what makes it free rather than a second
+                                // LIST of the same prefix, which is how the
+                                // admission path does it too.
+                                let reaped = worker.reap_keys(store.as_ref(), &read.reapable).await;
+                                if reaped > 0 {
+                                    tracing::info!(
+                                        reaped,
+                                        "maintenance: reaped dead worker heartbeat keys"
+                                    );
+                                }
+                                let computed = read.live;
                                 ownership.set_workers_live(computed.len() as u64);
                                 // Publish the latest live set for the discovery
                                 // loop. `send` fails only once the receiver has
@@ -703,102 +971,143 @@ async fn run_loop(
     // only when it actually fires.
     let discovery_sleep = tokio::time::sleep(jittered(interval, rng.as_ref()));
     tokio::pin!(discovery_sleep);
-    loop {
+    let mut completed_cycles: u64 = 0;
+    let exit = loop {
         tokio::select! {
             () = &mut discovery_sleep => {
-                // Latest live set from the heartbeat task (fail-open: the
-                // receiver holds the last-known set across a read failure). A
-                // membership change since the previous cycle may have moved a
-                // unit's ownership onto this process; request a warm start so its
-                // terminal facts are seeded from the departing worker's snapshot
-                // rather than rescanned cold (ADR-0065 decision 3). `borrow`
-                // returns a guard, so clone out of it immediately and never hold
-                // it across an await.
-                let live_set = live_rx.borrow().clone();
-                if membership_changed(&prev_live_set, &live_set) {
-                    reseed = true;
-                }
-                prev_live_set = live_set.clone();
+                // The whole cycle body runs inside `catch_unwind` so a panic
+                // anywhere in the discovery or sweep call graph is caught here,
+                // counted, and turned into a supervised restart rather than a
+                // silently dead loop on a Running/Ready pod (issue #1683).
+                // `AssertUnwindSafe` is honest: on a caught panic this attempt
+                // is discarded entirely -- the supervisor spawns a fresh
+                // `run_loop` with a fresh memo -- so a torn `memo`/`reseed`
+                // state is never observed by the next cycle.
+                let cycle = AssertUnwindSafe(async {
+                    // Test seam (a no-op in production): drives a panic through
+                    // the guard to exercise the supervisor's restart path.
+                    (*cycle_hook)();
 
-                // Warm start / handoff seeding (ADR-0065 decision 3): before a
-                // cycle runs cold, seed the memo from durable snapshots for the
-                // units this process now owns. Fail-open: a read fault logs and
-                // degrades to a cold start, never blocks the loop.
-                if reseed {
-                    match read_all_memo_snapshots(store.as_ref()).await {
-                        Ok(snapshots) => {
-                            let now = clock.now_ns();
-                            let (units, buckets) = seed_memo_from_snapshots(
-                                &mut memo, &snapshots, now, &worker, &live_set,
-                            );
-                            ownership.add_memo_warm_start_units(units as u64);
-                            if buckets > 0 {
-                                tracing::info!(
-                                    seeded_units = units,
-                                    seeded_buckets = buckets,
-                                    "maintenance: warm-started memo from durable snapshots"
+                    // Latest live set from the heartbeat task (fail-open: the
+                    // receiver holds the last-known set across a read failure). A
+                    // membership change since the previous cycle may have moved a
+                    // unit's ownership onto this process; request a warm start so its
+                    // terminal facts are seeded from the departing worker's snapshot
+                    // rather than rescanned cold (ADR-0065 decision 3). `borrow`
+                    // returns a guard, so clone out of it immediately and never hold
+                    // it across an await.
+                    let live_set = live_rx.borrow().clone();
+                    if membership_changed(&prev_live_set, &live_set) {
+                        reseed = true;
+                    }
+                    prev_live_set = live_set.clone();
+
+                    // Warm start / handoff seeding (ADR-0065 decision 3): before a
+                    // cycle runs cold, seed the memo from durable snapshots for the
+                    // units this process now owns. Fail-open: a read fault logs and
+                    // degrades to a cold start, never blocks the loop.
+                    if reseed {
+                        match read_all_memo_snapshots(store.as_ref()).await {
+                            Ok(snapshots) => {
+                                let now = clock.now_ns();
+                                let (units, buckets) = seed_memo_from_snapshots(
+                                    &mut memo, &snapshots, now, &worker, &live_set,
                                 );
+                                ownership.add_memo_warm_start_units(units as u64);
+                                if buckets > 0 {
+                                    tracing::info!(
+                                        seeded_units = units,
+                                        seeded_buckets = buckets,
+                                        "maintenance: warm-started memo from durable snapshots"
+                                    );
+                                }
+                                // Clear the pending reseed only on a successful read.
+                                // A single transient LIST/GET fault must leave reseed
+                                // set so the next cycle retries: in a single-replica
+                                // deployment the live set never changes (it is always
+                                // solo_live_set()), so `membership_changed` is
+                                // structurally never true and this first-cycle reseed
+                                // is the only warm-start trigger the worker ever gets.
+                                // Clearing it on the Err arm would leave that worker
+                                // cold for its whole process life.
+                                reseed = false;
                             }
-                            // Clear the pending reseed only on a successful read.
-                            // A single transient LIST/GET fault must leave reseed
-                            // set so the next cycle retries: in a single-replica
-                            // deployment the live set never changes (it is always
-                            // solo_live_set()), so `membership_changed` is
-                            // structurally never true and this first-cycle reseed
-                            // is the only warm-start trigger the worker ever gets.
-                            // Clearing it on the Err arm would leave that worker
-                            // cold for its whole process life.
-                            reseed = false;
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                "maintenance: memo snapshot read failed; cold start for all units \
+                                 this cycle, reseed retried next cycle (fail-open, ADR-0065 decision 3)"
+                            ),
                         }
-                        Err(err) => tracing::warn!(
-                            error = %err,
-                            "maintenance: memo snapshot read failed; cold start for all units \
-                             this cycle, reseed retried next cycle (fail-open, ADR-0065 decision 3)"
-                        ),
+                    }
+
+                    run_discovery_cycle(
+                        store.as_ref(),
+                        fallback_allow.as_deref(),
+                        &compactor,
+                        &retention,
+                        shard_count,
+                        &mut memo,
+                        metrics.as_ref(),
+                        safety.as_ref(),
+                        ownership.as_ref(),
+                        &worker,
+                        &live_set,
+                    )
+                    .await;
+
+                    // Persist the updated memo, debounced (ADR-0065 decision 3): a
+                    // tick whose terminal set and verify times are unchanged writes
+                    // nothing. Fail-open: a write fault logs and retries next cycle.
+                    persist_memo_snapshot(
+                        store.as_ref(),
+                        &worker,
+                        &memo,
+                        &mut last_memo_body,
+                        clock.now_ns(),
+                    )
+                    .await;
+                });
+
+                match cycle.catch_unwind().await {
+                    Ok(()) => {
+                        // The liveness stamp is written only on a cycle that
+                        // actually completed, from the same injected clock the
+                        // rest of the loop reads (issue #1683, mirroring
+                        // `ravel_catalog_fold_last_success_timestamp_seconds`).
+                        ownership.set_last_cycle_completed(clock.now_ns());
+                        completed_cycles = completed_cycles.saturating_add(1);
+                        discovery_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + jittered(interval, rng.as_ref()));
+                    }
+                    Err(_panic) => {
+                        // Count the panic and end this attempt; the supervisor
+                        // restarts a fresh loop after a bounded backoff. The
+                        // liveness gauge is deliberately not stamped, so its age
+                        // grows while the loop is down.
+                        ownership.inc_loop_panics();
+                        break LoopExit::Panicked;
                     }
                 }
-
-                run_discovery_cycle(
-                    store.as_ref(),
-                    fallback_allow.as_deref(),
-                    &compactor,
-                    &retention,
-                    shard_count,
-                    &mut memo,
-                    metrics.as_ref(),
-                    safety.as_ref(),
-                    ownership.as_ref(),
-                    &worker,
-                    &live_set,
-                )
-                .await;
-
-                // Persist the updated memo, debounced (ADR-0065 decision 3): a
-                // tick whose terminal set and verify times are unchanged writes
-                // nothing. Fail-open: a write fault logs and retries next cycle.
-                persist_memo_snapshot(
-                    store.as_ref(),
-                    &worker,
-                    &memo,
-                    &mut last_memo_body,
-                    clock.now_ns(),
-                )
-                .await;
-
-                discovery_sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + jittered(interval, rng.as_ref()));
             }
-            _ = &mut shutdown => break,
+            _ = &mut shutdown => break LoopExit::Shutdown,
         }
-    }
+    };
 
     // Stop the heartbeat task so no spawned task outlives this loop: signal it
     // and await its handle. On return the heartbeat task is
     // guaranteed finished rather than detached, matching
-    // `MaintenanceTasks::shutdown`'s join of the supervisor task itself.
+    // `MaintenanceTasks::shutdown`'s join of the supervisor task itself. This
+    // runs on the panic path too (the cycle body's `catch_unwind` returns here
+    // rather than unwinding past it), so a caught panic never leaks a heartbeat
+    // task into the restarted attempt.
     let _ = heartbeat_shutdown_tx.send(());
     let _ = heartbeat_handle.await;
+
+    LoopOutcome {
+        exit,
+        completed_cycles,
+    }
 }
 
 /// One discovery cycle: re-enumerate tenants from storage, narrow by lifecycle
@@ -998,6 +1307,21 @@ fn note_owned_units(
             }
         }
     }
+}
+
+/// Every orphan candidate the pass left present in the live set (ADR-0058
+/// decision 1), which is what the `orphans_present` gauge reports.
+///
+/// A refused candidate counts. Its copy to `quarantine/` failed, so the live
+/// key was deliberately not deleted, and the failure happens in exactly the
+/// store-fault case the gauge exists to surface. Summing only the first two
+/// terms read zero at the moment the signal mattered.
+///
+/// This is a named function rather than an expression at the call site so the
+/// rule has somewhere to be tested. Dropping a term is then a red test rather
+/// than a silent regression of the bug this closes.
+fn orphans_present_total(report: &ravel_maintain::SweepReport) -> usize {
+    report.orphans_deleted + report.orphans_withheld + report.orphans_quarantine_refused
 }
 
 /// [`run_tick`] with the clock injected instead of hardwired to [`WallClock`].
@@ -1300,12 +1624,7 @@ pub(crate) async fn run_tick_with_clock(
                              operator expects, see the breaker runbook"
                         );
                     }
-                    safety.record_sweep(
-                        signal,
-                        report.orphan_breaker_tripped,
-                        report.orphans_withheld,
-                        report.orphans_deleted + report.orphans_withheld,
-                    );
+                    safety.record_sweep(signal, &report);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -1669,11 +1988,12 @@ async fn erasure_rewrite_pass(
     signal: Signal,
     scan_shards: u32,
     pending: &[PendingErasureRequest],
+    derived_hours: &std::collections::BTreeSet<u32>,
     memo: &mut MaintainMemo,
 ) -> ErasureRewritePass {
     let mut pass = ErasureRewritePass::default();
     for shard in 0..scan_shards {
-        let hours = match list_erasure_scan_hours(store, tenant, signal, shard).await {
+        let listed = match list_erasure_scan_hours(store, tenant, signal, shard).await {
             Ok(hours) => hours,
             Err(err) => {
                 tracing::warn!(
@@ -1688,71 +2008,95 @@ async fn erasure_rewrite_pass(
                 continue;
             }
         };
+        // Union the commit-prefix listing with `derived_hours`, the ingest
+        // hours open at each request's acknowledgement (issue #1290). A pre-ack
+        // flush that has not published a commit record yet leaves its hour out
+        // of the listing, so without this union the completion gate never sees
+        // the bucket the subject's pre-ack records will later seal into and the
+        // request completes while that bucket resurrects the subject. Whether
+        // the derived bucket puts records in a request's scope stays the single
+        // judgement inside `bucket_erasure_completion`; this only makes the
+        // bucket present for that gate to judge.
+        let listed: std::collections::BTreeSet<u32> = listed.into_iter().collect();
+        let mut hours = listed.clone();
+        hours.extend(derived_hours.iter().copied());
         for hour in hours {
             let bucket = Bucket::new(*tenant, signal, shard, hour);
-            match erasure_rewrite_bucket(store, clock, compactor, hold, &bucket, pending, memo)
-                .await
-            {
-                Ok(ErasureRewriteOutcome::Rewritten {
-                    parts,
-                    publish,
-                    drops,
-                }) => {
-                    pass.rewritten += 1;
-                    // An abandoned publish wrote no record, so this bucket
-                    // does not yet name the pending requests.
-                    if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
-                        pass.deferred = true;
-                    }
-                    for drop in drops {
-                        pass.bucket_drops
-                            .entry(drop.request_id.clone())
-                            .or_default()
-                            .push(drop);
-                    }
-                    tracing::info!(
-                        tenant = %tenant.to_hex(),
-                        signal = ?signal,
-                        shard,
-                        hour,
+            // The rewrite runs only on hours the listing returned. A derived
+            // hour absent from the listing has no commit record for this shard,
+            // so there is nothing to rewrite; the completion gate below still
+            // examines it (it blocks while that bucket is unsealed and in
+            // scope, and passes once it seals empty). This also keeps the
+            // rewrite off an empty bucket, which `erasure_rewrite_bucket` does
+            // not currently accept for a windowless request (flagged in the
+            // task report). Once the derived hour's commit record lands it
+            // becomes a listed hour and the rewrite acts on it normally.
+            if listed.contains(&hour) {
+                match erasure_rewrite_bucket(store, clock, compactor, hold, &bucket, pending, memo)
+                    .await
+                {
+                    Ok(ErasureRewriteOutcome::Rewritten {
                         parts,
-                        publish = ?publish,
-                        "maintenance: erasure rewrite published for a bucket"
-                    );
-                }
-                Ok(ErasureRewriteOutcome::AlreadyApplied { request_ids }) => {
-                    pass.already_applied += 1;
-                    pass.drops_incomplete.extend(request_ids);
-                }
-                Ok(
-                    ErasureRewriteOutcome::NoApplicableRequests | ErasureRewriteOutcome::Tombstoned,
-                ) => pass.out_of_scope += 1,
-                Ok(ErasureRewriteOutcome::NotSealed) => pass.not_sealed += 1,
-                Ok(ErasureRewriteOutcome::Held) => {
-                    // ADR-0064 §6: a legal hold wins over erasure. The request
-                    // stays pending, query-time exclusion keeps hiding the
-                    // data, and the erasure clock is explicitly paused.
-                    pass.deferred = true;
-                    tracing::info!(
-                        tenant = %tenant.to_hex(),
-                        signal = ?signal,
-                        shard,
-                        hour,
-                        "maintenance: erasure rewrite skipped a bucket under legal hold; \
-                         the request stays pending until the hold clears"
-                    );
-                }
-                Err(err) => {
-                    pass.deferred = true;
-                    tracing::warn!(
-                        tenant = %tenant.to_hex(),
-                        signal = ?signal,
-                        shard,
-                        hour,
-                        error = %err,
-                        "maintenance: erasure rewrite of a bucket failed; no completion \
-                         written this tick, retried next tick"
-                    );
+                        publish,
+                        drops,
+                    }) => {
+                        pass.rewritten += 1;
+                        // An abandoned publish wrote no record, so this bucket
+                        // does not yet name the pending requests.
+                        if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
+                            pass.deferred = true;
+                        }
+                        for drop in drops {
+                            pass.bucket_drops
+                                .entry(drop.request_id.clone())
+                                .or_default()
+                                .push(drop);
+                        }
+                        tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            shard,
+                            hour,
+                            parts,
+                            publish = ?publish,
+                            "maintenance: erasure rewrite published for a bucket"
+                        );
+                    }
+                    Ok(ErasureRewriteOutcome::AlreadyApplied { request_ids }) => {
+                        pass.already_applied += 1;
+                        pass.drops_incomplete.extend(request_ids);
+                    }
+                    Ok(
+                        ErasureRewriteOutcome::NoApplicableRequests
+                        | ErasureRewriteOutcome::Tombstoned,
+                    ) => pass.out_of_scope += 1,
+                    Ok(ErasureRewriteOutcome::NotSealed) => pass.not_sealed += 1,
+                    Ok(ErasureRewriteOutcome::Held) => {
+                        // ADR-0064 §6: a legal hold wins over erasure. The request
+                        // stays pending, query-time exclusion keeps hiding the
+                        // data, and the erasure clock is explicitly paused.
+                        pass.deferred = true;
+                        tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            shard,
+                            hour,
+                            "maintenance: erasure rewrite skipped a bucket under legal hold; \
+                             the request stays pending until the hold clears"
+                        );
+                    }
+                    Err(err) => {
+                        pass.deferred = true;
+                        tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            shard,
+                            hour,
+                            error = %err,
+                            "maintenance: erasure rewrite of a bucket failed; no completion \
+                             written this tick, retried next tick"
+                        );
+                    }
                 }
             }
 
@@ -1766,9 +2110,11 @@ async fn erasure_rewrite_pass(
             // `bucket_erasure_completion`), on a fresh listing that reflects any
             // rewrite just published, so a `.done` can never be written while a
             // resolvable snapshot still serves the subject. This runs for every
-            // bucket regardless of the rewrite outcome: a bucket the pass called
-            // `AlreadyApplied` or `NoApplicableRequests` off its one-hop view is
-            // exactly where the divergence hides.
+            // bucket regardless of the rewrite outcome, and for every derived
+            // hour whether or not the listing returned it (issue #1290): a
+            // bucket the pass called `AlreadyApplied` or `NoApplicableRequests`
+            // off its one-hop view, or a derived ack-open hour still unsealed,
+            // is exactly where completion must be withheld.
             match ravel_maintain::bucket_erasure_completion(
                 store, clock, compactor, hold, &bucket, pending,
             )
@@ -1926,16 +2272,17 @@ async fn write_erasure_completion(
 /// Blocking is the safe failure: a stuck-pending request retains its `.dreq`
 /// and query-time exclusion, where a false `.done` would resurrect the subject.
 ///
-/// **Known gap, matching ADR-0064 decision 3 point 1:** an unsealed bucket is
-/// deferred and excluded from scope, so a windowless request can complete
-/// while the current (still-open) ingest hour holds matching records that will
-/// only seal later -- by which time the request is no longer pending and no
-/// rewrite will revisit it. The ADR defines scope as sealed buckets and defers
-/// unsealed ones; blocking completion on them instead would mean a
-/// continuously-ingesting tenant never completes any request, so its `.dreq`
-/// (which holds the subject identifier) would be retained forever, which is
-/// the failure ADR-0064 decision 5 exists to prevent. Reported rather than
-/// silently resolved either way.
+/// **The ack-open ingest hour (issue #1290).** The hour open at a request's
+/// acknowledgement whose pre-ack flush has not published a commit record yet is
+/// absent from the commit-prefix listing, so discovery derives it from the
+/// request's timestamp ([`ravel_maintain::erasure_rewrite::ack_open_ingest_hours`])
+/// and unions it into every shard's listed hours. That derived bucket is
+/// unsealed at the ack, so [`ravel_maintain::bucket_erasure_completion`] blocks
+/// completion until it seals and a later pass rewrites it. Only the hour open at
+/// the ack is derived: a later hour that opened after the ack is out of the
+/// request's scope, so ingest that never stops does not stall completion, and
+/// the wait is bounded to
+/// [`ravel_maintain::erasure_rewrite::erasure_seal_wait_bound_ns`].
 #[allow(clippy::too_many_arguments)]
 async fn run_erasure_pass(
     store: &dyn ObjectStoreBackend,
@@ -1949,6 +2296,16 @@ async fn run_erasure_pass(
 ) {
     match pending_erasure_requests(store, tenant, signal).await {
         Ok(pending) if !pending.is_empty() => {
+            // Discovery unions the per-shard commit-prefix listing (inside
+            // `erasure_rewrite_pass`) with the ingest hours open at each
+            // request's acknowledgement (issue #1290): a pre-ack flush that has
+            // not published a commit record leaves its hour absent from the
+            // listing, so deriving it here is the only way the completion gate
+            // ever considers that bucket. This mirrors the crate-level test's
+            // `erasure_tick`. Scope stays one judgement in
+            // `bucket_erasure_completion`; this only decides the bucket is
+            // present for it to judge.
+            let derived_hours = ravel_maintain::erasure_rewrite::ack_open_ingest_hours(&pending);
             let pass = erasure_rewrite_pass(
                 store,
                 clock,
@@ -1958,6 +2315,7 @@ async fn run_erasure_pass(
                 signal,
                 scan_shards,
                 &pending,
+                &derived_hours,
                 memo,
             )
             .await;
@@ -2718,12 +3076,11 @@ mod tests {
                 entry_count: 1,
                 watermark_hour: 100,
                 min_hour: 0,
+                column_stats: None,
             }],
             folder_id: vec![0u8; 16],
             created_unix_ns: 0,
             postings: None,
-            column_stats: None,
-            column_stats_part: None,
             shard_generation_count: 1,
         };
         store
@@ -2881,6 +3238,80 @@ mod tests {
             // The record's creation time has to sit inside the ingest hour it
             // declares (`IngestHourInconsistent` rejects any other pair).
             created_unix_ns: i64::from(hour) * TEST_NS_PER_HOUR + 10,
+            ingest_hour_bucket: hour,
+        })
+        .expect("valid commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// Publish one metrics bucket holding the erasure subject and one bystander
+    /// into ingest hour `hour` (a single L0 input, samples timestamped inside
+    /// the hour). This models issue #1290's delayed pre-ack flush: the ack
+    /// hour's commit record only appears once this is called, so the
+    /// commit-prefix listing returns the hour to nobody before it.
+    async fn publish_erasable_bucket_at_hour(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        hour: u32,
+    ) {
+        let tenant_hash = tenant.hash();
+        let ts_ns = i64::from(hour) * TEST_NS_PER_HOUR + 1_000;
+        let mut series: Vec<SeriesInput> = [TEST_ERASED_SUBJECT, TEST_SURVIVING_SUBJECT]
+            .into_iter()
+            .map(|subject| {
+                let labels = subject_labels(subject);
+                SeriesInput {
+                    series_id: SeriesId::compute(tenant, "http_requests", &labels)
+                        .expect("series id"),
+                    labels,
+                    samples: vec![Sample { ts_ns, value: 1.0 }],
+                }
+            })
+            .collect();
+        series.sort_by_key(|s| s.series_id);
+
+        let writer_id = Uuid::from_u128(9_300 + u128::from(hour));
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: ts_ns,
+                max_ingest_ts_ns: ts_ns,
+            },
+        )
+        .expect("write segment");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: ts_ns,
             ingest_hour_bucket: hour,
         })
         .expect("valid commit record");
@@ -3188,6 +3619,132 @@ mod tests {
         );
     }
 
+    /// Reachability through the SERVER's own pass (issue #1290). The previous
+    /// round proved the mechanism in the crate's `erasure_tick` mirror, but the
+    /// shipping driver `run_erasure_pass` still built its hour set from
+    /// `list_erasure_scan_hours` alone. This drives `run_erasure_pass` -- the
+    /// exact pattern `done_follows_the_catalog_resolver_not_the_one_hop_live_record`
+    /// uses -- to prove the driver now discovers the ack-open hour the listing
+    /// misses.
+    ///
+    /// Tick 1: the request is acknowledged while its ingest hour is open and
+    /// holds NO commit record (its pre-ack flush has not published yet). The
+    /// commit-prefix listing returns that hour to nobody, so only
+    /// `ack_open_ingest_hours` surfaces it; the derived bucket is unsealed, so
+    /// completion is blocked and no `.done` is written -- the request does not
+    /// complete. Tick 2: the delayed flush finally publishes its commit record
+    /// into that hour and the clock advances past the hour's seal bound, so it
+    /// is now listed and sealed; the rewrite drops the subject and the request
+    /// completes exactly once, the subject gone from the survivors.
+    ///
+    /// The flip that proves this test bites: replace
+    /// `ack_open_ingest_hours(&pending)` in `run_erasure_pass` with
+    /// `BTreeSet::new()` and tick 1 writes `.done` over an empty listing,
+    /// resurrecting the subject the delayed flush later seals into the hour.
+    #[tokio::test]
+    async fn run_erasure_pass_discovers_the_ack_open_hour_the_listing_misses() {
+        const ACK_HOUR: u32 = 10_000;
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        let request_id = Uuid::from_u128(0x1290);
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let compactor = CompactorConfig::default();
+        let hold = ravel_maintain::NoLeases;
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Tick 1: the ack hour is open and holds no commit record. The listing
+        // is empty; only the derived hour makes the unsealed bucket visible,
+        // and an unsealed in-scope bucket blocks completion.
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+        )
+        .await;
+
+        assert_eq!(
+            rewrite_records_at_hour(&store, &tenant, ACK_HOUR)
+                .await
+                .len(),
+            0,
+            "the ack hour holds no commit record yet, so nothing is rewritten this tick"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_err(),
+            "the ack-open hour is derived and unsealed, so completion is blocked and no .done \
+             is written -- without the driver's union this listing is empty and .done lands"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "the request stays pending: its .dreq (carrying the subject) survives"
+        );
+
+        // The delayed pre-ack flush finally publishes its commit record into
+        // the ack hour, and the clock advances past that hour's seal bound.
+        publish_erasable_bucket_at_hour(&store, &tenant_id, ACK_HOUR).await;
+        let sealed_ns = i64::from(ACK_HOUR + 1) * TEST_NS_PER_HOUR + compactor.seal_margin_ns() + 1;
+        clock.set(sealed_ns);
+
+        // Tick 2: the hour is now listed and sealed; the rewrite drops the
+        // subject and the request completes exactly once.
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+        )
+        .await;
+
+        let records = rewrite_records_at_hour(&store, &tenant, ACK_HOUR).await;
+        assert_eq!(
+            records.len(),
+            1,
+            "the sealed ack bucket is rewritten exactly once"
+        );
+        assert_eq!(
+            records[0].drops.len(),
+            1,
+            "the rewrite applies exactly the one pending request"
+        );
+        assert_eq!(records[0].drops[0].request_id, request_id.to_string());
+        assert_eq!(
+            records[0].drops[0].dropped_count, 1,
+            "exactly the subject's one sample is dropped"
+        );
+        assert_eq!(
+            rewritten_label_sets(&store, &records[0]).await,
+            vec![subject_labels(TEST_SURVIVING_SUBJECT)],
+            "the subject is gone from the survivors and the bystander is intact"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            "every in-scope bucket now carries the request, so it completes exactly once"
+        );
+    }
+
     /// Submit one erasure request exactly as `ravel-cli erase submit` does: a
     /// validated `ErasureRequest` written `CreateIfAbsent` to its `.dreq` key.
     /// Returns the key.
@@ -3232,8 +3789,18 @@ mod tests {
         store: &dyn ObjectStoreBackend,
         tenant: &TenantHash,
     ) -> Vec<ravel_proto::commit::v1::RewriteRecord> {
-        let prefix =
-            keys::commit_shard_hour_prefix(tenant, Signal::Metrics, 0, 0).expect("bucket prefix");
+        rewrite_records_at_hour(store, tenant, 0).await
+    }
+
+    /// Every `RewriteRecord` present in `(tenant, Metrics, shard 0, hour)`,
+    /// decoded, in key order.
+    async fn rewrite_records_at_hour(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        hour: u32,
+    ) -> Vec<ravel_proto::commit::v1::RewriteRecord> {
+        let prefix = keys::commit_shard_hour_prefix(tenant, Signal::Metrics, 0, hour)
+            .expect("bucket prefix");
         let mut keys_found: Vec<String> = list_all(store, &prefix)
             .await
             .expect("list bucket")
@@ -3303,13 +3870,20 @@ mod tests {
 
         let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
         let request_id = Uuid::from_u128(0xE7A5);
+        // Acknowledge the request inside the data's own ingest hour (hour 0),
+        // which is long sealed at `TEST_ERASURE_NOW_NS` (hour 10_000). This
+        // keeps the ack-open hour from being an obstacle in its own right, so
+        // this test stays about the rewrite/complete/sweep arc; the ack-open
+        // hour that the listing misses is covered separately by
+        // `run_erasure_pass_discovers_the_ack_open_hour_the_listing_misses`.
+        let ack_ns = 1_000;
         let dreq_key = submit_erasure_request(
             &store,
             &tenant,
             Signal::Metrics,
             request_id,
             TEST_ERASED_SUBJECT,
-            TEST_ERASURE_NOW_NS,
+            ack_ns,
         )
         .await;
         let done_key =
@@ -4412,17 +4986,21 @@ mod tests {
 
         let discovery_interval = Duration::from_secs(300);
         let handle = tokio::spawn(run_loop(
-            store,
-            None,
-            compactor,
-            retention,
-            1,
-            discovery_interval,
-            metrics.clone(),
-            safety,
-            ownership,
-            worker,
-            Arc::new(SystemRng),
+            LoopContext {
+                store,
+                fallback_allow: None,
+                compactor,
+                retention,
+                shard_count: 1,
+                interval: discovery_interval,
+                metrics: metrics.clone(),
+                safety,
+                ownership,
+                worker,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(WallClock),
+                cycle_hook: Arc::new(|| {}),
+            },
             shutdown_rx,
         ));
 
@@ -4761,6 +5339,20 @@ mod tests {
         );
     }
 
+    /// A sweep pass's report shaped the way `sweep_shard` builds one: a
+    /// tripped pass withholds and deletes nothing, an untripped one deletes
+    /// and quarantines the same candidates (`orphans_quarantined` mirrors
+    /// `orphans_deleted` in `ravel-maintain`).
+    fn sweep_report(tripped: bool, withheld: usize, deleted: usize) -> ravel_maintain::SweepReport {
+        ravel_maintain::SweepReport {
+            orphans_deleted: deleted,
+            orphans_quarantined: deleted,
+            orphan_breaker_tripped: tripped,
+            orphans_withheld: withheld,
+            ..Default::default()
+        }
+    }
+
     /// The un-trip an operator must not read as "resolved" (ADR-0048 decision
     /// 4): a second, non-tripped sweep pass for the same signal
     /// drops `orphans_withheld` back to `0`, but `orphan_breaker_trips` -- the
@@ -4769,11 +5361,11 @@ mod tests {
     #[test]
     fn orphan_breaker_withheld_gauge_drops_but_trip_counter_does_not() {
         let safety = MaintenanceSafetyMetrics::default();
-        safety.record_sweep(Signal::Metrics, true, 42, 42);
+        safety.record_sweep(Signal::Metrics, &sweep_report(true, 42, 0));
         assert_eq!(safety.orphan_breaker_trips(Signal::Metrics), 1);
         assert_eq!(safety.orphans_withheld(Signal::Metrics), 42);
 
-        safety.record_sweep(Signal::Metrics, false, 0, 0);
+        safety.record_sweep(Signal::Metrics, &sweep_report(false, 0, 0));
         assert_eq!(
             safety.orphan_breaker_trips(Signal::Metrics),
             1,
@@ -4791,6 +5383,54 @@ mod tests {
         assert_eq!(safety.legal_hold_refresh_failures(), 0);
     }
 
+    /// The `orphans_present` fold counts a refused quarantine. A candidate
+    /// whose copy failed is left live, so it is still present, and the copy
+    /// fails in exactly the store-fault case the gauge exists to surface.
+    ///
+    /// This guards the fold itself rather than the per-rule outcome one layer
+    /// below it: without it, an edit dropping the refused term regresses the
+    /// bug silently, because `orphans_present_gauge_tracks_latest_pass_and_is_not_sticky`
+    /// hands `record_sweep` a precomputed total and never exercises the sum.
+    ///
+    /// Flip to watch it fail: drop `+ report.orphans_quarantine_refused` from
+    /// `orphans_present_total`. The all-refused case then reports 0 present
+    /// while three objects sit live in the keyspace.
+    #[test]
+    fn orphans_present_total_counts_a_refused_quarantine() {
+        // Every copy faulted: nothing left the live set, nothing was withheld
+        // by the breaker, and three candidates are still there.
+        let all_refused = ravel_maintain::SweepReport {
+            orphans_deleted: 0,
+            orphans_withheld: 0,
+            orphans_quarantine_refused: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            orphans_present_total(&all_refused),
+            3,
+            "a pass whose every copy faulted still has three orphans present"
+        );
+
+        // The partially faulting pass: two terms nonzero at once, which the
+        // old "exactly one is nonzero" reading of this gauge ruled out.
+        let mixed = ravel_maintain::SweepReport {
+            orphans_deleted: 2,
+            orphans_withheld: 0,
+            orphans_quarantine_refused: 1,
+            ..Default::default()
+        };
+        assert_eq!(orphans_present_total(&mixed), 3);
+
+        // The breaker-tripped pass is unchanged by the new term.
+        let tripped = ravel_maintain::SweepReport {
+            orphans_deleted: 0,
+            orphans_withheld: 55,
+            orphans_quarantine_refused: 0,
+            ..Default::default()
+        };
+        assert_eq!(orphans_present_total(&tripped), 55);
+    }
+
     /// ADR-0058 decision 1: `orphans_present` is a last-observed-value gauge
     /// that catches small-scale record loss the breaker never trips on. It
     /// carries the pass's total orphan-candidate count regardless of what
@@ -4803,7 +5443,7 @@ mod tests {
         // Breaker not tripped: candidates were deleted, so `present` is the
         // deleted count while `withheld` stays 0. This is exactly the
         // small-scale-loss case the breaker's thresholds are too coarse for.
-        safety.record_sweep(Signal::Metrics, false, 0, 3);
+        safety.record_sweep(Signal::Metrics, &sweep_report(false, 0, 3));
         assert_eq!(safety.orphans_present(Signal::Metrics), 3);
         assert_eq!(safety.orphans_withheld(Signal::Metrics), 0);
         assert_eq!(
@@ -4814,14 +5454,14 @@ mod tests {
 
         // Breaker tripped: candidates were withheld, so `present` equals the
         // withheld count (deleted is 0 on a tripped pass).
-        safety.record_sweep(Signal::Metrics, true, 55, 55);
+        safety.record_sweep(Signal::Metrics, &sweep_report(true, 55, 0));
         assert_eq!(safety.orphans_present(Signal::Metrics), 55);
         assert_eq!(safety.orphans_withheld(Signal::Metrics), 55);
 
         // A subsequent clean pass with zero candidates resets the gauge to 0:
         // gauge semantics, last observed value, not a monotonic counter that
         // remembers the earlier 55.
-        safety.record_sweep(Signal::Metrics, false, 0, 0);
+        safety.record_sweep(Signal::Metrics, &sweep_report(false, 0, 0));
         assert_eq!(
             safety.orphans_present(Signal::Metrics),
             0,
@@ -4833,6 +5473,66 @@ mod tests {
 
         // A different signal is untouched throughout.
         assert_eq!(safety.orphans_present(Signal::Logs), 0);
+    }
+
+    /// The three quarantine figures accumulate across passes, which is what
+    /// makes their `_total` names honest. `SweepReport` reports each one per
+    /// pass, so storing instead of adding would publish a counter that drops
+    /// to `0` on the first pass that quarantines, refuses or reaps nothing,
+    /// and `rate()` over it would read as a reset rather than as quiet.
+    ///
+    /// Flip to watch it fail: change any of the three `fetch_add` calls in
+    /// `record_sweep` to `store`. The second assertion block then reports the
+    /// third pass's figures instead of the sum of all three.
+    #[test]
+    fn quarantine_counters_accumulate_across_passes() {
+        let safety = MaintenanceSafetyMetrics::default();
+
+        let first = ravel_maintain::SweepReport {
+            orphans_deleted: 4,
+            orphans_quarantined: 4,
+            orphans_quarantine_refused: 1,
+            quarantine_reaped: 2,
+            ..Default::default()
+        };
+        safety.record_sweep(Signal::Metrics, &first);
+        assert_eq!(safety.orphans_quarantined(Signal::Metrics), 4);
+        assert_eq!(safety.orphans_quarantine_refused(Signal::Metrics), 1);
+        assert_eq!(safety.quarantine_reaped(Signal::Metrics), 2);
+
+        let second = ravel_maintain::SweepReport {
+            orphans_deleted: 3,
+            orphans_quarantined: 3,
+            orphans_quarantine_refused: 5,
+            quarantine_reaped: 7,
+            ..Default::default()
+        };
+        safety.record_sweep(Signal::Metrics, &second);
+
+        // A quiet pass: nothing to quarantine, nothing refused, nothing past
+        // the quarantine horizon. The totals must not move, and must not drop.
+        safety.record_sweep(Signal::Metrics, &ravel_maintain::SweepReport::default());
+
+        assert_eq!(
+            safety.orphans_quarantined(Signal::Metrics),
+            7,
+            "quarantined is the sum over passes, not the last pass's count"
+        );
+        assert_eq!(
+            safety.orphans_quarantine_refused(Signal::Metrics),
+            6,
+            "refused is the sum over passes, not the last pass's count"
+        );
+        assert_eq!(
+            safety.quarantine_reaped(Signal::Metrics),
+            9,
+            "reaped is the sum over passes, not the last pass's count"
+        );
+
+        // A different signal shares none of it.
+        assert_eq!(safety.orphans_quarantined(Signal::Logs), 0);
+        assert_eq!(safety.orphans_quarantine_refused(Signal::Logs), 0);
+        assert_eq!(safety.quarantine_reaped(Signal::Logs), 0);
     }
 
     /// A store wrapper that instruments `list_delimited` -- the call
@@ -5506,17 +6206,21 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let handle = tokio::spawn(run_loop(
-            store,
-            None,
-            compactor,
-            retention,
-            1,
-            Duration::from_secs(1),
-            metrics,
-            safety,
-            ownership,
-            worker,
-            Arc::new(SystemRng),
+            LoopContext {
+                store,
+                fallback_allow: None,
+                compactor,
+                retention,
+                shard_count: 1,
+                interval: Duration::from_secs(1),
+                metrics,
+                safety,
+                ownership,
+                worker,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(WallClock),
+                cycle_hook: Arc::new(|| {}),
+            },
             shutdown_rx,
         ));
 
@@ -5588,19 +6292,23 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let handle = tokio::spawn(run_loop(
-            store,
-            None,
-            compactor,
-            retention,
-            1,
-            // Discovery interval far past the test window: only the heartbeat
-            // task runs, so this test isolates its lifecycle.
-            Duration::from_secs(300),
-            metrics,
-            safety,
-            ownership,
-            worker,
-            Arc::new(SystemRng),
+            LoopContext {
+                store,
+                fallback_allow: None,
+                compactor,
+                retention,
+                shard_count: 1,
+                // Discovery interval far past the test window: only the
+                // heartbeat task runs, so this test isolates its lifecycle.
+                interval: Duration::from_secs(300),
+                metrics,
+                safety,
+                ownership,
+                worker,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(WallClock),
+                cycle_hook: Arc::new(|| {}),
+            },
             shutdown_rx,
         ));
 
@@ -5631,6 +6339,396 @@ mod tests {
             writes_at_stop,
             "the heartbeat task must stop when the loop ends -- no writes after shutdown, no leak"
         );
+    }
+
+    /// Issue #1756: both halves of the membership decision read the ONE
+    /// injected clock. The heartbeat task writes `heartbeat_unix_ns` from it
+    /// and judges sibling staleness against it, so a test that drives a
+    /// `FixedClock` drives eviction rather than reporting on how fast the
+    /// machine ran.
+    ///
+    /// Two real `run_loop` workers heartbeat into one shared store until each
+    /// sees a live set of two. Worker B is then shut down and ONLY the injected
+    /// clock moves, past `DEFAULT_LIVENESS_FACTOR * DEFAULT_HEARTBEAT_INTERVAL`.
+    /// Worker A must drop B from its live set. Real time does not advance: the
+    /// runtime is paused, every advance below is simulated, and nothing here
+    /// sleeps or reads a wall clock.
+    ///
+    /// Flip to watch it fail against pre-fix code: build a `WallClock` inside
+    /// the spawned heartbeat task instead of cloning the context's clock. The
+    /// timestamps B wrote and the `now` A compares them against then both come
+    /// from real time, which moves by milliseconds over the whole test, so B
+    /// never ages out and the live set stays at two.
+    #[tokio::test(start_paused = true)]
+    async fn an_injected_clock_advance_evicts_a_stopped_worker() {
+        use ravel_maintain::worker_set::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LIVENESS_FACTOR};
+
+        // `MemoryStore` reports no modification time: its `clock_ms` defaults to
+        // 0 and nothing here sets it, so `live_set_read`'s LIST-metadata
+        // shortcut takes `mtime_stale`'s unknown-mtime path and the heartbeat
+        // body's stamp is what decides liveness. The value below does not gate
+        // that shortcut; it is epoch-relative only so the arithmetic below is
+        // readable.
+        const NOW_NS: i64 = 1_000 * TEST_NS_PER_HOUR;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+        let context_for = |worker: Arc<WorkerSet>, ownership: Arc<MaintenanceOwnershipMetrics>| {
+            LoopContext {
+                store: Arc::clone(&store),
+                fallback_allow: None,
+                compactor: Arc::new(CompactorConfig::default()),
+                retention: Arc::new(RetentionConfig::default()),
+                shard_count: 1,
+                // Past the whole simulated test window, so no discovery cycle
+                // fires and only the heartbeat task's behavior is under test.
+                interval: Duration::from_secs(3600),
+                metrics: Arc::new(TenantDiscoveryMetrics::default()),
+                safety: Arc::new(MaintenanceSafetyMetrics::default()),
+                ownership,
+                worker,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(clock.clone()),
+                cycle_hook: Arc::new(|| {}),
+            }
+        };
+
+        let ownership_a = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let ownership_b = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let (shutdown_a_tx, shutdown_a_rx) = oneshot::channel();
+        let (shutdown_b_tx, shutdown_b_rx) = oneshot::channel();
+        let loop_a = tokio::spawn(run_loop(
+            context_for(
+                Arc::new(WorkerSet::with_defaults(NOW_NS)),
+                Arc::clone(&ownership_a),
+            ),
+            shutdown_a_rx,
+        ));
+        let loop_b = tokio::spawn(run_loop(
+            context_for(
+                Arc::new(WorkerSet::with_defaults(NOW_NS)),
+                Arc::clone(&ownership_b),
+            ),
+            shutdown_b_rx,
+        ));
+
+        let converged = advance_until(600, Duration::from_secs(1), || {
+            ownership_a.workers_live() == 2 && ownership_b.workers_live() == 2
+        })
+        .await;
+        assert!(
+            converged,
+            "two workers sharing a store must converge to a live set of two, saw a={} b={}",
+            ownership_a.workers_live(),
+            ownership_b.workers_live()
+        );
+
+        // Worker B stops: its heartbeat key is never refreshed again, and
+        // nothing else in the store changes.
+        shutdown_b_tx.send(()).expect("send shutdown to worker b");
+        loop_b.await.expect("worker b joins cleanly on shutdown");
+
+        // Move ONLY the injected clock, to one heartbeat interval past the
+        // liveness window, and let worker A's heartbeat cadence fire on the
+        // paused runtime.
+        let heartbeat_ns =
+            i64::try_from(DEFAULT_HEARTBEAT_INTERVAL.as_nanos()).expect("H fits in i64");
+        let window_ns = heartbeat_ns * i64::from(DEFAULT_LIVENESS_FACTOR);
+        clock.set(NOW_NS + window_ns + heartbeat_ns);
+
+        let evicted = advance_until(600, Duration::from_secs(1), || {
+            ownership_a.workers_live() == 1
+        })
+        .await;
+        assert!(
+            evicted,
+            "advancing the injected clock past {}s must evict the stopped worker, saw {} live",
+            (window_ns / 1_000_000_000),
+            ownership_a.workers_live()
+        );
+
+        shutdown_a_tx.send(()).expect("send shutdown to worker a");
+        loop_a.await.expect("worker a joins cleanly on shutdown");
+    }
+
+    /// A `LoopContext` for the liveness/supervisor tests: one discovered tenant
+    /// behind a fault-free `FaultStore`, a solo worker, a 1s discovery interval,
+    /// and the injected `FixedClock`/`cycle_hook` the test drives. Returns the
+    /// context plus the shared `ownership` and `metrics` handles the test reads
+    /// its assertions off.
+    async fn liveness_loop_context(
+        clock: ravel_maintain::FixedClock,
+        cycle_hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> (
+        LoopContext,
+        Arc<MaintenanceOwnershipMetrics>,
+        Arc<TenantDiscoveryMetrics>,
+    ) {
+        let inner = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        publish_terminal_bucket(&inner, &tenant_id).await;
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(FaultStore::new(inner, FaultPlan::empty()));
+
+        let metrics = Arc::new(TenantDiscoveryMetrics::default());
+        let ownership = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let ctx = LoopContext {
+            store,
+            fallback_allow: None,
+            compactor: Arc::new(CompactorConfig::default()),
+            retention: Arc::new(RetentionConfig::default()),
+            shard_count: 1,
+            interval: Duration::from_secs(1),
+            metrics: Arc::clone(&metrics),
+            safety: Arc::new(MaintenanceSafetyMetrics::default()),
+            ownership: Arc::clone(&ownership),
+            worker: Arc::new(solo_worker()),
+            rng: Arc::new(SystemRng),
+            clock: Arc::new(clock),
+            cycle_hook,
+        };
+        (ctx, ownership, metrics)
+    }
+
+    /// Advances the paused clock in small steps until `pred` holds or the step
+    /// budget runs out, returning whether it held. Small steps so the paused
+    /// runtime actually wakes the spawned loop between each.
+    async fn advance_until(steps: usize, step: Duration, pred: impl Fn() -> bool) -> bool {
+        for _ in 0..steps {
+            if pred() {
+                return true;
+            }
+            tokio::time::advance(step).await;
+            tokio::task::yield_now().await;
+        }
+        pred()
+    }
+
+    /// Deliverable 1+2: a completed cycle stamps
+    /// `ravel_maintain_last_cycle_completed_timestamp_seconds` from the injected
+    /// clock, to that clock's exact value (issue #1683). Asserts the exact
+    /// number, not merely that it moved off zero: a stamp taken from the wrong
+    /// clock, or scaled wrong, fails here.
+    ///
+    /// Flip to watch it fail against pre-fix code: delete the
+    /// `ownership.set_last_cycle_completed(clock.now_ns())` call in `run_loop`'s
+    /// `Ok(())` arm. The gauge then never leaves zero and the `NOW_NS` assertion
+    /// fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_cycle_stamps_the_liveness_gauge_from_the_injected_clock() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+        let (ctx, ownership, metrics) = liveness_loop_context(clock, Arc::new(|| {})).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_loop(ctx, shutdown_rx));
+
+        let completed = advance_until(200, Duration::from_millis(100), || {
+            ownership.last_cycle_completed_unix_ns() != 0
+        })
+        .await;
+        assert!(completed, "a discovery cycle must have completed");
+
+        assert_eq!(
+            ownership.last_cycle_completed_unix_ns(),
+            NOW_NS,
+            "the liveness gauge must hold the injected clock's exact value"
+        );
+        assert_eq!(
+            metrics.tenants_maintained(),
+            1,
+            "the storage-discovered tenant was maintained this cycle"
+        );
+        assert_eq!(
+            ownership.loop_panics_total(),
+            0,
+            "a healthy cycle records no panic"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let _ = handle.await;
+    }
+
+    /// The contrast that is the whole point of the ticket (issue #1683): once
+    /// the loop stops, the liveness gauge does NOT advance even as the clock
+    /// moves past two intervals, while `ravel_maintain_tenants_maintained` still
+    /// reads its old value. A gauge that merely passed the wall clock through
+    /// would keep moving and read as healthy on a dead loop; both figures
+    /// freezing at their last healthy value is exactly the failure this gauge
+    /// exists to make visible through its age.
+    ///
+    /// Flip to watch it fail against pre-fix code: move the
+    /// `ownership.set_last_cycle_completed(...)` stamp out of the completed-cycle
+    /// guard and into the top of the `run_loop` iteration (or drive it off
+    /// `WallClock`). It would then advance without a completed cycle and the
+    /// "did not advance" assertion below fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_loop_freezes_the_gauge_and_the_maintained_count() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+        const INTERVAL_NS: i64 = 1_000_000_000;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+        // Keep a handle to drive the clock forward after the loop stops.
+        let clock_handle = clock.clone();
+        let (ctx, ownership, metrics) = liveness_loop_context(clock, Arc::new(|| {})).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_loop(ctx, shutdown_rx));
+
+        let completed = advance_until(200, Duration::from_millis(100), || {
+            ownership.last_cycle_completed_unix_ns() != 0
+        })
+        .await;
+        assert!(
+            completed,
+            "one cycle must complete before the loop is stopped"
+        );
+        let stamped = ownership.last_cycle_completed_unix_ns();
+        let maintained = metrics.tenants_maintained();
+        assert_eq!(stamped, NOW_NS);
+        assert_eq!(maintained, 1);
+
+        // End the loop, then advance the injected clock past two intervals.
+        shutdown_tx.send(()).expect("send shutdown");
+        handle.await.expect("run_loop joins cleanly on shutdown");
+        clock_handle.set(NOW_NS + 3 * INTERVAL_NS);
+        // Advance simulated time past two intervals too, proving no cycle sneaks
+        // in after shutdown.
+        let _ = advance_until(30, Duration::from_millis(100), || false).await;
+
+        assert_eq!(
+            ownership.last_cycle_completed_unix_ns(),
+            stamped,
+            "the liveness gauge must not advance once the loop stopped, even as the clock moves \
+             past two intervals -- its frozen age is the dead-loop signal"
+        );
+        assert_eq!(
+            metrics.tenants_maintained(),
+            maintained,
+            "ravel_maintain_tenants_maintained also freezes at its last healthy value, which is \
+             exactly why it cannot itself distinguish a dead loop from a healthy one"
+        );
+    }
+
+    /// Shutdown is observed DURING the restart backoff, not after it. The
+    /// backoff is 60 s and the drain is wrapped in a 5 s deadline, both on the
+    /// paused runtime's virtual clock: a supervisor that waits the backoff out
+    /// leaves both timers pending, the runtime advances to the earlier one,
+    /// and the deadline elides. No real time is measured, so the assertion is
+    /// deterministic rather than a band.
+    ///
+    /// Flip to watch it fail: move the wait back into the resolved `select!`
+    /// arm (`tokio::time::sleep(backoff).await;` in place of
+    /// `pending_backoff = Some(backoff);`). The receiver is no longer polled
+    /// while that sleep runs, so the drain misses the deadline below.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_the_restart_backoff_is_not_held_behind_it() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+        const BACKOFF: Duration = Duration::from_secs(60);
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+
+        // Every cycle panics, so the supervisor is always inside its backoff
+        // when the shutdown below arrives.
+        let cycle_hook: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(|| panic!("injected maintenance loop panic (test)"));
+
+        let (ctx, ownership, _metrics) = liveness_loop_context(clock, cycle_hook).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_supervisor(ctx, shutdown_rx, BACKOFF, BACKOFF));
+
+        let panicked = advance_until(400, Duration::from_millis(50), || {
+            ownership.loop_panics_total() >= 1
+        })
+        .await;
+        assert!(panicked, "the first attempt must panic and be counted");
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let drained = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            drained.is_ok(),
+            "a drain arriving during the {BACKOFF:?} backoff must be observed at once, not held \
+             behind it"
+        );
+        drained.expect("deadline").expect("supervisor joins");
+        assert_eq!(
+            ownership.loop_panics_total(),
+            1,
+            "no further attempt is spawned once shutdown arrives, so the panic total stays at \
+             the one attempt that ran"
+        );
+    }
+
+    /// Deliverables 3+4: a panic in the loop body is caught, counted exactly
+    /// once on `ravel_maintain_loop_panics_total`, and the supervisor restarts
+    /// the loop so a later cycle stamps the liveness gauge again (issue #1683).
+    ///
+    /// Flip to watch it fail against pre-fix code: in `run_loop`'s cycle arm,
+    /// drop the `catch_unwind` and `await` the cycle body directly. The injected
+    /// panic then aborts the whole task; `run_supervisor`'s `Err(join_err)` arm
+    /// still restarts it, but `inc_loop_panics` runs there too, so to see the
+    /// count assertion fail also remove that arm's `inc_loop_panics()` -- the
+    /// counter then reads 0. To see the restart itself matter, replace
+    /// `run_supervisor` with a bare `tokio::spawn(run_loop(...))`: the gauge
+    /// never leaves zero after the panic and the `NOW_NS` assertion fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_caught_panic_is_counted_and_the_supervisor_restarts_the_loop() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+
+        // Panic on the first cycle only; every later cycle runs normally. The
+        // supervisor clones the context (and this shared flag) into each attempt,
+        // so the second attempt sees the flag already consumed.
+        let panic_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook_flag = Arc::clone(&panic_armed);
+        let cycle_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if hook_flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                panic!("injected maintenance loop panic (test)");
+            }
+        });
+
+        let (ctx, ownership, _metrics) = liveness_loop_context(clock, cycle_hook).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        // Small, fixed backoff so the paused-time advance drives the restart.
+        let handle = tokio::spawn(run_supervisor(
+            ctx,
+            shutdown_rx,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+
+        let recovered = advance_until(400, Duration::from_millis(50), || {
+            ownership.last_cycle_completed_unix_ns() != 0
+        })
+        .await;
+        assert!(
+            recovered,
+            "the supervisor must restart the loop and complete a later cycle after the panic"
+        );
+        assert_eq!(
+            ownership.loop_panics_total(),
+            1,
+            "exactly one panic was caught and counted, not zero (uncounted) or a restart loop"
+        );
+        assert_eq!(
+            ownership.last_cycle_completed_unix_ns(),
+            NOW_NS,
+            "the restarted loop stamps the liveness gauge from the injected clock"
+        );
+        assert!(
+            !panic_armed.load(std::sync::atomic::Ordering::SeqCst),
+            "the one-shot panic must have fired"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let _ = handle.await;
     }
 
     /// The fail-closed re-assert (closing the write-fence gap): a stored

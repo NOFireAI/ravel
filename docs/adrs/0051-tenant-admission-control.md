@@ -599,11 +599,14 @@ older than `now - max_ingest_lag` are rejected with `TooOld`. That is
 ADR-0010 §8's existing contract, not a new restriction, and this
 amendment does not shrink it — the accept region is exactly the
 documented one. Deployments that need longer replay raise
-`max_ingest_lag`, together with the catalog listing window, under the
-coordinated-raise rule (docs/consistency-model.md "Late and skewed
-data"; docs/guides/admission-limits.md "Raising max_ingest_lag"): widen
-the catalog window first, then the admission bound. Lowering is always
-safe.
+`max_ingest_lag` with the `--max-ingest-lag` server flag (default `2h`).
+That single flag drives both the admission bound and the paired catalog
+listing window, resolved so the window is set first and the admission
+bound derived from it: the "widen the window first, then the admission
+bound" order (docs/consistency-model.md "Late and skewed data";
+docs/guides/admission-limits.md "Raising max_ingest_lag") holds by
+construction, and startup refuses a pair the listing window cannot serve
+rather than admitting data no query can find. Lowering is always safe.
 
 ![Ingest-timestamp plausibility window](../diagrams/ingest-plausibility-window.svg)
 

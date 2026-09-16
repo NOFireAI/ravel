@@ -128,6 +128,9 @@ fn sql_request(sql: &str, window: TimeRange, now_ns: i64) -> SqlRequest {
         min_tokens: Vec::new(),
         now_ns,
         deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     }
 }
 

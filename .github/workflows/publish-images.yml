@@ -20,6 +20,20 @@ env:
   # case (NOFireAI) and Docker rejects non-lowercase repository names.
   IMAGE_OWNER: nofireai
 
+# Workflow-level permissions floor (issue #1717). Every job below already
+# declares what it needs, so this changes nothing for them today; it is the
+# floor a job added later inherits, instead of inheriting the repository
+# default of write. The wider grants stay where they are: packages: write on
+# build and merge, contents: write and id-token: write on release.
+#
+# Every checkout carries `persist-credentials: false`. Nothing here runs git
+# against the remote after checking out: the registry steps authenticate
+# through docker/login-action and the release steps through gh's GH_TOKEN,
+# neither of which reads .git/config. These are the most powerful tokens in
+# the repo, so they stay out of a file the image build can read.
+permissions:
+  contents: read
+
 jobs:
   # ADR-0037 amendment decision 9 (and decision 11's version match). A tag
   # push no longer publishes unconditionally: this gate resolves the tagged
@@ -34,6 +48,8 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Decision 11: the workspace version is the release version. On a tag
       # push, [workspace.package] version from the tagged tree's Cargo.toml
@@ -207,6 +223,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/free-disk-space
 
@@ -606,6 +624,8 @@ jobs:
       # The tagged tree: decision 5 reads CHANGELOG.md from it, so a section
       # only reaches a Release if it was committed before the tag was cut.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 

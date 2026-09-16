@@ -75,6 +75,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{collect, displayable, execute_stream};
@@ -86,15 +87,16 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::distrib::partition::{DistribThresholds, partition_snapshot};
 use ravel_query::{
-    ByteLimit, EngineConfig, LogSegmentFetcher, QueryAdmissionController, QueryConcurrencyLimit,
-    SegmentFetcher,
+    ByteLimit, EngineConfig, LogSegmentFetcher, PhaseAccounting, QueryAdmissionController,
+    QueryConcurrencyLimit, SegmentFetcher,
 };
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_sql::distributed::{CoordinatorSliceReader, SliceFallback, SliceFallbackCounters};
 use ravel_sql::{
     DistributedFlightConfig, FlightAuth, FlightClock, FlightSqlConfig, FlightTicket,
-    FlightTicketError, RavelFlightSqlService, RavelTableProvider, SegmentPin, SqlConfig,
-    SqlExecutor, StaticWorkerEndpoints, WorkerSlice, WorkerSliceClient, distributed_samples_plan,
-    internal_schema, plan_distributed_slices,
+    FlightTicketError, FlightWorkerSliceClient, RavelFlightSqlService, RavelTableProvider,
+    SegmentPin, SqlConfig, SqlExecutor, StaticWorkerEndpoints, WorkerSlice, WorkerSliceClient,
+    distributed_samples_plan, internal_schema, plan_distributed_slices,
 };
 use ravel_types::accounting::{NoopQueryCostRecorder, QueryAccounting};
 use ravel_types::{CommitToken, Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
@@ -335,6 +337,7 @@ impl WorkerSliceClient for InProcessWorker {
         _location: &str,
         ticket: &FlightTicket,
         limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         self.limits_seen.lock().expect("lock").push(limit);
         // Rebuild the slice's snapshot from the ticket and run the worker
@@ -348,7 +351,7 @@ impl WorkerSliceClient for InProcessWorker {
             TENANT,
             self.fetcher.clone(),
             self.config.clone(),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         );
         let plan = provider.worker_fragment(segments.len().max(1), &segments)?;
         execute_stream(plan, Arc::new(TaskContext::default()))
@@ -428,6 +431,7 @@ impl WorkerSliceClient for WireWorker {
         _location: &str,
         ticket: &FlightTicket,
         _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         // Encode the slice ticket exactly as the coordinator would, then redeem
         // it against the real service. `slice_count > 1` routes it to the
@@ -565,7 +569,7 @@ async fn distributed_scan_equals_local_scan() {
         TENANT,
         fetcher.clone(),
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let local_plan = local.plan(4).expect("local plan");
     let local_batches = collect(local_plan, Arc::new(TaskContext::default()))
@@ -580,7 +584,7 @@ async fn distributed_scan_equals_local_scan() {
         TENANT,
         fetcher,
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client));
     let ctx = SessionContext::new();
@@ -626,6 +630,7 @@ async fn distributed_plan_shape_is_dedup_over_merge_over_scan() {
         None,
         QueryAccounting::new(),
         ByteLimit::Unlimited,
+        SliceFallback::remote_only(),
     )
     .expect("distributed plan");
 
@@ -676,7 +681,7 @@ async fn limit_hint_returns_exactly_limit_rows_over_multiple_slices() {
         TENANT,
         fetcher.clone(),
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let local_batches = collect(
         local.plan(4).expect("local plan"),
@@ -699,7 +704,7 @@ async fn limit_hint_returns_exactly_limit_rows_over_multiple_slices() {
         TENANT,
         fetcher,
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client));
 
@@ -1097,7 +1102,7 @@ async fn distributed_scan_over_wire_equals_local() {
         TENANT,
         fetcher.clone(),
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     );
     let local_batches = collect(
         local.plan(4).expect("local plan"),
@@ -1121,7 +1126,7 @@ async fn distributed_scan_over_wire_equals_local() {
         TENANT,
         fetcher,
         SqlConfig::default(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client));
     let ctx = SessionContext::new();
@@ -1238,7 +1243,7 @@ async fn distributed_aggregate_equals_local() {
                 TENANT,
                 fetcher.clone(),
                 SqlConfig::default(),
-                QueryAccounting::new(),
+                PhaseAccounting::new(),
             )),
         )
         .expect("register local");
@@ -1255,7 +1260,7 @@ async fn distributed_aggregate_equals_local() {
                     TENANT,
                     fetcher,
                     SqlConfig::default(),
-                    QueryAccounting::new(),
+                    PhaseAccounting::new(),
                 )
                 .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client)),
             ),
@@ -1299,7 +1304,7 @@ async fn distributed_scan_folds_bytes_into_coordinator_accounting() {
         TENANT,
         fetcher.clone(),
         SqlConfig::default(),
-        accounting.clone(),
+        PhaseAccounting::pooled_over(&accounting),
     )
     .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client));
     let ctx = SessionContext::new();
@@ -1326,7 +1331,7 @@ async fn distributed_scan_folds_bytes_into_coordinator_accounting() {
         TENANT,
         fetcher,
         tight,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
     )
     .with_distributed_scan(endpoints_for(&snapshot), Arc::clone(&client));
     let ctx2 = SessionContext::new();
@@ -1341,6 +1346,504 @@ async fn distributed_scan_folds_bytes_into_coordinator_accounting() {
         err.to_string().contains("too many bytes"),
         "the byte ceiling surfaces as a scanned-too-many-bytes error: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The fallback sequence: a dead but still-registered worker (#1684)
+// ---------------------------------------------------------------------------
+//
+// A heartbeat live-set keeps a dead worker registered for `3 * H`, so a slice
+// can be assigned to a location whose process is gone. The sequence under test
+// is: the assigned worker, EXACTLY ONE re-dispatch to another location, a
+// coordinator-local read, then a typed error.
+//
+// Both Flight failure shapes are covered, by two different clients:
+//
+// - *first poll*: `RefusedPortWorkers` answers a dead location through the REAL
+//   `FlightWorkerSliceClient`, dialed at a port nothing listens on. The channel
+//   is built lazily, so `fetch_slice` returns `Ok` and the connection refusal
+//   only surfaces when the stream is first polled. This is the ticket's own
+//   scenario, and a fallback that only handled the construct-time shape would
+//   leave every one of these cases failing.
+// - *construct time*: `RefusingClient` returns `Err` from `fetch_slice` itself,
+//   the shape an unparseable location or an unencodable ticket produces.
+//
+// prove-the-test: the reference on every byte-identity assertion is the plain
+// single-process provider scan (`plan(..)`), never the distributed plan under
+// test, so a regression in the fallback cannot hide by appearing on both sides.
+// Flipping the sequence back to the pre-fix single fetch (returning the first
+// attempt's error from `DistributedScanExec::execute` instead of running the
+// steps) fails all four cases: the first three on the error the refused port
+// raises, the fourth on its counter assertions.
+
+/// A TCP port with nothing listening on it: bound to learn a free port, then
+/// dropped. A dial gets `ECONNREFUSED` promptly rather than hanging.
+fn refused_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    port
+}
+
+/// A location pointing at [`refused_port`]: a registered worker whose process
+/// is gone, in the exact form the fleet roster would carry it.
+fn dead_location() -> String {
+    format!("http://127.0.0.1:{}", refused_port())
+}
+
+/// One worker endpoint per shard-major slice of `snapshot`, placed on
+/// `locations` round-robin, exactly as `plan_distributed_slices` places them.
+fn endpoints_at(snapshot: &Snapshot, locations: &[String]) -> Vec<WorkerSlice> {
+    endpoints_for(snapshot)
+        .into_iter()
+        .enumerate()
+        .map(|(k, slice)| WorkerSlice {
+            location: locations[k % locations.len()].clone(),
+            ..slice
+        })
+        .collect()
+}
+
+/// Serves healthy locations from the in-process worker and dead ones through
+/// the real Flight client, which dials the location's (closed) port. The dead
+/// half fails on the FIRST POLL of the returned stream, not at construction.
+struct RefusedPortWorkers {
+    healthy: InProcessWorker,
+    flight: FlightWorkerSliceClient,
+    dead: BTreeSet<String>,
+}
+
+impl std::fmt::Debug for RefusedPortWorkers {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("RefusedPortWorkers")
+    }
+}
+
+impl WorkerSliceClient for RefusedPortWorkers {
+    fn fetch_slice(
+        &self,
+        location: &str,
+        ticket: &FlightTicket,
+        limit: Option<usize>,
+        _context: &Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        if self.dead.contains(location) {
+            self.flight.fetch_slice(location, ticket, limit, _context)
+        } else {
+            self.healthy.fetch_slice(location, ticket, limit, _context)
+        }
+    }
+}
+
+/// Fails at CONSTRUCTION for the named locations (`fetch_slice` returns `Err`),
+/// serving every other location from the in-process worker. With `dead` empty
+/// and used as the coordinator-local reader, it fails every local read.
+struct RefusingClient {
+    healthy: Option<InProcessWorker>,
+    dead: BTreeSet<String>,
+    message: &'static str,
+}
+
+impl std::fmt::Debug for RefusingClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("RefusingClient")
+    }
+}
+
+impl WorkerSliceClient for RefusingClient {
+    fn fetch_slice(
+        &self,
+        location: &str,
+        ticket: &FlightTicket,
+        limit: Option<usize>,
+        _context: &Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        match &self.healthy {
+            Some(worker) if !self.dead.contains(location) => {
+                worker.fetch_slice(location, ticket, limit, _context)
+            }
+            _ => Err(DataFusionError::Internal(self.message.to_string())),
+        }
+    }
+}
+
+/// The coordinator's own slice reader over `fetcher`: the sequence's local step.
+fn local_reader(fetcher: &SegmentFetcher) -> Arc<dyn WorkerSliceClient> {
+    Arc::new(CoordinatorSliceReader::new(
+        TENANT,
+        fetcher.clone(),
+        SqlConfig::default(),
+        PhaseAccounting::new(),
+    ))
+}
+
+/// Collect the distributed plan built directly (not through the provider), so
+/// the test owns the `SliceFallback` and can read its counters afterwards.
+async fn collect_with_fallback(
+    endpoints: Vec<WorkerSlice>,
+    client: Arc<dyn WorkerSliceClient>,
+    fallback: SliceFallback,
+) -> DFResult<Vec<RecordBatch>> {
+    collect_with_fallback_in(
+        endpoints,
+        client,
+        fallback,
+        Arc::new(TaskContext::default()),
+    )
+    .await
+}
+
+/// The same, under a caller-supplied `TaskContext`, so a test can pin which
+/// memory pool the coordinator-local read reserves against.
+async fn collect_with_fallback_in(
+    endpoints: Vec<WorkerSlice>,
+    client: Arc<dyn WorkerSliceClient>,
+    fallback: SliceFallback,
+    context: Arc<TaskContext>,
+) -> DFResult<Vec<RecordBatch>> {
+    let plan = distributed_samples_plan(
+        endpoints,
+        client,
+        EngineConfig::default().max_samples,
+        None,
+        QueryAccounting::new(),
+        ByteLimit::Unlimited,
+        fallback,
+    )?;
+    collect(plan, context).await
+}
+
+/// The whole-set result of the plain local scan: the independent reference for
+/// every byte-identity assertion below.
+async fn whole_set_reference(snapshot: &Snapshot, fetcher: &SegmentFetcher) -> Reduced {
+    let local = RavelTableProvider::new(
+        snapshot.clone(),
+        TENANT,
+        fetcher.clone(),
+        SqlConfig::default(),
+        PhaseAccounting::new(),
+    );
+    let batches = collect(
+        local.plan(4).expect("local plan"),
+        Arc::new(TaskContext::default()),
+    )
+    .await
+    .expect("collect local");
+    reduce_batches(&batches)
+}
+
+fn assert_counters(counters: &SliceFallbackCounters, redispatched: u64, local: u64, failed: u64) {
+    assert_eq!(
+        counters.redispatched(),
+        redispatched,
+        "slices re-dispatched to another worker"
+    );
+    assert_eq!(
+        counters.local_reads(),
+        local,
+        "slices read on the coordinator"
+    );
+    assert_eq!(counters.failed(), failed, "slices that failed typed");
+}
+
+#[tokio::test]
+async fn one_dead_worker_re_dispatches_to_the_other() {
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher = SegmentFetcher::new(Arc::clone(&backend));
+    let want = whole_set_reference(&snapshot, &fetcher).await;
+
+    // Two locations, the first dead: slice 0 is assigned to it, slice 1 to the
+    // healthy one. Slice 0's re-dispatch lands on the healthy location, so the
+    // coordinator-local step never runs.
+    let dead = dead_location();
+    let locations = vec![dead.clone(), "grpc://worker-live".to_string()];
+    let endpoints = endpoints_at(&snapshot, &locations);
+    assert_eq!(
+        endpoints.len(),
+        2,
+        "the fixture fans out over both locations"
+    );
+
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RefusedPortWorkers {
+        healthy: InProcessWorker::new(fetcher.clone()),
+        flight: FlightWorkerSliceClient::new(
+            ravel_sql::derive_ticket_key(b"fallback-cases"),
+            MetadataMap::new(),
+            Duration::from_secs(1),
+        ),
+        dead: [dead].into_iter().collect(),
+    });
+    let fallback = SliceFallback::with_local(local_reader(&fetcher));
+    let counters = fallback.counters();
+
+    let got = collect_with_fallback(endpoints, client, fallback)
+        .await
+        .expect("the statement survives one dead worker");
+
+    assert_reduced_eq(&reduce_batches(&got), &want);
+    assert_counters(&counters, 1, 0, 0);
+}
+
+#[tokio::test]
+async fn a_construct_time_failure_also_re_dispatches() {
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher = SegmentFetcher::new(Arc::clone(&backend));
+    let want = whole_set_reference(&snapshot, &fetcher).await;
+
+    // The other Flight failure shape: `fetch_slice` itself returns `Err`, so no
+    // stream is ever constructed. The sequence must cover this too.
+    let dead = "grpc://worker-unparseable".to_string();
+    let locations = vec![dead.clone(), "grpc://worker-live".to_string()];
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RefusingClient {
+        healthy: Some(InProcessWorker::new(fetcher.clone())),
+        dead: [dead].into_iter().collect(),
+        message: "invalid worker location",
+    });
+    let fallback = SliceFallback::with_local(local_reader(&fetcher));
+    let counters = fallback.counters();
+
+    let got = collect_with_fallback(endpoints_at(&snapshot, &locations), client, fallback)
+        .await
+        .expect("the statement survives a construct-time worker failure");
+
+    assert_reduced_eq(&reduce_batches(&got), &want);
+    assert_counters(&counters, 1, 0, 0);
+}
+
+#[tokio::test]
+async fn every_worker_dead_reads_on_the_coordinator() {
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher = SegmentFetcher::new(Arc::clone(&backend));
+    let want = whole_set_reference(&snapshot, &fetcher).await;
+
+    // Both locations dead: every slice pays its assigned worker, its one
+    // re-dispatch, and then reads on the coordinator. The result is still the
+    // byte-identical whole set, because the local read runs the same worker
+    // fragment over the same pinned segments.
+    let locations = vec![dead_location(), dead_location()];
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RefusedPortWorkers {
+        healthy: InProcessWorker::new(fetcher.clone()),
+        flight: FlightWorkerSliceClient::new(
+            ravel_sql::derive_ticket_key(b"fallback-cases"),
+            MetadataMap::new(),
+            Duration::from_secs(1),
+        ),
+        dead: locations.iter().cloned().collect(),
+    });
+    let fallback = SliceFallback::with_local(local_reader(&fetcher));
+    let counters = fallback.counters();
+
+    let got = collect_with_fallback(endpoints_at(&snapshot, &locations), client, fallback)
+        .await
+        .expect("the coordinator reads the slices itself");
+
+    assert_reduced_eq(&reduce_batches(&got), &want);
+    // Two slices, each re-dispatched once and then read locally. The split is
+    // what distinguishes this case from the one above: a pooled "a fallback
+    // happened" figure would read the same for both.
+    assert_counters(&counters, 2, 2, 0);
+}
+
+/// A `MemoryPool` that records the name of every consumer registered against
+/// it. `RsegScanExec` registers `RsegScanExec[<partition>]`, so seeing that
+/// name is proof the scan reserved against THIS pool rather than another one.
+#[derive(Debug, Default)]
+struct RecordingPool {
+    inner: datafusion::execution::memory_pool::UnboundedMemoryPool,
+    consumers: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingPool {
+    fn saw_scan(&self) -> bool {
+        self.consumers
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|name| name.starts_with("RsegScanExec"))
+    }
+}
+
+impl std::fmt::Display for RecordingPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RecordingPool")
+    }
+}
+
+impl datafusion::execution::memory_pool::MemoryPool for RecordingPool {
+    fn memory_limit(&self) -> datafusion::execution::memory_pool::MemoryLimit {
+        self.inner.memory_limit()
+    }
+
+    fn register(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+        self.consumers
+            .lock()
+            .expect("lock")
+            .push(consumer.name().to_string());
+        self.inner.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+
+    fn grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) {
+        self.inner.grow(reservation, additional);
+    }
+
+    fn shrink(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        shrink: usize,
+    ) {
+        self.inner.shrink(reservation, shrink);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) -> DFResult<()> {
+        self.inner.try_grow(reservation, additional)
+    }
+
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+
+    fn name(&self) -> &str {
+        "RecordingPool"
+    }
+}
+
+/// The coordinator-local read reserves against the query's own memory pool,
+/// not a default one. `RsegScanExec` registers its `MemoryReservation` against
+/// `context.memory_pool()`, and a bare `TaskContext` carries an unbounded pool,
+/// so a local read under a default context is the one path whose decoded
+/// batches escape the tenant's budget. That window is exactly when every worker
+/// is dead and the coordinator reads every slice itself.
+///
+/// A pool that records its consumers proves the threading directly: the scan
+/// names itself `RsegScanExec[<partition>]`, so the assertion is that THIS
+/// pool saw that consumer. A bounded pool would not do: a small limit fails
+/// the whole plan whichever pool the scan used, which is a test that passes
+/// for the wrong reason.
+///
+/// Flip to watch it fail: in `CoordinatorSliceReader::fetch_slice`, pass
+/// `Arc::new(TaskContext::default())` to `execute_stream` instead of the
+/// threaded `context`. The scan then registers against that default pool and
+/// this one never sees it.
+#[tokio::test]
+async fn the_coordinator_local_read_reserves_against_the_query_pool() {
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher = SegmentFetcher::new(Arc::clone(&backend));
+
+    let locations = vec![dead_location(), dead_location()];
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RefusedPortWorkers {
+        healthy: InProcessWorker::new(fetcher.clone()),
+        flight: FlightWorkerSliceClient::new(
+            ravel_sql::derive_ticket_key(b"fallback-cases"),
+            MetadataMap::new(),
+            Duration::from_secs(1),
+        ),
+        dead: locations.iter().cloned().collect(),
+    });
+    let fallback = SliceFallback::with_local(local_reader(&fetcher));
+
+    let pool = Arc::new(RecordingPool::default());
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(
+            Arc::clone(&pool) as Arc<dyn datafusion::execution::memory_pool::MemoryPool>
+        )
+        .build_arc()
+        .expect("runtime builds");
+    let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+    let got = collect_with_fallback_in(
+        endpoints_at(&snapshot, &locations),
+        client,
+        fallback,
+        context,
+    )
+    .await
+    .expect("the coordinator reads the slices itself");
+    assert!(!got.is_empty(), "the fallback still returns the whole set");
+
+    assert!(
+        pool.saw_scan(),
+        "the coordinator-local scan must reserve against the query's pool;          consumers seen: {:?}",
+        pool.consumers.lock().expect("lock"),
+    );
+}
+
+#[tokio::test]
+async fn a_failing_local_read_fails_typed_and_names_the_cause() {
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher = SegmentFetcher::new(Arc::clone(&backend));
+
+    // ONE endpoint, so the counters are unambiguous: there is no other location
+    // to re-dispatch to, which also pins the "no phantom re-dispatch" rule.
+    let dead = dead_location();
+    let endpoints = vec![WorkerSlice {
+        location: dead.clone(),
+        ..endpoints_for(&snapshot)[0].clone()
+    }];
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RefusedPortWorkers {
+        healthy: InProcessWorker::new(fetcher.clone()),
+        flight: FlightWorkerSliceClient::new(
+            ravel_sql::derive_ticket_key(b"fallback-cases"),
+            MetadataMap::new(),
+            Duration::from_secs(1),
+        ),
+        dead: [dead].into_iter().collect(),
+    });
+    // The coordinator's own read fails too: nothing is left to try.
+    let local: Arc<dyn WorkerSliceClient> = Arc::new(RefusingClient {
+        healthy: None,
+        dead: BTreeSet::new(),
+        message: "the coordinator's own store is unreachable",
+    });
+    let fallback = SliceFallback::with_local(local);
+    let counters = fallback.counters();
+
+    let err = collect_with_fallback(endpoints, client, fallback)
+        .await
+        .expect_err("every step failed, so the statement fails");
+
+    let text = err.to_string();
+    assert!(
+        text.contains("distributed slice 0 of 2"),
+        "the error names the slice that could not be read: {text}"
+    );
+    assert!(
+        text.contains("the coordinator's own store is unreachable"),
+        "the error names the last cause, not just that something failed: {text}"
+    );
+    // Typed, not a bare string: the same `SqlError` channel every other
+    // ravel-sql failure surfaces through.
+    match err.find_root() {
+        DataFusionError::External(inner) => {
+            let sql = inner
+                .downcast_ref::<ravel_sql::SqlError>()
+                .unwrap_or_else(|| panic!("expected a typed SqlError, got {inner}"));
+            assert!(
+                matches!(sql, ravel_sql::SqlError::Execution(_)),
+                "a slice that no location could serve is an execution failure: {sql:?}"
+            );
+        }
+        other => panic!("expected the typed SqlError, got {other:?}"),
+    }
+    // One slice: no other location to re-dispatch to (so no phantom
+    // re-dispatch), one local attempt, one typed failure.
+    assert_counters(&counters, 0, 1, 1);
 }
 
 // ===========================================================================
@@ -1536,6 +2039,7 @@ impl WorkerSliceClient for RlogWorker {
         _location: &str,
         ticket: &FlightTicket,
         _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let snapshot = ticket.snapshot();
         let target_partitions = snapshot.segments.len().max(1);
@@ -1549,7 +2053,7 @@ fn logs_fragment(
     fetcher: LogSegmentFetcher,
     target_partitions: usize,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
-    LogsTableProvider::new(snapshot, TENANT, fetcher, QueryAccounting::new())
+    LogsTableProvider::new(snapshot, TENANT, fetcher, PhaseAccounting::new())
         .worker_fragment(target_partitions)
 }
 
@@ -1666,7 +2170,7 @@ async fn distributed_logs_reshard_straddle_equals_sorted_local() {
             snapshot.clone(),
             TENANT,
             fetcher.clone(),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )
         .plan(4)
         .expect("local plan"),
@@ -1680,7 +2184,7 @@ async fn distributed_logs_reshard_straddle_equals_sorted_local() {
         build: logs_fragment,
     });
     let dist: Arc<dyn TableProvider> = Arc::new(
-        LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+        LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, PhaseAccounting::new())
             .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
     );
     let got = ts_and(&collect_distributed(dist).await, "ts", "body");
@@ -1728,7 +2232,7 @@ async fn distributed_logs_preserves_duplicate_rows() {
             snapshot.clone(),
             TENANT,
             fetcher.clone(),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
         )
         .plan(4)
         .expect("local plan"),
@@ -1742,7 +2246,7 @@ async fn distributed_logs_preserves_duplicate_rows() {
         build: logs_fragment,
     });
     let dist: Arc<dyn TableProvider> = Arc::new(
-        LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+        LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, PhaseAccounting::new())
             .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
     );
     let mut got = ts_and(&collect_distributed(dist).await, "ts", "body");
@@ -1786,7 +2290,7 @@ async fn distributed_logs_plan_merges_without_dedup() {
         fetcher: fetcher.clone(),
         build: logs_fragment,
     });
-    let dist = LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+    let dist = LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, PhaseAccounting::new())
         .with_distributed_scan(rlog_endpoints_for(&snapshot), client);
     let ctx = SessionContext::new();
     let plan = dist
@@ -2193,6 +2697,7 @@ impl WorkerSliceClient for SpanWorker {
         _location: &str,
         ticket: &FlightTicket,
         _limit: Option<usize>,
+        _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let snapshot = ticket.snapshot();
         let target_partitions = snapshot.segments.len().max(1);

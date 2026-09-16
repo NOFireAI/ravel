@@ -212,6 +212,259 @@ exists for disk-hungry jobs.
    `services/*` in the doc map), an index entry in `docs/README.md`,
    and a README.md pointer.
 
+**Amendment (2026-09-07): pod and RBAC hardening are the operator's
+responsibility (issue #126).** The rendered objects this ADR describes
+shipped with no workload hardening, and the operator's ServiceAccount
+held a cluster-wide `secrets` read. Both are now the operator's job, in
+the same pure render path as everything else in decision 3:
+
+- Every rendered container carries a SecurityContext: `runAsNonRoot`,
+  `allowPrivilegeEscalation: false`, all Linux capabilities dropped, and
+  a read-only root filesystem. The read-only root is correct because
+  object storage is the only durable backend (no process writes local
+  disk on any path the operator renders): the sole opt-in local write is
+  the ADR-0046 disk cache, which the operator renders no `--cache-dir`
+  flag for, so every rendered container runs RAM-only. A future CRD field
+  that wires `--cache-dir` must add its own writable volume mount.
+- Every rendered PodSpec carries a pod SecurityContext (`runAsNonRoot`
+  and the `RuntimeDefault` seccomp profile) and preferred (soft), never
+  required, pod anti-affinity spreading a tier's replicas across nodes.
+  Preferred because a required rule would leave a single-node `kind`
+  cluster (the reference environment, decision 6) unable to schedule a
+  second replica.
+- The operator renders one PodDisruptionBudget per tier
+  (`maxUnavailable: 1`), applied and swept exactly like the Deployments,
+  so a manual patch does not survive a reconcile. The budget protects a
+  multi-replica tier during a voluntary disruption (a node drain): the
+  eviction of a second pod is blocked once it would breach
+  `maxUnavailable: 1`, so at least one replica keeps serving. A
+  single-replica tier (the maintain default) is not protected and can
+  still be drained to zero, which is intentional: `maxUnavailable: 1`
+  permits evicting the one pod, and the operator does not force two
+  replicas (the same reason the anti-affinity above is preferred, not
+  required).
+- The cluster-wide `secrets` grant is removed. The operator keeps its
+  cluster-wide `RavelCluster` watch (decision 3) and reads each object's
+  referenced Secrets in that object's own namespace, so `secrets get` is
+  granted per namespace, never cluster-wide. The rule lives in a
+  `ravel-operator-secrets` ClusterRole (a reusable definition that grants
+  nothing on its own) bound by a namespaced RoleBinding in each served
+  namespace; `ravel-system` ships bound, and
+  `deploy/k8s/operator/secrets-rolebinding.yaml` is the template for every
+  other namespace. A RoleBinding to a ClusterRole grants the rule only
+  within that RoleBinding's namespace, so this confers no cluster-wide
+  reach; a ClusterRoleBinding to it would, and the rbac lint asserts none
+  exists. The Secret names are user-chosen CRD fields, not a fixed set, so
+  `resourceNames` cannot enumerate them; a bare `secrets get` bound per
+  namespace is the tightest grant that still works.
+
+  Shipping the narrowing without the per-namespace binding was a
+  regression, not a follow-up (issue #126): before this change the operator
+  read Secrets for a RavelCluster in any namespace, and narrowing to a
+  Role in `ravel-system` alone silently 403'd every RavelCluster elsewhere.
+  Of the two remedies the finding offered, option (b) is taken here: keep
+  the cluster-wide watch and bind per namespace, rather than option (a),
+  restricting the watch to `ravel-system`. Option (b) preserves the
+  multi-namespace reconcile the controller already implements (`Api::all`
+  plus namespaced reads per object) and keeps the operator install guide's
+  "watches RavelCluster cluster-wide and manages Deployments and Services in
+  whatever namespace each RavelCluster lives in" true. Its cost is that a
+  served namespace now carries an out-of-band precondition (the
+  RoleBinding); so it does not fail silently, the reconciler maps a 403 on
+  Secret resolution to a `Degraded` condition with reason `SecretsUnreadable`
+  naming the namespace and Secret (`crate::controller::secret_error`),
+  rather than a bare reconcile failure.
+
+The container/pod SecurityContext, the PDB count, and the anti-affinity
+shape are asserted at render level in `reconcile.rs` tests; a manifest
+lint there (a text scan of `deploy/k8s/operator/rbac.yaml`, run by
+`cargo test -p ravel-operator`) asserts the cluster-wide ClusterRole
+grants no `secrets` and that the secrets read is bound only per namespace,
+and a `controller.rs` test asserts the 403-to-`SecretsUnreadable` mapping.
+The runtime behavior is left to the k8s CI lane (decision 8), and it is a
+runtime behavior, not an admission one: Kubernetes admits a hardened pod,
+and an operation that needs a dropped capability fails when it is attempted
+at runtime, exactly as a write under `readOnlyRootFilesystem` fails at
+runtime; nothing rejects the pod for the dropped capability. What the kind
+lane actually proves is that the hardened pods reach readiness and complete
+an OTLP round trip, not that a missing capability is rejected.
+
+**Amendment (2026-09-07): the operator qualifies the object store before it
+serves (issue #36).** Every `ravel-server` mode refuses to start on a
+non-Memory store whose `sys/qualification` marker is absent (ADR-0050
+section 6, EC7), and that marker is only ever written by an explicit
+`ravel-cli store qualify` run. The operator described in decision 3 never made
+that run, so a RavelCluster pointed at a backend that fails the object-store
+contract (docs/object-store-contract.md) came up as three tiers of pods all
+crash-looping on the same startup refusal, with the reason buried in pod
+logs rather than on `.status`. The kind lane papered over this with a
+hand-run qualification Job (scripts/kind-up.sh) that a real install had no
+equivalent of. Qualification is now the operator's job, in the same reconcile
+loop as everything else:
+
+- Before it creates any serving Deployment, the reconcile loop renders and
+  applies a one-shot Job named `<cluster>-qualify` in the cluster's
+  namespace, with the server image, credentials Secret, bucket, region, and
+  endpoint of the tiers it gates, running `ravel-cli store qualify`. The
+  gateway, query, and maintain Deployments are created only once that Job
+  reports `Complete`. `restartPolicy: Never`, a small `backoffLimit`, an
+  `activeDeadlineSeconds`, and a `ttlSecondsAfterFinished` keep a finished
+  Job from accumulating.
+- The Job sets `activeDeadlineSeconds` because `backoffLimit` bounds only how
+  many *failed* attempts run, not one attempt that never terminates: a
+  qualify pod against an S3 endpoint that accepts the connection and then
+  never answers would otherwise run indefinitely, leaving `StoreQualified`
+  stuck at `Pending` with no Deployment ever created. This deadline is
+  JOB-WIDE, not per-attempt: Kubernetes counts it against the Job's total
+  active time summed across every retry, and it takes precedence over
+  `backoffLimit`. So the two knobs are sized together, or a slow-but-healthy
+  first attempt plus a retry would trip `DeadlineExceeded` before the retry
+  budget was ever spent. `ravel-cli store qualify` runs 28 sequential object
+  operations (create-if-absent probe 3, CAS-version probe 4, read-after-write
+  probe 10 = 5 cycles of put+get, list-after-write probe 10 = 5 cycles of
+  put+list, and the final `sys/qualification` write 1; the two informational
+  probes issue no request through the object-store contract). Each operation's
+  per-request ceiling is the S3 client's 20 s `request_timeout`, so one
+  slow-but-healthy attempt whose every operation nears that ceiling without
+  retrying is bounded by 28 * 20 s = 560 s; adding ~140 s per attempt for pod
+  scheduling and image pull gives a 700 s per-attempt budget. `backoffLimit`
+  is 1 (two attempts: the initial run plus one retry), so the Job-wide deadline
+  is 2 * 700 s = 1400 s -- a slow-but-healthy initial attempt AND a full retry
+  both complete before it fires. A single hung attempt still terminates, at the
+  1400 s Job-wide bound rather than running forever (a hung endpoint stalls each
+  operation at ~200 s = `retry_timeout` 180 s + `request_timeout` 20 s). Both
+  knobs are tuning parameters, deliberately not part of the qualified-input
+  hash: changing either must not re-run a qualification that already passed.
+- A new `StoreQualified` status condition carries the gate's state with the
+  same shape as the other conditions (reasons `Pending` while the Job is
+  created or running, `Succeeded` once it completes, `Failed` when it fails,
+  the last carrying the Job's terminal reason and message). A Job that fails
+  by exhausting its `backoffLimit` and one the Job controller fails for
+  exceeding `activeDeadlineSeconds` (reason `DeadlineExceeded`) both read as
+  `Failed`, with the reason named in the message so an operator sees why. On
+  `Failed` no Deployment is created and the pass requeues on the existing
+  failure backoff rather than spinning.
+- The inputs qualification proves against (bucket, region, endpoint, image,
+  credentials Secret name, and that credentials Secret's `resourceVersion`)
+  are hashed into a Job annotation and, on success, into a durable
+  `status.storeQualifiedHash`. A later pass whose inputs still hash to the
+  recorded value proceeds without re-running qualification even after the
+  Job's TTL garbage-collected it. When the inputs change, the operator
+  deletes the stale Job with foreground propagation (its pod template is
+  immutable, and foreground propagation tears down the old Pod before the Job
+  object disappears so the replacement never races a live stale Pod),
+  recreates it, and flips `StoreQualified` back to `Pending`; a cluster that
+  was already serving keeps its existing Deployments up while the new inputs
+  qualify, rather than being torn down for a pending config edit.
+  - The credentials `resourceVersion` is what makes a fixed-name credential
+    ROTATION re-qualify: rotating the Secret in place keeps its name but bumps
+    its `resourceVersion`, so without it a rotation to credentials that no
+    longer pass the contract would skip qualification once the prior Job had
+    been TTL-collected. Only the `resourceVersion` (opaque API metadata) enters
+    the hash, never any Secret data, and it reaches neither the status nor a
+    log line. The operator does not watch Secrets (the per-namespace
+    `ravel-operator-secrets` RoleBinding grants `get` only, not `watch`), so a
+    rotation is noticed on the next periodic requeue (the controller's 300 s
+    resync): that pass reads the new `resourceVersion`, the hash changes, and
+    the gate recreates the Job. The bound on noticing an in-place rotation is
+    therefore one resync interval.
+- Non-goal: qualification is not re-run on a schedule. It runs once per
+  distinct set of inputs and only re-runs when those inputs change. A
+  periodic re-qualification would add object-store traffic and a recurring
+  failure mode for no gain, since the contract a backend satisfies does not
+  lapse between config edits.
+
+Because the operator now qualifies, the kind lane's hand-run qualification
+Job is removed from scripts/kind-up.sh: it deploys through the operator, so
+the operator's Job is the single qualification and a second one would only
+duplicate it. The RBAC in deploy/k8s/operator/rbac.yaml gains a `batch`
+`jobs` rule for the Job the operator now owns, scoped to the verbs the
+reconcile loop calls: `create`/`patch` (server-side apply), `get` (observe the
+Job's terminal state), and `delete` (foreground recreate on an input change).
+It is not watched by an informer, so it takes no `list`/`watch`, and every
+write is a PATCH, so it takes no `update`. That same audit -- server-side apply
+is a PATCH, not a PUT, and a resource the operator only applies and sweeps is
+never read -- removed the unused `update` verb from every rule and the unused
+read verbs from the write-only resources. The gate
+decision and the Job renderer are pure functions in `reconcile.rs` with
+unit tests; the runtime behavior (the Job actually completing and the
+Deployments appearing only after) is left to the k8s CI lane (decision 8),
+unproven until that lane runs.
+
+**Amendment (2026-09-08): the gate no longer re-triggers itself.** Two
+refinements stop the qualification hold from spinning. First, the primary
+`RavelCluster` watch drops status-only updates: its trigger stream runs through
+a generation predicate (`predicates::generation`), so an event passes only when
+`.metadata.generation` changed. Every reconcile rewrites `.status`, and without
+the filter each write re-enqueued the object before its requeue delay elapsed,
+so a terminally `Failed` qualify Job (which the controller does not watch) was
+deleted and recreated in a tight loop. A spec edit bumps the generation and
+still reconciles; a deletion arrives as its own watch event, not a status-only
+apply. Second, status conditions preserve their `lastTransitionTime` across a
+pass that does not change the condition's status value, per the Kubernetes
+convention that the field records the last transition, not the last write, so
+an unchanged condition no longer reads as a change on every pass. The `Failed`
+qualification hold requeues on the failure backoff, not the shorter bootstrap
+poll. The kind lane (scripts/kind-up.sh) reuses clusters and re-applies the dev
+RavelCluster, so it now waits for `StoreQualified=True` at
+`observedGeneration == .metadata.generation` before `Available=True`: a
+re-qualification in flight cannot let the wait return on the previous
+generation's readiness.
+
+**Amendment (2026-09-08): qualify-Job recreations are bounded, and the Secret
+change-detection checksum moved to blake3.** Two follow-ups from review of the
+qualification gate.
+
+First, a store that keeps failing qualification no longer recreates its Job
+without bound. The prior behavior deleted a `Failed` Job, requeued on the
+failure backoff, saw it Absent, and recreated it, forever: the Job's own
+`backoffLimit` and `activeDeadlineSeconds` bound attempts within one Job, never
+the number of Jobs. The gate now recreates on a capped exponential backoff (base
+30 s doubling to a 480 s ceiling over the first five failures) and, after 6
+consecutive failures, holds in a one-hour terminal cooldown. The failure count,
+the next-retry instant, and the qualified-input hash the failures were recorded
+against are persisted in status (`status.qualifyFailureCount`,
+`status.qualifyNextRetryTime`, `status.qualifyRetryHash`); all three are
+serialized even when absent so a status merge patch clears them, and none enters
+the qualified-input hash, so counting failures never re-runs a qualification that
+would otherwise pass. The retry state is keyed by that recorded hash: whenever the
+desired inputs no longer hash to it the operator drops the count and the
+next-retry and qualifies the new inputs at once, whether or not the `Failed` Job
+still exists. This is what makes an input change during a long cooldown reset and
+recreate at once rather than waiting the cooldown out, even after the `Failed`
+Job's TTL garbage-collected it (once the Job is gone, both a changed and an
+unchanged pass observe it absent, so only the recorded hash distinguishes them);
+the terminal cooldown is kept only while the hashes match. The count resets on a
+successful qualification. The
+`StoreQualified=False` condition names the consecutive-failure count and the next
+retry time. This supersedes the earlier "requeues on the existing failure backoff
+rather than spinning" note: the requeue is now the computed backoff, and past the
+threshold the gate holds instead of recreating.
+
+Second, the operator's Secret change-detection checksum
+(`SECRETS_CHECKSUM_ANNOTATION`, and the qualified-input hash) is now a `blake3`
+digest rendered as 64 hex characters, replacing a 16-character standard-hasher
+value that was not stable across Rust toolchain versions. An unstable hash could
+silently miss a Secret change (or spuriously roll on a toolchain bump). Because
+the annotation value itself changes, the first reconcile after upgrading the
+operator rolls every rendered gateway, query, and enabled maintain Deployment
+once even when the referenced Secrets are unchanged; subsequent reconciles are
+stable. Operators should schedule the operator upgrade in a maintenance window
+that tolerates one rolling restart of each serving tier.
+
+**Amendment (2026-09-08): the credentials `resourceVersion` slot in the
+qualified-input hash distinguishes absent from empty.** The credentials
+`resourceVersion` fed the hash through `unwrap_or("")`, collapsing an unresolved
+Secret (`None`) and one whose `resourceVersion` resolved to the empty string
+(`Some("")`) onto the same `""`, though they are different credential states. It
+now carries the same one-byte presence marker the endpoint slot already uses
+(`0x01` then the value when present, a lone `0x00` when absent), which the field
+separator alone cannot supply. This changes every persisted qualified-input hash
+once more, so the first reconcile after upgrading the operator re-runs store
+qualification once for every existing cluster on otherwise-unchanged inputs. The
+qualify Job is a one-shot that touches no Deployment, so there is no serving
+downtime; subsequent reconciles are stable.
+
 ## Rejected alternatives
 
 1. **Go operator (kubebuilder/controller-runtime).** The larger example

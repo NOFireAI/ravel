@@ -69,6 +69,15 @@ pub struct ScanStats {
     /// filtering. Equal to `page_bytes_fetched` for an all-columns scan; the
     /// gap to it is the column-filtering waste (ADR-0107 decision 4).
     pub page_bytes_decoded: u64,
+    /// Bytes zstd produced decompressing this object's sections for this scan:
+    /// the directory sections opened at [`RlogReader::new`] plus every block
+    /// page the scan decoded (issue #1401). Seeded at scan construction with the
+    /// open-time directory total and grown as blocks are decoded, so a
+    /// partially-drained [`BlockScan`] reports the directories plus what it has
+    /// decoded so far. A raw/`COMP_NONE` section or page contributes nothing (it
+    /// was never decompressed); a zstd one contributes its decompressed buffer's
+    /// actual length. Decompressed, not stored or wire, bytes.
+    pub decompressed_bytes: u64,
 }
 
 /// An opened RLOG object ready to scan.
@@ -92,6 +101,12 @@ pub struct RlogReader<'a> {
     /// Absent when the object was written with no indexed fields
     /// (docs/log-segment-format.md: POSTINGS is an optional section).
     postings: Option<SectionDesc>,
+    /// Bytes zstd produced decompressing the directory sections this open
+    /// decompressed (STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR), summed at
+    /// [`Self::new`] (issue #1401). A directory stored raw contributes nothing.
+    /// Each scan seeds its [`ScanStats::decompressed_bytes`] with this so the
+    /// figure counts opening the object as well as decoding its blocks.
+    open_decompressed_bytes: u64,
 }
 
 impl<'a> RlogReader<'a> {
@@ -101,11 +116,18 @@ impl<'a> RlogReader<'a> {
     /// degrade: without it no block can be located.
     pub fn new(bytes: &'a [u8], cfg: &RlogConfig) -> Result<Self, LogSegError> {
         let footer = open(bytes)?;
-        let stream_raw = read_section(bytes, section(&footer, kind::STREAM_DIR)?, cfg)?;
+        let mut open_decompressed_bytes = 0u64;
+        let stream_desc = *section(&footer, kind::STREAM_DIR)?;
+        let stream_raw = read_section(bytes, &stream_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&stream_desc, &stream_raw);
         let stream_dir = StreamDir::decode(&stream_raw, MAX_STREAMS)?;
-        let field_raw = read_section(bytes, section(&footer, kind::FIELD_DIR)?, cfg)?;
+        let field_desc = *section(&footer, kind::FIELD_DIR)?;
+        let field_raw = read_section(bytes, &field_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&field_desc, &field_raw);
         let field_dir = FieldDir::decode(&field_raw, MAX_FIELDS)?;
-        let skip_raw = read_section(bytes, section(&footer, kind::SKIP_IDX)?, cfg)?;
+        let skip_desc = *section(&footer, kind::SKIP_IDX)?;
+        let skip_raw = read_section(bytes, &skip_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&skip_desc, &skip_raw);
         let skip = SkipIndex::decode(&skip_raw, MAX_BLOCKS)?;
         let blocks = *section(&footer, kind::BLOCKS)?;
         let bloom = *section(&footer, kind::BLOOM)?;
@@ -116,10 +138,11 @@ impl<'a> RlogReader<'a> {
         // is refused rather than read under a guessed layout, which would
         // decode another block's bytes as this one's.
         let page_dir = {
-            let desc = footer
+            let desc = *footer
                 .section(kind::PAGE_DIR)
                 .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
-            let raw = read_section(bytes, desc, cfg)?;
+            let raw = read_section(bytes, &desc, cfg)?;
+            open_decompressed_bytes += section_decompressed_len(&desc, &raw);
             Arc::new(PageDir::decode_validated(&raw, blocks.len, skip.l0.len())?)
         };
         Ok(RlogReader {
@@ -131,6 +154,7 @@ impl<'a> RlogReader<'a> {
             page_dir,
             bloom,
             postings,
+            open_decompressed_bytes,
         })
     }
 
@@ -242,6 +266,10 @@ impl<'a> RlogReader<'a> {
     ) -> Result<BlockScan, LogSegError> {
         let mut stats = ScanStats {
             blocks_total: self.skip.l0.len() as u32,
+            // Opening the object already decompressed its directory sections;
+            // seed the scan with that so the figure counts the open plus the
+            // block pages the scan goes on to decode (issue #1401).
+            decompressed_bytes: self.open_decompressed_bytes,
             ..ScanStats::default()
         };
 
@@ -343,13 +371,18 @@ impl<'a> RlogReader<'a> {
                             let mut postings_arms = content_arms;
                             postings_arms.extend(prune_arms);
                             for (cid, term) in &postings_arms {
-                                match section.probe(*cid, term) {
-                                    Ok(Some(blocks)) => {
+                                match section.probe_accounted(*cid, term) {
+                                    Ok((Some(blocks), decompressed)) => {
+                                        stats.decompressed_bytes =
+                                            stats.decompressed_bytes.saturating_add(decompressed);
                                         let allowed: std::collections::HashSet<usize> =
                                             blocks.iter().map(|&b| b as usize).collect();
                                         candidates.retain(|b| allowed.contains(b));
                                     }
-                                    Ok(None) => {}
+                                    Ok((None, decompressed)) => {
+                                        stats.decompressed_bytes =
+                                            stats.decompressed_bytes.saturating_add(decompressed);
+                                    }
                                     Err(_) => stats.postings_degraded = true,
                                 }
                             }
@@ -924,6 +957,10 @@ impl BlockScan {
             .stats
             .page_bytes_decoded
             .saturating_add(decoded.page_bytes_decoded());
+        self.stats.decompressed_bytes = self
+            .stats
+            .decompressed_bytes
+            .saturating_add(decoded.decompressed_bytes());
 
         for row in 0..decoded.record_count() {
             if eval(
@@ -1008,7 +1045,16 @@ pub(crate) fn decode_v4_block(
             )));
         }
         block_crc = crc32c::crc32c_append(block_crc, stored);
-        page_bytes.push(Some(read_page(stored, &p.desc, DEFAULT_MAX_UNCOMP)?));
+        let produced = read_page(stored, &p.desc, DEFAULT_MAX_UNCOMP)?;
+        // Only a zstd page was decompressed; count what it actually produced
+        // (equal to `uncomp_len` for a valid page, which `read_page` already
+        // checked). A raw page was copied, not decompressed (issue #1401).
+        if p.desc.comp == crate::page::COMP_ZSTD {
+            counters.decompressed_bytes = counters
+                .decompressed_bytes
+                .saturating_add(produced.len() as u64);
+        }
+        page_bytes.push(Some(produced));
         counters.decoded += 1;
         counters.bytes_decoded = counters.bytes_decoded.saturating_add(p.desc.len);
     }
@@ -1283,6 +1329,27 @@ pub fn read_section(
     desc: &SectionDesc,
     cfg: &RlogConfig,
 ) -> Result<Vec<u8>, LogSegError> {
+    decode_section(section_slice(bytes, desc)?, desc, cfg)
+}
+
+/// [`read_section`], additionally charging the bytes zstd produced to
+/// `accounting` (issue #1401 finding 3), the same way
+/// [`decode_section_accounted`] does for a caller that has already sliced the
+/// section's stored bytes out of an assembled buffer.
+pub fn read_section_accounted(
+    bytes: &[u8],
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+    accounting: &ravel_types::accounting::QueryAccounting,
+) -> Result<Vec<u8>, LogSegError> {
+    decode_section_accounted(section_slice(bytes, desc)?, desc, cfg, accounting)
+}
+
+/// The section's stored bytes, sliced out of a whole-object buffer at
+/// `[desc.offset, desc.offset + desc.len)`. Shared by [`read_section`] and
+/// [`read_section_accounted`], which differ only in whether the decode that
+/// follows charges `decompressed_bytes`.
+fn section_slice<'b>(bytes: &'b [u8], desc: &SectionDesc) -> Result<&'b [u8], LogSegError> {
     let start = usize::try_from(desc.offset)
         .map_err(|_| LogSegError::Corrupted("section offset range".into()))?;
     let len = usize::try_from(desc.len)
@@ -1290,10 +1357,9 @@ pub fn read_section(
     let end = start
         .checked_add(len)
         .ok_or_else(|| LogSegError::Corrupted("section range overflow".into()))?;
-    let stored = bytes
+    bytes
         .get(start..end)
-        .ok_or_else(|| LogSegError::Corrupted("section out of bounds".into()))?;
-    decode_section(stored, desc, cfg)
+        .ok_or_else(|| LogSegError::Corrupted("section out of bounds".into()))
 }
 
 /// The crc-and-decompress half of [`read_section`], taking a section's stored
@@ -1338,6 +1404,39 @@ pub fn decode_section(
         }
         Ok(stored.to_vec())
     }
+}
+
+/// Bytes zstd produced decoding one section: the produced buffer's own length
+/// for a `COMP_ZSTD` section, zero for one stored raw (nothing was
+/// decompressed). Used both by [`RlogReader::new`] for the directory sections
+/// it opens and by [`decode_section_accounted`] (issue #1401).
+fn section_decompressed_len(desc: &SectionDesc, produced: &[u8]) -> u64 {
+    if desc.comp == COMP_ZSTD {
+        produced.len() as u64
+    } else {
+        0
+    }
+}
+
+/// [`decode_section`], additionally charging the bytes zstd produced to
+/// `accounting` (issue #1401).
+///
+/// The charge is the returned buffer's actual length, not `desc.uncomp_len`,
+/// for a `COMP_ZSTD` section, and nothing for a raw section (which was copied,
+/// not decompressed). `decode_section` has already checked the two are equal for
+/// a valid section, so a short or corrupt frame is charged as what it produced
+/// only in the error paths it also rejects. Callers pass the phase handle for
+/// the phase the read belongs to (`PhaseAccounting::scan`/`plan`), the same way
+/// the surrounding fetch already charges its GET requests and bytes.
+pub fn decode_section_accounted(
+    stored: &[u8],
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+    accounting: &ravel_types::accounting::QueryAccounting,
+) -> Result<Vec<u8>, LogSegError> {
+    let produced = decode_section(stored, desc, cfg)?;
+    accounting.add_decompressed_bytes(section_decompressed_len(desc, &produced));
+    Ok(produced)
 }
 
 fn flatten<'p>(pred: &'p Predicate, out: &mut Vec<&'p Predicate>) {
@@ -1467,7 +1566,13 @@ pub fn phrase_match(value: &[u8], word: &str) -> bool {
 /// of a record's stream and per-record attributes). Kept in this crate so the
 /// merge does not depend on `ravel-sql`
 /// (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
-pub(crate) fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+///
+/// Public because the declared-column statistics producers resolve the same
+/// merged view: `ravel-ingest`'s flush fold and `ravel-maintain`'s compaction
+/// fold both need a stream's attributes to decide what a record that does not
+/// set a declared key reads. The blob grammar is frozen, so a second decoder
+/// elsewhere would be a copy that can drift from this one.
+pub fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
     use crate::varint::get_uvarint;
     let mut pos = 0usize;
     let mut pairs = decode_attr_set(blob, &mut pos, 0)?;
@@ -1604,6 +1709,7 @@ mod tests {
     use super::*;
     use crate::record::LogRecord;
     use crate::writer::{ObjectIdentity, RlogWriter};
+    use ravel_types::accounting::QueryAccounting;
     use ravel_types::logstream::{AttrValue, LogStreamId};
 
     fn identity() -> ObjectIdentity {
@@ -1652,6 +1758,217 @@ mod tests {
             w.push(r).expect("push");
         }
         w.finish().expect("finish")
+    }
+
+    /// The on-object stored bytes of a section (`[offset, offset+len)`).
+    fn section_stored<'a>(obj: &'a [u8], desc: &SectionDesc) -> &'a [u8] {
+        let start = desc.offset as usize;
+        &obj[start..start + desc.len as usize]
+    }
+
+    /// An object whose directory sections AND block pages clear the writer's
+    /// compression floor and are stored `COMP_ZSTD`, so decoding either produces
+    /// strictly more bytes than it read: 200 distinct streams (a distinct
+    /// `service.name` each), each with a long, highly compressible body so its
+    /// `body` page is well over the 512-byte page floor and zstd-encoded.
+    fn object_with_zstd_dirs() -> Vec<u8> {
+        let cfg = RlogConfig::default();
+        let body = "log message body ".repeat(200);
+        let mut recs = Vec::new();
+        for s in 0..200u8 {
+            recs.push(rec(s, i64::from(s), &body));
+        }
+        build(cfg, recs)
+    }
+
+    /// A section descriptor of `kind`, asserted to be zstd-compressed so its
+    /// `uncomp_len` is the exact byte count one decode produces. (The writer
+    /// stores every whole-read directory section `COMP_ZSTD` unconditionally, so
+    /// this holds for any object; `uncomp_len` may be below `len` for a tiny
+    /// section zstd could not shrink, which does not change what one decode
+    /// produces.)
+    fn zstd_section(obj: &[u8], k: u32) -> SectionDesc {
+        let footer = open(obj).expect("open");
+        let desc = *footer.section(k).expect("section present");
+        assert_eq!(
+            desc.comp, COMP_ZSTD,
+            "fixture section {k} must be zstd-compressed for this test"
+        );
+        desc
+    }
+
+    /// One `decode_section_accounted` charges exactly the section's `uncomp_len`
+    /// (the bytes zstd produced), and N calls charge exactly N times it. The
+    /// pre-fix `decode_section` charged nothing, so this reads 0 there; the
+    /// flipped line is the `add_decompressed_bytes` call in
+    /// `decode_section_accounted` (issue #1401).
+    #[test]
+    fn decode_section_accounted_charges_uncomp_len_per_read() {
+        let obj = object_with_zstd_dirs();
+        let cfg = RlogConfig::default();
+        let desc = zstd_section(&obj, kind::STREAM_DIR);
+        let stored = section_stored(&obj, &desc);
+        let acct = QueryAccounting::new();
+
+        let raw = decode_section_accounted(stored, &desc, &cfg, &acct).expect("decode");
+        assert_eq!(
+            raw.len() as u64,
+            desc.uncomp_len,
+            "decode produces uncomp_len"
+        );
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            desc.uncomp_len,
+            "one section read charges exactly the section's uncomp_len"
+        );
+
+        // Four more reads: the counter is exactly five times the section.
+        for _ in 0..4 {
+            decode_section_accounted(stored, &desc, &cfg, &acct).expect("decode");
+        }
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            desc.uncomp_len * 5,
+            "N reads charge exactly N times the section's uncomp_len"
+        );
+    }
+
+    /// Two sections of DIFFERENT uncompressed size sum to the byte, so a counter
+    /// that charged the wrong section, `desc.len` instead of `uncomp_len`, or
+    /// double-charged one would miss the exact total (issue #1401).
+    #[test]
+    fn decode_section_accounted_sums_two_distinct_sections() {
+        let obj = object_with_zstd_dirs();
+        let cfg = RlogConfig::default();
+        let stream_desc = zstd_section(&obj, kind::STREAM_DIR);
+        let field_desc = zstd_section(&obj, kind::FIELD_DIR);
+        assert_ne!(
+            stream_desc.uncomp_len, field_desc.uncomp_len,
+            "the two sections must differ in uncompressed size for this test"
+        );
+        let acct = QueryAccounting::new();
+        decode_section_accounted(
+            section_stored(&obj, &stream_desc),
+            &stream_desc,
+            &cfg,
+            &acct,
+        )
+        .expect("decode stream_dir");
+        decode_section_accounted(section_stored(&obj, &field_desc), &field_desc, &cfg, &acct)
+            .expect("decode field_dir");
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            stream_desc.uncomp_len + field_desc.uncomp_len,
+            "two distinct sections sum to the byte"
+        );
+    }
+
+    /// A raw (`COMP_NONE`) section decodes without decompression, so it charges
+    /// nothing: the counter is bytes zstd PRODUCED, not bytes copied. The writer
+    /// always zstd-compresses whole-read sections, so this synthesizes a raw
+    /// section descriptor (the shape `decode_section`'s `COMP_NONE` branch and a
+    /// ranged reader over an uncompressed section both accept).
+    #[test]
+    fn decode_section_accounted_charges_nothing_for_raw_section() {
+        let cfg = RlogConfig::default();
+        let payload = b"an uncompressed section body".to_vec();
+        let desc = SectionDesc {
+            kind: kind::STREAM_DIR,
+            offset: 0,
+            len: payload.len() as u64,
+            crc32c: crc32c::crc32c(&payload),
+            comp: crate::footer::COMP_NONE,
+            uncomp_len: payload.len() as u64,
+        };
+        let acct = QueryAccounting::new();
+        let raw = decode_section_accounted(&payload, &desc, &cfg, &acct).expect("decode raw");
+        assert_eq!(raw, payload, "a raw section decodes to its own bytes");
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            0,
+            "a raw section was copied, not decompressed, so it charges nothing"
+        );
+    }
+
+    /// A whole-object scan's `ScanStats.decompressed_bytes` is the object's
+    /// zstd directory total plus every zstd block page it decodes, and it grows
+    /// only as blocks are drained: opening the reader seeds the directory total,
+    /// each `next_block` adds that block's produced page bytes. A second scan of
+    /// the same reader reports the same figure, proving the seed is per-scan and
+    /// not accumulated across scans (issue #1401).
+    #[test]
+    fn scan_stats_decompressed_bytes_covers_open_and_pages() {
+        let obj = object_with_zstd_dirs();
+        let cfg = RlogConfig::default();
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // The seed equals the sum of the object's zstd directory sections.
+        let footer = open(&obj).expect("open");
+        let mut open_total = 0u64;
+        for k in [
+            kind::STREAM_DIR,
+            kind::FIELD_DIR,
+            kind::SKIP_IDX,
+            kind::PAGE_DIR,
+        ] {
+            let desc = *footer.section(k).expect("section");
+            if desc.comp == COMP_ZSTD {
+                open_total += desc.uncomp_len;
+            }
+        }
+        assert!(
+            open_total > 0,
+            "fixture must have at least one zstd directory"
+        );
+
+        // Independent reference for the page total below (issue #1401 finding
+        // 4): every page PAGE_DIR lists, across every group and chunk, summed
+        // by its own `uncomp_len` when it is stored COMP_ZSTD and contributing
+        // nothing when it is raw -- read straight from the directory rather
+        // than through `decode_v4_block`'s own counters, and gated on each
+        // page's own `comp` field rather than assumed, so a charge that only
+        // covers the first page of each block (which would still clear a bare
+        // `> open_total` bound) is caught by the sum falling short.
+        let page_desc = *footer.section(kind::PAGE_DIR).expect("PAGE_DIR section");
+        let page_dir_raw = read_section(&obj, &page_desc, &cfg).expect("decode PAGE_DIR");
+        let page_dir = PageDir::decode(&page_dir_raw).expect("parse PAGE_DIR");
+        let mut page_total = 0u64;
+        for group in &page_dir.groups {
+            for chunk in &group.chunks {
+                for page in &chunk.pages {
+                    if page.comp == COMP_ZSTD {
+                        page_total += page.uncomp_len;
+                    }
+                }
+            }
+        }
+        assert!(page_total > 0, "fixture must decode at least one zstd page");
+
+        let mut cursor = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        // Before any block is decoded the figure is exactly the open-time total.
+        assert_eq!(cursor.stats().decompressed_bytes, open_total);
+        while cursor.next_block(&obj).expect("next").is_some() {}
+        let total = cursor.stats().decompressed_bytes;
+        assert_eq!(
+            total,
+            open_total + page_total,
+            "draining every block adds exactly the zstd pages PAGE_DIR lists, \
+             on top of the open total"
+        );
+
+        // A second, independent scan reports the identical figure: the seed is
+        // per-scan, not accumulated onto the reader.
+        let mut again = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        while again.next_block(&obj).expect("next").is_some() {}
+        assert_eq!(
+            again.stats().decompressed_bytes,
+            total,
+            "a re-scan of the same reader charges the same, not double"
+        );
     }
 
     /// A record carrying `cols` int columns and `cols` string columns, all
@@ -2419,6 +2736,69 @@ mod tests {
         assert_eq!(stats.blocks_after_postings, 4);
         assert_eq!(stats.blocks_scanned, 4);
         assert!(!stats.postings_degraded);
+    }
+
+    /// A postings-eligible prune arm decompresses one POSTINGS term block
+    /// (`PostingsSection::probe_accounted`), and that block's bytes must land
+    /// in `ScanStats.decompressed_bytes` alongside the open-time directory
+    /// total: before this fix nothing on the postings path charged
+    /// `decompressed_bytes` at all (issue #1401 finding 1). Three distinct
+    /// `svc` values fit inside one `DEFAULT_STRIDE` (128) term block, so the
+    /// section holds exactly one postings term block and
+    /// `total_block_uncompressed_len` names its exact byte count independent
+    /// of `probe_accounted`'s own block selection. Read right after
+    /// `scan_blocks` returns, before any block page is decoded, so no page
+    /// bytes are in the figure to account for.
+    #[test]
+    fn scan_blocks_charges_postings_probe_decompression() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..60i64 {
+            let block = i / 5;
+            recs.push(rec_with_svc(i, &format!("s{}", block % 3)));
+        }
+        let obj = build_indexed(cfg, recs, &["svc"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let footer = open(&obj).expect("open");
+        let mut open_total = 0u64;
+        for k in [
+            kind::STREAM_DIR,
+            kind::FIELD_DIR,
+            kind::SKIP_IDX,
+            kind::PAGE_DIR,
+        ] {
+            let desc = *footer.section(k).expect("section");
+            if desc.comp == COMP_ZSTD {
+                open_total += desc.uncomp_len;
+            }
+        }
+
+        let postings_bytes = postings_bytes_of(&obj);
+        let section = PostingsSection::parse(&postings_bytes).expect("parse postings");
+        let postings_total = section.total_block_uncompressed_len();
+        assert!(
+            postings_total > 0,
+            "fixture must produce at least one postings term block"
+        );
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("svc".into()),
+            value: AttrValue::Str("s0".into()),
+        }];
+        let cursor = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &prune, &ColumnSelection::all())
+            .expect("scan");
+
+        assert_eq!(
+            cursor.stats().decompressed_bytes,
+            open_total + postings_total,
+            "scan_blocks charges the postings probe's decompressed term block \
+             on top of the open-time directory total"
+        );
     }
 
     /// An attribute the POSTINGS index does not cover prunes nothing. `region`

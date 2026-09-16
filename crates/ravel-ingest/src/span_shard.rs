@@ -8,9 +8,14 @@
 //! waiters and its ADR-0069 byte charges) into a task spawned onto
 //! [`SpanFlushCtx::run_flush`], then keeps draining its channel.
 //! `max_inflight_flushes` (ADR-0067 decision 2) bounds concurrent flush tasks
-//! per shard via a semaphore acquired before spawning; at the bound the acquire
-//! blocks the flush trigger (and the actor's next message pull), which is where
-//! backpressure propagates. This ports ADR-0067 decisions 1 and 2 from the
+//! per shard via a semaphore acquired INSIDE the spawned task (issue #1641):
+//! the actor spawns and returns, so a stalled flush -- a tenant whose S3 key
+//! prefix is being throttled -- parks only its own task on the permit, never the
+//! actor, so every co-resident tenant's age tick and channel drain keep running.
+//! Backpressure at the bound propagates through the ADR-0069 byte budget
+//! (charges held until a flush completes), not through parking the actor;
+//! ADR-1642 supersedes ADR-0067 decision 2 with that. This ports ADR-0067
+//! decisions 1 and 2 from the
 //! metrics [`crate::shard`]; the adaptive flush delay (decision 3) is
 //! metrics-only and deliberately absent here (the age trigger stays the fixed
 //! `max_flush_delay`/`max_flush_delay_idle` in [`SpanShardActor::age_threshold_ns`]).
@@ -49,9 +54,12 @@ use tokio::task::JoinSet;
 use tokio::time::Duration;
 use uuid::Uuid;
 
-use crate::budget::IngestByteCharge;
+use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
-use crate::config::{IngestConfig, SPAN_SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket};
+use crate::config::{
+    DrainIntent, FlushClockError, IngestConfig, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
+    SPAN_SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket, size_trigger_fires,
+};
 use crate::metrics::FlushTrigger;
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::SpanIngestMetrics;
@@ -100,6 +108,35 @@ pub(crate) fn est_span_bytes(span: &NormalizedSpan) -> usize {
     span.name.len() + span.status_message.as_ref().map(String::len).unwrap_or(0) + attr_bytes + 64
 }
 
+/// Fixed per-span cost in the object a span flush writes: the two i64
+/// timestamps, the 16-byte trace id, the two 8-byte span ids, and the status
+/// code. The same 64 [`est_span_bytes`] charges, which is already the stored
+/// width of those fields rather than their in-memory width.
+const SPAN_OBJECT_FIXED_BYTES: usize = 64;
+
+/// Estimated bytes one span contributes to the object a span flush writes, for
+/// the size trigger only (`target_bytes` and `min_flush_bytes`, issue #1305).
+/// The memory-side figure stays [`est_span_bytes`], which the ADR-0069 ceiling
+/// charges.
+///
+/// Model: the span's stored payload -- name, status message, and every
+/// attribute key and value byte -- plus [`SPAN_OBJECT_FIXED_BYTES`]. No
+/// `(String, String)` pair header appears, because none reaches the object; a
+/// twenty-attribute span charges nearly a kilobyte of struct headers to the
+/// ceiling that RSPAN does not store.
+///
+/// Direction: an upper bound on the bytes the flush writes, for the reason
+/// [`crate::value::IngestPoint::est_object_sample_bytes`] states. RSPAN interns
+/// repeated attribute keys and compresses its blocks, both strictly below the
+/// raw bytes counted here.
+pub(crate) fn est_span_object_bytes(span: &NormalizedSpan) -> usize {
+    let attr_bytes: usize = span.attrs.iter().map(|(k, v)| k.len() + v.len()).sum();
+    span.name.len()
+        + span.status_message.as_ref().map(String::len).unwrap_or(0)
+        + attr_bytes
+        + SPAN_OBJECT_FIXED_BYTES
+}
+
 /// Type-level bridge from the OTLP-independent [`NormalizedSpan`] to the
 /// writer's [`SpanRecord`]. Every field maps one to one; there is no data
 /// transformation, only a struct rename. In particular `attrs` is already the
@@ -125,6 +162,11 @@ fn to_rspan_record(span: NormalizedSpan) -> SpanRecord {
 struct SpanTenantBuf {
     spans: Vec<NormalizedSpan>,
     est_bytes: usize,
+    /// Estimated bytes the object this buffer's flush writes will hold, the
+    /// size trigger's own figure (issue #1305, [`est_span_object_bytes`]).
+    /// `est_bytes` above stays the buffered-memory charge behind the ADR-0069
+    /// ceiling.
+    flush_est_bytes: usize,
     oldest_arrival_ns: Option<i64>,
     min_ingest_ts_ns: Option<i64>,
     max_ingest_ts_ns: Option<i64>,
@@ -154,8 +196,10 @@ impl SpanTenantBuf {
     fn merge(&mut self, spans: Vec<NormalizedSpan>, arrival_ns: i64) -> usize {
         self.note_arrival(arrival_ns);
         let bytes_added: usize = spans.iter().map(est_span_bytes).sum();
+        let object_bytes_added: usize = spans.iter().map(est_span_object_bytes).sum();
         self.spans.extend(spans);
         self.est_bytes += bytes_added;
+        self.flush_est_bytes += object_bytes_added;
         bytes_added
     }
 }
@@ -345,6 +389,24 @@ impl SpanFlushCtx {
         }
     }
 
+    /// Abandons a flush whose flush-open deadline already elapsed while it was
+    /// queued for a permit, before it took one or attempted any store call
+    /// (issue #1739). Its waiters are acked with a retryable `Abandoned` error
+    /// and its byte charges are dropped, refunding the ADR-0069 budget.
+    fn abandon_in_queue(&self, pinned: SpanPinnedFlush) {
+        let SpanPinnedFlush {
+            waiters, charges, ..
+        } = pinned;
+        self.metrics.record_abandoned_queue_deadline();
+        self.ack_waiters(
+            waiters,
+            Err(SpanWriteError::Abandoned(
+                "flush lifetime elapsed while queued for a shard flush permit".into(),
+            )),
+        );
+        drop(charges);
+    }
+
     /// Races `fut` against the remaining budget to `deadline_ns` on the injected
     /// `Clock`, returning `None` if the deadline is already past or elapses
     /// while `fut` is still in flight. Built on `tokio::select!` racing
@@ -476,13 +538,34 @@ fn handle_flush_join_result(shard: u32, result: Result<(), tokio::task::JoinErro
     }
 }
 
-/// RAII in-flight-flush accounting: incremented when a flush task is spawned,
-/// decremented on `Drop` when it ends, including on panic. Moved into the
-/// spawned task itself (not held by the actor) so the decrement fires exactly
-/// once, whenever that task's future is finally dropped.
+/// RAII in-flight-flush accounting, the span-pipeline counterpart of
+/// [`crate::shard`]'s guard. [`InFlightFlushGuard::new`] is the only way to
+/// construct one and it performs the `+1`; `Drop` performs the `-1`. Pairing
+/// them in one value is what keeps the gauge unbiased: an increment written as
+/// a separate statement inside the spawned task never runs for a task dropped
+/// before its first poll (a `JoinSet` dropped with tasks still queued, when the
+/// actor unwinds out of `handle_flush_join_result` or the router drops the
+/// actor), while dropping that task's future still fires the `Drop`. The gauge
+/// clamps at 0 on read so nothing underflows, but the negative bias persists in
+/// the map, and the router hands the same [`SpanIngestMetrics`] to the respawned
+/// actor for that shard index, so a shard biased to -2 would report 0 in flight
+/// while two real flushes ran.
+///
+/// The guard is constructed on the actor, in the same non-awaiting region that
+/// moves the buffer into the flush task, so the gauge counts a flush from the
+/// moment its memory leaves the actor: a task still waiting for a permit holds
+/// its buffer and its ADR-0069 byte charge exactly as an executing one does, and
+/// that memory is what ADR-0067's in-flight consequence is about.
 struct InFlightFlushGuard {
     metrics: Arc<SpanIngestMetrics>,
     shard: u32,
+}
+
+impl InFlightFlushGuard {
+    fn new(metrics: Arc<SpanIngestMetrics>, shard: u32) -> Self {
+        metrics.record_inflight_flush_delta(shard, 1);
+        InFlightFlushGuard { metrics, shard }
+    }
 }
 
 impl Drop for InFlightFlushGuard {
@@ -496,6 +579,14 @@ pub(crate) struct SpanShardActor {
     writer_id: Uuid,
     epoch: u64,
     next_seq: u64,
+    /// Per-writer monotonic floor for the flush-open stamp (ADR-1307): every
+    /// reading is raised to this value and this value advances to the result,
+    /// so [`SpanShardActor::monotonic_flush_open_ns`] never returns below a
+    /// stamp already committed by this writer. In-process state only, never
+    /// persisted: it resets to 0 on restart by construction (a fresh actor
+    /// starts the floor at 0). The guarantee is therefore per-process; ADR-1307
+    /// records the cross-restart limitation.
+    last_flush_open_ns: i64,
     clock: Arc<dyn Clock>,
     config: IngestConfig,
     metrics: Arc<SpanIngestMetrics>,
@@ -510,6 +601,11 @@ pub(crate) struct SpanShardActor {
     flushes: JoinSet<()>,
     rx: mpsc::Receiver<SpanShardMsg>,
     tenants: HashMap<TenantId, SpanTenantBuf>,
+    /// The configured ADR-0069 ceiling, shared live with the router so the
+    /// per-buffer memory backstop is a fraction of the limit the operator set.
+    /// Read at trigger time rather than resolved once, because the router
+    /// installs the budget after the actors are spawned.
+    backstop_ceiling: BufferBudgetCeiling,
 }
 
 impl SpanShardActor {
@@ -524,6 +620,7 @@ impl SpanShardActor {
         config: IngestConfig,
         metrics: Arc<SpanIngestMetrics>,
         rx: mpsc::Receiver<SpanShardMsg>,
+        backstop_ceiling: BufferBudgetCeiling,
     ) -> Self {
         let ctx = Arc::new(SpanFlushCtx {
             shard,
@@ -540,6 +637,7 @@ impl SpanShardActor {
             writer_id,
             epoch,
             next_seq: 0,
+            last_flush_open_ns: 0,
             clock,
             config,
             metrics,
@@ -548,6 +646,7 @@ impl SpanShardActor {
             flushes: JoinSet::new(),
             rx,
             tenants: HashMap::new(),
+            backstop_ceiling,
         }
     }
 
@@ -570,11 +669,16 @@ impl SpanShardActor {
                             self.handle_write(tenant, spans, ack, charge).await;
                         }
                         Some(SpanShardMsg::FlushNow { done }) => {
-                            self.flush_all(FlushTrigger::Manual).await;
+                            // Not a teardown: this arm does not break, so the
+                            // actor keeps running and anything the drain could
+                            // not stamp is retried by a later trigger.
+                            self.flush_all(FlushTrigger::Manual, DrainIntent::Retryable)
+                                .await;
                             let _ = done.send(());
                         }
                         Some(SpanShardMsg::Shutdown { done }) => {
-                            self.flush_all(FlushTrigger::Manual).await;
+                            self.flush_all(FlushTrigger::Manual, DrainIntent::Teardown)
+                                .await;
                             let _ = done.send(());
                             break;
                         }
@@ -595,7 +699,8 @@ impl SpanShardActor {
                                      flushing buffered tenants before stopping"
                                 );
                             }
-                            self.flush_all(FlushTrigger::Manual).await;
+                            self.flush_all(FlushTrigger::Manual, DrainIntent::Teardown)
+                                .await;
                             break;
                         }
                     }
@@ -624,7 +729,6 @@ impl SpanShardActor {
         }
         let arrival_ns = self.clock.now_ns();
         let spans_len = spans.len() as u64;
-        let target_bytes = self.config.target_bytes;
 
         let buf = self.tenants.entry(tenant.clone()).or_default();
         let bytes_added = buf.merge(spans, arrival_ns);
@@ -641,21 +745,32 @@ impl SpanShardActor {
         let should_flush = self
             .tenants
             .get(&tenant)
-            .map(|b| b.est_bytes >= target_bytes)
+            .map(|b| {
+                size_trigger_fires(
+                    b.flush_est_bytes,
+                    b.est_bytes,
+                    &self.config,
+                    self.backstop_ceiling.get(),
+                )
+            })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
             self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
         }
     }
 
-    /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
+    /// A buffer with a strict-mode waiter, or one whose flush would write at
+    /// least `min_flush_bytes` of object,
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
     /// else is idle and waits for the slower `max_flush_delay_idle` instead
-    /// (ADR-0051 section 7). Strict-mode ack latency is unaffected:
+    /// (ADR-0051 section 7). "Worth a PUT" is a claim about the object, so this
+    /// reads the object-bytes estimate, not the buffered-memory charge (issue
+    /// #1305). Strict-mode ack latency is unaffected:
     /// a strict write always leaves `waiters` non-empty for its whole flush
     /// window.
     fn age_threshold_ns(&self, buf: &SpanTenantBuf) -> i64 {
-        let has_priority = !buf.waiters.is_empty() || buf.est_bytes >= self.config.min_flush_bytes;
+        let has_priority =
+            !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if has_priority {
             self.config.max_flush_delay.as_nanos() as i64
         } else {
@@ -693,11 +808,63 @@ impl SpanShardActor {
         (self.tenants.len(), spans)
     }
 
-    async fn flush_all(&mut self, trigger: FlushTrigger) {
-        let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
-        for tenant in tenants {
-            if let Some(buf) = self.tenants.remove(&tenant) {
-                self.flush_tenant(tenant, buf, trigger).await;
+    /// Drains every buffered tenant, then awaits durability (ADR-1307 finding
+    /// F1). A clock-refused flush re-buffers its tenant (`flush_tenant`'s
+    /// `RegressionRefused` arm), so a single snapshot of the key set is not
+    /// exhaustive: a tenant re-inserted after the snapshot consumed its key
+    /// would never be retried in this call. On the `Shutdown` and channel-close
+    /// paths there is no later actor tick to retry it, so the re-buffered
+    /// tenant would drop on teardown -- the exact loss the channel-close arm
+    /// forbids. Retry over fresh snapshots until the map empties, bounded by
+    /// [`MAX_FLUSH_ALL_PASSES`]. This terminates because a refusal re-anchors
+    /// the monotonic floor to the raw reading, so the next pass stamps it and
+    /// proceeds; the bound only guards a pathological clock stepping back on
+    /// every reading.
+    ///
+    /// Residue left by the bound is never dropped silently, but it is only a
+    /// durability defect when nothing will retry it, so `intent` decides how it
+    /// is reported: an ERROR and the `flush_all_residue_tenants` bump on a
+    /// [`DrainIntent::Teardown`], a WARN on [`DrainIntent::Retryable`], where
+    /// the residue is still in the tenant map with its arrival bookkeeping and
+    /// the actor is still running to flush it.
+    async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
+        let mut passes = 0;
+        while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
+            let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
+            for tenant in tenants {
+                if let Some(buf) = self.tenants.remove(&tenant) {
+                    self.flush_tenant(tenant, buf, trigger).await;
+                }
+            }
+            passes += 1;
+        }
+        if !self.tenants.is_empty() {
+            let (tenant_count, buffered_spans) = self.buffered_summary();
+            match intent {
+                DrainIntent::Teardown => {
+                    self.metrics.record_flush_all_residue(tenant_count as u64);
+                    tracing::error!(
+                        shard = self.shard,
+                        tenant_count,
+                        buffered_spans,
+                        passes,
+                        "ravel-ingest: flush_all left buffered tenants unflushed after \
+                         exhausting retry passes; acknowledged buffered-mode rows lost \
+                         on this graceful drain"
+                    );
+                }
+                DrainIntent::Retryable => {
+                    tracing::warn!(
+                        shard = self.shard,
+                        tenant_count,
+                        buffered_spans,
+                        passes,
+                        "ravel-ingest: flush_all left buffered tenants unflushed after \
+                         exhausting retry passes; the actor keeps running and these \
+                         tenants stay buffered, so the next trigger (age tick or \
+                         explicit flush) retries them"
+                    );
+                }
             }
         }
         self.join_all_flushes().await;
@@ -718,17 +885,147 @@ impl SpanShardActor {
         }
     }
 
+    /// The flush-open stamp for this flush: `raw_ns` (the single flush-open
+    /// clock reading) raised to this writer's monotonic floor (ADR-1307),
+    /// mirroring [`crate::shard::ShardActor::monotonic_flush_open_ns`].
+    ///
+    /// `raw_ns` is plausibility-checked here first
+    /// (`checked_ingest_hour_bucket`), so a sub-floor or otherwise garbage
+    /// reading fails loud before the floor can hide it: raising a garbage
+    /// reading to an armed floor would defeat that check.
+    ///
+    /// The reading carries no ordering guarantee on its own: a backwards
+    /// wall-clock step (an NTP correction, a manual set) can read below a stamp
+    /// this writer already committed. Stamping that raw reading as
+    /// `created_unix_ns` would let a stale duplicate span outrank its own
+    /// correction under the query-time dedup order (docs/catalog-and-mvcc.md
+    /// "Cross-segment duplicate samples"), whose primary key is
+    /// `created_unix_ns`. Raising each reading to `last_flush_open_ns` keeps
+    /// stamps non-decreasing within this writer's process lifetime and counts
+    /// every step it absorbs (`clock_regressions`).
+    ///
+    /// A backwards step is absorbed only up to [`MAX_FLUSH_CLOCK_HOLD_NS`].
+    /// Beyond that the flush is refused with a typed error rather than stamped
+    /// (`clock_regressions_refused`) and the floor re-anchors to `raw_ns`, so a
+    /// single spurious forward glitch that ratcheted the floor into a future
+    /// ingest hour cannot pin every later flush there.
+    ///
+    /// The floor is in-process state, never persisted, so it resets to 0 on
+    /// restart by construction. The guarantee is per-process; ADR-1307 records
+    /// the cross-restart limitation.
+    fn monotonic_flush_open_ns(&mut self, raw_ns: i64) -> Result<i64, FlushClockError> {
+        checked_ingest_hour_bucket(raw_ns).map_err(FlushClockError::InvalidReading)?;
+        if raw_ns >= self.last_flush_open_ns {
+            self.last_flush_open_ns = raw_ns;
+            return Ok(raw_ns);
+        }
+        let held_ns = self.last_flush_open_ns - raw_ns;
+        if held_ns > MAX_FLUSH_CLOCK_HOLD_NS {
+            self.last_flush_open_ns = raw_ns;
+            self.metrics.record_clock_regression_refused();
+            tracing::warn!(
+                shard = self.shard,
+                held_ns,
+                bound_ns = MAX_FLUSH_CLOCK_HOLD_NS,
+                "ravel-ingest: flush clock regressed beyond the monotonic hold bound; refusing the flush and re-anchoring the floor"
+            );
+            return Err(FlushClockError::RegressionRefused(format!(
+                "flush clock regressed {held_ns} ns below the previous flush-open stamp, \
+                 beyond the monotonic hold bound of {MAX_FLUSH_CLOCK_HOLD_NS} ns; \
+                 refusing the flush (ADR-1307)"
+            )));
+        }
+        self.metrics.record_clock_regression();
+        tracing::warn!(
+            shard = self.shard,
+            regression_ns = held_ns,
+            "ravel-ingest: flush clock stepped backwards; held flush-open stamp to per-writer monotonic floor"
+        );
+        Ok(self.last_flush_open_ns)
+    }
+
     /// Pins `buf`'s flush identity, then moves `buf`'s payload, waiters, and
     /// ADR-0069 charges into a task spawned onto [`SpanFlushCtx::run_flush`]
     /// (ADR-0067 decision 1), mirroring [`crate::log_shard`]'s `flush_tenant`.
-    /// Everything up to and including the semaphore acquire runs here, on the
-    /// actor; nothing after it does, so a slow encode or a slow PUT never blocks
-    /// the actor from processing its next message once a permit is free.
+    /// Everything up to the spawn runs here, on the actor; nothing after it
+    /// does. The `max_inflight_flushes` acquire is inside the spawned task
+    /// (ADR-1642), so neither a slow encode, a slow PUT, nor a wait for a permit
+    /// blocks the actor from processing its next message.
     ///
-    /// An empty buffer never reaches the semaphore or a spawned task: there is
-    /// nothing to encode, and a flush identity pinned for nothing would burn a
-    /// `seq` for no object.
-    async fn flush_tenant(&mut self, tenant: TenantId, buf: SpanTenantBuf, trigger: FlushTrigger) {
+    /// An empty buffer never reaches a spawned task: there is nothing to encode,
+    /// and a flush identity pinned for nothing would burn a `seq` for no object.
+    async fn flush_tenant(
+        &mut self,
+        tenant: TenantId,
+        mut buf: SpanTenantBuf,
+        trigger: FlushTrigger,
+    ) {
+        if buf.spans.is_empty() {
+            // Nothing to write, so no flush task runs: dropping `charges` here
+            // is the ADR-0069 refund for this (span-less) buffer.
+            drop(buf.charges);
+            // `waiters` is empty here by construction: the span router mints a
+            // strict-mode ack only for a shard that actually received spans
+            // (`by_shard` only holds shards with at least one span, and the ack
+            // rides that same shard message), so a span-less buffer has nobody
+            // to answer. If that ever changes, this returns without acking and
+            // the router reads the dropped oneshot as a dead shard; the assert
+            // makes the invariant loud rather than silently dropping.
+            debug_assert!(buf.waiters.is_empty());
+            return;
+        }
+        let raw_ns = self.clock.now_ns();
+        // The flush-open stamp is decided before the buffer is consumed and
+        // before `record_flush`: a refused flush never touched the store, so it
+        // must not be counted as a flush that happened, and (on the retryable
+        // arm) its rows must be re-buffered rather than dropped (ADR-1307
+        // finding 1).
+        let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns) {
+            Ok(ns) => ns,
+            Err(FlushClockError::InvalidReading(msg)) => {
+                // A grossly broken raw reading is fail-loud and non-retryable
+                // (`SegmentBuild`, 400): the buffer is dropped, `charges` refund
+                // on drop.
+                self.metrics.record_abandoned_input_rejected();
+                self.ctx
+                    .ack_waiters(buf.waiters, Err(SpanWriteError::SegmentBuild(msg)));
+                return;
+            }
+            Err(FlushClockError::RegressionRefused(msg)) => {
+                // Already counted as `clock_regressions_refused` inside the
+                // helper; a clock regression is a transient server condition the
+                // next flush recovers from, so it is retryable (`Abandoned`, 503),
+                // not a client `SegmentBuild` (400) that would drop the buffered
+                // rows on a conformant exporter. The floor re-anchored to `raw_ns`
+                // inside the helper, so the next reading at or above `raw_ns`
+                // proceeds: the bound is per backwards step, not global, and a
+                // single backwards step refuses exactly one flush. It is not a
+                // guarantee that only one flush is refused over the process
+                // lifetime (ADR-1307 Consequences). A clock that keeps stepping
+                // back beyond the bound refuses every flush for as long as that
+                // continues, and within one drain the absorb path returns the held
+                // stamp without advancing the floor, so a receding clock can refuse
+                // one tenant, absorb the next few against the re-anchored value,
+                // and refuse again. Re-buffer the rows
+                // so that next trigger flushes them (finding 1): `charges` ride
+                // back with the buffer (the byte budget is not refunded, the bytes
+                // are still held), and the whole buffer -- spans and the trigger
+                // bookkeeping -- is preserved intact. Only `waiters` are acked here
+                // and taken out of the re-inserted buffer: a waiter left in it
+                // would be re-acked by the next flush against an already-answered
+                // oneshot. A strict-mode waiter that retries on the 503 re-enqueues
+                // spans this buffer still holds; the query-time dedup collapses the
+                // duplicate, so the retry is safe.
+                let waiters = std::mem::take(&mut buf.waiters);
+                self.ctx
+                    .ack_waiters(waiters, Err(SpanWriteError::Abandoned(msg)));
+                self.tenants.insert(tenant, buf);
+                return;
+            }
+        };
+        let tenant_hash = tenant.hash();
+        let seq = self.next_seq;
+        self.next_seq += 1;
         let SpanTenantBuf {
             spans,
             min_ingest_ts_ns,
@@ -737,37 +1034,28 @@ impl SpanShardActor {
             charges,
             ..
         } = buf;
-        if spans.is_empty() {
-            // Nothing to write, so no flush task runs: dropping `charges` here
-            // is the ADR-0069 refund for this (span-less) buffer.
-            drop(charges);
-            // `waiters` is empty here by construction: the span router mints a
-            // strict-mode ack only for a shard that actually received spans
-            // (`by_shard` only holds shards with at least one span, and the ack
-            // rides that same shard message), so a span-less buffer has nobody
-            // to answer. If that ever changes, this returns without acking and
-            // the router reads the dropped oneshot as a dead shard; the assert
-            // makes the invariant loud rather than silently dropping.
-            debug_assert!(waiters.is_empty());
-            return;
-        }
-        self.metrics.record_flush(trigger);
-
-        let tenant_hash = tenant.hash();
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        let flush_open_ns = self.clock.now_ns();
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
             Ok(bucket) => bucket,
             Err(msg) => {
+                // Defensive: `flush_open_ns` was already hour-bucket-validated;
+                // if it ever fails here it is fail-loud like InvalidReading.
                 self.metrics.record_abandoned_input_rejected();
                 self.ctx
                     .ack_waiters(waiters, Err(SpanWriteError::SegmentBuild(msg)));
                 return;
             }
         };
-        let deadline_ns =
-            flush_open_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
+        self.metrics.record_flush(trigger);
+        // The deadline pinned here is the flush-open deadline. It bounds how
+        // long the flush may sit queued for a permit: the spawned task checks it
+        // before acquiring and abandons a flush already past it without taking a
+        // permit (issue #1739 part 2). The budget for the flush's own store
+        // calls is re-derived from the moment the permit is granted (part 1), so
+        // a flush that waited behind a stalled prefix does not spend its lifetime
+        // in the queue and drop already-acked rows with no PUT.
+        // ADR-1307 finding 4: it derives from the raw clock reading, not the
+        // (possibly floor-raised) stamp.
+        let deadline_ns = raw_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
 
         let identity = ObjectIdentity {
             tenant_hash: tenant_hash.0,
@@ -793,28 +1081,79 @@ impl SpanShardActor {
             charges,
         };
 
-        // ADR-0067 decision 2: the only place a flush trigger blocks. At
-        // `max_inflight_flushes` already-spawned tasks, this await parks until
-        // one ends and releases its permit; because `flush_tenant` is itself
-        // awaited from `handle_write`/`flush_aged`/`flush_all`, that park keeps
-        // the actor from pulling its next channel message, exactly the
-        // backpressure path the bounded mpsc already relies on.
-        let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => panic!(
-                "ravel-ingest: span flush semaphore closed unexpectedly on shard {}",
-                self.shard
-            ),
-        };
-        self.metrics.record_inflight_flush_delta(self.shard, 1);
-        let guard = InFlightFlushGuard {
-            metrics: Arc::clone(&self.metrics),
-            shard: self.shard,
-        };
+        // ADR-0067 decision 2, amended for tenant isolation (issue #1641): the
+        // `max_inflight_flushes` acquire runs INSIDE the spawned flush task, not
+        // on the actor. Acquiring on the actor parked the whole `select!` loop at
+        // the bound -- it stopped pulling channel messages, stopped the age-flush
+        // tick, and stopped reaping finished flushes -- so one tenant whose
+        // key prefix was throttled (S3 `503 SlowDown` is per-prefix) stalled
+        // every co-resident tenant on the shard, including their age triggers.
+        // Handing the acquire to the task keeps the actor draining and ticking no
+        // matter how long a flush is stalled. Backpressure now propagates through
+        // the ADR-0069 global byte budget: each flush's `charges` are held until
+        // it completes, so a shard wedged on a throttled prefix drains the budget
+        // and `try_charge` sheds at the ceiling, rather than parking the actor and
+        // filling the bounded channel. ADR-1642 supersedes ADR-0067 decision 2
+        // with exactly this, for all three ingest pipelines.
+        //
+        // The in-flight gauge is incremented here, by the guard's constructor,
+        // and decremented by its `Drop` inside the task: see
+        // [`InFlightFlushGuard`] for why the two must be one value. A flush
+        // still waiting for a permit counts as in flight, because it is holding
+        // a flush window of memory.
+        let guard = InFlightFlushGuard::new(Arc::clone(&self.metrics), self.shard);
+        let semaphore = Arc::clone(&self.semaphore);
+        let shard = self.shard;
         let ctx = Arc::clone(&self.ctx);
+        let metrics = Arc::clone(&self.metrics);
         self.flushes.spawn(async move {
-            let _permit = permit;
             let _guard = guard;
+            let mut pinned = pinned;
+            // Issue #1739 part 2: a flush whose flush-open deadline already
+            // elapsed while it sat in the spawn queue must not take a permit only
+            // to fail the deadline check inside `run_flush` and waste the slot.
+            // Check the pinned flush-open deadline here, before the acquire; if
+            // it has passed, abandon in the queue with no permit taken. In normal
+            // operation the deadline is a full `max_flush_lifetime` ahead of
+            // flush-open, so this fires only when this task is scheduled
+            // pathologically late.
+            if ctx
+                .bound_to_deadline(pinned.deadline_ns, std::future::ready(()))
+                .await
+                .is_none()
+            {
+                ctx.abandon_in_queue(pinned);
+                return;
+            }
+            // Wait for a flush permit here, off the actor. At the bound this task
+            // parks; the actor does not. The wait is this shard's
+            // `flush_permit_wait_ns` (issue #865), measured on the injected clock.
+            let permit_wait_start_ns = ctx.clock.now_ns();
+            let permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => panic!(
+                    "ravel-ingest: span flush semaphore closed unexpectedly on shard {shard}"
+                ),
+            };
+            let permit_wait_ns = ctx
+                .clock
+                .now_ns()
+                .saturating_sub(permit_wait_start_ns)
+                .max(0) as u64;
+            metrics.record_shard_flush_permit_wait_ns(shard, permit_wait_ns);
+            let _permit = permit;
+            // Issue #1739 part 1: re-derive the abandonment deadline from the
+            // moment the permit is granted, not from flush-open. A flush that
+            // queued behind a stalled prefix must get its full
+            // `max_flush_lifetime` for its own store calls; pinning at flush-open
+            // spent that budget in the queue and dropped already-acked buffered
+            // rows with no PUT. The re-derived value only ever moves the deadline
+            // later (grant is at or after open), so it never shortens a flush's
+            // store budget.
+            pinned.deadline_ns = ctx
+                .clock
+                .now_ns()
+                .saturating_add(ctx.config.max_flush_lifetime.as_nanos() as i64);
             ctx.run_flush(pinned).await;
         });
     }
@@ -931,7 +1270,7 @@ mod tests {
 
         fn spawn_with_store(config: IngestConfig, store: Arc<dyn ObjectStoreBackend>) -> Self {
             let clock = TestClock::new(BASE_NS);
-            let metrics = Arc::new(SpanIngestMetrics::default());
+            let metrics = Arc::new(SpanIngestMetrics::new(config.shard_count));
             let (tx, rx) = mpsc::channel(64);
             let actor = SpanShardActor::new(
                 0,
@@ -943,6 +1282,7 @@ mod tests {
                 config,
                 Arc::clone(&metrics),
                 rx,
+                BufferBudgetCeiling::unlimited(),
             );
             let task = tokio::spawn(actor.run());
             Harness {
@@ -1510,7 +1850,7 @@ mod tests {
         let store: Arc<dyn ObjectStoreBackend> =
             Arc::new(FaultStore::new(MemoryStore::new(), plan));
         let clock = TestClock::new(BASE_NS);
-        let metrics = Arc::new(SpanIngestMetrics::default());
+        let metrics = Arc::new(SpanIngestMetrics::new(1));
         let (tx, rx) = mpsc::channel(64);
         let actor = SpanShardActor::new(
             0,
@@ -1522,6 +1862,7 @@ mod tests {
             exhaustion_config(4),
             Arc::clone(&metrics),
             rx,
+            BufferBudgetCeiling::unlimited(),
         );
         let task = tokio::spawn(actor.run());
 
@@ -1623,5 +1964,124 @@ mod tests {
             "seq1's span resolves to its own object"
         );
         h.shutdown().await;
+    }
+
+    /// Issue #865: the span pipeline's `flush_permit_wait_ns` is measured on
+    /// the injected clock, exactly like the metrics and log pipelines. Flush
+    /// A holds the only permit (`max_inflight_flushes: 1`) with its data PUT
+    /// held open; flush B queues behind it. Advancing the clock while B waits
+    /// on the semaphore, then releasing A, pins B's recorded wait to exactly
+    /// the advance.
+    ///
+    /// Prove-the-test: reverting the acquire site in `flush` to the pre-fix
+    /// code (no `permit_wait_start_ns` / `record_shard_flush_permit_wait_ns`
+    /// around `semaphore.acquire_owned()`) makes the final assertion fail --
+    /// `flush_permit_wait_ns_total` stays 0 no matter how long B actually
+    /// waited for the permit.
+    #[tokio::test]
+    async fn permit_wait_is_measured_on_the_injected_clock() {
+        let config = IngestConfig {
+            max_inflight_flushes: 1,
+            ..flush_on_first()
+        };
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let h = Harness::spawn_with_store(config, Arc::clone(&store));
+        let tenant = TenantId::new("acme");
+        // Held on A's data PUT, so A holds the flush's one permit for its
+        // whole duration rather than releasing it before B is sent.
+        let gate = fault.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+
+        let (ack_a_tx, ack_a_rx) = oneshot::channel();
+        h.tx.send(SpanShardMsg::Write {
+            tenant: tenant.clone(),
+            spans: vec![norm_span(1, 1, 1_000, "a")],
+            ack: Some(ack_a_tx),
+            charge: None,
+        })
+        .await
+        .expect("send A");
+        gate.wait_until_held(1).await;
+
+        let (ack_b_tx, ack_b_rx) = oneshot::channel();
+        h.tx.send(SpanShardMsg::Write {
+            tenant: tenant.clone(),
+            spans: vec![norm_span(2, 1, 2_000, "b")],
+            ack: Some(ack_b_tx),
+            charge: None,
+        })
+        .await
+        .expect("send B");
+
+        // Nothing else in this test blocks the executor, so yielding a
+        // bounded number of times deterministically lets B's flush task run
+        // up to (and park on) the semaphore acquire before the clock moves.
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+
+        h.clock.advance_ns(5_000);
+
+        let ids = gate.held();
+        assert_eq!(ids.len(), 1, "exactly one PUT is held (A's)");
+        gate.release(ids[0]);
+
+        ack_a_rx.await.expect("ack A").expect("A commits");
+        ack_b_rx
+            .await
+            .expect("ack B")
+            .expect("B commits once A releases the permit");
+
+        let snapshot = h.metrics.snapshot();
+        assert_eq!(
+            snapshot.flush_permit_wait_ns_total, 5_000,
+            "B's recorded wait must equal exactly the clock advance while it queued for the permit"
+        );
+        let by_shard = h.metrics.shard_skew_by_shard();
+        let shard0 = by_shard
+            .iter()
+            .find(|(shard, _)| *shard == 0)
+            .expect("shard 0 flushed both A and B");
+        assert_eq!(
+            shard0.1.flush_permit_wait_ns, 5_000,
+            "the wait must be recorded against the shard that actually flushed, not a constant"
+        );
+
+        h.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod inflight_guard_tests {
+    use super::*;
+
+    /// The span-pipeline counterpart of
+    /// `crate::shard::inflight_guard_tests::a_flush_task_dropped_before_its_first_poll_leaves_the_gauge_balanced`.
+    /// A flush task spawned and then dropped before its first poll has to leave
+    /// the gauge exactly where it found it; pairing the `+1` and the `-1` in one
+    /// value is what makes that hold, and the public reader's clamp at 0 is why
+    /// this asserts on the raw signed count.
+    #[test]
+    fn a_flush_task_dropped_before_its_first_poll_leaves_the_gauge_balanced() {
+        let metrics = Arc::new(SpanIngestMetrics::new(1));
+        assert_eq!(metrics.in_flight_flushes_signed(0), 0);
+
+        let guard = InFlightFlushGuard::new(Arc::clone(&metrics), 0);
+        assert_eq!(
+            metrics.in_flight_flushes_signed(0),
+            1,
+            "the buffer has left the actor, so the flush counts as in flight"
+        );
+
+        let flush_task = async move {
+            let _guard = guard;
+        };
+        drop(flush_task);
+
+        assert_eq!(
+            metrics.in_flight_flushes_signed(0),
+            0,
+            "the guard's own Drop ran, so the pair balanced"
+        );
     }
 }

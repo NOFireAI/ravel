@@ -25,8 +25,12 @@
 //! id-ranges are disjoint, since series are emitted in ascending id order and a
 //! part is a contiguous id range. Each finished part is a whole object written
 //! with a single `CreateIfAbsent` PUT (no multipart), and its encoded bytes are
-//! retained in the returned `Vec` until publish so the convergence-repair path
-//! can re-PUT a part a racing winner is missing.
+//! released the moment that PUT succeeds (ADR-0979 decision 3), so the returned
+//! `Vec` carries part metadata only and the retained-parts memory term does not
+//! grow with the bucket's output. A part whose PUT answered `AlreadyExists` is
+//! HEAD-verified after the record PUT
+//! ([`crate::publish::verify_already_existed_parts`]) instead of being repaired
+//! from a retained copy.
 //!
 //! Format-migration note (ADR-0066 decision 5): an input recorded *below* the
 //! current output version (its commit record's `segment_format_version` is older
@@ -51,12 +55,12 @@
 //! re-encoded) in ascending id order and the window's fetched buffers are then
 //! dropped, so peak fetch buffering is one window's worth. A part accumulates
 //! re-encoded series across windows until its estimated STORED bytes reach
-//! `max_l1_part_bytes`, checked between series; the encoded parts held until
-//! publish, plus one series' decoded samples at a time, dominate peak memory.
-//! Neither of those two terms is sized by a config knob: the retained parts grow
-//! with the bucket's output, and one series' decoded samples grow with that
-//! series. `l1_part_memory_target_bytes` governs the RLOG and RSPAN merges and
-//! is not read on this path.
+//! `max_l1_part_bytes`, checked between series; the pending output part plus one
+//! series' decoded samples at a time dominate peak memory. Neither term is sized
+//! by a config knob: one series' decoded samples grow with that series, and the
+//! pending part runs one whole series past `max_l1_part_bytes`.
+//! `l1_part_memory_target_bytes` governs the RLOG and RSPAN merges and is not
+//! read on this path.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -110,10 +114,10 @@ pub const OUTPUT_FORMAT_VERSION: u32 = ravel_segment::SUPPORTED_VERSIONS.newest(
 ///
 /// `bytes` is `Option<Bytes>` (ADR-0979 decision 3): a caller that retains the
 /// encoded bytes for its own publish path (the erasure rewrite, and for now the
-/// RSEG/RSPAN codecs) carries `Some`; the bounded RLOG compaction path releases
-/// them the moment the part's PUT succeeds and carries `None`, so the
-/// retained-parts memory term goes to zero instead of scaling with the bucket's
-/// whole L1 output. A `None`-bytes part cannot be re-PUT by the convergence
+/// RSPAN codec) carries `Some`; the RLOG and RSEG compaction paths release them
+/// the moment the part's PUT succeeds and carry `None`, so the retained-parts
+/// memory term goes to zero instead of scaling with the bucket's whole L1
+/// output. A `None`-bytes part cannot be re-PUT by the convergence
 /// repair path, which is sound on the compaction path because every part is PUT
 /// (content-addressed) before the record is; see
 /// [`crate::publish::resolve_already_exists`].
@@ -127,8 +131,8 @@ pub const OUTPUT_FORMAT_VERSION: u32 = ravel_segment::SUPPORTED_VERSIONS.newest(
 /// `AlreadyExists` part would recreate the whole-output term D3 exists to kill,
 /// in exactly the abandoned-run-retry case) and instead HEAD-verifies these
 /// parts after the record PUT succeeds
-/// ([`crate::publish::verify_already_existed_parts`]). The flag is only set on
-/// the bounded RLOG compaction path; every other constructor leaves it `false`.
+/// ([`crate::publish::verify_already_existed_parts`]). The flag is set on the
+/// RLOG and RSEG compaction paths; every other constructor leaves it `false`.
 #[derive(Debug, Clone)]
 pub struct BuiltPart {
     pub key: String,
@@ -287,13 +291,14 @@ pub async fn build_parts(
     //
     // `l1_part_memory_target_bytes` is not read here at all, so no configured
     // number sizes this builder's heap. What it holds at once is one fetch
-    // window's raw pages (the stored-size target applied to INPUT page bytes),
-    // one series' decoded samples while `materialize_series` decodes, merges,
-    // and re-encodes its runs (bounded by that series' own size and by nothing
-    // configurable), and every finished part's encoded bytes, which are retained
-    // until publish so convergence repair can re-PUT one. The pending output
-    // part is the only term `max_l1_part_bytes` sizes, and it is checked between
-    // series, so that term runs one whole series past the target.
+    // window's raw pages (the stored-size target applied to INPUT page bytes)
+    // and one series' decoded samples while `materialize_series` decodes,
+    // merges, and re-encodes its runs (bounded by that series' own size and by
+    // nothing configurable). A finished part's encoded bytes are released at its
+    // PUT (ADR-0979 decision 3), so no term here grows with the bucket's whole
+    // output. The pending output part is the only term `max_l1_part_bytes`
+    // sizes, and it is checked between series, so that term runs one whole
+    // series past the target.
     let mut pending: Vec<SeriesInputV7> = Vec::new();
     let mut pending_exemplars: Vec<ExemplarInput> = Vec::new();
     let mut pending_estimate = PartSizeEstimate::new();
@@ -327,7 +332,7 @@ pub async fn build_parts(
                 pending_exemplars.append(&mut records);
             }
             if pending_estimate.bytes() >= config.max_l1_part_bytes {
-                let part = flush_part(
+                let mut part = flush_part(
                     bucket,
                     config,
                     &ingest_bounds,
@@ -337,9 +342,7 @@ pub async fn build_parts(
                     std::mem::take(&mut pending),
                     std::mem::take(&mut pending_exemplars),
                 )?;
-                if !config.dry_run {
-                    put_part_with_ledger(store, &part, ledger).await?;
-                }
+                put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
                 parts.push(part);
                 part_index += 1;
                 pending_estimate.reset();
@@ -351,7 +354,7 @@ pub async fn build_parts(
 
     // The tail part: whatever series remain below the stored-size target.
     if !pending.is_empty() {
-        let part = flush_part(
+        let mut part = flush_part(
             bucket,
             config,
             &ingest_bounds,
@@ -361,9 +364,7 @@ pub async fn build_parts(
             pending,
             pending_exemplars,
         )?;
-        if !config.dry_run {
-            put_part_with_ledger(store, &part, ledger).await?;
-        }
+        put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
         parts.push(part);
     }
 
@@ -1129,6 +1130,38 @@ fn flush_part(
         part,
         put_already_existed: false,
     })
+}
+
+/// PUT one finished part and release its encoded bytes (ADR-0979 decision 3),
+/// the same shape `rlog.rs`'s `finalize_part` applies on the bounded RLOG
+/// compaction path.
+///
+/// Compaction never retains: a fresh PUT's part is age-zero and so unreachable
+/// by the unreferenced-part sweep for the run's whole duration, which made its
+/// in-RAM copy belt-and-braces rather than a correctness dependency. A part
+/// whose PUT answered `AlreadyExists` carries an abandoned run's
+/// `last_modified` and CAN be swept mid-run, so it is flagged here and
+/// HEAD-verified after the record PUT
+/// ([`crate::publish::verify_already_existed_parts`]); its bytes are dropped
+/// too, because a retry after an abandoned run that uploaded every part answers
+/// `AlreadyExists` for all of them and retaining those would recreate the
+/// whole-output memory term this decision removes, in exactly the recovery
+/// case. Under `dry_run` nothing is ever PUT, so the bytes are released
+/// immediately.
+async fn put_and_release_part(
+    store: &dyn ObjectStoreBackend,
+    part: &mut BuiltPart,
+    dry_run: bool,
+    ledger: Option<&RequestLedger>,
+) -> Result<()> {
+    if !dry_run {
+        match put_part_with_ledger(store, part, ledger).await? {
+            PartPut::Created => {}
+            PartPut::AlreadyExisted => part.put_already_existed = true,
+        }
+    }
+    part.bytes = None;
+    Ok(())
 }
 
 /// PUT one part `CreateIfAbsent`; `AlreadyExists` is idempotent success (the

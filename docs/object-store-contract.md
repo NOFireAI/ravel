@@ -142,11 +142,48 @@ trait honors cancellation by drop, so the query deadline (usually well under
   and MinIO (the memory oracle alone cannot catch a uniform mapping).
 - Concurrent conditional writes racing the same key may surface as a
   transient conflict; after retry the loser must land on
-  `AlreadyExists`/`PreconditionFailed` per mode.
+  `AlreadyExists`/`PreconditionFailed` per mode. A raced `CreateIfAbsent`
+  is the load-bearing case: AWS PutObject documents a 409
+  `ConditionalRequestConflict` that the client MUST retry, distinct from a
+  genuine already-exists. The S3 adapter cannot see the HTTP status
+  (`object_store` 0.14 maps every raw 409 to `AlreadyExists`, keeps the
+  status in a crate-private type, and enables its own conflict retry only
+  for the update / etag-match modes, never for create), so on
+  `AlreadyExists` under `CreateIfAbsent` it issues one `HEAD` to
+  disambiguate, and the HEAD's own outcome decides which of four ways the
+  conflict resolves: key **present** stays `AlreadyExists` (a real
+  collision, so the commit-path split-brain guard and the compaction
+  vanished-part guard still fire); key **absent** becomes a retryable
+  `Transient` naming a conditional-request conflict, which
+  `StoreError::is_retryable` routes back into the caller's existing retry
+  loop; the HEAD itself failing retryably (`Throttled`, `Timeout`,
+  `Transient`) surfaces that error verbatim, because an inconclusive probe
+  determined nothing about the key, and a caller that read it as
+  `AlreadyExists` would stop retrying while nothing had been written; and
+  the HEAD failing terminally (`AccessDenied`, `PreconditionFailed`,
+  `Corrupted`, `InvalidRange`, `Permanent`) still resolves to
+  `AlreadyExists`, since retrying the probe cannot change a terminal
+  outcome. This cannot lose a genuine already-exists, only delay one: on
+  the retry the idempotent create conflicts again, and once a HEAD finally
+  succeeds a present key still yields `AlreadyExists`. The cost of an
+  inconclusive probe is one extra round trip, never a wrong answer.
 - Listing is paginated (S3 pages at 1000 keys). Cross-page guarantee: any
   key created before the first page request is returned; keys created
   during the scan may or may not appear; a key MAY appear more than once
-  and callers MUST dedup by key.
+  and callers MUST dedup by key. The RAW delivery sequence, across every
+  page of one drain and counting repeats, is non-decreasing, and a repeat
+  re-delivers the last key delivered, never an earlier one. That is what
+  `MemoryStore::list`, `S3Store::list`, and S3 itself do, and the
+  conformance suite's `LexicographicListingOrder` probe judges the raw
+  sequence on exactly this rule: equal adjacent keys pass, a decrease
+  fails qualification. So a caller draining every page dedups at constant
+  memory by holding only the last key: an equal key is dropped, and a key
+  strictly below it is an order violation, not a repeat, which the client
+  rejects rather than reordering. The client also bounds the drain: a
+  continuation token equal to the previous one is a spinning backend and
+  the client fails rather than looping forever, and a token that keeps
+  changing without ending is bounded by a page ceiling (100 000 pages,
+  100 million keys at the 1000-key page size).
 - `list_after(prefix, start_after, page)` returns exactly the keys `list`
   would, minus every key `<= start_after`: each returned key compares
   strictly greater than `start_after`, in the same lexicographic order and
@@ -497,13 +534,23 @@ looked like data loss rather than a misconfigured store.
 
 `crates/ravel-object-store/src/conformance.rs` is this contract turned into
 a suite that empirically probes a live backend rather than reading its
-declared flags. `run_conformance_suite(store, scratch_prefix)` runs, under a
-throwaway key prefix:
+declared flags. `run_conformance_suite(store, scratch_prefix, page_size)`
+runs, under a throwaway key prefix (`page_size` is the declared list page
+size the two listing probes size their key counts against; see
+`CrossPageListing` below):
 
-- `ConditionalWriteCreateIfAbsent`: two concurrent `CreateIfAbsent` puts to
-  the same key: exactly one must win and the loser must observe
-  `AlreadyExists` (the losing-writer outcome the "Semantics adapters MUST
-  honor" section above requires).
+- `ConditionalWriteCreateIfAbsent`: a `CreateIfAbsent` put on a key an
+  earlier `CreateIfAbsent` put already created must fail `AlreadyExists` and
+  must not apply its bytes (the losing-writer outcome the "Semantics adapters
+  MUST honor" section above requires). This is the sequential case: the
+  loser starts after the winner finished.
+- `ConcurrentCreateIfAbsentSingleWinner`: the same conditional create with
+  eight writers racing one absent key, every request in flight at once.
+  Exactly one must return `Ok`, exactly seven must observe `AlreadyExists`,
+  and the surviving object must hold the winner's bytes. The sequential
+  probe above cannot falsify a backend that checks and applies the
+  precondition non-atomically, because it never gives it a window to lose
+  in; this one does.
 - `ConditionalWriteCasVersion`: a `CasVersion` put against a stale version
   must fail `PreconditionFailed`, not silently overwrite.
 - `ConsistentReadAfterWrite`: a `get` immediately following a `put` returns
@@ -511,18 +558,106 @@ throwaway key prefix:
   read-your-writes gap that only shows up intermittently.
 - `ConsistentListAfterWrite`: a `list` immediately following a `put`
   includes the new key, repeated the same way, to catch eventual-consistency
-  listing rather than trusting the `consistent_list` flag.
+  listing rather than trusting the `consistent_list` flag. This probe
+  drains `list` itself, which `S3Store` implements separately from
+  `list_after` and every catalog scan issues, so the suite covers both
+  methods rather than reaching one only through the other's default.
+- `LexicographicListingOrder`: `page_size + 2` keys (the suite's declared list
+  page size, floored at 5; see `CrossPageListing` below) written in
+  non-sorted order must come back in lexicographic key order on both `list`
+  and `list_after`, and `list_after` must additionally resume strictly after
+  its marker in that same order, delivering exactly the keys above it. At the
+  floor of 5 the keys are a fixed five-letter alphabet; above it they are
+  zero-padded numeric suffixes written in descending order, so an unpadded
+  ordering (where `"k10"` would otherwise sort before `"k9"`) cannot pass by
+  accident. A continuation token only names a position when the order is the
+  lexicographic one, which is what `S3Store::list` pagination and every
+  catalog scan built on it assume. `S3Store` implements `list` and
+  `list_after` separately (the default `list_after` is `list` plus a
+  client-side filter), so a backend can be ordered on one entry point and
+  reversed on the other; the probe drains a full pass through each and names
+  the offending entry point in its failure, including when the failure is the
+  drain itself (a `list`/`list_after` error, or pagination that never
+  terminates), not only an out-of-order delivery. Every pass judges the raw
+  delivery sequence, repeats included, on the rule the listing bullet above
+  states: a repeat of the last delivered key passes, a repeat of an earlier
+  one fails. Judging a deduplicated sequence instead, or only one entry
+  point, would qualify a backend whose every drain then fails with
+  `ListOrderViolation`. Each full drain must also have crossed a real page
+  boundary, on the same at-least-two-key-bearing-pages rule
+  `CrossPageListing` states below: order observed inside a single page is
+  order the backend already had in hand, and says nothing about whether a
+  continuation token names a position in the key space, which is the claim
+  this probe exists to check.
+- `CrossPageListing`: the suite is given a declared list page size (the real
+  page size the backend under test was built with -- `ravel-cli store
+  qualify --list-page-size`, defaulting to the production S3 page size of
+  1000); the probe writes `page_size + 2` keys, floored at 5, before the
+  first page request. `S3Store::with_page_size` cuts one wire response
+  client-side rather than asking for a smaller one: `S3Store::list` sets no
+  `MaxKeys`, so S3 answers with its default of up to 1000 keys, and the
+  method opens a fresh `object_store` listing stream per page, pulls at most
+  `page_size` entries off it, and drops it -- leaving that response's own
+  `NextContinuationToken` unfollowed unless `page_size` exceeds what one
+  response carries. Writing more keys than the backend's actual page size is
+  therefore the only way to force a real continuation-token boundary; a
+  shrunken declared page size against a large real one exercises only Ravel's
+  own client-side drain loop, not the backend. At the default the run does
+  prove the backend's side: 1002 keys means S3 serves a full 1000-key
+  response and then honours an exclusive `start-after` resume past it. All
+  `page_size + 2` keys written must come back as that many distinct keys,
+  none lost between pages, AND delivered across at least two
+  pages that actually carry objects: a backend may emit a trailing empty page
+  purely to signal the end of a listing once total keys exactly fill a
+  multiple of the page size, and counting that page toward "more than one
+  page" would let a single real page of results pass as if a boundary had
+  been crossed. Repeat deliveries across real pages are allowed (the
+  cross-page guarantee above permits them); losses are not.
+- `DeleteVisibility`: after a successful delete, a `get` of the key returns
+  `NotFound` and a listing of its prefix omits it while still holding the
+  sibling key that was not deleted; a second delete of the now-absent key
+  succeeds and changes nothing. The listing side is drained through both
+  `list` and `list_after`, so a delete visible through one entry point but not
+  the other is caught here rather than depending on which path a caller
+  happens to use. Retention sweep, GC, and ADR-0064 erasure all read a
+  delete's acknowledgement as the object being gone.
 
 Each probe returns a `ProbeResult` naming which `Property` it checked, so a
 failure reads "this backend cannot do conditional writes" or "this backend's
 listing is eventually consistent" instead of a bare pass/fail, so an operator
 does not have to guess which mandatory capability the backend actually
-lacks.
+lacks. The last four probes above are the empirical counterparts of the
+common TLA model's `CreateIfAbsentWinnerUnique`,
+`ListingConsumersConsistent`, `ListReturn`/`ListEventuallyComplete`, and
+`DeleteIdempotent` (`formal/tla/common/traceability.md`).
+
+Because the delete probe deletes, the credential running `ravel-cli store
+qualify` needs delete permission on the scratch prefix
+`sys/qualify/<run-id>/**`, and only there. The shipped Admin template
+(`deploy/iam/admin.json`, the `AdminQualifyDelete` statement) grants exactly
+this: `s3:DeleteObject` on `sys/qualify/*` and nowhere else, added by
+ADR-0055's amendment for this probe. A deployment using that template
+qualifies a fresh bucket with no manual policy edit, and Admin still holds no
+delete on tenant data or any protected key.
 
 ADR-0050 section 6 also names cross-page listing consistency and
-multipart-complete visibility as probes for this suite; neither is
-implemented yet. `CONFORMANCE_SUITE_VERSION` exists precisely so a later
-addition can be told apart from the four probes qualifying a bucket today.
+multipart-complete visibility as probes for this suite. Cross-page listing
+is the `CrossPageListing` probe above; multipart-complete visibility is
+still not implemented.
+
+`CONFORMANCE_SUITE_VERSION` is `2`. Version 1 checked four properties (the two
+conditional-write modes, read-after-write, and list-after-write); version 2 is
+the eight-probe suite above, adding concurrent single-winner create,
+lexicographic listing order, cross-page listing, and delete visibility. A
+record written under version 1 was never checked against those four, so
+ravel-server refuses startup on it (a stale record that reads as a current pass
+is worse than none: a missing record fails closed, a stale one passes). A
+bucket qualified under the old suite must be re-qualified. `ravel-cli store
+qualify` does that in place: a re-run overwrites a below-floor
+`sys/qualification` record with the current pass, and leaves an
+equal-or-newer record untouched. Re-recording is the only way to clear the
+refusal, because the record is written with `CreateIfAbsent` and cannot
+otherwise be replaced.
 
 This is a runtime, once-per-bucket check, not a replacement for the
 compile-time contract suite below: `crates/ravel-object-store/tests/contract.rs`
@@ -540,24 +675,63 @@ JSON record to `sys/qualification` via `CreateIfAbsent`:
 
 ```json
 {
-  "suite_version": 1,
+  "suite_version": 2,
   "backend_identity": "s3://<bucket>@<endpoint>",
   "qualified_unix_ns": 1234567890000000000,
   "passed_properties": ["conditional_write_create_if_absent", "..."]
 }
 ```
 
-`CreateIfAbsent` makes qualification once-per-bucket: a second `store
-qualify` run against an already-qualified bucket leaves the existing record
-untouched and reports it instead of overwriting it, per ADR-0050 section 6.
-A failing run writes nothing new to `sys/qualification`; its process exit
-names every failing property. The command only ever writes under
-`sys/qualify/<run-id>/` (a handful of small scratch objects the suite does
-not delete afterward: each run's key is unique, so this is unbounded
-untracked storage a runbook should sweep periodically, not a correctness
-issue) and the single `sys/qualification` key; it never reads, lists, or
-writes any tenant-prefixed key, so it is safe to run against a bucket that
-already holds production data.
+`CreateIfAbsent` makes qualification once-per-bucket at a given suite version:
+a second `store qualify` run against a bucket already qualified under the
+current version leaves the existing record untouched and reports it instead of
+overwriting it, per ADR-1302 (superseding ADR-0050 section 6). The one exception
+is a record written under an older suite version, which a re-run overwrites with
+the current pass so the version above does not strand an already-qualified
+bucket. That overwrite is guarded by `CasVersion` on the version the run just
+read, not an unconditional write, so a concurrent `qualify` from a newer binary
+that installed a higher-version record between the read and the write is left in
+place rather than downgraded. A failing run writes nothing new to
+`sys/qualification`; its process exit names every failing property.
+
+At startup ravel-server compares the record's `backend_identity` against the
+identity it is configured for and logs a warning on a mismatch, without
+refusing. The identity is endpoint-derived (bucket plus optional endpoint, no
+credentials), so an endpoint rename or a path-style/virtual-host switch alters
+it with no change of backend, and refusing on that benign case would be an
+outage an operator disables. A mismatch is instead the signal that a
+replicated, restored, or migrated bucket carries a qualification a different
+backend earned: verify the backend and re-run `store qualify` if it is
+genuinely a different store. The command only ever writes under
+`sys/qualify/<run-id>/` and the single `sys/qualification` key; it never
+reads, lists, or writes any tenant-prefixed key, so it is safe to run
+against a bucket that already holds production data.
+
+The scratch objects the suite leaves behind are no longer a handful. The two
+listing probes dominate the count, and each writes `max(page_size + 2, 5)`
+small objects, so a run leaves `2 x max(page_size + 2, 5)` of them plus the
+14 the other probes leave (two conditional-write keys, five read-after-write,
+five list-after-write, one concurrent-create, and the delete probe's
+surviving key): 2018 objects at the default page size of 1000, against 24
+before the page size became a parameter. None are deleted
+afterward and each run's prefix is unique, so this is unbounded untracked
+storage a runbook should sweep periodically (delete `sys/qualify/` between
+runs), not a correctness issue. A bucket qualified with a small
+`--list-page-size` writes proportionally fewer, but proves proportionally
+less.
+
+A `sys/qualification` record written by this suite before the page size
+became a parameter recorded a pass that never crossed a real pagination
+boundary, so it is weaker evidence than its version number suggests.
+`CONFORMANCE_SUITE_VERSION` deliberately stays at `2`: bumping it would make
+`ravel-server` refuse startup on every deployed bucket's record until each
+was re-qualified, which is an outage traded for evidence of a property no
+deployment has been observed to lack. The consequence is that re-running
+`store qualify` against such a bucket does not replace the record: the
+stored version is the current one, so the run leaves it untouched and
+reports it (the once-per-bucket no-op above). The re-run's own printed probe
+results are the evidence that pagination holds; installing a fresh record
+instead requires removing the old one out of band.
 
 ## Required bucket configuration (ADR-0064 §7, ADR-0072 decision 3)
 
@@ -587,18 +761,136 @@ adapter contract:
    - The noncurrent-version expiration rule required by point 1 when
      versioning is ON.
 4. **Object Lock, compliance mode**, on the protected prefixes: `sys/*`,
-   `t/*/*/prov`, commit records `t/*/*/c/*`, and `t/*/catalog/*/*` HEAD
-   history. These are the objects whose immutability the commit and
-   catalog layers assume as a given (see "Data objects, commit records,
-   manifests, and index objects are immutable"; this section is that
-   invariant's bucket-level enforcement point). Object Lock is what makes
-   that assumption hold even against a compromised or misconfigured
-   credential that can otherwise issue deletes: compliance mode refuses
-   deletion or overwrite for the configured retention period, with no
-   principal (including the bucket owner) able to shorten or remove it.
-   Subject identifiers that must remain erasable under ADR-0064 live in
-   *values*, never in *object keys or names*, precisely so Object Lock on
-   these prefixes never conflicts with a legitimate erasure request.
+   `t/*/*/prov`, commit records `t/*/*/c/*`, and the catalog keyspace
+   `t/*/catalog/*/*` (the HEAD pointer and its versions, and the snapshot
+   and index objects the same pattern reaches). These are the objects whose
+   immutability the commit and catalog layers assume as a given (see "Data
+   objects, commit records, manifests, and index objects are immutable";
+   this section is that invariant's bucket-level enforcement point). Object
+   Lock is what makes that assumption hold even against a compromised or
+   misconfigured credential that can otherwise issue deletes: compliance
+   mode refuses deletion or overwrite for the configured retention period,
+   with no principal (including the bucket owner) able to shorten or remove
+   it. Subject identifiers that must remain erasable under ADR-0064 live in
+   *values*, never in *object keys or names*, so naming a prefix in the lock
+   never exposes a subject value through the pattern itself. What a locked
+   object *contains* is a separate question, and for one member of the
+   catalog family the answer is not "nothing erasable"; see "A lock on the
+   catalog family" below. `sys/*`, `t/*/*/prov`, and `t/*/catalog/*/*` are
+   never targets of supersession GC, ADR-0019 retention deletion, or
+   ADR-0064 erasure, so a lock on those three costs nothing *against those
+   three mechanisms*. That is the whole of the exemption, and it does not
+   generalise: the catalog family is a target of a fourth mechanism, the
+   unreferenced-catalog sweep, covered in "A lock on the catalog family"
+   below. Commit records (`t/*/*/c/*`) are not exempt even that far: once
+   superseded, supersession GC and ADR-0019 retention deletion physically
+   delete them, and ADR-0064 erasure reaches them transitively (the
+   erasure sweep itself deletes only the `.dreq` request objects; the
+   rewrite pass supersedes its inputs, and the superseded sweep then
+   removes those inputs' commit records like any other superseded chain).
+   A per-object compliance-mode retention `R` on a still-locked commit
+   record refuses that delete until `R` elapses, so the physical-removal
+   bound for the record (and for the sweep pass holding it) becomes
+   `max(bound, R)`. The superseded sweep runs three delete loops in order
+   over every cleared chain in the pass: every chain's input commit
+   records first, then every chain's input data objects (its L0 data and
+   pre-rewrite L1 segments), then every chain's own compaction or rewrite
+   records last, so a rewrite record outlives every input it superseded.
+   A lock on a chain's input commit record therefore aborts the pass at
+   the first loop, before the data loop runs at all: the data-delete step
+   never runs for any chain in that pass, and the L0 data the pass would
+   otherwise collect stays in place, undeleted, until the record's
+   retention expires and a later pass completes the delete. A lock on a
+   chain's own compaction or rewrite record is different: by the time the
+   third loop reaches it the pass has already deleted that chain's input
+   records and their data, so the refusal holds only the chain's own
+   record, aborts the pass at the third loop, and leaves that record in
+   place through the retention period for the next pass to retry once `R`
+   elapses; the crash ordering the sweep is built around, a record
+   outliving the objects it superseded, is preserved either way. An
+   operator who needs these sweeps to keep making progress keeps `R` at
+   or under `protection_horizon` (about 25 hours with `CompactorConfig`
+   defaults); an `R` longer than that pauses collection on that record
+   for the difference.
+
+   **A lock on the catalog family.** `t/*/catalog/*/*` reaches more than
+   the HEAD pointer and its versions: the same pattern covers the
+   snapshot parts under `catalog/<signal>/snap/` and the name-postings
+   and column-statistics objects under `catalog/<signal>/idx/`
+   (docs/catalog-and-mvcc.md, object layout). Those are swept. Every fold
+   writes new content-addressed objects and swaps HEAD, and
+   `sweep_unreferenced_catalog_objects`
+   (`crates/ravel-maintain/src/sweep.rs`, driven in production by
+   `services/ravel-server/src/maintain.rs`'s maintenance tick) deletes
+   every object under those two prefixes that the current HEAD no longer
+   names, once it is older than `protection_horizon`. A compliance-mode
+   retention on the family therefore has a cost, and for some tenants
+   part of that cost is a genuine erasure bound.
+
+   Not every catalog object is alike here. The HEAD pointer, the snapshot
+   entries inside a snapshot part, and the name postings carry identities,
+   hashes, counts, timestamps, and metric names only, never a label or
+   attribute value: that is what ADR-0064's Context establishes, and it
+   enumerates exactly `SnapshotEntry`, `SnapshotPartHeader`, and name
+   postings (ADR-0064 Context, plus its §7 requirement that subject
+   identifiers never appear inside metric names). The per-part
+   column-statistics objects post-date that ADR and were never analysed
+   there, and they do hold values. A `ColumnStat` carries a `ColumnValue`
+   min, a `ColumnValue` max, and a repeated `DictEntry` dictionary, and a
+   `ColumnValue` admits `str_utf8` and `bytes_val`
+   (proto/ravel/catalog.proto). The fold tallies a declared `Str` or
+   `Bytes` column exactly: its distinct-value dictionary and its exact min
+   and max (`crates/ravel-catalog/src/column_stats_build.rs`; the
+   dictionary is kept only up to a fixed entry cap and dropped past it,
+   the min and max are always kept, so a subject value can sit in the
+   extrema of a high-cardinality column with no dictionary). A tenant
+   may declare any attribute key, `user.id` among them, as a `STR` typed
+   attribute column whose key is the SQL column name verbatim
+   (proto/ravel/sys.proto, `TypedAttrColumn`). Those objects are written as
+   `t/<hash>/catalog/<signal>/idx/*.cstat`
+   (`crates/ravel-catalog/src/fold.rs`), inside the `idx/` prefix this
+   sweep lists.
+
+   So for any tenant with a `STR` or `BYTES` typed attribute column, an
+   erased subject's own value can sit verbatim in a `.cstat`. Erasure does
+   not rewrite that object in place, and it does not refresh the catalog
+   either: the rewrite pass publishes new data objects and a rewrite record
+   and drives no tenant-catalog fold of its own
+   (`crates/ravel-maintain/src/rewrite.rs`, whose catalog calls are the
+   segment-internal catalog a rewrite decodes). The catalog picks the
+   rewrite up only when the fold reconciles that hour, through the fixed
+   reconcile window or the retention-frontier band, or when a HEAD rebuild
+   re-derives every hour (`crates/ravel-catalog/src/fold.rs`,
+   docs/catalog-and-mvcc.md "Fold reconcile pass"). Until one of those
+   runs, the live HEAD still names the pre-rewrite part, the sweep keeps
+   that part's `.cstat` precisely because HEAD names it
+   (`crates/ravel-maintain/src/sweep.rs`), and the erased value persists
+   with no retention involved at all. Only after the reconcile or the
+   rebuild is the stale `.cstat` unreferenced, and only then does a
+   retention `R` on `t/*/catalog/*/*` start to matter. The erasure bound
+   for such a tenant is therefore "until the fold reconciles that hour,
+   then `+R`", not `max(bound, R)` alone.
+
+   Under the shipped IAM templates it is worse than that bound.
+   `deploy/iam/maintain.json`'s `DenyDeleteProtected` statement denies the
+   Maintain role every delete under `t/*/catalog/*/*`, so the unreferenced
+   `.cstat` is not deletable at all today, whatever the retention posture
+   is: the bound is open-ended rather than `+R` until that template
+   changes. An operator who wants the immutability guarantee without the
+   retention half scopes the mechanism to `catalog/<signal>/HEAD` alone,
+   which is the object the immutability argument above actually rests on.
+   That scoping is necessary but not sufficient while the IAM deny stands.
+
+   The refusal is not confined to the locked object either. The sweep's
+   delete loop propagates the first refusal, so one locked object aborts
+   that `(tenant, signal)` pass and the unreferenced objects behind it in
+   the same pass are left in place too. The production driver logs the
+   failed pass and retries on the next maintenance tick, where the same
+   object refuses again, so collection of that `(tenant, signal)`'s
+   catalog garbage resumes only once `R` elapses. An operator who applies
+   the scoped posture to the whole catalog keyspace should therefore keep
+   `R` inside `protection_horizon` here for the same reason as for commit
+   records.
 
    **How the prefix scoping is achieved.** Object Lock has no prefix
    scope of its own. It is enabled once per bucket, at bucket creation,

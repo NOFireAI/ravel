@@ -265,34 +265,34 @@ fn normalize_impl(
 ) -> MetricsNormalizeResult {
     let total_points = count_data_points(&req);
     if total_points > limits.max_data_points_per_request {
-        let mut rejected = vec![Rejection::TooManyDataPoints {
-            count: total_points,
-            max: limits.max_data_points_per_request,
-        }];
-        // The whole request is rejected before any data point is inspected, so
-        // every exemplar it carried is dropped with it. Count them, matching the
-        // Remote Write twin, so the dropped-data counter does not read zero
-        // while exemplars are lost (ADR-0047 decision 2). Remote Write can count
-        // here because its exemplars are already decoded into the resolved
-        // request; OTLP can because they ride inline on the decoded request.
-        // OTAP deliberately does not count here: its exemplar payloads are not
-        // decoded at the point-count check, a genuine structural difference, so
-        // the OTAP/OTLP differential gate compares this path at the
-        // exemplar-carrying layer rather than at the wrapper.
-        let dropped_exemplars = count_exemplars(&req);
-        if dropped_exemplars > 0 {
-            rejected.push(Rejection::HistogramExemplarsDropped {
-                count: dropped_exemplars,
-            });
-        }
-        return MetricsNormalizeResult {
-            output: NormalizeOutput {
-                points: Vec::new(),
-                histogram_points: Vec::new(),
-                rejected,
+        return whole_request_rejection(
+            &req,
+            Rejection::TooManyDataPoints {
+                count: total_points,
+                max: limits.max_data_points_per_request,
             },
-            exemplars: Vec::new(),
-        };
+        );
+    }
+
+    // Second bound, on what the request expands to rather than on what it
+    // carries on the wire. One classic histogram data point becomes one point
+    // per explicit bound plus `+Inf`, `_sum`, and `_count` (ADR-0016), and
+    // each of those copies the whole base label set, so a request well under
+    // `max_data_points_per_request` in wire points can still expand into an
+    // arbitrary number of allocated ones. `max_histogram_buckets` bounds a
+    // single data point; this bounds a request of many that each stay under
+    // it. Counted from vector lengths only, so it runs before any per-point
+    // allocation, like the wire-count check above.
+    let exploded_points = count_exploded_data_points(&req);
+    if exploded_points > limits.max_data_points_per_request {
+        return whole_request_rejection(
+            &req,
+            Rejection::TooManyExplodedPoints {
+                exploded: exploded_points,
+                count: total_points,
+                max: limits.max_data_points_per_request,
+            },
+        );
     }
 
     let mut points = Vec::new();
@@ -325,6 +325,35 @@ fn normalize_impl(
     }
 }
 
+/// Reject a whole request for `reason`, before any data point is inspected,
+/// so every exemplar it carried is dropped with it. Count those, matching the
+/// Remote Write twin, so the dropped-data counter does not read zero while
+/// exemplars are lost (ADR-0047 decision 2). Remote Write can count here
+/// because its exemplars are already decoded into the resolved request; OTLP
+/// can because they ride inline on the decoded request. OTAP counts here too,
+/// from its exemplar payloads' row counts rather than a decode, and the
+/// OTAP/OTLP differential gate compares the two at this wrapper.
+fn whole_request_rejection(
+    req: &ExportMetricsServiceRequest,
+    reason: Rejection,
+) -> MetricsNormalizeResult {
+    let mut rejected = vec![reason];
+    let dropped_exemplars = count_exemplars(req);
+    if dropped_exemplars > 0 {
+        rejected.push(Rejection::HistogramExemplarsDropped {
+            count: dropped_exemplars,
+        });
+    }
+    MetricsNormalizeResult {
+        output: NormalizeOutput {
+            points: Vec::new(),
+            histogram_points: Vec::new(),
+            rejected,
+        },
+        exemplars: Vec::new(),
+    }
+}
+
 fn count_data_points(req: &ExportMetricsServiceRequest) -> usize {
     req.resource_metrics
         .iter()
@@ -351,9 +380,51 @@ fn metric_data_point_count(metric: &Metric) -> usize {
     }
 }
 
+/// Normalized points `req` would expand into: the same count as
+/// [`count_data_points`] for every metric type that admits one point per data
+/// point, and the exploded series count (ADR-0016) for the two that do not.
+/// Read from vector lengths and the presence of `sum` only, never from bucket
+/// contents, so it is a second traversal that allocates nothing.
+fn count_exploded_data_points(req: &ExportMetricsServiceRequest) -> usize {
+    req.resource_metrics
+        .iter()
+        .flat_map(|rm| rm.scope_metrics.iter())
+        .flat_map(|sm| sm.metrics.iter())
+        .map(metric_exploded_point_count)
+        .fold(0usize, usize::saturating_add)
+}
+
+fn metric_exploded_point_count(metric: &Metric) -> usize {
+    match &metric.data {
+        Some(MetricData::Histogram(h)) => h
+            .data_points
+            .iter()
+            .map(histogram_exploded_point_count)
+            .fold(0usize, usize::saturating_add),
+        // `{name}{quantile=...}` per quantile, plus `_sum` and `_count`,
+        // both unconditional (`SummaryDataPoint::sum` is not optional).
+        Some(MetricData::Summary(s)) => s
+            .data_points
+            .iter()
+            .map(|dp| dp.quantile_values.len().saturating_add(2))
+            .fold(0usize, usize::saturating_add),
+        _ => metric_data_point_count(metric),
+    }
+}
+
+/// `{name}_bucket` per explicit bound, plus the `+Inf` bucket, `_count`, and
+/// `_sum` when the data point carries one: exactly what
+/// [`explode_histogram`] pushes.
+fn histogram_exploded_point_count(dp: &HistogramDataPoint) -> usize {
+    dp.explicit_bounds
+        .len()
+        .saturating_add(2)
+        .saturating_add(usize::from(dp.sum.is_some()))
+}
+
 /// Total exemplars carried on every data point in `req`, used only by the
-/// `TooManyDataPoints` early return to count what the whole-request rejection
-/// drops. Summary data points carry no exemplars in OTLP.
+/// whole-request early returns to count what the rejection drops. Summary
+/// data points carry no exemplars in OTLP.
 fn count_exemplars(req: &ExportMetricsServiceRequest) -> usize {
     req.resource_metrics
         .iter()
@@ -1357,6 +1428,15 @@ fn explode_histogram(
     }
     if !dp.explicit_bounds.windows(2).all(|w| w[0] < w[1]) {
         return Err(Rejection::HistogramBoundsNotIncreasing);
+    }
+    // Last of the validity checks, and the one that has to precede
+    // `build_explode_base_labels`: everything below allocates per bucket, and
+    // the bound list is the sender's to choose.
+    if dp.explicit_bounds.len() > ctx.limits.max_histogram_buckets {
+        return Err(Rejection::TooManyHistogramBuckets {
+            bounds: dp.explicit_bounds.len(),
+            max: ctx.limits.max_histogram_buckets,
+        });
     }
 
     let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes))?;
@@ -4100,6 +4180,160 @@ mod tests {
         );
         assert!(out.points.is_empty());
         assert_eq!(out.rejected, vec![Rejection::HistogramBoundsNotIncreasing]);
+    }
+
+    /// `bounds` ascending finite bounds with a matching `bounds + 1` bucket
+    /// counts, so a data point built from them clears the three validity
+    /// checks that precede the bucket cap.
+    fn wide_histogram_point(bounds: usize) -> HistogramDataPoint {
+        histogram_point(
+            vec![string_kv("route", "/a")],
+            1_000,
+            3,
+            Some(1.0),
+            (0..bounds).map(|i| i as f64).collect(),
+            vec![1; bounds + 1],
+        )
+    }
+
+    #[test]
+    fn histogram_over_bucket_cap_rejects_point() {
+        let limits = IngestLimits::default();
+        let over = limits.max_histogram_buckets + 1;
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![wide_histogram_point(over)],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::TooManyHistogramBuckets {
+                bounds: over,
+                max: limits.max_histogram_buckets,
+            }]
+        );
+        // One OTLP data point in, one rejected data point reported out.
+        let rejected: usize = out.rejected.iter().map(|r| r.rejected_count()).sum();
+        assert_eq!(rejected, 1);
+    }
+
+    /// The cap is inclusive: a data point at exactly the bound is admitted,
+    /// and admits the full `bounds + 1` bucket series plus `_sum` and
+    /// `_count`.
+    #[test]
+    fn histogram_at_bucket_cap_is_admitted() {
+        let limits = IngestLimits::default();
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![wide_histogram_point(limits.max_histogram_buckets)],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        assert_eq!(out.rejected, vec![]);
+        assert_eq!(out.points.len(), 163);
+        assert_eq!(out.points.len(), limits.max_histogram_buckets + 3);
+    }
+
+    /// The per-point cap bounds one data point; this is the request-level
+    /// bound on many that each stay under it. Ten data points is far below
+    /// `max_data_points_per_request`, but what they explode into is not.
+    #[test]
+    fn many_histograms_over_exploded_total_reject_whole_request() {
+        let limits = IngestLimits {
+            max_data_points_per_request: 100,
+            ..IngestLimits::default()
+        };
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                (0..10).map(|_| wide_histogram_point(20)).collect(),
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected,
+            // 20 bounds + `+Inf` + `_sum` + `_count` = 23 points each.
+            vec![Rejection::TooManyExplodedPoints {
+                exploded: 230,
+                count: 10,
+                max: 100,
+            }]
+        );
+        // ADR-0016: the sender-facing count stays in wire data points.
+        let rejected: usize = out.rejected.iter().map(|r| r.rejected_count()).sum();
+        assert_eq!(rejected, 10);
+    }
+
+    /// The same ten data points are admitted when the limit accommodates what
+    /// they explode into, so the test above pins the new bound and not some
+    /// other rejection.
+    #[test]
+    fn many_histograms_under_exploded_total_are_admitted() {
+        let limits = IngestLimits {
+            max_data_points_per_request: 230,
+            ..IngestLimits::default()
+        };
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                (0..10).map(|_| wide_histogram_point(20)).collect(),
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        assert_eq!(out.rejected, vec![]);
+        assert_eq!(out.points.len(), 230);
+    }
+
+    /// Memory shape of the cap, asserted where it is observable: the first
+    /// allocation on the explode path is `build_explode_base_labels`, which
+    /// reaches the data point's attributes through `std::mem::take`. A
+    /// rejected point keeps its attributes, which is the proof that neither
+    /// the base label set nor any of the `bounds + 3` per-bucket label
+    /// vectors below it was built. `explode_histogram` is called directly
+    /// because the take is not observable through `normalize_metrics`, which
+    /// consumes the request.
+    #[test]
+    fn histogram_over_bucket_cap_allocates_no_labels() {
+        let limits = IngestLimits::default();
+        let over = limits.max_histogram_buckets + 1;
+        let mut dp = wide_histogram_point(over);
+        let tenant = tenant();
+        let ctx = ExplodeContext {
+            tenant: &tenant,
+            metric_name: "latency",
+            resource_labels: &[],
+            limits: &limits,
+            ingest_ts_ns: 1_000,
+        };
+        let mut memo = SeriesIdMemo::new();
+        let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
+        let mut exemplars = Vec::new();
+
+        let err = explode_histogram(&ctx, &mut dp, &mut memo, &mut cap, &mut exemplars)
+            .expect_err("a bound list over the cap must be rejected");
+
+        assert_eq!(
+            err,
+            Rejection::TooManyHistogramBuckets {
+                bounds: over,
+                max: limits.max_histogram_buckets,
+            }
+        );
+        assert_eq!(dp.attributes, vec![string_kv("route", "/a")]);
+        assert!(exemplars.is_empty());
     }
 
     #[test]

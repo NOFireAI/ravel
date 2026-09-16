@@ -57,7 +57,15 @@ async fn proxy(State(state): State<Arc<RouterState>>, req: Request) -> Response 
         Err(err) => return err.status().into_response(),
     };
 
-    match forward(&state.http, selection.addr, parts, body).await {
+    match forward(
+        &state.http,
+        &state.identity_header,
+        selection.addr,
+        parts,
+        body,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(err) => {
             tracing::warn!(addr = %selection.addr, error = %err, "upstream forward failed");
@@ -69,6 +77,7 @@ async fn proxy(State(state): State<Arc<RouterState>>, req: Request) -> Response 
 /// Forward the request to `addr` and stream the response back.
 async fn forward(
     client: &reqwest::Client,
+    identity_header: &HeaderName,
     addr: std::net::SocketAddr,
     parts: axum::http::request::Parts,
     body: Body,
@@ -84,6 +93,9 @@ async fn forward(
 
     let mut headers = parts.headers.clone();
     strip_hop_by_hop(&mut headers);
+    // Strip the client-certificate identity header, both the configured name
+    // and the default one, so no client-set value reaches the upstream.
+    crate::router::strip_identity_headers(&mut headers, identity_header);
     // reqwest sets Host from the URL authority (the pod address); a forwarded
     // client Host would conflict with it.
     headers.remove(axum::http::header::HOST);

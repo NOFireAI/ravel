@@ -1,0 +1,434 @@
+//! Tenant-wide latest-alert-state memo (issue #1294).
+//!
+//! [`crate::alerting::AlertEvaluator`] derives each alert's current state by
+//! folding the tenant's whole `Signal::Alerts` transition history to the most
+//! recent record per `alert_id` (ADR-0040 decision 3). Nothing maintains that
+//! signal (`Signal::Alerts` is absent from `maintain::MAINTAINED_SIGNALS`), so
+//! the history only grows, and a fold that re-reads all of it every tick costs
+//! `ceil(N/page)` LISTs plus `2N` GETs where `N` is the cumulative transition
+//! count, independent of the rule count the evaluator actually needs.
+//!
+//! This memo is a derived cache of that fold at one durable, tenant-wide key
+//! (`t/<tenant_hash>/a/state/latest`), deliberately outside the
+//! `t/<tenant>/a/c/` commit prefix so neither the fold nor ravel-sql's `alerts`
+//! table ever lists it. It is never source of truth: the transition records
+//! remain the only durable state (ADR-0040 decision 3 is untouched, no record
+//! format changes). Following the `sys/maintain/memo` precedent (ADR-0065),
+//! everything here is advisory and reconstructible; a lost, stale, or corrupt
+//! memo costs a rescan, never correctness, because the reader always re-lists
+//! the hours at or after the memo's watermark, clamped to its own seal bound,
+//! and re-folds them over the memo.
+//!
+//! # Wire format and versioning
+//!
+//! The memo carries an explicit `format_version` from day one. The reader is a
+//! supported-set gate accepting exactly `{1}` and refusing `0` and any future
+//! version it does not understand, so a forward-incompatible writer can never
+//! be mistaken for a valid memo: an unsupported version falls back to a full
+//! fold exactly as an absent or corrupt memo does. The writer is the alert
+//! lease holder only, a single writer per key, using [`PutMode::Overwrite`].
+
+use std::collections::HashMap;
+
+use bytes::Bytes;
+use ravel_alerting::{AlertId, AlertRecord, AlertState};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError};
+use ravel_types::TenantHash;
+use serde::{Deserialize, Serialize};
+
+/// The only `format_version` this build writes and the sole member of the set
+/// its reader accepts. Bumping it is an ADR-gated change; a reader that meets a
+/// version outside its supported set falls back to a full fold.
+pub const ALERT_STATE_MEMO_FORMAT_VERSION: u32 = 1;
+
+/// The memo object key for a tenant's alert state.
+///
+/// Under the tenant's alert keyspace (`Signal::Alerts` prefix `a`) but outside
+/// the `c/<shard>/` commit prefix that
+/// [`crate::alerting::AlertEvaluator::load_latest_records`] folds and that
+/// ravel-sql's `alerts` table reads, so neither ever lists this key or mistakes
+/// it for a commit record. It is mutable, derived coordination state, not an
+/// immutable data/commit object, so the object-key immutability rule does not
+/// apply to it.
+pub fn alert_state_memo_key(tenant: &TenantHash) -> String {
+    format!("t/{}/a/state/latest", tenant.to_hex())
+}
+
+/// Decoding a memo failed. Both variants are non-fatal at the call site: the
+/// evaluator logs and falls back to a full fold, then rewrites the memo.
+#[derive(Debug, thiserror::Error)]
+pub enum MemoError {
+    /// The bytes are not a well-formed memo (truncated, not JSON, a field of
+    /// the wrong type, or an `alert_id`/`state` that does not decode).
+    #[error("alert state memo decode: {0}")]
+    Decode(String),
+    /// The memo is well-formed but carries a `format_version` this reader does
+    /// not support.
+    #[error(
+        "unsupported alert state memo format_version {found}; this reader supports \
+         {{{ALERT_STATE_MEMO_FORMAT_VERSION}}}"
+    )]
+    UnsupportedVersion { found: u32 },
+    /// Serializing a memo to its on-object bytes failed. A `WireMemo` of owned
+    /// scalars and strings does not fail to serialize in practice; this variant
+    /// lets [`write_alert_state_memo`] propagate rather than overwrite a good
+    /// memo with a zero-byte object.
+    #[error("alert state memo encode: {0}")]
+    Encode(String),
+}
+
+/// The folded latest-state-per-`alert_id` snapshot, plus the watermark hour the
+/// reader must re-list at or after to catch any transition written since the
+/// memo was stamped.
+#[derive(Debug, Clone)]
+pub struct AlertStateMemo {
+    /// The seal-bound hour (`seal_bound_hour(now_ns)`) at the moment this memo
+    /// was written, never the writer's own current-tick hour. Every alert
+    /// record whose ingest hour is strictly below this is fully represented in
+    /// `records`; the reader re-lists hours at or after it to fold in anything
+    /// newer. The seal bound holds the watermark back to the newest hour no
+    /// overlapping prior lease holder can still write into (never past
+    /// `now_ns - (lease_ttl + query_deadline)`), so a late transition an
+    /// expired-but-still-finishing holder publishes after this holder's tail
+    /// LIST still lands at or above the watermark and stays inside the tail.
+    ///
+    /// This field is untrusted on read: [`decode`] accepts any `u32`, so the
+    /// value can exceed the reading replica's own seal bound (a writer whose
+    /// clock ran ahead, or a corrupted-but-decodable field). The reader clamps
+    /// it, folding from `min(watermark_hour, seal_bound_hour(now_ns))` instead
+    /// (ADR-1294 decision 3); an unclamped cursor would start past the hours the
+    /// current commit keys live in and serve pre-transition state.
+    pub watermark_hour: u32,
+    /// Latest record per `alert_id` as of `watermark_hour`.
+    pub records: HashMap<AlertId, AlertRecord>,
+}
+
+/// The version header parsed before the full body, so an unsupported version is
+/// reported as [`MemoError::UnsupportedVersion`] rather than a decode failure of
+/// a body whose shape it does not share. Extra fields are ignored (no
+/// `deny_unknown_fields`).
+#[derive(Deserialize)]
+struct WireHeader {
+    format_version: u32,
+}
+
+/// The on-object memo shape. `AlertRecord` and `AlertId` carry no serde derives,
+/// so records are mirrored field-for-field with `alert_id` and `state` in their
+/// canonical string forms (the same forms the RLOG `attrs` use).
+#[derive(Serialize, Deserialize)]
+struct WireMemo {
+    format_version: u32,
+    watermark_hour: u32,
+    records: Vec<WireRecord>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireRecord {
+    /// Lowercase hex, as [`AlertId::to_hex`].
+    alert_id: String,
+    rule_id: String,
+    /// `firing`/`resolved`/`pending`/`suppressed`, as [`AlertState::as_str`].
+    state: String,
+    generation: u32,
+    ts_ns: i64,
+    labels: Vec<(String, String)>,
+    annotations: Vec<(String, String)>,
+    body: String,
+}
+
+impl WireRecord {
+    fn from_record(record: &AlertRecord) -> Self {
+        WireRecord {
+            alert_id: record.alert_id.to_hex(),
+            rule_id: record.rule_id.clone(),
+            state: record.state.as_str().to_string(),
+            generation: record.generation,
+            ts_ns: record.ts_ns,
+            labels: record.labels.clone(),
+            annotations: record.annotations.clone(),
+            body: record.body.clone(),
+        }
+    }
+
+    fn into_record(self) -> Result<(AlertId, AlertRecord), MemoError> {
+        let alert_id =
+            AlertId::from_hex(&self.alert_id).map_err(|err| MemoError::Decode(err.to_string()))?;
+        let state = AlertState::parse(&self.state)
+            .ok_or_else(|| MemoError::Decode(format!("unknown alert state {:?}", self.state)))?;
+        let record = AlertRecord {
+            alert_id,
+            rule_id: self.rule_id,
+            state,
+            generation: self.generation,
+            ts_ns: self.ts_ns,
+            labels: self.labels,
+            annotations: self.annotations,
+            body: self.body,
+        };
+        Ok((alert_id, record))
+    }
+}
+
+/// Serialize a memo to its on-object bytes, stamping the current
+/// [`ALERT_STATE_MEMO_FORMAT_VERSION`].
+///
+/// Returns [`MemoError::Encode`] rather than an empty `Vec` on a serialize
+/// failure, so [`write_alert_state_memo`] leaves the prior memo intact instead
+/// of overwriting it with a zero-byte object that the next tick would decode as
+/// corrupt and pay a full fold to replace.
+pub fn encode(memo: &AlertStateMemo) -> Result<Vec<u8>, MemoError> {
+    let wire = WireMemo {
+        format_version: ALERT_STATE_MEMO_FORMAT_VERSION,
+        watermark_hour: memo.watermark_hour,
+        records: memo.records.values().map(WireRecord::from_record).collect(),
+    };
+    encode_wire(&wire)
+}
+
+/// Serialize any wire value to JSON bytes, mapping a serialize failure to
+/// [`MemoError::Encode`]. Split out so a test can drive the failure path with a
+/// type whose `Serialize` impl errors, which a `WireMemo` of plain scalars and
+/// strings never does.
+fn encode_wire<T: Serialize>(wire: &T) -> Result<Vec<u8>, MemoError> {
+    serde_json::to_vec(wire).map_err(|err| MemoError::Encode(err.to_string()))
+}
+
+/// A wire value whose `Serialize` impl always fails, so a test can drive the
+/// [`MemoError::Encode`] path (and, via [`write_memo_encoded`], prove a failed
+/// encode never overwrites the prior memo). The real [`WireMemo`] cannot fail
+/// to serialize, so this is the only way to reach that path.
+#[cfg(test)]
+pub(crate) struct UnserializableWire;
+
+#[cfg(test)]
+impl Serialize for UnserializableWire {
+    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("forced serialize failure"))
+    }
+}
+
+/// Encode `UnserializableWire`, exposing the module-private [`encode_wire`] to
+/// the sibling `alerting` test module so its store-backed test can prove the
+/// write path short-circuits on an encode failure.
+#[cfg(test)]
+pub(crate) fn encode_unserializable_for_test() -> Result<Vec<u8>, MemoError> {
+    encode_wire(&UnserializableWire)
+}
+
+/// Overwrite a tenant's memo with whatever `encode_unserializable_for_test`
+/// produces, so the sibling `alerting` test can drive [`write_memo_encoded`]
+/// through a failing encoder without access to the module-private seam.
+#[cfg(test)]
+pub(crate) async fn write_with_failing_encode_for_test(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> anyhow::Result<()> {
+    write_memo_encoded(store, tenant, encode_unserializable_for_test).await
+}
+
+/// Parse memo bytes, gating on the supported version set before the body.
+///
+/// Never panics: a truncated or malformed object, an `alert_id`/`state` that
+/// does not decode, or a version outside the supported set is a typed error the
+/// caller turns into a full fold, not a crash.
+///
+/// `watermark_hour` is deliberately not validated here: every `u32` is a
+/// syntactically valid ingest hour, and whether one is too far in the future is
+/// a question about the reading replica's clock, not about the bytes. The fold
+/// answers it instead, by clamping to its own seal bound (see
+/// [`AlertStateMemo::watermark_hour`]).
+pub fn decode(bytes: &[u8]) -> Result<AlertStateMemo, MemoError> {
+    let header: WireHeader =
+        serde_json::from_slice(bytes).map_err(|err| MemoError::Decode(err.to_string()))?;
+    if header.format_version != ALERT_STATE_MEMO_FORMAT_VERSION {
+        return Err(MemoError::UnsupportedVersion {
+            found: header.format_version,
+        });
+    }
+    let wire: WireMemo =
+        serde_json::from_slice(bytes).map_err(|err| MemoError::Decode(err.to_string()))?;
+    let mut records = HashMap::with_capacity(wire.records.len());
+    for wire_record in wire.records {
+        let (alert_id, record) = wire_record.into_record()?;
+        // A well-formed memo holds one record per alert_id (the fold's output is
+        // keyed by alert_id). A body that repeats an alert_id is ambiguous: a
+        // silent last-wins insert would let a stale duplicate seed the state for
+        // an hour below the watermark, which the tail never re-reads, so the
+        // evaluator would serve wrong state instead of falling back to a full
+        // fold. Refuse it as a decode error, the same non-fatal path a truncated
+        // or bad-version memo takes: the caller rescans and rewrites a clean memo.
+        if records.insert(alert_id, record).is_some() {
+            return Err(MemoError::Decode(format!(
+                "duplicate alert_id {} in memo",
+                alert_id.to_hex()
+            )));
+        }
+    }
+    Ok(AlertStateMemo {
+        watermark_hour: wire.watermark_hour,
+        records,
+    })
+}
+
+/// Read and decode the tenant's memo.
+///
+/// `Ok(None)` when no memo exists yet (the cold-start case). `Err` on any store
+/// failure other than not-found, and on a corrupt or unsupported-version memo,
+/// so the caller can log the distinction; in every non-`Some` case the caller
+/// falls back to a full fold.
+pub async fn read_alert_state_memo(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> anyhow::Result<Option<AlertStateMemo>> {
+    let key = alert_state_memo_key(tenant);
+    let outcome = match store.get(&key, GetRange::Full).await {
+        Ok(outcome) => outcome,
+        Err(StoreError::NotFound) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(Some(decode(&outcome.data)?))
+}
+
+/// Overwrite the tenant's memo. Called only by the alert lease holder, so this
+/// is a single writer per key; `PutMode::Overwrite` because a stale memo is
+/// harmless (the reader re-folds the tail) and last-write-wins during a brief
+/// two-holder lease handover leaves correct derived state either way.
+pub async fn write_alert_state_memo(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    memo: &AlertStateMemo,
+) -> anyhow::Result<()> {
+    write_memo_encoded(store, tenant, || encode(memo)).await
+}
+
+/// Encode via `encode`, then overwrite the memo object with the result.
+///
+/// The encode step runs first and its error is propagated before any `put`, so
+/// a failed serialize leaves the prior object untouched. Factored out from
+/// [`write_alert_state_memo`] so a test can inject a failing encoder and prove
+/// no `put` reaches the store, without a way to make the real `encode` fail.
+async fn write_memo_encoded<F>(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    encode: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Result<Vec<u8>, MemoError>,
+{
+    let body = Bytes::from(encode()?);
+    let key = alert_state_memo_key(tenant);
+    store
+        .put(
+            &key,
+            body,
+            PutOptions {
+                mode: PutMode::Overwrite,
+                checksum: None,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn record(id: u8, state: AlertState, ts_ns: i64) -> AlertRecord {
+        AlertRecord {
+            alert_id: AlertId([id; 16]),
+            rule_id: format!("rule-{id}"),
+            state,
+            generation: 0,
+            ts_ns,
+            labels: vec![("severity".to_string(), "page".to_string())],
+            annotations: vec![("summary".to_string(), "high".to_string())],
+            body: format!("alert {id}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_preserves_every_field() {
+        let mut records = HashMap::new();
+        let a = record(1, AlertState::Firing, 100);
+        let b = record(2, AlertState::Resolved, 200);
+        records.insert(a.alert_id, a.clone());
+        records.insert(b.alert_id, b.clone());
+        let memo = AlertStateMemo {
+            watermark_hour: 42,
+            records,
+        };
+
+        let decoded = decode(&encode(&memo).expect("encodes")).expect("round trips");
+        assert_eq!(decoded.watermark_hour, 42);
+        assert_eq!(decoded.records.len(), 2);
+        assert_eq!(decoded.records.get(&a.alert_id), Some(&a));
+        assert_eq!(decoded.records.get(&b.alert_id), Some(&b));
+    }
+
+    #[test]
+    fn truncated_bytes_are_a_decode_error_not_a_panic() {
+        let memo = AlertStateMemo {
+            watermark_hour: 1,
+            records: HashMap::new(),
+        };
+        let bytes = encode(&memo).expect("encodes");
+        let err = decode(&bytes[..bytes.len() / 2]).expect_err("truncation rejected");
+        assert!(matches!(err, MemoError::Decode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn version_zero_is_unsupported_not_decode() {
+        let bytes = br#"{"format_version":0,"watermark_hour":1,"records":[]}"#;
+        let err = decode(bytes).expect_err("version 0 rejected");
+        assert!(
+            matches!(err, MemoError::UnsupportedVersion { found: 0 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn future_version_is_unsupported_not_decode() {
+        let bytes = br#"{"format_version":2,"watermark_hour":1,"records":[]}"#;
+        let err = decode(bytes).expect_err("version 2 rejected");
+        assert!(
+            matches!(err, MemoError::UnsupportedVersion { found: 2 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_alert_id_is_a_decode_error() {
+        // A body that is otherwise well-formed but carries the same alert_id
+        // twice. A last-wins insert would silently drop one record and could
+        // seed stale below-watermark state; the reader must refuse it so the
+        // caller falls back to a full fold instead.
+        let bytes = br#"{"format_version":1,"watermark_hour":1,"records":[
+            {"alert_id":"11111111111111111111111111111111","rule_id":"r","state":"firing",
+             "generation":0,"ts_ns":1,"labels":[],"annotations":[],"body":"b"},
+            {"alert_id":"11111111111111111111111111111111","rule_id":"r","state":"resolved",
+             "generation":1,"ts_ns":2,"labels":[],"annotations":[],"body":"b"}]}"#;
+        let err = decode(bytes).expect_err("duplicate alert_id rejected");
+        assert!(matches!(err, MemoError::Decode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_serialize_failure_is_an_encode_error_not_an_empty_vec() {
+        // The real `encode` cannot fail; drive the failure through the same
+        // `encode_wire` with a type whose `Serialize` impl errors. The old code
+        // returned an empty `Vec` here (`unwrap_or_default`), which the writer
+        // would then have put as a zero-byte object.
+        let err = encode_wire(&UnserializableWire).expect_err("serialize failure is an error");
+        assert!(matches!(err, MemoError::Encode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn unknown_state_string_is_a_decode_error() {
+        let bytes = br#"{"format_version":1,"watermark_hour":1,"records":[
+            {"alert_id":"00000000000000000000000000000000","rule_id":"r","state":"exploded",
+             "generation":0,"ts_ns":1,"labels":[],"annotations":[],"body":"b"}]}"#;
+        let err = decode(bytes).expect_err("unknown state rejected");
+        assert!(matches!(err, MemoError::Decode(_)), "got {err:?}");
+    }
+}

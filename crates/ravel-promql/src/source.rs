@@ -36,6 +36,29 @@ use crate::histogram::FloatHistogram;
 /// vector position. That is defense-in-depth, not a second tiebreak rule: it
 /// is the normative order's own final comparison, so it can never contradict
 /// the deduped input the engine hands over.
+///
+/// That SHOULD is not a MUST: a source MAY deliver several samples with
+/// equal `ts_ns` in one series when each is a distinct underlying record
+/// rather than competing versions of one sample (ADR-1103 "PromQL over
+/// logs": a log-derived series carries one sample per log line, and two
+/// lines logged in the same nanosecond are two real samples, neither a
+/// duplicate to resolve). For such a source, a range-vector function
+/// receives every sample its window selects, with no dedup step anywhere
+/// between the source and the function, and then applies its own defined
+/// semantics to that slice: `count_over_time` counts records rather than
+/// distinct timestamps, `sum_over_time`/`avg_over_time`/`min_over_time`/
+/// `max_over_time`/`quantile_over_time` fold every one of them,
+/// `last_over_time` selects one, and `absent_over_time` only asks whether
+/// the window held any.
+/// Instant selection still applies the tie rule above: `pick_sample` picks
+/// one sample per series at the selected timestamp regardless of why the
+/// samples it is choosing among share that timestamp.
+///
+/// Regardless of which case applies, `samples` MUST be sorted ascending by
+/// `ts_ns` by the time it reaches the evaluator (the sort MUST be stable
+/// when duplicates are present, keeping equal-timestamp samples adjacent in
+/// their original relative order): the evaluator's binary search assumes
+/// this and does not re-sort.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeriesData {
     pub labels: LabelSet,

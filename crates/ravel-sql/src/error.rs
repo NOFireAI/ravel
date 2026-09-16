@@ -54,18 +54,20 @@ pub const MSG_UNSATISFIABLE: &str = "requested commit token is not yet visible; 
 /// says nothing about which column, type, or plan node was at fault: those
 /// strings carry schema detail. The full error is logged server-side.
 ///
-/// It names both v1 tables rather than one: a `Plan` error is built from a
-/// bare `DataFusionError` in `crate::executor::plan_error`, which has no
-/// handle on which table the failed query targeted, and a `logs` query can
-/// fail to plan like any other (an unregistered function, an unknown
-/// column). Naming only `samples` would point a `logs` client at the wrong
-/// table.
+/// It names no table at all: a `Plan` error is built from a bare
+/// `DataFusionError` in `crate::executor::plan_error`, which has no handle on
+/// which table the failed query targeted, and a query against any registered
+/// table can fail to plan like any other (an unregistered function, an
+/// unknown column). Naming a subset would point a client at the wrong table,
+/// which is what happened while this text said "samples or logs" and the
+/// registered set grew to five.
 ///
 /// This doc cited the `attrs['k']` subscript gap as the example until
-/// `crate::map_field_planner` closed it. The reason for naming both tables
-/// never depended on that particular gap, so only the example changed.
-pub const MSG_PLAN: &str = "the SQL query could not be planned; check that it uses only the v1 subset \
-     over the samples or logs table";
+/// `crate::map_field_planner` closed it. The reason for staying
+/// table-neutral never depended on that particular gap, so only the example
+/// changed.
+pub const MSG_PLAN: &str =
+    "the SQL query could not be planned; check that it uses only the v1 subset";
 
 /// Stable client message for a DataFusion execution failure that is not one
 /// of the classes above.
@@ -137,15 +139,17 @@ pub enum SqlError {
     #[error(transparent)]
     Validation(#[from] ValidationError),
 
-    /// The query references both the `samples` and `logs` tables. ADR-0033
-    /// decision C admits exactly one signal per query in v1 (no query needs to
-    /// scan or join both metrics and logs), so this is rejected before any
-    /// catalog resolve. Its text names only the two fixed table names -- no
-    /// server state -- so it is safe to return verbatim, like a validation
-    /// error, and maps to HTTP 400.
+    /// The query references two or more of the registered tables (`samples`,
+    /// `logs`, `spans`, `alerts`, `audit`). ADR-0033 decision C admits exactly
+    /// one signal per query in v1, and ADR-0045 decision 5 and ADR-1101
+    /// decision 1 extend that rule to the third, fourth and fifth tables, so
+    /// this is rejected before any catalog resolve. Its text names only the
+    /// fixed table names -- no server state -- so it is safe to return
+    /// verbatim, like a validation error, and maps to HTTP 400.
     #[error(
-        "a SQL query may reference either the samples table or the logs table, \
-         not both; metrics and logs cannot be scanned or joined together in v1"
+        "a SQL query may reference exactly one of the samples, logs, spans, \
+         alerts and audit tables; two signals cannot be scanned or joined \
+         together in v1"
     )]
     CrossSignalQuery,
 
@@ -410,7 +414,7 @@ impl SqlError {
     pub fn client_message(&self) -> String {
         match self {
             SqlError::Validation(e) => e.to_string(),
-            // Safe to echo: the text names only the two fixed table names.
+            // Safe to echo: the text names only the fixed table names.
             SqlError::CrossSignalQuery => self.to_string(),
             // Safe to echo: `WindowTooWide` carries only the estimate and the
             // limit (counts, no object key or tenant identity), and its text
@@ -424,15 +428,25 @@ impl SqlError {
             SqlError::ColumnStats(_) => MSG_CORRUPT.to_string(),
             SqlError::Fetch(fetch) => match fetch {
                 FetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
-                FetchError::Store { .. } | FetchError::EtagChanged { .. } => {
-                    MSG_UNAVAILABLE.to_string()
-                }
+                // A memory-budget refusal carries only byte counts (no object
+                // key or tenant identity); redacted to the transient message
+                // like a storage fault, since retrying under less pressure can
+                // succeed.
+                FetchError::Store { .. }
+                | FetchError::EtagChanged { .. }
+                | FetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
             },
             SqlError::LogFetch(fetch) => match fetch {
-                LogFetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
-                LogFetchError::Store { .. } | LogFetchError::EtagChanged { .. } => {
-                    MSG_UNAVAILABLE.to_string()
+                // A carry paired with the wrong segment is an integrity
+                // violation of the read relative to the request, redacted like
+                // corruption: its `Display` names both object keys and both
+                // tenant hashes, none of which reaches the client.
+                LogFetchError::Corrupt { .. } | LogFetchError::CarryMismatch { .. } => {
+                    MSG_CORRUPT.to_string()
                 }
+                LogFetchError::Store { .. }
+                | LogFetchError::EtagChanged { .. }
+                | LogFetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
             },
             SqlError::SpanFetch(fetch) => match fetch {
                 // A cross-tenant object is an integrity violation of the fetched
@@ -441,7 +455,8 @@ impl SqlError {
                 SpanFetchError::Corrupt { .. } | SpanFetchError::TenantMismatch { .. } => {
                     MSG_CORRUPT.to_string()
                 }
-                SpanFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
+                SpanFetchError::Store { .. }
+                | SpanFetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
             },
             SqlError::CorruptStreamAttrs(_) => MSG_CORRUPT.to_string(),
             SqlError::SnapshotInvalidated => MSG_UNAVAILABLE.to_string(),
@@ -635,6 +650,25 @@ mod tests {
     }
 
     #[test]
+    fn a_carry_mismatch_is_redacted_like_corruption() {
+        // `CarryMismatch`'s Display names BOTH object keys and BOTH tenant
+        // hashes, so an un-redacted arm would leak two keys at once rather
+        // than one. It shares the corruption class: the read's integrity
+        // relative to the request is broken, and no retry can fix it.
+        let err = SqlError::LogFetch(LogFetchError::CarryMismatch {
+            key: LEAKY_KEY.to_string(),
+            carried_key: format!("{LEAKY_KEY}.other"),
+            tenant: ravel_types::TenantHash([1u8; 16]),
+            carried_tenant: ravel_types::TenantHash([2u8; 16]),
+        });
+        assert_eq!(err.client_message(), MSG_CORRUPT);
+        assert_eq!(err.class(), ErrorClass::Unavailable);
+        // The detail survives server-side, where it is the whole point.
+        assert!(err.to_string().contains(LEAKY_KEY));
+        assert_redacted(&err.client_message());
+    }
+
+    #[test]
     fn internal_errors_are_not_echoed() {
         let err = SqlError::Internal(format!("downcast failed while reading {LEAKY_KEY}"));
         assert_eq!(err.client_message(), MSG_INTERNAL);
@@ -670,10 +704,15 @@ mod tests {
     fn cross_signal_query_is_a_bad_request_that_keeps_its_own_text() {
         let err = SqlError::CrossSignalQuery;
         assert_eq!(err.class(), ErrorClass::BadRequest);
-        // Its own text is returned verbatim and names both tables.
+        // Its own text is returned verbatim and names every real table, so a
+        // client that named two of them learns which set the rule covers.
         assert_eq!(err.client_message(), err.to_string());
-        assert!(err.client_message().contains("samples"));
-        assert!(err.client_message().contains("logs"));
+        for table in ["samples", "logs", "spans", "alerts", "audit"] {
+            assert!(
+                err.client_message().contains(table),
+                "the cross-signal message must name {table}"
+            );
+        }
         // It carries no server state to redact.
         assert_redacted(&err.client_message());
     }

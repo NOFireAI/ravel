@@ -8,7 +8,7 @@ use ravel_cache::CacheLimits;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::http::{AppState, TenantResolver};
-use ravel_query::{EngineConfig, QueryAdmissionController, QueryEngine, ReadCache};
+use ravel_query::{EngineConfig, GetLimiter, QueryAdmissionController, QueryEngine, ReadCache};
 use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccountingSnapshot};
 
 /// The per-query `stats` object attached beside a query response's data
@@ -103,22 +103,45 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// disk tier shares the one `--cache-max-bytes` number the fetcher cache and the
 /// catalog RAM tier already share. `--disable-cache` (the `0` sentinel) wins
 /// over a configured `cache_dir`: no cache of either tier is built.
+///
+/// `resolve_get_concurrency` is the CLI's `--catalog-resolve-concurrency`.
+/// `None` leaves `ravel_catalog::CatalogConfig`'s own default in place;
+/// `Some(n)` overrides it for this catalog instance.
+///
+/// `max_ingest_lag_ns` is the catalog listing window (ADR-0051 section 4), from
+/// `--max-ingest-lag`. `None` leaves `CatalogConfig`'s own 2h default; `Some(ns)`
+/// is the value `start` keeps equal to the OTLP admission bound so admitted late
+/// data stays discoverable.
 pub fn build_catalog(
     store: Arc<dyn ObjectStoreBackend>,
     shard_count: u32,
     disable_cache: bool,
     cache_max_bytes: u64,
     cache_dir: Option<PathBuf>,
+    resolve_get_concurrency: Option<usize>,
+    max_ingest_lag_ns: Option<i64>,
 ) -> anyhow::Result<Arc<Catalog>> {
     // `0` is the byte cache's disabled sentinel (ravel_catalog::CatalogConfig):
     // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
     // --disable-cache into a `None` fetcher cache.
     let byte_cache_max_bytes = if disable_cache { 0 } else { cache_max_bytes };
-    let catalog_config = CatalogConfig {
+    let mut catalog_config = CatalogConfig {
         shard_count,
         byte_cache_max_bytes,
         ..CatalogConfig::default()
     };
+    // The catalog listing window (ADR-0051 section 4), from `--max-ingest-lag`.
+    // `None` leaves `CatalogConfig`'s own 2h default; `Some(ns)` is the value
+    // `start` resolves through `resolve_ingest_lag`, kept equal to the OTLP
+    // admission bound so admitted late data stays discoverable.
+    if let Some(ns) = max_ingest_lag_ns {
+        catalog_config.max_ingest_lag_ns = ns;
+    }
+    // `None` leaves ravel-catalog's own default (currently 128) as the sole
+    // source of truth; only override when the CLI passed an explicit value.
+    if let Some(concurrency) = resolve_get_concurrency {
+        catalog_config.resolve_get_concurrency = concurrency;
+    }
     // Durable shard_count enforcement on the read path (ADR-0050 section 5,
     // EC5): the first resolve for each (tenant, signal) validates this
     // catalog's configured shard_count against the tenant's provisioning
@@ -160,13 +183,14 @@ pub fn build_app_state(
     tenant_resolver: Arc<dyn TenantResolver>,
     cache: Option<ReadCache>,
     engine_config: EngineConfig,
+    get_limiter: Arc<GetLimiter>,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
     distributed: Option<Arc<ravel_query::distrib::Distributed>>,
     federation: Option<Arc<ravel_query::distrib::Federation>>,
     metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
 ) -> AppState {
-    let mut engine = QueryEngine::new(catalog, store, engine_config);
+    let mut engine = QueryEngine::new(catalog, store, engine_config).with_get_limiter(get_limiter);
     if let Some(cache) = cache {
         engine = engine.with_cache(cache);
     }
@@ -191,8 +215,13 @@ pub fn build_app_state(
     // cache that backs `/api/v1/metadata`. `None` in a mode that serves no
     // Prometheus-shaped query routes; when absent the endpoint keeps its
     // pre-ADR behavior byte-for-byte (a `200` with an empty `data` object).
+    // The same aggregator is the usage sink as well as the cost recorder: the
+    // cost recorder only ever sees a query that produced an answer, so without
+    // this the drop guard's cancelled, timed-out, and failed records from every
+    // Prometheus-shaped route would be folded into a sink that discards them.
     let state = AppState::new(Arc::new(engine), tenant_resolver)
-        .with_cost_recorder(query_accounting)
+        .with_cost_recorder(query_accounting.clone())
+        .with_usage_sink(query_accounting)
         .with_query_admission(query_admission);
     match metadata_cache {
         Some(cache) => state.with_metadata_cache(cache),
@@ -257,6 +286,14 @@ pub const DEFAULT_MAX_QUERY_BYTES: usize = ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 /// built here so the caller owns the concrete overlay: `start` registers it with
 /// the idle-tenant sweep, and a test can build one with a short staleness
 /// horizon and still exercise this exact wiring.
+///
+/// `process_memory_budget` is the ADR-1170 decisions 1/3 process-wide
+/// accountant: the shared remainder left after both hard cache carves
+/// (`ResolvedPerformanceDefaults::memory_remainder_bytes`), installed on the
+/// executor via `SqlExecutor::with_process_memory_budget` so every tenant's
+/// SQL memory reservation counts against the SAME instance
+/// [`crate::lib`]'s `/metrics` gauges read, rather than an executor-private
+/// budget the exposition cannot see.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state(
@@ -265,12 +302,14 @@ pub fn build_sql_state(
     tenant_resolver: Arc<dyn TenantResolver>,
     cache: Option<ReadCache>,
     engine_config: EngineConfig,
+    get_limiter: Arc<GetLimiter>,
     max_query_bytes: usize,
     max_tenant_bytes: usize,
     parallel_final_aggregation: bool,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
@@ -294,25 +333,36 @@ pub fn build_sql_state(
         // is an in-process escape hatch and the regression fixture's red side,
         // not a server-level knob.
         late_materialization_extra_columns: SqlConfig::default().late_materialization_extra_columns,
+        // The bounded top-k grouped aggregate's limit ceiling: the shipped
+        // default, with no flag, for the same reason as the two lines above.
+        // The rewrite is exact for the shape it admits, so the `SqlConfig`
+        // field is an in-process escape hatch and the tests' rule-off side,
+        // not a server-level knob.
+        bounded_topk_max_limit: SqlConfig::default().bounded_topk_max_limit,
         // ADR-0954: bounded ephemeral spill is off by default (requirement 9's
         // no-spill deployment profile). `with_spill_from_env` below fills this
         // from `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` when both are
         // set, so a deployment can arm spill without a code change; unset leaves
         // it `None` and the memory budget refuses as before.
         spill: None,
+        // Issue #913: the per-segment scan timeline is a bench-reporter-only
+        // knob, with no flag, for the same reason as the lines above. Off by
+        // default so a production logs query never pays its per-segment
+        // metric registrations.
+        segment_timing: SqlConfig::default().segment_timing,
     }
     .with_spill_from_env()?;
     let max_deadline = config.engine.deadline;
-    let mut metrics_fetcher = SegmentFetcher::new(store.clone());
+    let mut metrics_fetcher =
+        SegmentFetcher::new(store.clone()).with_get_limiter(get_limiter.clone());
     // ADR-0107's read-shape crossover, from `--logs-block-range-threshold` via
     // `QueryBudgets::apply_to_engine`. This is the single wiring point for it, so
     // an operator who sets the flag to `u64::MAX` gets whole-object logs reads
     // (the pre-ADR-0107 shape) on every SQL logs scan this process serves.
-    // `--fetch-concurrency` is documented (ADR-0088) as the knob that bounds
-    // S3 GET concurrency; the logs fetcher keeps its own permit pool (ADR-0107
-    // decision 1, separate from RSEG's), so the bound has to be handed to it
-    // here or the pool stays at its compiled-in 16 whatever the flag says
-    // (issue #700).
+    // ADR-1195: GET concurrency is now the single process-wide `GetLimiter`
+    // (`--store-get-concurrency`, legacy `--fetch-concurrency`), shared with
+    // the metrics and spans fetchers via `with_get_limiter` below, not a
+    // private pool sized from the flag.
     // `--logs-request-cost-bytes` (ADR-0904) reaches the same fetcher the same
     // way: the request cost lives on the block-range fetcher this builder owns,
     // so the flag has to be handed over here or the fetcher keeps its
@@ -330,7 +380,7 @@ pub fn build_sql_state(
     // like the other three or the fetcher keeps its compiled-in 64 MiB.
     let mut logs_fetcher = LogSegmentFetcher::new(store.clone())
         .with_block_range_threshold(config.engine.logs_block_range_threshold)
-        .with_max_concurrent_gets(config.engine.fetch_concurrency)
+        .with_get_limiter(get_limiter.clone())
         .with_request_cost_bytes(config.engine.logs_request_cost_bytes)
         .with_max_fetch_run_bytes(config.engine.logs_max_fetch_run_bytes)
         .map_err(|err| anyhow::anyhow!("invalid logs fetch bound: {err}"))?;
@@ -339,7 +389,9 @@ pub fn build_sql_state(
     // the RSEG/RLOG fetchers it has no `with_cache` seam, and none is wired
     // here. Its `fetch_accounted` path is tenant-checked and accounted (ADR-0045
     // via #1080), so a `spans` query is isolated and metered like any other.
-    let span_fetcher = SpanSegmentFetcher::new(store.clone());
+    // ADR-1195: shares the same process-wide `GetLimiter` as the metrics and
+    // logs fetchers above, not a private pool.
+    let span_fetcher = SpanSegmentFetcher::new(store.clone()).with_get_limiter(get_limiter);
     if let Some(cache) = cache {
         metrics_fetcher = metrics_fetcher.with_cache(cache.clone());
         logs_fetcher = logs_fetcher.with_cache(cache);
@@ -347,7 +399,9 @@ pub fn build_sql_state(
     // The metrics fetcher (RSEG), the logs fetcher (RLOG), and the spans
     // fetcher (RSPAN) all read the same object store; the executor uses
     // whichever the query's target table needs (ADR-0033, extended to `spans`
-    // by ADR-0045 decision 5).
+    // by ADR-0045 decision 5). The `alerts` and `audit` tables (ADR-1101
+    // decision 1) need no fetcher of their own: their records ride RLOG, so
+    // they read through the logs fetcher above, cache included.
     let executor = SqlExecutor::new(
         catalog,
         metrics_fetcher,
@@ -366,6 +420,7 @@ pub fn build_sql_state(
         Some(source) => executor.with_declared_column_source(source),
         None => executor,
     };
+    let executor = executor.with_process_memory_budget(process_memory_budget);
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
         tenant_resolver,
@@ -376,10 +431,11 @@ pub fn build_sql_state(
         max_deadline,
         query_accounting,
         query_admission,
-        // The SQL HTTP audit routes through the QueryAuditSink seam;
-        // installing the process-wide AuditPipeline is a separate server-wiring
-        // step, so this defaults to the no-op today. The endpoint already
-        // submits and awaits through the trait, so enabling it is a one-line swap.
+        // The SQL HTTP audit routes through the QueryAuditSink seam. This
+        // function builds no pipeline of its own, so it defaults to the no-op
+        // sink; `start` (lib.rs) overrides this field with the process-wide
+        // AuditPipeline's sink once it builds one (ADR-0062 decision 2b), in
+        // every mode that installs a pipeline.
         audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
     })
 }
@@ -407,6 +463,8 @@ mod catalog_cache_tests {
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
             None,
+            None,
+            None,
         )
         .expect("catalog");
         let engine_config = EngineConfig {
@@ -419,6 +477,7 @@ mod catalog_cache_tests {
             Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
             None,
             engine_config,
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),
@@ -446,6 +505,8 @@ mod catalog_cache_tests {
             1,
             true,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+            None,
             None,
         )
         .expect("catalog builds");
@@ -505,7 +566,8 @@ mod catalog_cache_tests {
     fn build_catalog_wires_cache_max_bytes_through_to_the_byte_cache() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let budget = 7 * 1024 * 1024;
-        let catalog = build_catalog(store, 1, false, budget, None).expect("catalog builds");
+        let catalog =
+            build_catalog(store, 1, false, budget, None, None, None).expect("catalog builds");
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
             budget,
@@ -514,6 +576,82 @@ mod catalog_cache_tests {
         assert!(
             catalog.byte_cache_metrics().is_some(),
             "an enabled catalog byte cache must expose its counters handle for /metrics"
+        );
+    }
+
+    /// Issue #1141 reachability for the derived catalog cache ceiling: the
+    /// number the resolution produced on an injected host is the number the
+    /// catalog byte cache is bounded by, through the same `build_catalog`
+    /// argument `crate::start` passes (`ServerConfig::catalog_cache_max_bytes`,
+    /// which `main` fills from
+    /// `ResolvedPerformanceDefaults::catalog_cache_max_bytes`). The catalog
+    /// cache is a SEPARATE ceiling from the fetcher cache: both carve from
+    /// `memory_budget_bytes` (`MemTotal` minus
+    /// [`crate::config::MEMORY_OVERHEAD_RESERVE_BYTES`], ADR-1170 decision 3),
+    /// not from raw `MemTotal`. On the reference profile the 30,064,771,072
+    /// budget resolves to 5% for the catalog cache (1,503,238,553) while the
+    /// fetcher cache `store::build_cache` bounds stays at 25%
+    /// (7,516,192,768), so the two independent LRU caches do not each claim
+    /// the full share. An explicit `--cache-max-bytes` sets both equal.
+    ///
+    /// Prove-the-test: pass `resolved.cache_max_bytes` (the fetcher 25% number)
+    /// to `build_catalog` here and the first assertion reads 7,516,192,768
+    /// against the expected 1,503,238,553.
+    #[test]
+    fn the_derived_cache_max_bytes_reaches_the_catalog_byte_cache() {
+        use clap::Parser;
+
+        use crate::config::HostProfile;
+
+        let cli = crate::Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let resolved = cli
+            .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
+            .expect("performance defaults resolve");
+        // The two caches derive to different ceilings on the same host.
+        assert_eq!(resolved.cache_max_bytes, 7_516_192_768);
+        assert_eq!(resolved.catalog_cache_max_bytes, 1_503_238_553);
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store,
+            1,
+            cli.disable_cache,
+            resolved.catalog_cache_max_bytes,
+            cli.cache_dir.clone(),
+            None,
+            None,
+        )
+        .expect("catalog builds");
+        assert_eq!(
+            catalog.config().byte_cache_max_bytes,
+            1_503_238_553,
+            "the catalog byte cache must be bounded by the derived catalog ceiling (5% of \
+             memory_budget_bytes), not the fetcher cache's 25% and not the compiled-in 256 MiB"
+        );
+
+        // An explicit --cache-max-bytes couples both caches at that one value.
+        let flagged = crate::Cli::try_parse_from(["ravel-server", "--cache-max-bytes", "4096"])
+            .expect("flag parses");
+        let resolved = flagged
+            .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
+            .expect("performance defaults resolve");
+        assert_eq!(resolved.cache_max_bytes, 4096);
+        assert_eq!(resolved.catalog_cache_max_bytes, 4096);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store,
+            1,
+            flagged.disable_cache,
+            resolved.catalog_cache_max_bytes,
+            flagged.cache_dir.clone(),
+            None,
+            None,
+        )
+        .expect("catalog builds");
+        assert_eq!(
+            catalog.config().byte_cache_max_bytes,
+            4096,
+            "an explicit --cache-max-bytes bounds the catalog byte cache at the flag value"
         );
     }
 }
@@ -540,6 +678,8 @@ mod tests {
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
             None,
+            None,
+            None,
         )
         .expect("catalog");
         let tenant_resolver: Arc<dyn TenantResolver> =
@@ -560,6 +700,7 @@ mod tests {
             tenant_resolver,
             None,
             non_default,
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             DEFAULT_MAX_TENANT_BYTES,
             false,
@@ -568,6 +709,7 @@ mod tests {
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
             None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         )
         .expect("sql state builds");
 
@@ -594,6 +736,8 @@ mod tests {
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
             None,
+            None,
+            None,
         )
         .expect("catalog");
         let engine_config = EngineConfig {
@@ -606,6 +750,7 @@ mod tests {
             Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
             None,
             engine_config,
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             DEFAULT_MAX_TENANT_BYTES,
             false,
@@ -614,6 +759,7 @@ mod tests {
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
             None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         )
         .expect("sql state builds");
         assert_eq!(
@@ -637,18 +783,26 @@ mod tests {
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
             None,
+            None,
+            None,
         )
         .expect("catalog");
-        let budgets = crate::Cli::try_parse_from(argv)
-            .expect("flags parse")
-            .query_budgets()
-            .expect("budgets resolve");
+        let cli = crate::Cli::try_parse_from(argv).expect("flags parse");
+        // The injected reference host of issue #1141 (16 cores, 30 GB), never
+        // the real one: an unset SQL budget flag is now a share of the host's
+        // memory, so a test that read the machine it runs on would assert a
+        // different number on every box.
+        let resolved = cli
+            .resolve_performance(crate::config::HostProfile::new(16, Some(32_212_254_720)))
+            .expect("performance defaults resolve");
+        let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
         build_sql_state(
             catalog,
             store,
             Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
             None,
             EngineConfig::default(),
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
             budgets.sql_max_query_bytes,
             budgets.sql_tenant_max_bytes,
             budgets.sql_parallel_final_aggregation,
@@ -657,6 +811,7 @@ mod tests {
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
             None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         )
         .expect("sql state builds")
     }
@@ -681,12 +836,16 @@ mod tests {
             "the SQL executor's per-query pool ceiling must be the configured flag, not the default"
         );
 
-        // Unset: byte-identical to the compiled-in per-query default.
+        // Unset: the HOST-DERIVED per-query pool reaches the executor (issue
+        // #1141), 25% of the injected reference host's 30 GB, not the
+        // compiled-in 256 MiB.
         let state = sql_state_from_cli(&["ravel-server"]);
         assert_eq!(
             state.executor.config().max_query_bytes,
-            ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+            8_053_063_680,
+            "an unset --sql-max-query-bytes must reach the executor as the host-derived pool"
         );
+        assert_ne!(8_053_063_680, ravel_sql::DEFAULT_MAX_QUERY_BYTES);
     }
 
     /// ADR-0094 reachability: `--sql-parallel-final-aggregation` must reach the
@@ -737,8 +896,14 @@ mod tests {
             "the SQL executor's per-tenant ceiling must be the configured flag, not the default"
         );
 
-        // Unset: byte-identical to the compiled-in per-tenant default.
+        // Unset: the HOST-DERIVED per-tenant ceiling reaches the executor
+        // (issue #1141), 50% of the injected reference host's 30 GB.
         let state = sql_state_from_cli(&["ravel-server"]);
-        assert_eq!(state.executor.max_tenant_bytes(), DEFAULT_MAX_TENANT_BYTES);
+        assert_eq!(
+            state.executor.max_tenant_bytes(),
+            16_106_127_360,
+            "an unset --sql-tenant-max-bytes must reach the executor as the host-derived ceiling"
+        );
+        assert_ne!(16_106_127_360, DEFAULT_MAX_TENANT_BYTES);
     }
 }

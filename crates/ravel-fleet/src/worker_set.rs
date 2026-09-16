@@ -41,6 +41,35 @@
 //! `ravel_maintain::sweep::LeaseCheck` trait is the GC reader-protection gate, a
 //! different concept, and the two must not blur (ADR-0065 decision 1). The
 //! vocabulary here is `WorkerSet`, `live_set`, `owner`, `owns`.
+//!
+//! # Bounding the prefix (issue #1679)
+//!
+//! A heartbeat key is named by a `process_id` generated fresh per process and
+//! nothing deleted it, so `sys/maintain/workers/` accumulated one key for every
+//! maintain process that ever ran and [`WorkerSet::live_set`] paid a GET for
+//! each of them on every heartbeat. Two bounds keep that proportional to the
+//! live fleet, matching what `ravel_ingest::reconcile` does for the admission
+//! snapshots:
+//!
+//! - `live_set` skips the GET for a key the LIST result already shows as older
+//!   than the liveness window ([`mtime_stale`]). A heartbeat's
+//!   `heartbeat_unix_ns` is stamped no later than the write that set the
+//!   modification time, so a key that looks past the window by its modification
+//!   time can only hold a stamp at least as old.
+//! - A key past the *reap horizon* ([`reap_horizon_ns`]: the liveness window
+//!   widened by [`REAP_WINDOW_FACTOR`]) is deleted, which bounds the LIST
+//!   itself. The extra width is the clock-skew margin between the object
+//!   store's clock (which sets the modification time) and the reader's.
+//!   [`WorkerSet::live_set_read`] returns those keys from the SAME listing it
+//!   makes for the live set, and the maintain tier's heartbeat tick deletes
+//!   them through [`WorkerSet::reap_keys`], so the reap costs no listing of its
+//!   own. [`WorkerSet::reap_dead_workers`] is the standalone form for a caller
+//!   that is not already reading the live set, and it does pay one listing.
+//!   Reaping is idempotent and costs a live-but-skewed worker at most one
+//!   heartbeat interval of invisibility, since it rewrites its key every `H`.
+//!
+//! A backend reporting no usable modification time (`<= 0`) gets neither
+//! treatment: its keys are read as before and never reaped.
 
 use std::time::Duration;
 
@@ -157,6 +186,43 @@ pub(crate) fn is_stale(now_ns: i64, heartbeat_unix_ns: i64, liveness_window_ns: 
     too_old || too_future
 }
 
+/// How much wider than the liveness window the reap horizon is (issue #1679): a
+/// heartbeat key is deleted only once it is `REAP_WINDOW_FACTOR *
+/// liveness_factor * H` old. A factor rather than a second absolute duration,
+/// so the configured `H` stays the only knob and the horizon keeps being
+/// derived from the window [`is_stale`] already judges against.
+pub const REAP_WINDOW_FACTOR: i64 = 2;
+
+/// The reap horizon for a liveness window: the window widened by
+/// [`REAP_WINDOW_FACTOR`], which is the clock-skew margin between the object
+/// store's clock (which stamps the modification time reaping reads) and this
+/// reader's.
+pub(crate) fn reap_horizon_ns(window_ns: i64) -> i64 {
+    window_ns.saturating_mul(REAP_WINDOW_FACTOR)
+}
+
+/// Whether a listed key is already past `window_ns` by the LIST result's
+/// modification time alone, so its GET can be skipped (or, at the reap horizon,
+/// the key deleted).
+///
+/// Unlike [`is_stale`] this is one-directional: a modification time in the
+/// future means the object store's clock runs ahead of this reader's, which is
+/// a reason to read the key normally rather than to skip or delete it. The
+/// symmetric exclusion still applies to the `heartbeat_unix_ns` a GET returns,
+/// which is what can carry an implausible stamp.
+///
+/// `last_modified_unix_ms <= 0` means the backend reported no usable
+/// modification time (the in-memory oracle's default clock does exactly this).
+/// That is "unknown", never "ancient": the key is read normally and never
+/// reaped.
+pub(crate) fn mtime_stale(now_ns: i64, last_modified_unix_ms: i64, window_ns: i64) -> bool {
+    if last_modified_unix_ms <= 0 {
+        return false;
+    }
+    let last_modified_ns = last_modified_unix_ms.saturating_mul(1_000_000);
+    now_ns.saturating_sub(last_modified_ns) > window_ns
+}
+
 /// Run `f` over `items` with at most `concurrency` futures in flight,
 /// preserving input order in the returned results (ADR-0065 decision 2's
 /// bounded intra-process unit concurrency, mirroring ravel-catalog's
@@ -188,6 +254,18 @@ pub struct WorkerSet {
     heartbeat_interval: Duration,
     liveness_factor: u32,
     unit_concurrency: usize,
+}
+
+/// What one listing of `sys/maintain/workers/` yields: the live set, and the
+/// keys past the reap horizon. Returned together because the maintain tick
+/// needs both on the same cadence over the same prefix, so a second listing
+/// would be pure cost. Mirrors `read_siblings` on the admission path.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LiveSetRead {
+    /// Workers inside the liveness window, including this process.
+    pub live: Vec<Uuid>,
+    /// Keys past the reap horizon, for [`WorkerSet::reap_keys`] to delete.
+    pub reapable: Vec<String>,
 }
 
 impl WorkerSet {
@@ -305,14 +383,42 @@ impl WorkerSet {
         store: &dyn ObjectStoreBackend,
         now_ns: i64,
     ) -> Result<Vec<Uuid>, StoreError> {
+        Ok(self.live_set_read(store, now_ns).await?.live)
+    }
+
+    /// The live set AND the keys past the reap horizon, from ONE listing.
+    ///
+    /// The maintain tick needs both every heartbeat, and the prefix is the
+    /// same. Returning them together is what makes the reap free rather than a
+    /// second LIST: `read_siblings` on the admission path is the same shape for
+    /// the same reason. A caller that wants only one of the two still pays one
+    /// listing, never two.
+    pub async fn live_set_read(
+        &self,
+        store: &dyn ObjectStoreBackend,
+        now_ns: i64,
+    ) -> Result<LiveSetRead, StoreError> {
         let window = self.liveness_window_ns();
+        let horizon = reap_horizon_ns(window);
         let objects = list_all(store, WORKERS_PREFIX).await?;
         let mut live = vec![self.process_id];
+        let mut reapable = Vec::new();
         for meta in objects {
             let Some(pid) = process_id_of(&meta.key) else {
                 continue;
             };
             if pid == self.process_id {
+                continue;
+            }
+            if mtime_stale(now_ns, meta.last_modified_unix_ms, window) {
+                // Already past the liveness window by the LIST's own metadata:
+                // the body could only be older still, so it costs no GET
+                // (issue #1679). Past the wider reap horizon it is also this
+                // listing's reap candidate, collected here so the delete needs
+                // no listing of its own.
+                if mtime_stale(now_ns, meta.last_modified_unix_ms, horizon) {
+                    reapable.push(meta.key.clone());
+                }
                 continue;
             }
             let got = store.get(&meta.key, GetRange::Full).await?;
@@ -338,7 +444,32 @@ impl WorkerSet {
         }
         live.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         live.dedup();
-        Ok(live)
+        Ok(LiveSetRead { live, reapable })
+    }
+
+    /// Delete the keys a [`live_set_read`] already identified. Issues no
+    /// listing of its own, which is the whole point of taking them as an
+    /// argument.
+    ///
+    /// `delete` is idempotent, so several maintain processes reaping the same
+    /// dead key concurrently is not a race. A failed individual delete is
+    /// logged and retried by whichever process next lists the prefix, since a
+    /// key that outlives one tick costs one listing entry and nothing else.
+    ///
+    /// [`live_set_read`]: Self::live_set_read
+    pub async fn reap_keys(&self, store: &dyn ObjectStoreBackend, keys: &[String]) -> u64 {
+        let mut reaped = 0;
+        for key in keys {
+            match store.delete(key).await {
+                Ok(()) => reaped += 1,
+                Err(err) => tracing::warn!(
+                    key = %key,
+                    error = %err,
+                    "worker_set: reaping a dead worker heartbeat failed; retried next tick"
+                ),
+            }
+        }
+        reaped
     }
 
     /// Whether this process owns `(tenant, signal, shard)` under `live_set`
@@ -357,6 +488,41 @@ impl WorkerSet {
         )
     }
 
+    /// Delete every heartbeat key under `sys/maintain/workers/` that is past
+    /// the reap horizon (issue #1679), judged from the modification time the
+    /// LIST result already carries, and return how many were deleted.
+    ///
+    /// This is the standalone form and it costs one listing. The maintain tick
+    /// does NOT use it: that tick already calls [`live_set_read`], which returns
+    /// the same candidates from the listing it was making anyway, so it reaps
+    /// through [`reap_keys`] and pays nothing extra. Use this where no live-set
+    /// read is happening.
+    ///
+    /// [`live_set_read`]: Self::live_set_read
+    /// [`reap_keys`]: Self::reap_keys
+    ///
+    /// Never deletes this process's own key, never deletes a key that does not
+    /// parse as `sys/maintain/workers/<uuid>` (something else's key under a
+    /// prefix this process does not own is not this function's to reap), and
+    /// never deletes a key the backend reports no modification time for. The
+    /// horizon is [`reap_horizon_ns`] of the liveness window, so a worker whose
+    /// key merely aged out of the live set keeps a full extra window of grace
+    /// against clock skew before it is reaped.
+    ///
+    /// `delete` is idempotent, so several maintain processes reaping the same
+    /// dead key concurrently is not a race. A failed LIST is an `Err` the
+    /// caller can treat fail-open; a failed individual delete is logged and
+    /// retried by whichever process next lists the prefix, since a key that
+    /// outlives one tick costs one listing entry and nothing else.
+    pub async fn reap_dead_workers(
+        &self,
+        store: &dyn ObjectStoreBackend,
+        now_ns: i64,
+    ) -> Result<u64, StoreError> {
+        let read = self.live_set_read(store, now_ns).await?;
+        Ok(self.reap_keys(store, &read.reapable).await)
+    }
+
     /// The single-replica live set (`{self}`): every unit owned by self, so
     /// maintenance behaves byte-for-byte as the pre-ADR-0065 unconditional walk.
     /// Used as the fail-open fallback when a live-set read fails and no prior
@@ -369,6 +535,9 @@ impl WorkerSet {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::TenantId;
 
@@ -376,9 +545,44 @@ mod tests {
 
     const H: Duration = Duration::from_secs(60);
     const H_NS: i64 = 60 * 1_000_000_000;
+    /// `H` in milliseconds. The default liveness window is `3 * H_MS`
+    /// (`DEFAULT_LIVENESS_FACTOR` is 3), which is how the tests spell it.
+    const H_MS: u64 = 60 * 1_000;
 
     fn worker(now_ns: i64) -> WorkerSet {
         WorkerSet::new(now_ns, H, DEFAULT_LIVENESS_FACTOR, DEFAULT_UNIT_CONCURRENCY)
+    }
+
+    /// Write `worker`'s heartbeat so the object carries a *store* modification
+    /// time of `mtime_ms`, which is what the LIST result reports and therefore
+    /// what the read-side skip and the reaper judge against. The oracle's clock
+    /// is left at `restore_ms`, so anything written afterwards lands current.
+    async fn beat_with_mtime(
+        memory: &MemoryStore,
+        store: &dyn ObjectStoreBackend,
+        worker: &WorkerSet,
+        mtime_ms: u64,
+        restore_ms: u64,
+        stamp_ns: i64,
+    ) {
+        memory.set_clock_ms(mtime_ms);
+        worker
+            .write_heartbeat(store, stamp_ns)
+            .await
+            .expect("seed heartbeat");
+        memory.set_clock_ms(restore_ms);
+    }
+
+    /// Every key currently under `sys/maintain/workers/`, sorted.
+    async fn worker_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
+        let mut keys: Vec<String> = list_all(store, WORKERS_PREFIX)
+            .await
+            .expect("list workers prefix")
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect();
+        keys.sort();
+        keys
     }
 
     /// The rendezvous hash is deterministic: same unit key and live set yields
@@ -649,5 +853,281 @@ mod tests {
             cap,
             "at most, and exactly, the cap runs concurrently"
         );
+    }
+
+    /// Test debt (formal/tla/TRACEABILITY.md, `HeartbeatAndMemoNeverCas`): the
+    /// row asks for a test that both a heartbeat PUT and a "memo" PUT use
+    /// `PutMode::Overwrite`, not CAS. `write_heartbeat` issues exactly one PUT;
+    /// no "memo" write exists anywhere in `ravel-fleet`. The memo write is
+    /// `ravel_maintain::memo_snapshot::write_memo_snapshot`, in a different
+    /// crate, and the two are only ever driven together from
+    /// `services/ravel-server`'s maintain loop -- outside this task's scope.
+    /// This test pins what is true and testable here: the heartbeat PUT is an
+    /// unconditional overwrite. Proven behaviorally, since no store wrapper in
+    /// this workspace records the `PutMode` a call used: a second heartbeat
+    /// write to an already-populated key succeeds and its content wins, which
+    /// neither CAS variant (`CreateIfAbsent`, `CasVersion`) can do without the
+    /// caller reading and passing a precondition -- and `write_heartbeat` never
+    /// reads the key before writing it.
+    #[tokio::test]
+    async fn heartbeat_and_memo_puts_use_overwrite_not_cas() {
+        let store = MemoryStore::new();
+        let w = worker(0);
+
+        w.write_heartbeat(&store, 1_000)
+            .await
+            .expect("first heartbeat write succeeds");
+        w.write_heartbeat(&store, 2_000)
+            .await
+            .expect("second heartbeat write to the same key succeeds unconditionally");
+
+        let key = heartbeat_key(&w.process_id());
+        let got = store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("get heartbeat");
+        let heartbeat = WorkerHeartbeat::decode(got.data.as_ref()).expect("decode heartbeat");
+        assert_eq!(
+            heartbeat.heartbeat_unix_ns, 2_000,
+            "the second write's content wins: no CAS precondition blocked it"
+        );
+    }
+
+    /// The reaper deletes exactly the keys past the reap horizon (issue #1679):
+    /// dead workers go, a worker inside the clock-skew margin stays even though
+    /// it is already out of the live set, a fresh worker stays, this process's
+    /// own key stays, and a key that is not `sys/maintain/workers/<uuid>` is
+    /// left alone.
+    async fn reap_case(memory: MemoryStore) {
+        let now_ns = 1_000 * H_NS;
+        let now_ms = 1_000 * H_MS;
+        let store = memory;
+        store.set_clock_ms(now_ms);
+
+        let me = worker(now_ns);
+        let fresh = worker(now_ns);
+        // 4 * H old: past the 3 * H liveness window, inside the 6 * H horizon.
+        let skewed = worker(now_ns);
+        let dead: Vec<WorkerSet> = (0..3).map(|_| worker(now_ns)).collect();
+
+        beat_with_mtime(&store, &store, &me, now_ms, now_ms, now_ns).await;
+        beat_with_mtime(&store, &store, &fresh, now_ms, now_ms, now_ns).await;
+        beat_with_mtime(
+            &store,
+            &store,
+            &skewed,
+            now_ms - 4 * H_MS,
+            now_ms,
+            now_ns - 4 * H_NS,
+        )
+        .await;
+        for d in &dead {
+            beat_with_mtime(
+                &store,
+                &store,
+                d,
+                now_ms - 10 * H_MS,
+                now_ms,
+                now_ns - 10 * H_NS,
+            )
+            .await;
+        }
+        // A key under the same prefix that this mechanism does not own: never
+        // reaped, however old it looks.
+        store.set_clock_ms(now_ms - 100 * H_MS);
+        store
+            .put(
+                &format!("{WORKERS_PREFIX}not-a-uuid"),
+                b"x".to_vec().into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("seed foreign key");
+        store.set_clock_ms(now_ms);
+
+        let reaped = me.reap_dead_workers(&store, now_ns).await.expect("reap");
+        assert_eq!(reaped, 3, "exactly the three keys past the horizon");
+
+        let mut expected = vec![
+            heartbeat_key(&me.process_id()),
+            heartbeat_key(&fresh.process_id()),
+            heartbeat_key(&skewed.process_id()),
+            format!("{WORKERS_PREFIX}not-a-uuid"),
+        ];
+        expected.sort();
+        assert_eq!(
+            worker_keys(&store).await,
+            expected,
+            "own, fresh, inside-the-margin and foreign keys all survive"
+        );
+
+        // Reaping again is idempotent: nothing left is past the horizon.
+        assert_eq!(
+            me.reap_dead_workers(&store, now_ns)
+                .await
+                .expect("second reap"),
+            0
+        );
+    }
+
+    /// The tick's listing serves both purposes: `live_set_read` returns the
+    /// live set AND the reap candidates from ONE listing, so reaping costs no
+    /// second LIST of the same prefix. The previous shape called `live_set`
+    /// and then `reap_dead_workers`, each with its own `list_all`, while three
+    /// doc sites claimed the reap added no listing of its own.
+    ///
+    /// Asserted through the FaultStore's LIST counter, because that is the
+    /// claim: one listing, not two.
+    ///
+    /// Flip to watch it fail: have the body call `live_set` and then
+    /// `reap_dead_workers` instead of `live_set_read` plus `reap_keys`. The
+    /// LIST count goes to 2.
+    #[tokio::test]
+    async fn one_listing_serves_both_the_live_set_and_the_reap() {
+        let now_ns = 1_000 * H_NS;
+        let now_ms = 1_000 * H_MS;
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(now_ms);
+
+        let me = worker(now_ns);
+        let dead = worker(now_ns);
+
+        // Seed through the memory store directly: the rule below matches
+        // `list`, and seeding is `put`, but going through the plain store
+        // keeps the scripted occurrence counting only the read path.
+        beat_with_mtime(&memory, &memory, &me, now_ms, now_ms, now_ns).await;
+        beat_with_mtime(
+            &memory,
+            &memory,
+            &dead,
+            now_ms - 10 * H_MS,
+            now_ms,
+            now_ns - 10 * H_NS,
+        )
+        .await;
+
+        // Fault the SECOND listing of this prefix. The previous shape called
+        // `live_set` and then `reap_dead_workers`, each with its own
+        // `list_all`, so it tripped this; one listing never reaches it.
+        let store = FaultStore::new(
+            memory,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("a second listing".into()),
+                )
+                .with_occurrence(Occurrence::Nth(2)),
+            ),
+        );
+
+        let read = me.live_set_read(&store, now_ns).await.expect("one read");
+        let reaped = me.reap_keys(&store, &read.reapable).await;
+
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Transient),
+            0,
+            "the live set and the reap must come from one listing, not two"
+        );
+        assert_eq!(reaped, 1, "the dead worker's key was reaped");
+        assert_eq!(read.live, vec![me.process_id], "only this process is live");
+    }
+
+    #[tokio::test]
+    async fn dead_worker_heartbeats_are_reaped_past_the_horizon() {
+        reap_case(MemoryStore::new()).await;
+    }
+
+    /// The same case over a listing that pages: a reaper that only ever sees
+    /// the first page leaves most of a long-lived prefix behind.
+    #[tokio::test]
+    async fn dead_worker_heartbeats_are_reaped_across_list_pages() {
+        reap_case(MemoryStore::with_page_size(2)).await;
+    }
+
+    /// `live_set` pays one GET per LIVE sibling, not per listed key (issue
+    /// #1679): the 2nd GET under the workers prefix is scripted to fail, so a
+    /// cycle that fetches any key the LIST already showed as stale surfaces as
+    /// a fired fault and as a live set missing the one live sibling.
+    #[tokio::test]
+    async fn live_set_costs_no_get_for_a_key_the_list_shows_stale() {
+        let now_ns = 1_000 * H_NS;
+        let now_ms = 1_000 * H_MS;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Transient("a 2nd workers-prefix GET".into()),
+            )
+            .with_key_contains(WORKERS_PREFIX)
+            .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        store.inner().set_clock_ms(now_ms);
+
+        let me = worker(now_ns);
+        let live = worker(now_ns);
+        beat_with_mtime(store.inner(), &store, &me, now_ms, now_ms, now_ns).await;
+        beat_with_mtime(store.inner(), &store, &live, now_ms, now_ms, now_ns).await;
+        for _ in 0..8 {
+            beat_with_mtime(
+                store.inner(),
+                &store,
+                &worker(now_ns),
+                now_ms - 10 * H_MS,
+                now_ms,
+                now_ns - 10 * H_NS,
+            )
+            .await;
+        }
+
+        let set = me.live_set(&store, now_ns).await.expect("live set");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Transient),
+            0,
+            "a 2nd GET under the workers prefix never happened: at most 1"
+        );
+        let mut expected = vec![me.process_id(), live.process_id()];
+        expected.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(
+            set, expected,
+            "self plus the one live sibling, and nobody else"
+        );
+    }
+
+    /// The modification-time judgement the skip and the reaper share: unknown
+    /// is never ancient, the boundary is inclusive on the fresh side, a future
+    /// modification time is read rather than reaped, and the reap horizon is
+    /// the same window widened by the factor.
+    #[test]
+    fn mtime_staleness_is_one_directional_and_treats_unknown_as_fresh() {
+        let now_ns = 1_000 * H_NS;
+        let now_ms = now_ns / 1_000_000;
+        let window = 3 * H_NS;
+        let h_ms = H_MS as i64;
+
+        assert!(!mtime_stale(now_ns, 0, window), "unknown, so read the key");
+        assert!(!mtime_stale(now_ns, -1, window));
+        assert!(
+            !mtime_stale(now_ns, now_ms - 3 * h_ms, window),
+            "exactly the window old is still live, as is_stale judges it"
+        );
+        assert!(mtime_stale(now_ns, now_ms - 3 * h_ms - 1, window));
+        assert!(
+            !mtime_stale(now_ns, now_ms + 100 * h_ms, window),
+            "a store clock running ahead is a reason to read the key, not to reap it"
+        );
+        assert_eq!(reap_horizon_ns(window), 6 * H_NS);
+        assert!(!mtime_stale(
+            now_ns,
+            now_ms - 6 * h_ms,
+            reap_horizon_ns(window)
+        ));
+        assert!(mtime_stale(
+            now_ns,
+            now_ms - 6 * h_ms - 1,
+            reap_horizon_ns(window)
+        ));
     }
 }

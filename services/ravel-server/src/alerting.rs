@@ -48,10 +48,27 @@
 //! per alert_id for one tenant", and the cost is bounded by the number of
 //! transitions, not by ingest volume, because a record is written only on a
 //! transition (ADR-0043 decision 4).
+//!
+//! # The state memo
+//!
+//! `Signal::Alerts` is never maintained (it is absent from
+//! `maintain::MAINTAINED_SIGNALS`), so that transition history only grows and a
+//! full fold every tick costs `2N` GETs for a cumulative transition count `N`,
+//! independent of the rule count actually needed. [`AlertEvaluator::fold_latest`]
+//! avoids that with a tenant-wide derived cache, the alert state memo
+//! ([`crate::alert_state_memo`], issue #1294): each tick seeds from the memo and
+//! folds only the ingest hours at or after its watermark, clamped to the
+//! reader's own seal bound so a watermark from a fast clock cannot move the tail
+//! cursor past hours that still hold commit keys. The memo is never source of
+//! truth (the transition records remain the only durable state, ADR-0040
+//! decision 3); a lost, stale, or corrupt memo costs a full fold, never
+//! correctness, because the tail listing re-folds every hour that could hold a
+//! record written since the memo. Only the lease holder writes it.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -66,7 +83,9 @@ use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::{Clock, LOG_SEGMENT_FORMAT_VERSION};
 use ravel_logseg::{ObjectIdentity, Predicate, RlogConfig, RlogReader};
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all};
+use ravel_object_store::{
+    GetRange, ObjectMeta, ObjectStoreBackend, PageToken, PutMode, PutOptions, StoreError,
+};
 use ravel_promql::Value as PromqlValue;
 use ravel_query::{Coverage, QueryEngine};
 use ravel_types::{Signal, TenantHash, TenantId};
@@ -76,6 +95,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::alert_sink::{AlertNotification, AlertSink, DEFAULT_SINK_TIMEOUT, deliver};
+use crate::alert_state_memo::{AlertStateMemo, read_alert_state_memo, write_alert_state_memo};
 
 /// Default `--alert-eval-interval-secs`: 60 seconds, Prometheus' own default
 /// rule-evaluation interval.
@@ -101,6 +121,10 @@ pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(30);
 /// write-path benefit. Fixed rather than configurable so a reader always knows
 /// where an alert history lives.
 pub const ALERT_SHARD: u32 = 0;
+// Moving this writer to a shard outside the reader's floor (ADR-1101
+// decision 2) fails the build here rather than silently dropping every alert
+// record from alerts queries.
+const _: () = assert!(ALERT_SHARD < Signal::Alerts.fixed_read_shards());
 
 /// The writer epoch every alert record carries. Flush identity is
 /// `(writer_id, epoch, seq)` and each evaluator task mints a fresh v4
@@ -363,6 +387,195 @@ pub struct AlertEvalReport {
     pub lease_unavailable: bool,
 }
 
+impl AlertEvalReport {
+    /// How this tick ended, as one value of a closed set.
+    ///
+    /// The three state flags are mutually exclusive by construction in
+    /// [`AlertEvaluator::run_tick`]: an unreadable history returns before the
+    /// lease is touched, and the lease attempt sets at most one of
+    /// `lease_unavailable` and `lease_not_held`. Collapsing them into one
+    /// outcome is what lets `/metrics` render them as one counter split by a
+    /// closed `outcome` label rather than three independent flags whose
+    /// combinations an operator would have to reason about.
+    pub fn outcome(&self) -> AlertTickOutcome {
+        if self.history_unavailable {
+            AlertTickOutcome::HistoryUnavailable
+        } else if self.lease_unavailable {
+            AlertTickOutcome::LeaseUnavailable
+        } else if self.lease_not_held {
+            AlertTickOutcome::LeaseNotHeld
+        } else {
+            AlertTickOutcome::Evaluated
+        }
+    }
+}
+
+/// How one evaluation tick ended, the `outcome` dimension of
+/// `ravel_alert_ticks_total`.
+///
+/// `LeaseNotHeld` is a healthy outcome, not a failure: in a multi-replica
+/// deployment every replica but the lease holder reports it on every tick. It
+/// is a separate outcome rather than folded into a failure count precisely so
+/// an alert rule can leave the steady state alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertTickOutcome {
+    /// The lease was held and every configured rule was evaluated.
+    Evaluated,
+    /// A peer replica held the tenant's lease, so rule evaluation was skipped.
+    /// Expected steady state, not an error.
+    LeaseNotHeld,
+    /// The lease could not be acquired or renewed because the object store
+    /// failed.
+    LeaseUnavailable,
+    /// The alert history could not be read, so no rule was evaluated at all.
+    HistoryUnavailable,
+}
+
+impl AlertTickOutcome {
+    /// Every outcome, so the renderer emits one series per variant on every
+    /// scrape rather than only the ones seen so far. Adding a variant without
+    /// adding it here is caught by the exhaustive match in
+    /// `crate::metrics::alert_outcome_name`.
+    pub const ALL: [AlertTickOutcome; 4] = [
+        AlertTickOutcome::Evaluated,
+        AlertTickOutcome::LeaseNotHeld,
+        AlertTickOutcome::LeaseUnavailable,
+        AlertTickOutcome::HistoryUnavailable,
+    ];
+
+    /// Whether a tick with this outcome advances the liveness gauge. Only a
+    /// tick that observed the tenant's state and reached its end does:
+    /// `LeaseNotHeld` qualifies (a standby replica is alive and evaluating
+    /// nothing by design), the two failure outcomes do not.
+    fn completed(self) -> bool {
+        match self {
+            AlertTickOutcome::Evaluated | AlertTickOutcome::LeaseNotHeld => true,
+            AlertTickOutcome::LeaseUnavailable | AlertTickOutcome::HistoryUnavailable => false,
+        }
+    }
+}
+
+/// The alerting pipeline's `/metrics` counters, folded across every tenant this
+/// process evaluates.
+///
+/// Process-wide with no `tenant_hash` dimension, the same constraint every
+/// other family on this unauthenticated route carries (ADR-0044 section 4).
+/// One handle per process, reached through [`active_alert_metrics`]; an
+/// evaluator built for a test can hold its own instead, so a test asserts
+/// exact values without racing the process-global one.
+#[derive(Debug, Default)]
+pub struct AlertMetrics {
+    rules_evaluated: AtomicU64,
+    rules_failed: AtomicU64,
+    records_written: AtomicU64,
+    repeats_queued: AtomicU64,
+    notifications_delivered: AtomicU64,
+    notifications_failed: AtomicU64,
+    ticks_evaluated: AtomicU64,
+    ticks_lease_not_held: AtomicU64,
+    ticks_lease_unavailable: AtomicU64,
+    ticks_history_unavailable: AtomicU64,
+    /// Unix nanoseconds of the last tick that reached its end, from the
+    /// injected clock; `0` until one does. Every other figure here is
+    /// cumulative and stops moving when the loop dies, so only this gauge's age
+    /// separates a dead evaluator from a healthy one with nothing to do.
+    last_tick_completed_unix_ns: AtomicI64,
+}
+
+impl AlertMetrics {
+    /// Fold one finished tick in. `now_ns` is the clock reading that tick ran
+    /// at, so the liveness gauge is the injected clock's value and never
+    /// `SystemTime::now`.
+    ///
+    /// Called once per tick from [`AlertEvaluator::run_tick`], on every path
+    /// including the ones that fail: a tick that could not read history still
+    /// records what it observed, and only the liveness gauge distinguishes it.
+    pub fn record_tick(&self, report: &AlertEvalReport, now_ns: i64) {
+        let add = |counter: &AtomicU64, value: u32| {
+            counter.fetch_add(u64::from(value), Ordering::Relaxed);
+        };
+        add(&self.rules_evaluated, report.rules_evaluated);
+        add(&self.rules_failed, report.rules_failed);
+        add(&self.records_written, report.records_written);
+        add(&self.repeats_queued, report.repeats_queued);
+        add(
+            &self.notifications_delivered,
+            report.notifications_delivered,
+        );
+        add(&self.notifications_failed, report.notifications_failed);
+
+        let outcome = report.outcome();
+        self.tick_counter(outcome).fetch_add(1, Ordering::Relaxed);
+        if outcome.completed() {
+            self.last_tick_completed_unix_ns
+                .store(now_ns, Ordering::Relaxed);
+        }
+    }
+
+    fn tick_counter(&self, outcome: AlertTickOutcome) -> &AtomicU64 {
+        match outcome {
+            AlertTickOutcome::Evaluated => &self.ticks_evaluated,
+            AlertTickOutcome::LeaseNotHeld => &self.ticks_lease_not_held,
+            AlertTickOutcome::LeaseUnavailable => &self.ticks_lease_unavailable,
+            AlertTickOutcome::HistoryUnavailable => &self.ticks_history_unavailable,
+        }
+    }
+
+    pub fn rules_evaluated(&self) -> u64 {
+        self.rules_evaluated.load(Ordering::Relaxed)
+    }
+
+    pub fn rules_failed(&self) -> u64 {
+        self.rules_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn records_written(&self) -> u64 {
+        self.records_written.load(Ordering::Relaxed)
+    }
+
+    pub fn repeats_queued(&self) -> u64 {
+        self.repeats_queued.load(Ordering::Relaxed)
+    }
+
+    pub fn notifications_delivered(&self) -> u64 {
+        self.notifications_delivered.load(Ordering::Relaxed)
+    }
+
+    pub fn notifications_failed(&self) -> u64 {
+        self.notifications_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn ticks(&self, outcome: AlertTickOutcome) -> u64 {
+        self.tick_counter(outcome).load(Ordering::Relaxed)
+    }
+
+    pub fn last_tick_completed_unix_ns(&self) -> i64 {
+        self.last_tick_completed_unix_ns.load(Ordering::Relaxed)
+    }
+}
+
+/// The one handle every evaluator in this process folds into, created on the
+/// first [`AlertEvaluator::new`].
+static ALERT_METRICS: OnceLock<Arc<AlertMetrics>> = OnceLock::new();
+
+/// The process handle, creating it if this is the first evaluator.
+fn global_alert_metrics() -> Arc<AlertMetrics> {
+    Arc::clone(ALERT_METRICS.get_or_init(|| Arc::new(AlertMetrics::default())))
+}
+
+/// The process handle for `/metrics`, or `None` when this process has built no
+/// evaluator at all.
+///
+/// `None` is what keeps the whole `ravel_alert_*` family off the exposition of
+/// a deployment that configured no alert rules, rather than exporting a row of
+/// permanent zeros there (the same choice `render_durable_auth_family` makes).
+/// It is also what keeps the alert rules in docs/guides/observability.md quiet
+/// on such a deployment: with no series to match, each rule's expression is the
+/// empty vector.
+pub fn active_alert_metrics() -> Option<Arc<AlertMetrics>> {
+    ALERT_METRICS.get().map(Arc::clone)
+}
+
 /// The evaluator for one tenant.
 pub struct AlertEvaluator {
     store: Arc<dyn ObjectStoreBackend>,
@@ -411,6 +624,10 @@ pub struct AlertEvaluator {
     /// at-least-once contract ADR-0043 decision 6 actually states, rather
     /// than at-most-once across a restart.
     bootstrapped: bool,
+    /// Where every tick's report is folded for `/metrics`. The process-global
+    /// handle by default; a test swaps in its own with
+    /// [`AlertEvaluator::with_metrics`] so it can assert exact counter values.
+    metrics: Arc<AlertMetrics>,
 }
 
 impl AlertEvaluator {
@@ -442,7 +659,20 @@ impl AlertEvaluator {
             undelivered: HashMap::new(),
             repeat_marks: HashMap::new(),
             bootstrapped: false,
+            // Constructing an evaluator is what marks this process as one that
+            // runs alerting, and therefore what makes `/metrics` render the
+            // family at all.
+            metrics: global_alert_metrics(),
         })
+    }
+
+    /// Fold this evaluator's ticks into `metrics` instead of the process-global
+    /// handle. For tests: a shared global cannot carry an exact-value
+    /// assertion when other tests in the same binary tick their own evaluators.
+    #[cfg(test)]
+    fn with_metrics(mut self, metrics: Arc<AlertMetrics>) -> AlertEvaluator {
+        self.metrics = metrics;
+        self
     }
 
     /// One evaluation pass over every rule of this tenant, then one delivery
@@ -456,11 +686,42 @@ impl AlertEvaluator {
     /// reached, and a sink failure only leaves an entry in `undelivered` for
     /// the next tick. No sink result can prevent, delay past its own write, or
     /// alter a record.
+    ///
+    /// Every exit of the tick body funnels through the single
+    /// [`AlertMetrics::record_tick`] call here, so a tick that ends in a
+    /// failure still records what it observed. Splitting the body out is what
+    /// makes that structural rather than a rule to remember at each early
+    /// return.
     pub async fn run_tick(&mut self) -> AlertEvalReport {
-        let mut report = AlertEvalReport::default();
         let now_ns = self.clock.now_ns();
+        let report = self.evaluate_tick(now_ns).await;
+        self.metrics.record_tick(&report, now_ns);
+        report
+    }
 
-        let mut latest = match self.load_latest_records().await {
+    /// The tick body, at the clock reading [`Self::run_tick`] took.
+    async fn evaluate_tick(&mut self, now_ns: i64) -> AlertEvalReport {
+        let mut report = AlertEvalReport::default();
+
+        // Read the derived state memo first, before the lease and unguarded: it
+        // is an advisory cache every replica reads, so each folds only the ingest
+        // hours since the memo instead of the whole history (issue #1294). A
+        // missing memo (cold start), a corrupt one, or an unsupported-version one
+        // is not an error here; it falls back to a full fold below, and the lease
+        // holder rewrites a valid memo at the end of the tick.
+        let memo = match read_alert_state_memo(self.store.as_ref(), &self.tenant).await {
+            Ok(memo) => memo,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %self.tenant.to_hex(),
+                    error = %err,
+                    "alert evaluation: alert state memo unreadable; folding full history this tick"
+                );
+                None
+            }
+        };
+
+        let mut latest = match self.fold_latest(memo.as_ref(), now_ns).await {
             Ok(latest) => latest,
             Err(err) => {
                 tracing::warn!(
@@ -539,6 +800,44 @@ impl AlertEvaluator {
                 self.queue_repeat_if_due(rule, &latest, now_ns, &mut report);
             }
             self.rules = rules;
+
+            // Refresh the derived state memo from the just-folded latest state
+            // (issue #1294). Lease holder only, so there is a single writer per
+            // key; debounced so a tick that changed neither the watermark hour
+            // nor any record skips the write. The memo is advisory and
+            // reconstructible (ADR-0065 precedent): a failed write costs the next
+            // tick a full fold, never correctness.
+            //
+            // The watermark is the seal bound, not `hour_bucket(now_ns)`. The
+            // alert lease permits a two-holder overlap (see `acquire_lease`): a
+            // prior holder can still publish one in-flight transition after this
+            // holder's tail LIST, stamped at that holder's clock reading at its
+            // own publish (`evaluate_rule`). If that stamp lands in an hour below
+            // the watermark, the tail would exclude it from every future tick and
+            // the memo would omit it permanently. `seal_bound_hour` holds the
+            // watermark back far enough that a stamp taken on a clock disagreeing
+            // with this one still lands at or above it, so the tail always
+            // re-reads such a late transition (ADR-1294 decision 5).
+            let watermark_hour = self.seal_bound_hour(now_ns);
+            let unchanged = memo
+                .as_ref()
+                .is_some_and(|m| m.watermark_hour == watermark_hour && m.records == latest);
+            if !unchanged {
+                let refreshed = AlertStateMemo {
+                    watermark_hour,
+                    records: latest.clone(),
+                };
+                if let Err(err) =
+                    write_alert_state_memo(self.store.as_ref(), &self.tenant, &refreshed).await
+                {
+                    tracing::warn!(
+                        tenant = %self.tenant.to_hex(),
+                        error = %err,
+                        "alert evaluation: could not refresh the alert state memo; a full fold \
+                         recovers it next tick"
+                    );
+                }
+            }
         } else if !report.lease_unavailable {
             report.lease_not_held = true;
             tracing::debug!(
@@ -550,6 +849,38 @@ impl AlertEvaluator {
 
         self.flush_sinks(&mut report).await;
         report
+    }
+
+    /// The newest ingest hour that is sealed for alert writes as of `now_ns`:
+    /// the memo watermark. No overlapping lease holder can still stamp a
+    /// transition into this hour or any older one, so a tail LIST that starts at
+    /// this hour re-reads every transition an in-flight prior holder might
+    /// publish after this tick's own tail LIST.
+    ///
+    /// The alert lease documents a two-holder overlap (see [`Self::acquire_lease`]):
+    /// a prior holder whose lease has expired can still finish an in-flight tick
+    /// and publish one transition. [`Self::evaluate_rule`] reads the clock
+    /// immediately before that write, so the margin has to bound the prior
+    /// holder's *stamp*, not the duration of its tick: a tick of any length
+    /// stamps at the reading it holds when it publishes, which on one clock is at
+    /// or after the reading this holder computed its own watermark from. What is
+    /// left for the margin to absorb is disagreement between the two holders'
+    /// clocks. [`DEFAULT_QUERY_DEADLINE`] (this evaluator's `query_deadline`) is
+    /// the only wall-clock tolerance the alerting path defines, so it stands in
+    /// for a cross-node skew constant the path does not have; [`Self::lease_ttl`]
+    /// (`LEASE_TTL_TICKS` times the eval interval) is carried on top of it
+    /// because a holder that fell that far behind is already the case a handover
+    /// produces. The seal margin is therefore `lease_ttl + query_deadline`, and
+    /// the watermark is the ingest hour of `now_ns - seal_margin`. A deployment
+    /// whose inter-node clock skew exceeds that margin would need to widen it.
+    fn seal_bound_hour(&self, now_ns: i64) -> u32 {
+        let seal_margin_ns = i64::try_from(
+            self.lease_ttl
+                .saturating_add(self.query_deadline)
+                .as_nanos(),
+        )
+        .unwrap_or(i64::MAX);
+        hour_bucket(now_ns.saturating_sub(seal_margin_ns))
     }
 
     /// Try to own this tenant's alert lease for this tick.
@@ -762,20 +1093,33 @@ impl AlertEvaluator {
             return Ok(false);
         }
 
-        // guard against a backward wall-clock step (an NTP correction can
-        // move `now_ns` behind the prior record's `ts_ns`).
-        // `load_latest_records` orders records by `(ts_ns, epoch, seq)` with
-        // `ts_ns` first, so a record stamped at or before its predecessor sorts
-        // behind it and never becomes the folded "latest" -- the evaluator would
-        // then re-transition from the same stale state every tick instead of
-        // converging. Stamp the new record strictly after the prior one so the
-        // per-alert sequence is monotonic regardless of clock jitter. The
-        // transition decision above still uses the true `now_ns`; pending-
-        // duration elapse already clamps a backward step to zero, so only the
-        // durable stamp needs correcting here.
+        // The durable stamp is read here, immediately before the write, not at
+        // tick start. A tick evaluates its rules sequentially under a per-rule
+        // query deadline and has no tick-level cap, so a slow tick can outlive
+        // the lease it started under and publish long after `now_ns`. The memo
+        // watermark a successor holder writes is a seal bound strictly below
+        // that successor's own clock reading, so a stamp taken at publish time
+        // is always at or above any watermark any holder can have written by
+        // then, and the transition stays inside the tail the next fold re-reads.
+        // A tick-start stamp carries no such bound: it can land in an hour below
+        // the watermark, which the tail never descends to, and the transition is
+        // then lost from the memo for good.
+        //
+        // The `max` over the prior record guards a backward wall-clock step (an
+        // NTP correction can move the reading behind the prior record's
+        // `ts_ns`). `load_latest_records` orders records by `(ts_ns, epoch, seq)`
+        // with `ts_ns` first, so a record stamped at or before its predecessor
+        // sorts behind it and never becomes the folded "latest" -- the evaluator
+        // would then re-transition from the same stale state every tick instead
+        // of converging.
+        //
+        // The transition decision above still uses the tick's own `now_ns`:
+        // pending-duration elapse is a property of when the rule was evaluated,
+        // not of when its record reached the store.
+        let publish_ns = self.clock.now_ns();
         let stamp_ns = match prior.as_ref() {
-            Some(p) => now_ns.max(p.ts_ns.saturating_add(1)),
-            None => now_ns,
+            Some(p) => publish_ns.max(p.ts_ns.saturating_add(1)),
+            None => publish_ns,
         };
 
         let seq = self.next_seq;
@@ -892,6 +1236,9 @@ impl AlertEvaluator {
             min_tokens: Vec::new(),
             now_ns,
             deadline: self.query_deadline,
+            row_window: false,
+            max_rows: None,
+            budgets: None,
         };
         let outcome = executor.execute(self.tenant, &request).await?;
         Ok(QueryResultSummary::RowCount(
@@ -953,11 +1300,107 @@ impl AlertEvaluator {
     /// partial history would look like "this alert is not firing" and re-fire
     /// an alert that already is.
     async fn load_latest_records(&self) -> anyhow::Result<HashMap<AlertId, AlertRecord>> {
-        let prefix = keys::commit_shard_prefix(&self.tenant, Signal::Alerts, ALERT_SHARD)?;
-        let entries = list_all(self.store.as_ref(), &prefix).await?;
+        Ok(flatten_fold(self.full_fold().await?))
+    }
 
+    /// Fold the tenant's alert history to latest-per-`alert_id`, using `memo` as
+    /// a derived cache when one is present (issue #1294).
+    ///
+    /// With a memo, this seeds from its folded snapshot and then folds only the
+    /// commit records at or after the memo's effective watermark, so the
+    /// per-tick cost is bounded by the transitions written since the memo rather
+    /// than by the whole history. The tail listing is non-optional: it is what
+    /// makes a stale memo detectable rather than silently wrong, since any
+    /// record written since the memo is stamped at an ingest hour at or above
+    /// its watermark and is therefore re-listed here. Records below the
+    /// watermark come only from the memo, which is why an arbitrarily old
+    /// still-`Firing` record survives a tail that a bounded lookback would step
+    /// past.
+    ///
+    /// The effective watermark is the minimum of the persisted
+    /// `memo.watermark_hour` and this reader's own `seal_bound_hour(now_ns)`
+    /// (ADR-1294 decision 3). `decode` accepts any `u32`, so a memo written by a
+    /// replica whose clock runs ahead, or one whose watermark field was
+    /// corrupted into a decodable but too-large value, would otherwise start the
+    /// tail cursor past the hours the current commit keys live in: the tail
+    /// would skip them, the seed would serve state from before them, and
+    /// `evaluate_rule` would take a skipped firing transition for a resolved
+    /// alert and write the transition again. Clamping restores the staleness
+    /// invariant's precondition (the watermark is at or below every hour the
+    /// tail must cover) and only ever widens the tail, which the fold tolerates
+    /// by construction: a re-read record wins the tie against its byte-identical
+    /// memoized copy.
+    ///
+    /// With no memo (cold, absent, corrupt, or unsupported version) this is a
+    /// full fold, identical to [`Self::load_latest_records`].
+    async fn fold_latest(
+        &self,
+        memo: Option<&AlertStateMemo>,
+        now_ns: i64,
+    ) -> anyhow::Result<HashMap<AlertId, AlertRecord>> {
+        let best = match memo {
+            Some(memo) => {
+                // Seed each memoized record at fold order `(ts_ns, 0, 0)` so any
+                // real commit the tail re-reads (order `(ts_ns, epoch, seq)` with
+                // a nonzero seq) wins the tie against its own memoized copy. The
+                // two are byte-identical, so the tie-break only decides which
+                // clone survives, never the folded state.
+                let mut best: HashMap<AlertId, ((i64, u64, u64), AlertRecord)> = memo
+                    .records
+                    .iter()
+                    .map(|(id, record)| (*id, ((record.ts_ns, 0, 0), record.clone())))
+                    .collect();
+                // A watermark above this reader's seal bound is not trusted: the
+                // seal bound is the newest hour no writer can still be stamping
+                // into, so it is the highest cursor this fold may start from.
+                let watermark = memo.watermark_hour.min(self.seal_bound_hour(now_ns));
+                self.fold_tail(&mut best, watermark).await?;
+                best
+            }
+            // No memo: the cold path is a full fold, the same read
+            // `load_latest_records` performs.
+            None => return self.load_latest_records().await,
+        };
+        Ok(flatten_fold(best))
+    }
+
+    /// Full fold over the whole alert commit history, keyed by fold order.
+    async fn full_fold(&self) -> anyhow::Result<FoldedByOrder> {
+        let prefix = keys::commit_shard_prefix(&self.tenant, Signal::Alerts, ALERT_SHARD)?;
+        let entries = list_all_after(self.store.as_ref(), &prefix, None).await?;
+        let mut best = HashMap::new();
+        self.fold_commit_entries(entries, &mut best).await?;
+        Ok(best)
+    }
+
+    /// Fold the commit records at or after `watermark_hour` into `best`.
+    ///
+    /// One `start-after` LIST over the commit prefix, skipping every ingest hour
+    /// strictly below the watermark server-side, then a commit+data GET pair per
+    /// transition in that window. The watermark hour itself is included (its keys
+    /// sort after the bare `prefix + hour_string` cursor), so the hour a memo was
+    /// stamped in is always re-folded.
+    async fn fold_tail(&self, best: &mut FoldedByOrder, watermark_hour: u32) -> anyhow::Result<()> {
+        let prefix = keys::commit_shard_prefix(&self.tenant, Signal::Alerts, ALERT_SHARD)?;
+        let start_after = format!("{prefix}{}", keys::ingest_hour_string(watermark_hour));
+        let entries = list_all_after(self.store.as_ref(), &prefix, Some(&start_after)).await?;
+        self.fold_commit_entries(entries, best).await
+    }
+
+    /// Read each commit record in `entries` and the RLOG object it names, folding
+    /// every alert record into `best` by `(ts_ns, epoch, seq)`.
+    ///
+    /// Records are reached through commit records, never by listing data objects:
+    /// an object whose commit never landed is an abandoned write and must not
+    /// influence state. Any malformed entry aborts the whole read rather than
+    /// being skipped: a partial history would look like "this alert is not
+    /// firing" and re-fire an alert that already is.
+    async fn fold_commit_entries(
+        &self,
+        entries: Vec<ObjectMeta>,
+        best: &mut FoldedByOrder,
+    ) -> anyhow::Result<()> {
         let cfg = RlogConfig::default();
-        let mut best: HashMap<AlertId, ((i64, u64, u64), AlertRecord)> = HashMap::new();
         for meta in entries {
             let parsed = match keys::partition_bucket_entry(&meta.key)? {
                 keys::BucketEntry::CommitRecord(parsed) => parsed,
@@ -1001,10 +1444,7 @@ impl AlertEvaluator {
                 }
             }
         }
-        Ok(best
-            .into_iter()
-            .map(|(id, (_order, record))| (id, record))
-            .collect())
+        Ok(())
     }
 
     /// Attempt delivery of every undelivered notification to every sink,
@@ -1048,6 +1488,137 @@ impl AlertEvaluator {
             }
         }
     }
+}
+
+/// A fold in progress: the winning `(ts_ns, epoch, seq)` order and record for
+/// each `alert_id` seen so far.
+type FoldedByOrder = HashMap<AlertId, ((i64, u64, u64), AlertRecord)>;
+
+/// Drop the fold-order key, leaving the latest record per `alert_id`.
+fn flatten_fold(best: FoldedByOrder) -> HashMap<AlertId, AlertRecord> {
+    best.into_iter()
+        .map(|(id, (_order, record))| (id, record))
+        .collect()
+}
+
+/// Page ceiling for one listing drain over the alert commit prefix.
+///
+/// The prefix is a single shard per tenant, and at the object store's 1000-key
+/// page size this bounds one drain to 100 million keys, far above any tenant's
+/// cumulative alert-transition count (the history grows without maintenance,
+/// but not that fast). It only ever trips on a backend that never terminates.
+/// The repeated-token guard below catches the common spin (a backend returning
+/// the same continuation token) on the second page; this ceiling is the
+/// backstop for a token that keeps changing without advancing.
+const MAX_LIST_PAGES: usize = 100_000;
+
+/// A paged listing could not be folded. `RepeatedToken` and `PageCeiling` mean
+/// the backend kept reporting "another page" without making progress; draining
+/// returns the error rather than spinning forever (the last-key check below
+/// dedups a permitted repeat but never breaks the loop). `OrderViolation` means
+/// the backend delivered a key strictly below one already delivered, breaking
+/// the contract's lexicographic-order guarantee; folding out of order is wrong,
+/// so draining returns the error rather than silently reordering.
+#[derive(Debug, thiserror::Error)]
+enum ListDrainError {
+    #[error("listing under {prefix:?} repeated its continuation token; refusing to spin")]
+    RepeatedToken { prefix: String },
+    #[error("listing under {prefix:?} exceeded the {ceiling}-page ceiling")]
+    PageCeiling { prefix: String, ceiling: usize },
+    #[error(
+        "listing under {prefix:?} delivered {offending:?} after {previous:?}, \
+         out of lexicographic order"
+    )]
+    OrderViolation {
+        prefix: String,
+        previous: String,
+        offending: String,
+    },
+}
+
+/// Drain every page of a listing under `prefix`, deduplicating by key. With
+/// `start_after` set, every returned key sorts strictly after it (`list_after`
+/// with `None` is identical to `list`, per the object-store contract), so this
+/// serves both the full fold (`None`) and the tail fold (`Some(cursor)`).
+///
+/// Two object-store contract guarantees (docs/object-store-contract.md,
+/// "Listing") drive the dedup: keys arrive in lexicographic order, and a key
+/// MAY appear more than once so callers MUST dedup. Because a permitted repeat
+/// is therefore always equal to the last key already delivered, [`drain_pages`]
+/// dedups by holding only that last key rather than a set of every key: an
+/// equal key is dropped, a strictly smaller key breaks the order guarantee and
+/// becomes [`ListDrainError::OrderViolation`], and a larger key is kept. That
+/// is constant extra memory over the returned set.
+///
+/// The loop terminates on `page.next == None`, on a repeated continuation
+/// token, or at [`MAX_LIST_PAGES`]; the last two are typed errors, never a
+/// spin.
+async fn list_all_after(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    start_after: Option<&str>,
+) -> anyhow::Result<Vec<ObjectMeta>> {
+    drain_pages(store, prefix, start_after, MAX_LIST_PAGES).await
+}
+
+/// [`list_all_after`] with an explicit page ceiling, so a test can exercise the
+/// [`ListDrainError::PageCeiling`] path without draining 100 000 pages.
+async fn drain_pages(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    start_after: Option<&str>,
+    max_pages: usize,
+) -> anyhow::Result<Vec<ObjectMeta>> {
+    let mut out: Vec<ObjectMeta> = Vec::new();
+    let mut last_key: Option<String> = None;
+    let mut page_token: Option<PageToken> = None;
+    let mut prev_token: Option<PageToken> = None;
+    let mut pages = 0usize;
+    loop {
+        if pages >= max_pages {
+            return Err(ListDrainError::PageCeiling {
+                prefix: prefix.to_string(),
+                ceiling: max_pages,
+            }
+            .into());
+        }
+        pages += 1;
+        let page = store.list_after(prefix, start_after, page_token).await?;
+        for meta in page.objects {
+            match last_key.as_deref() {
+                // Lexicographic order plus a permitted repeat means a key at or
+                // below the last delivered one is either that same key again
+                // (dropped) or a backend that broke ordering (a typed error).
+                Some(last) if meta.key.as_str() < last => {
+                    return Err(ListDrainError::OrderViolation {
+                        prefix: prefix.to_string(),
+                        previous: last.to_string(),
+                        offending: meta.key,
+                    }
+                    .into());
+                }
+                Some(last) if meta.key.as_str() == last => {}
+                _ => {
+                    last_key = Some(meta.key.clone());
+                    out.push(meta);
+                }
+            }
+        }
+        match page.next {
+            Some(next) => {
+                if prev_token.as_ref() == Some(&next) {
+                    return Err(ListDrainError::RepeatedToken {
+                        prefix: prefix.to_string(),
+                    }
+                    .into());
+                }
+                prev_token = Some(next.clone());
+                page_token = Some(next);
+            }
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
 /// The hour bucket a commit record stamped at `now_ns` belongs to. A pre-epoch
@@ -1600,10 +2171,17 @@ mod tests {
 mod tick_tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
+    use ravel_alerting::build_transition_record;
     use ravel_catalog::{Catalog, CatalogConfig};
+    use ravel_object_store::InstrumentedStore;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule as FaultRule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{Capabilities, DelimitedList, GetOutcome, ListPage, PutOutcome};
     use ravel_query::{EngineConfig, QueryEngine};
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, Sample, SeriesId};
@@ -1697,8 +2275,15 @@ mod tick_tests {
             min_ingest_ts_ns: written.summary.min_event_ts_ns,
             max_ingest_ts_ns: written.summary.max_event_ts_ns,
             segment_format_version: 1,
-            created_unix_ns: 10,
-            ingest_hour_bucket: 0,
+            // Created in the same hour the object's events fall in, so the
+            // commit-record cross-check (`ingest_hour_bucket` at or before the
+            // created hour) holds when the seed is in a later hour than epoch.
+            created_unix_ns: written.summary.max_event_ts_ns,
+            // Key the commit under the ingest hour of its own event time so a
+            // query whose window falls in a later hour still resolves it. At the
+            // hour-0 timestamps most tests use this is 0, unchanged; the memo
+            // seal-bound tests seed a metric in hour 1 and need it keyed there.
+            ingest_hour_bucket: hour_bucket(written.summary.max_event_ts_ns),
         })
         .expect("valid commit record");
 
@@ -1758,11 +2343,25 @@ mod tick_tests {
     /// Each call mints a fresh `writer_id`, so two evaluators over one store are
     /// two distinct "replicas" for the lease test.
     fn evaluator(store: Arc<dyn ObjectStoreBackend>, clock: Arc<TestClock>) -> AlertEvaluator {
+        evaluator_with(store, clock, Vec::new(), Arc::new(AlertMetrics::default()))
+    }
+
+    /// [`evaluator`] with explicit sinks and an explicit metrics handle. The
+    /// handle is never the process-global one: other tests in this binary tick
+    /// their own evaluators, so only a per-test handle can carry an exact-value
+    /// assertion.
+    fn evaluator_with(
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<TestClock>,
+        sinks: Vec<AlertSink>,
+        metrics: Arc<AlertMetrics>,
+    ) -> AlertEvaluator {
         let catalog =
             Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
         let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default());
         let config = AlertEvalConfig {
             enabled: true,
+            sinks: Arc::new(sinks),
             ..AlertEvalConfig::default()
         };
         AlertEvaluator::new(
@@ -1778,6 +2377,7 @@ mod tick_tests {
             &config,
         )
         .expect("build evaluator")
+        .with_metrics(metrics)
     }
 
     /// Every alert record this tenant has, read through its commit records and
@@ -1790,7 +2390,7 @@ mod tick_tests {
             keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
         let cfg = RlogConfig::default();
         let mut out = Vec::new();
-        for meta in list_all(store, &prefix).await.expect("list") {
+        for meta in list_all_after(store, &prefix, None).await.expect("list") {
             // Skip anything that is not an L0 commit record (e.g. the
             // compaction-record test injects one under this prefix).
             if !matches!(
@@ -2132,6 +2732,1828 @@ mod tick_tests {
         assert_eq!(
             report.repeats_queued, 1,
             "at the 60s default cadence a repeat is due"
+        );
+    }
+
+    // --- Alert state memo (issue #1294) --------------------------------------
+    //
+    // These pin the fold's per-tick object-store cost. A counting store
+    // (`InstrumentedStore`) makes the request count an assertion, not a comment:
+    // the whole point of the memo is that a steady-state tick reads only the
+    // tail, not the whole history, so the number of GETs it issues is the claim.
+
+    /// Publish `records` as real alert transition objects, one commit + one data
+    /// object each, at the ingest hour of each record's own `ts_ns`. Distinct
+    /// writer seqs keep the commit keys from colliding, so `n` records yield `n`
+    /// commit records under the alerts prefix.
+    async fn seed_alert_history(evaluator: &AlertEvaluator, records: &[AlertRecord]) {
+        seed_alert_history_from(evaluator, records, 10_000).await;
+    }
+
+    /// [`seed_alert_history`] with an explicit base writer seq, so two seeding
+    /// calls against one evaluator (a prior-holder write published after the
+    /// first batch) do not collide on `(writer_id, epoch, seq)` and its commit
+    /// key.
+    async fn seed_alert_history_from(
+        evaluator: &AlertEvaluator,
+        records: &[AlertRecord],
+        base_seq: u64,
+    ) {
+        for (i, record) in records.iter().enumerate() {
+            let seq = base_seq + i as u64;
+            let identity = ObjectIdentity {
+                tenant_hash: evaluator.tenant.0,
+                shard: ALERT_SHARD,
+                writer_id: evaluator.writer_id.into_bytes(),
+                writer_epoch: ALERT_WRITER_EPOCH,
+                writer_seq: seq,
+            };
+            let bytes =
+                ravel_alerting::encode_record_object(record, RlogConfig::default(), identity)
+                    .expect("encode alert record");
+            evaluator
+                .publish(bytes, seq, record.ts_ns)
+                .await
+                .expect("publish alert record");
+        }
+    }
+
+    /// A full fold reads exactly one commit GET and one data GET per transition
+    /// record, so its cost grows with the cumulative history `N`. This is the
+    /// baseline the memo removes.
+    #[tokio::test]
+    async fn a_full_fold_reads_two_gets_per_transition() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+
+        let n: u64 = 4;
+        let records: Vec<AlertRecord> = (0..n)
+            .map(|i| build_transition_record(&rule, AlertState::Firing, 0, NOW_NS + i as i64))
+            .collect();
+        seed_alert_history(&ev, &records).await;
+
+        let before = metrics.snapshot();
+        let latest = ev.load_latest_records().await.expect("full fold");
+        let after = metrics.snapshot();
+
+        assert_eq!(latest.len(), 1, "all transitions share one alert_id");
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2 * n,
+            "a full fold reads one commit GET and one data GET per transition record"
+        );
+    }
+
+    /// The memo path folds only the ingest hours at or after the watermark. With
+    /// every seeded record below the watermark, a steady-state fold reads zero
+    /// commit/data GETs and issues exactly one tail LIST, yet still returns the
+    /// full folded state, including a `Firing` record that lives only in the memo
+    /// (the case a bounded newest-first lookback would lose).
+    #[tokio::test]
+    async fn the_memo_path_reads_only_hours_at_or_after_the_watermark() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // Three transitions for one alert, all in ingest hour 0, last is Firing.
+        let n = 3;
+        let records: Vec<AlertRecord> = (0..n)
+            .map(|i| {
+                let state = if i + 1 == n {
+                    AlertState::Firing
+                } else {
+                    AlertState::Pending
+                };
+                build_transition_record(&rule, state, 0, NOW_NS)
+            })
+            .collect();
+        seed_alert_history(&ev, &records).await;
+
+        let full = ev.load_latest_records().await.expect("full fold");
+
+        // A memo whose watermark is hour 1, above every seeded record's hour 0.
+        let memo = AlertStateMemo {
+            watermark_hour: 1,
+            records: full.clone(),
+        };
+
+        // Fold two hours on, so the reader's own seal bound is at or above the
+        // memo's watermark and the effective-watermark clamp is a no-op here:
+        // this test is about the tail cursor, not about the clamp.
+        let fold_at = NOW_NS + 2 * NS_PER_HOUR;
+        assert!(
+            ev.seal_bound_hour(fold_at) >= memo.watermark_hour,
+            "the clamp must not lower the watermark under test"
+        );
+
+        let before = metrics.snapshot();
+        let via_memo = ev
+            .fold_latest(Some(&memo), fold_at)
+            .await
+            .expect("memo fold");
+        let after = metrics.snapshot();
+
+        assert_eq!(
+            via_memo, full,
+            "the memo path folds to the same latest state as a full fold"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "an hour-0 Firing below the watermark survives via the memo, not the tail"
+        );
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            0,
+            "the memo path issues no commit or data GETs for hours below the watermark"
+        );
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            1,
+            "the memo path issues exactly one tail LIST"
+        );
+    }
+
+    /// A transition written after the memo, at an hour at or above its
+    /// watermark, is folded in by the non-optional tail LIST: the memo path
+    /// matches a full fold rather than returning the stale memoized state.
+    #[tokio::test]
+    async fn a_transition_after_the_memo_is_caught_by_the_tail_list() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // Memo snapshot: Firing as of hour 0, watermark hour 1. This record is
+        // never written to the store; it exists only in the memo.
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, NOW_NS);
+        let mut memo_records = HashMap::new();
+        memo_records.insert(alert_id, firing);
+        let memo = AlertStateMemo {
+            watermark_hour: 1,
+            records: memo_records,
+        };
+
+        // A newer Resolved transition lands in hour 1, at the watermark.
+        let hour1_ts = NS_PER_HOUR + NOW_NS;
+        let resolved = build_transition_record(&rule, AlertState::Resolved, 0, hour1_ts);
+        seed_alert_history(&ev, &[resolved]).await;
+
+        // Fold two hours on, so the effective-watermark clamp is a no-op and the
+        // tail cursor really is the memo's own hour 1.
+        let fold_at = NOW_NS + 2 * NS_PER_HOUR;
+        assert!(
+            ev.seal_bound_hour(fold_at) >= memo.watermark_hour,
+            "the clamp must not lower the watermark under test"
+        );
+        let via_memo = ev
+            .fold_latest(Some(&memo), fold_at)
+            .await
+            .expect("memo fold");
+        let full = ev.load_latest_records().await.expect("full fold");
+
+        assert_eq!(
+            via_memo, full,
+            "the tail list folds in the transition written after the memo"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Resolved),
+            "the memo path reflects the Resolved written after the memo, not the stale Firing"
+        );
+    }
+
+    /// The lease holder writes the state memo after a tick, stamping the
+    /// seal-bound hour as the watermark and recording every folded alert.
+    #[tokio::test]
+    async fn the_lease_holder_writes_the_state_memo() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+
+        assert_eq!(ev.run_tick().await.records_written, 1, "onset fires");
+
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the lease holder wrote a memo");
+        assert_eq!(
+            memo.watermark_hour,
+            ev.seal_bound_hour(NOW_NS),
+            "the watermark is the seal-bound hour, not the tick's own hour"
+        );
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        assert_eq!(
+            memo.records.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the memo records the firing alert the tick just wrote"
+        );
+
+        // Finding 4 (issue #1438): the fold seeds the memo with no active-rule
+        // filter, so an identity for a rule that is no longer configured stays in
+        // the memo. Seed one transition for a rule this evaluator is NOT
+        // configured with (a rule since deleted, whose history remains), fold
+        // again, and the identity is still present. The memo's growth is bounded
+        // by distinct identities ever configured, not by ticks or transitions, and
+        // pruning that growth is deferred to issue #1438. The day that prune lands,
+        // this exact-key-set assertion is the one that changes.
+        let deleted_rule = Rule {
+            rule_id: "since-deleted-rule".to_string(),
+            ..threshold_rule()
+        };
+        let deleted_id = compute_alert_id(&deleted_rule.rule_id, &deleted_rule.labels);
+        assert_ne!(
+            deleted_id, alert_id,
+            "the deleted rule has its own identity"
+        );
+        let ghost = build_transition_record(&deleted_rule, AlertState::Firing, 0, NOW_NS);
+        seed_alert_history(&ev, &[ghost]).await;
+
+        let refolded = ev.load_latest_records().await.expect("refold");
+        assert_eq!(
+            refolded
+                .keys()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            [alert_id, deleted_id]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            "the deleted rule's identity is retained in the fold: no active-rule filter prunes it"
+        );
+    }
+
+    /// A corrupt memo is not fatal: the tick falls back to a full fold, still
+    /// fires, and the lease holder overwrites the garbage with a valid memo.
+    #[tokio::test]
+    async fn a_corrupt_memo_is_ignored_and_rewritten() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        store
+            .put(
+                &crate::alert_state_memo::alert_state_memo_key(&tenant),
+                Bytes::from_static(b"not a memo"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put garbage memo");
+
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        assert_eq!(
+            ev.run_tick().await.records_written,
+            1,
+            "a corrupt memo falls back to a full fold, not a skipped tick"
+        );
+
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo now decodes")
+            .expect("memo present after rewrite");
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        assert_eq!(
+            memo.records.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the holder rewrote a valid memo over the garbage"
+        );
+    }
+
+    /// A memo body that repeats an alert_id is refused as a corrupt memo, so the
+    /// tick falls back to a full fold exactly as `a_corrupt_memo_is_ignored_and_
+    /// rewritten` does, and the fallback fold reads the same `2N` GETs as any
+    /// full fold (finding 1, issue #1294).
+    #[tokio::test]
+    async fn a_duplicate_alert_id_memo_falls_back_to_a_full_fold() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let tenant = TenantId::new(TENANT).hash();
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+
+        // A single transition in the durable history: a full fold of it is 2 GETs.
+        let n: u64 = 1;
+        let records: Vec<AlertRecord> = (0..n)
+            .map(|i| build_transition_record(&rule, AlertState::Firing, 0, NOW_NS + i as i64))
+            .collect();
+        seed_alert_history(&ev, &records).await;
+
+        // A well-formed memo body that lists the one alert_id twice.
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        let hex = alert_id.to_hex();
+        let body = format!(
+            r#"{{"format_version":1,"watermark_hour":1,"records":[
+                {{"alert_id":"{hex}","rule_id":"high-cpu","state":"firing",
+                 "generation":0,"ts_ns":1,"labels":[],"annotations":[],"body":"b"}},
+                {{"alert_id":"{hex}","rule_id":"high-cpu","state":"resolved",
+                 "generation":1,"ts_ns":2,"labels":[],"annotations":[],"body":"b"}}]}}"#
+        );
+        store
+            .put(
+                &crate::alert_state_memo::alert_state_memo_key(&tenant),
+                Bytes::from(body),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put duplicate-alert_id memo");
+
+        // The reader refuses the duplicate memo outright.
+        assert!(
+            read_alert_state_memo(store.as_ref(), &tenant)
+                .await
+                .is_err(),
+            "a memo repeating an alert_id is refused, not silently deduped"
+        );
+
+        // So the tick folds `None`: a full fold, exactly 2 GETs per transition.
+        let before = metrics.snapshot();
+        let latest = ev
+            .fold_latest(None, NOW_NS)
+            .await
+            .expect("full fold fallback");
+        let after = metrics.snapshot();
+        assert_eq!(latest.len(), 1, "all transitions share one alert_id");
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2 * n,
+            "the duplicate-memo fallback is a full fold: one commit GET and one \
+             data GET per transition"
+        );
+    }
+
+    /// A failed memo write does not clear the prior memo, so the next tick reads
+    /// the surviving memo and folds only the tail, not the whole history (finding
+    /// 1, issue #1294). `run_tick` logs the `write_alert_state_memo` error and
+    /// leaves the object as it was; the full-fold path is reached only when no
+    /// readable memo exists, never merely because a write failed. The fault layer
+    /// fails the tick's memo `Overwrite`; the prior memo sits below that layer, so
+    /// it stays readable and its own seeding write is not the faulted one.
+    #[tokio::test]
+    async fn a_failed_memo_write_leaves_the_prior_memo_so_the_next_tick_folds_the_tail() {
+        let instrumented = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = instrumented.metrics();
+        let tenant = TenantId::new(TENANT).hash();
+        let memo_key = crate::alert_state_memo::alert_state_memo_key(&tenant);
+
+        // A metric above the threshold so the alert stays Firing and the tick
+        // writes no new transition: the durable history is fixed at one record.
+        publish_metric(
+            instrumented.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        // Fail the FIRST memo PUT the fault layer sees. The prior memo below is
+        // seeded straight into the counting store, under the fault layer, so it is
+        // not that first PUT; the tick's own memo `Overwrite` is.
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::Put,
+                ScriptedFault::Transient("alert state memo write unavailable".into()),
+            )
+            .with_key_contains(memo_key.clone())
+            .with_occurrence(Occurrence::Nth(1)),
+        );
+        let fault = Arc::new(FaultStore::new(Arc::clone(&instrumented), plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+
+        // One Firing transition in ingest hour 0 is the whole durable history.
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, NOW_NS);
+        assert_eq!(hour_bucket(NOW_NS), 0, "the firing record is in hour 0");
+        seed_alert_history(&ev, &[firing]).await;
+
+        // The full fold of that history: the state the memo must reproduce.
+        let full = ev.load_latest_records().await.expect("full fold");
+
+        // A prior, valid memo whose watermark (hour 1) is above the record's hour
+        // 0, so a fold over it re-reads no commit/data objects. Seeded below the
+        // fault layer, so it stays readable and does not trip the PUT fault.
+        let prior = AlertStateMemo {
+            watermark_hour: 1,
+            records: full.clone(),
+        };
+        write_alert_state_memo(instrumented.as_ref(), &tenant, &prior)
+            .await
+            .expect("seed prior memo below the fault layer");
+
+        // The tick reads the prior memo, stays Firing (writes no transition), and
+        // attempts to rewrite the memo at the seal-bound watermark (hour 0, below
+        // the prior hour 1), which the fault fails.
+        let report = ev.run_tick().await;
+        assert_eq!(
+            report.records_written, 0,
+            "already firing: the tick writes no new transition"
+        );
+        assert_eq!(
+            fault.fault_count(Op::Put, FaultKind::Transient),
+            1,
+            "the memo write was attempted and the injected fault fired exactly once"
+        );
+
+        // The failed write did not clear the memo: the prior memo (watermark hour
+        // 1) is still readable, not gone.
+        let surviving = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the failed write left the prior memo in place");
+        assert_eq!(
+            surviving.watermark_hour, 1,
+            "the surviving memo is the prior one, untouched by the failed overwrite"
+        );
+
+        // A later tick's read path (memo GET then tail fold) takes the fold_tail
+        // path over the surviving memo, not a full fold: one memo GET, no
+        // commit/data GETs for the below-watermark record, and one tail LIST.
+        // "Later" is two hours on so this reader's seal bound is at or above the
+        // surviving watermark and the effective-watermark clamp is a no-op; the
+        // claim under test is that a failed write left a usable memo behind.
+        let fold_at = NOW_NS + 2 * NS_PER_HOUR;
+        assert!(
+            ev.seal_bound_hour(fold_at) >= 1,
+            "the clamp must not lower the surviving watermark under test"
+        );
+        let before = metrics.snapshot();
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("memo present");
+        let via_memo = ev
+            .fold_latest(Some(&memo), fold_at)
+            .await
+            .expect("memo fold");
+        let after = metrics.snapshot();
+
+        assert_eq!(
+            via_memo, full,
+            "the served state still equals the full fold, record for record"
+        );
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            1,
+            "the memo path reads only the memo object: no commit/data GETs below the watermark"
+        );
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            1,
+            "the memo path issues exactly one tail LIST"
+        );
+
+        // Contrast: a full fold over the same history costs two GETs (one commit,
+        // one data) for the one transition, so the memo path above really did skip
+        // the full fold rather than accidentally matching its cost.
+        let before = metrics.snapshot();
+        let full_again = ev.load_latest_records().await.expect("full fold");
+        let after = metrics.snapshot();
+        assert_eq!(full_again, full, "the full fold is stable");
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2,
+            "a full fold reads one commit GET and one data GET per transition"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the memo path still serves the firing alert from the surviving memo"
+        );
+    }
+
+    /// The memo watermark is the seal-bound hour, strictly older than the tick's
+    /// own hour when the tick runs within the seal margin of an hour boundary.
+    /// Pinning it to `hour_bucket(now_ns)` (the flip) would let it advance past an
+    /// hour an overlapping prior holder can still write into (finding 2,
+    /// issue #1294).
+    #[tokio::test]
+    async fn the_watermark_never_exceeds_the_seal_bound() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        // A `now` just inside hour 1, within the seal margin of the hour-0
+        // boundary, so the seal bound is hour 0 while the tick's own hour is 1.
+        let now = NS_PER_HOUR + 60 * NS_PER_SEC;
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(now - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(now));
+
+        assert_eq!(ev.run_tick().await.records_written, 1, "onset fires");
+
+        let seal = ev.seal_bound_hour(now);
+        assert!(
+            seal < hour_bucket(now),
+            "test is only meaningful when the seal bound (hour {seal}) is strictly \
+             older than the tick's own hour (hour {})",
+            hour_bucket(now)
+        );
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the lease holder wrote a memo");
+        assert_eq!(
+            memo.watermark_hour, seal,
+            "the watermark is pinned to the seal-bound hour, not the tick's own hour"
+        );
+    }
+
+    /// A transition an overlapping prior holder publishes into an hour below the
+    /// tick's own hour, after this holder's tail LIST, is still folded in on the
+    /// next tick: the seal-bound watermark keeps that hour inside the tail. With
+    /// the watermark reverted to the tick's own hour (the flip) the tail skips
+    /// the hour and the transition is lost forever from the memo (finding 2,
+    /// issue #1294).
+    #[tokio::test]
+    async fn a_transition_published_by_an_overlapping_prior_holder_is_not_lost() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // A `now` just inside hour 1, within the seal margin of the hour-0
+        // boundary: the seal-bound watermark is hour 0, the tick's own hour is 1.
+        let now = NS_PER_HOUR + 60 * NS_PER_SEC;
+        // Metric above the threshold so holder A stays Firing and writes no new
+        // transition this tick.
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(now - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        let mut a = evaluator(Arc::clone(&store), TestClock::at(now));
+
+        // Pre-seed a Firing transition in hour 0, so A folds to Firing.
+        let firing_ts = NS_PER_HOUR - 200 * NS_PER_SEC;
+        assert_eq!(hour_bucket(firing_ts), 0, "the firing record is in hour 0");
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, firing_ts);
+        seed_alert_history_from(&a, &[firing], 10_000).await;
+
+        // A's tick: folds Firing, writes no transition, writes the memo.
+        assert_eq!(
+            a.run_tick().await.records_written,
+            0,
+            "already firing: no new transition written this tick"
+        );
+
+        // The prior holder B, still in flight after A's tail LIST, publishes a
+        // Resolved transition. Its skewed clock stamps it in hour 0 (below A's own
+        // hour 1) but later in ts than A's firing record, so it is the new latest.
+        let resolved_ts = NS_PER_HOUR - 100 * NS_PER_SEC;
+        assert_eq!(hour_bucket(resolved_ts), 0, "the late resolve is in hour 0");
+        assert!(resolved_ts > firing_ts, "the resolve supersedes the firing");
+        let resolved = build_transition_record(&rule, AlertState::Resolved, 0, resolved_ts);
+        seed_alert_history_from(&a, &[resolved], 20_000).await;
+
+        // The next tick reads the memo A wrote and folds its tail on top.
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("A wrote a memo");
+        let via_memo = a.fold_latest(Some(&memo), now).await.expect("memo fold");
+        let full = a.load_latest_records().await.expect("full fold");
+
+        assert_eq!(
+            via_memo, full,
+            "the seal-bound watermark keeps the prior holder's hour in the tail, so \
+             the memo fold matches the full fold exactly"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Resolved),
+            "the late Resolved from the overlapping prior holder is not lost"
+        );
+    }
+
+    /// A holder whose tick outlives its own lease stamps its transition at the
+    /// clock reading it holds when it publishes, not at its tick start, so the
+    /// transition lands at or above the watermark a successor wrote while that
+    /// tick was still in flight (issue #1294, review finding 1).
+    ///
+    /// A tick evaluates its rules sequentially under a per-rule query deadline
+    /// and has no tick-level cap, so it can run far longer than the seal margin
+    /// (`lease_ttl + query_deadline`); a slow tick is exactly what causes the
+    /// handover in the first place. The flip is stamping with the tick-start
+    /// reading, which carries no such bound: the transition lands in an hour
+    /// below the watermark, the tail never descends there, and every later memo
+    /// re-seeds from the last, so the record is lost from the memo path for good.
+    #[tokio::test]
+    async fn a_slow_prior_holder_publishing_after_handover_stays_inside_the_tail() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let tenant = TenantId::new(TENANT).hash();
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // Both holders read one clock, so this is about the tick outliving the
+        // seal margin, not about clock skew between nodes.
+        let clock = TestClock::at(NOW_NS);
+        let mut a = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        let mut b = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        assert_ne!(
+            a.writer_id, b.writer_id,
+            "A and B are distinct lease holders"
+        );
+
+        // A metric above the threshold at A's tick start, so A's in-flight tick
+        // decides a Firing onset.
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        // A starts its tick at NOW: it takes the lease and folds an empty
+        // history.
+        assert!(
+            a.acquire_lease(NOW_NS).await.expect("lease store ok"),
+            "A holds the lease at its tick start"
+        );
+        let mut a_latest = a
+            .load_latest_records()
+            .await
+            .expect("A folds at its tick start");
+        assert!(
+            a_latest.is_empty(),
+            "no prior transition: A's tick decides the onset"
+        );
+
+        // A's tick is slow: two hours pass before it reaches its write. That is
+        // past A's lease and far past the seal margin.
+        let slow_ns = 2 * NS_PER_HOUR;
+        let seal_margin_ns = i64::try_from(a.lease_ttl.saturating_add(a.query_deadline).as_nanos())
+            .expect("seal margin fits an i64");
+        assert!(
+            slow_ns > seal_margin_ns,
+            "the tick must outlast the seal margin ({slow_ns} ns vs {seal_margin_ns} ns) or the \
+             margin alone would cover the stamp"
+        );
+        let handover_ns = NOW_NS + slow_ns;
+        clock.set(handover_ns);
+
+        // B takes over the expired lease, folds (A has still written nothing),
+        // and writes a memo at its own seal-bound watermark W.
+        let report = b.run_tick().await;
+        assert!(!report.lease_not_held, "B took over A's expired lease");
+        assert_eq!(
+            report.records_written, 0,
+            "the only sample is two hours stale: B decides no transition"
+        );
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("B wrote a memo");
+        let watermark = memo.watermark_hour;
+        assert_eq!(
+            watermark,
+            b.seal_bound_hour(handover_ns),
+            "B's watermark is its own seal bound"
+        );
+        assert!(
+            watermark > hour_bucket(NOW_NS),
+            "the watermark (hour {watermark}) has advanced past A's tick-start hour (hour {}), \
+             which is what makes a tick-start stamp fall out of the tail",
+            hour_bucket(NOW_NS)
+        );
+        assert!(
+            memo.records.is_empty(),
+            "B memoized an empty state: A's transition does not exist yet"
+        );
+
+        // Only now does A's in-flight tick reach its write.
+        assert!(
+            a.evaluate_rule(&rule, &mut a_latest, NOW_NS)
+                .await
+                .expect("A publishes its transition"),
+            "A writes the onset transition its tick decided at NOW"
+        );
+
+        // B's next fold over the memo it just wrote still sees that transition:
+        // seed plus tail equals a full fold, record for record.
+        let before = metrics.snapshot();
+        let via_memo = b
+            .fold_latest(Some(&memo), handover_ns)
+            .await
+            .expect("memo fold");
+        let after = metrics.snapshot();
+        let full = b.load_latest_records().await.expect("full fold");
+        assert_eq!(
+            full.len(),
+            1,
+            "the durable history holds exactly A's one transition"
+        );
+        assert_eq!(
+            via_memo, full,
+            "the late transition is inside the tail, so the memo fold equals the full fold"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "A's late Firing is not lost from the memo path"
+        );
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2,
+            "the tail read A's transition: one commit GET and one data GET"
+        );
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            1,
+            "the memo path issues exactly one tail LIST"
+        );
+
+        // The mechanism: the stamp is the publish-time reading, so its ingest
+        // hour is at or above the watermark B wrote.
+        let history = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(history.len(), 1, "A published exactly one transition");
+        assert_eq!(
+            history[0].ts_ns, handover_ns,
+            "stamped at publish, not at NOW"
+        );
+        assert!(
+            hour_bucket(history[0].ts_ns) >= watermark,
+            "the transition's ingest hour ({}) must be at or above the watermark ({watermark})",
+            hour_bucket(history[0].ts_ns)
+        );
+    }
+
+    /// Store calls split by keyspace: the tenant's alert keyspace
+    /// (`t/<hash>/a/`, holding the memo, the lease, and the commit and data
+    /// objects the fold reads) against everything else, which for an evaluation
+    /// tick is the rule query's own reads. A single pooled counter cannot say
+    /// which layer a per-tick figure belongs to, and the tick's cost claim is
+    /// about the alerting layer only.
+    struct KeyspaceCountingStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        alert_prefix: String,
+        alert: OpCounts,
+        other: OpCounts,
+    }
+
+    #[derive(Default)]
+    struct OpCounts {
+        gets: AtomicU64,
+        puts: AtomicU64,
+        lists: AtomicU64,
+    }
+
+    /// A `Copy` reading of both counters, so a test can bracket one call.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct KeyspaceCounts {
+        alert_gets: u64,
+        alert_puts: u64,
+        alert_lists: u64,
+        other_gets: u64,
+        other_puts: u64,
+        other_lists: u64,
+    }
+
+    impl KeyspaceCountingStore {
+        fn new(inner: Arc<dyn ObjectStoreBackend>, tenant: &TenantHash) -> Self {
+            KeyspaceCountingStore {
+                inner,
+                alert_prefix: format!("t/{}/{}/", tenant.to_hex(), Signal::Alerts.key_prefix()),
+                alert: OpCounts::default(),
+                other: OpCounts::default(),
+            }
+        }
+
+        fn counts_for(&self, key: &str) -> &OpCounts {
+            if key.starts_with(&self.alert_prefix) {
+                &self.alert
+            } else {
+                &self.other
+            }
+        }
+
+        fn snapshot(&self) -> KeyspaceCounts {
+            KeyspaceCounts {
+                alert_gets: self.alert.gets.load(Ordering::SeqCst),
+                alert_puts: self.alert.puts.load(Ordering::SeqCst),
+                alert_lists: self.alert.lists.load(Ordering::SeqCst),
+                other_gets: self.other.gets.load(Ordering::SeqCst),
+                other_puts: self.other.puts.load(Ordering::SeqCst),
+                other_lists: self.other.lists.load(Ordering::SeqCst),
+            }
+        }
+    }
+
+    impl KeyspaceCounts {
+        /// This reading minus `before`, so a test states one tick's own cost.
+        fn since(self, before: KeyspaceCounts) -> KeyspaceCounts {
+            KeyspaceCounts {
+                alert_gets: self.alert_gets - before.alert_gets,
+                alert_puts: self.alert_puts - before.alert_puts,
+                alert_lists: self.alert_lists - before.alert_lists,
+                other_gets: self.other_gets - before.other_gets,
+                other_puts: self.other_puts - before.other_puts,
+                other_lists: self.other_lists - before.other_lists,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for KeyspaceCountingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.counts_for(key).puts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.counts_for(key).gets.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.counts_for(prefix).lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.counts_for(prefix).lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.counts_for(prefix).lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The whole cost of one steady-state `run_tick`, bracketed end to end
+    /// (issue #1294, review finding 2). The fold tests above pin the fold's own
+    /// reads; nothing pinned the lease and memo calls a tick makes around them,
+    /// and `acquire_lease` in steady state is three calls, not one.
+    ///
+    /// Two consecutive quiet ticks at one clock reading, differing only in
+    /// whether the memo write is debounced:
+    ///
+    /// - not debounced (the watermark hour advanced since the last memo): 4
+    ///   alert GETs (memo, lease, and a commit plus data GET for the one
+    ///   transition the tail still covers), 3 alert PUTs (the lease's
+    ///   `CreateIfAbsent` attempt, its CAS renewal, and the memo `Overwrite`),
+    ///   1 alert LIST.
+    /// - debounced, and the tail now covers no transition: 2 alert GETs, 2 alert
+    ///   PUTs (the lease only), 1 alert LIST.
+    ///
+    /// The LIST is one call only because the tail fits in a single page; a tail
+    /// spanning more pages costs one LIST per page.
+    ///
+    /// The figures outside the alert keyspace are the rule query's own reads of
+    /// the metrics it evaluates, pinned here so they cannot drift into the
+    /// alerting figures unnoticed. They are not identical across the two ticks
+    /// (the second reads one object fewer, from a warm query-engine cache), which
+    /// is exactly why the two keyspaces are counted apart.
+    #[tokio::test]
+    async fn one_steady_state_tick_costs_its_lease_memo_and_tail_calls_exactly() {
+        let tenant = TenantId::new(TENANT).hash();
+        let counting = Arc::new(KeyspaceCountingStore::new(
+            Arc::new(MemoryStore::new()),
+            &tenant,
+        ));
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+
+        // One sample per hour, each 30s before the tick that reads it, so the
+        // alert fires on the first tick and stays Firing across the hour
+        // boundary without any further transition.
+        let hour_one_ns = NOW_NS + NS_PER_HOUR;
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(hour_one_ns - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        let clock = TestClock::at(NOW_NS);
+        let mut ev = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        // Tick 1 is the cold path: no memo, a full fold, and the Firing onset.
+        assert_eq!(ev.run_tick().await.records_written, 1, "onset fires");
+        assert_eq!(
+            hour_bucket(NOW_NS),
+            0,
+            "the onset transition is written in hour 0"
+        );
+
+        // An hour on, so the seal-bound watermark has moved to hour 1 and the
+        // memo write is not debounced. The memo still says hour 0, so the tail
+        // covers the onset transition.
+        clock.set(hour_one_ns);
+        assert_eq!(
+            ev.seal_bound_hour(hour_one_ns),
+            1,
+            "the tick's seal-bound watermark is hour 1"
+        );
+
+        let before = counting.snapshot();
+        let report = ev.run_tick().await;
+        let refresh = counting.snapshot().since(before);
+        assert_eq!(
+            report.records_written, 0,
+            "already firing on a fresh sample: no transition this tick"
+        );
+        assert!(!report.lease_not_held, "the sole replica holds the lease");
+        assert_eq!(
+            refresh,
+            KeyspaceCounts {
+                alert_gets: 4,
+                alert_puts: 3,
+                alert_lists: 1,
+                other_gets: 3,
+                other_puts: 0,
+                other_lists: 2,
+            },
+            "a steady-state tick whose memo write is not debounced"
+        );
+
+        // Tick 3 at the same reading: the watermark and the records are both
+        // unchanged, so the memo write is debounced, and the tail now starts at
+        // hour 1, above the onset transition, so it reads no commit or data
+        // object at all.
+        let before = counting.snapshot();
+        let report = ev.run_tick().await;
+        let debounced = counting.snapshot().since(before);
+        assert_eq!(report.records_written, 0, "still no transition");
+        assert_eq!(
+            debounced,
+            KeyspaceCounts {
+                alert_gets: 2,
+                alert_puts: 2,
+                alert_lists: 1,
+                other_gets: 2,
+                other_puts: 0,
+                other_lists: 2,
+            },
+            "a debounced steady-state tick over an empty tail"
+        );
+    }
+
+    /// A memo watermark above this reader's seal bound is clamped to the seal
+    /// bound, so the tail cursor never starts past the hours the current commit
+    /// keys live in. `decode` accepts any `u32`, so such a memo is reachable from
+    /// a replica whose clock runs ahead or from a corrupted-but-decodable field.
+    /// Without the clamp the tail skips the current hour, the fold serves the
+    /// memo's pre-transition state, and the tick re-writes a firing transition
+    /// that is already durable.
+    #[tokio::test]
+    async fn a_watermark_above_the_seal_bound_is_clamped_to_it() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // One firing transition, committed in the current hour: the hour the
+        // tail must cover, and the hour an over-high watermark skips.
+        let seal = ev.seal_bound_hour(NOW_NS);
+        let firing_ts = NOW_NS - 10 * NS_PER_SEC;
+        assert_eq!(
+            hour_bucket(firing_ts),
+            seal,
+            "the firing transition sits in the seal-bound hour, so only a watermark \
+             above the seal bound can skip it"
+        );
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, firing_ts);
+        seed_alert_history(&ev, &[firing]).await;
+
+        let full = ev.load_latest_records().await.expect("full fold");
+        assert_eq!(
+            full.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the durable history folds to Firing"
+        );
+
+        // A memo one hour above the seal bound, holding no record for the alert:
+        // the state as of before the firing transition was written.
+        let memo = AlertStateMemo {
+            watermark_hour: seal + 1,
+            records: HashMap::new(),
+        };
+        write_alert_state_memo(store.as_ref(), &tenant, &memo)
+            .await
+            .expect("seed the over-high memo");
+
+        // The served state is the full fold, record for record, not the memo's
+        // empty snapshot.
+        let via_memo = ev
+            .fold_latest(Some(&memo), NOW_NS)
+            .await
+            .expect("memo fold");
+        assert_eq!(
+            via_memo, full,
+            "the clamped watermark keeps the current hour in the tail, so the memo \
+             fold equals the full fold exactly"
+        );
+
+        // And the next evaluation writes no duplicate transition: the tick reads
+        // the same over-high memo from the store, folds to Firing, and finds no
+        // transition to make. The history stays at the one record seeded above.
+        let report = ev.run_tick().await;
+        assert_eq!(
+            report.records_written, 0,
+            "already firing: the tick writes no duplicate firing transition"
+        );
+        let history = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(
+            history.len(),
+            1,
+            "the durable history still holds exactly the one seeded transition"
+        );
+        assert_eq!(
+            history[0].state,
+            AlertState::Firing,
+            "and it is the firing record the memo's watermark would have skipped"
+        );
+    }
+
+    /// A failed encode never overwrites the prior memo (finding 1, issue #1294).
+    /// The old `encode` returned an empty `Vec` on a serialize failure, so the
+    /// writer put a zero-byte object over a good memo; now the write path
+    /// propagates the encode error and issues no `put` at all.
+    #[tokio::test]
+    async fn a_failed_encode_writes_nothing_and_leaves_the_prior_memo() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+
+        // Seed a good, readable memo.
+        let prior = AlertStateMemo {
+            watermark_hour: 5,
+            records: HashMap::new(),
+        };
+        write_alert_state_memo(&store, &tenant, &prior)
+            .await
+            .expect("seed prior memo");
+        assert_eq!(
+            store.metrics().snapshot().put.calls,
+            1,
+            "the seeding write issued exactly one put"
+        );
+
+        // A write whose encode fails must short-circuit before the put.
+        let err = crate::alert_state_memo::write_with_failing_encode_for_test(&store, &tenant)
+            .await
+            .expect_err("a failing encode is propagated");
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::alert_state_memo::MemoError>(),
+                Some(crate::alert_state_memo::MemoError::Encode(_))
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.metrics().snapshot().put.calls,
+            1,
+            "the failed encode issued no additional put"
+        );
+
+        // The prior memo is untouched and still readable.
+        let surviving = read_alert_state_memo(&store, &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the failed encode left the prior memo in place");
+        assert_eq!(surviving.watermark_hour, 5, "the prior watermark is intact");
+    }
+
+    /// A store whose `list_after` never signals a last page: it always reports
+    /// another page. With `distinct` it hands back a fresh continuation token
+    /// each call (exercising the page ceiling); otherwise it repeats one token
+    /// (exercising the repeated-token guard). Every call is counted.
+    struct NeverEndingList {
+        inner: MemoryStore,
+        calls: AtomicUsize,
+        distinct: bool,
+    }
+
+    impl NeverEndingList {
+        fn new(distinct: bool) -> Self {
+            NeverEndingList {
+                inner: MemoryStore::new(),
+                calls: AtomicUsize::new(0),
+                distinct,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for NeverEndingList {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            _prefix: &str,
+            _start_after: Option<&str>,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let token = if self.distinct {
+                PageToken(format!("tok-{n}"))
+            } else {
+                PageToken("stuck".to_string())
+            };
+            Ok(ListPage {
+                objects: Vec::new(),
+                next: Some(token),
+            })
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A backend that repeats one continuation token is a typed error on the
+    /// second page, never an infinite loop (finding 2, issue #1294).
+    #[tokio::test]
+    async fn a_repeated_continuation_token_is_a_typed_error_after_two_pages() {
+        let store = NeverEndingList::new(false);
+        let err = drain_pages(&store, "p/", None, MAX_LIST_PAGES)
+            .await
+            .expect_err("a repeated token must not spin");
+        assert!(
+            matches!(
+                err.downcast_ref::<ListDrainError>(),
+                Some(ListDrainError::RepeatedToken { .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            2,
+            "the repeat is detected on exactly the second page"
+        );
+    }
+
+    /// A backend whose token keeps changing without ever ending trips the page
+    /// ceiling at exactly `max_pages` pages (finding 2, issue #1294).
+    #[tokio::test]
+    async fn an_ever_advancing_token_trips_the_page_ceiling_exactly() {
+        let store = NeverEndingList::new(true);
+        let err = drain_pages(&store, "p/", None, 3)
+            .await
+            .expect_err("an unbounded listing must stop at the ceiling");
+        assert!(
+            matches!(
+                err.downcast_ref::<ListDrainError>(),
+                Some(ListDrainError::PageCeiling { ceiling: 3, .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            3,
+            "exactly three pages are drained before the ceiling fires"
+        );
+    }
+
+    /// The shared helper dedupes by key and returns keys in order across pages,
+    /// through both the `None` (full) and `Some` (tail) cursor modes.
+    #[tokio::test]
+    async fn list_all_after_dedupes_and_orders_through_both_cursor_modes() {
+        // Page size 2 forces three pages over five keys.
+        let store = MemoryStore::with_page_size(2);
+        for key in ["p/a", "p/b", "p/c", "p/d", "p/e"] {
+            store
+                .put(
+                    key,
+                    Bytes::from_static(b"x"),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("seed key");
+        }
+
+        let all: Vec<String> = list_all_after(&store, "p/", None)
+            .await
+            .expect("full drain")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            all,
+            vec!["p/a", "p/b", "p/c", "p/d", "p/e"],
+            "the full drain returns every key once, in order"
+        );
+
+        let tail: Vec<String> = list_all_after(&store, "p/", Some("p/c"))
+            .await
+            .expect("tail drain")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            tail,
+            vec!["p/d", "p/e"],
+            "the tail drain skips keys at or before the cursor"
+        );
+    }
+
+    /// A backend that replays a fixed script of pages, so a test can place an
+    /// exact key sequence across page boundaries: a contract-permitted repeat,
+    /// or a contract-violating backward key. `MemoryStore` cannot repeat a key,
+    /// so the dedup and order paths need a driver that can. Every call is
+    /// counted; the last scripted page ends the listing (`next == None`).
+    struct ScriptedList {
+        pages: Vec<Vec<String>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedList {
+        fn new(pages: &[&[&str]]) -> Self {
+            ScriptedList {
+                pages: pages
+                    .iter()
+                    .map(|page| page.iter().map(|k| k.to_string()).collect())
+                    .collect(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn meta(key: &str) -> ObjectMeta {
+            ObjectMeta {
+                key: key.to_string(),
+                size: 1,
+                etag: ravel_object_store::Etag("e".to_string()),
+                version: ravel_object_store::Version("v".to_string()),
+                last_modified_unix_ms: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for ScriptedList {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: Bytes,
+            _opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn head(&self, _key: &str) -> Result<ObjectMeta, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn list(
+            &self,
+            _prefix: &str,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            unreachable!("ScriptedList is list-after-only")
+        }
+
+        async fn list_after(
+            &self,
+            _prefix: &str,
+            _start_after: Option<&str>,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let objects = self.pages[n].iter().map(|k| Self::meta(k)).collect();
+            let next = if n + 1 < self.pages.len() {
+                Some(PageToken(format!("tok-{n}")))
+            } else {
+                None
+            };
+            Ok(ListPage { objects, next })
+        }
+
+        async fn list_delimited(&self, _prefix: &str) -> Result<DelimitedList, StoreError> {
+            unreachable!("ScriptedList is list-after-only")
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::mandatory()
+        }
+    }
+
+    /// The object-store contract permits a key to appear more than once across
+    /// pages. When the last key of one page repeats as the first key of the
+    /// next, the fold keeps it exactly once (finding on PR #1451, issue #1294).
+    #[tokio::test]
+    async fn a_repeat_at_a_page_boundary_is_folded_once() {
+        let store = ScriptedList::new(&[&["p/a", "p/b"], &["p/b", "p/c"]]);
+        let keys: Vec<String> = drain_pages(&store, "p/", None, MAX_LIST_PAGES)
+            .await
+            .expect("a permitted repeat must not error")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["p/a", "p/b", "p/c"],
+            "the boundary repeat of p/b is folded once, not twice"
+        );
+        assert_eq!(store.call_count(), 2, "both scripted pages are drained");
+    }
+
+    /// A key strictly below the last delivered one breaks the contract's
+    /// lexicographic-order guarantee. Folding out of order is wrong, so the
+    /// drain returns a typed error rather than reordering (finding on PR #1451,
+    /// issue #1294).
+    #[tokio::test]
+    async fn a_backward_key_is_a_typed_order_violation() {
+        let store = ScriptedList::new(&[&["p/a", "p/c"], &["p/b"]]);
+        let err = drain_pages(&store, "p/", None, MAX_LIST_PAGES)
+            .await
+            .expect_err("a backward key must be rejected");
+        assert!(
+            matches!(
+                err.downcast_ref::<ListDrainError>(),
+                Some(ListDrainError::OrderViolation {
+                    previous,
+                    offending,
+                    ..
+                }) if previous == "p/c" && offending == "p/b"
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            2,
+            "the violation is detected on the second page, after both are fetched"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // `/metrics` (issue #532). Every counter of the family is pinned at an
+    // exact value driven by a real tick, not asserted to be merely nonzero.
+    // ---------------------------------------------------------------------
+
+    /// A webhook URL whose port was bound and immediately released, so every
+    /// POST to it is refused at once. Refused, not hung: there is no wall-clock
+    /// wait anywhere in this test, and the delivery failure is deterministic.
+    /// The same technique `analytics_endpoint.rs`'s `dead_endpoint` uses.
+    async fn dead_sink_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dead sink");
+        let addr = listener.local_addr().expect("dead sink addr");
+        drop(listener);
+        format!("http://{addr}/hook")
+    }
+
+    /// A webhook endpoint that answers every POST `200`, so `flush_sinks`
+    /// records a delivery. Aborted on drop.
+    struct OkSink {
+        url: String,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for OkSink {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn ok_sink() -> OkSink {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ok sink");
+        let addr = listener.local_addr().expect("ok sink addr");
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                // Drain the whole request (headers, then `content-length`
+                // bytes) before answering. Replying while the client is still
+                // writing its body would surface as a broken pipe and read as
+                // a delivery failure, which is the opposite of what this sink
+                // exists to produce.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let read = socket.read(&mut chunk).await;
+                    match read {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                    let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                    let body_len = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= head_end + 4 + body_len {
+                        break;
+                    }
+                }
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                let _ = socket.flush().await;
+            }
+        });
+        OkSink {
+            url: format!("http://{addr}/hook"),
+            task,
+        }
+    }
+
+    /// Every counter the family exports, folded from one real tick and asserted
+    /// against that tick's own report field by field. The sink is unreachable,
+    /// so this tick is the one that pins `notifications_failed`; the repeat and
+    /// delivery counters are pinned by the test below it.
+    #[tokio::test]
+    async fn one_tick_records_every_counter_exactly() {
+        let store = seeded_store().await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let sink = AlertSink::webhook(dead_sink_url().await);
+        let mut ev = evaluator_with(
+            store,
+            TestClock::at(NOW_NS),
+            vec![sink],
+            Arc::clone(&metrics),
+        );
+
+        let report = ev.run_tick().await;
+        assert_eq!(
+            report,
+            AlertEvalReport {
+                rules_evaluated: 1,
+                rules_failed: 0,
+                records_written: 1,
+                repeats_queued: 0,
+                notifications_delivered: 0,
+                notifications_failed: 1,
+                history_unavailable: false,
+                lease_not_held: false,
+                lease_unavailable: false,
+            },
+            "the tick fires the one rule, writes its transition, and fails to \
+             deliver it to the unreachable sink"
+        );
+
+        assert_eq!(metrics.rules_evaluated(), 1);
+        assert_eq!(metrics.rules_failed(), 0);
+        assert_eq!(metrics.records_written(), 1);
+        assert_eq!(metrics.repeats_queued(), 0);
+        assert_eq!(metrics.notifications_delivered(), 0);
+        assert_eq!(metrics.notifications_failed(), 1);
+        assert_eq!(metrics.ticks(AlertTickOutcome::Evaluated), 1);
+        assert_eq!(metrics.ticks(AlertTickOutcome::LeaseNotHeld), 0);
+        assert_eq!(metrics.ticks(AlertTickOutcome::LeaseUnavailable), 0);
+        assert_eq!(metrics.ticks(AlertTickOutcome::HistoryUnavailable), 0);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "the liveness gauge carries the injected clock's reading, not a wall clock"
+        );
+    }
+
+    /// The two counters the test above leaves at zero: a second tick one
+    /// repeat window later re-queues the still-firing alert and a reachable
+    /// sink accepts both sends.
+    #[tokio::test]
+    async fn a_repeat_tick_counts_the_repeat_and_both_deliveries() {
+        let store = seeded_store().await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let sink = ok_sink().await;
+        let clock = TestClock::at(NOW_NS);
+        let mut ev = evaluator_with(
+            store,
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::clone(&metrics),
+        );
+
+        let first = ev.run_tick().await;
+        assert_eq!(first.records_written, 1, "the onset fires");
+        assert_eq!(first.notifications_delivered, 1, "the sink accepted it");
+
+        // One default repeat window (60s) later: still firing, so no new
+        // record, but the repeat pass re-queues the folded latest record.
+        clock.set(NOW_NS + 60 * NS_PER_SEC);
+        let second = ev.run_tick().await;
+        assert_eq!(
+            second,
+            AlertEvalReport {
+                rules_evaluated: 1,
+                rules_failed: 0,
+                records_written: 0,
+                repeats_queued: 1,
+                notifications_delivered: 1,
+                notifications_failed: 0,
+                history_unavailable: false,
+                lease_not_held: false,
+                lease_unavailable: false,
+            },
+            "a repeat re-sends the folded record and writes nothing durable"
+        );
+
+        assert_eq!(metrics.rules_evaluated(), 2);
+        assert_eq!(metrics.rules_failed(), 0);
+        assert_eq!(metrics.records_written(), 1);
+        assert_eq!(metrics.repeats_queued(), 1);
+        assert_eq!(metrics.notifications_delivered(), 2);
+        assert_eq!(metrics.notifications_failed(), 0);
+        assert_eq!(metrics.ticks(AlertTickOutcome::Evaluated), 2);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS + 60 * NS_PER_SEC,
+            "the second tick re-stamps the gauge"
+        );
+    }
+
+    /// The liveness gauge is the only figure that separates a dead loop from a
+    /// healthy idle one, so it must advance on a tick that reached its end and
+    /// stay put on one that did not. The failing tick runs an hour later on a
+    /// store whose alert-history listing always fails, which is the
+    /// `history_unavailable` path; both evaluators fold into one handle,
+    /// exactly as every tenant's evaluator does in a real process.
+    #[tokio::test]
+    async fn the_liveness_gauge_advances_only_on_a_completed_tick() {
+        let metrics = Arc::new(AlertMetrics::default());
+
+        let healthy = seeded_store().await;
+        let mut ok = evaluator_with(
+            healthy,
+            TestClock::at(NOW_NS),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+        assert!(!ok.run_tick().await.history_unavailable);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "a completed tick stamps the gauge with the clock it ran at"
+        );
+
+        let tenant = TenantId::new(TENANT).hash();
+        let commit_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::List,
+                ScriptedFault::Transient("alert history listing unavailable".into()),
+            )
+            .with_key_contains(commit_prefix)
+            .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(seeded_store().await, plan));
+        let broken: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let later = NOW_NS + 3_600 * NS_PER_SEC;
+        let mut dead = evaluator_with(
+            broken,
+            TestClock::at(later),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+
+        let report = dead.run_tick().await;
+        assert!(
+            report.history_unavailable,
+            "the listing fault makes the history unreadable"
+        );
+        assert!(
+            fault.fault_count(Op::List, FaultKind::Transient) >= 1,
+            "the injected listing fault actually fired"
+        );
+        assert_eq!(
+            metrics.ticks(AlertTickOutcome::HistoryUnavailable),
+            1,
+            "the failed tick is still counted, under its own outcome"
+        );
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "a tick that could not read history must NOT advance the gauge, or a \
+             permanently broken loop would look alive"
+        );
+    }
+
+    /// A replica that loses the lease is healthy, not failing. It must count as
+    /// its own tick outcome and keep stamping the liveness gauge: folding it
+    /// into a failure counter, or withholding the gauge, turns the expected
+    /// multi-replica steady state into a permanent alarm.
+    #[tokio::test]
+    async fn a_lease_not_held_tick_records_the_state_without_a_failure() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let holder_metrics = Arc::new(AlertMetrics::default());
+        let standby_metrics = Arc::new(AlertMetrics::default());
+
+        let mut holder = evaluator_with(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            Vec::new(),
+            Arc::clone(&holder_metrics),
+        );
+        let mut standby = evaluator_with(store, clock, Vec::new(), Arc::clone(&standby_metrics));
+
+        assert_eq!(
+            holder.run_tick().await.records_written,
+            1,
+            "the holder fires"
+        );
+        let report = standby.run_tick().await;
+        assert!(report.lease_not_held, "the peer holds the lease");
+        assert!(!report.lease_unavailable, "the store is healthy");
+
+        assert_eq!(standby_metrics.ticks(AlertTickOutcome::LeaseNotHeld), 1);
+        assert_eq!(standby_metrics.ticks(AlertTickOutcome::Evaluated), 0);
+        assert_eq!(
+            standby_metrics.ticks(AlertTickOutcome::LeaseUnavailable),
+            0,
+            "a peer holding the lease is not a store failure"
+        );
+        assert_eq!(
+            standby_metrics.rules_failed(),
+            0,
+            "skipping evaluation is not a rule failure"
+        );
+        assert_eq!(standby_metrics.rules_evaluated(), 0);
+        assert_eq!(standby_metrics.records_written(), 0);
+        assert_eq!(
+            standby_metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "a standby replica is alive; its liveness gauge must keep advancing"
+        );
+    }
+
+    /// A store that fails the lease write is a failure, not the healthy standby
+    /// state the test above pins: it must count under its own outcome and leave
+    /// the liveness gauge where the last completed tick left it, because the
+    /// recommended operator alert keys on exactly this series. The fault is
+    /// `Transient`, which reaches `acquire_lease`'s catch-all `Err` arm and is
+    /// the error class a stuck backend produces; the lease-not-held path needs
+    /// a live peer lease to read back, which this store never holds. Both ticks
+    /// fold into one handle, as every tenant's evaluator does in a real process.
+    #[tokio::test]
+    async fn a_lease_unavailable_tick_records_the_store_failure() {
+        let metrics = Arc::new(AlertMetrics::default());
+        let tenant = TenantId::new(TENANT).hash();
+
+        let mut healthy = evaluator_with(
+            seeded_store().await,
+            TestClock::at(NOW_NS),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+        assert!(
+            !healthy.run_tick().await.lease_unavailable,
+            "the first tick holds the lease on a healthy store"
+        );
+
+        // Scoped to the lease key. On this tick the lease create is the only
+        // put that runs (the memo and rule writes sit behind the held lease),
+        // so the scoping documents intent rather than changing the outcome.
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::Put,
+                ScriptedFault::Transient("alert lease write unavailable".into()),
+            )
+            .with_key_contains(alert_lease_key(&tenant))
+            .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(seeded_store().await, plan));
+        let broken: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let mut dead = evaluator_with(
+            broken,
+            TestClock::at(NOW_NS + 3_600 * NS_PER_SEC),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+
+        let report = dead.run_tick().await;
+        // Whole-struct, not an `assert!` on the flag: `outcome` tests
+        // `lease_unavailable` before `lease_not_held`, so a build that set both
+        // would still count `LeaseUnavailable` and only this compare catches it.
+        assert_eq!(
+            report,
+            AlertEvalReport {
+                lease_unavailable: true,
+                ..Default::default()
+            },
+            "a failed lease write is a store failure and nothing else: no rule \
+             ran, and the tick is not the healthy lease-not-held state"
+        );
+
+        assert!(
+            fault.fault_count(Op::Put, FaultKind::Transient) >= 1,
+            "the injected lease-write fault actually fired"
+        );
+        assert_eq!(metrics.ticks(AlertTickOutcome::LeaseUnavailable), 1);
+        assert_eq!(metrics.ticks(AlertTickOutcome::Evaluated), 1);
+        assert_eq!(
+            metrics.ticks(AlertTickOutcome::LeaseNotHeld),
+            0,
+            "a store failure is not a peer holding the lease"
+        );
+        assert_eq!(metrics.ticks(AlertTickOutcome::HistoryUnavailable), 0);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "the gauge still carries the first tick's reading: a tick that could \
+             not reach the store must not look alive"
         );
     }
 }

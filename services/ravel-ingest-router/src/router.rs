@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 
 use crate::clock::Clock;
 use crate::endpoints::EndpointStore;
@@ -24,6 +24,10 @@ pub(crate) struct RouterState {
     pub subset_size: usize,
     pub round_robin: RoundRobin,
     pub clock: Arc<dyn Clock>,
+    /// The client-certificate identity header this deployment names
+    /// (`--mtls-header`). Both forwarding paths strip it, alongside the default
+    /// name, through [`strip_identity_headers`].
+    pub identity_header: HeaderName,
     pub http: reqwest::Client,
     /// The forwarding client for the gRPC listener ([`crate::grpc`]). Separate
     /// from `http` because it is built with `http2_prior_knowledge()`, which
@@ -60,6 +64,25 @@ impl RouterState {
         let offset = self.round_robin.tick(key.hash(), self.clock.now_ns());
         pick(&ranked, &snapshot.ready_addr, self.subset_size, offset)
     }
+}
+
+/// Remove the client-certificate identity header from a request about to be
+/// forwarded upstream.
+///
+/// This router never installs the mTLS resolver (ADR-0050 decision 1 shape:
+/// `--mtls-enabled` is refused at startup), so no header here was ever verified
+/// as a real client certificate. Both the configured name (`--mtls-header`,
+/// carried on [`RouterState::identity_header`]) and the default name are
+/// removed: the configured name is the one the upstream reads under a
+/// deployment that set the flag, and the default name is the one it reads under
+/// a deployment that did not, so stripping only one of them leaves the other
+/// reaching the upstream as if a trusted proxy had stamped it.
+///
+/// Both transports call this rather than each listing header names of their
+/// own, so the HTTP and gRPC paths cannot drift on what is stripped.
+pub(crate) fn strip_identity_headers(headers: &mut HeaderMap, configured: &HeaderName) {
+    headers.remove(ravel_tenant_resolve::MtlsResolver::DEFAULT_HEADER);
+    headers.remove(configured);
 }
 
 impl RouteError {

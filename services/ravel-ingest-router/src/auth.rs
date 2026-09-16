@@ -4,19 +4,22 @@
 //! decision 3).
 //!
 //! The chain mirrors `ravel_server::tenant::build_auth_resolver`: a static
-//! bearer map, optionally a dev-header resolver, optionally OIDC, and -- unlike
-//! `ravel-server`, which keeps mTLS on a dedicated listener -- optionally the
-//! mTLS resolver folded into the one chain, since this router terminates a
-//! single ingest path rather than separate public/mTLS listeners. The mTLS
-//! resolver still reads a proxy-forwarded header and is only as trustworthy as
-//! the proxy that sets it (see [`ravel_tenant_resolve::MtlsResolver`]).
+//! bearer map, optionally a dev-header resolver, optionally OIDC. Unlike
+//! `ravel-server`, this router has no dedicated mTLS listener, so
+//! [`ravel_tenant_resolve::MtlsResolver`] is never installed here at all
+//! (ADR-0050 decision 1 shape): `--mtls-enabled` is refused at startup
+//! (`crate::config::Cli::into_config`) rather than folded into this one public
+//! chain, where a client-supplied client-certificate identity header would let
+//! any client pick its own tenant. A dedicated `--mtls-listener` that
+//! terminates mTLS separately from the public HTTP/gRPC listeners is a
+//! follow-up that needs its own ADR.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ravel_tenant_resolve::{
-    DevHeaderTenantResolver, FallbackResolver, MtlsResolver, OidcJwksCache, OidcResolver,
+    DevHeaderTenantResolver, FallbackResolver, OidcJwksCache, OidcResolver,
     StaticBearerTokenResolver, TenantResolver,
 };
 use ravel_types::TenantId;
@@ -72,10 +75,6 @@ pub(crate) fn build(settings: &CanonicalAuthSettings) -> anyhow::Result<Canonica
         });
     }
 
-    if let Some(header) = &settings.mtls_header {
-        resolvers.push(Arc::new(MtlsResolver::new(header.clone())));
-    }
-
     let resolver: Arc<dyn TenantResolver> = Arc::new(FallbackResolver::new(resolvers));
     Ok(CanonicalResolver {
         resolver,
@@ -105,4 +104,41 @@ pub(crate) fn spawn_jwks_refresh(params: OidcRefresh) -> JoinHandle<()> {
             }
         }
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn built_chain_rejects_a_client_cert_header_only_request() {
+        // The mTLS resolver must never be part of this chain (ADR-0050
+        // decision 1 shape): a chain built from a static bearer token alone
+        // must not resolve a tenant from the client-certificate identity
+        // header. What this kills is an unconditional push of MtlsResolver
+        // onto `resolvers` in `build`: with one there, this resolves to
+        // Ok(TenantId("victim-tenant")) instead of an error. It cannot kill
+        // the original conditional folding, which read a `mtls_header` field
+        // CanonicalAuthSettings no longer has.
+        let settings = CanonicalAuthSettings {
+            tokens: vec![("tok".to_string(), "acme".to_string())],
+            dev_header: false,
+            oidc: None,
+        };
+        let built = build(&settings).expect("chain builds");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ravel-client-cert-cn",
+            "victim-tenant".parse().expect("valid header value"),
+        );
+
+        assert!(
+            built.resolver.resolve(&headers).is_err(),
+            "a client-cert header alone must not resolve a tenant: the mTLS \
+             resolver must never be installed in this chain"
+        );
+    }
 }

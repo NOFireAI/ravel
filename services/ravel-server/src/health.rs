@@ -12,7 +12,8 @@
 //!   definition, so this handler carries no state.
 //! - `/readyz` (readiness): 503 until startup has fully completed (config
 //!   parsed, the object-store capability gate passed, listeners bound), then
-//!   200 for as long as the store also stays reachable. It performs no
+//!   200 for as long as the store also stays reachable and no ingest shard has
+//!   been condemned. It performs no
 //!   object-store I/O per probe: a store call on every kubelet probe of every
 //!   pod would add real S3 cost, and a transient S3 blip would eject every pod
 //!   from its Service at once. Since ADR-0050 section 7 (EC7) readiness is the
@@ -20,7 +21,7 @@
 //!   ([`crate::store_probe`]): the continuous store probing that the original
 //!   comment deferred now runs on its own jittered cadence, with hysteresis, so
 //!   `/readyz` reflects a real store outage while still reading only an atomic
-//!   per probe.
+//!   per probe. [`Readiness::is_ready`] enumerates every condition.
 //!
 //! `/-/healthy` and `/-/ready` are Prometheus' own spellings of the same two
 //! probes, routed to the same handler functions so a
@@ -50,13 +51,91 @@ use axum::routing::get;
 /// `/healthz` (liveness) is deliberately independent of the probe: a store
 /// outage must never make liveness fail and get healthy processes killed and
 /// restarted (see the module docs).
+///
+/// A third input, the `draining` flag, is one-way in the opposite direction:
+/// it starts `false` and graceful shutdown flips it to `true` exactly once,
+/// before any listener closes, so a readiness probe observes 503 while the
+/// process is still routing and draining. It never flips back: a process that
+/// has begun draining is on its way out and must not re-advertise itself as a
+/// rollout target. It is intentionally distinct from the startup latch (which
+/// never reverts either, but in the other direction) so that beginning to drain
+/// cannot be confused with startup never having completed.
 #[derive(Clone, Default)]
-pub struct Readiness(Arc<AtomicBool>);
+pub struct Readiness {
+    /// One-way startup-completion latch: `false` until startup finishes, then
+    /// `true` forever.
+    startup: Arc<AtomicBool>,
+    /// One-way drain latch: `false` until graceful shutdown begins, then `true`
+    /// forever.
+    draining: Arc<AtomicBool>,
+    /// In-process ingest health sources (issue #1299): each reports not-ready
+    /// once one of an ingest router's shard actors has been condemned after
+    /// exhausting its respawn budget. `is_ready` ANDs `shards_ready` across all
+    /// of them, so a condemned shard turns `/readyz` to 503, which sheds
+    /// traffic: Kubernetes removes the pod from its Service endpoints. Nothing
+    /// restarts or reschedules it, so an operator has to roll the pod.
+    ///
+    /// Fixed at construction ([`Readiness::with_ingest_health`]) rather than
+    /// registered into a `Mutex<Vec<_>>`, for two reasons. The set never
+    /// changes after startup, so the lock guarded nothing; and the probe path
+    /// must stay lock-free, since taking a `Mutex` on every kubelet probe of
+    /// every pod is exactly the per-probe cost `/readyz` is designed not to
+    /// have.
+    ingest: Arc<[Arc<dyn IngestHealth>]>,
+}
+
+/// In-process ingest health consulted by the readiness probe (issue #1299): the
+/// source reports not-ready once one of an ingest router's shard actors has
+/// exhausted its respawn budget and been condemned. Pull-based --
+/// [`Readiness::is_ready`] reads it on each probe -- so no code path has to
+/// remember to set a flag, matching the store-probe design's one-truth,
+/// read-on-demand shape.
+///
+/// Implemented for [`ravel_ingest::IngestMetrics`] and NOT for
+/// [`ravel_ingest::IngestRouter`], deliberately. Readiness holds its sources in
+/// an `Arc` for the process lifetime, and the graceful-shutdown path drains the
+/// router by `Arc::try_unwrap`ing it to take ownership and join the shard
+/// actors. An `Arc<IngestRouter>` parked here is a second strong reference that
+/// makes that unwrap fail on every shutdown, so the actors are never joined.
+/// The metrics handle carries the same condemned count and is already shared by
+/// design, so reading health through it keeps the router's reference count
+/// under the drain path's sole control.
+pub trait IngestHealth: Send + Sync {
+    /// False once the observed router has a condemned shard.
+    fn shards_ready(&self) -> bool;
+}
+
+impl IngestHealth for ravel_ingest::IngestMetrics {
+    fn shards_ready(&self) -> bool {
+        self.condemned_shards() == 0
+    }
+}
 
 impl Readiness {
-    /// A new flag in the not-ready state.
+    /// A new flag in the not-ready, not-draining state, with no ingest health
+    /// sources.
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self {
+            startup: Arc::new(AtomicBool::new(false)),
+            draining: Arc::new(AtomicBool::new(false)),
+            ingest: Arc::new([]),
+        }
+    }
+
+    /// Attach the in-process ingest health sources (issue #1299). Consuming and
+    /// called once during startup, before `mark_ready`: the set is immutable
+    /// afterwards, which is what keeps the probe path lock-free.
+    pub fn with_ingest_health(self, sources: Vec<Arc<dyn IngestHealth>>) -> Self {
+        Self {
+            ingest: sources.into(),
+            ..self
+        }
+    }
+
+    /// Whether every ingest source reports its shards ready. True when none is
+    /// attached (the modes that run no ingest router).
+    fn ingest_shards_ready(&self) -> bool {
+        self.ingest.iter().all(|source| source.shards_ready())
     }
 
     /// Latch the startup flag to ready. Idempotent; calling it more than once is
@@ -64,22 +143,42 @@ impl Readiness {
     /// reachability is tracked separately by [`crate::store_probe`] and can flip
     /// both ways after this latches.
     pub fn mark_ready(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.startup.store(true, Ordering::SeqCst);
     }
 
-    /// Whether the startup latch alone has fired, ignoring store reachability.
-    /// Retained for tests and callers that need the latch state specifically;
-    /// `/readyz` uses [`Readiness::is_ready`], which also requires the store to
-    /// be reachable.
+    /// Latch the drain flag so `is_ready` returns false from here on. One-way:
+    /// once draining begins the process is leaving and must never re-advertise
+    /// as ready. `pub(crate)` so it is reachable only from graceful shutdown
+    /// within this crate, matching the doc: nothing outside the crate may flip a
+    /// process into draining.
+    pub(crate) fn begin_drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the startup latch alone has fired, ignoring store reachability
+    /// and draining. Retained for tests and callers that need the latch state
+    /// specifically; `/readyz` uses [`Readiness::is_ready`].
     pub fn startup_complete(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.startup.load(Ordering::SeqCst)
     }
 
-    /// Whether the process is ready to serve: startup has completed AND the
-    /// background store probe currently reports the store reachable (ADR-0050
-    /// section 7). Either condition false yields 503 at `/readyz`.
+    /// Whether graceful shutdown has begun draining this process.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Whether the process is ready to serve, the AND of four conditions:
+    /// startup has completed, the process is NOT draining, the background store
+    /// probe currently reports the store reachable (ADR-0050 section 7), AND
+    /// every attached ingest source still has all its shards (none condemned
+    /// after exhausting its respawn budget, issue #1299). Any one false yields
+    /// 503 at `/readyz`. Each is an atomic load; nothing on this path locks or
+    /// performs I/O.
     pub fn is_ready(&self) -> bool {
-        self.startup_complete() && crate::store_probe::store_reachable()
+        self.startup_complete()
+            && !self.is_draining()
+            && crate::store_probe::store_reachable()
+            && self.ingest_shards_ready()
     }
 }
 
@@ -104,7 +203,12 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Readiness: 200 once startup has completed, 503 before that.
+/// Readiness: 200 only when all four of [`Readiness::is_ready`]'s conditions
+/// hold (startup completed, the process is not draining, the background store
+/// probe reports the store reachable, and no ingest shard is condemned); 503
+/// whenever any one is false, so before startup completes, once graceful
+/// shutdown begins draining, during a store outage, or once a shard actor has
+/// exhausted its respawn budget.
 async fn readyz(State(readiness): State<Readiness>) -> StatusCode {
     if readiness.is_ready() {
         StatusCode::OK
@@ -133,5 +237,71 @@ mod tests {
         // A clone observes the same latched state (the flag is shared).
         let clone = readiness.clone();
         assert!(clone.is_ready(), "clone shares the latched state");
+    }
+
+    #[test]
+    fn draining_makes_is_ready_false_without_reverting_the_startup_latch() {
+        let readiness = Readiness::new();
+        readiness.mark_ready();
+        assert!(readiness.is_ready(), "ready once startup completes");
+        assert!(!readiness.is_draining(), "not draining before shutdown");
+
+        // Begin draining: readiness drops to not-ready so a probe sees 503,
+        // but the startup latch itself must NOT revert (a draining process has
+        // still completed startup; it is leaving, not un-started).
+        readiness.begin_drain();
+        assert!(readiness.is_draining(), "draining after begin_drain");
+        assert!(
+            readiness.startup_complete(),
+            "the one-way startup latch must not revert when draining begins"
+        );
+        assert!(
+            !readiness.is_ready(),
+            "a draining process is not ready even with startup complete and store reachable"
+        );
+
+        // One-way: draining stays latched, and the drain state is shared across
+        // clones (shutdown flips one handle; the /readyz handler holds another).
+        let clone = readiness.clone();
+        assert!(clone.is_draining(), "clone observes the shared drain latch");
+        assert!(!clone.is_ready(), "clone is not ready while draining");
+    }
+
+    #[test]
+    fn a_condemned_ingest_shard_makes_readiness_not_ready() {
+        struct Health(bool);
+        impl IngestHealth for Health {
+            fn shards_ready(&self) -> bool {
+                self.0
+            }
+        }
+
+        let readiness = Readiness::new();
+        readiness.mark_ready();
+        assert!(
+            readiness.is_ready(),
+            "ready with startup complete, store reachable, no ingest source condemned"
+        );
+
+        // A healthy ingest source leaves readiness ready.
+        let healthy = Readiness::new().with_ingest_health(vec![Arc::new(Health(true))]);
+        healthy.mark_ready();
+        assert!(healthy.is_ready(), "a healthy ingest source keeps it ready");
+
+        // A set containing a source with a condemned shard (shards_ready ==
+        // false) turns the AND false, so /readyz becomes 503 even though
+        // startup completed, the store is reachable, and the process is not
+        // draining.
+        let condemned = Readiness::new()
+            .with_ingest_health(vec![Arc::new(Health(true)), Arc::new(Health(false))]);
+        condemned.mark_ready();
+        assert!(
+            !condemned.is_ready(),
+            "a condemned shard in any attached ingest source turns readiness not-ready"
+        );
+        assert!(
+            condemned.startup_complete() && !condemned.is_draining(),
+            "the condemned-shard path, not draining or an unset startup latch, is what dropped readiness"
+        );
     }
 }

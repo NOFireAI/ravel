@@ -12,8 +12,8 @@ use ravel_types::{Label, LabelSet, SeriesId};
 use crate::crc::page_crc;
 use crate::error::SegmentError;
 use crate::format::{
-    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, SUPPORTED_VERSIONS, VERSION_V7, compression,
-    page_comp, page_enc, section_kind,
+    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, SegmentVersion, compression, page_comp,
+    page_enc, section_kind,
 };
 use crate::histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 use crate::varint::{read_uvarint, read_zigzag_varint};
@@ -31,11 +31,119 @@ pub struct FooterLocation {
     /// Absolute offset of the 16-byte trailer within the object.
     pub trailer_offset: u64,
     pub total_size: u64,
-    /// Trailer format version. ADR-0027 leaves 6 the only supported value;
-    /// `parse_footer` rejects any other, so this is always 6 on a
-    /// successfully parsed object. Retained in the trailer and here so a
-    /// future version bump reuses the same dispatch point.
+    /// Trailer format version. Always inside this build's reader window
+    /// ([`crate::SUPPORTED_VERSIONS`], ADR-0066 decision 1): `parse_footer`
+    /// rejects anything else with [`SegmentError::UnsupportedVersion`], so a
+    /// successfully parsed object carries an admitted version and nothing else.
+    /// Today the window holds only [`crate::VERSION_V7`], so this is always 7.
     pub version: u16,
+}
+
+/// The trailer's fixed fields, after the version gate. Parsed once, by
+/// [`parse_trailer`], for every caller that needs any of them: the full parse
+/// ([`parse_footer`]) and the version probe ([`classify_trailer`]) therefore
+/// apply the same gate to the same bytes rather than each carrying their own
+/// copy of it.
+#[derive(Debug, Clone, Copy)]
+struct Trailer {
+    footer_len: u32,
+    footer_crc32c: u32,
+    version: SegmentVersion,
+    signal: u8,
+    reserved: u8,
+}
+
+/// Parses and gates a 16-byte trailer (docs/segment-format.md): magic, then the
+/// version against this build's reader window, then signal and reserved.
+///
+/// The version check resolves the raw `u16` into a [`SegmentVersion`] token
+/// through the window's single resolution point, so a version outside the
+/// window fails closed here with [`SegmentError::UnsupportedVersion`] and never
+/// reaches a rule set. `footer_len` is returned unvalidated beyond its own
+/// non-zero check, which is the caller's business.
+fn parse_trailer(trailer: &[u8; TRAILER_LEN_USIZE]) -> Result<Trailer, SegmentError> {
+    let footer_len = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let footer_crc32c = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
+    let version = u16::from_le_bytes([trailer[8], trailer[9]]);
+    let signal = trailer[10];
+    let reserved = trailer[11];
+    let magic = &trailer[12..16];
+
+    if magic != MAGIC {
+        return Err(SegmentError::BadMagic);
+    }
+    // The reader accepts only versions inside its supported-version window
+    // (ADR-0066 decision 1). Today that window is the single current version
+    // `VERSION_V7`; versions 1-6 and any unknown future version fail closed
+    // with the same typed error, so a stray pre-v7 object (including a retired
+    // v6) is rejected, never half-parsed. An object rejected here is not
+    // corrupt: another build whose window covers this version can read it, and
+    // that is the distinction `classify_trailer` exists to report.
+    let version =
+        SegmentVersion::from_number(version).ok_or(SegmentError::UnsupportedVersion(version))?;
+    if signal != SIGNAL_METRICS {
+        return Err(SegmentError::UnsupportedSignal(signal));
+    }
+    if reserved != RESERVED {
+        return Err(SegmentError::ReservedNonZero(reserved));
+    }
+    if footer_len == 0 {
+        return Err(SegmentError::InvalidFooterLen);
+    }
+    Ok(Trailer {
+        footer_len,
+        footer_crc32c,
+        version,
+        signal,
+        reserved,
+    })
+}
+
+/// What an object's trailer says about this build's ability to read it
+/// (ADR-0066 decisions 1 and 2). Distinguishes the two kinds of "cannot read
+/// this" that a caller holding a delete decision must never collapse: a version
+/// another build in the fleet can read, and bytes no build can.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TrailerClass {
+    /// The trailer is well-formed and its version is inside this build's
+    /// window: the object is readable here.
+    Readable(SegmentVersion),
+    /// The trailer is well-formed but its version is outside this build's
+    /// window. The object is not corrupt: a peer running a different build, or
+    /// the build a rollback returns to, can read it. Carries the version the
+    /// trailer declared.
+    OutsideVersionWindow(u16),
+    /// The bytes are not a readable RSEG trailer for any version: bad magic, a
+    /// foreign signal, a non-zero reserved byte, a zero `footer_len`, or an
+    /// object too small to hold a trailer. Carries the typed error.
+    Corrupt(SegmentError),
+}
+
+/// Classifies an object from its trailer alone: `tail` is a suffix of the
+/// object ending at its last byte, and `total_size` is the object's full size.
+/// A 16-byte suffix GET is enough, which is what makes this usable as a probe
+/// by a caller that must decide whether an object it cannot read may be
+/// deleted (`ravel-maintain`'s retention sweep).
+///
+/// The gate is [`parse_trailer`], the same one [`parse_footer`] applies, so a
+/// probe can never disagree with a real read about which versions this build
+/// admits. Nothing past the trailer is checked: a `Readable` answer means the
+/// version is admitted, not that the footer or sections decode.
+pub fn classify_trailer(total_size: u64, tail: &[u8]) -> TrailerClass {
+    let trailer_len = crate::format::TRAILER_LEN;
+    if total_size < trailer_len {
+        return TrailerClass::Corrupt(SegmentError::TooSmall { size: total_size });
+    }
+    if (tail.len() as u64) < trailer_len {
+        return TrailerClass::Corrupt(SegmentError::Truncated);
+    }
+    let mut trailer = [0u8; TRAILER_LEN_USIZE];
+    trailer.copy_from_slice(&tail[tail.len() - TRAILER_LEN_USIZE..]);
+    match parse_trailer(&trailer) {
+        Ok(t) => TrailerClass::Readable(t.version),
+        Err(SegmentError::UnsupportedVersion(v)) => TrailerClass::OutsideVersionWindow(v),
+        Err(e) => TrailerClass::Corrupt(e),
+    }
 }
 
 /// Result of attempting to locate the footer from a (possibly partial)
@@ -68,34 +176,15 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
         });
     }
 
-    let trailer = &tail[tail.len() - TRAILER_LEN_USIZE..];
-    let footer_len = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-    let footer_crc32c = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
-    let version = u16::from_le_bytes([trailer[8], trailer[9]]);
-    let signal = trailer[10];
-    let reserved = trailer[11];
-    let magic = &trailer[12..16];
-
-    if magic != MAGIC {
-        return Err(SegmentError::BadMagic);
-    }
-    // The reader accepts only versions inside its supported-version window
-    // (ADR-0066 decision 1). Today that window is the single current version
-    // [`VERSION_V7`]; versions 1-6 and any unknown future version fail closed
-    // with the same typed error, so a stray pre-v7 object (including a retired
-    // v6) is rejected, never half-parsed.
-    if !SUPPORTED_VERSIONS.contains(version) {
-        return Err(SegmentError::UnsupportedVersion(version));
-    }
-    if signal != SIGNAL_METRICS {
-        return Err(SegmentError::UnsupportedSignal(signal));
-    }
-    if reserved != RESERVED {
-        return Err(SegmentError::ReservedNonZero(reserved));
-    }
-    if footer_len == 0 {
-        return Err(SegmentError::InvalidFooterLen);
-    }
+    let mut trailer_bytes = [0u8; TRAILER_LEN_USIZE];
+    trailer_bytes.copy_from_slice(&tail[tail.len() - TRAILER_LEN_USIZE..]);
+    let Trailer {
+        footer_len,
+        footer_crc32c,
+        version,
+        signal,
+        reserved,
+    } = parse_trailer(&trailer_bytes)?;
 
     let footer_len_u64 = u64::from(footer_len);
     let footer_start_abs = total_size
@@ -116,7 +205,8 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
     let footer_end_in_tail = tail.len() - TRAILER_LEN_USIZE;
     let footer_bytes = &tail[footer_start_in_tail..footer_end_in_tail];
 
-    let expected_crc = crate::crc::footer_crc(footer_bytes, footer_len, version, signal, reserved);
+    let expected_crc =
+        crate::crc::footer_crc(footer_bytes, footer_len, version.number(), signal, reserved);
     if expected_crc != footer_crc32c {
         return Err(SegmentError::FooterCrcMismatch);
     }
@@ -129,17 +219,24 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
         footer_offset: footer_start_abs,
         trailer_offset: total_size - trailer_len,
         total_size,
-        version,
+        version: version.number(),
     }))
 }
 
-/// Validates footer-level section invariants (docs/segment-format.md).
-/// ADR-0027 leaves v7 the only supported version, so this dispatches to the
-/// v7 rule set or rejects with `UnsupportedVersion`: at most one section per
-/// known kind, every mandatory kind present, exactly one of the whole
-/// SERIES_META or the sparse SERIES_IDX+SERIES_META_CHUNKS pair, every
+/// Validates footer-level section invariants (docs/segment-format.md): at most
+/// one section per known kind, every mandatory kind present, exactly one of the
+/// whole SERIES_META or the sparse SERIES_IDX+SERIES_META_CHUNKS pair, every
 /// section range within `[0, page_region_end)` with checked arithmetic, and
 /// section `uncompressed_len` within `limits`.
+///
+/// The version selects the rule set, through the same window resolution
+/// [`parse_footer`]'s trailer gate uses ([`SegmentVersion::from_number`]). It
+/// carries no version literal of its own, so it cannot admit a version the
+/// trailer gate rejects or reject one the trailer gate admits; a version
+/// outside the window fails here with the same typed
+/// [`SegmentError::UnsupportedVersion`] the gate returns. Dispatch is an
+/// exhaustive match over [`SegmentVersion`] with no wildcard arm, so a version
+/// added to the window without a rule set fails to compile.
 ///
 /// The count-equality check (SERIES_IDS `count`, SERIES_META `count`, and
 /// `Footer.series_count` must all be equal) is deliberately NOT performed
@@ -156,9 +253,11 @@ pub fn validate_sections(
     page_region_end: u64,
     limits: ReaderLimits,
 ) -> Result<(), SegmentError> {
+    let Some(version) = SegmentVersion::from_number(version) else {
+        return Err(SegmentError::UnsupportedVersion(version));
+    };
     match version {
-        VERSION_V7 => validate_sections_v7(footer, page_region_end, limits),
-        other => Err(SegmentError::UnsupportedVersion(other)),
+        SegmentVersion::V7 => validate_sections_v7(footer, page_region_end, limits),
     }
 }
 

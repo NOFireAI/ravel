@@ -31,6 +31,12 @@ const CACHE_MAX_ENTRIES: usize = 1_000_000;
 /// `SegmentFetcher`/`LogSegmentFetcher`/`QueryEngine`'s `with_cache` only when
 /// `Some`.
 ///
+/// `cache_max_bytes` is the RESOLVED `--cache-max-bytes`
+/// (`ResolvedPerformanceDefaults::cache_max_bytes`, issue #1141), passed in
+/// rather than read off `cli`: an unset flag is a share of the host's memory,
+/// and reading the raw `Option` here would silently cache 256 MiB on a host
+/// whose startup log announced 24 GiB.
+///
 /// With no `--cache-dir`, this returns [`ravel_query::ReadCache::Ram`], byte-for-byte
 /// the pre-#97 RAM-only cache (same `--cache-max-bytes` budget and the same
 /// [`CACHE_MAX_ENTRY_BYTES`]/[`CACHE_MAX_ENTRIES`] constants).
@@ -46,15 +52,11 @@ const CACHE_MAX_ENTRIES: usize = 1_000_000;
 /// [`DiskCache::new`] spawns the ADR-0064 background age-sweep and so must run
 /// inside a Tokio runtime; `build_store`'s caller (`main`) is `#[tokio::main]`,
 /// so this holds on every `--cache-dir` startup.
-pub fn build_cache(cli: &Cli) -> Option<ravel_query::ReadCache> {
+pub fn build_cache(cli: &Cli, cache_max_bytes: u64) -> Option<ravel_query::ReadCache> {
     if cli.disable_cache {
         return None;
     }
-    let ram_limits = CacheLimits::new(
-        cli.cache_max_bytes,
-        CACHE_MAX_ENTRIES,
-        CACHE_MAX_ENTRY_BYTES,
-    );
+    let ram_limits = CacheLimits::new(cache_max_bytes, CACHE_MAX_ENTRIES, CACHE_MAX_ENTRY_BYTES);
     match &cli.cache_dir {
         None => Some(ravel_query::ReadCache::Ram(Arc::new(Cache::new(
             ram_limits,
@@ -337,7 +339,10 @@ fn instance_role_credential_conflict(cli: &Cli) -> Option<anyhow::Error> {
     ))
 }
 
-pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
+/// `cache_max_bytes` is the RESOLVED `--cache-max-bytes` (issue #1141), handed
+/// straight to [`build_cache`]; see that function for why it is a parameter
+/// rather than a field read.
+pub fn build_store(cli: &Cli, cache_max_bytes: u64) -> anyhow::Result<BuiltStore> {
     let (store, metrics, kms): (
         Arc<dyn ObjectStoreBackend>,
         Arc<StoreMetrics>,
@@ -460,7 +465,7 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
     let foreground = classed.foreground();
     let background = classed.background();
 
-    let cache = build_cache(cli);
+    let cache = build_cache(cli, cache_max_bytes);
     Ok(BuiltStore {
         foreground,
         background,
@@ -705,7 +710,8 @@ mod tests {
         use clap::Parser;
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert!(matches!(cli.store, StoreKind::Memory));
-        build_store(&cli).expect("memory backend must build and satisfy the capability gate");
+        build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .expect("memory backend must build and satisfy the capability gate");
     }
 
     /// The built store is instrumented, and the instrumentation is invisible
@@ -724,7 +730,8 @@ mod tests {
             metrics,
             kms,
             ..
-        } = build_store(&cli).expect("memory backend must build");
+        } = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .expect("memory backend must build");
         assert!(
             kms.is_none(),
             "no --tenant-kms-config means no KmsRoutingStore handle"
@@ -774,7 +781,7 @@ mod tests {
             "test",
         ])
         .expect("flags parse");
-        let kms = build_store(&cli)
+        let kms = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
             .expect("dummy S3 config must build without network access")
             .kms;
         assert!(
@@ -822,7 +829,8 @@ mod tests {
             foreground: store,
             kms,
             ..
-        } = build_store(&cli).expect("dummy S3 config must build without network access");
+        } = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .expect("dummy S3 config must build without network access");
         let kms = kms.expect("--tenant-kms-config must yield a KmsRoutingStore handle");
 
         assert_eq!(
@@ -876,7 +884,8 @@ mod tests {
             metrics,
             kms,
             ..
-        } = build_store(&cli).expect("dummy S3 config must build without network access");
+        } = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .expect("dummy S3 config must build without network access");
         let kms = kms.expect("--tenant-kms-config must yield a KmsRoutingStore handle");
 
         // `build_store` leaves the tenant-key map empty (main.rs installs it
@@ -1006,7 +1015,7 @@ mod tests {
     /// `build_store`'s error text, panicking with `context` if it succeeded.
     /// `BuiltStore` is not `Debug`, so `expect_err` is unavailable.
     fn build_store_error(cli: &Cli, context: &str) -> String {
-        match build_store(cli) {
+        match build_store(cli, crate::config::DEFAULT_CACHE_MAX_BYTES) {
             Ok(_) => panic!("{context}"),
             Err(err) => err.to_string(),
         }
@@ -1222,10 +1231,12 @@ mod tests {
             "precondition: instance-role starts with no inline keys set"
         );
 
-        let built = tokio::task::spawn_blocking(move || build_store(&cli))
-            .await
-            .expect("join")
-            .expect("instance-role build_store must construct against the mock IMDS");
+        let built = tokio::task::spawn_blocking(move || {
+            build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+        })
+        .await
+        .expect("join")
+        .expect("instance-role build_store must construct against the mock IMDS");
 
         built
             .foreground
@@ -1373,7 +1384,8 @@ mod tests {
         with_token.extend(["--s3-session-token", "sts-token"]);
         let cli = Cli::try_parse_from(with_token).expect("flags parse");
         assert_eq!(cli.s3_session_token.as_deref(), Some("sts-token"));
-        build_store(&cli).expect("a session token must not break construction");
+        build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .expect("a session token must not break construction");
 
         let mut missing_file = base.to_vec();
         missing_file.extend(["--s3-credentials-file", "/nonexistent/ravel-creds.json"]);
@@ -1394,7 +1406,8 @@ mod tests {
         let file_path = file.path().to_str().expect("temp path is valid utf-8");
         with_file.extend(["--s3-credentials-file", file_path]);
         let cli = Cli::try_parse_from(with_file).expect("flags parse");
-        build_store(&cli).expect("a readable --s3-credentials-file must build");
+        build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .expect("a readable --s3-credentials-file must build");
     }
 
     /// The reachability acceptance test (ADR-0070) for the
@@ -1427,7 +1440,8 @@ mod tests {
             !cli.store_scheduling,
             "the store scheduler must default off (ADR-0070 decision 2)"
         );
-        let built = build_store(&cli).expect("memory backend must build");
+        let built = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .expect("memory backend must build");
         assert!(
             Arc::ptr_eq(&built.foreground, &built.background),
             "passthrough: the foreground and background handles must be the same store"
@@ -1441,7 +1455,8 @@ mod tests {
         let cli = Cli::try_parse_from(["ravel-server", "--store-scheduling"])
             .expect("scheduling flag parses");
         assert!(cli.store_scheduling);
-        let built = build_store(&cli).expect("scheduled memory backend must build");
+        let built = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES)
+            .expect("scheduled memory backend must build");
         assert!(
             !Arc::ptr_eq(&built.foreground, &built.background),
             "scheduled: the foreground and background handles must be distinct"

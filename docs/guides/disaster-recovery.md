@@ -35,14 +35,41 @@ paired with versioning:
 - the deployment records under `sys/`,
 - the per-(tenant, signal) provisioning records,
 - the commit records,
-- the catalog HEAD history.
+- the catalog keyspace `t/*/catalog/*/*` (the HEAD pointer and its versions,
+  and the snapshot and index objects the same pattern reaches).
 
 Versioning is what makes the last of those work: a HEAD compare-and-swap
 creates a new locked version rather than overwriting one. None of those four
-prefix families holds an erasable subject value, deliberately, so locking them
-never collides with an erasure request. The scoped posture is therefore not a
-disaster-recovery choice and carries no erasure cost; it is the baseline the
-commit and catalog layers already assume.
+prefix families spells a subject identifier into an object *key*, so naming
+them in the lock never exposes a subject through the key pattern itself. What
+those objects contain is a separate question, and it is where the erasure cost
+lives. The deployment records, the provisioning records, and the catalog
+keyspace are never targets of the three mechanisms that physically remove
+tenant data (supersession GC, retention deletion, and subject erasure), so
+locking those three costs nothing against those three mechanisms. The commit
+records are not exempt even that far: they are physically deleted, once
+superseded, by the same sweeps, so a still-locked commit record delays that
+delete until its retention period elapses, and the sweep pass touching it
+pauses for the difference. Keep that retention period short enough for the
+sweeps to keep making progress; see the object store contract's "Required
+bucket configuration" for the bound.
+
+The catalog keyspace carries a cost of its own, from a fourth mechanism. A
+compliance lock on `t/*/catalog/*/*` costs an erasure obligation, not only a
+reclamation delay. The unreferenced-catalog sweep deletes the snapshot and
+index objects the current HEAD no longer names, and for a tenant that declares
+a typed string or bytes attribute column a per-part column-statistics object
+among them holds that subject's own column value; a lock over the keyspace
+delays that delete, and the value persists until the fold reconciles that hour
+and then a further retention period. Under the maintenance IAM policy Ravel
+ships the delete is denied outright, so the bound stays open-ended until that
+policy changes. The four-step mechanism, the exact bound, the IAM ceiling and
+the HEAD-scoping advice are in the object store contract's "Required bucket
+configuration" section, "A lock on the catalog family". The scoped posture is
+therefore still not a disaster-recovery choice; it is the baseline the commit
+and catalog layers already assume, with the commit-record family carrying the
+sweep-delay cost above and the catalog family the sweep delay and, for those
+tenants, the erasure bound.
 
 Scoping the lock takes an operator-run mechanism, and it is a requirement of
 levels 0 and 1, not an optional extra. Level 2 replaces it with a bucket
@@ -59,7 +86,32 @@ these:
 - [ ] One of the two mechanisms below, applying per-object retention in
       compliance mode, for the chosen retention period, to new objects under
       `sys/`, the provisioning records, the commit records, and the catalog
-      HEAD history.
+      keyspace.
+
+The retention period is unconstrained for the deployment records and the
+provisioning records: no sweep deletes either of them, so no choice of period
+delays anything. For the commit records the period is not free to pick
+arbitrarily long: it delays the maintenance sweeps that physically remove a
+superseded commit record, so choose a period the object store contract's
+"Required bucket configuration" bounds against the sweeps' own default window,
+or accept those sweeps pausing on a commit record until the period elapses.
+For the catalog keyspace the same window applies for a different reason: the
+unreferenced-catalog sweep deletes the snapshot and index objects the current
+HEAD no longer names, and a retention covering them pauses that sweep for the
+tenant and signal it fires on. A lock on a superseded *input* commit
+record extends the erasure bound rather than only deferring reclamation: the
+sweep deletes a chain's input commit records before the data they supersede,
+so a refusal there aborts the pass before the data-delete step and that data
+stays behind the locked record. A lock on a chain's own compaction or rewrite
+record does not hold data that way: by the time the sweep reaches those
+records it has already deleted the chain's inputs and their data, so the
+refusal only leaves the chain's own record in place until its retention
+elapses, and the crash-ordering guarantee that a rewrite record outlives its
+inputs is preserved. The catalog delay extends the bound too, for a tenant
+with a typed string or bytes attribute column and only for such a tenant; that
+cost, its exact bound and the shipped-IAM ceiling are in the object store
+contract's "Required bucket configuration" section, "A lock on the catalog
+family".
 
 | Mechanism | What it does | Coverage window |
 |---|---|---|
@@ -417,7 +469,7 @@ record: a real end-to-end run against MinIO is what fills a row.
 
 | Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
-| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and catalog HEAD history (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None; those prefixes hold no erasable subject value | Not a recovery control |
+| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound, R)` where `R` is the chosen retention period, until it elapses. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and for any tenant with a typed string or bytes attribute column a stale per-part column-statistics object stores an erased value verbatim. That bound is not `max(bound, R)`: the object stays referenced until the fold reconciles that hour or HEAD is rebuilt, so it is "until the fold reconciles, then plus `R`", and under the maintenance IAM policy Ravel ships, which denies the maintenance role every delete under the catalog keyspace, it is open-ended until that policy changes. Scope the mechanism to `catalog/<signal>/HEAD` alone to drop the retention half of it | Not a recovery control |
 | **level 0** (default) | Versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup; no replica | Primary `+E_v` | None; bucket loss is total loss |
 | **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended; the replica versioned with `NoncurrentDays = E_v_r` and expired-delete-marker cleanup | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound, D)`; query-time exclusion still immediate | As level 1 |

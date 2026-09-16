@@ -14,14 +14,46 @@
 //! hot-path checks never wait on this task.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use ravel_ingest::{AdmissionController, Clock, SystemClock, reconcile_once};
+use ravel_ingest::{AdmissionController, Clock, ReconcileCycleStats, SystemClock, reconcile_once};
 use ravel_object_store::ObjectStoreBackend;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::fold::jittered;
+
+/// The one reconciliation figure the exporter cannot read off the controller.
+///
+/// [`AdmissionController::last_reconcile_cycle_stats`] publishes the most
+/// recent cycle only, so its three last-observed figures (duration, siblings,
+/// stale keys skipped) render straight out of it as gauges. Reaped keys is the
+/// exception: [`ReconcileCycleStats::keys_reaped`] is also per cycle, and
+/// publishing a per-cycle count under a `_total` name gives a counter that
+/// drops to zero on the first cycle that reaps nothing. So the running total
+/// is kept here, on the process, and the loop adds each cycle's count to it as
+/// the cycle completes.
+#[derive(Debug, Default)]
+pub struct ReconcileCycleMetrics {
+    keys_reaped_total: AtomicU64,
+}
+
+impl ReconcileCycleMetrics {
+    /// Snapshot keys reaped by every completed cycle since process start,
+    /// rendered as `ravel_admission_reconciliation_keys_reaped_total`.
+    pub fn keys_reaped_total(&self) -> u64 {
+        self.keys_reaped_total.load(Ordering::Relaxed)
+    }
+
+    /// Fold one completed cycle's figures in. Called by the loop below once
+    /// [`reconcile_once`] returns, the same point the controller's own
+    /// last-cycle copy is replaced.
+    pub fn record_cycle(&self, stats: &ReconcileCycleStats) {
+        self.keys_reaped_total
+            .fetch_add(stats.keys_reaped, Ordering::Relaxed);
+    }
+}
 
 /// Handle to the spawned reconciliation task, so shutdown can stop it cleanly
 /// (mirrors [`crate::fold::FoldTasks`]).
@@ -58,6 +90,7 @@ pub fn spawn(
     controller: Arc<AdmissionController>,
     store: Arc<dyn ObjectStoreBackend>,
     interval: Duration,
+    cycle_metrics: Arc<ReconcileCycleMetrics>,
 ) -> AdmissionReconcileTask {
     let (tx, mut rx) = oneshot::channel();
     // Production OS-entropy jitter (ADR-0068 decision 2), the same default the
@@ -70,7 +103,18 @@ pub fn spawn(
                 _ = &mut rx => return,
             }
             let now_ns = SystemClock.now_ns();
-            reconcile_once(controller.as_ref(), store.as_ref(), interval, now_ns).await;
+            let stats = reconcile_once(controller.as_ref(), store.as_ref(), interval, now_ns).await;
+            cycle_metrics.record_cycle(&stats);
+            // A cycle that approaches the `2 * R` staleness window makes every
+            // sibling read as stale, so each process starts enforcing the whole
+            // fleet cap alone (issue #1679). The figures move before that does.
+            tracing::debug!(
+                cycle_duration_ns = stats.cycle_duration_ns,
+                siblings_observed = stats.siblings_observed,
+                stale_keys_skipped = stats.stale_keys_skipped,
+                keys_reaped = stats.keys_reaped,
+                "admission reconciliation cycle"
+            );
         }
     });
     AdmissionReconcileTask {

@@ -724,6 +724,86 @@ mod tests {
         assert!(admitted.rejected.is_empty());
     }
 
+    /// Reachability for ADR-0066 R1: the lifecycle refresh reads a version-2
+    /// tenant config record and applies it. A version-2 record is what an R2
+    /// writer will leave once the writer flip ships; this R1 reader must already
+    /// accept it (readers-before-writers), so the refresh loop keeps applying
+    /// durable caps across a rolling upgrade instead of failing closed on a peer's
+    /// newer record. Seeded directly (bypassing set_tenant_config's version-1
+    /// stamp) and observed through real admission: the record's cap of 5 admits
+    /// five series where the startup base cap of 2 would admit two.
+    #[tokio::test]
+    async fn refresh_reads_a_version_two_tenant_config() {
+        use prost::Message;
+        use ravel_catalog::config_key;
+        use ravel_ingest::{CountLimit, RateLimit};
+        use ravel_object_store::{PutOptions, memory::MemoryStore};
+        use ravel_types::SeriesId;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("acme");
+        let hash = tenant.hash();
+
+        // A version-2 config record on disk, raising the active-series cap to 5.
+        let record = ravel_proto::sys::v1::TenantConfigRecord {
+            format_version: 2,
+            tenant_hash: hash.0.to_vec(),
+            lifecycle_state: ravel_proto::sys::v1::TenantLifecycleState::Active as i32,
+            max_active_series: Some(5),
+            max_active_streams: None,
+            max_ingest_byte_rate: None,
+            max_series_creation_rate: None,
+            retention_ns: None,
+            indexed_fields: None,
+            created_unix_ns: 1_000,
+            updated_unix_ns: 1_000,
+            typed_attr_columns: None,
+        };
+        store
+            .put(
+                &config_key(&hash),
+                record.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seed a version-2 tenant config");
+
+        let base = AdmissionLimits {
+            max_active_series: CountLimit::Bounded(2),
+            max_active_streams: CountLimit::Unlimited,
+            ingest_byte_rate: RateLimit::Unlimited,
+            series_creation_rate: RateLimit::Unlimited,
+        };
+        let admission = AdmissionController::new(Arc::new(SystemClock), base);
+        admission.set_tenant_limits(tenant.clone(), base);
+
+        // The refresh decodes the version-2 record and applies its cap.
+        let applied = refresh_tenant_limits_once(&admission, store.as_ref(), &tenant, base)
+            .await
+            .expect("refresh reads the version-2 config");
+        assert!(
+            applied.is_some(),
+            "the refresh decoded the version-2 record rather than failing closed"
+        );
+        assert_eq!(
+            applied.expect("config present").max_active_series,
+            Some(5),
+            "the version-2 record's cap reached the refresh"
+        );
+
+        let admitted = admission.admit_series(
+            &tenant,
+            (1u8..=5).map(|b| SeriesId([b; 16])),
+            SystemClock.now_ns(),
+        );
+        assert_eq!(
+            admitted.admitted.len(),
+            5,
+            "the version-2 config's cap of 5 is in force (base cap 2 would admit two)"
+        );
+        assert!(admitted.rejected.is_empty());
+    }
+
     /// The `TenantResolver` surface: a hard-stale or unknown-token request is an
     /// `AuthError` (so the fallback chain moves on), and a header with no bearer
     /// token is an `AuthError` too (this resolver claims only bearer requests).

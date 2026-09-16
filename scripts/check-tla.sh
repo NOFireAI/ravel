@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# check-tla usage: begin
 # TLA+ verification harness (ADR-1113 task T1).
 #
 # Runs TLC over every formal/tla area, or one named area. An "area" is any
@@ -8,19 +9,34 @@
 #
 # Subcommands:
 #   smoke        [-a AREA]   fast reachability + safety (budget 300s per cfg)
-#   exhaustive   [-a AREA]   full safety + liveness (budget 3600s per cfg)
+#   live         [-a AREA]   liveness under fairness; runs an area's live.cfg
+#                            only when bands.tsv carries a row for it (a
+#                            measured band is the opt-in), same 300s budget
+#                            as smoke; an unbanded live.cfg is reported SKIP
+#                            and does not fail the lane
+#   exhaustive   [-a AREA]   full safety + liveness (budget 3600s per cfg,
+#                            overridable per cfg via bands.tsv's budget_s)
 #   negative     [-a AREA]   run negative/*.cfg, assert the expected violation
 #   traceability [-a AREA]   check every traceability.md source ref resolves
-#   ci           [-a AREA]   smoke + negative + traceability under one run id
+#   ci           [-a AREA]   smoke + live + negative + traceability under one run id
 #   all          [-a AREA]   ci, then exhaustive, under one run id
+# check-tla usage: end
 #
-# Exit codes: 0 pass; 1 a check failed; 2 toolchain missing (no usable Java).
+# Exit codes: 0 pass; 1 a check failed; 2 toolchain missing (no usable Java
+# or no GNU timeout(1)).
 #
 # The TLC jar is resolved once and checksum-pinned. Set RAVEL_TLA_TOOLS_JAR to
 # an operator-supplied jar (verified against the pin, never downloaded); else it
 # is fetched once into .cache/tla (gitignored). A checksum mismatch refuses to
 # run. Java is taken from RAVEL_TLA_JAVA if set, else the `java` on PATH;
 # version 17 or newer is required.
+#
+# TLC's worker count and JVM heap cap come from RAVEL_TLA_WORKERS (default 2)
+# and RAVEL_TLA_XMX (default 2g). Both are validated (workers: `auto` or a
+# positive integer; xmx: digits then k, m, or g, a nonzero size) and refused
+# with a one-line message otherwise; the resolved values are printed once per
+# run. An empty or unset value takes the default. CI overrides workers to
+# `auto` on its dedicated runners, where claiming every core is fine.
 set -u
 
 TLA_VERSION="1.7.4"
@@ -29,6 +45,9 @@ TLA_JAR_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION
 
 SMOKE_BUDGET=300
 EXHAUSTIVE_BUDGET=3600
+TIMEOUT_KILL_AFTER=30
+
+TIMEOUT_BIN=""
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 FORMAL_DIR="$REPO_ROOT/formal/tla"
@@ -61,6 +80,63 @@ resolve_java() {
     fi
     JAVA="$java"
     note "java: $java (version $ver)"
+}
+
+# resolve_tla_resources: read the TLC worker count and JVM heap cap from
+# RAVEL_TLA_WORKERS / RAVEL_TLA_XMX (defaults 2 / 2g). `-workers auto` claims
+# every core on the host, and an uncapped heap on a loaded or shared machine
+# is the failure this guards: both default small unless overridden, and both
+# are validated so a typo fails closed instead of reaching TLC as a silently
+# wrong flag. `auto` is the one non-numeric worker value accepted (TLC's own
+# "use every core" setting), which CI opts into on its dedicated runners; an
+# empty or unset value takes the default.
+resolve_tla_resources() {
+    TLA_WORKERS="${RAVEL_TLA_WORKERS:-2}"
+    if [ "$TLA_WORKERS" != auto ]; then
+        # Bound the digit count before the numeric test: an over-long run of
+        # digits passes a bare ^[0-9]+$ but overflows `[ -eq ]`, which aborts
+        # with "integer expression expected" and would otherwise leak past
+        # the guard as a silently accepted value.
+        if ! printf '%s' "$TLA_WORKERS" | grep -qE '^[0-9]{1,9}$' || [ "$TLA_WORKERS" -eq 0 ]; then
+            note "RAVEL_TLA_WORKERS must be 'auto' or a positive integer (1-999999999), got '$TLA_WORKERS'"
+            exit 2
+        fi
+    fi
+    TLA_XMX="${RAVEL_TLA_XMX:-2g}"
+    # digits then k, m, or g, and nonzero. Not the full JVM -Xmx grammar: the
+    # JVM also takes a bare byte count and a `t` suffix, but accepting only
+    # k/m/g makes a typo like `2048` or `1t` fail here, and a zero heap
+    # (`0g`/`0m`) passes the size shape yet the JVM refuses to start, so it is
+    # rejected too.
+    if ! printf '%s' "$TLA_XMX" | grep -qE '^[0-9]+[kKmMgG]$' \
+        || printf '%s' "$TLA_XMX" | grep -qE '^0+[kKmMgG]$'; then
+        note "RAVEL_TLA_XMX must be digits then k, m, or g (a nonzero size), got '$TLA_XMX'"
+        exit 2
+    fi
+    note "resources: workers=$TLA_WORKERS xmx=$TLA_XMX"
+}
+
+# resolve_timeout: pick GNU timeout(1) once, before any lane launches
+# anything, so a run that would otherwise start unbounded refuses instead.
+# Only GNU coreutils' timeout supports --kill-after, which is the mechanism
+# every budget in this script relies on; BSD/macOS ship no `timeout` at all,
+# so the coreutils one arrives as `gtimeout` there (Homebrew). A `timeout`
+# on PATH that isn't GNU coreutils (some minimal containers ship a look-alike)
+# is rejected the same as no binary at all: it silently drops --kill-after
+# and turns a hang into an unbounded run instead of a report.
+resolve_timeout() {
+    local candidate
+    for candidate in timeout gtimeout; do
+        if command -v "$candidate" >/dev/null 2>&1 \
+            && "$candidate" --version 2>/dev/null | grep -qi 'GNU coreutils' \
+            && "$candidate" --kill-after=1 1 true >/dev/null 2>&1; then
+            TIMEOUT_BIN="$candidate"
+            note "timeout: $candidate (GNU coreutils)"
+            return 0
+        fi
+    done
+    note "GNU timeout(1) not found; on macOS run: brew install coreutils"
+    exit 2
 }
 
 # sha256 of a file: coreutils sha256sum where present, else the shasum that
@@ -160,18 +236,30 @@ module_cfg() {
 
 truncate_tsv() {
     mkdir -p "$CACHE_DIR"
-    printf 'run-id\tarea\tcfg\tstates\tdistinct\tdepth\tseconds\tresult\n' > "$LAST_RUN"
+    printf 'run-id\tarea\tcfg\tstates\tdistinct\tdepth\tseconds\tworkers\txmx\tresult\n' > "$LAST_RUN"
 }
 
+# The workers/xmx columns carry the resolved resource configuration next to
+# the figures it produced, so a last-run.tsv row reads without the run's
+# environment beside it. resolve_tla_resources always sets both before any
+# model-check subcommand records a row.
 record_row() {
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$RUN_ID" "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$LAST_RUN"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$RUN_ID" "$1" "$2" "$3" "$4" "$5" "$6" "${TLA_WORKERS:--}" "${TLA_XMX:--}" "$7" >> "$LAST_RUN"
 }
 
 # --- TLC invocation ---------------------------------------------------------
 # Runs TLC on one cfg. Echoes the log path. Returns TLC's exit code.
 # CHECK_DEADLOCK FALSE in a cfg means the model has intentional stutter/terminal
 # states, so pass -deadlock (TLC's flag that DISABLES the deadlock check).
+#
+# The wall-clock ceiling is GNU timeout(1), resolved once into $TIMEOUT_BIN
+# by resolve_timeout before any area runs. `--kill-after=$TIMEOUT_KILL_AFTER`
+# sends TERM at the budget and, if the JVM ignores it, KILL after the grace
+# period: that turns "ignores TERM" from an unbounded hang into a bounded
+# one instead of needing a second layer to catch it. timeout(1) exits 124 on
+# its own TERM, and 137 (128+9) when it had to escalate to KILL; both are
+# mapped to 124 here so callers keyed off that one code work either way.
 run_tlc() {
     local area="$1" module="$2" cfg="$3" budget="$4" logfile="$5"
     local area_dir="$FORMAL_DIR/$area"
@@ -181,28 +269,18 @@ run_tlc() {
     fi
     local metadir="$CACHE_DIR/meta/$area"
     mkdir -p "$metadir"
-    # The wall-clock ceiling needs coreutils timeout (gtimeout from Homebrew
-    # coreutils on macOS). Without either the run is unbounded, announced once;
-    # CI and the fleet executors are Linux and always have timeout.
-    local -a wrap=()
-    if [ -z "${TIMEOUT_BIN+x}" ]; then
-        if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
-        elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout
-        else
-            TIMEOUT_BIN=""
-            note "neither timeout nor gtimeout on PATH: running TLC without a wall-clock ceiling"
-        fi
-    fi
-    if [ -n "$TIMEOUT_BIN" ]; then wrap=("$TIMEOUT_BIN" "$budget"); fi
     # The library path carries the shared common/ module first, then the area
     # dir, so any area can EXTEND or INSTANCE RavelObjectStore. The area dir
     # comes second so a same-named module in the area still wins locally.
     local libpath="$FORMAL_DIR/common:$area_dir"
     local code=0
-    # ${wrap[@]+...}: an empty array is "unbound" under set -u on bash 3.2.
-    ( cd "$area_dir" && ${wrap[@]+"${wrap[@]}"} "$JAVA" -XX:+UseParallelGC \
-        -DTLA-Library="$libpath" -cp "$JAR" tlc2.TLC \
-        -config "$cfg" -metadir "$metadir" -workers auto $deadlock "$module" ) > "$logfile" 2>&1 || code=$?
+    ( cd "$area_dir" && "$TIMEOUT_BIN" "--kill-after=$TIMEOUT_KILL_AFTER" "$budget" \
+        "$JAVA" -XX:+UseParallelGC -Xmx"$TLA_XMX" -DTLA-Library="$libpath" -cp "$JAR" tlc2.TLC \
+        -config "$cfg" -metadir "$metadir" -workers "$TLA_WORKERS" $deadlock "$module" ) > "$logfile" 2>&1 || code=$?
+    if [ "$code" -eq 137 ]; then
+        note "$area/$module: ignored TERM at the ${budget}s budget, needed the ${TIMEOUT_KILL_AFTER}s kill-after grace period"
+        code=124
+    fi
     return $code
 }
 
@@ -221,8 +299,24 @@ log_field() {
 # check_bands <area> <cfg-name> <distinct> <depth>
 # Compares a PASS run's figures against the optional bands.tsv row for this cfg.
 # A missing bands.tsv, or a bands.tsv with no row for this cfg, is not an error
-# (bands are opt-in). A row that exists is enforced: the figure must be present
-# (not "-") and inside [min,max]. Returns non-zero on any violation.
+# (bands are opt-in). A row that exists is enforced: every figure must be
+# present (not "-" or non-numeric) regardless of enforcement, and inside
+# [min,max] whenever that bound is enforced. Returns non-zero on any
+# violation. "-" means two different things in two different files: a missing
+# figure in last-run.tsv is always a failure, while a "-" bound in bands.tsv
+# only means that bound isn't range-checked.
+#
+# min_depth/max_depth may instead both be the literal sentinel "-", meaning
+# depth is not range-checked for this row: TLC's reported BFS search depth can
+# overshoot the true diameter by a level when multiple workers race (issues
+# #1353, #1439, #1638), so a row measured and enforced under a parallel
+# `-workers auto` configuration cannot pin an exact depth the way it can pin
+# distinct, which is worker-independent. The sentinel waives the range check
+# only; a run that fails to produce a depth figure at all is still a broken
+# parse and still fails. One sentinel, not two: min_depth and max_depth must
+# agree (both "-" or both integers) so a half-specified range fails closed as
+# malformed rather than silently comparing against an empty bound.
+# min_distinct/max_distinct take no sentinel; distinct stays exactly enforced.
 check_bands() {
     local area="$1" cfg_name="$2" distinct="$3" depth="$4"
     local bands="$FORMAL_DIR/$area/bands.tsv"
@@ -242,13 +336,28 @@ check_bands() {
     mindepth="$(echo "$row" | cut -f4)"
     maxdepth="$(echo "$row" | cut -f5)"
     local f
-    for f in "$mind" "$maxd" "$mindepth" "$maxdepth"; do
+    for f in "$mind" "$maxd"; do
         case "$f" in
             ''|*[!0-9]*)
-                note "$area bands: malformed row for $cfg_name (need cfg, min_distinct, max_distinct, min_depth, max_depth as integers): '$row'"
+                note "$area bands: malformed row for $cfg_name (need min_distinct, max_distinct as integers): '$row'"
                 return 1 ;;
         esac
     done
+    local depth_enforced=1
+    if [ "$mindepth" = '-' ] && [ "$maxdepth" = '-' ]; then
+        depth_enforced=0
+    elif [ "$mindepth" = '-' ] || [ "$maxdepth" = '-' ]; then
+        note "$area bands: malformed row for $cfg_name (min_depth and max_depth must both be '-' or both be integers): '$row'"
+        return 1
+    else
+        for f in "$mindepth" "$maxdepth"; do
+            case "$f" in
+                ''|*[!0-9]*)
+                    note "$area bands: malformed row for $cfg_name (need min_depth, max_depth as integers or '-'): '$row'"
+                    return 1 ;;
+            esac
+        done
+    fi
     local rc=0
     case "$distinct" in
         ''|*[!0-9]*)
@@ -262,11 +371,72 @@ check_bands() {
         ''|*[!0-9]*)
             note "$area bands: $cfg_name depth figure missing or non-numeric ('$depth')"; rc=1 ;;
         *)
-            if [ "$depth" -lt "$mindepth" ] || [ "$depth" -gt "$maxdepth" ]; then
+            if [ "$depth_enforced" -eq 0 ]; then
+                note "$area bands: $cfg_name depth=$depth (not enforced, band is '-')"
+            elif [ "$depth" -lt "$mindepth" ] || [ "$depth" -gt "$maxdepth" ]; then
                 note "$area bands: $cfg_name depth=$depth outside [$mindepth,$maxdepth]"; rc=1
             fi ;;
     esac
     return $rc
+}
+
+# band_row_exists <area> <cfg-name>
+# True if bands.tsv carries a row for this cfg. The `live` kind uses this as
+# its opt-in gate: a live.cfg with no measured band is not run at all, rather
+# than running under check_bands's after-the-fact enforcement.
+band_row_exists() {
+    local area="$1" cfg_name="$2"
+    local bands="$FORMAL_DIR/$area/bands.tsv"
+    [ -f "$bands" ] || return 1
+    local row
+    row="$(awk -F'\t' -v c="$cfg_name" '$1==c {print; exit}' "$bands")"
+    [ -n "$row" ]
+}
+
+# cfg_budget <area> <cfg-name> <default> -> the exhaustive per-config TLC
+# wall-clock budget in seconds: bands.tsv's optional 6th column (budget_s) on
+# this cfg's row, or <default> when the file, the row, or the column is
+# absent, non-numeric, zero, or over 9 digits. Uses the same awk-by-cfg-name
+# lookup check_bands uses to find the row, so a config with no bands.tsv row
+# resolves to the default exactly the way an unbanded config already does for
+# its figures. Every fallback logs a note naming the area, cfg, and (for a
+# malformed or out-of-range value) the rejected value: a budget silently
+# falling back to 3600s on a typo reads as "the config is just slow" instead
+# of the row being wrong.
+cfg_budget() {
+    local area="$1" cfg_name="$2" default="$3"
+    local bands="$FORMAL_DIR/$area/bands.tsv"
+    if [ ! -f "$bands" ]; then
+        note "$area bands: no bands.tsv for $cfg_name; using default budget ${default}s"
+        echo "$default"
+        return 0
+    fi
+    local row
+    row="$(awk -F'\t' -v c="$cfg_name" '$1==c {print; exit}' "$bands")"
+    if [ -z "$row" ]; then
+        note "$area bands: no row for $cfg_name in bands.tsv; using default budget ${default}s"
+        echo "$default"
+        return 0
+    fi
+    local b
+    b="$(echo "$row" | cut -f6)"
+    if [ -z "$b" ]; then
+        note "$area bands: $cfg_name has no budget_s column; using default budget ${default}s"
+        echo "$default"
+        return 0
+    fi
+    # Bound the digit count before the numeric test, the same shape
+    # resolve_tla_resources uses for RAVEL_TLA_WORKERS: an over-long run of
+    # digits passes a bare ^[0-9]+$ but overflows `[ -eq ]`, and coreutils
+    # timeout(1) disables its own ceiling on 0 and rejects an out-of-range
+    # duration outright, either of which would remove the budget instead of
+    # falling back to it.
+    if ! printf '%s' "$b" | grep -qE '^[0-9]{1,9}$' || [ "$b" -eq 0 ]; then
+        note "$area bands: $cfg_name budget_s '$b' invalid (must be 1-9 digits, nonzero); using default budget ${default}s"
+        echo "$default"
+        return 0
+    fi
+    echo "$b"
 }
 
 # check_one_model <area> <module> <kind> <cfg>
@@ -275,10 +445,15 @@ check_one_model() {
     local area_dir="$FORMAL_DIR/$area"
     local cfg_name budget logfile
     cfg_name="$(basename "$cfg")"
-    if [ "$kind" = exhaustive ]; then budget=$EXHAUSTIVE_BUDGET; else budget=$SMOKE_BUDGET; fi
+    if [ "$kind" = exhaustive ]; then
+        budget="$(cfg_budget "$area" "$cfg_name" "$EXHAUSTIVE_BUDGET")"
+    else
+        budget=$SMOKE_BUDGET
+    fi
     mkdir -p "$LOG_DIR"
     logfile="$LOG_DIR/${area}-${module}-${kind}.log"
     local label="$area/$module ${kind}"
+    note "$label: budget ${budget}s"
 
     local start=$SECONDS code=0
     run_tlc "$area" "$module" "$cfg" "$budget" "$logfile" || code=$?
@@ -330,6 +505,14 @@ check_model() {
                 note "$area/$module: no ${kind} cfg, skipping"
             fi
             continue
+        fi
+        if [ "$kind" = live ]; then
+            local cfg_name
+            cfg_name="$(basename "$cfg")"
+            if ! band_row_exists "$area" "$cfg_name"; then
+                note "$area live: SKIP (unbanded live.cfg; add a bands.tsv row to enrol)"
+                continue
+            fi
         fi
         check_one_model "$area" "$module" "$kind" "$cfg" || rc=1
     done <<< "$modules"
@@ -488,12 +671,21 @@ check_traceability() {
             *[Aa]ction*[Pp]roperty*) continue ;;   # header row
         esac
         # The required source ref is column 3 (awk field 4 after the leading |).
+        # It may hold more than one whitespace-separated reference, for a
+        # property whose transition spans two symbols in two crates; each is
+        # resolved independently against its own file, never pooled into a
+        # single resolve_rust_ref call, so a row still rejects a reference
+        # whose own ::-segments don't resolve in its own file.
         local src
         src="$(echo "$line" | awk -F'|' '{print $4}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr -d '`')"
         if [ -z "$src" ]; then
             note "$area traceability: row has no Rust source ref: $line"; rc=1; continue
         fi
-        resolve_rust_ref "$area" "$src" || { rc=1; continue; }
+        local one row_failed=0
+        for one in $src; do
+            resolve_rust_ref "$area" "$one" || row_failed=1
+        done
+        [ "$row_failed" -eq 0 ] || { rc=1; continue; }
         count=$((count + 1))
 
         # Resolve any further crates/... references in the remaining columns.
@@ -503,6 +695,10 @@ check_traceability() {
         done
     done < "$tfile"
 
+    if [ "$rc" -eq 0 ] && [ "$count" -eq 0 ]; then
+        note "$area traceability: FAIL (zero rows resolved)"
+        return 1
+    fi
     if [ "$rc" -eq 0 ]; then
         note "$area traceability: PASS ($count rows resolve)"
     fi
@@ -512,7 +708,11 @@ check_traceability() {
 # --- dispatch ---------------------------------------------------------------
 
 usage() {
-    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+    # Marker-delimited, not a line-number slice: a line-number range goes
+    # stale the moment the banner between the markers grows or shrinks by a
+    # different amount than whoever last edited the range accounted for.
+    sed -n '/^# check-tla usage: begin$/,/^# check-tla usage: end$/p' "$0" \
+        | sed '1d;$d;s/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
@@ -534,12 +734,22 @@ main() {
     done
 
     case "$cmd" in
-        smoke|exhaustive|negative|traceability|ci|all) : ;;
+        smoke|live|exhaustive|negative|traceability|ci|all) : ;;
         ""|-h|--help) usage 0 ;;
         *) die "unknown subcommand: $cmd" ;;
     esac
 
-    resolve_java
+    # resolve_timeout runs before resolve_java: resolve_java's -version probe
+    # spawns java, so on a host without GNU timeout(1) that probe must never
+    # happen. Resolved once, before any lane launches anything, and even for
+    # a lane that discovers zero configs to run: a developer without GNU
+    # coreutils must hear about it on the first invocation, not on the first
+    # slow run. traceability enforces no budget and needs no timeout binary
+    # at all.
+    case "$cmd" in
+        traceability) : ;;
+        *) resolve_timeout; resolve_java; resolve_tla_resources ;;
+    esac
 
     local areas
     if [ -n "$only_area" ]; then
@@ -559,26 +769,29 @@ main() {
     RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse 'HEAD^{tree}')"
 
     local records_tsv=0
-    case "$cmd" in smoke|exhaustive|negative|ci|all) records_tsv=1 ;; esac
+    case "$cmd" in smoke|live|exhaustive|negative|ci|all) records_tsv=1 ;; esac
     [ "$records_tsv" -eq 1 ] && truncate_tsv
 
     # ci and all record every model under ONE run id, so last-run.tsv is a
-    # single coherent run: the smoke, negative, and (for all) exhaustive rows
-    # all carry the same run-id column.
+    # single coherent run: the smoke, live, negative, and (for all) exhaustive
+    # rows all carry the same run-id column.
     local rc=0 area
     for area in $areas; do
         case "$cmd" in
             smoke)        check_model "$area" smoke || rc=1 ;;
+            live)         check_model "$area" live || rc=1 ;;
             exhaustive)   check_model "$area" exhaustive || rc=1 ;;
             negative)     check_negative "$area" || rc=1 ;;
             traceability) check_traceability "$area" || rc=1 ;;
             ci)
                 check_model "$area" smoke || rc=1
+                check_model "$area" live || rc=1
                 check_negative "$area" || rc=1
                 check_traceability "$area" || rc=1
                 ;;
             all)
                 check_model "$area" smoke || rc=1
+                check_model "$area" live || rc=1
                 check_negative "$area" || rc=1
                 check_traceability "$area" || rc=1
                 check_model "$area" exhaustive || rc=1

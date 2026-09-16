@@ -251,3 +251,58 @@ protected by that key.
 - Nothing durable moves. No format, key layout, commit protocol, or
   consistency property changes. A node with its cache directory deleted
   mid-flight answers every query correctly and more slowly.
+
+## Amendment (2026-09-05): startup warm-up measures "most recent" from each tenant's latest ingest hour, not wall-clock now
+
+The startup cache warm-up pass (`services/ravel-server/src/cache_warm.rs`)
+resolves each tenant's most recent parts to prime the RAM/disk tiers
+before `/readyz` latches. It originally resolved a fixed `[now - 24h,
+now]` window, so a tenant whose last ingest predated `now` by more than
+24h got zero parts warmed on restart (issue #1233: such a tenant's first
+real query after restart paid the full cold-fetch cost this ADR exists to
+avoid). The pass now calls `Catalog::latest_ingest_hour` first and anchors
+the warm window to that tenant's own latest ingest hour, so "most recent"
+means the tenant's own most recent data, never data recent only relative
+to wall-clock time.
+
+This anchors to the ingest-hour bucket a part was filed under, not to the
+part's own `max_event_ts_ns`. The new window is a superset of the old
+`[now - 24h, now]` window only when every part's `max_event_ts_ns` stays
+within `max_ingest_lag_ns` of its ingest-hour bucket's span, which is the
+assumption this warm-up serves, not a guarantee `latest_ingest_hour`
+enforces. A part filed further out of that bound can still miss the warm
+pass.
+
+`Catalog::latest_ingest_hour` itself discovers the latest hour with a
+bounded, floored listing that doubles its lookback window backwards from
+now (24h, 48h, ..., capped at 64 days across at most 7 probes per shard)
+instead of listing a shard's entire commit history, so a tenant with a
+long or gapless history no longer pages through it all before `/readyz`.
+An "ingest hour" here means any hour bucket holding a commit-record-shaped
+key of any kind -- a commit record, a compaction record, a rewrite record,
+or a tombstone -- not only a live commit record; the shard loop reports
+whichever of those it finds newest, and separately reports whether that
+newest hour actually holds a live (non-tombstone) part.
+
+A tenant whose last ingest predates the 64-day cap, or one that has never
+ingested this signal at all, both resolve to `Ok(None)`. Exhausting the
+probe sweep without finding anything is a normal, expected outcome for a
+signal a tenant simply does not use, so `Catalog` itself never logs above
+`debug!` for it; only `cache_warm`'s own `log_warm_result` decides between
+`info!` and its "parts exist but none warmed" `warn!`, and it does so
+using the found hour's live-part flag, not merely whether a hour was
+found -- a tenant whose only bucket in range is tombstone-only resolves
+`Ok(Some((hour, false)))` and is logged the same as "nothing to warm",
+never as the warn-level "has parts but none warmed" case. The flag is
+per hour, not per bucket: an hour holding both a live record and a
+tombstone reports `true` while the resolve drops the tombstoned bucket,
+so that warning can still fire for such an hour when the rest of the
+window warms nothing; it is a hint, not a fault signal.
+
+Residual clock-skew case: an event whose timestamp is up to
+`max_ingest_lag_ns` behind its ingest-hour bucket, where that ingest hour
+is itself not ahead of the wall clock, still resolves correctly -- the
+probe's `max_hour` is computed from `now_ns + clock_skew_allowance_ns`,
+not from the event timestamp, so a late-arriving event filed under an
+hour at or before wall-clock `now` is always within the first probe's
+upper bound.

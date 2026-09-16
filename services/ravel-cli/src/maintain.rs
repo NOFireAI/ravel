@@ -9,7 +9,6 @@ use std::io::Write;
 use std::sync::Arc;
 
 use clap::ValueEnum;
-use prost::Message;
 use ravel_commit::keys;
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, LegalHoldCheck,
@@ -18,7 +17,6 @@ use ravel_maintain::{
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
-use ravel_proto::commit::v1::{CompactionRecord, RetentionTombstone};
 use ravel_types::{Signal, TenantHash, TenantId};
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -171,6 +169,11 @@ pub async fn compact(
         CompactionOutcome::AlreadyCompacted => {
             println!("outcome: AlreadyCompacted (a compaction record already exists)")
         }
+        CompactionOutcome::RewritePresent => println!(
+            "outcome: RewritePresent (a live erasure rewrite record already \
+             serves this bucket; compacting it would make the catalog serve \
+             two record sets)"
+        ),
         CompactionOutcome::BelowMinInputs { count } => {
             println!("outcome: BelowMinInputs (only {count} L0 record(s); nothing to do)")
         }
@@ -244,6 +247,12 @@ pub struct CompactTenantReport {
     pub compacted: usize,
     /// Buckets that already carried a compaction record.
     pub already: usize,
+    /// Buckets refused because a live erasure rewrite record already serves
+    /// them (ADR-0064 decision 3 point 5). Counted separately from `already`:
+    /// the bucket is not compacted and never will be while the rewrite record
+    /// stands, which is a different operator-visible state from a bucket whose
+    /// compaction is done.
+    pub rewrite_present: usize,
     /// Buckets reached that are not yet sealed. Hours ascend, so the walk stops
     /// at the first one in each shard; this is therefore at most one per shard.
     pub not_sealed: usize,
@@ -583,16 +592,18 @@ pub async fn compact_tenant_to(
     let verb = if dry_run { "would write" } else { "wrote" };
     writeln!(out, "compacted: {}", report.compacted)?;
     writeln!(out, "already: {}", report.already)?;
+    writeln!(out, "rewrite_present: {}", report.rewrite_present)?;
     writeln!(out, "not_sealed: {}", report.not_sealed)?;
     writeln!(out, "below_min: {}", report.below_min)?;
     writeln!(out, "tombstoned: {}", report.tombstoned)?;
     writeln!(out, "parts ({verb}): {}", report.parts_written)?;
     writeln!(out, "wall_time_ms: {}", started.elapsed().as_millis())?;
     // Buckets that reported any non-error outcome (compacted, already,
-    // not-sealed, below-min, tombstoned). `failed` is the count of buckets
-    // whose compaction returned a typed error.
+    // rewrite-present, not-sealed, below-min, tombstoned). `failed` is the
+    // count of buckets whose compaction returned a typed error.
     let succeeded = report.compacted
         + report.already
+        + report.rewrite_present
         + report.not_sealed
         + report.below_min
         + report.tombstoned;
@@ -674,6 +685,10 @@ fn emit_bucket_outcome(
         Ok(CompactionOutcome::AlreadyCompacted) => {
             report.already += 1;
             writeln!(out, "shard={shard} hour={hour} outcome=AlreadyCompacted")?;
+        }
+        Ok(CompactionOutcome::RewritePresent) => {
+            report.rewrite_present += 1;
+            writeln!(out, "shard={shard} hour={hour} outcome=RewritePresent")?;
         }
         Ok(CompactionOutcome::BelowMinInputs { count }) => {
             report.below_min += 1;
@@ -869,7 +884,12 @@ pub async fn sweep(
         })?;
 
     let SweepReport {
-        orphans_deleted,
+        // Equal to orphans_quarantined since the ADR-0058 amendment; the
+        // quarantined figure is the one reported below.
+        orphans_deleted: _,
+        orphans_quarantined,
+        orphans_quarantine_refused,
+        quarantine_reaped,
         superseded_records_deleted,
         superseded_data_deleted,
         unreferenced_parts_deleted,
@@ -890,8 +910,27 @@ pub async fn sweep(
     .map_err(|err| anyhow::anyhow!("sweep failed: {err}"))?;
 
     let verb = if dry_run { "would delete" } else { "deleted" };
+    let q_verb = if dry_run {
+        "would quarantine"
+    } else {
+        "quarantined"
+    };
+    // The reaper counts a candidate before the dry-run guard, which wraps only
+    // the delete, so a dry run reports what it would reap rather than what it
+    // did. Printing "physically deleted" for that figure tells an operator the
+    // opposite of what a dry run means.
+    let r_verb = if dry_run {
+        "would reap, past 2nd horizon"
+    } else {
+        "reaped, physically deleted past 2nd horizon"
+    };
     println!("dry_run: {dry_run}");
-    println!("orphans ({verb}): {orphans_deleted}");
+    // Orphan GC moves candidates to quarantine rather than deleting them
+    // (ADR-0058 amendment); orphans_deleted counts candidates removed from the
+    // live keyspace and equals orphans_quarantined.
+    println!("orphans ({q_verb}): {orphans_quarantined}");
+    println!("orphans quarantine refused (left live): {orphans_quarantine_refused}");
+    println!("quarantine ({r_verb}): {quarantine_reaped}");
     println!("superseded_records ({verb}): {superseded_records_deleted}");
     println!("superseded_data ({verb}): {superseded_data_deleted}");
     println!("unreferenced_parts ({verb}): {unreferenced_parts_deleted}");
@@ -947,7 +986,7 @@ pub async fn status(
             .get(key, GetRange::Full)
             .await
             .map_err(|err| anyhow::anyhow!("failed to fetch compaction record {key}: {err}"))?;
-        let record = CompactionRecord::decode(got.data.as_ref())
+        let record = ravel_commit::record::decode_compaction(got.data.as_ref())
             .map_err(|err| anyhow::anyhow!("compaction record {key} is corrupt: {err}"))?;
         superseded_inputs += record.inputs.len();
         for part in &record.parts {
@@ -1096,8 +1135,8 @@ pub async fn audit_versions(
                         let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
                             anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
                         })?;
-                        let record =
-                            CompactionRecord::decode(got.data.as_ref()).map_err(|err| {
+                        let record = ravel_commit::record::decode_compaction(got.data.as_ref())
+                            .map_err(|err| {
                                 anyhow::anyhow!("compaction record {} is corrupt: {err}", meta.key)
                             })?;
                         for part in &record.parts {
@@ -1250,12 +1289,16 @@ fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
 /// within budget, migrate re-audits fresh and raises the floor only if nothing
 /// below the target survives; if a straggler is found the floor is left
 /// untouched and this exits nonzero, reporting what it found. The re-audit
-/// already excludes a bucket's pre-rewrite commit records once that bucket
-/// carries a compaction/rewrite record (dead, sweepable leftovers of a
-/// rewrite this same invocation may have just performed, not stragglers),
-/// so a clean migration converges and raises the floor in one
-/// invocation -- no interleaved `sweep` required. A reported straggler is
-/// therefore genuine below-target live data still to migrate.
+/// excludes a bucket's pre-rewrite commit records once an AUTHORITATIVE
+/// compaction or rewrite record supersedes them (dead, sweepable leftovers of a
+/// rewrite this same invocation may have just performed, not stragglers). An
+/// input named only by a LOSING record of an overlap is not superseded: the
+/// resolver still serves it raw, so it stays counted. A clean migration
+/// therefore converges and raises the floor in one invocation, with no
+/// interleaved `sweep` required, but a below-target loser-only input is a
+/// straggler the walk cannot migrate, so that refusal is permanent until the
+/// overlap itself is resolved. `buckets_blocked` reports how many buckets are
+/// in that state.
 ///
 /// `target_version` defaults to the signal's current supported version
 /// ([`signal_current_version`]); `family` defaults to the signal's canonical
@@ -1315,6 +1358,7 @@ pub async fn migrate(
     println!("budget_records: {budget_records} (0 = unlimited)");
     println!("buckets_examined: {}", report.buckets_examined);
     println!("buckets_migrated: {}", report.buckets_migrated);
+    println!("buckets_blocked: {}", report.buckets_blocked);
     println!("records_migrated: {}", report.records_migrated);
     if let Some((shard, hour)) = report.cursor_advanced_to {
         println!("cursor_advanced_to: shard={shard} hour={hour}");
@@ -1347,8 +1391,14 @@ pub async fn migrate(
                  finishing and the floor raise, or is not yet migratable -- e.g. still \
                  unsealed). These are genuinely live: a bucket's own pre-rewrite commit records \
                  are already excluded from this count once that bucket has been migrated, so a \
-                 `sweep` will not make this converge. The floor was NOT raised; re-run migrate \
-                 once the stragglers are at or above the target."
+                 `sweep` will not make this converge. The floor was NOT raised.\n\n\
+                 Whether re-running helps depends on why they are below target. Data that is \
+                 merely not yet sealed migrates on a later run. But a below-target L0 that only \
+                 a LOSING compaction record names is served raw by the resolver and is not \
+                 migratable by the walk, so that straggler is permanent until the overlap \
+                 itself is resolved, and re-running will report the same count forever. \
+                 buckets_blocked above counts the buckets in that state: if it is non-zero, \
+                 re-running is not the remedy."
             )
         }
         None => {
@@ -1649,8 +1699,8 @@ pub async fn verify_custody(
                         let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
                             anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
                         })?;
-                        let record =
-                            CompactionRecord::decode(got.data.as_ref()).map_err(|err| {
+                        let record = ravel_commit::record::decode_compaction(got.data.as_ref())
+                            .map_err(|err| {
                                 anyhow::anyhow!("compaction record {} is corrupt: {err}", meta.key)
                             })?;
 
@@ -1911,7 +1961,7 @@ pub async fn check_noncurrent_versions<S: NoncurrentVersionSource + ?Sized>(
 /// field-by-field style. Reports the compaction identity plus every input
 /// identity and every part's summary and level/part_index/version.
 pub fn decode_compaction_record(bytes: &[u8]) -> anyhow::Result<()> {
-    let record = CompactionRecord::decode(bytes)
+    let record = ravel_commit::record::decode_compaction(bytes)
         .map_err(|err| anyhow::anyhow!("failed to decode compaction record: {err}"))?;
     println!("format_version: {}", record.format_version);
     println!("tenant_hash: {}", hex::encode(&record.tenant_hash));
@@ -1952,7 +2002,7 @@ pub fn decode_compaction_record(bytes: &[u8]) -> anyhow::Result<()> {
 
 /// Decode and print a `RetentionTombstone` (proto).
 pub fn decode_retention_tombstone(bytes: &[u8]) -> anyhow::Result<()> {
-    let tombstone = RetentionTombstone::decode(bytes)
+    let tombstone = ravel_commit::record::decode_tombstone(bytes)
         .map_err(|err| anyhow::anyhow!("failed to decode retention tombstone: {err}"))?;
     println!("format_version: {}", tombstone.format_version);
     println!("tenant_hash: {}", hex::encode(&tombstone.tenant_hash));
@@ -2249,5 +2299,60 @@ mod tests {
             "the trait-contract default cannot enumerate versions"
         );
         assert_eq!(report.recoverable_versions, 0);
+    }
+
+    /// The `maintain inspect` decode path refuses a compaction record stamped a
+    /// future `format_version` (ADR-0066 decision 2), rather than printing it as
+    /// a version-1 record. Routing the bytes back through the raw prost
+    /// `Message::decode` (the pre-fix path) makes this test fail: the record
+    /// decodes silently and the call returns `Ok`.
+    #[test]
+    fn inspect_refuses_a_future_version_compaction_record() {
+        let record = ravel_proto::commit::v1::CompactionRecord {
+            format_version: 2,
+            tenant_hash: vec![0u8; 16],
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 1,
+            input_set_hash: vec![0x44; 32],
+            ..Default::default()
+        };
+        let bytes = record::encode_compaction(&record);
+        let err = decode_compaction_record(bytes.as_ref())
+            .expect_err("a version-2 compaction record must be refused, not printed as v1");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compaction record")
+                && msg.contains("format_version")
+                && msg.contains('2'),
+            "the error names the record kind, the gate, and the version seen: {msg}"
+        );
+    }
+
+    /// The `maintain inspect` decode path refuses a retention tombstone stamped
+    /// a future `format_version`. Same raw-prost-decode failure argument as the
+    /// compaction case.
+    #[test]
+    fn inspect_refuses_a_future_version_tombstone() {
+        let tombstone = ravel_proto::commit::v1::RetentionTombstone {
+            format_version: 2,
+            tenant_hash: vec![0u8; 16],
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 1,
+            retired_at_ns: 1,
+            retention_window_ns: 1,
+            record_count_observed: 0,
+        };
+        let bytes = record::encode_tombstone(&tombstone);
+        let err = decode_retention_tombstone(bytes.as_ref())
+            .expect_err("a version-2 tombstone must be refused, not printed as v1");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("retention tombstone")
+                && msg.contains("format_version")
+                && msg.contains('2'),
+            "the error names the record kind, the gate, and the version seen: {msg}"
+        );
     }
 }

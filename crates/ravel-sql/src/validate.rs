@@ -9,13 +9,15 @@
 //! extension form), and a multi-statement body -- is rejected with a typed
 //! error the endpoint maps to HTTP 400.
 //!
-//! Parsing here uses `datafusion::sql::parser::DFParser`, not bare
-//! sqlparser: DFParser is the same front end `SessionContext::sql` uses, so
-//! a statement that parses into a DataFusion extension variant
-//! (`CreateExternalTable`, `CopyTo`, `Explain`, `Reset`) is seen here in the
-//! same shape the planner would see it. A gate built on bare sqlparser would
-//! either fail to parse those or classify them differently from the planner,
-//! which is exactly the kind of gap the invariant exists to close.
+//! Parsing goes through [`complexity_guard::parse_guarded`], the crate's only
+//! parse of caller text, which runs the structural-complexity guard and then
+//! DataFusion's own `DFParser` front end rather than bare sqlparser: it is the
+//! front end `SessionContext::sql` uses, so a statement that parses into a
+//! DataFusion extension variant (`CreateExternalTable`, `CopyTo`, `Explain`,
+//! `Reset`) is seen here in the same shape the planner would see it. A gate
+//! built on bare sqlparser would either fail to parse those or classify them
+//! differently from the planner, which is exactly the kind of gap the
+//! invariant exists to close.
 //!
 //! A `Query` is not automatically read-only in sqlparser's grammar: its body
 //! is a `SetExpr`, which has `Insert`/`Update`/`Delete`/`Merge` variants
@@ -65,7 +67,8 @@
 //! UDAF landed; no walk here guards min/max any more, because the registry
 //! replacement is structurally total.
 
-use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use crate::complexity_guard;
+use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, SetExpr, Statement,
     TableFactor, Visit, Visitor,
@@ -206,13 +209,43 @@ pub enum ValidationError {
          (docs/adrs/0097-sql-scalar-function-surface.md)"
     )]
     ExcludedWindow { name: String },
+
+    /// The statement text carries more structural tokens than
+    /// [`MAX_STATEMENT_COMPLEXITY`](crate::complexity_guard::MAX_STATEMENT_COMPLEXITY),
+    /// so it is refused before it is parsed (crate::complexity_guard, issue
+    /// #1680). The message carries the two counts and nothing else of the
+    /// caller's input, so it is safe to return verbatim like the other
+    /// validation errors.
+    #[error("{0}")]
+    TooComplex(#[from] complexity_guard::StatementTooComplex),
+}
+
+impl From<complexity_guard::GuardedParseError> for ValidationError {
+    fn from(error: complexity_guard::GuardedParseError) -> Self {
+        match error {
+            complexity_guard::GuardedParseError::TooComplex(too_complex) => {
+                ValidationError::TooComplex(too_complex)
+            }
+            complexity_guard::GuardedParseError::Parse(message) => {
+                ValidationError::Parse(strip_prefix(&message))
+            }
+        }
+    }
 }
 
 /// Parse `sql` and accept it only if it is exactly one read-only
 /// `Statement::Query` inside the v1 subset. Returns before any planning.
+///
+/// The structural-complexity guard runs first, before the text is parsed at
+/// all: parsing a deep enough statement, and every recursive walk over the
+/// tree it produces (the two below, `crate::page_plan`'s rewrites, DataFusion's
+/// SQL-to-`LogicalPlan` conversion, and the tree's own `Drop`) recurses once
+/// per tree level, and a stack overflow on a 2 MiB tokio worker stack aborts
+/// the process rather than raising a catchable panic (issue #1680). That
+/// ordering is not this function's to remember: it is what
+/// [`complexity_guard::parse_guarded`] is, so every parse in the crate has it.
 pub fn validate(sql: &str) -> Result<(), ValidationError> {
-    let statements = DFParser::parse_sql(sql)
-        .map_err(|e| ValidationError::Parse(strip_prefix(&e.to_string())))?;
+    let statements = complexity_guard::parse_guarded(sql)?;
 
     if statements.len() > 1 {
         return Err(ValidationError::MultipleStatements {
@@ -281,8 +314,12 @@ pub fn validate(sql: &str) -> Result<(), ValidationError> {
 /// any query that reads both real tables (no CTE shadows a name it also
 /// reads as a base table without the query being nonsensical).
 pub(crate) fn referenced_base_tables(sql: &str) -> Result<BTreeSet<String>, ValidationError> {
-    let statements = DFParser::parse_sql(sql)
-        .map_err(|e| ValidationError::Parse(strip_prefix(&e.to_string())))?;
+    // This parses and walks a tree of its own, so it carries the same guard
+    // [`validate`] does rather than relying on every caller having run
+    // `validate` on the same text first. The scan stops one token past the
+    // bound, so a statement that already passed `validate` pays a bounded
+    // rescan and nothing else.
+    let statements = complexity_guard::parse_guarded(sql)?;
     let mut tables = BTreeSet::new();
     let mut ctes = BTreeSet::new();
     for statement in &statements {

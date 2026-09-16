@@ -8,11 +8,86 @@
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use bytes::Bytes;
 use clap::ValueEnum;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store};
-use ravel_object_store::{ObjectStoreBackend, StoreMetrics};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError, StoreMetrics,
+};
+
+/// A backend wrapper that sleeps a fixed duration before every `get`,
+/// delegating everything else unchanged. It exists to give an in-process
+/// store a controllable per-request stall so a scan's exposed open time can
+/// be measured against a known injected figure. It is a measurement device:
+/// a number produced through it describes the scan's structure under that
+/// stall, never an object store's latency.
+pub struct DelayedGetStore<S> {
+    inner: S,
+    delay: Duration,
+}
+
+impl<S> DelayedGetStore<S> {
+    pub fn new(inner: S, delay: Duration) -> Self {
+        DelayedGetStore { inner, delay }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S: ObjectStoreBackend> ObjectStoreBackend for DelayedGetStore<S> {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        self.inner.put_multipart(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.inner.list_after(prefix, start_after, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum StoreKind {
@@ -107,6 +182,66 @@ pub fn store_and_metrics_from_env(
     }
 }
 
+/// Whether a request against `kind`'s backend is billed: false on
+/// `MemoryStore` and on any store behind a configured endpoint (a local
+/// MinIO reached over `RAVEL_S3_ENDPOINT`; ADR-0927 decision 10 is exactly
+/// this -- MinIO is valid for correctness, conformance and CI, never for a
+/// performance or cost claim, because removing per-request fees is what
+/// makes a request-count defect invisible), true only for real S3 with no
+/// endpoint override. The one place every `--store`-driven bin derives this,
+/// rather than re-deriving it from `StoreKind` alone.
+pub fn backend_bills_requests(kind: StoreKind) -> bool {
+    backend_bills_requests_from_lookup(kind, |key| std::env::var(key).ok())
+}
+
+/// [`backend_bills_requests`]'s logic over an injected lookup, for the same
+/// reason [`s3_config_from_lookup`] exists: testable without
+/// `std::env::set_var` (`unsafe` under the 2024 edition) and without racing
+/// other tests over global process env state.
+fn backend_bills_requests_from_lookup(
+    kind: StoreKind,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> bool {
+    match kind {
+        StoreKind::Memory => false,
+        StoreKind::S3 => lookup("RAVEL_S3_ENDPOINT").is_none(),
+    }
+}
+
+/// The configured S3 endpoint's host, when `kind` is [`StoreKind::S3`] and
+/// `RAVEL_S3_ENDPOINT` is set. `None` for [`StoreKind::Memory`] regardless of
+/// the env var: a memory-backed run never touched an endpoint, so it must
+/// never name one. Host only: never the scheme, path, or any embedded
+/// userinfo credentials, so a report can name the substrate without ever
+/// carrying a secret.
+pub fn endpoint_host_from_env(kind: StoreKind) -> Option<String> {
+    endpoint_host_from_lookup(kind, |key| std::env::var(key).ok())
+}
+
+/// [`endpoint_host_from_env`]'s logic over an injected lookup; see
+/// [`backend_bills_requests_from_lookup`].
+fn endpoint_host_from_lookup(
+    kind: StoreKind,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if !matches!(kind, StoreKind::S3) {
+        return None;
+    }
+    let raw = lookup("RAVEL_S3_ENDPOINT")?;
+    // `RAVEL_S3_ENDPOINT` is commonly given without a scheme (`localhost:9000`),
+    // which `Url::parse` treats as a `localhost:`-scheme URL rather than a host:
+    // port and returns no `host_str`. Retry with an assumed `http://` prefix so a
+    // scheme-less value still reports the right host.
+    reqwest::Url::parse(&raw)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .or_else(|| {
+            reqwest::Url::parse(&format!("http://{raw}"))
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +309,61 @@ mod tests {
     fn unrecognized_auth_value_defaults_to_static() {
         let cfg = s3_config_from_lookup(lookup(&[("RAVEL_S3_AUTH", "Instance-Role")]));
         assert_eq!(cfg.auth, S3AuthMode::Static);
+    }
+
+    /// `backend_bills_requests` is true only for real S3 with no endpoint
+    /// override; a configured endpoint or a `MemoryStore` are both false.
+    #[test]
+    fn backend_bills_requests_is_false_behind_a_configured_endpoint() {
+        assert!(
+            !backend_bills_requests_from_lookup(
+                StoreKind::S3,
+                lookup(&[("RAVEL_S3_ENDPOINT", "http://localhost:9000")]),
+            ),
+            "S3 behind a configured endpoint (MinIO) must not report billing"
+        );
+        assert!(
+            backend_bills_requests_from_lookup(StoreKind::S3, lookup(&[])),
+            "S3 with no endpoint override is real S3 and must report billing"
+        );
+        assert!(
+            !backend_bills_requests_from_lookup(
+                StoreKind::Memory,
+                lookup(&[("RAVEL_S3_ENDPOINT", "http://localhost:9000")]),
+            ),
+            "MemoryStore requests are free regardless of any configured S3 endpoint"
+        );
+    }
+
+    #[test]
+    fn endpoint_host_extracts_the_host_with_or_without_a_scheme() {
+        assert_eq!(
+            endpoint_host_from_lookup(
+                StoreKind::S3,
+                lookup(&[("RAVEL_S3_ENDPOINT", "http://localhost:9000")]),
+            ),
+            Some("localhost".to_string()),
+            "a scheme-carrying endpoint's host is extracted directly"
+        );
+        assert_eq!(
+            endpoint_host_from_lookup(
+                StoreKind::S3,
+                lookup(&[("RAVEL_S3_ENDPOINT", "localhost:9000")]),
+            ),
+            Some("localhost".to_string()),
+            "a scheme-less endpoint must still report its host, not silently omit it"
+        );
+    }
+
+    #[test]
+    fn endpoint_host_is_absent_for_memory_regardless_of_the_env_var() {
+        assert_eq!(
+            endpoint_host_from_lookup(
+                StoreKind::Memory,
+                lookup(&[("RAVEL_S3_ENDPOINT", "http://localhost:9000")]),
+            ),
+            None,
+            "a memory-backed run never touched an endpoint, so it must never name one"
+        );
     }
 }

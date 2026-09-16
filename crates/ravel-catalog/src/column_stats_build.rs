@@ -1006,24 +1006,25 @@ mod tests {
     /// query scans it.)
     #[test]
     fn decode_previous_column_stats_mismatched_part_binding_is_graceful() {
-        // A v2 record carries the covered part content hash in writer_id.
+        // A v3 record carries the covered part content hash in writer_id.
         let seg = ColumnStatsSegment {
             ingest_hour_bucket: 1,
             shard: 0,
-            writer_id: vec![0xCC; 32],
+            writer_id: [0x0Au8; 32].to_vec(),
             writer_epoch: 0,
             writer_seq: 0,
             columns: vec![],
         };
         let part_a = [0x0Au8; 32];
         let part_b = [0x0Bu8; 32];
-        let bytes = crate::snapshot_format::encode_column_stats_v2(
+        let bytes = crate::snapshot_format::encode_column_stats_v3(
             TENANT.0,
             3,
-            vec![part_a.to_vec()],
+            part_a,
             std::slice::from_ref(&seg),
+            crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
         )
-        .expect("v2 encodes");
+        .expect("v3 encodes");
         let limits = crate::snapshot_format::ColumnStatsLimits::default();
 
         // Asked for part B: the binding does not match -> typed graceful error.
@@ -1034,6 +1035,6 @@ mod tests {
         // Asked for the true binding: decodes, record is content-hash keyed.
         let ok = decode_previous_column_stats(&bytes, &[part_a], &limits).expect("binding matches");
         assert_eq!(ok.len(), 1);
-        assert_eq!(ok[0].writer_id, vec![0xCC; 32]);
+        assert_eq!(ok[0].writer_id, part_a.to_vec());
     }
 }

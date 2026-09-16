@@ -149,20 +149,6 @@ pub enum SnapshotFormatError {
     #[error("malformed varint in postings body")]
     PostingsBadVarint,
 
-    #[error("head column-stats ref blake3 must be 32 bytes, got {0}")]
-    BadColumnStatsRefBlake3Len(usize),
-    #[error("head column-stats ref has an empty key")]
-    EmptyColumnStatsKey,
-    #[error("head column-stats ref part_blake3[{index}] must be 32 bytes, got {actual}")]
-    BadColumnStatsRefPartBlake3Len { index: usize, actual: usize },
-    #[error("head column-stats ref names {stats_parts} parts but head has {head_parts} parts")]
-    ColumnStatsRefPartCountMismatch {
-        stats_parts: usize,
-        head_parts: usize,
-    },
-    #[error("head column-stats ref part_blake3[{index}] does not match parts[{index}].blake3")]
-    ColumnStatsRefPartBlake3Mismatch { index: usize },
-
     #[error("column-stats object is smaller than the minimum envelope prefix: {size} bytes")]
     ColumnStatsTooSmall { size: usize },
     #[error("bad column-stats magic bytes")]
@@ -211,6 +197,24 @@ pub enum SnapshotFormatError {
     },
     #[error("column-stats header part_blake3 does not match the expected covered parts")]
     ColumnStatsPartBindingMismatch,
+    /// ADR-1413: a v3 (per-part) column-stats header must name exactly one
+    /// part. Any other count means the object was framed for the wrong
+    /// version or is corrupt; never decoded as if it covered zero or several
+    /// parts.
+    #[error("v3 column-stats header part_blake3 must have exactly one entry, got {0}")]
+    ColumnStatsV3PartBlake3CountMismatch(usize),
+    /// ADR-1413 (amended): the fold degrades a per-part column-stats object
+    /// that would exceed the ceiling by dropping its largest dictionaries
+    /// first against a running total. This error fires only once no
+    /// dictionary is left to drop and the dictionary-free body (fixed fields:
+    /// min/max/count/sum, never truncated) is still over the fixed ceiling
+    /// (`DEFAULT_MAX_COLUMN_STATS_BYTES`), checked before compression. Never
+    /// a silent skip: the caller must fail the whole fold for this part
+    /// rather than publish no v3 object for it.
+    #[error(
+        "column-stats part object body {declared} bytes exceeds the ceiling {ceiling} with no dictionary left to drop"
+    )]
+    ColumnStatsPartOverBound { declared: u64, ceiling: u64 },
     #[error("column-stats segment carries duplicate column name {name:?}")]
     ColumnStatsDuplicateColumnName { name: String },
     #[error("column-stats column {name:?} has an unknown declared_type {declared_type}")]

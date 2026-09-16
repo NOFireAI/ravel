@@ -256,10 +256,11 @@ pub enum Probe {
     ToleranceEntry,
     /// Any entry using `mode: ravel_error_prom_success` whose `name` also
     /// contains this marker substring. The mode alone is not distinguishing:
-    /// more than one accepted divergence can use it (ADR-0030's per-node
-    /// point cap and issue #524's histogram-binop guard both do), so a
-    /// bare mode match would double-count one divergence's corpus entries
-    /// as evidence for another's `Construct` row. The marker scopes each
+    /// more than one accepted divergence can use it, so a bare mode match
+    /// would double-count one divergence's corpus entries as evidence for
+    /// another's `Construct` row. ADR-0030's per-node point cap is the only
+    /// divergence still using the mode (the histogram-binop guard's row is
+    /// gone: issue #1700 implemented the operators). The marker scopes each
     /// registry entry to only the corpus entries actually naming it (e.g.
     /// `"subquery"` for ADR-0030's `error_*subquery*` entries).
     DivergenceModeEntry(&'static str),
@@ -589,26 +590,11 @@ pub static REGISTRY: &[Construct] = &[
          200; distinct from the subquery-over-histograms refusal, which \
          triggers inside `eval_subquery_matrix`",
     ),
-    rejected_modifier(
-        "binary operator over native histograms",
-        "Unsupported: binary operator over native histograms (422 execution)",
-        "the binop evaluator (`combine_value` and its callers) only ever \
-         reads a sample's plain float `value`, which is a meaningless 0.0 \
-         placeholder for a histogram element (issue #524); guarded before \
-         any value combination so the fabricated-zero result is never \
-         produced. `corpus/binop.txt`'s `error_*_over_histogram` entries \
-         (mode: ravel_error_prom_success) additionally pin that Prometheus \
-         itself succeeds here, so this is a real capability gap, not a \
-         shared limitation",
-    ),
     // ---- Binary operators ----
     binop("+", corpus("corpus/binop.txt")),
     binop("-", corpus("corpus/binop.txt")),
     binop("*", corpus("corpus/binop.txt")),
-    binop(
-        "/",
-        unit("ravel-promql:scalar_scalar_arithmetic_and_bool_comparison"),
-    ),
+    binop("/", corpus("corpus/binop.txt")),
     binop("%", corpus("corpus/binop.txt")),
     binop("^", corpus("corpus/binop.txt")),
     word_binop("atan2"),
@@ -805,13 +791,6 @@ pub static REJECTION_CASES: &[RejectionCase] = &[
         eval: RejectionEval::Instant,
         time_offset_ms: 600_000,
         message_contains: "subquery over native histograms",
-    },
-    RejectionCase {
-        construct: "binary operator over native histograms",
-        query: "diff_native_hist * 2",
-        eval: RejectionEval::Instant,
-        time_offset_ms: 0,
-        message_contains: "binary operator over native histograms",
     },
     RejectionCase {
         // +600s so the instant query's window matches the generated histogram
@@ -2355,9 +2334,11 @@ mod tests {
     #[test]
     fn divergence_probe_marker_does_not_cross_match_a_different_divergence() {
         // Two entries can both use `mode: ravel_error_prom_success` for
-        // unrelated reasons (ADR-0030's subquery point cap, issue #524's
-        // histogram-binop guard); a registry row's marker must not count
-        // the other's corpus entries as its own evidence.
+        // unrelated reasons, and a registry row's marker must not count the
+        // other's corpus entries as its own evidence. ADR-0030's subquery
+        // point cap is the only such divergence the corpus carries now, so
+        // the histogram entry below is synthetic: it stands for whatever the
+        // next accepted divergence turns out to be.
         let histogram_entry = parse_corpus(
             "name: error_binop_over_histogram\nquery: h * 2\nkind: instant\ntime: +0s\nmode: ravel_error_prom_success\n",
         )

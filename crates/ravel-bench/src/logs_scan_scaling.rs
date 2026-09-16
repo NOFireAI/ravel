@@ -615,7 +615,7 @@ async fn measure_planning_latency(
             .plan_segment(seg, tenant_hash, &query, &accounting)
             .await
             .expect("plan segment");
-        if let Some((survivors, _, _)) = planned {
+        if let Some((survivors, _, _, _)) = planned {
             total_blocks += survivors;
         }
     }
@@ -640,7 +640,7 @@ async fn measure_planning_latency(
     assert_eq!(
         planned
             .iter()
-            .filter_map(|p| p.as_ref().map(|(s, _, _)| *s))
+            .filter_map(|p| p.as_ref().map(|(s, _, _, _)| *s))
             .sum::<usize>(),
         total_blocks,
         "both planning passes must prune to the same surviving-block count"
@@ -726,6 +726,9 @@ async fn run_combo(
         min_tokens: Vec::new(),
         now_ns: NOW_NS,
         deadline,
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     };
 
     // Observe the physical plan's scan fan-out before the timed runs. Planning

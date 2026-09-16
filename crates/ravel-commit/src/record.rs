@@ -2,7 +2,7 @@
 //! (docs/catalog-and-mvcc.md, ADR-0010 §1).
 
 use prost::Message;
-use ravel_proto::commit::v1::CommitRecord;
+use ravel_proto::commit::v1::{CommitRecord, CompactionRecord, RetentionTombstone};
 use ravel_types::{CommitToken, Signal, TenantHash};
 use uuid::Uuid;
 
@@ -11,7 +11,55 @@ use crate::signal;
 
 /// The only supported `CommitRecord.format_version`.
 pub const FORMAT_VERSION: u32 = 1;
+/// The only supported `CompactionRecord.format_version` (ADR-0066 decision 2).
+pub const COMPACTION_FORMAT_VERSION: u32 = 1;
+/// The only supported `RetentionTombstone.format_version` (ADR-0066 decision 2).
+pub const TOMBSTONE_FORMAT_VERSION: u32 = 1;
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+/// A durable commit-protocol record kind that carries a `format_version`.
+/// Every variant here must have a decode-and-validate pair that rejects an
+/// out-of-range version through [`check_format_version`]; the enumeration
+/// guard test asserts it, so a fourth kind cannot ship ungated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordKind {
+    Commit,
+    Compaction,
+    RetentionTombstone,
+}
+
+impl RecordKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            RecordKind::Commit => "commit record",
+            RecordKind::Compaction => "compaction record",
+            RecordKind::RetentionTombstone => "retention tombstone",
+        }
+    }
+}
+
+/// The shared supported-set gate for every versioned record kind: `actual`
+/// must fall within the inclusive `[min, max]` band. A version below the
+/// floor (a writer that failed to stamp, leaving proto3's default 0) and a
+/// version above the ceiling (a future writer whose meaning this reader does
+/// not know) are both refused with the typed error naming the kind and the
+/// version seen, never read as the supported version.
+fn check_format_version(
+    kind: RecordKind,
+    actual: u32,
+    min: u32,
+    max: u32,
+) -> Result<(), RecordError> {
+    if actual < min || actual > max {
+        return Err(RecordError::UnsupportedRecordFormatVersion {
+            kind,
+            min,
+            max,
+            actual,
+        });
+    }
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RecordError {
@@ -21,6 +69,16 @@ pub enum RecordError {
     InvalidContentHashLen(usize),
     #[error("unsupported format_version: expected {expected}, got {actual}")]
     UnsupportedFormatVersion { expected: u32, actual: u32 },
+    #[error(
+        "unsupported {kind} format_version: supported {min}..={max}, got {actual}",
+        kind = kind.as_str()
+    )]
+    UnsupportedRecordFormatVersion {
+        kind: RecordKind,
+        min: u32,
+        max: u32,
+        actual: u32,
+    },
     #[error("event ts out of order: min_event_ts_ns {min} > max_event_ts_ns {max}")]
     EventTsOutOfOrder { min: i64, max: i64 },
     #[error("ingest ts out of order: min_ingest_ts_ns {min} > max_ingest_ts_ns {max}")]
@@ -185,6 +243,68 @@ pub fn token_for(record: &CommitRecord) -> Result<CommitToken, RecordError> {
     })
 }
 
+/// Structural invariants every `CompactionRecord` must satisfy on read. The
+/// primary gate is the supported-set `format_version` check (ADR-0066
+/// decision 2): a record stamped with an unknown version is refused, never
+/// read as version 1. Mirrors [`validate`] for `CommitRecord`; like it, the
+/// distinct `object_key`/identity reconstruction is a separate reader check
+/// (see [`crate::keys::verify_compaction_record_key`]), not repeated here.
+pub fn validate_compaction(record: &CompactionRecord) -> Result<(), RecordError> {
+    check_format_version(
+        RecordKind::Compaction,
+        record.format_version,
+        COMPACTION_FORMAT_VERSION,
+        COMPACTION_FORMAT_VERSION,
+    )?;
+    if record.tenant_hash.len() != 16 {
+        return Err(RecordError::InvalidTenantHashLen(record.tenant_hash.len()));
+    }
+    Ok(())
+}
+
+/// Serialize a `CompactionRecord`. Infallible, like [`encode`].
+pub fn encode_compaction(record: &CompactionRecord) -> bytes::Bytes {
+    record.encode_to_vec().into()
+}
+
+/// Deserialize and validate a `CompactionRecord`. The only decode path
+/// production code may use: the raw prost `Message::decode` skips the
+/// `format_version` gate and reads a future record as version 1.
+pub fn decode_compaction(bytes: &[u8]) -> Result<CompactionRecord, RecordError> {
+    let record = CompactionRecord::decode(bytes)?;
+    validate_compaction(&record)?;
+    Ok(record)
+}
+
+/// Structural invariants every `RetentionTombstone` must satisfy on read.
+/// Same supported-set `format_version` gate and rationale as
+/// [`validate_compaction`].
+pub fn validate_tombstone(record: &RetentionTombstone) -> Result<(), RecordError> {
+    check_format_version(
+        RecordKind::RetentionTombstone,
+        record.format_version,
+        TOMBSTONE_FORMAT_VERSION,
+        TOMBSTONE_FORMAT_VERSION,
+    )?;
+    if record.tenant_hash.len() != 16 {
+        return Err(RecordError::InvalidTenantHashLen(record.tenant_hash.len()));
+    }
+    Ok(())
+}
+
+/// Serialize a `RetentionTombstone`. Infallible, like [`encode`].
+pub fn encode_tombstone(record: &RetentionTombstone) -> bytes::Bytes {
+    record.encode_to_vec().into()
+}
+
+/// Deserialize and validate a `RetentionTombstone`. The only decode path
+/// production code may use, for the same reason as [`decode_compaction`].
+pub fn decode_tombstone(bytes: &[u8]) -> Result<RetentionTombstone, RecordError> {
+    let record = RetentionTombstone::decode(bytes)?;
+    validate_tombstone(&record)?;
+    Ok(record)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -326,5 +446,161 @@ mod tests {
         input.ingest_hour_bucket = u32::MAX;
         let record = build(input).expect("zero created_unix_ns skips the cross-check");
         assert!(validate(&record).is_ok());
+    }
+
+    fn sample_compaction() -> CompactionRecord {
+        CompactionRecord {
+            format_version: COMPACTION_FORMAT_VERSION,
+            tenant_hash: vec![0x33; 16],
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            shard: 1,
+            ingest_hour_bucket: 495_734,
+            level: 1,
+            inputs: Vec::new(),
+            input_set_hash: vec![0x44; 32],
+            parts: Vec::new(),
+            created_unix_ns: 495_734 * NS_PER_HOUR,
+        }
+    }
+
+    fn sample_tombstone() -> RetentionTombstone {
+        RetentionTombstone {
+            format_version: TOMBSTONE_FORMAT_VERSION,
+            tenant_hash: vec![0x55; 16],
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            shard: 1,
+            ingest_hour_bucket: 495_734,
+            retired_at_ns: 495_734 * NS_PER_HOUR,
+            retention_window_ns: 720 * NS_PER_HOUR as u64,
+            record_count_observed: 3,
+        }
+    }
+
+    #[test]
+    fn compaction_version_one_accepted_and_round_trips() {
+        let record = sample_compaction();
+        assert!(validate_compaction(&record).is_ok());
+        let bytes = encode_compaction(&record);
+        let decoded = decode_compaction(&bytes).expect("decode");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn compaction_version_two_refused_with_typed_error() {
+        let mut record = sample_compaction();
+        record.format_version = 2;
+        let bytes = record.encode_to_vec();
+        assert_eq!(
+            decode_compaction(&bytes),
+            Err(RecordError::UnsupportedRecordFormatVersion {
+                kind: RecordKind::Compaction,
+                min: 1,
+                max: 1,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn compaction_version_zero_refused_with_typed_error() {
+        let mut record = sample_compaction();
+        record.format_version = 0;
+        let bytes = record.encode_to_vec();
+        assert_eq!(
+            decode_compaction(&bytes),
+            Err(RecordError::UnsupportedRecordFormatVersion {
+                kind: RecordKind::Compaction,
+                min: 1,
+                max: 1,
+                actual: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn tombstone_version_one_accepted_and_round_trips() {
+        let record = sample_tombstone();
+        assert!(validate_tombstone(&record).is_ok());
+        let bytes = encode_tombstone(&record);
+        let decoded = decode_tombstone(&bytes).expect("decode");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn tombstone_version_two_refused_with_typed_error() {
+        let mut record = sample_tombstone();
+        record.format_version = 2;
+        let bytes = record.encode_to_vec();
+        assert_eq!(
+            decode_tombstone(&bytes),
+            Err(RecordError::UnsupportedRecordFormatVersion {
+                kind: RecordKind::RetentionTombstone,
+                min: 1,
+                max: 1,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn tombstone_version_zero_refused_with_typed_error() {
+        let mut record = sample_tombstone();
+        record.format_version = 0;
+        let bytes = record.encode_to_vec();
+        assert_eq!(
+            decode_tombstone(&bytes),
+            Err(RecordError::UnsupportedRecordFormatVersion {
+                kind: RecordKind::RetentionTombstone,
+                min: 1,
+                max: 1,
+                actual: 0,
+            })
+        );
+    }
+
+    /// Enumeration guard: every `RecordKind` must have a decode-and-validate
+    /// pair that refuses an out-of-range `format_version`. The exhaustive
+    /// match makes a fourth kind fail to compile here until it is wired to a
+    /// validate pair, so no versioned record can ship ungated (ADR-0066).
+    #[test]
+    fn every_record_kind_has_a_versioned_validate_pair() {
+        for kind in [
+            RecordKind::Commit,
+            RecordKind::Compaction,
+            RecordKind::RetentionTombstone,
+        ] {
+            match kind {
+                RecordKind::Commit => {
+                    let mut record = build(base_input()).expect("valid");
+                    record.format_version = 2;
+                    assert!(matches!(
+                        validate(&record),
+                        Err(RecordError::UnsupportedFormatVersion { .. })
+                    ));
+                }
+                RecordKind::Compaction => {
+                    let mut record = sample_compaction();
+                    record.format_version = 2;
+                    assert!(matches!(
+                        validate_compaction(&record),
+                        Err(RecordError::UnsupportedRecordFormatVersion {
+                            kind: RecordKind::Compaction,
+                            ..
+                        })
+                    ));
+                }
+                RecordKind::RetentionTombstone => {
+                    let mut record = sample_tombstone();
+                    record.format_version = 2;
+                    assert!(matches!(
+                        validate_tombstone(&record),
+                        Err(RecordError::UnsupportedRecordFormatVersion {
+                            kind: RecordKind::RetentionTombstone,
+                            ..
+                        })
+                    ));
+                }
+            }
+        }
     }
 }

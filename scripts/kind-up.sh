@@ -44,6 +44,11 @@ CLUSTER_NAME="${RAVEL_KIND_CLUSTER:-ravel-dev}"
 # floating tag would silently change the control-plane version under a
 # reproduction. This is the image kind v0.32.0 ships with, and the digest is
 # the multi-arch index digest, so it resolves on both amd64 and arm64 hosts.
+# v1.32.2 sits above the operator's own minimum Kubernetes floor
+# (MIN_KUBERNETES_MINOR_VERSION = 30, issue #1714), not at it: never pin
+# this below 1.30, or the apiserver drops the rendered preStop SleepAction
+# (the pod runs without it) and the operator raises
+# KubernetesVersionUnsupported on the cluster.
 NODE_IMAGE="${RAVEL_KIND_NODE_IMAGE:-kindest/node:v1.32.2@sha256:142f543559cc55d64e1ab9341df08e5ced84bd2e893736da8f51320f26f5950b}"
 SERVER_IMAGE="${RAVEL_SERVER_IMAGE:-ravel-server:kind-dev}"
 OPERATOR_IMAGE="${RAVEL_OPERATOR_IMAGE:-ravel-operator:kind-dev}"
@@ -60,6 +65,7 @@ TENANT_NAME="${RAVEL_TENANT_NAME:-demo-tenant}"
 TENANT_TOKEN="${RAVEL_TENANT_TOKEN:-demo-token}"
 S3_CREDENTIALS_SECRET="ravel-s3-credentials"
 TENANT_TOKENS_SECRET="ravel-tenant-tokens"
+AUDIT_TOKEN_KEY_SECRET="ravel-audit-token-key"
 
 log() {
   echo "[kind-up] $*" >&2
@@ -68,6 +74,42 @@ log() {
 die() {
   log "$*"
   exit 1
+}
+
+# Wait until a RavelCluster status condition reaches a target status AND its
+# observedGeneration has caught up to .metadata.generation, i.e. the condition
+# reflects the currently applied spec rather than a prior one. The lane reuses
+# clusters and re-applies the dev RavelCluster (step 6), so a re-qualification
+# can be in flight while the operator still reports the previous generation's
+# Available=True; a bare `kubectl wait --for=condition=Available` would then
+# return before the new qualification and Deployment rollout finish. Bounded by
+# an explicit timeout so a stuck condition fails with a clear message instead of
+# hanging. Args: condition type, target status, timeout seconds, description.
+wait_cluster_condition() {
+  local ctype="$1" want="$2" timeout="$3" desc="$4"
+  local deadline=$(( SECONDS + timeout ))
+  local snap rest gen obsgen cstatus
+  while (( SECONDS < deadline )); do
+    # One GET per iteration: read .metadata.generation, the condition status, and
+    # its observedGeneration from a SINGLE object snapshot. Reading them in three
+    # separate kubectl calls let a spec change land between reads, matching an old
+    # condition against an old generation and returning success early. A single
+    # jsonpath template applied to one fetched object is an atomic read of all
+    # three, joined by a literal '|' none of the values can contain (an integer,
+    # a True/False/Unknown status, an integer).
+    snap="$(kubectl get --namespace "$NAMESPACE" "ravelcluster/${CLUSTER_CR}" \
+      -o jsonpath="{.metadata.generation}|{.status.conditions[?(@.type==\"${ctype}\")].status}|{.status.conditions[?(@.type==\"${ctype}\")].observedGeneration}" \
+      2>/dev/null || true)"
+    gen="${snap%%|*}"
+    rest="${snap#*|}"
+    cstatus="${rest%%|*}"
+    obsgen="${rest##*|}"
+    if [[ -n "$gen" && "$cstatus" == "$want" && "$obsgen" == "$gen" ]]; then
+      return 0
+    fi
+    sleep 3
+  done
+  die "timed out after ${timeout}s waiting for ${desc}: ${ctype}=${want} at generation ${gen:-?} (observed ${ctype}=${cstatus:-<none>} at generation ${obsgen:-<none>})"
 }
 
 # On any failure after the cluster exists, dump what a human would ask for
@@ -117,7 +159,7 @@ case "$BACKEND" in
     ;;
 esac
 
-for tool in docker kind kubectl; do
+for tool in docker kind kubectl openssl; do
   command -v "$tool" >/dev/null 2>&1 || die "${tool} is required but not on PATH"
 done
 
@@ -162,7 +204,7 @@ kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -
 # Secrets are created by the script, not committed as manifests: committing a
 # Secret manifest -- even a dev one -- puts credentials in git and invites
 # copying into a real cluster.
-log "creating Secrets ${S3_CREDENTIALS_SECRET} and ${TENANT_TOKENS_SECRET}"
+log "creating Secrets ${S3_CREDENTIALS_SECRET}, ${TENANT_TOKENS_SECRET}, and ${AUDIT_TOKEN_KEY_SECRET}"
 kubectl create secret generic "$S3_CREDENTIALS_SECRET" \
   --namespace "$NAMESPACE" \
   --from-literal="accessKeyId=${S3_ACCESS_KEY}" \
@@ -173,6 +215,14 @@ kubectl create secret generic "$S3_CREDENTIALS_SECRET" \
 kubectl create secret generic "$TENANT_TOKENS_SECRET" \
   --namespace "$NAMESPACE" \
   --from-literal="${TENANT_NAME}=${TENANT_TOKEN}" \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+# The operator does not generate this Secret (#1487: its RBAC grants
+# `secrets get` only), so the same platform-owner-provisions-it pattern as
+# the two Secrets above applies here too. One key, 64 hex characters
+# (32 bytes).
+kubectl create secret generic "$AUDIT_TOKEN_KEY_SECRET" \
+  --namespace "$NAMESPACE" \
+  --from-literal="key=$(openssl rand -hex 32)" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 # ---- 4. fake S3 backend ------------------------------------------------------
@@ -194,62 +244,11 @@ if ! kubectl wait --namespace "$NAMESPACE" --for=condition=Complete --timeout=30
 fi
 log "bucket ${BUCKET} ready on ${S3_ENDPOINT}"
 
-# ---- 4b. store qualification --------------------------------------------
-# ADR-0050 section 6 (EC7): server startup on a non-Memory store
-# refuses unless `sys/qualification` is already present. Unlike the tenancy
-# marker and gc-config objects, there is deliberately no bootstrap-and-continue
-# path for this one -- it is only ever written by an explicit `ravel-cli store
-# qualify` run, so this script has to be that run, or every gateway/query/
-# maintain pod the RavelCluster below creates crash-loops on a fresh bucket
-# (the exact EC3/#566 startup-refusal shape, this time for qualification).
-# Runs as a one-shot Job using the server image already loaded into the
-# cluster (it ships ravel-cli alongside ravel-server, see the Dockerfile),
-# against the same bucket/credentials the RavelCluster will use.
-log "running store qualification (ravel-cli store qualify) against ${S3_ENDPOINT}"
-kubectl delete job ravel-store-qualify --namespace "$NAMESPACE" \
-  --ignore-not-found --wait=true >/dev/null
-kubectl apply -f - <<YAML
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: ravel-store-qualify
-  namespace: ${NAMESPACE}
-spec:
-  backoffLimit: 2
-  template:
-    spec:
-      restartPolicy: Never
-      containers:
-        - name: qualify
-          image: ${SERVER_IMAGE}
-          imagePullPolicy: IfNotPresent
-          command: ["/usr/local/bin/ravel-cli"]
-          args: ["--store", "s3", "store", "qualify"]
-          env:
-            - name: RAVEL_S3_ENDPOINT
-              value: "${S3_ENDPOINT}"
-            - name: RAVEL_S3_BUCKET
-              value: "${BUCKET}"
-            - name: RAVEL_S3_REGION
-              value: "us-east-1"
-            - name: RAVEL_S3_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: ${S3_CREDENTIALS_SECRET}
-                  key: accessKeyId
-            - name: RAVEL_S3_SECRET_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: ${S3_CREDENTIALS_SECRET}
-                  key: secretAccessKey
-YAML
-if ! kubectl wait --namespace "$NAMESPACE" --for=condition=Complete --timeout=120s \
-  job/ravel-store-qualify; then
-  kubectl logs --namespace "$NAMESPACE" job/ravel-store-qualify 2>&1 |
-    sed 's/^/[qualify-job] /' >&2 || true
-  die "store qualification job did not complete"
-fi
-log "store qualified"
+# Store qualification is no longer a step here: the operator runs its own
+# one-shot `<cluster>-qualify` Job before it creates any serving Deployment and
+# gates them on its success (issue #36, ADR-0034), so this script installing the
+# operator (step 5) and applying the RavelCluster (step 6) is enough to qualify
+# the bucket exactly once. A hand-run Job here would only duplicate it.
 
 # ---- 5. operator -------------------------------------------------------------
 # CRD before the operator Deployment: the operator's watch fails until the
@@ -293,6 +292,8 @@ spec:
         name: ${S3_CREDENTIALS_SECRET}
   tenantTokensSecretRef:
     name: ${TENANT_TOKENS_SECRET}
+  auditTokenKeySecretRef:
+    name: ${AUDIT_TOKEN_KEY_SECRET}
   gateway:
     replicas: 1
   query:
@@ -305,12 +306,19 @@ spec:
 YAML
 
 # ---- 7. readiness ------------------------------------------------------------
-# The operator sets Available=True only when both the gateway and the query
-# Deployment report ready replicas, so this waits on real pods passing /readyz
-# against the real backend, not on objects existing.
-log "waiting for RavelCluster ${CLUSTER_CR} to report Available"
-kubectl wait --namespace "$NAMESPACE" --for=condition=Available --timeout=300s \
-  "ravelcluster/${CLUSTER_CR}"
+# Two bounded stages, in order, because the lane reuses clusters and re-applies
+# the dev RavelCluster. First StoreQualified=True at the current generation: on
+# a reused cluster the operator re-runs qualification for the new inputs while it
+# keeps the previous generation's Available=True, so gating on Available alone
+# could return before the new qualification (and the Deployment rollout it gates)
+# even starts. Then Available=True at the current generation, which the operator
+# sets only when both the gateway and query Deployments report ready replicas for
+# the applied spec: real pods passing /readyz against the real backend, not
+# objects existing.
+log "waiting for RavelCluster ${CLUSTER_CR} to report StoreQualified for the applied spec"
+wait_cluster_condition StoreQualified True 300 "store qualification to pass"
+log "waiting for RavelCluster ${CLUSTER_CR} to report Available for the applied spec"
+wait_cluster_condition Available True 300 "the gateway and query tiers to become ready"
 
 log "cluster up. Deployments:"
 kubectl get --namespace "$NAMESPACE" deployments

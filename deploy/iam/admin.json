@@ -36,10 +36,16 @@
       ]
     },
     {
+      "Sid": "AdminQualifyDelete",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/sys/qualify/*"
+    },
+    {
       "Sid": "AdminTenantKms",
       "Effect": "Allow",
       "Action": "kms:Decrypt",
-      "Resource": "arn:aws:kms:us-east-1:111122223333:key/*"
+      "Resource": ["arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-TENANT-KEY-ID"]
     },
     {
       "Sid": "DenyDeleteProtected",

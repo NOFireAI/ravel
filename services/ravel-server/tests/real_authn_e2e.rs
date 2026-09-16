@@ -29,6 +29,9 @@ use ravel_query::http::{OidcJwksCache, OidcResolver, TenantResolver};
 use ravel_server::config::AuthResolverSettings;
 use ravel_server::tenant::FallbackResolver;
 use ravel_server::{FoldTaskConfig, Mode, MtlsListenerConfig, ServerConfig};
+use ravel_types::TenantId;
+
+const DEV_TENANT_HEADER: &str = "x-ravel-tenant";
 
 const ISSUER: &str = "https://issuer.example.com";
 const KID: &str = "itest-key";
@@ -54,8 +57,21 @@ async fn start_with_mtls(
     resolver: Arc<dyn TenantResolver>,
     mtls_resolver: Option<Arc<dyn TenantResolver>>,
 ) -> ravel_server::Running {
+    let (running, _store) = start_returning_store(resolver, mtls_resolver).await;
+    running
+}
+
+/// Same as [`start_with_mtls`] but also hands back the backing `MemoryStore`,
+/// so a test can count objects before and after a request to prove a rejected
+/// request wrote nothing durable.
+async fn start_returning_store(
+    resolver: Arc<dyn TenantResolver>,
+    mtls_resolver: Option<Arc<dyn TenantResolver>>,
+) -> (ravel_server::Running, Arc<MemoryStore>) {
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
@@ -82,6 +98,7 @@ async fn start_with_mtls(
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
@@ -94,16 +111,22 @@ async fn start_with_mtls(
         typed_attr_columns: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_is_fallback: false,
         cache_dir: None,
+        catalog_resolve_concurrency: None,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
         remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: std::time::Duration::ZERO,
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
     };
-    ravel_server::start(
+    let running = ravel_server::start(
         config,
         store.clone(),
         store.clone(),
@@ -111,7 +134,8 @@ async fn start_with_mtls(
         None,
     )
     .await
-    .expect("server starts")
+    .expect("server starts");
+    (running, store)
 }
 
 async fn start_with_resolver(resolver: Arc<dyn TenantResolver>) -> ravel_server::Running {
@@ -175,6 +199,236 @@ fn mtls_bundle() -> (Arc<dyn TenantResolver>, Arc<dyn TenantResolver>) {
         .mtls_resolver
         .expect("mtls_header was set above, so build_auth_resolver returns Some");
     (bundle.resolver, mtls_resolver)
+}
+
+/// The production resolver chain with the dev header flag OFF: the static
+/// bearer map only, exactly what `build_auth_resolver(tokens, false, ..)`
+/// produces when `--dev-insecure-tenant-header` is not passed. Two genuinely
+/// distinct tenants, each with its own bearer credential, so a forged
+/// `x-ravel-tenant` naming one of them carries no legitimate token.
+fn bearer_only_resolver() -> Arc<dyn TenantResolver> {
+    let mut tokens = HashMap::new();
+    tokens.insert("victim-token".to_string(), TenantId::new("victim-tenant"));
+    tokens.insert(
+        "attacker-token".to_string(),
+        TenantId::new("attacker-tenant"),
+    );
+    ravel_server::tenant::build_auth_resolver(
+        tokens,
+        false,
+        AuthResolverSettings {
+            oidc: None,
+            mtls_header: None,
+        },
+    )
+    .expect("resolver builds")
+    .resolver
+}
+
+async fn store_key_count(store: &MemoryStore) -> usize {
+    ravel_object_store::list_all(store, "")
+        .await
+        .expect("list store")
+        .len()
+}
+
+/// A minimal but non-empty OTLP metrics export: one resource, one gauge point
+/// under one series for `victim-tenant`. Sent with a real bearer this produces
+/// durable objects (the positive control below proves it); the negative test
+/// sends the exact same payload with only a forged `x-ravel-tenant` header, so
+/// its unchanged-key-count assertion measures a request the server would have
+/// written had it accepted it. An empty `resource_metrics` would make that
+/// assertion vacuous: an accepted-but-empty export writes nothing either, so
+/// before == after could not tell rejection from a no-op.
+fn victim_metrics_export_request()
+-> opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
+    use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+    };
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let ts_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_nanos() as u64;
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(AnyValueVariant::StringValue("authn-e2e".to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "authn_e2e_gauge".to_string(),
+                    data: Some(MetricData::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: ts_ns,
+                            value: Some(NumberValue::AsDouble(1.0)),
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+/// Positive control for
+/// [`forged_tenant_header_rejected_on_public_grpc_and_writes_nothing`]: the
+/// same non-empty payload, exported with the victim tenant's real bearer
+/// token, must be accepted and write durable objects. Strict ingest (the
+/// default, no `x-ravel-ingest-mode` header) blocks the export until the
+/// flush's commit ack, so a completed `export` already guarantees the objects
+/// are on the store. Without this control the negative test's before/after
+/// assertion proves nothing: it could pass because the payload never writes
+/// anything, credential or not.
+#[tokio::test]
+async fn valid_bearer_metric_export_writes_durable_objects() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+
+    let (running, store) = start_returning_store(bearer_only_resolver(), None).await;
+    let before = store_key_count(&store).await;
+
+    let grpc_addr = running.grpc_addr.expect("gRPC listener binds in All mode");
+    let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("gRPC client connects");
+    let mut request = tonic::Request::new(victim_metrics_export_request());
+    request.metadata_mut().insert(
+        "authorization",
+        "Bearer victim-token".parse().expect("ascii metadata"),
+    );
+    client
+        .export(request)
+        .await
+        .expect("a valid bearer must authenticate and the export must be accepted");
+
+    let after = store_key_count(&store).await;
+    assert_eq!(
+        after - before,
+        DURABLE_OBJECTS_PER_METRIC_EXPORT,
+        "a valid non-empty metric export must write exactly \
+         {DURABLE_OBJECTS_PER_METRIC_EXPORT} durable object(s): store held {before} keys before \
+         and {after} after"
+    );
+
+    let metric_prefix = format!("t/{}/m/l0/", TenantId::new("victim-tenant").hash().to_hex());
+    let metric_objects = ravel_object_store::list_all(store.as_ref(), &metric_prefix)
+        .await
+        .expect("list metric data objects")
+        .len();
+    assert_eq!(
+        metric_objects, 1,
+        "the accepted export must land exactly one metric data object under {metric_prefix}"
+    );
+
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// The exact number of durable objects a single non-empty metric export writes
+/// through one shard's one flush: one data object, one commit record, one
+/// catalog manifest. Pinned so the negative test's before == after assertion
+/// is read against a payload known to move this count when accepted.
+const DURABLE_OBJECTS_PER_METRIC_EXPORT: usize = 3;
+
+/// With `--dev-insecure-tenant-header` OFF, an OTLP gRPC export carrying only
+/// the `x-ravel-tenant` header for a victim tenant (no bearer credential) is
+/// Unauthenticated on the public gRPC listener, and writes nothing durable.
+/// This exercises the running listener through `start()`, not the config-level
+/// `validate()` predicate: `main.rs` is the only caller of `Cli::validate` and
+/// `start()` never re-validates, so a config guard alone proves nothing about
+/// the listener (issue #1293).
+#[tokio::test]
+async fn forged_tenant_header_rejected_on_public_grpc_and_writes_nothing() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+
+    let (running, store) = start_returning_store(bearer_only_resolver(), None).await;
+    let before = store_key_count(&store).await;
+
+    let grpc_addr = running.grpc_addr.expect("gRPC listener binds in All mode");
+    let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("gRPC client connects");
+    // A non-empty payload, the same one the positive control proves DOES write
+    // durable objects with a real credential. With only the forged header the
+    // before == after assertion below now distinguishes rejection from an
+    // accepted no-op.
+    let mut request = tonic::Request::new(victim_metrics_export_request());
+    request.metadata_mut().insert(
+        DEV_TENANT_HEADER,
+        "victim-tenant".parse().expect("ascii metadata"),
+    );
+    let status = client
+        .export(request)
+        .await
+        .expect_err("x-ravel-tenant must not authenticate on the public gRPC listener");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    let after = store_key_count(&store).await;
+    assert_eq!(
+        after, before,
+        "a rejected export must write no object: store held {before} keys before and \
+         {after} after"
+    );
+
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// The Flight SQL sibling of the above: a `get_flight_info` carrying only the
+/// `x-ravel-tenant` metadata, with the dev header flag OFF, is Unauthenticated
+/// on the public Flight listener. `get_flight_info` is the authenticated Flight
+/// entry point (it resolves the tenant before planning); the Flight `Handshake`
+/// RPC has no default implementation in arrow-flight and never reaches the
+/// resolver, so it cannot demonstrate the auth boundary.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn forged_tenant_header_rejected_on_public_flight() {
+    use arrow_flight::FlightDescriptor;
+    use arrow_flight::flight_service_client::FlightServiceClient;
+    use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
+    use prost::Message as _;
+
+    let (running, _store) = start_returning_store(bearer_only_resolver(), None).await;
+    let grpc_addr = running.grpc_addr.expect("gRPC listener binds in All mode");
+    let channel = tonic::transport::Channel::from_shared(format!("http://{grpc_addr}"))
+        .expect("valid endpoint uri")
+        .connect()
+        .await
+        .expect("Flight client connects");
+    let mut client = FlightServiceClient::new(channel);
+
+    let command = CommandStatementQuery {
+        query: "SELECT 1".to_string(),
+        transaction_id: None,
+    };
+    let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
+    let mut request = tonic::Request::new(descriptor);
+    request.metadata_mut().insert(
+        DEV_TENANT_HEADER,
+        "victim-tenant".parse().expect("ascii metadata"),
+    );
+    let status = client
+        .get_flight_info(request)
+        .await
+        .expect_err("x-ravel-tenant must not authenticate on the public Flight listener");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    running.shutdown().await.expect("clean shutdown");
 }
 
 #[tokio::test]

@@ -55,8 +55,8 @@ use crate::distrib::{
 use crate::engine::merge_soa_runs;
 use crate::erasure::{ErasurePredicate, is_erased_span};
 use crate::fetcher::SegmentFetcher;
-use crate::log_fetcher::{LogQuery, LogSegmentFetcher};
-use crate::span_fetcher::{SpanRow, SpanSegmentFetcher};
+use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
+use crate::span_fetcher::{SpanFetchError, SpanRow, SpanSegmentFetcher};
 
 const NS: i64 = 1_000_000;
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -482,6 +482,128 @@ proptest! {
         let rt = Runtime::new().expect("runtime");
         rt.block_on(run_acceptance(segments, cap));
     }
+
+    /// ADR-0103 count-pushdown acceptance at a fan-out above one: the
+    /// coordinator collects each slice's worker partials in slice-completion
+    /// order (which varies run to run under `buffer_unordered`), and
+    /// `sorted_pushdown_counts` must turn them into the same per-series count
+    /// table a purely local fetch-and-count produces, in the same label-set
+    /// order the raw path sorts its merged series into.
+    ///
+    /// Each series lives in its own segment under its own shard, so the
+    /// shard-major partition places every series in exactly one slice for any
+    /// cap: the pushdown path hard-errors (`DuplicatePushdownSeries`) on a
+    /// series id that appears in two slices, so a differential over it must
+    /// keep every series slice-local.
+    #[test]
+    fn distributed_pushdown_count_equals_local(
+        per_series in prop::collection::vec(arb_samples(), 2..8),
+        cap in 2usize..=6,
+    ) {
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(run_pushdown_count_acceptance(per_series, cap));
+    }
+}
+
+/// The metric name (`__name__`) of a label set, the whole distinguishing label
+/// in the pushdown corpora.
+fn metric_name(labels: &LabelSet) -> String {
+    labels
+        .iter()
+        .find(|l| l.name == "__name__")
+        .map(|l| l.value.clone())
+        .expect("corpus labels carry __name__")
+}
+
+/// Drives one count-pushdown differential: build `per_series.len()` distinct
+/// series, one per segment and one per shard, fetch their counts both locally
+/// and through the distributed pushdown path at `cap`, and assert the built
+/// count table equals the local counts and is in label-set order.
+async fn run_pushdown_count_acceptance(per_series: Vec<Vec<(i64, u64)>>, cap: usize) {
+    let store = Arc::new(MemoryStore::new());
+    let mut segments = Vec::new();
+    for (i, samples) in per_series.iter().enumerate() {
+        let desc = SeriesDesc {
+            metric: format!("m{i}"),
+            samples: samples.clone(),
+        };
+        // One series, its own segment, its own shard, so no series id can span
+        // two slices at any cap.
+        segments.push(
+            write_segment(&store, i as u64, i as u32, 100, std::slice::from_ref(&desc)).await,
+        );
+    }
+    let snapshot = Snapshot {
+        segments: segments.clone(),
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+
+    // Local reference: the deduped per-series sample count, keyed by metric.
+    let (local_runs, _acct, _stats) = local_scalar(Arc::clone(&store), &snapshot).await;
+    let local_merged = merge_soa_runs(local_runs, usize::MAX, usize::MAX).expect("local merge");
+    let mut local_counts: Vec<(String, u64)> = local_merged
+        .iter()
+        .map(|s| (metric_name(&s.labels), s.samples.len() as u64))
+        .collect();
+    local_counts.sort();
+
+    // Distributed count pushdown over a real worker at a fan-out above one.
+    let (fetcher, server) = spawn_worker(Arc::clone(&store), segments).await;
+    let distributed = Distributed::new(
+        Arc::new(fetcher),
+        DistribThresholds {
+            min_store_bytes: 0,
+            min_segments: 0,
+            max_parallel_slices: cap,
+        },
+    );
+    let accounting = QueryAccounting::new();
+    let (_triple, partials) = distributed
+        .fetch(
+            TENANT,
+            Signal::Metrics,
+            &snapshot,
+            &[],
+            &[],
+            &accounting,
+            &EngineConfig::default(),
+            i64::MAX,
+            Some(pb::PartialAggregateRequest {
+                want_count: true,
+                want_min: false,
+                want_max: false,
+                reduce_start_ns: None,
+                reduce_end_ns: None,
+            }),
+        )
+        .await
+        .expect("distributed fetch")
+        .expect("count pushdown produced a result, not a fallback");
+    server.abort();
+
+    let table = crate::engine::sorted_pushdown_counts(partials);
+
+    // In label-set order regardless of which slice finished first: the raw path
+    // sorts its merged series by this same comparison, so the pushdown table
+    // must too.
+    let mut resorted = table.clone();
+    resorted.sort_by(|a, b| a.0.iter().cmp(b.0.iter()));
+    assert_eq!(
+        table, resorted,
+        "pushdown count table is not in label-set order"
+    );
+
+    // And it carries exactly the local per-series counts.
+    let mut got: Vec<(String, u64)> = table
+        .iter()
+        .map(|(labels, count)| (metric_name(labels), *count))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got, local_counts,
+        "distributed pushdown counts differ from the local reduction"
+    );
 }
 
 /// A hand-built corpus where metric `m0` is written under shard 0 in hour 100
@@ -5041,4 +5163,108 @@ fn duplicate_partial_series_id_is_a_hard_error() {
             "expected DuplicatePushdownSeries, got {err:?}"
         );
     });
+}
+
+/// The coordinator reconstructs a worker's memory refusal by parsing the
+/// figures back out of the gRPC status message, because today's `Status`
+/// carries only a code and a message: `parse_fetch_memory_exhausted` is the
+/// exact inverse of `FetchMemoryExhausted`'s `Display`. That is a stopgap, not
+/// a constraint -- the proto evolves additively, so three `uint64` fields would
+/// carry the figures and delete this coupling. Three independently-editable
+/// `#[error(..)]` strings render that variant -- `FetchError` (series fold,
+/// `distrib/mod.rs:355`), `LogFetchError` (log fold, `:529`), and
+/// `SpanFetchError` (span fold, `:682`) -- and nothing but this test keeps them
+/// textually identical to each other and to the parser. This pins all three:
+/// a reword of any one of them, alone, fails the corresponding `assert_eq`
+/// below rather than silently degrading that fold's coordinator-side
+/// reconstruction to a generic `Distrib`.
+#[test]
+fn fetch_memory_exhausted_message_round_trips() {
+    let original = crate::fetcher::FetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    };
+    let rendered = original.to_string();
+    assert_eq!(
+        super::parse_fetch_memory_exhausted(&rendered),
+        Some((4_194_304, 268_435_456, 268_500_000)),
+        "parser must invert the Display of FetchError::FetchMemoryExhausted {rendered:?}"
+    );
+
+    let original = LogFetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    };
+    let rendered = original.to_string();
+    assert_eq!(
+        super::parse_fetch_memory_exhausted(&rendered),
+        Some((4_194_304, 268_435_456, 268_500_000)),
+        "parser must invert the Display of LogFetchError::FetchMemoryExhausted {rendered:?}"
+    );
+
+    let original = SpanFetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    };
+    let rendered = original.to_string();
+    assert_eq!(
+        super::parse_fetch_memory_exhausted(&rendered),
+        Some((4_194_304, 268_435_456, 268_500_000)),
+        "parser must invert the Display of SpanFetchError::FetchMemoryExhausted {rendered:?}"
+    );
+
+    // A message that is not this error's Display parses to None, so the fold
+    // falls back to a generic Distrib rather than fabricating figures.
+    assert_eq!(
+        super::parse_fetch_memory_exhausted("slice tripped its budget: something else"),
+        None,
+        "an unrelated message must not parse as a memory refusal"
+    );
+}
+
+/// The coordinator's `BudgetExceeded` fold surfaces a fetch-layer memory refusal
+/// as the typed `Fetch(FetchMemoryExhausted)` -- the same error the local path
+/// raises -- when the folded bytes-scanned total is under the query's cap (so
+/// the trip is memory, not bytes). Replacing the `parse_fetch_memory_exhausted`
+/// branch in `budget_exceeded_error` with the `Distrib` fallback makes the
+/// `matches!` below fail. When the folded total is at or over the bytes cap, the
+/// same helper yields the bytes-scanned error instead, proving the
+/// disambiguation.
+#[test]
+fn budget_exceeded_fold_renders_memory_refusal_typed() {
+    let msg = crate::fetcher::FetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    }
+    .to_string();
+
+    // Folded bytes under the cap: the trip is a memory refusal, surfaced typed.
+    let err =
+        super::budget_exceeded_error(1_000, crate::config::ByteLimit::Bounded(1_000_000), &msg);
+    assert!(
+        matches!(
+            err,
+            crate::error::QueryError::Fetch(crate::fetcher::FetchError::FetchMemoryExhausted {
+                requested: 4_194_304,
+                reserved: 268_435_456,
+                limit: 268_500_000,
+            })
+        ),
+        "a memory refusal under the bytes cap must fold to a typed FetchMemoryExhausted, got {err:?}"
+    );
+
+    // Folded bytes at or over the cap: the bytes-scanned trip dominates.
+    let err = super::budget_exceeded_error(
+        2_000_000,
+        crate::config::ByteLimit::Bounded(1_000_000),
+        &msg,
+    );
+    assert!(
+        matches!(err, crate::error::QueryError::TooManyBytesScanned { .. }),
+        "a folded total over the bytes cap must fold to TooManyBytesScanned, got {err:?}"
+    );
 }

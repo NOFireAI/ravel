@@ -2,7 +2,9 @@
 
 One decision per document. Status: Proposed | Accepted | Superseded.
 
-Numbering: ADR 0001 through 0109 are sequential, with no 0014. From ADR 0110 onward the
+Numbering: ADR 0001 through 0109 are sequential, with no 0014 and no 0091
+(0091 recorded the authorization boundary for a review integration that was
+removed outright; ADR-1586 replaces it). From ADR 0110 onward the
 number is the GitHub issue number of the issue that produced it (the epic
 when the decision spans the epic, the ticket when an epic has several
 decisions in flight at once, as ADR-0774 under epic #680 does), so the
@@ -101,7 +103,6 @@ the reservation commit that used to work around it.
 | [0088](0088-operator-configurable-query-budgets.md) | Operator-configurable query budgets | Accepted |
 | [0089](0089-bulk-import-logs-signal.md) | Bulk import of structured event data into the logs signal | Accepted |
 | [0090](0090-typed-attribute-columns-logs-sql.md) | Typed attribute columns for the logs SQL table | Accepted |
-| [0091](0091-maintainer-gated-coderabbit-reviews.md) | Maintainer-gated CodeRabbit reviews: a workflow started by hand or by a `/coderabbit review` comment, which verifies `role_name` is maintain or admin, keeps the credential behind a main-only protected environment, loads policy from main by absolute path, and never executes pull-request code; amendment 2 (2026-08-26) turns the App's automatic review back on for every pull request, with every write-capable surface still off | Proposed |
 | [0092](0092-run-merged-l1-and-rseg-v7.md) | Run-merged L1 compaction and RSEG v7: per-sample dedup provenance columns, first timestamp as a delta from the run minimum, no alignment pad on single-sample raw value pages, and three measured page encodings, landed as one version bump | Accepted |
 | [0093](0093-typed-column-pushdown-logs.md) | Skip-index and postings pushdown for declared typed logs columns: one resolver dispatching to two existing prune primitives (NumRange for I64/Bool, POSTINGS Equals for Str/Bytes), envelope-range IN, allowlist-only extraction | Proposed |
 | [0094](0094-parallel-final-aggregation-exact-typed.md) | Parallel final aggregation for exact-typed inputs | Amended by 0825 |
@@ -121,6 +122,7 @@ the reservation commit that used to work around it.
 | [0108](0108-range-eval-over-native-histograms.md) | Histogram-aware range evaluation for PromQL | Proposed |
 | [0109](0109-columnar-bulk-load-fast-path.md) | Columnar bulk-load fast path for Parquet ingest | Accepted |
 | [0110](0110-columnar-spans-scan.md) | Columnar decode-to-Arrow for the SQL spans scan | Proposed |
+| [0531](0531-format-lifecycle-activation-milestone.md) | What "first public release" means for the format-lifecycle policy: it denotes a not-yet-reached activation milestone distinct from the software's 0.9.0 release, so ADR-0027's pre-release regime holds at HEAD; records the format-bump rollback stance | Proposed |
 | [0699](0699-rlog-row-groups-and-page-directory.md) | RLOG row groups with column-major pages and a PAGE_DIR section: a scan fetches only the projected columns' chunks, per-page checksums keep every read verifiable, trailer version 4 with the version-3 reader kept as N-1 | Proposed |
 | [0716](0716-series-value-kind-migration.md) | Series value-kind migration: maintenance merges group by (series_id, value_kind) with kind-homogeneous output parts, unblocking compaction (#716) and selective erasure (#789) over migrated series; identity, RSEG layout, and the ingest contract unchanged; the within-buffer mismatch remaps to 400/INVALID_ARGUMENT | Proposed |
 | [0774](0774-topk-late-materialization-logs-scan.md) | TopK late materialization for the logs scan: a physical optimizer rule splitting a wide `ORDER BY ... LIMIT k` into a narrow row-ref-carrying scan and a k-row block fetch | Proposed |
@@ -140,6 +142,18 @@ the reservation commit that used to work around it.
 | [0996](0996-request-cost-aware-fetching.md) | request-cost-aware fetching and the S3 request ledger | Proposed |
 | [1029](1029-advisory-compaction-claims.md) | advisory compaction claims over object-store CAS | Proposed |
 | [1040](1040-documentation-architecture.md) | Documentation architecture, canonical vocabulary, and a docs gate | Proposed |
-| [1101](1101-alerts-and-audit-sql-tables.md) | Register the `alerts` and `audit` SQL tables | Proposed |
+| [1101](1101-alerts-and-audit-sql-tables.md) | Register the `alerts` and `audit` SQL tables | Accepted (2026-09-03) |
 | [1103](1103-promql-over-logs.md) | PromQL over logs: `ravel_log_lines` and `ravel_log_bytes` | Accepted |
 | [1113](1113-tla-verification-suite.md) | TLA+ verification suite for the commit, catalog, lifecycle, resharding, and maintenance protocols | Proposed |
+| [1170](1170-process-memory-budget.md) | One process-wide memory budget: a `MemoryBudget` accountant the tenant accountants adapt to, byte reservations at the fetch layer where the unit is known, a static carve under one number, and the aggregate logged and gauged | Proposed |
+| [1195](1195-unbundle-fetch-concurrency.md) | Unbundle `--fetch-concurrency`, and make GET concurrency a process-wide limit | Proposed |
+| [1196](1196-fetch-objective-cost-first-default-latency-first-policy.md) | Keep the cost-first fetch default, add a latency-first policy | Proposed |
+| [1199](1199-bounded-query-io-and-tail-checkpoints.md) | Bounded query I/O accounting, and a pre-registered measured gate deciding whether an L0.5 tail checkpoint gets built at all | Proposed |
+| [1294](1294-alert-state-memo.md) | A durable, derived alert-state memo per tenant that bounds each alert evaluation tick to a memo GET, a lease GET, one tail LIST, and the transitions since the memo, instead of re-folding the whole `Signal::Alerts` history every tick | Proposed |
+| [1295](1295-per-local-tenant-federation-credentials.md) | Key each `--remote-cluster` credential by the one local tenant it belongs to, with `Federation::fetch` selecting remotes by the caller's tenant before dispatch, so a multi-tenant coordinator can federate at all; an unmapped local tenant gets local data only reported complete, and an unkeyed remote is still refused on a coordinator resolving more than one local tenant. Amends ADR-0071 | Accepted (2026-09-14) |
+| [1302](1302-cas-guarded-re-record-of-a-stale-qualification.md) | Make the `sys/qualification` record re-recordable once per bucket per suite version instead of write-once, so a `CONFORMANCE_SUITE_VERSION` bump does not strand already-qualified buckets, and guard the replacing write with `CasVersion` on the read version so concurrent `qualify` runs from a newer binary cannot be silently downgraded. Supersedes ADR-0050 section 6 | Accepted (2026-09-12) |
+| [1307](1307-per-writer-monotonic-flush-clock.md) | Per-writer monotonic flush clock: each shard actor raises the flush-open `created_unix_ns` stamp to a per-writer in-process monotonic floor so a backwards wall-clock step cannot invert query-time duplicate resolution, counting each absorbed step; the floor is per-process only and does not order a restarted writer against its predecessor (`writer_id` is not part of the dedup comparator, so it does not close this), no format change | Proposed |
+| [1374](1374-agent-mcp-server.md) | A first-party MCP server behind a shared query service layer, with a bounded, evidence-bearing agent result contract | Proposed |
+| [1413](1413-split-cstat-per-part.md) | Split `.cstat` column statistics per snapshot part, so a wide table's statistics fit the reader's guard and the process memory budget, with a per-part ceiling the writer also enforces | Accepted (2026-09-08) |
+| [1586](1586-fleet-review-bot-as-the-review-path.md) | The fleet review bot is Ravel's agent review path: `@claude-fleet review` as the trigger, the previous third-party integration and its repository-side control plane deleted outright, a `write`-level trigger accepted on the record with the role gate filed on the bot, and a missing review classified into five states rather than one | Accepted |
+| [1642](1642-flush-permit-acquired-in-the-flush-task.md) | Acquire the `max_inflight_flushes` permit inside the spawned flush task rather than on the shard actor, in all three ingest pipelines, so a stalled flush cannot stop a co-resident tenant's channel drain or age trigger; backpressure at the bound moves to the ADR-0069 byte budget and the in-flight gauge counts permit-waiting flushes. Supersedes ADR-0067 decision 2 | Accepted (2026-09-12) |

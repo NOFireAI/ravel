@@ -138,9 +138,15 @@ impl ColumnSelection {
     }
 
     /// Decode every dynamic attribute column plus `attrs_raw`. This is what a
-    /// query referencing the SQL `attrs` map column at all resolves to,
-    /// including `SELECT *` (ADR-0087: per-key `attrs['k']` projection is out
-    /// of scope, and the merged map's contract is that every key is present).
+    /// query that needs the whole SQL `attrs` map resolves to, including
+    /// `SELECT *`, because the merged map's contract is that every key is
+    /// present.
+    ///
+    /// A query whose every `attrs` reference is a literal-key subscript
+    /// resolves a narrower set instead, one column per key plus `attrs_raw`
+    /// (ADR-0087 as amended 2026-09-14; the planner side is
+    /// `ravel_sql::attrs_per_key`). Anything that cannot be proved to be only
+    /// literal-key reads still lands here.
     #[must_use]
     pub fn with_all_attrs(mut self) -> Self {
         self.all_attrs = true;

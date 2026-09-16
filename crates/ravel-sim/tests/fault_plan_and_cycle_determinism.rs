@@ -11,6 +11,7 @@
 //!   run in between.
 
 use ravel_sim::fault_plan::{FaultScheduleConfig, generate};
+use ravel_sim::workload::{CardinalityShape, WorkloadConfig};
 use ravel_sim::{CycleConfig, MasterSeed, run_cycle};
 
 #[test]
@@ -70,5 +71,71 @@ fn same_seed_produces_identical_cycle_digest() {
             a.fault_counters, b.fault_counters,
             "seed {seed}: fired-fault counters not deterministic"
         );
+        assert_eq!(
+            a.faulted_sweep_pass, b.faulted_sweep_pass,
+            "seed {seed}: faulted sweep pass not deterministic"
+        );
+        assert_eq!(
+            a.faulted_pass_superseded_records_deleted, b.faulted_pass_superseded_records_deleted,
+            "seed {seed}: faulted-pass superseded records not deterministic"
+        );
+        assert_eq!(
+            a.faulted_pass_superseded_data_deleted, b.faulted_pass_superseded_data_deleted,
+            "seed {seed}: faulted-pass superseded data not deterministic"
+        );
+        assert_eq!(
+            a.faulted_pass_unreferenced_parts_deleted, b.faulted_pass_unreferenced_parts_deleted,
+            "seed {seed}: faulted-pass unreferenced parts not deterministic"
+        );
     }
+}
+
+/// The same seed twice, under a workload that guarantees the sweep delete fault
+/// fires (so the per-pass faulted fields are non-trivial), produces an
+/// identical faulted-pass report. This exercises the new per-pass fields with a
+/// positive value, which the default workload above may leave at `None`.
+#[test]
+fn same_seed_produces_identical_faulted_pass_report() {
+    let config = CycleConfig {
+        workload: WorkloadConfig {
+            tenant_count: 2,
+            series_per_tenant: 8,
+            samples_per_series: 6,
+            cardinality: CardinalityShape::ManySmallLabels,
+            histogram_fraction: 0.25,
+            queries_per_tenant: 4,
+            ..WorkloadConfig::default()
+        },
+        inject_faults: true,
+        ..CycleConfig::default()
+    };
+    let seed = 3u64;
+    let a = run_cycle(MasterSeed::new(seed), &config)
+        .unwrap_or_else(|e| panic!("seed {seed}: first cycle failed: {e}"));
+    let b = run_cycle(MasterSeed::new(seed), &config)
+        .unwrap_or_else(|e| panic!("seed {seed}: second cycle failed: {e}"));
+
+    // The fault really landed, so the comparison is over a positive value.
+    assert_eq!(
+        a.faulted_sweep_pass.as_ref(),
+        Some(&("sim-tenant-000".to_string(), 0)),
+        "seed {seed}: delete fault did not fire on the expected pass"
+    );
+    assert!(
+        a.faulted_pass_superseded_records_deleted > 0,
+        "seed {seed}: faulted pass reported no superseded-record deletes"
+    );
+
+    assert_eq!(
+        a.faulted_sweep_pass, b.faulted_sweep_pass,
+        "seed {seed}: faulted sweep pass not deterministic"
+    );
+    assert_eq!(
+        a.faulted_pass_superseded_records_deleted, b.faulted_pass_superseded_records_deleted,
+        "seed {seed}: faulted-pass superseded records not deterministic"
+    );
+    assert_eq!(
+        a.faulted_pass_superseded_data_deleted, b.faulted_pass_superseded_data_deleted,
+        "seed {seed}: faulted-pass superseded data not deterministic"
+    );
 }

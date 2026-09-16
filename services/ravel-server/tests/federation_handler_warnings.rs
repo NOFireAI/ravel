@@ -143,6 +143,7 @@ fn dead_federation(name: &str, endpoint: &str) -> Federation {
         name: name.to_string(),
         endpoint: endpoint.to_string(),
         credential: OPERATOR_CRED.to_string(),
+        tenant: None,
         tls: false,
         tls_ca_file: None,
         skip_unavailable: true,
@@ -153,6 +154,7 @@ fn dead_federation(name: &str, endpoint: &str) -> Federation {
     Federation::new(vec![RemoteCluster {
         name: name.to_string(),
         fetcher: Arc::new(fetcher),
+        tenant: None,
         skip_unavailable: true,
         soft_timeout: Duration::from_secs(3),
     }])
@@ -161,7 +163,7 @@ fn dead_federation(name: &str, endpoint: &str) -> Federation {
 /// The PromQL router wired with a federation over one dead, skippable remote,
 /// exactly as `ravel_server::start` assembles it (through `build_app_state`).
 async fn promql_with_federation(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Router {
-    let catalog = build_catalog(store.clone(), 1, true, 0, None).expect("catalog");
+    let catalog = build_catalog(store.clone(), 1, true, 0, None, None, None).expect("catalog");
     let mut tokens = std::collections::HashMap::new();
     tokens.insert(TOKEN.to_string(), tenant.clone());
     let federation = Arc::new(dead_federation("west", &dead_endpoint().await));
@@ -172,6 +174,7 @@ async fn promql_with_federation(store: Arc<dyn ObjectStoreBackend>, tenant: &Ten
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         None,
         EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         Arc::new(QueryAccountingMetrics::new(HashSet::new())),
         ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,

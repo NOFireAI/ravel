@@ -29,6 +29,7 @@ use ravel_otap::normalize::normalize_decoded_with_metadata;
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
 use ravel_otap::stream::{DecodeError, DecodedBatch, StreamConfig, StreamState};
+use ravel_otlp::NormalizeRejectCounts;
 use ravel_types::{CommitToken, ExemplarCap, SeriesId, Signal, TenantId};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -352,6 +353,15 @@ async fn write_batch(
     let (result, metadata) =
         normalize_decoded_with_metadata(tenant, decoded, &ingest.limits, ingest_ts_ns, &mut cap);
     let normalized = result.output;
+    // Layer 3's rejections, counted exactly as the OTLP path counts them
+    // (ADR-0051 section 3). OTAP has no partial-success field to carry them,
+    // so before this the only trace of a structurally rejected batch was the
+    // absence of its points: switching transport silently moved the signal.
+    ingest.normalize_metrics.record(
+        tenant,
+        ravel_types::Signal::Metrics,
+        NormalizeRejectCounts::from_metric_rejections(&normalized.rejected),
+    );
     // Synchronous, no I/O, off the acknowledgement path: see the twin call in
     // `crate::ingest::handle_export`.
     if let Some(sink) = &ingest.metadata_sink {
@@ -485,6 +495,9 @@ mod tests {
             recovery: None,
             provisioning: None,
             metadata_sink: None,
+            normalize_metrics: Arc::new(
+                crate::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+            ),
         }
     }
 
@@ -544,5 +557,78 @@ mod tests {
             row.requests_rejected_clock_total, 1,
             "the reason=\"clock\" rejected counter incremented exactly once"
         );
+    }
+
+    /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds,
+    /// the same anchor the OTLP surface's tests use. Never `SystemTime::now()`.
+    const BASE_TS_NS: i64 = 1_767_225_600_000_000_000;
+
+    /// The same delta-temporality rejection the OTLP surface counts must be
+    /// counted identically here: the reason label is a property of the
+    /// rejection, not of the transport that carried the batch. OTAP has no
+    /// partial-success field, so this counter is the only operator-visible
+    /// trace of the drop.
+    #[tokio::test]
+    async fn delta_sum_batch_counts_every_point_as_structural() {
+        use ravel_otap::encode::{DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder};
+        use ravel_otap::normalize::AGGREGATION_TEMPORALITY_DELTA;
+        use ravel_otap::stream::{StreamConfig, StreamState};
+
+        const POINT_COUNT: usize = 3;
+
+        let ingest = ingest_state();
+        let tenant = TenantId::new("acme");
+        let mut encoder = MetricsStreamEncoder::new("a9").expect("encoder");
+        let batch = encoder
+            .encode_batch(
+                0,
+                &[MetricRow {
+                    name: "requests".to_string(),
+                    kind: MetricKind::Sum {
+                        temporality: AGGREGATION_TEMPORALITY_DELTA,
+                        is_monotonic: true,
+                    },
+                    data_points: (0..POINT_COUNT)
+                        .map(|i| DataPointRow {
+                            time_unix_nano: BASE_TS_NS,
+                            value: i as f64,
+                            flags: 0,
+                            exemplars: vec![],
+                            attrs: vec![],
+                        })
+                        .collect(),
+                }],
+            )
+            .expect("encode a delta Sum batch");
+        let mut state = StreamState::new(StreamConfig::default());
+        let decoded = state.decode(batch).expect("decode the batch back");
+
+        let before = normalize_totals(&ingest, &tenant);
+        let outcome =
+            write_batch(&ingest, &tenant, WriteMode::Buffered, &decoded, BASE_TS_NS).await;
+        assert!(
+            outcome.is_ok(),
+            "a fully rejected batch is still an OK write with no points"
+        );
+        let after = normalize_totals(&ingest, &tenant);
+
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (0, POINT_COUNT as u64),
+            "every rejected point counts once under structural, none under skew"
+        );
+    }
+
+    /// `(skew, structural)` for the tenant's Metrics rows of the
+    /// normalize-reject counters.
+    fn normalize_totals(ingest: &IngestState, tenant: &TenantId) -> (u64, u64) {
+        ingest
+            .normalize_metrics
+            .snapshot()
+            .into_iter()
+            .filter(|row| row.tenant_hash == tenant.hash() && row.signal == Signal::Metrics)
+            .fold((0, 0), |acc, row| {
+                (acc.0 + row.skew_total, acc.1 + row.structural_total)
+            })
     }
 }

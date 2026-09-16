@@ -155,15 +155,18 @@ async fn labels_submits_one_labels_event() {
     assert_common(&one(&events), "labels", "ok");
 }
 
+/// Distinct from `labels`'s own tag (issue #1377): the two label routes share
+/// the same `metadata()` execution path, and the audit record is the only
+/// place that still tells an auditor which route a caller used.
 #[tokio::test]
-async fn label_values_submits_one_labels_event() {
+async fn label_values_submits_one_label_values_event() {
     let (app, events) = recording();
     let response = app
         .oneshot(get("/api/v1/label/job/values"))
         .await
         .expect("infallible");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_common(&one(&events), "labels", "ok");
+    assert_common(&one(&events), "label_values", "ok");
 }
 
 #[tokio::test]

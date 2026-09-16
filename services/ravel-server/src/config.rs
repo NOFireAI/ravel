@@ -27,6 +27,20 @@ pub enum Mode {
     Maintain,
 }
 
+impl Mode {
+    /// Whether [`crate::start`] installs a process-wide
+    /// `ravel_maintain::AuditPipeline` for this mode (ADR-0062 decision 2b):
+    /// true only for [`Mode::All`] and [`Mode::Query`], the modes that build a
+    /// query engine. [`Mode::Gateway`] and [`Mode::Maintain`] serve no query
+    /// surface and write no query-audit record, so they never need
+    /// `--audit-text`'s policy resolved. Shared by the resolve site
+    /// ([`resolve_audit_text_policy_for_mode`]) and the install site
+    /// (`start` in lib.rs) so the two cannot drift apart.
+    pub fn installs_query_audit_pipeline(self) -> bool {
+        matches!(self, Mode::All | Mode::Query)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum StoreKind {
     Memory,
@@ -62,7 +76,7 @@ impl S3Auth {
 /// The `--logs-fetch-policy` values (ADR-0996 decision 2). The CLI-facing
 /// mirror of [`ravel_query::LogsFetchPolicy`], which lives in a crate that does
 /// not depend on clap. The spellings clap derives from these variant names are
-/// the ADR's: `request-minimal`, `byte-minimal`, `cost-based`.
+/// the ADR's: `request-minimal`, `byte-minimal`, `cost-based`, `latency-first`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum LogsFetchPolicyArg {
     /// Minimize object-store requests: every object is read whole in one
@@ -77,6 +91,15 @@ pub enum LogsFetchPolicyArg {
     /// behaviour; at egress prices it resolves to a small byte cost.
     #[default]
     CostBased,
+    /// Resolves the byte quantities exactly as `byte-minimal` does (issue
+    /// #1196): an intent, not a tuning constant. Measured at `740f94b97` over
+    /// 3 reps, it traded 5.30x the GET requests for 52% less cold wall-clock
+    /// (per-rep range 50.3% to 54.2%) on the reference corpus,
+    /// at a raised object-store GET concurrency the operator sets explicitly
+    /// (this policy carries no concurrency default of its own). In-flight
+    /// fetch memory at that concurrency is not yet bounded by a process-wide
+    /// budget (ADR-1196, #1170, #1007).
+    LatencyFirst,
 }
 
 impl LogsFetchPolicyArg {
@@ -86,8 +109,219 @@ impl LogsFetchPolicyArg {
             LogsFetchPolicyArg::RequestMinimal => ravel_query::LogsFetchPolicy::RequestMinimal,
             LogsFetchPolicyArg::ByteMinimal => ravel_query::LogsFetchPolicy::ByteMinimal,
             LogsFetchPolicyArg::CostBased => ravel_query::LogsFetchPolicy::CostBased,
+            LogsFetchPolicyArg::LatencyFirst => ravel_query::LogsFetchPolicy::LatencyFirst,
         }
     }
+}
+
+/// The `--audit-mode` values (ADR-0062 decision 2b). The CLI-facing mirror of
+/// [`ravel_maintain::AuditMode`], which lives in a crate that does not depend
+/// on clap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum AuditModeArg {
+    /// A failed audit-batch flush fails every query in the batch (HTTP 503,
+    /// Flight `Unavailable`): during an object-store outage queries fail
+    /// closed instead of running unaudited.
+    #[default]
+    Required,
+    /// A failed audit-batch flush is logged and counted
+    /// (`ravel_audit_write_failures_total`); the query response proceeds.
+    /// An explicit, documented opt-out for deployments (dev, single-tenant
+    /// labs) that would rather serve unaudited than fail closed.
+    BestEffort,
+}
+
+impl AuditModeArg {
+    /// The library-level mode this flag value selects.
+    pub fn mode(self) -> ravel_maintain::AuditMode {
+        match self {
+            AuditModeArg::Required => ravel_maintain::AuditMode::Required,
+            AuditModeArg::BestEffort => ravel_maintain::AuditMode::BestEffort,
+        }
+    }
+}
+
+/// The `--audit-text` values (ADR-0062 decision 2e). Selects how a query's
+/// text is recorded on its audit record's `query.text` attribute;
+/// [`resolve_audit_text_policy`] turns it into the policy `start` installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum AuditTextArg {
+    /// The structure-preserving keyed-tokenization posture ADR-0062 decision
+    /// 2e describes: literals and label-matcher values replaced by a
+    /// deterministic token, selector names/operators/structure left
+    /// readable.
+    #[default]
+    Redacted,
+    /// Verbatim query text, an explicit opt-in for a compliance regime that
+    /// requires it (ADR-0062 decision 2e), storing PII under the audit
+    /// retention window.
+    Plaintext,
+}
+
+/// Environment variable holding the audit tokenization key (ADR-0062 decision
+/// 2e): 64 hex characters, the 32-byte key `blake3::keyed_hash` is taken under.
+///
+/// Hex only, and deliberately not "hex or base64": a 64-character string is
+/// simultaneously valid hex for 32 bytes and valid base64 for 48, so accepting
+/// both would make one spelling of a key decode to two different keys
+/// depending on which branch ran first, and every record written under the
+/// wrong branch would carry uncorrelatable tokens. Hex matches the
+/// `--tenant-hash-key-file` form an operator already handles.
+pub const AUDIT_TOKEN_KEY_ENV: &str = "RAVEL_AUDIT_TOKEN_KEY";
+
+/// Context string for deriving the audit token key from the deployment key.
+/// Key separation: the deployment key already keys the tenant hash and the
+/// recovery manifest's AEAD, so the audit tokenizer takes a distinct derived
+/// key rather than the deployment key itself.
+const AUDIT_TOKEN_KEY_CONTEXT: &str = "ravel audit query-text token key v1";
+
+/// The `--audit-text redacted` redactor (ADR-0062 decision 2e): keyed,
+/// structure-preserving tokenization of a query's text, per query language.
+///
+/// SQL statements go through `ravel_sql::redact` (sqlparser AST, literal
+/// values tokenized) and everything else through `ravel_promql::redact`
+/// (PromQL AST, label-matcher values and string literals tokenized). Both call
+/// the same `ravel_promql::audit_token` generator, so one value tokenizes
+/// identically whichever surface queried it.
+pub struct AuditQueryTextRedactor {
+    token_key: Box<[u8; 32]>,
+}
+
+impl AuditQueryTextRedactor {
+    /// A redactor tokenizing under `token_key`.
+    pub fn new(token_key: [u8; 32]) -> Self {
+        AuditQueryTextRedactor {
+            token_key: Box::new(token_key),
+        }
+    }
+
+    /// The fail-safe form for text no parser accepted: one token over the
+    /// whole text.
+    ///
+    /// ADR-0062 decision 2e rejects whole-text hashing as the *posture*,
+    /// because it destroys the trail's evidential structure. It is still the
+    /// right answer for one record whose text did not parse: the alternatives
+    /// are storing the text (the plaintext leak the posture exists to prevent)
+    /// or storing nothing (a record that no longer says a query ran). A
+    /// non-parsing query is a query that failed, and its record still carries
+    /// the tenant, language, status, window, and timestamp.
+    fn whole_text_token(&self, query_text: &str) -> String {
+        ravel_promql::audit_token(&self.token_key, query_text.as_bytes())
+    }
+
+    /// Redact one PromQL expression, or the `"; "`-joined selector list the
+    /// metadata surfaces record. Each selector is redacted on its own, so one
+    /// unparseable selector costs only its own structure.
+    fn redact_promql(&self, query_text: &str) -> String {
+        query_text
+            .split("; ")
+            .map(|selector| {
+                ravel_promql::redact(selector, &self.token_key)
+                    .unwrap_or_else(|_| self.whole_text_token(selector))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Redact one SQL statement. Without the `sql` feature this process serves
+    /// no SQL surface and therefore records no `sql`-language event; the arm
+    /// still fails safe rather than echoing the text.
+    #[cfg(feature = "sql")]
+    fn redact_sql(&self, query_text: &str) -> String {
+        ravel_sql::redact(query_text, &self.token_key)
+            .unwrap_or_else(|_| self.whole_text_token(query_text))
+    }
+
+    #[cfg(not(feature = "sql"))]
+    fn redact_sql(&self, query_text: &str) -> String {
+        self.whole_text_token(query_text)
+    }
+}
+
+impl ravel_maintain::QueryTextRedactor for AuditQueryTextRedactor {
+    fn redact(&self, language: &str, query_text: &str) -> String {
+        match language {
+            "sql" => self.redact_sql(query_text),
+            // Every other surface records PromQL: one expression for `promql`
+            // and `analytics`, a selector for `exemplars`, and the joined
+            // selector list for `labels`, `label_values`, and `series`.
+            _ => self.redact_promql(query_text),
+        }
+    }
+}
+
+/// Resolve `--audit-text` into the policy [`crate::start`] installs, given the
+/// raw `RAVEL_AUDIT_TOKEN_KEY` value and the deployment key (ADR-0062 decision
+/// 2e).
+///
+/// `redacted` needs a key. It comes from `RAVEL_AUDIT_TOKEN_KEY` when set, and
+/// otherwise from a key derived from the deployment key, which a keyed-tenancy
+/// deployment already holds outside the bucket. With neither available this
+/// fails startup naming the variable: falling back to verbatim text would make
+/// the default posture silently store the PII it exists to tokenize, and
+/// nothing about the running process would say so.
+pub fn resolve_audit_text_policy(
+    audit_text: AuditTextArg,
+    raw_token_key: Option<&str>,
+    deployment_key: Option<&[u8; 32]>,
+) -> anyhow::Result<ravel_maintain::AuditTextPolicy> {
+    if audit_text == AuditTextArg::Plaintext {
+        return Ok(ravel_maintain::AuditTextPolicy::Plaintext);
+    }
+    let token_key = match raw_token_key.map(str::trim).filter(|raw| !raw.is_empty()) {
+        Some(raw) => parse_audit_token_key(raw)?,
+        None => match deployment_key {
+            Some(key) => blake3::derive_key(AUDIT_TOKEN_KEY_CONTEXT, key),
+            None => anyhow::bail!(
+                "--audit-text redacted needs a tokenization key and none is configured: set \
+                 {AUDIT_TOKEN_KEY_ENV} to 64 hex characters (32 bytes), or configure \
+                 --tenant-hash-key-file so the key can be derived from the deployment key, or \
+                 pass --audit-text plaintext to record query text verbatim."
+            ),
+        },
+    };
+    Ok(ravel_maintain::AuditTextPolicy::Redacted(
+        std::sync::Arc::new(AuditQueryTextRedactor::new(token_key)),
+    ))
+}
+
+/// [`resolve_audit_text_policy`], gated to the modes that actually install
+/// the query-audit pipeline ([`Mode::installs_query_audit_pipeline`]).
+///
+/// `gateway` and `maintain` write no query-audit record, so resolving the
+/// policy for them must not fail startup for a key those modes never read: a
+/// `redacted`-posture gateway or maintain process on a bucket with no
+/// deployment key would otherwise refuse to start over a subsystem it does
+/// not run. Those modes get [`ravel_maintain::AuditTextPolicy::default()`]
+/// (`Plaintext`), which is never installed anywhere and is inert.
+pub fn resolve_audit_text_policy_for_mode(
+    mode: Mode,
+    audit_text: AuditTextArg,
+    raw_token_key: Option<&str>,
+    deployment_key: Option<&[u8; 32]>,
+) -> anyhow::Result<ravel_maintain::AuditTextPolicy> {
+    if !mode.installs_query_audit_pipeline() {
+        return Ok(ravel_maintain::AuditTextPolicy::default());
+    }
+    resolve_audit_text_policy(audit_text, raw_token_key, deployment_key)
+}
+
+/// Parse a `RAVEL_AUDIT_TOKEN_KEY` value: exactly 64 hex characters. A
+/// wrong-length key is refused rather than padded or truncated, because a key
+/// that is not the operator's key tokenizes every value differently and makes
+/// the records written under it uncorrelatable with the rest of the trail.
+fn parse_audit_token_key(raw: &str) -> anyhow::Result<[u8; 32]> {
+    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "{AUDIT_TOKEN_KEY_ENV} must be 64 hex characters (a 32-byte key); got {} characters",
+            raw.len()
+        );
+    }
+    let bytes = hex::decode(raw)
+        .map_err(|e| anyhow::anyhow!("{AUDIT_TOKEN_KEY_ENV} is not valid hex: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{AUDIT_TOKEN_KEY_ENV} did not decode to 32 bytes"))
 }
 
 /// Dev binary wiring gateway + ingest + query into one process.
@@ -118,16 +352,41 @@ pub struct Cli {
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 
+    /// File holding `TOKEN=TENANT` pairs for the static bearer map, one per
+    /// line, so a token never has to sit in argv or a process listing. Blank
+    /// lines and `#` comment lines are ignored; every other line is split on
+    /// the first `=`, exactly like `--tenant-token`, so a token containing
+    /// `=` is mis-parsed the same way in both sources (see the CRD docs
+    /// warning in `services/ravel-operator/src/crd.rs`). A leading UTF-8 byte
+    /// order mark is stripped before parsing. Mutually exclusive with
+    /// `--tenant-token`: `Cli::validate` refuses startup if both are set. The
+    /// env var carries only the path, never a token value, which is the same
+    /// exposure class as argv. An empty or comment-only file parses to an
+    /// empty map: that authenticates nothing, the same as passing no
+    /// `--tenant-token` at all, and unless `--maintain-tenant` names tenants,
+    /// background fold, compaction and retention widen to every tenant
+    /// discovery finds in storage rather than refusing startup. A Secret mount
+    /// that failed to populate looks like this, not like a startup error.
+    #[arg(
+        long = "tenant-token-file",
+        value_name = "PATH",
+        env = "RAVEL_TENANT_TOKEN_FILE"
+    )]
+    pub tenant_token_file: Option<PathBuf>,
+
     /// Repeatable tenant name this process runs background maintenance for
     /// (catalog fold, compaction, retention, the GC sweeper), in addition to
-    /// every tenant named by `--tenant-token`. Required for a deployment that
-    /// authenticates through OIDC or mTLS: those tenants are only known once a
-    /// request arrives, so maintenance has no other way to learn about them.
+    /// every tenant named by `--tenant-token` or `--tenant-token-file`.
+    /// Required for a deployment that authenticates through OIDC or mTLS:
+    /// those tenants are only known once a request arrives, so maintenance
+    /// has no other way to learn about them.
     #[arg(long = "maintain-tenant", value_name = "TENANT")]
     pub maintain_tenants: Vec<String>,
 
     /// Dev-only tenant resolution via the `x-ravel-tenant` header. Refuses to
-    /// enable unless `--listen-http` binds a loopback address.
+    /// enable unless both `--listen-http` and `--listen-grpc` bind loopback
+    /// addresses: the dev header resolver backs every public listener (HTTP,
+    /// OTLP gRPC, and Flight SQL), not just HTTP.
     #[arg(long)]
     pub dev_insecure_tenant_header: bool,
 
@@ -142,6 +401,58 @@ pub struct Cli {
     /// production deployment impossible to start.
     #[arg(long, env = "RAVEL_REQUIRE_BUCKET_PROTECTION")]
     pub require_bucket_protection: bool,
+
+    /// Failure posture of the query-audit pipeline (ADR-0062 decision 2b):
+    /// `required` (default) fails a query 503 when its audit record cannot be
+    /// made durable; `best-effort` logs and counts the failure and serves the
+    /// response anyway. Installed only in the query-serving modes (`all` and
+    /// `query`); `maintain` and `gateway` serve no query surface and install
+    /// no pipeline.
+    #[arg(
+        long = "audit-mode",
+        value_enum,
+        default_value = "required",
+        env = "RAVEL_AUDIT_MODE"
+    )]
+    pub audit_mode: AuditModeArg,
+
+    /// How `query.text` is recorded on a query-audit record (ADR-0062 decision
+    /// 2e): `redacted` (default) tokenizes every literal and label-matcher
+    /// value under the key in RAVEL_AUDIT_TOKEN_KEY, or one derived from the
+    /// deployment key, and refuses to start with neither; `plaintext` is an
+    /// explicit opt-in to storing verbatim text. Resolved only in the
+    /// query-serving modes (`all` and `query`); `maintain` and `gateway`
+    /// serve no query surface and never read the key.
+    #[arg(
+        long = "audit-text",
+        value_enum,
+        default_value = "redacted",
+        env = "RAVEL_AUDIT_TEXT"
+    )]
+    pub audit_text: AuditTextArg,
+
+    /// Audit group-commit batch size (ADR-0062 decision 2b): the pipeline
+    /// flushes one RLOG object plus one commit record after this many
+    /// submitted events, or after `--audit-max-age`, whichever comes first.
+    /// Unset uses the pipeline's own default
+    /// (`ravel_maintain::config::DEFAULT_AUDIT_MAX_BATCH`).
+    #[arg(
+        long = "audit-max-batch",
+        value_name = "COUNT",
+        env = "RAVEL_AUDIT_MAX_BATCH"
+    )]
+    pub audit_max_batch: Option<usize>,
+
+    /// Audit group-commit batch age ceiling (ADR-0062 decision 2b): the
+    /// pipeline flushes a non-empty batch after this long even if
+    /// `--audit-max-batch` has not been reached. Unset uses the pipeline's
+    /// own default (`ravel_maintain::config::DEFAULT_AUDIT_MAX_AGE`, 25 ms).
+    #[arg(
+        long = "audit-max-age",
+        value_name = "DURATION",
+        env = "RAVEL_AUDIT_MAX_AGE"
+    )]
+    pub audit_max_age: Option<String>,
 
     #[arg(long, env = "RAVEL_S3_ENDPOINT")]
     pub s3_endpoint: Option<String>,
@@ -499,24 +810,38 @@ pub struct Cli {
     /// Governs a single SQL query's intermediate `RecordBatch` footprint; a
     /// query whose pool grow would exceed it aborts rather than growing without
     /// bound. Process-wide, not per-tenant (per-tenant SQL budgets wait on the
-    /// limits-file's per-tenant enforcement gap, ADR-0088). Omitted defaults to
-    /// [`DEFAULT_SQL_MAX_QUERY_BYTES`] (256 MiB, today's compiled-in value), so
-    /// behavior is byte-identical when unset. Meaningful only in a build with
-    /// the `sql` feature (the SQL query surface); inert otherwise.
-    #[arg(long = "sql-max-query-bytes", value_name = "BYTES", default_value_t = DEFAULT_SQL_MAX_QUERY_BYTES)]
-    pub sql_max_query_bytes: usize,
+    /// limits-file's per-tenant enforcement gap, ADR-0088). Default when unset:
+    /// derived, 25% of MemTotal; reference host (16 cores, 30 GiB): 8,053,063,680.
+    /// Fallback when MemTotal is unknown: 256 MiB.
+    ///
+    /// Omitted, the value is DERIVED from the host
+    /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
+    /// [`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal` (capped by the cgroup memory
+    /// limit in a container), or [`DEFAULT_SQL_MAX_QUERY_BYTES`] (256 MiB) when
+    /// memory cannot be read.
+    /// The resolved value is clamped to `--sql-tenant-max-bytes`, never above
+    /// it. Meaningful only in a build with the `sql` feature (the SQL query
+    /// surface); inert otherwise.
+    #[arg(long = "sql-max-query-bytes", value_name = "BYTES")]
+    pub sql_max_query_bytes: Option<usize>,
 
     /// Per-tenant ceiling, in bytes, on the SQL memory a single tenant may hold
     /// across its concurrent queries (ADR-0088), threaded into the
     /// `SqlExecutor`'s per-tenant accountant. The multi-tenant isolation bound:
     /// one tenant's wide scans cannot starve another tenant's query pool. Sits
-    /// above `--sql-max-query-bytes` (the per-query ceiling); defaults to four
-    /// times it. Process-wide, not itself per-tenant-overridable (ADR-0088).
-    /// Omitted defaults to [`DEFAULT_SQL_TENANT_MAX_BYTES`] (1 GiB, today's
-    /// compiled-in value), so behavior is byte-identical when unset. Meaningful
-    /// only in a build with the `sql` feature; inert otherwise.
-    #[arg(long = "sql-tenant-max-bytes", value_name = "BYTES", default_value_t = DEFAULT_SQL_TENANT_MAX_BYTES)]
-    pub sql_tenant_max_bytes: usize,
+    /// above `--sql-max-query-bytes` (the per-query ceiling). Process-wide, not
+    /// itself per-tenant-overridable (ADR-0088). Default when unset: derived,
+    /// 50% of MemTotal; reference host (16 cores, 30 GiB): 16,106,127,360.
+    /// Fallback when MemTotal is unknown: 1 GiB.
+    ///
+    /// Omitted, the value is DERIVED from the host
+    /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
+    /// [`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal` (capped by the cgroup memory
+    /// limit in a container), or [`DEFAULT_SQL_TENANT_MAX_BYTES`] (1 GiB) when
+    /// memory cannot be read.
+    /// Meaningful only in a build with the `sql` feature; inert otherwise.
+    #[arg(long = "sql-tenant-max-bytes", value_name = "BYTES")]
+    pub sql_tenant_max_bytes: Option<usize>,
 
     /// Allow an exact-typed SQL query to repartition its final aggregation
     /// (ADR-0094, amended 2026-08-26 by issue #741), threaded into
@@ -599,9 +924,31 @@ pub struct Cli {
     /// `byte-minimal` is ADR-0904's behaviour, ranged reads wherever they save
     /// more bytes than a request costs; `cost-based` (the default) derives the
     /// rate from `--store-cost-profile`, which at the reference intra-region
-    /// profile means request-minimal behaviour. Read at startup only: the
-    /// running engine never changes its own policy, so the stamped effective
-    /// policy describes the whole process lifetime.
+    /// profile means request-minimal behaviour; `latency-first` (issue #1196)
+    /// resolves the byte quantities exactly as `byte-minimal` does. Read at
+    /// startup only: the running engine never changes its own policy, so the
+    /// stamped effective policy describes the whole process lifetime.
+    ///
+    /// `latency-first` is an intent, not a tuning constant: it says spend
+    /// requests to save wall time, and carries no concurrency default of its
+    /// own. Measured at `740f94b97` over 3 reps on the reference corpus it
+    /// traded 5.30x the GET requests for 52% less cold wall-clock than
+    /// `cost-based` (per-rep range 50.3% to 54.2%), at
+    /// [`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`] (256) -- set
+    /// explicitly with `--fetch-concurrency` or with `--store-get-concurrency`
+    /// plus `--sql-partition-count`, since both the GET permits and the SQL
+    /// scan width need to move together to reach it. At a lower concurrency
+    /// the trade does not pay off, and selecting this policy alone is not
+    /// inert: the byte quantities already change, so a logs read is routed the
+    /// way `byte-minimal` routes it, taking ranged reads wherever they save
+    /// more bytes than a request costs and whole-object reads where they do
+    /// not. On the reference corpus that shape at the default concurrency
+    /// measured 712.4 s against `cost-based`'s 525.0 s, 36% SLOWER, which is
+    /// why the concurrency is a precondition and not a tuning suggestion.
+    /// In-flight fetch memory at the
+    /// measured concurrency is not yet bounded by a process-wide budget (see
+    /// #1170 and #1007), so raising concurrency without watching process
+    /// memory can end in an out-of-memory kill instead of a faster query.
     #[arg(long = "logs-fetch-policy", value_enum, default_value_t = LogsFetchPolicyArg::CostBased)]
     pub logs_fetch_policy: LogsFetchPolicyArg,
 
@@ -637,29 +984,78 @@ pub struct Cli {
     #[arg(long = "logs-max-fetch-run-bytes", value_name = "BYTES", default_value_t = ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES)]
     pub logs_max_fetch_run_bytes: u64,
 
-    /// Bound on concurrent in-flight segment fetches per query (ADR-0088),
-    /// threaded into `ravel_query::EngineConfig::fetch_concurrency`. This is a
-    /// single knob with three coupled effects, NOT decoupled by this change: it
-    /// governs the PromQL/analytics per-query segment fetch fan-out, the SQL
-    /// scan partition count (`target_partitions` in
-    /// `crates/ravel-sql/src/session.rs`), and S3 GET concurrency (ADR-0087).
-    /// Raising it widens all three together; sizing it is a memory-vs-latency
-    /// trade against the host's cores and the store's request budget. Omitted
-    /// defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`] (8, today's
-    /// compiled-in value), so behavior is byte-identical when unset.
-    #[arg(long = "fetch-concurrency", value_name = "N", default_value_t = ravel_query::DEFAULT_FETCH_CONCURRENCY)]
-    pub fetch_concurrency: usize,
+    /// Legacy combined knob (ADR-0088, unbundled by ADR-1195): sets
+    /// `--store-get-concurrency`, `--sql-partition-count`, and
+    /// `--promql-fetch-fanout` together, at source `legacy-flag`, when none of
+    /// those three is given explicitly. Combining this flag with any of the
+    /// three is a startup error naming both flags: pass either this flag alone,
+    /// or the specific new flags without it. Prefer the specific flags for new
+    /// configuration; this one remains for existing deployments' unit files.
+    /// Sizing any of the four is a memory-vs-latency trade against the host's
+    /// cores and the store's request budget.
+    ///
+    /// Omitted, the value is DERIVED from the host
+    /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
+    /// `max(MIN_DERIVED_FETCH_CONCURRENCY, FETCH_CONCURRENCY_PER_CORE *
+    /// cores)`, which is 32 on the 16-core reference host and never below the
+    /// compiled-in 8 on a small one.
+    #[arg(long = "fetch-concurrency", value_name = "N")]
+    pub fetch_concurrency: Option<usize>,
+
+    /// Count of permits for concurrent GETs against the object store,
+    /// process-wide (ADR-1195), threaded into
+    /// `ravel_query::EngineConfig::store_get_concurrency` and from there into
+    /// the single process-owned `GetLimiter` every fetcher (RSEG, RLOG, RSPAN)
+    /// shares. Default when unset: derived,
+    /// `max(MIN_DERIVED_FETCH_CONCURRENCY, FETCH_CONCURRENCY_PER_CORE *
+    /// cores)`.
+    ///
+    /// Legacy precedence: `--fetch-concurrency` still sets this (and the two
+    /// flags below) when neither is given explicitly. Setting both
+    /// `--fetch-concurrency` and this flag is a startup error.
+    #[arg(long = "store-get-concurrency", value_name = "COUNT")]
+    pub store_get_concurrency: Option<usize>,
+
+    /// Count of DataFusion scan partitions (`target_partitions`,
+    /// `crates/ravel-sql/src/session.rs`), threaded into
+    /// `ravel_query::EngineConfig::sql_partition_count` (ADR-1195). Default
+    /// when unset: derived, `max(MIN_DERIVED_FETCH_CONCURRENCY,
+    /// FETCH_CONCURRENCY_PER_CORE * cores)`.
+    ///
+    /// Legacy precedence: `--fetch-concurrency` still sets this (and the two
+    /// flags above/below) when neither is given explicitly. Setting both
+    /// `--fetch-concurrency` and this flag is a startup error.
+    #[arg(long = "sql-partition-count", value_name = "COUNT")]
+    pub sql_partition_count: Option<usize>,
+
+    /// Count of in-flight futures in the PromQL/analytics `buffer_unordered`
+    /// segment fetch fan-out (`crates/ravel-query/src/engine.rs`), threaded
+    /// into `ravel_query::EngineConfig::promql_fetch_fanout` (ADR-1195).
+    /// Default when unset: derived, `max(MIN_DERIVED_FETCH_CONCURRENCY,
+    /// FETCH_CONCURRENCY_PER_CORE * cores)`.
+    ///
+    /// Legacy precedence: `--fetch-concurrency` still sets this (and the two
+    /// flags above) when neither is given explicitly. Setting both
+    /// `--fetch-concurrency` and this flag is a startup error.
+    #[arg(long = "promql-fetch-fanout", value_name = "COUNT")]
+    pub promql_fetch_fanout: Option<usize>,
 
     /// Cap on the number of segments a single query may fan out over (ADR-0088),
     /// threaded into `ravel_query::EngineConfig::max_segments`. A wide scan over
     /// a tenant with many sealed-below-watermark L0/L1 objects hits this cap
     /// directly (only the narrow `SegmentOrigin::Recent` set, roughly the last
     /// couple of hours, is exempt); this flag is what lets an operator raise it
-    /// for such a workload. Omitted defaults to
-    /// [`ravel_query::DEFAULT_MAX_SEGMENTS`] (1024, today's compiled-in value),
-    /// so behavior is byte-identical when unset.
-    #[arg(long = "max-segments", value_name = "N", default_value_t = ravel_query::DEFAULT_MAX_SEGMENTS)]
-    pub max_segments: usize,
+    /// for such a workload. Default when unset: derived (host-independent):
+    /// 1,000,000; reference host (16 cores, 30 GiB): 1,000,000. A segment-count
+    /// cap is a plan-width bound, not resident bytes, so it does not scale with
+    /// MemTotal and has no memory fallback.
+    ///
+    /// Omitted, the value is DERIVED ([`resolve_performance_defaults`],
+    /// ADR-0088 as amended by issue #1141): [`DERIVED_MAX_SEGMENTS`]
+    /// (1,000,000), the cap the #968 ClickBench measurement ran under. Set this
+    /// flag to restore the old compiled-in 1024 or any other bound.
+    #[arg(long = "max-segments", value_name = "N")]
+    pub max_segments: Option<usize>,
 
     /// The process-wide in-flight ingest-request ceiling: the
     /// maximum number of OTLP metrics/logs/traces and Remote Write requests
@@ -668,34 +1064,86 @@ pub struct Cli {
     /// shed immediately, never queued: HTTP gets 429 with `Retry-After`,
     /// gRPC gets `RESOURCE_EXHAUSTED`. Unlike `--max-concurrent-queries`,
     /// this is never fleet-reconciled: each process enforces its own local
-    /// bound independently, since it exists to cap this process's own
-    /// worst-case buffered memory, not to shape aggregate fleet fan-out.
+    /// bound independently. It bounds request COUNT, so the transient
+    /// decode memory it caps is this ceiling times the largest per-request
+    /// decoded body: Remote Write's 64 MiB post-decompression cap, or
+    /// OTLP's 16 MiB (docs/ingest.md, "Worst-case resident memory", term 2).
+    /// That same 16 MiB request cap also bounds the compressed OTLP HTTP
+    /// gzip request body term 2 now lists.
+    /// It does not by itself bound the buffered ingest bytes those
+    /// requests then hold, nor the OTLP HTTP gzip inflate and the Remote
+    /// Write snappy inflate, which `--max-ingest-buffer-bytes` charges.
     /// `0` disables the limit.
     #[arg(long = "max-inflight-ingest-requests", default_value_t = 1024)]
     pub max_inflight_ingest_requests: u64,
 
-    /// The process-wide ingest buffer byte budget (ADR-0069 decision 1): a
-    /// ceiling on the sum of estimated buffered ingest bytes held
-    /// across every tenant and signal (metrics, logs, traces) at once. A
-    /// request whose estimated buffered bytes would push the gauge past this
-    /// ceiling is shed before any buffering -- HTTP 429 with `Retry-After`,
-    /// gRPC `RESOURCE_EXHAUSTED` -- so a burst of active tenants can no longer
-    /// grow resident memory without bound (the per-tenant buffer caps bound
-    /// each tenant, not their sum). Like `--max-inflight-ingest-requests` this
-    /// is a per-process local bound, never fleet-reconciled. Default 512 MiB;
-    /// `0` disables the ceiling (the gauge is still tracked for `/metrics`).
+    /// The process-wide ingest buffer byte budget (ADR-0069 decision 1,
+    /// amended by issues #1297 and #1419): a ceiling on the sum of estimated
+    /// buffered ingest bytes held across every tenant and signal (metrics,
+    /// logs, traces) at once, plus the transient bytes an OTLP HTTP gzip
+    /// request or a Remote Write snappy request inflates during decode.
+    /// The gzip bytes are charged against this same gauge as
+    /// they inflate: each decompressed chunk is charged before it is retained,
+    /// and the inflate is retained as those exactly-sized chunks rather than
+    /// appended into one growing buffer, so the charge equals the bytes held at
+    /// every instant. What stays uncharged is a fixed staging-and-decoder cost
+    /// plus per-chunk bookkeeping that scales with chunk count: one fixed 64
+    /// KiB staging chunk the decoder reads into per in-flight inflate, which
+    /// transiently holds one chunk of decompressed bytes; per-chunk bookkeeping
+    /// (about 48 bytes per 64 KiB chunk, held in two vectors that grow by
+    /// doubling); and flate2's own decoder state (tens of KiB); the compressed
+    /// request body itself also stays resident for the whole inflate but is
+    /// bounded by the request cap and already counted against
+    /// `--max-inflight-ingest-requests`. No uncharged allocation holds a copy
+    /// of the full decompressed body; the staging chunk holds only one chunk at
+    /// a time, and it and the decoder state are a fixed cost that alone can
+    /// exceed the charge itself on a small decompressed body. A decompression
+    /// whose running charge would cross the ceiling is shed mid-inflate instead
+    /// of being allocated in full. Remote Write's snappy body is charged in one
+    /// step instead, and before anything is allocated: the snappy block format
+    /// declares its decompressed length in a varint header, so the exact
+    /// inflated size is charged ahead of the buffer it pays for, and the charge
+    /// is held through protobuf decode and normalization and released before
+    /// the router charges the normalized batch. A body whose declared inflate
+    /// exceeds the 64 MiB post-decompression cap takes no charge and is
+    /// rejected by the decoder as before. A request whose charge would push the gauge
+    /// past this ceiling is shed before any buffering -- HTTP 429 with
+    /// `Retry-After`, gRPC `RESOURCE_EXHAUSTED` -- so a burst of active
+    /// tenants can no longer grow resident memory without bound (the
+    /// per-tenant buffer caps bound each tenant, not their sum). It does NOT
+    /// cover the identity-path decoded body, the OTLP gRPC gzip inflate, or
+    /// the OTAP zstd payload inflate; those stay bounded by
+    /// `--max-inflight-ingest-requests` (docs/ingest.md, "Worst-case resident
+    /// memory"). Like `--max-inflight-ingest-requests` this is a per-process
+    /// local bound, never fleet-reconciled. Default 512 MiB; `0` disables the
+    /// ceiling (the gauge is still tracked for `/metrics`).
     #[arg(long = "max-ingest-buffer-bytes", default_value_t = 512 * 1024 * 1024)]
     pub max_ingest_buffer_bytes: u64,
 
-    /// Per-shard bound on concurrently in-flight flushes, for all three
-    /// ingest pipelines (metrics, logs, spans -- ADR-0067 decision 2,
-    /// extended to logs and spans by ADR-0076 decision 3). Each shard's
-    /// flush runs in a spawned task the shard actor no longer waits on; this
-    /// caps how many such tasks a single shard may have outstanding at once,
-    /// so pipelining trades bounded extra memory (buffers held by in-flight
-    /// flushes) for overlapped PUT latency instead of unbounded fan-out.
-    /// Matches [`ravel_ingest::IngestConfig::max_inflight_flushes`]'s own
-    /// default of 1 (today's non-pipelined behavior). `0` is rejected by
+    /// Per-shard bound on flushes executing at once, for all three ingest
+    /// pipelines (metrics, logs, spans -- ADR-0067 decision 2, extended to
+    /// logs and spans by ADR-0076 decision 3, and amended by ADR-1642). Each
+    /// flush runs in a spawned task that acquires the shard's permit itself,
+    /// so the shard actor never waits for one: it keeps draining its channel
+    /// and firing age triggers for every tenant on the shard while a flush is
+    /// stalled. This makes the knob the per-shard cross-tenant flush
+    /// isolation control as much as a throughput one. At the default of 1, a
+    /// tenant whose S3 key prefix is being throttled (`503 SlowDown`, applied
+    /// per prefix) holds the shard's only permit, and co-resident tenants'
+    /// flushes queue behind it until the stall clears. A queued flush's
+    /// `max_flush_lifetime` budget is measured from when it acquires the permit,
+    /// not from flush-open, so the wait itself does not abandon
+    /// it: a buffered write's rows stay invisible to queries until the stall
+    /// clears, then commit, rather than being dropped. A co-resident strict
+    /// write instead takes `WriteError::AckTimeout` once the request's ack
+    /// deadline elapses while its flush is still queued for the permit, even
+    /// though its own prefix stayed healthy. Raising the bound gives those
+    /// tenants a permit to flush on, at the cost of more concurrent PUTs and more
+    /// encode memory in flight. Queued flushes hold their buffers and their
+    /// ADR-0069 byte charges, so the byte budget, not this bound, is what
+    /// sheds when a shard backs up. Matches
+    /// [`ravel_ingest::IngestConfig::max_inflight_flushes`]'s own default of
+    /// 1 (today's non-pipelined behavior). `0` is rejected by
     /// [`Cli::validate`]: it would deadlock every flush, since a shard could
     /// never acquire a permit to run one.
     #[arg(long = "max-inflight-flushes", default_value_t = 1)]
@@ -786,6 +1234,45 @@ pub struct Cli {
     #[arg(long = "idle-tenant-state-ttl", value_name = "DURATION")]
     pub idle_tenant_state_ttl: Option<String>,
 
+    /// Serve the native MCP adapter at `POST /mcp` on the query router
+    /// (ADR-1374 decision 9). Off by default, and meaningful only in a build
+    /// with the `mcp` cargo feature: without the feature the route is never
+    /// mounted and this flag is inert. Unlike `--otap`, the flag is declared
+    /// in every build so the generated flag reference does not change with
+    /// the feature set. Runs only in the query-serving modes (`all`,
+    /// `query`), on both the public HTTP listener and the mTLS listener when
+    /// one is configured, and authenticates every request with the same
+    /// tenant resolver the HTTP query routes use.
+    #[arg(long)]
+    pub mcp: bool,
+
+    /// Exact `Origin` header values the MCP adapter accepts, comma-separated.
+    /// A request whose `Origin` is not on the list is refused with 403, and a
+    /// request with no `Origin` at all is accepted (a non-browser client
+    /// sends none). ADR-1374 decision 7 makes origin validation mandatory,
+    /// because a browser page on another site can otherwise reach a
+    /// loopback-bound MCP server with the user's ambient credentials. Empty
+    /// is allowed only when every listener the route is mounted on binds a
+    /// loopback address (`--listen-http`, and `--mtls-listener` when one is
+    /// configured); otherwise `--mcp` refuses to start without this flag.
+    #[arg(
+        long = "mcp-allowed-origins",
+        value_name = "ORIGINS",
+        value_delimiter = ','
+    )]
+    pub mcp_allowed_origins: Vec<String>,
+
+    /// Largest request body, in bytes, the MCP adapter reads before answering
+    /// 413 (ADR-1374 decision 7). The cap is applied before any JSON-RPC
+    /// parsing, so an oversized body is never buffered whole. `0` is
+    /// rejected: it would refuse every request.
+    #[arg(
+        long = "mcp-max-body-bytes",
+        value_name = "BYTES",
+        default_value_t = DEFAULT_MCP_MAX_BODY_BYTES
+    )]
+    pub mcp_max_body_bytes: u64,
+
     /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
     /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
     /// stack; this flag is the runtime opt-in that decides whether a given
@@ -797,21 +1284,41 @@ pub struct Cli {
     #[arg(long)]
     pub otap: bool,
 
-    /// Maximum resident bytes for the ADR-0046 read caches' RAM tier. Bounds
-    /// every ADR-0046 cache in the process from this one number: the query
-    /// fetcher cache (`store::build_cache`) and the catalog's byte cache
-    /// (`query::build_catalog`) both, not just the fetcher cache.
-    /// Read at startup only; there is no live resize. Ignored when
-    /// `--disable-cache` is set.
-    #[arg(long, default_value_t = DEFAULT_CACHE_MAX_BYTES)]
-    pub cache_max_bytes: u64,
+    /// Maximum resident bytes for the ADR-0046 read caches' RAM tier. When SET,
+    /// bounds BOTH caches from this one number: the query fetcher cache
+    /// (`store::build_cache`) and the catalog's byte cache
+    /// (`query::build_catalog`). When UNSET the two derive independently, the
+    /// catalog cache at a smaller share (they are separate LRU caches, so one
+    /// number would double-commit RAM). Read at startup only; there is no live
+    /// resize. Ignored when `--disable-cache` is set. Default when unset:
+    /// derived, 25% of `memory_budget_bytes` for the fetcher cache and 5% for
+    /// the catalog byte cache (ADR-1170 decision 3: the budget is
+    /// cgroup-capped effective memory minus a reserve, not raw `MemTotal`);
+    /// reference host (16 cores, 30 GiB, at today's provisional reserve):
+    /// 7,516,192,768 and 1,503,238,553. Fallback when MemTotal is unknown:
+    /// 256 MiB each. Startup refuses (does not clamp) a value whose two
+    /// resolved caps together exceed `memory_budget_bytes`.
+    ///
+    /// Omitted, the value is DERIVED from the host
+    /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141,
+    /// rebased onto `memory_budget_bytes` by ADR-1170 decision 3): the
+    /// fetcher cache takes [`CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`
+    /// (cgroup-capped effective memory minus
+    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`]) and the catalog byte cache
+    /// [`CATALOG_CACHE_MEMORY_PERCENT`], or [`DEFAULT_CACHE_MAX_BYTES`]
+    /// (256 MiB) each when memory cannot be read.
+    #[arg(long, value_name = "BYTES")]
+    pub cache_max_bytes: Option<u64>,
 
     /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
     /// absent, only the RAM tier exists and behavior is exactly today's. Set,
     /// both the query fetcher cache (`store::build_cache`) and the catalog byte
     /// cache (`query::build_catalog`) gain a `DiskCache` at this path, each
-    /// bounded by `--cache-max-bytes` (there is no separate disk-tier capacity
-    /// flag). The directory is created lazily on first admission and is never
+    /// bounded by its own resolved RAM ceiling: the fetcher cache by
+    /// `--cache-max-bytes` or its derived value, the catalog byte cache by its
+    /// own resolved value, which equals `--cache-max-bytes` only when that flag
+    /// is set explicitly (there is no separate disk-tier capacity flag). The
+    /// directory is created lazily on first admission and is never
     /// required to exist; a missing, full, or corrupt cache directory degrades
     /// to a store read, never a query error.
     ///
@@ -822,6 +1329,18 @@ pub struct Cli {
     /// must provide it at the filesystem/volume layer (an encrypted volume).
     #[arg(long, value_name = "PATH")]
     pub cache_dir: Option<PathBuf>,
+
+    /// Number of in-flight object-store requests (LISTs and record GETs) the
+    /// catalog resolve path (`Catalog::resolve_impl`) keeps in flight at
+    /// once, via a per-instance semaphore. Unset, it takes
+    /// `ravel_catalog::CatalogConfig`'s own default (currently 128). `0` is
+    /// rejected by [`Cli::validate`]: a zero-permit semaphore would deadlock
+    /// every resolve, never silently clamped to 1. A value above
+    /// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY` is rejected too: past
+    /// that ceiling the number is a typo, not a setting (see the constant's
+    /// doc for the per-prefix arithmetic).
+    #[arg(long = "catalog-resolve-concurrency", value_name = "COUNT")]
+    pub catalog_resolve_concurrency: Option<usize>,
 
     /// Disables every ADR-0046 read cache in the process entirely: the query
     /// fetcher cache (`store::build_cache`) and the catalog's byte cache
@@ -878,12 +1397,19 @@ pub struct Cli {
     /// `30s`). Query-mode startup requires it to be `<=` the durable `sys/gc`
     /// `max_query_duration` (ADR-0050 section 4). Feeds the real
     /// `QueryEngine` (`EngineConfig::deadline`) as well as the validation, so
-    /// the value validated is the value enforced. Omitted defaults to
-    /// `ravel_query::EngineConfig::default().deadline` (30s), the compiled-in
-    /// engine deadline, so behavior is byte-identical when unset. Note this
-    /// is the *engine's* enforced query timeout, a distinct quantity from
-    /// `sys/gc`'s `max_query_duration` (the GC protection budget the timeout
-    /// must fit under); the flag governs the former. (default: 30s)
+    /// the value validated is the value enforced. Default when unset: derived
+    /// (host-independent): 11m; reference host (16 cores, 30 GiB): 11m. A
+    /// deadline is wall-clock, not resident bytes, so it does not scale with
+    /// MemTotal and has no memory fallback.
+    ///
+    /// Omitted, the value is DERIVED ([`resolve_performance_defaults`],
+    /// ADR-0088 as amended by issue #1141): [`DERIVED_QUERY_DEADLINE`]
+    /// (11 minutes), the deadline the #968 ClickBench run needed for its
+    /// longest statement, and still under the durable `sys/gc`
+    /// `max_query_duration` default of 1h. Note this is the *engine's*
+    /// enforced query timeout, a distinct quantity from `sys/gc`'s
+    /// `max_query_duration` (the GC protection budget the timeout must fit
+    /// under); the flag governs the former. (default: 11m)
     #[arg(long, value_name = "DURATION")]
     pub gc_max_query_duration: Option<String>,
 
@@ -907,6 +1433,38 @@ pub struct Cli {
     /// `store_probe::DEFAULT_STORE_PROBE_INTERVAL` (30s). (default: 30s)
     #[arg(long, value_name = "DURATION")]
     pub store_probe_interval: Option<String>,
+
+    /// Upper bound on the graceful-shutdown drain, as a humantime duration
+    /// (e.g. `25s`). On SIGTERM the process flips readiness to draining, waits
+    /// for probes to observe 503, then flushes ingest buffers and joins its
+    /// background tasks; this bounds that whole drain so the process still
+    /// exits before Kubernetes escalates SIGTERM to SIGKILL. Matches the
+    /// humantime-duration flag convention of `--store-probe-interval`. Omitted
+    /// defaults to `DEFAULT_SHUTDOWN_TIMEOUT`, deliberately below the
+    /// Kubernetes default `terminationGracePeriodSeconds` (30s). A zero
+    /// duration is rejected, and so is a value above `MAX_SHUTDOWN_TIMEOUT`
+    /// (1h): a larger timeout serves no grace period and overflows the listener
+    /// sub-budget at shutdown. (default: 25s)
+    #[arg(long, value_name = "DURATION")]
+    pub shutdown_timeout: Option<String>,
+
+    /// How far behind ingest time a data point's event time may fall before it
+    /// is rejected as too old, as a humantime duration (e.g. `2h`, `720h`),
+    /// ADR-0051 section 4. One flag drives BOTH the OTLP admission bound
+    /// (`IngestLimits`/`LogIngestLimits`/`SpanIngestLimits::max_ingest_lag_ns`
+    /// on metrics, logs, and spans) AND the catalog listing window
+    /// (`ravel_catalog::CatalogConfig::max_ingest_lag_ns`), so the two cannot be
+    /// set inconsistently: raising the flag widens the listing window first,
+    /// then the admission bound, the order
+    /// `docs/guides/admission-limits.md` prescribes. Raise it to replay
+    /// telemetry older than the default after an outage or a bulk import.
+    /// Matches the humantime-duration flag convention of `--store-probe-interval`.
+    /// Omitted defaults to `DEFAULT_MAX_INGEST_LAG` (2h), so a
+    /// deployment that does not set it sees byte-identical behavior. A zero
+    /// duration is rejected: it would reject every point not exactly at ingest
+    /// time, discarding all normally-delayed telemetry. (default: 2h)
+    #[arg(long, value_name = "DURATION")]
+    pub max_ingest_lag: Option<String>,
 
     /// OTLP/gRPC endpoint this process exports its own query-path `tracing`
     /// spans to (ADR-0060). Absent by default: with no endpoint the subscriber
@@ -1024,13 +1582,17 @@ pub struct Cli {
     pub max_parallel_slices: usize,
 
     /// A remote cluster this coordinator federates a query out to (ADR-0071
-    /// cross-cluster federation). Repeatable: one flag per remote.
+    /// cross-cluster federation). Repeatable: one flag per remote. Its
+    /// credential belongs to one local tenant, named by the `tenant` key; a
+    /// spec that names none is refused on a coordinator that runs queries for
+    /// more than one local tenant.
     ///
     /// The value is a comma-separated `key=value` spec. Required keys: `name`
     /// (the cluster's stable label, surfaced in the `warnings` field when it is
     /// skipped), `endpoint` (`host:port` of the remote's fragment `SeriesFetch`
     /// surface), and `credential-file` (a file holding the bearer token this
-    /// coordinator presents to the remote). Optional keys: `tls`
+    /// coordinator presents to the remote). Optional keys: `tenant` (the one
+    /// local tenant whose queries fan out to this remote), `tls`
     /// (`true`/`false`, default `true`), `tls-ca-file` (a CA bundle for the
     /// remote's server certificate, meaningful only with TLS on),
     /// `skip-unavailable` (`true`/`false`, default `false`), and `soft-timeout`
@@ -1051,8 +1613,29 @@ pub struct Cli {
     /// this configured principal. Remotes are operator configuration only and
     /// never appear in query text.
     ///
+    /// Because that credential authorizes one tenant's data on the remote, it
+    /// belongs to one LOCAL tenant: `tenant` names it, and a query from any
+    /// other local tenant never dials this remote, presenting no credential and
+    /// receiving no remote series. A local tenant no remote names is answered
+    /// from local data alone. Two local tenants sharing a remote endpoint is two
+    /// `--remote-cluster` specs, each with its own `name` and `credential-file`;
+    /// there is no syntax for naming several local tenants on one spec, because
+    /// that puts them back behind one credential.
+    ///
+    /// Omitting `tenant` leaves the remote reachable by every local tenant,
+    /// which is correct only where the coordinator runs queries for one. A
+    /// coordinator that runs queries for more than one (two or more
+    /// `--tenant-token` tenants, an `--alert-rules-file` naming a tenant no
+    /// token does, or any of `--dev-insecure-tenant-header`, `--oidc-issuer`,
+    /// or `--mtls-enabled`) refuses to start with such a spec, rather than
+    /// fanning every local tenant's selectors and discovery out under the same
+    /// credential and returning another tenant's series. A `tenant` named by
+    /// neither a `--tenant-token` nor an `--alert-rules-file` rule is also
+    /// refused where the tenant set is fully known: it can never fire. A
+    /// tenant that only alert rules name is a valid target.
+    ///
     /// Example:
-    /// `--remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,skip-unavailable=true`
+    /// `--remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tenant=acme,skip-unavailable=true`
     #[arg(long = "remote-cluster", value_name = "SPEC")]
     pub remote_clusters: Vec<String>,
 
@@ -1099,17 +1682,22 @@ pub struct Cli {
     pub store_bg_permits: usize,
 }
 
-/// Default `--sql-max-query-bytes`: the per-query SQL memory-pool ceiling
-/// (256 MiB), today's compiled-in `ravel_sql::config::DEFAULT_MAX_QUERY_BYTES`.
-/// Mirrored here (ravel-sql is an optional dependency, so this crate cannot
-/// name that constant in feature-independent code) and pinned equal to it by
-/// `sql_budget_defaults_match_compiled_in_constants`.
+/// `--sql-max-query-bytes` when the flag is unset and the host's `MemTotal`
+/// cannot be read: the per-query SQL memory-pool ceiling (256 MiB), the
+/// compiled-in `ravel_sql::config::DEFAULT_MAX_QUERY_BYTES`. Mirrored here
+/// (ravel-sql is an optional dependency, so this crate cannot name that
+/// constant in feature-independent code) and pinned equal to it by
+/// `sql_budget_fallbacks_match_compiled_in_constants`. The derived value
+/// ([`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal`) is used whenever memory is
+/// known.
 pub const DEFAULT_SQL_MAX_QUERY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Default `--sql-tenant-max-bytes`: the per-tenant SQL memory ceiling (1 GiB),
-/// today's compiled-in `crate::query::DEFAULT_MAX_TENANT_BYTES` (which is
-/// defined as this constant when the `sql` feature is on). Four times the
-/// per-query default.
+/// `--sql-tenant-max-bytes` when the flag is unset and the host's `MemTotal`
+/// cannot be read: the per-tenant SQL memory ceiling (1 GiB), the compiled-in
+/// `crate::query::DEFAULT_MAX_TENANT_BYTES` (which is defined as this constant
+/// when the `sql` feature is on). Four times the per-query fallback. The
+/// derived value ([`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal`) is used whenever
+/// memory is known.
 pub const DEFAULT_SQL_TENANT_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
 /// The four ADR-0088 operator-configurable query budgets, resolved from
@@ -1118,15 +1706,74 @@ pub const DEFAULT_SQL_TENANT_MAX_BYTES: usize = 1024 * 1024 * 1024;
 /// ([`Cli::query_budgets`]) into [`crate::ServerConfig::query_budgets`], and
 /// [`crate::start`] folds `fetch_concurrency`/`max_segments` into the one
 /// process-wide `EngineConfig` both query surfaces share and passes the two SQL
-/// ceilings to `build_sql_state`. Every field's [`Default`] is exactly today's
-/// compiled-in value, so a server built with none of the four flags carries a
-/// budget bit-for-bit identical to before they existed.
+/// ceilings to `build_sql_state`.
+///
+/// The four ADR-0088 budgets arrive here already RESOLVED
+/// ([`ResolvedPerformanceDefaults`]): an unset flag is the host-derived value,
+/// not the library constant. [`Default`] still spells the library constants,
+/// which is the baseline a test constructs from, never what an unset CLI
+/// produces.
+/// The MCP surface's settings (ADR-1374 D7/D9), resolved from `--mcp`,
+/// `--mcp-allowed-origins`, and `--mcp-max-body-bytes`.
+///
+/// These ride on [`QueryBudgets`] because that is the one query-surface
+/// configuration [`Cli::query_budgets`] builds and [`crate::start`] receives;
+/// the MCP adapter is mounted on the same query router and reads them there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpConfig {
+    /// Whether `POST /mcp` is mounted at all. Off unless `--mcp` was passed,
+    /// so a build that carries the feature still serves no MCP route by
+    /// default.
+    pub enabled: bool,
+    /// The exact `Origin` header values a browser-originated request may
+    /// carry (D7). A request carrying no `Origin` at all is always accepted:
+    /// a non-browser client sends none, and a browser always does. Empty
+    /// disables the check, which is why [`Cli::validate`] refuses an empty
+    /// list on a non-loopback listener rather than serving an open surface.
+    pub allowed_origins: Vec<String>,
+    /// The request body cap in bytes (D7). A body past it is refused with 413
+    /// before the JSON-RPC frame is parsed.
+    pub max_body_bytes: u64,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        McpConfig {
+            enabled: false,
+            allowed_origins: Vec::new(),
+            max_body_bytes: DEFAULT_MCP_MAX_BODY_BYTES,
+        }
+    }
+}
+
+/// The D7 request body cap: 1 MiB.
+pub const DEFAULT_MCP_MAX_BODY_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryBudgets {
-    /// Per-query segment fetch concurrency, also the SQL scan partition count
-    /// and S3 GET concurrency (ADR-0087; not decoupled). Reaches
-    /// `EngineConfig::fetch_concurrency`.
+    /// The legacy combined knob (ADR-0087). Since ADR-1195 the three resolved
+    /// fields below carry the GET concurrency, the SQL partition count, and the
+    /// PromQL fan-out, and `apply_to_engine` always sets all three, so this
+    /// value still reaches `EngineConfig::fetch_concurrency` but the server's
+    /// engine no longer consults it for any of those effects. Kept for the
+    /// startup log line and for callers that still read it.
     pub fetch_concurrency: usize,
+    /// The resolved GET concurrency (ADR-1195): the operator's explicit
+    /// `--store-get-concurrency`, else the legacy `--fetch-concurrency`
+    /// value, else the derived default -- already resolved by
+    /// [`resolve_performance_defaults`], never re-derived here. Reaches
+    /// `EngineConfig::store_get_concurrency` as `Some(self.store_get_concurrency)`,
+    /// which is what makes the accessor return exactly this value regardless
+    /// of `fetch_concurrency`.
+    pub store_get_concurrency: usize,
+    /// The resolved SQL scan partition count (ADR-1195), same resolution
+    /// shape as [`Self::store_get_concurrency`]. Reaches
+    /// `EngineConfig::sql_partition_count`.
+    pub sql_partition_count: usize,
+    /// The resolved PromQL fetch fan-out width (ADR-1195), same resolution
+    /// shape as [`Self::store_get_concurrency`]. Reaches
+    /// `EngineConfig::promql_fetch_fanout`.
+    pub promql_fetch_fanout: usize,
     /// Per-query segment fan-out cap. Reaches `EngineConfig::max_segments`.
     pub max_segments: usize,
     /// Per-query SQL memory-pool ceiling. Reaches `SqlConfig::max_query_bytes`.
@@ -1165,12 +1812,18 @@ pub struct QueryBudgets {
     /// `EngineConfig::logs_max_fetch_run_bytes` and from there
     /// `LogSegmentFetcher::with_max_fetch_run_bytes`.
     pub logs_max_fetch_run_bytes: u64,
+    /// The MCP surface's settings (ADR-1374). Not a query budget; it rides
+    /// here because this is the query-surface configuration `start` receives.
+    pub mcp: McpConfig,
 }
 
 impl Default for QueryBudgets {
     fn default() -> Self {
         QueryBudgets {
             fetch_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            store_get_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            sql_partition_count: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            promql_fetch_fanout: ravel_query::DEFAULT_FETCH_CONCURRENCY,
             max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
             sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
@@ -1180,6 +1833,7 @@ impl Default for QueryBudgets {
             logs_fetch_policy: ravel_query::LogsFetchPolicy::default(),
             store_cost_profile: StoreCostProfile::reference(),
             logs_max_fetch_run_bytes: ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -1227,6 +1881,14 @@ impl QueryBudgets {
             overridden_block_range_threshold: resolved.overridden_block_range_threshold,
             saturated_profile: resolved.saturated_profile,
             max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
+            latency_first_measured_concurrency: match self.logs_fetch_policy {
+                ravel_query::LogsFetchPolicy::LatencyFirst => {
+                    Some(ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY)
+                }
+                _ => None,
+            },
+            store_get_concurrency: self.store_get_concurrency,
+            sql_partition_count: self.sql_partition_count,
         }
     }
 
@@ -1255,6 +1917,9 @@ impl QueryBudgets {
         let resolved = self.logs_fetch_resolution();
         let config = ravel_query::EngineConfig {
             fetch_concurrency: self.fetch_concurrency,
+            store_get_concurrency: Some(self.store_get_concurrency),
+            sql_partition_count: Some(self.sql_partition_count),
+            promql_fetch_fanout: Some(self.promql_fetch_fanout),
             max_segments: self.max_segments,
             logs_block_range_threshold: resolved.block_range_threshold,
             logs_request_cost_bytes: resolved.request_cost_bytes,
@@ -1309,9 +1974,39 @@ pub struct LogsFetchStamp {
     pub saturated_profile: Option<String>,
     /// The resolved fetch bound (`--logs-max-fetch-run-bytes`).
     pub max_fetch_run_bytes: u64,
+    /// The resolved `store_get_concurrency` (ADR-1195), carried here only so
+    /// [`Self::emit`] can name it on the `latency-first` memory-precondition
+    /// line below; this policy resolves the same value every other policy
+    /// does (ADR-1196), so it is not itself part of the fetch resolution.
+    pub store_get_concurrency: usize,
+    /// The resolved `sql_partition_count` (ADR-1195), carried for the same
+    /// reason as [`Self::store_get_concurrency`]: a logs read reaches the
+    /// measured concurrency only when the GET permits and the SQL scan width
+    /// are both there, so the precondition below reads both.
+    pub sql_partition_count: usize,
+    /// `Some(`[`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`]`)` when
+    /// [`Self::policy`] is `latency-first`, `None` otherwise (ADR-1196). This
+    /// is the concurrency the policy's trade was measured at, not a resolved
+    /// default: `latency-first` carries no concurrency preference of its own,
+    /// so this field exists to make the memory precondition operator-visible
+    /// in [`Self::emit`]. It does not describe what any knob resolved to.
+    pub latency_first_measured_concurrency: Option<usize>,
 }
 
 impl LogsFetchStamp {
+    /// Whether this process has reached the concurrency `latency-first`'s
+    /// measured trade needs. Both the GET permits and the SQL scan width have
+    /// to be there: `--store-get-concurrency` alone leaves logs scanning at
+    /// the derived partition count, which is not the shape that was measured.
+    /// `None` under every other policy, which stamps no measured concurrency
+    /// at all. [`Self::emit`] words its precondition line from this, so an
+    /// operator who has already raised both is not told to raise them.
+    fn latency_first_precondition_met(&self) -> Option<bool> {
+        self.latency_first_measured_concurrency.map(|measured| {
+            self.store_get_concurrency >= measured && self.sql_partition_count >= measured
+        })
+    }
+
     /// Emit this stamp at startup. One INFO line with the whole effective
     /// configuration, plus a WARN naming the overridden
     /// `--logs-block-range-threshold` when the resolution saturated past it:
@@ -1338,6 +2033,32 @@ impl LogsFetchStamp {
                  every logs object is read whole-object"
             );
         }
+        if let Some(measured_concurrency) = self.latency_first_measured_concurrency {
+            if self.latency_first_precondition_met() == Some(false) {
+                tracing::info!(
+                    policy = self.policy,
+                    store_get_concurrency = self.store_get_concurrency,
+                    sql_partition_count = self.sql_partition_count,
+                    latency_first_measured_concurrency = measured_concurrency,
+                    precondition_met = false,
+                    "latency-first is an intent, not a tuning constant: its measured trade \
+                     needs both store_get_concurrency and sql_partition_count raised to \
+                     the measured concurrency explicitly, and below it this policy's \
+                     byte-minimal routing has measured slower than the default policy"
+                );
+            } else {
+                tracing::info!(
+                    policy = self.policy,
+                    store_get_concurrency = self.store_get_concurrency,
+                    sql_partition_count = self.sql_partition_count,
+                    latency_first_measured_concurrency = measured_concurrency,
+                    precondition_met = true,
+                    "latency-first is running at or above the concurrency its trade was \
+                     measured at; in-flight fetch memory there is still not bounded by a \
+                     process-wide budget, so watch process memory"
+                );
+            }
+        }
     }
 }
 
@@ -1347,10 +2068,946 @@ impl LogsFetchStamp {
 /// the fetcher's own.
 pub const DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD: u64 = ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD;
 
-/// Default `--cache-max-bytes`: generous enough to hold a working set of
-/// recently fetched segment/log byte ranges across a handful of concurrent
-/// queries, small enough that a dev process does not need tuning to pick it.
+/// `--cache-max-bytes` when the flag is unset and the host's `MemTotal` cannot
+/// be read (256 MiB): generous enough to hold a working set of recently fetched
+/// segment/log byte ranges across a handful of concurrent queries, small enough
+/// that a dev process does not need tuning to pick it. The derived value
+/// ([`CACHE_MEMORY_PERCENT`] of `MemTotal`) is used whenever memory is known.
 pub const DEFAULT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// This process's host, read once at startup and injected into
+/// [`resolve_performance_defaults`] so the resolution itself does no I/O and is
+/// unit-testable against any host shape (ADR-0088 as amended by issue #1141).
+///
+/// `cores` has no "unknown" state: an unreadable parallelism yields the floor of
+/// 1, which resolves to the same minimum a 1-core host gets. `mem_total_bytes`
+/// does: a percentage of an unknown total is not a number, so every
+/// memory-derived default falls back to its compiled-in constant instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostProfile {
+    /// Usable parallelism, from `std::thread::available_parallelism`, floored
+    /// at 1.
+    pub cores: usize,
+    /// Usable memory in bytes: `/proc/meminfo`'s `MemTotal` on Linux, capped
+    /// by the cgroup memory limit when the process runs under a finite one
+    /// (cgroup v2 `memory.max`, else v1 `memory.limit_in_bytes`), so a
+    /// container derives from the memory it may use rather than the host's.
+    /// `None` when neither can be read or parsed, and on every non-Linux
+    /// target.
+    pub mem_total_bytes: Option<u64>,
+}
+
+impl HostProfile {
+    /// Build a profile from known values. `cores` is floored at 1 here, so a
+    /// caller (or a test) cannot construct a zero-core host that would resolve
+    /// a zero fetch concurrency.
+    pub fn new(cores: usize, mem_total_bytes: Option<u64>) -> Self {
+        HostProfile {
+            cores: cores.max(1),
+            mem_total_bytes,
+        }
+    }
+
+    /// Read this host's shape. Called exactly once, from `main`, before any
+    /// value is resolved: every consumer takes the resolved values, not the
+    /// profile, so no later code re-reads the host and no two resolutions can
+    /// disagree.
+    pub fn detect() -> Self {
+        HostProfile {
+            cores: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            mem_total_bytes: detect_mem_total_bytes(),
+        }
+    }
+}
+
+/// This host's usable memory total in bytes, or `None` when it is not
+/// knowable: `/proc/meminfo`'s `MemTotal`, capped by the cgroup memory limit
+/// when the process runs under one (cgroup v2 `memory.max`, else cgroup v1
+/// `memory.limit_in_bytes`). A container reads the host's `MemTotal`, so a
+/// share of it alone would size the caches and pools against memory the
+/// container is not allowed to use and the derived defaults would OOM-kill the
+/// process they were meant to size.
+#[cfg(target_os = "linux")]
+fn detect_mem_total_bytes() -> Option<u64> {
+    let mem_total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| parse_mem_total_bytes(&contents));
+    let cgroup_limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|contents| parse_cgroup_memory_limit(&contents))
+        .or_else(|| {
+            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                .ok()
+                .and_then(|contents| parse_cgroup_memory_limit(&contents))
+        });
+    effective_memory_total(mem_total, cgroup_limit)
+}
+
+/// Parse a cgroup memory limit file into a finite byte limit: `memory.max` on
+/// cgroup v2, `memory.limit_in_bytes` on v1. `max` (v2's "no limit"), the v1
+/// no-limit sentinel (the page-rounded `i64::MAX`, recognised as any value at
+/// or above 2^60), `0`, and anything malformed are `None`: an absent or
+/// unlimited cgroup must not cap anything, and a wrong cap would resize every
+/// memory-derived default.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_memory_limit(contents: &str) -> Option<u64> {
+    let raw = contents.trim();
+    if raw == "max" {
+        return None;
+    }
+    let bytes: u64 = raw.parse().ok()?;
+    if bytes == 0 || bytes >= 1 << 60 {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// The memory total the derived defaults size against: `MemTotal` capped by a
+/// finite cgroup limit. Either one alone is used when the other is unknown, so
+/// a container whose `/proc/meminfo` is unreadable still derives from its
+/// limit, and a bare host with no cgroup limit derives from `MemTotal`.
+#[cfg(any(target_os = "linux", test))]
+fn effective_memory_total(mem_total: Option<u64>, cgroup_limit: Option<u64>) -> Option<u64> {
+    match (mem_total, cgroup_limit) {
+        (Some(total), Some(limit)) => Some(total.min(limit)),
+        (Some(total), None) => Some(total),
+        (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    }
+}
+
+/// Non-Linux targets expose no `/proc/meminfo`; every memory-derived default
+/// falls back to its compiled-in constant there rather than guessing.
+#[cfg(not(target_os = "linux"))]
+fn detect_mem_total_bytes() -> Option<u64> {
+    None
+}
+
+/// Parse `MemTotal` out of `/proc/meminfo` contents, in bytes.
+///
+/// The line is `MemTotal:       32137720 kB`: a fixed key, a decimal count, and
+/// a unit the kernel always writes as `kB` (kibibytes, despite the spelling).
+/// Anything else -- a missing line, a non-numeric count, an unrecognised unit --
+/// is `None` rather than a guess, because a wrong total silently resizes every
+/// memory-derived default.
+///
+/// Only the Linux detector calls this; on other targets it exists for the
+/// tests alone, so it is compiled out of the library there rather than left
+/// as dead code.
+#[cfg(any(target_os = "linux", test))]
+fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let mut fields = line.split_whitespace().skip(1);
+    let value: u64 = fields.next()?.parse().ok()?;
+    match fields.next() {
+        Some("kB") | Some("KB") => value.checked_mul(1024),
+        None => Some(value),
+        Some(_) => None,
+    }
+}
+
+/// Fetch concurrency per core in the derived default: the reference host's
+/// 16 cores resolve to 32, the setting the #968 ClickBench result was measured
+/// at.
+pub const FETCH_CONCURRENCY_PER_CORE: usize = 2;
+
+/// Floor under the derived fetch concurrency, the compiled-in
+/// `ravel_query::DEFAULT_FETCH_CONCURRENCY`: a 1- or 2-core host keeps today's
+/// fan-out rather than dropping below it.
+pub const MIN_DERIVED_FETCH_CONCURRENCY: usize = 8;
+
+/// Provisional placeholder for the overhead reserve subtracted from
+/// cgroup-capped effective memory to derive `memory_budget_bytes`. NOT the
+/// measured figure the calibration run below produces; that run is future
+/// work, gated on parts 1, 2, and 4 of the memory-budget project all having
+/// landed.
+///
+/// The calibration rule this constant will be overwritten with: with the
+/// budget set to unlimited (so nothing is refused) and the same 10-connection
+/// window used to sweep [`CACHE_MEMORY_PERCENT`], the reserve is the maximum
+/// over the window of `ravel_process_allocator_bytes{stat="resident"}` minus
+/// the unique tracked total (`cache_resident + sql_reserved + fetch_reserved
+/// minus handoff_overlap`), plus a 25% margin, rounded up to the next 256
+/// MiB; it must also exceed the fetch layer's `partitions x max batch bytes`
+/// exposure. That run is separate from, and frozen before, the acceptance
+/// runs the resulting figure gates, so the acceptance assertion is not
+/// circular.
+///
+/// Until that run exists, this is a round, clearly-provisional 2 GiB: well
+/// above the few hundred MiB an idle process (binary text/data, thread
+/// stacks, the tokio runtime, tracing buffers) costs before its first query,
+/// so a flag combination is not falsely refused for lack of the real number.
+pub const MEMORY_OVERHEAD_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Share of `memory_budget_bytes` (cgroup-capped effective memory minus
+/// [`MEMORY_OVERHEAD_RESERVE_BYTES`]) the derived `--cache-max-bytes` takes.
+///
+/// 25% rather than a larger share because the cache does not have the machine
+/// to itself. Measured on the 30 GiB reference host with ten concurrent
+/// connections (issue #1170), the query and fetch working set peaks at
+/// 17.2-20.8 GB and does NOT vary with the cache ceiling: it is an independent
+/// claim on the same memory. The budget is therefore a subtraction, not a
+/// preference.
+///
+/// | cache cap | error ratio | peak RSS | peak non-cache |
+/// |---|---|---|---|
+/// | 4 GiB | 0.035 | 20.0 GB | 18.1 GB |
+/// | 8 GiB | 0.044 | 23.7 GB | 18.3 GB |
+/// | 12 GiB | 0.997 | 24.8 GB | 17.2 GB |
+///
+/// The cliff between 8 and 12 GiB is where the sum crosses what the host has.
+/// At the previous 80% (of raw `MemTotal`) this resolved to 26.3 GB against a
+/// query path needing 20 GB on the same box, which is not satisfiable at any
+/// load: the server reached 31.4 GB and was OOM-killed roughly four minutes
+/// into the concurrency phase, taking the run with it. A flat 25% of raw
+/// `MemTotal` shares the same failure shape one layer down: on a host whose
+/// non-cache working set alone is close to the reserve this constant assumes,
+/// the two no longer leave room for each other. Carving from
+/// `memory_budget_bytes` instead of `MemTotal` keeps the 25% share meaningful
+/// once the reserve is subtracted, rather than letting it silently compete
+/// with the reserve for the same bytes.
+///
+/// This buys headroom; it does not by itself make the process fit. Bounding the
+/// query and fetch working set is #1170's remaining subject.
+pub const CACHE_MEMORY_PERCENT: u64 = 25;
+
+/// Share of `memory_budget_bytes` the derived catalog byte cache takes, a
+/// SEPARATE ceiling from [`CACHE_MEMORY_PERCENT`]. The fetcher cache
+/// (`store::build_cache`) and the catalog byte cache (`query::build_catalog`)
+/// are two independent LRU caches, so deriving both at the fetcher's share
+/// would double the pair's claim. 5% on the 30 GiB reference host is ~1.4 GiB
+/// of catalog objects, enough for a wide fold's HEAD/part working set without
+/// doubling the fetcher's claim. Both percentages carve the same
+/// `memory_budget_bytes`, so their 5-to-1 ratio to each other (and thus the
+/// relative split between the two caches) is unchanged by rebasing off the
+/// budget instead of the raw host total. An explicit `--cache-max-bytes`
+/// still bounds both caches at that one value.
+pub const CATALOG_CACHE_MEMORY_PERCENT: u64 = 5;
+
+/// Share of `MemTotal` the derived `--sql-max-query-bytes` takes (~8 GiB on the
+/// reference host).
+pub const SQL_QUERY_MEMORY_PERCENT: u64 = 25;
+
+/// Share of `MemTotal` the derived `--sql-tenant-max-bytes` takes (~16 GiB on
+/// the reference host), twice the per-query share so the per-tenant ceiling
+/// admits concurrent queries without the per-query clamp binding.
+pub const SQL_TENANT_MEMORY_PERCENT: u64 = 50;
+
+/// The derived `--max-segments`: the fan-out cap the #968 ClickBench result ran
+/// under. Host-independent -- a segment list is a per-query bound on plan width,
+/// not on resident bytes -- so it is the same on every host.
+pub const DERIVED_MAX_SEGMENTS: usize = 1_000_000;
+
+/// The derived `--gc-max-query-duration` (11 minutes): the engine deadline the
+/// #968 ClickBench run was configured with, far above the 30s the engine
+/// compiles in and far under the durable `sys/gc` `max_query_duration` default
+/// of 1h that query-mode startup validates against. Host-independent, like
+/// [`DERIVED_MAX_SEGMENTS`].
+pub const DERIVED_QUERY_DEADLINE: Duration = Duration::from_secs(11 * 60);
+
+/// [`ResolvedPerformanceDefaults`] source: the operator set the flag, and its
+/// value is used verbatim.
+pub const PERF_SOURCE_FLAG: &str = "flag";
+/// [`ResolvedPerformanceDefaults`] source: no flag was set and the value was
+/// derived from the [`HostProfile`] (or from a host-independent rule).
+pub const PERF_SOURCE_DERIVED: &str = "derived";
+/// [`ResolvedPerformanceDefaults`] source: no flag was set and the host's
+/// `MemTotal` was unknown, so the compiled-in constant is used.
+pub const PERF_SOURCE_FALLBACK: &str = "fallback";
+/// [`ResolvedPerformanceDefaults`] source: no explicit flag for this setting
+/// was set, but the legacy `--fetch-concurrency` was, and its value is used
+/// verbatim (ADR-1195 legacy precedence).
+pub const PERF_SOURCE_LEGACY_FLAG: &str = "legacy-flag";
+/// [`ResolvedPerformanceDefaults`] source: no flag was set, and the value was
+/// carved as a fixed share of `memory_budget_bytes` rather than of raw
+/// `MemTotal` (ADR-1170 decision 3): the fetcher and catalog byte caches.
+pub const PERF_SOURCE_BUDGET_CARVE: &str = "budget-carve";
+
+/// The operator's explicit performance flags: `None` per field means "derive".
+///
+/// A parsed, typed mirror of the CLI flags rather than the CLI itself, so
+/// [`resolve_performance_defaults`] takes no `Cli`, does no string parsing, and
+/// cannot fail. [`Cli::performance_flags`] builds it (and is where the
+/// `--gc-max-query-duration` humantime parse and its error live).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PerformanceFlags {
+    /// `--fetch-concurrency`.
+    pub fetch_concurrency: Option<usize>,
+    /// `--store-get-concurrency` (ADR-1195).
+    pub store_get_concurrency: Option<usize>,
+    /// `--sql-partition-count` (ADR-1195).
+    pub sql_partition_count: Option<usize>,
+    /// `--promql-fetch-fanout` (ADR-1195).
+    pub promql_fetch_fanout: Option<usize>,
+    /// `--max-segments`.
+    pub max_segments: Option<usize>,
+    /// `--cache-max-bytes`.
+    pub cache_max_bytes: Option<u64>,
+    /// `--sql-max-query-bytes`.
+    pub sql_max_query_bytes: Option<usize>,
+    /// `--sql-tenant-max-bytes`.
+    pub sql_tenant_max_bytes: Option<usize>,
+    /// `--gc-max-query-duration`, already parsed from its humantime spelling.
+    pub query_deadline: Option<Duration>,
+    /// `--disable-cache`. Not an `Option` because it is a bool flag with no
+    /// "derive" state: it is off unless the operator set it.
+    ///
+    /// It carves nothing itself, but it decides whether the two resolved cache
+    /// ceilings hold any memory at all. With it set, `store::build_cache`
+    /// returns no fetcher cache and `query::build_catalog` forces the catalog
+    /// byte cache to its `0` disabled sentinel, so both hard caps are
+    /// fictitious and the whole budget is really available to the shared
+    /// SQL/fetch accountant.
+    pub disable_cache: bool,
+}
+
+/// The six performance settings this process runs with, each with the source it
+/// came from, resolved once at startup by [`resolve_performance_defaults`].
+///
+/// `main` builds this before it builds anything that consumes one of the six,
+/// and threads the values into the read cache (`store::build_store`), the
+/// process-wide `EngineConfig` (through [`QueryBudgets`]), the SQL executor's
+/// two ceilings, and the `sys/gc` deadline validation. Nothing downstream reads
+/// a raw flag, so a value that is logged here is the value that is enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedPerformanceDefaults {
+    /// Reaches `EngineConfig::fetch_concurrency`.
+    pub fetch_concurrency: usize,
+    /// Reaches `EngineConfig::store_get_concurrency` and, from there, the
+    /// single process-owned `GetLimiter` (ADR-1195).
+    pub store_get_concurrency: usize,
+    /// Reaches `EngineConfig::sql_partition_count` and, from there,
+    /// `target_partitions` in `crates/ravel-sql/src/session.rs` (ADR-1195).
+    pub sql_partition_count: usize,
+    /// Reaches `EngineConfig::promql_fetch_fanout` and, from there, the
+    /// PromQL/analytics `buffer_unordered` fan-out width (ADR-1195).
+    pub promql_fetch_fanout: usize,
+    /// Reaches `EngineConfig::max_segments`.
+    pub max_segments: usize,
+    /// Reaches the query fetcher cache's byte ceiling
+    /// (`store::build_cache`). NOT the catalog byte cache: that has its own
+    /// [`Self::catalog_cache_max_bytes`], so the two independent LRU caches do
+    /// not each claim the full derived share of RAM.
+    pub cache_max_bytes: u64,
+    /// Reaches the catalog byte cache's byte ceiling
+    /// (`query::build_catalog`), a SEPARATE LRU from the fetcher cache. Derived
+    /// at [`CATALOG_CACHE_MEMORY_PERCENT`] rather than sharing
+    /// [`Self::cache_max_bytes`]'s 25%; an explicit `--cache-max-bytes` sets
+    /// both equal.
+    pub catalog_cache_max_bytes: u64,
+    /// Reaches `SqlConfig::max_query_bytes`. Never above
+    /// [`Self::sql_tenant_max_bytes`].
+    pub sql_max_query_bytes: usize,
+    /// Reaches the `SqlExecutor`'s per-tenant accountant.
+    pub sql_tenant_max_bytes: usize,
+    /// Reaches `EngineConfig::deadline`, and the `sys/gc` query validation.
+    pub query_deadline: Duration,
+    /// The process-wide ceiling (ADR-1170 decision 3, amended by issue
+    /// #1255) that [`Self::cache_max_bytes`] and
+    /// [`Self::catalog_cache_max_bytes`] are now carved from: cgroup-capped
+    /// effective memory minus [`MEMORY_OVERHEAD_RESERVE_BYTES`], or
+    /// `u64::MAX` when memory is unknown (the two caches then fall back to
+    /// [`DEFAULT_CACHE_MAX_BYTES`] instead of carving a meaningless budget;
+    /// `u64::MAX` rather than `0` because an unmeasured host has no
+    /// trustworthy ceiling, not the tightest possible one). The shared
+    /// remainder after both hard caps (`Self::memory_remainder_bytes`) sizes
+    /// the `MemoryBudget` handed to the SQL/fetch accountant; the per-tenant
+    /// SQL ceiling is the fairness bound WITHIN that remainder, not a second
+    /// separate budget.
+    pub memory_budget_bytes: u64,
+    /// The overhead reserve subtracted from effective memory to produce
+    /// [`Self::memory_budget_bytes`]. Always [`MEMORY_OVERHEAD_RESERVE_BYTES`]
+    /// today; logged so an operator can see the constant that was live for a
+    /// given run, independent of `main.rs`'s compiled-in value at read time.
+    pub memory_overhead_reserve_bytes: u64,
+    /// `cache_max_bytes + catalog_cache_max_bytes`: the two hard, non-shedding
+    /// eviction caps carved from [`Self::memory_budget_bytes`]. Startup
+    /// refuses (see `Cli::resolve_performance`) rather than clamps when this
+    /// is at or above the budget (issue #1255: a shared remainder of `0` is
+    /// as unusable as a negative one, since a `MemoryBudget::new(0)` refuses
+    /// every real reservation).
+    ///
+    /// `0` under [`Self::cache_disabled`], where the two ceilings above bound
+    /// caches that are never built, so this is NOT their sum on that path.
+    pub memory_hard_caps_bytes: u64,
+    /// `memory_budget_bytes - memory_hard_caps_bytes`: what sizes the shared
+    /// `MemoryBudget` accountant SQL and fetch draw from. Always strictly
+    /// positive on a derived budget once past startup refusal (issue #1255);
+    /// `0` (not negative) remains the saturating floor for a fallback budget
+    /// whose hard caps happen to consume all of `u64::MAX`, which does not
+    /// occur with today's flat cache constants.
+    ///
+    /// Under [`Self::cache_disabled`] this is the whole budget, and startup
+    /// does not refuse it, so a `0` here is also reachable on a host whose
+    /// effective memory is at or below the overhead reserve. `emit` WARNs on
+    /// that combination rather than refusing: no flag can raise a budget the
+    /// host's memory did not produce, and the process still ingests.
+    pub memory_remainder_bytes: u64,
+    /// `--disable-cache`: no fetcher cache and no catalog byte cache is built,
+    /// so [`Self::cache_max_bytes`] and [`Self::catalog_cache_max_bytes`] hold
+    /// no memory and [`Self::memory_hard_caps_bytes`] is `0` regardless of
+    /// them.
+    pub cache_disabled: bool,
+    /// Where each of the six above came from: [`PERF_SOURCE_FLAG`],
+    /// [`PERF_SOURCE_DERIVED`], or [`PERF_SOURCE_FALLBACK`].
+    pub sources: PerformanceSources,
+    /// Whether the per-query SQL pool was reduced to the per-tenant ceiling.
+    /// True only when the two crossed and the tenant ceiling won: an explicit
+    /// tenant flag against any per-query value, or a non-explicit per-query
+    /// value against any tenant ceiling. The startup log says so, because the
+    /// operator's `--sql-max-query-bytes` is then not the number in force.
+    pub sql_max_query_bytes_clamped: bool,
+    /// Whether a non-explicit (derived or fallback) per-tenant ceiling was
+    /// raised to fit an explicit `--sql-max-query-bytes`. True only when an
+    /// explicit per-query flag exceeded a tenant ceiling the operator did not
+    /// set; the tenant ceiling then equals the per-query pool. The startup log
+    /// says so, because the per-tenant number in force is not what the
+    /// derivation alone produced.
+    pub sql_tenant_max_bytes_raised: bool,
+}
+
+/// The provenance of each field of [`ResolvedPerformanceDefaults`], carried
+/// beside the values so the startup log can name it per line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerformanceSources {
+    pub fetch_concurrency: &'static str,
+    pub store_get_concurrency: &'static str,
+    pub sql_partition_count: &'static str,
+    pub promql_fetch_fanout: &'static str,
+    pub max_segments: &'static str,
+    pub cache_max_bytes: &'static str,
+    pub catalog_cache_max_bytes: &'static str,
+    pub sql_max_query_bytes: &'static str,
+    pub sql_tenant_max_bytes: &'static str,
+    pub query_deadline: &'static str,
+    pub memory_budget_bytes: &'static str,
+}
+
+/// `percent` percent of `total`, as integer arithmetic in `u128` so the product
+/// cannot overflow for any `u64` total.
+///
+/// Rounding is TRUNCATION toward zero: 5% of 8 GiB is 429,496,729 bytes, not
+/// 429,496,730. These are ceilings on resident bytes, so rounding down is the
+/// safe direction, and a fixed rule makes the resolved figure reproducible from
+/// the host's `MemTotal` by hand.
+fn percent_of(total: u64, percent: u64) -> u64 {
+    let product = u128::from(total) * u128::from(percent);
+    u64::try_from(product / 100).unwrap_or(u64::MAX)
+}
+
+/// Clamp a byte count into `usize` for the SQL ceilings, which are
+/// `usize`-typed. Saturating rather than wrapping: on a 32-bit target a host
+/// with more memory than `usize` can address resolves the largest expressible
+/// ceiling, never a wrapped small one.
+fn bytes_as_usize(bytes: u64) -> usize {
+    usize::try_from(bytes).unwrap_or(usize::MAX)
+}
+
+/// Resolve one of the three ADR-1195 knobs (`store_get_concurrency`,
+/// `sql_partition_count`, `promql_fetch_fanout`): an explicit flag wins, else
+/// the legacy `--fetch-concurrency` value if the operator set it, else the
+/// derived default. `Cli::validate` refuses the combination of an explicit
+/// flag together with `--fetch-concurrency`, so at most one of `explicit` and
+/// `legacy` is ever `Some` here.
+fn resolve_knob(
+    explicit: Option<usize>,
+    legacy: Option<usize>,
+    derived: usize,
+) -> (usize, &'static str) {
+    match (explicit, legacy) {
+        (Some(n), _) => (n, PERF_SOURCE_FLAG),
+        (None, Some(n)) => (n, PERF_SOURCE_LEGACY_FLAG),
+        (None, None) => (derived, PERF_SOURCE_DERIVED),
+    }
+}
+
+/// Resolve the six performance settings from the host and the operator's flags
+/// (ADR-0088 as amended by issue #1141).
+///
+/// Pure: no I/O, no clock, no global state. The rules, each of which an explicit
+/// flag overrides verbatim:
+///
+/// - `fetch_concurrency`: `max(MIN_DERIVED_FETCH_CONCURRENCY,
+///   FETCH_CONCURRENCY_PER_CORE * cores)`.
+/// - `memory_budget_bytes` (ADR-1170 decision 3, amended by issue #1255):
+///   cgroup-capped effective memory minus [`MEMORY_OVERHEAD_RESERVE_BYTES`],
+///   or `u64::MAX` when memory is unknown (no trustworthy ceiling can be
+///   derived, which is unlimited, not `0`).
+/// - `cache_max_bytes` (fetcher cache): [`CACHE_MEMORY_PERCENT`] of
+///   `memory_budget_bytes`, else [`DEFAULT_CACHE_MAX_BYTES`].
+/// - `catalog_cache_max_bytes` (catalog byte cache): a SEPARATE ceiling,
+///   [`CATALOG_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`, else
+///   [`DEFAULT_CACHE_MAX_BYTES`]. An explicit `--cache-max-bytes` sets it equal
+///   to `cache_max_bytes`, preserving the pre-#1141 single-number coupling.
+///   `memory_hard_caps_bytes` is the sum of these two, and
+///   `memory_remainder_bytes` is what's left of the budget after them: what
+///   sizes the shared `MemoryBudget` the SQL/fetch accountant draws from,
+///   with the per-tenant ceiling below as the fairness bound WITHIN it, not a
+///   second separate budget. `Cli::resolve_performance` refuses (does not
+///   clamp) a flag combination whose hard caps alone exceed the budget.
+///   `--disable-cache` builds neither cache, so `memory_hard_caps_bytes` is
+///   `0`, the remainder is the whole budget, and there is nothing for that
+///   refusal to fire on.
+/// - `sql_max_query_bytes`: [`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal`, else
+///   [`DEFAULT_SQL_MAX_QUERY_BYTES`].
+/// - `sql_tenant_max_bytes`: [`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal`, else
+///   [`DEFAULT_SQL_TENANT_MAX_BYTES`].
+/// - `max_segments`: [`DERIVED_MAX_SEGMENTS`].
+/// - `query_deadline`: [`DERIVED_QUERY_DEADLINE`].
+///
+/// The per-query SQL pool and the per-tenant ceiling are then reconciled so
+/// `sql_max_query_bytes <= sql_tenant_max_bytes` always holds. Which side gives
+/// depends on which was set explicitly:
+///
+/// - explicit `--sql-max-query-bytes` over a non-explicit (derived or fallback)
+///   tenant ceiling: RAISE the tenant ceiling to the per-query flag
+///   (`sql_tenant_max_bytes_raised`). An operator who typed a per-query pool on
+///   a host whose `MemTotal` was unknown must not have it silently cut to the
+///   1 GiB fallback tenant ceiling they never set.
+/// - any other crossing (an explicit tenant ceiling, or a non-explicit
+///   per-query value): CLAMP the per-query pool down to the tenant ceiling
+///   (`sql_max_query_bytes_clamped`) and warn. Lowering an isolation bound the
+///   operator explicitly set is the one direction that costs isolation.
+///
+/// Derived-vs-derived and fallback-vs-fallback never cross by construction
+/// (25% <= 50%, 256 MiB <= 1 GiB), so neither flag fires there.
+pub fn resolve_performance_defaults(
+    host: HostProfile,
+    flags: PerformanceFlags,
+) -> ResolvedPerformanceDefaults {
+    let cores = host.cores.max(1);
+
+    let derived_fetch_concurrency =
+        (FETCH_CONCURRENCY_PER_CORE.saturating_mul(cores)).max(MIN_DERIVED_FETCH_CONCURRENCY);
+
+    let (fetch_concurrency, fetch_source) = match flags.fetch_concurrency {
+        Some(n) => (n, PERF_SOURCE_FLAG),
+        None => (derived_fetch_concurrency, PERF_SOURCE_DERIVED),
+    };
+
+    let (store_get_concurrency, store_get_concurrency_source) = resolve_knob(
+        flags.store_get_concurrency,
+        flags.fetch_concurrency,
+        derived_fetch_concurrency,
+    );
+    let (sql_partition_count, sql_partition_count_source) = resolve_knob(
+        flags.sql_partition_count,
+        flags.fetch_concurrency,
+        derived_fetch_concurrency,
+    );
+    let (promql_fetch_fanout, promql_fetch_fanout_source) = resolve_knob(
+        flags.promql_fetch_fanout,
+        flags.fetch_concurrency,
+        derived_fetch_concurrency,
+    );
+
+    let (max_segments, segments_source) = match flags.max_segments {
+        Some(n) => (n, PERF_SOURCE_FLAG),
+        None => (DERIVED_MAX_SEGMENTS, PERF_SOURCE_DERIVED),
+    };
+
+    // ADR-1170 decision 3, amended by issue #1255: one process-wide
+    // memory_budget_bytes, cgroup-capped effective memory minus the overhead
+    // reserve, or `u64::MAX` (source `fallback`) when memory is unknown -- a
+    // percentage of an unknown total is not a number, so the two caches below
+    // fall back to a flat compiled-in constant rather than carving a budget
+    // that isn't one. `u64::MAX`, not `0`: "we could not measure the host"
+    // means no trustworthy ceiling can be derived, which is unlimited, not
+    // the tightest possible ceiling. A `0` budget here would starve the
+    // shared SQL/fetch `MemoryBudget` accountant (`memory_remainder_bytes`)
+    // down to `0`, refusing every real reservation on a process that
+    // otherwise looks healthy.
+    let (memory_budget_bytes, memory_budget_source) = match host.mem_total_bytes {
+        Some(total) => (
+            total.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES),
+            PERF_SOURCE_DERIVED,
+        ),
+        None => (u64::MAX, PERF_SOURCE_FALLBACK),
+    };
+
+    let (cache_max_bytes, cache_source) = match (flags.cache_max_bytes, host.mem_total_bytes) {
+        (Some(n), _) => (n, PERF_SOURCE_FLAG),
+        (None, Some(_)) => (
+            percent_of(memory_budget_bytes, CACHE_MEMORY_PERCENT),
+            PERF_SOURCE_BUDGET_CARVE,
+        ),
+        (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
+    };
+
+    // The catalog byte cache is a SEPARATE LRU from the fetcher cache, so an
+    // unset flag derives it at its own smaller share rather than committing a
+    // second 25% of the budget. An explicit `--cache-max-bytes` bounds both at
+    // that one value (the pre-#1141 coupling).
+    let (catalog_cache_max_bytes, catalog_cache_source) =
+        match (flags.cache_max_bytes, host.mem_total_bytes) {
+            (Some(n), _) => (n, PERF_SOURCE_FLAG),
+            (None, Some(_)) => (
+                percent_of(memory_budget_bytes, CATALOG_CACHE_MEMORY_PERCENT),
+                PERF_SOURCE_BUDGET_CARVE,
+            ),
+            (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
+        };
+
+    // `--disable-cache` builds neither cache: `store::build_cache` returns
+    // `None` and `query::build_catalog` forces the byte cache's `0` disabled
+    // sentinel. Both resolved ceilings above are then ceilings on nothing, so
+    // charging them against the budget would carve memory no cache holds and
+    // shrink the shared SQL/fetch remainder by up to 30% of the budget.
+    let memory_hard_caps_bytes = if flags.disable_cache {
+        0
+    } else {
+        cache_max_bytes.saturating_add(catalog_cache_max_bytes)
+    };
+    let memory_remainder_bytes = memory_budget_bytes.saturating_sub(memory_hard_caps_bytes);
+
+    let (sql_tenant_max_bytes, tenant_source) =
+        match (flags.sql_tenant_max_bytes, host.mem_total_bytes) {
+            (Some(n), _) => (n, PERF_SOURCE_FLAG),
+            (None, Some(total)) => (
+                bytes_as_usize(percent_of(total, SQL_TENANT_MEMORY_PERCENT)),
+                PERF_SOURCE_DERIVED,
+            ),
+            (None, None) => (DEFAULT_SQL_TENANT_MAX_BYTES, PERF_SOURCE_FALLBACK),
+        };
+
+    let (unclamped_query_bytes, query_bytes_source) =
+        match (flags.sql_max_query_bytes, host.mem_total_bytes) {
+            (Some(n), _) => (n, PERF_SOURCE_FLAG),
+            (None, Some(total)) => (
+                bytes_as_usize(percent_of(total, SQL_QUERY_MEMORY_PERCENT)),
+                PERF_SOURCE_DERIVED,
+            ),
+            (None, None) => (DEFAULT_SQL_MAX_QUERY_BYTES, PERF_SOURCE_FALLBACK),
+        };
+    // Reconcile the per-query pool with the per-tenant ceiling, keeping the
+    // invariant sql_max_query_bytes <= sql_tenant_max_bytes. An EXPLICIT
+    // per-query flag raises a non-explicit tenant ceiling to fit; any other
+    // crossing clamps the per-query pool down (see the doc comment above).
+    let query_bytes_explicit = query_bytes_source == PERF_SOURCE_FLAG;
+    let tenant_explicit = tenant_source == PERF_SOURCE_FLAG;
+    let mut sql_max_query_bytes = unclamped_query_bytes;
+    let mut sql_tenant_max_bytes = sql_tenant_max_bytes;
+    let mut sql_max_query_bytes_clamped = false;
+    let mut sql_tenant_max_bytes_raised = false;
+    if unclamped_query_bytes > sql_tenant_max_bytes {
+        if query_bytes_explicit && !tenant_explicit {
+            sql_tenant_max_bytes = unclamped_query_bytes;
+            sql_tenant_max_bytes_raised = true;
+        } else {
+            sql_max_query_bytes = sql_tenant_max_bytes;
+            sql_max_query_bytes_clamped = true;
+        }
+    }
+
+    let (query_deadline, deadline_source) = match flags.query_deadline {
+        Some(d) => (d, PERF_SOURCE_FLAG),
+        None => (DERIVED_QUERY_DEADLINE, PERF_SOURCE_DERIVED),
+    };
+
+    ResolvedPerformanceDefaults {
+        fetch_concurrency,
+        store_get_concurrency,
+        sql_partition_count,
+        promql_fetch_fanout,
+        max_segments,
+        cache_max_bytes,
+        catalog_cache_max_bytes,
+        sql_max_query_bytes,
+        sql_tenant_max_bytes,
+        query_deadline,
+        memory_budget_bytes,
+        memory_overhead_reserve_bytes: MEMORY_OVERHEAD_RESERVE_BYTES,
+        memory_hard_caps_bytes,
+        memory_remainder_bytes,
+        cache_disabled: flags.disable_cache,
+        sources: PerformanceSources {
+            fetch_concurrency: fetch_source,
+            store_get_concurrency: store_get_concurrency_source,
+            sql_partition_count: sql_partition_count_source,
+            promql_fetch_fanout: promql_fetch_fanout_source,
+            max_segments: segments_source,
+            cache_max_bytes: cache_source,
+            catalog_cache_max_bytes: catalog_cache_source,
+            sql_max_query_bytes: query_bytes_source,
+            sql_tenant_max_bytes: tenant_source,
+            query_deadline: deadline_source,
+            memory_budget_bytes: memory_budget_source,
+        },
+        sql_max_query_bytes_clamped,
+        sql_tenant_max_bytes_raised,
+    }
+}
+
+/// Startup refuses this flag combination (ADR-1170 decision 3, amended by
+/// issue #1255): the fetcher and catalog byte caches' hard eviction caps
+/// together leave no strictly positive shared remainder of
+/// `memory_budget_bytes` for the SQL/fetch `MemoryBudget` accountant --
+/// caps at or above the budget, not only strictly above it. A remainder of
+/// exactly `0` builds a `MemoryBudget::new(0)`, which refuses every real
+/// reservation while `SELECT 1` (which reserves nothing) still answers, so
+/// the process looks healthy and fails every non-trivial query. Refused,
+/// never clamped: silently shrinking an operator-typed `--cache-max-bytes`
+/// would change the eviction behavior they asked for without telling them,
+/// and clamping toward whichever cache the code touched first would depend on
+/// carve order rather than on anything the operator chose.
+///
+/// Only raised when the host's memory is known: with no host memory figure
+/// there is no derived budget to check hard caps against
+/// (`memory_budget_bytes` is `u64::MAX`, and the two caches already fell
+/// back to a flat compiled-in default for exactly that reason -- see
+/// [`ResolvedPerformanceDefaults::check_memory_budget`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudgetExceeded {
+    /// The resolved fetcher cache ceiling (`--cache-max-bytes` or its derived
+    /// share of the budget).
+    pub cache_max_bytes: u64,
+    /// The resolved catalog byte cache ceiling.
+    pub catalog_cache_max_bytes: u64,
+    /// `cache_max_bytes + catalog_cache_max_bytes`.
+    pub hard_caps_total: u64,
+    /// The budget the two hard caps were checked against.
+    pub memory_budget_bytes: u64,
+}
+
+impl std::fmt::Display for MemoryBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cache_max_bytes ({}) + catalog_cache_max_bytes ({}) = {} bytes leaves no \
+             strictly positive remainder of memory_budget_bytes ({} bytes) for the shared \
+             SQL/fetch memory budget; ",
+            self.cache_max_bytes,
+            self.catalog_cache_max_bytes,
+            self.hard_caps_total,
+            self.memory_budget_bytes
+        )?;
+        // A `0` budget is not fixable by any --cache-max-bytes value: an
+        // explicit `n` bounds both caches, so any `n >= 1` sums to `2n > 0`
+        // and `n == 0` still fails the `hard_caps >= budget` comparison.
+        // Naming the flag there sends the operator after a knob that cannot
+        // satisfy the check; the memory the process is given is the only
+        // thing that can.
+        if self.memory_budget_bytes == 0 {
+            write!(
+                f,
+                "no --cache-max-bytes value can satisfy this check against a 0-byte budget, \
+                 because an explicit value bounds both caches and any positive one sums \
+                 above 0. The host's effective memory (its cgroup memory limit when it runs \
+                 under a finite one, else MemTotal) is at or below the overhead reserve \
+                 ({MEMORY_OVERHEAD_RESERVE_BYTES} bytes) subtracted to derive the budget: \
+                 give the process more memory, or raise its cgroup memory limit, above that \
+                 reserve"
+            )
+        } else {
+            f.write_str("lower --cache-max-bytes or raise the host's available memory")
+        }
+    }
+}
+
+impl std::error::Error for MemoryBudgetExceeded {}
+
+impl ResolvedPerformanceDefaults {
+    /// Refuse a flag combination whose two hard cache caps together leave no
+    /// strictly positive remainder of [`Self::memory_budget_bytes`]
+    /// (ADR-1170 decision 3, amended by issue #1255), rather than silently
+    /// clamping either cache or letting a zero or negative remainder reach
+    /// the `MemoryBudget` accountant: a `0` remainder builds
+    /// `MemoryBudget::new(0)`, which refuses every real reservation.
+    ///
+    /// A no-op when the host's memory is unknown
+    /// (`sources.memory_budget_bytes == PERF_SOURCE_FALLBACK`): the budget is
+    /// then `u64::MAX` by construction (there is nothing to derive a real
+    /// ceiling from), so there is no meaningful budget to check the flat
+    /// fallback cache ceilings against, and the fallback remainder cannot be
+    /// `0` with today's compiled-in cache constants.
+    ///
+    /// Also a no-op under `--disable-cache` ([`Self::cache_disabled`]), which
+    /// is what this refusal's own remedy reduces to on a small host: no cache
+    /// of either kind is built, so the process holds no read-cache memory,
+    /// `memory_hard_caps_bytes` is `0`, and the remainder is the whole budget.
+    /// Refusing there would refuse a process that has already given back
+    /// every byte the refusal asks it to give back, and a container whose
+    /// effective memory is at or below the overhead reserve derives a `0`
+    /// budget against `0` caps, which the `>=` comparison below would refuse
+    /// with no flag left that could satisfy it. `emit` WARNs about a `0`
+    /// remainder instead.
+    pub fn check_memory_budget(&self) -> Result<(), MemoryBudgetExceeded> {
+        if self.sources.memory_budget_bytes == PERF_SOURCE_FALLBACK || self.cache_disabled {
+            return Ok(());
+        }
+        if self.memory_hard_caps_bytes >= self.memory_budget_bytes {
+            return Err(MemoryBudgetExceeded {
+                cache_max_bytes: self.cache_max_bytes,
+                catalog_cache_max_bytes: self.catalog_cache_max_bytes,
+                hard_caps_total: self.memory_hard_caps_bytes,
+                memory_budget_bytes: self.memory_budget_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ResolvedPerformanceDefaults {
+    /// Emit the resolved settings at startup, one INFO line per value with its
+    /// source, in the shape of [`LogsFetchStamp::emit`]'s policy line.
+    ///
+    /// The server exposes no config-provenance endpoint, so this log is the only
+    /// place an operator can see that (say) a 24 GiB read cache was derived from
+    /// the host rather than typed by whoever wrote the unit file. A clamped
+    /// per-query SQL pool gets an additional WARN, because the flag the operator
+    /// set is then not the number in force.
+    pub fn emit(&self, host: HostProfile) {
+        tracing::info!(
+            cores = host.cores,
+            mem_total_bytes = host.mem_total_bytes.unwrap_or(0),
+            mem_total_known = host.mem_total_bytes.is_some(),
+            "host profile detected"
+        );
+        tracing::info!(
+            setting = "fetch_concurrency",
+            value = self.fetch_concurrency,
+            source = self.sources.fetch_concurrency,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "store_get_concurrency",
+            value = self.store_get_concurrency,
+            source = self.sources.store_get_concurrency,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "sql_partition_count",
+            value = self.sql_partition_count,
+            source = self.sources.sql_partition_count,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "promql_fetch_fanout",
+            value = self.promql_fetch_fanout,
+            source = self.sources.promql_fetch_fanout,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "max_segments",
+            value = self.max_segments,
+            source = self.sources.max_segments,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "cache_max_bytes",
+            value = self.cache_max_bytes,
+            source = self.sources.cache_max_bytes,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "catalog_cache_max_bytes",
+            value = self.catalog_cache_max_bytes,
+            source = self.sources.catalog_cache_max_bytes,
+            "performance default resolved"
+        );
+        // ADR-1170 decision 3/4: the budget the two caches above were carved
+        // from, the reserve subtracted to get it, the sum of the two hard
+        // caps, and what's left for the shared SQL/fetch accountant. One line
+        // per figure, each exactly once, so an operator can reconstruct
+        // budget = hard_caps + remainder from this log alone.
+        //
+        // All four carry the BUDGET's source, not a bare `derived`: on the
+        // fallback path the reserve was never subtracted from anything and
+        // both sums are taken against a `u64::MAX` budget, so a `derived`
+        // label there invites the reader to check
+        // `budget = effective - reserve` against arithmetic that never ran.
+        tracing::info!(
+            setting = "memory_budget_bytes",
+            value = self.memory_budget_bytes,
+            source = self.sources.memory_budget_bytes,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "memory_overhead_reserve_bytes",
+            value = self.memory_overhead_reserve_bytes,
+            source = self.sources.memory_budget_bytes,
+            "performance default resolved"
+        );
+        // `cache_disabled` rides on the hard-caps line for the reason
+        // `clamped` rides on `sql_max_query_bytes` below: when it is true this
+        // value is `0` rather than the sum of the two cache lines above it,
+        // and a reader adding those two up would not get this number.
+        tracing::info!(
+            setting = "memory_hard_caps_bytes",
+            value = self.memory_hard_caps_bytes,
+            source = self.sources.memory_budget_bytes,
+            cache_disabled = self.cache_disabled,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "memory_remainder_bytes",
+            value = self.memory_remainder_bytes,
+            source = self.sources.memory_budget_bytes,
+            "performance default resolved"
+        );
+        // Startup refuses a `0` remainder on every other path (see
+        // `check_memory_budget`), so this WARN is the only signal on the one
+        // path that is allowed to start with one: `--disable-cache` on a host
+        // whose effective memory is at or below the overhead reserve. The
+        // process ingests normally and refuses every query that reserves.
+        if self.cache_disabled && self.memory_remainder_bytes == 0 {
+            tracing::warn!(
+                memory_budget_bytes = self.memory_budget_bytes,
+                memory_overhead_reserve_bytes = self.memory_overhead_reserve_bytes,
+                "the shared SQL/fetch memory budget is 0 bytes: the host's effective memory is at \
+                 or below the overhead reserve, so every query that reserves memory will be \
+                 refused; give the process more memory, or raise its cgroup memory limit, above \
+                 that reserve"
+            );
+        }
+        // The only line that carries `clamped`: when it is true the value is
+        // the per-tenant ceiling, not what `source` resolved, and a reader who
+        // saw `source="derived"` alone would go looking for a derivation that
+        // produces this number.
+        tracing::info!(
+            setting = "sql_max_query_bytes",
+            value = self.sql_max_query_bytes,
+            source = self.sources.sql_max_query_bytes,
+            clamped = self.sql_max_query_bytes_clamped,
+            "performance default resolved"
+        );
+        // `raised` rides on the info line for the same reason `clamped` does
+        // above: a `source="fallback"` or `"derived"` beside a value that
+        // neither produces would send a reader looking for a derivation, when
+        // the number is the operator's own --sql-max-query-bytes.
+        tracing::info!(
+            setting = "sql_tenant_max_bytes",
+            value = self.sql_tenant_max_bytes,
+            source = self.sources.sql_tenant_max_bytes,
+            raised = self.sql_tenant_max_bytes_raised,
+            "performance default resolved"
+        );
+        // Milliseconds, not seconds: an explicit sub-second deadline would
+        // otherwise log as `0`, which reads as no deadline at all.
+        tracing::info!(
+            setting = "gc_max_query_duration",
+            value_ms = u64::try_from(self.query_deadline.as_millis()).unwrap_or(u64::MAX),
+            source = self.sources.query_deadline,
+            "performance default resolved"
+        );
+        if self.sql_max_query_bytes_clamped {
+            tracing::warn!(
+                sql_max_query_bytes = self.sql_max_query_bytes,
+                sql_tenant_max_bytes = self.sql_tenant_max_bytes,
+                "--sql-max-query-bytes was clamped to --sql-tenant-max-bytes: a single query may \
+                 never hold more than its tenant's whole ceiling"
+            );
+        }
+        if self.sql_tenant_max_bytes_raised {
+            tracing::warn!(
+                sql_max_query_bytes = self.sql_max_query_bytes,
+                sql_tenant_max_bytes = self.sql_tenant_max_bytes,
+                "--sql-tenant-max-bytes was raised to fit an explicit --sql-max-query-bytes: the \
+                 derived per-tenant ceiling now equals the per-query pool the operator set"
+            );
+        }
+    }
+}
 
 /// The resolved ADR-0076 decision 4 flush-cadence knobs
 /// (`--max-flush-delay`, `--max-flush-delay-idle`, `--min-flush-bytes`), all
@@ -1500,6 +3157,24 @@ pub struct RemoteClusterConfig {
     /// `credential-file`. This is the ONLY principal the remote sees for a
     /// federated fetch: the calling client's credential is never forwarded.
     pub credential: String,
+    /// The single local tenant whose queries fan out to this remote, from the
+    /// `tenant` key. `credential` above is one principal, so it authorizes one
+    /// remote tenant's data; this names the local tenant that data belongs to.
+    /// A query from any other local tenant never dials this remote.
+    ///
+    /// `None` means the spec carried no `tenant` key: the remote serves every
+    /// local tenant. That is only expressible on a coordinator that runs queries
+    /// for at most one local tenant (its `--tenant-token` values and its
+    /// `--alert-rules-file` tenants together), which
+    /// [`crate::ensure_federation_tenant_mapping`] enforces at startup; it is
+    /// what every pre-`tenant` federation deployment already is.
+    ///
+    /// To serve two local tenants from one remote endpoint, write one
+    /// `--remote-cluster` per local tenant, each with its own `name` and its own
+    /// `credential-file`. There is deliberately no syntax for naming several
+    /// local tenants on one spec: that would put two local tenants back behind
+    /// one credential, which is the exposure the `tenant` key exists to remove.
+    pub tenant: Option<TenantId>,
     /// Whether to dial the remote over TLS. Defaults to `true` when the spec
     /// carries no `tls` key: plaintext federation is an explicit, logged choice,
     /// never the fallback (ADR-0071 amendment, federation TLS by default).
@@ -1524,6 +3199,7 @@ impl std::fmt::Debug for RemoteClusterConfig {
             .field("name", &self.name)
             .field("endpoint", &self.endpoint)
             .field("credential", &"<redacted>")
+            .field("tenant", &self.tenant)
             .field("tls", &self.tls)
             .field("tls_ca_file", &self.tls_ca_file)
             .field("skip_unavailable", &self.skip_unavailable)
@@ -1559,6 +3235,22 @@ fn parse_bool_field(spec: &str, key: &str, value: &str) -> anyhow::Result<bool> 
 }
 
 impl Cli {
+    /// The `backend_identity` this process compares against a
+    /// `sys/qualification` record at startup (ADR-0050 section 6, D2), or
+    /// `None` for the exempt memory store. Built from
+    /// [`ravel_object_store::conformance::s3_backend_identity`], the same
+    /// function `ravel-cli store qualify` writes the record with, so the reader
+    /// and writer never disagree on format.
+    pub fn backend_identity(&self) -> Option<String> {
+        match self.store {
+            StoreKind::Memory => None,
+            StoreKind::S3 => Some(ravel_object_store::conformance::s3_backend_identity(
+                self.s3_bucket.as_deref(),
+                self.s3_endpoint.as_deref(),
+            )),
+        }
+    }
+
     /// The OTLP trace-export config `main.rs` passes to
     /// `ravel_tracing_export::init` (ADR-0060), or `None` when
     /// `--otlp-trace-endpoint` is absent. A single function so the binary's
@@ -1579,15 +3271,52 @@ impl Cli {
 
     pub fn parse_tenant_tokens(&self) -> anyhow::Result<HashMap<String, TenantId>> {
         let mut map = HashMap::new();
-        for pair in &self.tenant_tokens {
-            let (token, tenant) = pair.split_once('=').ok_or_else(|| {
-                anyhow::anyhow!("invalid --tenant-token '{pair}', expected TOKEN=TENANT")
-            })?;
-            if token.is_empty() || tenant.is_empty() {
-                anyhow::bail!("invalid --tenant-token '{pair}', expected TOKEN=TENANT");
-            }
-            map.insert(token.to_string(), TenantId::new(tenant));
+        // `ctx` names where a malformed pair came from (an argv position, or a
+        // file and line number) but never the pair's own text: for the file
+        // source that text is the bearer token itself, and `main` prints this
+        // error to stderr, so echoing it back would leak the secret into the
+        // container log.
+        let insert_pair =
+            |map: &mut HashMap<String, TenantId>, pair: &str, ctx: &str| -> anyhow::Result<()> {
+                let (token, tenant) = pair
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("invalid {ctx}, expected TOKEN=TENANT"))?;
+                if token.is_empty() || tenant.is_empty() {
+                    anyhow::bail!("invalid {ctx}, expected TOKEN=TENANT");
+                }
+                map.insert(token.to_string(), TenantId::new(tenant));
+                Ok(())
+            };
+
+        for (i, pair) in self.tenant_tokens.iter().enumerate() {
+            insert_pair(
+                &mut map,
+                pair,
+                &format!("--tenant-token (position {})", i + 1),
+            )?;
         }
+
+        if let Some(path) = &self.tenant_token_file {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("failed to read --tenant-token-file {}: {e}", path.display())
+            })?;
+            // A BOM-prefixed file otherwise registers a token with a leading
+            // U+FEFF, which never matches any `Authorization: Bearer` header
+            // and fails closed with no diagnostic pointing at the cause.
+            let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw.as_str());
+            for (i, line) in raw.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                insert_pair(
+                    &mut map,
+                    line,
+                    &format!("line {} in --tenant-token-file {}", i + 1, path.display()),
+                )?;
+            }
+        }
+
         Ok(map)
     }
 
@@ -1878,6 +3607,63 @@ impl Cli {
         }
     }
 
+    /// Parse `--shutdown-timeout` into a duration, defaulting to
+    /// [`crate::DEFAULT_SHUTDOWN_TIMEOUT`] when unset. Rejects a zero or
+    /// unparseable duration rather than a zero-length drain that would skip the
+    /// buffer flush entirely, mirroring [`Self::parse_store_probe_interval`].
+    /// Also rejects a value above [`crate::MAX_SHUTDOWN_TIMEOUT`]: the shutdown
+    /// path multiplies this by four for the listener sub-budget, so an absurd
+    /// value would panic on a `Duration` overflow at shutdown rather than being
+    /// caught at startup.
+    pub fn parse_shutdown_timeout(&self) -> anyhow::Result<Duration> {
+        match self.shutdown_timeout.as_deref() {
+            None => Ok(crate::DEFAULT_SHUTDOWN_TIMEOUT),
+            Some(s) => {
+                let dur = humantime::parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --shutdown-timeout '{s}': {e}"))?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--shutdown-timeout '{s}' must be a positive duration: a zero timeout \
+                         would cut the drain off before any ingest buffer is flushed"
+                    );
+                }
+                if dur > crate::MAX_SHUTDOWN_TIMEOUT {
+                    anyhow::bail!(
+                        "--shutdown-timeout '{s}' exceeds the maximum of {:?}: a larger value \
+                         serves no grace period and overflows the listener sub-budget at shutdown",
+                        crate::MAX_SHUTDOWN_TIMEOUT
+                    );
+                }
+                Ok(dur)
+            }
+        }
+    }
+
+    /// Parse `--max-ingest-lag` into a duration (ADR-0051 section 4), defaulting
+    /// to [`crate::DEFAULT_MAX_INGEST_LAG`] (2h) when unset. Rejects a zero or
+    /// unparseable duration rather than a zero-length window that would reject
+    /// every normally-delayed data point, mirroring
+    /// [`Self::parse_shutdown_timeout`]. The resolved value drives both the OTLP
+    /// admission bound and the catalog listing window; see
+    /// [`crate::resolve_ingest_lag`] for how the coordinated pair is built.
+    pub fn parse_max_ingest_lag(&self) -> anyhow::Result<Duration> {
+        match self.max_ingest_lag.as_deref() {
+            None => Ok(crate::DEFAULT_MAX_INGEST_LAG),
+            Some(s) => {
+                let dur = humantime::parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --max-ingest-lag '{s}': {e}"))?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--max-ingest-lag '{s}' must be a positive duration: a zero window would \
+                         reject every data point whose event time is not exactly ingest time, \
+                         discarding all normally-delayed telemetry"
+                    );
+                }
+                Ok(dur)
+            }
+        }
+    }
+
     /// Parse `--admission-reconcile-interval` into a duration (ADR-0057 section
     /// 4), defaulting to [`ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL`]
     /// when unset. Rejects a zero or unparseable duration rather than
@@ -1899,6 +3685,70 @@ impl Cli {
                 Ok(dur)
             }
         }
+    }
+
+    /// Resolve `--audit-mode`, `--audit-max-batch`, and `--audit-max-age` into
+    /// a pipeline config (ADR-0062 decision 2b). `--audit-max-batch`/
+    /// `--audit-max-age` unset fall back to the pipeline's own compiled-in
+    /// defaults, exactly as omitting `--store-probe-interval` does; a zero of
+    /// either is rejected the same way (a zero batch size or age would flush
+    /// every submitted event as its own single-record batch, defeating group
+    /// commit). `--audit-text` is not part of this config: it selects how
+    /// `query.text` is recorded on the way into the pipeline, resolved
+    /// separately by [`Cli::resolve_audit_text_policy`].
+    pub fn resolve_audit_pipeline_config(
+        &self,
+    ) -> anyhow::Result<ravel_maintain::AuditPipelineConfig> {
+        let max_batch = match self.audit_max_batch {
+            None => ravel_maintain::config::DEFAULT_AUDIT_MAX_BATCH,
+            Some(0) => anyhow::bail!(
+                "--audit-max-batch '0' would flush every submitted audit event as its own \
+                 single-record batch, defeating group commit. Omit the flag for the pipeline's \
+                 default, or set a positive count."
+            ),
+            Some(n) => n,
+        };
+        let max_age = match self.audit_max_age.as_deref() {
+            None => ravel_maintain::config::DEFAULT_AUDIT_MAX_AGE,
+            Some(s) => {
+                let dur = humantime::parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --audit-max-age '{s}': {e}"))?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--audit-max-age '{s}' must be a positive duration: a zero max age \
+                         would flush every submitted audit event as its own single-record \
+                         batch, defeating group commit."
+                    );
+                }
+                dur
+            }
+        };
+        Ok(ravel_maintain::AuditPipelineConfig {
+            max_batch,
+            max_age,
+            audit_mode: self.audit_mode.mode(),
+            ..ravel_maintain::AuditPipelineConfig::default()
+        })
+    }
+
+    /// Resolve `--audit-text` into the policy [`crate::start`] installs
+    /// (ADR-0062 decision 2e), reading the token key from
+    /// [`AUDIT_TOKEN_KEY_ENV`] and falling back to a key derived from
+    /// `deployment_key`. Fails startup under `redacted` when neither is
+    /// available and `self.mode` installs the pipeline; see
+    /// [`resolve_audit_text_policy_for_mode`], which holds the mode gate and
+    /// the logic and takes every input explicitly.
+    pub fn resolve_audit_text_policy(
+        &self,
+        deployment_key: Option<&[u8; 32]>,
+    ) -> anyhow::Result<ravel_maintain::AuditTextPolicy> {
+        let raw = std::env::var(AUDIT_TOKEN_KEY_ENV).ok();
+        resolve_audit_text_policy_for_mode(
+            self.mode,
+            self.audit_text,
+            raw.as_deref(),
+            deployment_key,
+        )
     }
 
     /// Parse `--max-concurrent-queries` into a [`ravel_query::QueryConcurrencyLimit`]
@@ -2003,24 +3853,39 @@ impl Cli {
     /// into the process-wide `EngineConfig` and the SQL executor, so a flag set
     /// here is the value the query/SQL execution path enforces.
     ///
+    /// The four ADR-0088 budgets are taken from `resolved`, never from the raw
+    /// flags: an unset flag is a host-derived value (issue #1141), and reading
+    /// `self.fetch_concurrency` here would put the compiled-in constant back
+    /// into the engine while the startup log claimed the derived one.
+    ///
     /// Fallible only for `--store-cost-profile`, which reads a file: every
-    /// other field is a clap-parsed value (an unset flag is its compiled-in
-    /// default). A profile that cannot be read or parsed refuses startup here
-    /// rather than falling back to the reference profile, so the prices a
-    /// deployment's figures are modelled at are always the ones its operator
-    /// declared.
-    pub fn query_budgets(&self) -> anyhow::Result<QueryBudgets> {
+    /// other field is a clap-parsed value or an already-resolved default. A
+    /// profile that cannot be read or parsed refuses startup here rather than
+    /// falling back to the reference profile, so the prices a deployment's
+    /// figures are modelled at are always the ones its operator declared.
+    pub fn query_budgets(
+        &self,
+        resolved: &ResolvedPerformanceDefaults,
+    ) -> anyhow::Result<QueryBudgets> {
         Ok(QueryBudgets {
-            fetch_concurrency: self.fetch_concurrency,
-            max_segments: self.max_segments,
-            sql_max_query_bytes: self.sql_max_query_bytes,
-            sql_tenant_max_bytes: self.sql_tenant_max_bytes,
+            fetch_concurrency: resolved.fetch_concurrency,
+            store_get_concurrency: resolved.store_get_concurrency,
+            sql_partition_count: resolved.sql_partition_count,
+            promql_fetch_fanout: resolved.promql_fetch_fanout,
+            max_segments: resolved.max_segments,
+            sql_max_query_bytes: resolved.sql_max_query_bytes,
+            sql_tenant_max_bytes: resolved.sql_tenant_max_bytes,
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
             logs_block_range_threshold: self.logs_block_range_threshold,
             logs_request_cost_bytes: self.logs_request_cost_bytes,
             logs_fetch_policy: self.logs_fetch_policy.policy(),
             store_cost_profile: self.resolve_store_cost_profile()?,
             logs_max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
+            mcp: McpConfig {
+                enabled: self.mcp,
+                allowed_origins: self.mcp_allowed_origins.clone(),
+                max_body_bytes: self.mcp_max_body_bytes,
+            },
         })
     }
 
@@ -2152,12 +4017,19 @@ impl Cli {
     /// [`RemoteClusterConfig`] (ADR-0071 cross-cluster federation).
     ///
     /// Each spec is a comma-separated `key=value` list. `name`, `endpoint`, and
-    /// `credential-file` are required; `tls`, `tls-ca-file`, `skip-unavailable`,
-    /// and `soft-timeout` are optional. The credential file is read and trimmed
-    /// here (failing startup on an unreadable or empty file), so the operator
-    /// principal is validated at the same point every other credential file is.
-    /// Cluster names must be unique: a duplicate name would make the `warnings`
-    /// field ambiguous about which remote was skipped.
+    /// `credential-file` are required; `tenant`, `tls`, `tls-ca-file`,
+    /// `skip-unavailable`, and `soft-timeout` are optional. The credential file
+    /// is read and trimmed here (failing startup on an unreadable or empty
+    /// file), so the operator principal is validated at the same point every
+    /// other credential file is. Cluster names must be unique: a duplicate name
+    /// would make the `warnings` field ambiguous about which remote was skipped.
+    ///
+    /// `tenant` names the ONE local tenant whose queries fan out to this remote
+    /// (see [`RemoteClusterConfig::tenant`]). Two local tenants sharing a remote
+    /// endpoint is two specs, not one spec naming two tenants. A spec with no
+    /// `tenant` key serves every local tenant and is accepted only on a
+    /// coordinator that runs queries for at most one, which
+    /// [`crate::ensure_federation_tenant_mapping`] checks at startup.
     ///
     /// `tls` defaults to `true`. A spec that carries `tls-ca-file` and no `tls`
     /// key therefore means "TLS on, with this CA trusted" and is accepted; only
@@ -2171,6 +4043,7 @@ impl Cli {
             let mut name = None;
             let mut endpoint = None;
             let mut credential_file = None;
+            let mut tenant: Option<TenantId> = None;
             // TLS on unless the spec explicitly turns it off: the credential,
             // the query, and the result stream all cross this hop, so plaintext
             // is an opt-in the operator states and startup logs, never a silent
@@ -2195,6 +4068,34 @@ impl Cli {
                     "name" => name = Some(value.to_string()),
                     "endpoint" => endpoint = Some(value.to_string()),
                     "credential-file" => credential_file = Some(PathBuf::from(value)),
+                    "tenant" => {
+                        if value.is_empty() {
+                            anyhow::bail!(
+                                "invalid --remote-cluster '{spec}': tenant is empty; name the \
+                                 local tenant whose queries fan out to this remote, or omit the \
+                                 key entirely on a single-tenant coordinator"
+                            );
+                        }
+                        // Refuse a repeat rather than take the last one. A spec
+                        // is one remote credential, so naming two local tenants
+                        // on it puts them back behind one credential, which is
+                        // the disclosure the key exists to prevent. Last-wins
+                        // would leave the earlier tenant with no remote at all
+                        // and send the later one out under a credential meant
+                        // for the earlier, and every startup check would pass.
+                        if let Some(first) = &tenant {
+                            anyhow::bail!(
+                                "invalid --remote-cluster '{spec}': tenant is set twice, to '{}' \
+                                 and '{}'. One spec carries one remote credential and maps it to \
+                                 one local tenant. Write one --remote-cluster per local tenant \
+                                 that needs this remote, each with its own name and \
+                                 credential-file.",
+                                first.as_str(),
+                                value
+                            );
+                        }
+                        tenant = Some(TenantId::new(value));
+                    }
                     "tls" => tls = parse_bool_field(spec, "tls", value)?,
                     "tls-ca-file" => tls_ca_file = Some(PathBuf::from(value)),
                     "skip-unavailable" => {
@@ -2215,7 +4116,7 @@ impl Cli {
                     }
                     other => anyhow::bail!(
                         "invalid --remote-cluster '{spec}': unknown key '{other}' (expected name, \
-                         endpoint, credential-file, tls, tls-ca-file, skip-unavailable, \
+                         endpoint, credential-file, tenant, tls, tls-ca-file, skip-unavailable, \
                          soft-timeout)"
                     ),
                 }
@@ -2266,6 +4167,7 @@ impl Cli {
                 name,
                 endpoint,
                 credential,
+                tenant,
                 tls,
                 tls_ca_file,
                 skip_unavailable,
@@ -2355,11 +4257,48 @@ impl Cli {
         })
     }
 
+    /// Every listener `POST /mcp` is mounted on, each with the flag that binds
+    /// it, in the order `lib.rs` merges the MCP router in: the plain HTTP
+    /// listener, and the mTLS listener when one is configured.
+    ///
+    /// The route is mounted per listener, so a loopback rule that reads only
+    /// one of them leaves the other unguarded. This is the same shape as the
+    /// dev-header rule in [`Self::validate`], which guards `--listen-http` and
+    /// `--listen-grpc` together for the same reason (issue #1293): a listener
+    /// added to the mount site in `lib.rs` has to be added here too, or the
+    /// origin allowlist silently stops being required on it.
+    fn mcp_route_listeners(&self) -> Vec<(&'static str, SocketAddr)> {
+        let mut listeners = vec![("--listen-http", self.listen_http)];
+        if let Some(mtls_listener) = self.mtls_listener {
+            listeners.push(("--mtls-listener", mtls_listener));
+        }
+        listeners
+    }
+
+    /// The [`Self::mcp_route_listeners`] entries bound to an address something
+    /// other than this host can reach.
+    fn public_mcp_route_listeners(&self) -> Vec<(&'static str, SocketAddr)> {
+        self.mcp_route_listeners()
+            .into_iter()
+            .filter(|(_, listener)| !listener.ip().is_loopback())
+            .collect()
+    }
+
     /// Cross-flag startup invariants that do not fit `parse_auth_resolvers`'s
     /// per-resolver shape (ADR-0050 section 1, plus the pre-existing
     /// dev-header loopback rule this consolidates from `main`). Every case
     /// here refuses startup outright; none of them warn and continue.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Two sources for the same static bearer map: refuse both at once
+        // rather than silently picking one, mirroring the
+        // --distributed-query/--fragment-key-file pairing checks below.
+        if !self.tenant_tokens.is_empty() && self.tenant_token_file.is_some() {
+            anyhow::bail!(
+                "--tenant-token and --tenant-token-file are mutually exclusive: both populate \
+                 the same static bearer map. Drop --tenant-token, or drop --tenant-token-file."
+            );
+        }
+
         // No value of `--max-inflight-ingest-requests` is invalid (`0` is a
         // deliberate "unlimited", not a footgun), but it is still parsed here
         // so a malformed future extension of this flag fails startup rather
@@ -2376,6 +4315,14 @@ impl Cli {
         // pre-flight failure, like --limits-file and the credential files.
         self.resolve_store_cost_profile()?;
 
+        // Resolve here for the same reason: the `ServerConfig` build site
+        // (main.rs) runs after startup has already pinned the tenancy marker
+        // and written key-epoch state, so a bad --audit-max-batch/
+        // --audit-max-age must fail before any of that, not after. This does
+        // not resolve --audit-text: that needs the deployment key, which
+        // isn't available yet at this point in startup.
+        self.resolve_audit_pipeline_config()?;
+
         if self.max_inflight_flushes == 0 {
             anyhow::bail!(
                 "--max-inflight-flushes '0' would deadlock every flush: a shard could never \
@@ -2388,6 +4335,26 @@ impl Cli {
             anyhow::bail!(
                 "--max-s3-requests '0' would reject every query; omit the flag to derive the \
                  budget from --shards and the flush cadence, or set a positive count"
+            );
+        }
+
+        if self.catalog_resolve_concurrency == Some(0) {
+            anyhow::bail!(
+                "--catalog-resolve-concurrency '0' would deadlock every catalog resolve: a \
+                 zero-permit semaphore can never be acquired. Omit the flag to use the \
+                 catalog's own default, or set a positive count."
+            );
+        }
+
+        if let Some(concurrency) = self.catalog_resolve_concurrency
+            && concurrency > ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY
+        {
+            anyhow::bail!(
+                "--catalog-resolve-concurrency '{concurrency}' exceeds the maximum of {}: \
+                 past that ceiling the value is not a sane operator setting (at about \
+                 30 ms per round it is 25x S3's per-prefix request guidance). Set a \
+                 smaller count.",
+                ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY
             );
         }
 
@@ -2471,10 +4438,69 @@ impl Cli {
             );
         }
 
-        if self.dev_insecure_tenant_header && !self.listen_http.ip().is_loopback() {
+        // The dev header resolver trusts an unauthenticated `x-ravel-tenant`
+        // header, and the single resolver chain it joins backs every public
+        // listener: HTTP, remote-write, OTLP gRPC, and Flight SQL (via the
+        // flight auth path). Guarding `--listen-http` alone left the flag
+        // reachable on a non-loopback `--listen-grpc`, forging tenant identity
+        // on the public gRPC/Flight surfaces (issue #1293). ADR-0009 promises
+        // refusal on any reachable port, so require both listeners loopback.
+        if self.dev_insecure_tenant_header
+            && (!self.listen_http.ip().is_loopback() || !self.listen_grpc.ip().is_loopback())
+        {
             anyhow::bail!(
-                "--dev-insecure-tenant-header refuses to enable unless --listen-http binds a \
-                 loopback address"
+                "--dev-insecure-tenant-header refuses to enable unless both --listen-http and \
+                 --listen-grpc bind loopback addresses: the dev header resolver trusts an \
+                 unauthenticated x-ravel-tenant header and backs every public listener (HTTP, \
+                 OTLP gRPC, and Flight SQL), not just HTTP"
+            );
+        }
+
+        // ADR-1374 decision 7 makes origin validation mandatory on the MCP
+        // route. An empty allowlist means "accept any Origin", which is only
+        // safe on a loopback listener that no browser page on another site
+        // can reach in the first place; on a reachable address it is the
+        // DNS-rebinding hole the decision exists to close, so refuse at
+        // startup rather than serving an open route. Every listener the route
+        // is mounted on counts, not just `--listen-http`: the same mistake the
+        // dev-header rule above made before issue #1293.
+        if self.mcp && self.mcp_allowed_origins.is_empty() {
+            let public = self.public_mcp_route_listeners();
+            if !public.is_empty() {
+                let named = public
+                    .iter()
+                    .map(|(flag, listener)| format!("{flag} {listener}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "--mcp requires --mcp-allowed-origins: POST /mcp is mounted on every \
+                     query-serving listener, and these are not loopback: {named}. An empty \
+                     allowlist accepts every Origin, which lets a page on any site drive this \
+                     server from a browser with the user's ambient credentials"
+                );
+            }
+        }
+
+        if self.mcp_max_body_bytes == 0 {
+            anyhow::bail!(
+                "--mcp-max-body-bytes 0 would refuse every MCP request; set a positive cap or \
+                 leave the flag unset for the 1 MiB default"
+            );
+        }
+
+        // `POST /mcp` is mounted only from inside the block `start` (lib.rs)
+        // guards with `config.mode.installs_query_audit_pipeline()`, the same
+        // predicate that gates the SQL, PromQL, and analytics query surfaces:
+        // under `--mode gateway` or `--mode maintain` that block never runs,
+        // so the route never mounts and `--mcp` is silently inert. Refuse it
+        // at startup so an operator cannot believe MCP is being served when
+        // nothing serves it.
+        if self.mcp && !self.mode.installs_query_audit_pipeline() {
+            anyhow::bail!(
+                "--mcp is only supported under --mode all or --mode query: POST /mcp is mounted \
+                 only by a query-serving process, so under --mode {:?} this flag would be \
+                 silently inert. Drop --mcp, or run --mode all or --mode query.",
+                self.mode
             );
         }
 
@@ -2496,6 +4522,28 @@ impl Cli {
                 "--mtls-enabled requires --mtls-listener: the mTLS resolver is only installed on \
                  its own dedicated listener (ADR-0050 section 1), never on the public HTTP or \
                  gRPC/Flight listeners."
+            );
+        }
+
+        // Issue #94: the ADR-0071 fragment surface (the `SeriesFetch` service,
+        // its listener, and the coordinator fan-out) is constructed only by a
+        // query-serving process. `fragment_service` in lib.rs is gated on
+        // `matches!(config.mode, Mode::All | Mode::Query)`, so under gateway-only
+        // or maintain mode no fragment surface is ever built and no listener
+        // binds. Both `--distributed-query` and `--fragment-listener` are then
+        // silently inert. This is a diagnostic, not a security fix: refuse them
+        // so an operator cannot believe distribution is on when nothing serves
+        // it. The supported set is derived from that `Mode::All | Mode::Query`
+        // guard, not guessed.
+        if !matches!(self.mode, Mode::All | Mode::Query)
+            && (self.distributed_query || self.fragment_listener.is_some())
+        {
+            anyhow::bail!(
+                "--distributed-query and --fragment-listener are only supported under \
+                 --mode all or --mode query: the ADR-0071 fragment SeriesFetch surface is \
+                 constructed only by a query-serving process, so under --mode {:?} these flags \
+                 would be silently inert. Drop them, or run --mode all or --mode query.",
+                self.mode
             );
         }
 
@@ -2658,6 +4706,56 @@ impl Cli {
             );
         }
 
+        // ADR-1195: a zero value in any of the four fetch-concurrency-family
+        // flags is refused here, before configuration resolution builds any
+        // fetcher, engine, or SQL session, with the flag named in the error.
+        if self.fetch_concurrency == Some(0) {
+            anyhow::bail!(
+                "--fetch-concurrency '0' would admit no concurrent segment fetches; omit the \
+                 flag to derive the default from host cores, or set a positive count"
+            );
+        }
+        if self.store_get_concurrency == Some(0) {
+            anyhow::bail!(
+                "--store-get-concurrency '0' would admit no concurrent object-store GETs; omit \
+                 the flag to derive the default from host cores, or set a positive count"
+            );
+        }
+        if self.sql_partition_count == Some(0) {
+            anyhow::bail!(
+                "--sql-partition-count '0' would give DataFusion zero scan partitions; omit the \
+                 flag to derive the default from host cores, or set a positive count"
+            );
+        }
+        if self.promql_fetch_fanout == Some(0) {
+            anyhow::bail!(
+                "--promql-fetch-fanout '0' would admit no concurrent PromQL segment fetches; \
+                 omit the flag to derive the default from host cores, or set a positive count"
+            );
+        }
+
+        // ADR-1195 legacy precedence: `--fetch-concurrency` sets all three new
+        // knobs together when none of them is given explicitly. Combining it
+        // with any of the three is a startup error naming both flags, not a
+        // silent precedence rule.
+        if self.fetch_concurrency.is_some() {
+            let conflicting = [
+                ("--store-get-concurrency", self.store_get_concurrency),
+                ("--sql-partition-count", self.sql_partition_count),
+                ("--promql-fetch-fanout", self.promql_fetch_fanout),
+            ]
+            .into_iter()
+            .find(|(_, value)| value.is_some());
+            if let Some((flag_name, _)) = conflicting {
+                anyhow::bail!(
+                    "--fetch-concurrency cannot be combined with {flag_name}: --fetch-concurrency \
+                     is the legacy flag that sets --store-get-concurrency, \
+                     --sql-partition-count, and --promql-fetch-fanout together (ADR-1195). Pass \
+                     either --fetch-concurrency alone, or the specific new flags without it."
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -2684,11 +4782,66 @@ impl Cli {
         Ok(ConfiguredScheme::Unspecified)
     }
 
+    /// The six performance flags, parsed but not resolved: `None` per field
+    /// means the operator set nothing there and
+    /// [`resolve_performance_defaults`] derives it.
+    ///
+    /// This is where `--gc-max-query-duration`'s humantime spelling is parsed,
+    /// which is why this is the fallible half and the resolution itself is not.
+    /// The error message and its `must be a positive duration` /
+    /// `invalid --gc-max-query-duration` shapes are unchanged from when
+    /// `resolve_gc_runtime` did the parse.
+    pub fn performance_flags(&self) -> anyhow::Result<PerformanceFlags> {
+        let query_deadline = match self.gc_max_query_duration.as_deref() {
+            Some(s) => {
+                let ns = parse_gc_duration_ns("--gc-max-query-duration", s)?;
+                Some(Duration::from_nanos(u64::try_from(ns).unwrap_or(0)))
+            }
+            None => None,
+        };
+        Ok(PerformanceFlags {
+            fetch_concurrency: self.fetch_concurrency,
+            store_get_concurrency: self.store_get_concurrency,
+            sql_partition_count: self.sql_partition_count,
+            promql_fetch_fanout: self.promql_fetch_fanout,
+            max_segments: self.max_segments,
+            cache_max_bytes: self.cache_max_bytes,
+            sql_max_query_bytes: self.sql_max_query_bytes,
+            sql_tenant_max_bytes: self.sql_tenant_max_bytes,
+            query_deadline,
+            disable_cache: self.disable_cache,
+        })
+    }
+
+    /// The six performance settings this process will run with, resolved
+    /// against `host` (issue #1141). `main` calls this once, with
+    /// [`HostProfile::detect`], and threads the result into every consumer;
+    /// a test calls it with an injected profile.
+    ///
+    /// `--logs-fetch-policy` carries no concurrency default (ADR-1196):
+    /// `latency-first` resolves `store_get_concurrency` exactly as every
+    /// other policy does, from `--store-get-concurrency`, the legacy
+    /// `--fetch-concurrency`, or the host-derived default.
+    pub fn resolve_performance(
+        &self,
+        host: HostProfile,
+    ) -> anyhow::Result<ResolvedPerformanceDefaults> {
+        let resolved = resolve_performance_defaults(host, self.performance_flags()?);
+        resolved.check_memory_budget()?;
+        Ok(resolved)
+    }
+
     /// Resolve the four `--gc-*` duration flags into the concrete values the
     /// GC-config startup path needs (ADR-0050 section 4). Each flag is
     /// optional; an omitted flag falls back to its compiled-in default, so a
     /// process that sets none of them is byte-identical to before the flags
     /// existed.
+    ///
+    /// `query_deadline` is the exception: it is passed in already resolved
+    /// (`ResolvedPerformanceDefaults::query_deadline`, from
+    /// `--gc-max-query-duration` or the derived 11 minutes) so the deadline the
+    /// `sys/gc` validation runs on is the same value the engine enforces and
+    /// the startup log named.
     ///
     /// This is the single resolution point: `main` feeds the returned values
     /// into BOTH the `sys/gc` validation (`validate_maintain` /
@@ -2697,7 +4850,7 @@ impl Cli {
     /// A flag that only satisfied validation while a `::default()` was enforced
     /// elsewhere would be the exact "looks configured, is actually inert" bug
     /// this wiring exists to prevent.
-    pub fn resolve_gc_runtime(&self) -> anyhow::Result<GcRuntimeConfig> {
+    pub fn resolve_gc_runtime(&self, query_deadline: Duration) -> anyhow::Result<GcRuntimeConfig> {
         use ravel_maintain::config::{
             DEFAULT_GRACE_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_PROTECTION_HORIZON_NS,
         };
@@ -2714,18 +4867,6 @@ impl Cli {
             Some(s) => parse_gc_duration_ns("--gc-max-flush-lifetime", s)?,
             None => DEFAULT_MAX_FLUSH_LIFETIME_NS,
         };
-        let query_deadline = match self.gc_max_query_duration.as_deref() {
-            Some(s) => {
-                let ns = parse_gc_duration_ns("--gc-max-query-duration", s)?;
-                Duration::from_nanos(u64::try_from(ns).unwrap_or(0))
-            }
-            // The engine deadline's established default lives in ravel-query,
-            // and the real query engine uses it today; defaulting here to the
-            // same constant keeps a single source of truth and preserves the
-            // 30s enforced deadline exactly when the flag is unset.
-            None => ravel_query::EngineConfig::default().deadline,
-        };
-
         Ok(GcRuntimeConfig {
             protection_horizon_ns,
             grace_ns,
@@ -3647,6 +5788,100 @@ mod tests {
     use ravel_catalog::DeclaredTypedColumn;
     use ravel_ingest::{CountLimit, RateLimit};
 
+    /// Issue #1297: the two ingest memory flags must not document a memory
+    /// bound they do not deliver. A flag doc that mentions bounding memory has
+    /// to name the transient inflate/decompression term, so it cannot claim a
+    /// ceiling that silently excludes the gzip inflate the way both flags once
+    /// did. Rendered from clap's long help, the same surface `docs/reference/
+    /// ravel-server-flags.md` is generated from, so the assertion tracks what
+    /// an operator actually reads.
+    ///
+    /// This checks that the term is named, not that no unbounded claim
+    /// exists: a doc reading "bounds ALL resident ingest memory with no
+    /// exceptions, the gzip inflate included" still passes it.
+    ///
+    /// Non-vacuity: `max_inflight_ingest_requests`'s doc carries both
+    /// `post-decompression` and `gzip inflate` wording, so dropping either
+    /// one alone does not fail this test on that flag; both would have to go
+    /// at once.
+    #[test]
+    fn ingest_flag_docs_name_the_inflate_term() {
+        use clap::CommandFactory;
+
+        let cmd = Cli::command();
+        let long_help = |id: &str| -> String {
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .unwrap_or_else(|| panic!("flag {id} is defined on the command"));
+            arg.get_long_help()
+                .or_else(|| arg.get_help())
+                .map(|help| help.to_string())
+                .unwrap_or_default()
+                .to_lowercase()
+        };
+
+        for id in ["max_inflight_ingest_requests", "max_ingest_buffer_bytes"] {
+            let help = long_help(id);
+            assert!(!help.is_empty(), "flag {id} must carry help text");
+            if help.contains("memory") {
+                assert!(
+                    help.contains("inflat") || help.contains("decompress"),
+                    "flag {id} documents a memory bound but never names the \
+                     inflate/decompression term (issue #1297): {help}"
+                );
+            }
+        }
+    }
+
+    /// Records every INFO event's fields as one combined string (`"
+    /// name=value"` per field), so a test can count how many times a given
+    /// `setting=` figure appears across an `emit()` call -- the emit-line
+    /// analogue of `ravel_query::http::json`'s `IoShapeJson` wire-text
+    /// "exactly once" tests, adapted from log fields instead of JSON keys.
+    #[derive(Default, Clone)]
+    struct InfoEventCapture(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for InfoEventCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::INFO {
+                return;
+            }
+            #[derive(Default)]
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value}", field.name());
+                }
+
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            self.0.lock().push(visitor.0);
+        }
+    }
+
     /// `RemoteClusterConfig`'s `Debug` must never print the bearer credential:
     /// the config flows into startup logs and error contexts, and a derived
     /// `Debug` would leak the operator token there.
@@ -3656,6 +5891,7 @@ mod tests {
             name: "beta".to_string(),
             endpoint: "beta.internal:9443".to_string(),
             credential: "super-secret-operator-token".to_string(),
+            tenant: None,
             tls: true,
             tls_ca_file: None,
             skip_unavailable: true,
@@ -3904,11 +6140,155 @@ mod tests {
         );
     }
 
+    /// The `tenant` key names the one local tenant whose queries fan out to a
+    /// remote, and its absence is a distinct state (`None`, an unkeyed remote
+    /// serving every local tenant) rather than a default value, because startup
+    /// treats the two differently.
+    #[test]
+    fn remote_cluster_tenant_key_is_parsed_and_optional() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let mapped = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={},tenant=acme",
+            token.path().display()
+        );
+        let unmapped = format!(
+            "name=us,endpoint=us.internal:9443,credential-file={}",
+            token.path().display()
+        );
+
+        let clusters = cli(&["--remote-cluster", &mapped, "--remote-cluster", &unmapped])
+            .parse_remote_clusters()
+            .expect("a tenant-keyed spec and an unkeyed spec both parse");
+
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(
+            clusters[0].tenant.as_ref().map(TenantId::as_str),
+            Some("acme"),
+            "tenant=acme must resolve to that local tenant, got {:?}",
+            clusters[0]
+        );
+        assert_eq!(
+            clusters[1].tenant, None,
+            "a spec with no tenant key must stay unkeyed, got {:?}",
+            clusters[1]
+        );
+    }
+
+    /// Two local tenants sharing one remote endpoint is two specs, each with its
+    /// own name and its own credential file. There is deliberately no syntax for
+    /// naming several local tenants on one spec, so this is the shape the guide
+    /// documents and it must parse.
+    #[test]
+    fn two_local_tenants_share_a_remote_endpoint_as_two_specs() {
+        let acme_cred = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(acme_cred.path(), "acme-operator-token\n").expect("write credential");
+        let beta_cred = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(beta_cred.path(), "beta-operator-token\n").expect("write credential");
+        let acme = format!(
+            "name=eu-acme,endpoint=eu.internal:9443,credential-file={},tenant=acme",
+            acme_cred.path().display()
+        );
+        let beta = format!(
+            "name=eu-beta,endpoint=eu.internal:9443,credential-file={},tenant=beta",
+            beta_cred.path().display()
+        );
+
+        let clusters = cli(&["--remote-cluster", &acme, "--remote-cluster", &beta])
+            .parse_remote_clusters()
+            .expect("two specs to one endpoint under distinct names parse");
+
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0].endpoint, clusters[1].endpoint);
+        assert_ne!(
+            clusters[0].credential, clusters[1].credential,
+            "each local tenant must carry its own remote credential; sharing one is the \
+             exposure the tenant key exists to remove"
+        );
+    }
+
+    /// `tenant=` with no value is a truncated spec, not "unkeyed": accepting it
+    /// would turn a typo into a remote every local tenant reaches.
+    #[test]
+    fn remote_cluster_empty_tenant_value_is_refused() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let spec = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={},tenant=",
+            token.path().display()
+        );
+
+        let err = cli(&["--remote-cluster", &spec])
+            .parse_remote_clusters()
+            .expect_err("an empty tenant value must refuse startup");
+        assert!(
+            err.to_string().contains("tenant is empty"),
+            "expected the empty-tenant error, got: {err}"
+        );
+    }
+
+    /// A repeated `tenant` key is the one wrong spelling of "both tenants on
+    /// this remote" that would otherwise be accepted. Every other spelling is
+    /// already refused or lands on an unknown tenant the startup check catches;
+    /// last-wins would instead leave the first tenant with no remote and send
+    /// the second out under a credential meant for the first.
+    #[test]
+    fn remote_cluster_repeated_tenant_key_is_refused() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let spec = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={},tenant=acme,tenant=beta",
+            token.path().display()
+        );
+
+        let err = cli(&["--remote-cluster", &spec])
+            .parse_remote_clusters()
+            .expect_err("a repeated tenant key must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tenant is set twice"),
+            "expected the repeated-tenant error, got: {err}"
+        );
+        assert!(
+            msg.contains("acme") && msg.contains("beta"),
+            "the error must name both tenants so the operator can see which was dropped, got: \
+             {err}"
+        );
+    }
+
+    /// The unknown-key error lists the keys a spec may carry, so it has to list
+    /// `tenant` now that one exists. An operator reading the old list writes a
+    /// spec without the key and gets the startup refusal instead.
+    #[test]
+    fn remote_cluster_unknown_key_error_lists_tenant() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let spec = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={},tenat=acme",
+            token.path().display()
+        );
+
+        let err = cli(&["--remote-cluster", &spec])
+            .parse_remote_clusters()
+            .expect_err("an unknown key must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown key 'tenat'"), "got: {msg}");
+        assert!(
+            msg.contains("credential-file, tenant, tls"),
+            "the expected-key list must name tenant, got: {msg}"
+        );
+    }
+
     /// A zero (or negative) `--gc-*` duration must be rejected at parse time,
     /// not resolved to a 0 ns value: the same all-zero bricking scenario
     /// `GcConfigValues::validate` refuses on the durable `sys/gc` write path
     /// applies equally to the process's own configured side of the
     /// must-match check.
+    ///
+    /// `--gc-max-query-duration` is parsed by [`Cli::performance_flags`] now
+    /// (issue #1141 moved the deadline into the resolved performance defaults),
+    /// the other three by [`Cli::resolve_gc_runtime`]; both are driven here, so
+    /// the move cannot drop the check for the flag it moved.
     #[test]
     fn zero_gc_duration_flag_is_rejected() {
         for flag in [
@@ -3919,14 +6299,198 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(["ravel-server", "--mode", "query", flag, "0s"])
                 .expect("flag parses at the CLI layer");
-            let err = cli
-                .resolve_gc_runtime()
-                .expect_err(&format!("{flag} 0s must be rejected as non-positive"));
+            let err = if flag == "--gc-max-query-duration" {
+                cli.performance_flags()
+                    .expect_err(&format!("{flag} 0s must be rejected as non-positive"))
+            } else {
+                cli.resolve_gc_runtime(DERIVED_QUERY_DEADLINE)
+                    .expect_err(&format!("{flag} 0s must be rejected as non-positive"))
+            };
             assert!(
                 err.to_string().contains("positive"),
                 "expected a positive-duration error for {flag}, got: {err}"
             );
         }
+    }
+
+    /// `--audit-max-batch 0`/`--audit-max-age 0s` would each flush every
+    /// submitted audit event as its own single-record batch, defeating group
+    /// commit (ADR-0062 decision 2b); both must be rejected at startup.
+    #[test]
+    fn zero_audit_batch_or_age_is_rejected() {
+        let batch_err = cli(&["--audit-max-batch", "0"])
+            .resolve_audit_pipeline_config()
+            .expect_err("--audit-max-batch 0 must be rejected");
+        assert!(
+            batch_err.to_string().contains("--audit-max-batch"),
+            "expected an --audit-max-batch error, got: {batch_err}"
+        );
+
+        let age_err = cli(&["--audit-max-age", "0s"])
+            .resolve_audit_pipeline_config()
+            .expect_err("--audit-max-age 0s must be rejected");
+        assert!(
+            age_err.to_string().contains("positive"),
+            "expected a positive-duration error, got: {age_err}"
+        );
+    }
+
+    /// Omitting `--audit-max-batch`/`--audit-max-age` resolves to the
+    /// pipeline's own compiled-in defaults, and `--audit-mode` defaults to
+    /// `required` (fail closed), matching `AuditPipelineConfig::default()`.
+    #[test]
+    fn default_audit_pipeline_config_matches_the_pipeline_defaults() {
+        let resolved = cli(&[])
+            .resolve_audit_pipeline_config()
+            .expect("defaults must resolve");
+        let default = ravel_maintain::AuditPipelineConfig::default();
+        assert_eq!(resolved.max_batch, default.max_batch);
+        assert_eq!(resolved.max_age, default.max_age);
+        assert_eq!(resolved.audit_mode, ravel_maintain::AuditMode::Required);
+    }
+
+    /// `--audit-mode best-effort` must select `AuditMode::BestEffort`, not
+    /// silently stay on the fail-closed default.
+    #[test]
+    fn audit_mode_best_effort_flag_selects_best_effort() {
+        let resolved = cli(&["--audit-mode", "best-effort"])
+            .resolve_audit_pipeline_config()
+            .expect("best-effort must resolve");
+        assert_eq!(resolved.audit_mode, ravel_maintain::AuditMode::BestEffort);
+    }
+
+    /// `--audit-text redacted` (the default) with no tokenization key anywhere
+    /// fails startup. The alternative a caller might expect -- recording
+    /// verbatim query text because tokenization is unavailable -- would store
+    /// PII the operator asked not to store, so the process must refuse to
+    /// start and the message must name the variable that fixes it.
+    #[test]
+    fn redacted_without_a_key_fails_startup() {
+        let err = resolve_audit_text_policy(AuditTextArg::Redacted, None, None)
+            .expect_err("the redacted posture without a key must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains(AUDIT_TOKEN_KEY_ENV),
+            "the error must name {AUDIT_TOKEN_KEY_ENV}, got: {message}"
+        );
+    }
+
+    /// With no `RAVEL_AUDIT_TOKEN_KEY` but a configured deployment key, the
+    /// tokenization key is derived from it, so a tenancy-configured deployment
+    /// gets the redacted posture without a second secret to distribute.
+    #[test]
+    fn redacted_derives_its_key_from_the_deployment_key() {
+        let deployment_key = [7u8; 32];
+        let policy = resolve_audit_text_policy(AuditTextArg::Redacted, None, Some(&deployment_key))
+            .expect("a deployment key must resolve the redacted posture");
+        assert!(matches!(
+            policy,
+            ravel_maintain::AuditTextPolicy::Redacted(_)
+        ));
+    }
+
+    /// `--audit-text plaintext` is the explicit opt-in to verbatim text, so it
+    /// needs no key at all and must not be blocked by the check above.
+    #[test]
+    fn plaintext_needs_no_tokenization_key() {
+        let policy = resolve_audit_text_policy(AuditTextArg::Plaintext, None, None)
+            .expect("plaintext must resolve without a key");
+        assert!(matches!(policy, ravel_maintain::AuditTextPolicy::Plaintext));
+    }
+
+    /// With no `RAVEL_AUDIT_TOKEN_KEY`, no deployment key, and the default
+    /// `redacted` posture, `gateway` and `maintain` resolve because they
+    /// install no query-audit pipeline and never read the key; `all` and
+    /// `query` still refuse, still naming the variable, exactly as
+    /// `redacted_without_a_key_fails_startup` pins for the ungated function.
+    #[test]
+    fn audit_text_policy_is_gated_to_query_serving_modes() {
+        for mode in [Mode::Gateway, Mode::Maintain] {
+            let policy =
+                resolve_audit_text_policy_for_mode(mode, AuditTextArg::default(), None, None)
+                    .unwrap_or_else(|e| panic!("mode {mode:?} must not need a key: {e}"));
+            assert!(
+                matches!(policy, ravel_maintain::AuditTextPolicy::Plaintext),
+                "mode {mode:?} installs no pipeline, so the resolved policy must be inert"
+            );
+        }
+
+        for mode in [Mode::All, Mode::Query] {
+            let err = resolve_audit_text_policy_for_mode(mode, AuditTextArg::default(), None, None)
+                .expect_err("a query-serving mode must still refuse without a key");
+            let message = err.to_string();
+            assert!(
+                message.contains(AUDIT_TOKEN_KEY_ENV),
+                "mode {mode:?} error must name {AUDIT_TOKEN_KEY_ENV}, got: {message}"
+            );
+        }
+    }
+
+    /// A 64-character all-hex string parses to its exact 32 bytes: pinned
+    /// against a known input rather than only checking that parsing succeeds,
+    /// so a transposition inside `parse_audit_token_key` would fail this test.
+    #[test]
+    fn parse_audit_token_key_pins_the_exact_bytes() {
+        let key = parse_audit_token_key(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .expect("64 hex characters must parse");
+        assert_eq!(
+            key,
+            [
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+                0x1c, 0x1d, 0x1e, 0x1f,
+            ]
+        );
+    }
+
+    /// One character short of 64 is refused, not zero-padded.
+    #[test]
+    fn parse_audit_token_key_rejects_63_characters() {
+        let raw = "a".repeat(63);
+        let err = parse_audit_token_key(&raw).expect_err("63 characters must be refused");
+        assert!(
+            err.to_string().contains("64 hex characters"),
+            "expected a length error, got: {err}"
+        );
+    }
+
+    /// One character over 64 is refused, not truncated.
+    #[test]
+    fn parse_audit_token_key_rejects_65_characters() {
+        let raw = "a".repeat(65);
+        let err = parse_audit_token_key(&raw).expect_err("65 characters must be refused");
+        assert!(
+            err.to_string().contains("64 hex characters"),
+            "expected a length error, got: {err}"
+        );
+    }
+
+    /// 64 characters with one non-hex character is refused rather than
+    /// silently dropping or replacing the bad character.
+    #[test]
+    fn parse_audit_token_key_rejects_non_hex_character() {
+        let raw = format!("{}g{}", "a".repeat(31), "a".repeat(32));
+        assert_eq!(raw.len(), 64, "test fixture must stay 64 characters long");
+        let err = parse_audit_token_key(&raw).expect_err("a non-hex character must be refused");
+        assert!(
+            err.to_string().contains("64 hex characters"),
+            "expected a length/hex-digit error, got: {err}"
+        );
+    }
+
+    /// The error message must never echo the key text: a startup log or error
+    /// body carrying the literal key would leak the secret the check exists
+    /// to protect.
+    #[test]
+    fn parse_audit_token_key_error_never_contains_the_key_text() {
+        let raw = "a".repeat(63);
+        let err = parse_audit_token_key(&raw).expect_err("63 characters must be refused");
+        assert!(
+            !err.to_string().contains(&raw),
+            "error message must not contain the key text, got: {err}"
+        );
     }
 
     /// ADR-0075 reachability: the S3 request budget the running binary
@@ -4039,12 +6603,245 @@ mod tests {
              not EngineConfig::default()'s 8"
         );
 
-        // Default path: unset flag leaves the engine's value byte-identical.
+        // Unset: the HOST-DERIVED value reaches the same field (issue #1141),
+        // not the compiled-in 8. `engine_from` resolves against the injected
+        // reference host, so this asserts an exact integer.
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert_eq!(
             engine_from(&cli).fetch_concurrency,
-            EngineConfig::default().fetch_concurrency,
+            REFERENCE_FETCH_CONCURRENCY,
+            "an unset --fetch-concurrency must reach the engine as the host-derived value"
         );
+        assert_ne!(
+            REFERENCE_FETCH_CONCURRENCY,
+            EngineConfig::default().fetch_concurrency,
+            "guard: the derived value must differ from the library constant, or this test \
+             would pass on a server that ignored the derivation"
+        );
+    }
+
+    /// ADR-1195 reachability: `--store-get-concurrency` must reach the
+    /// `EngineConfig` the running engine enforces, not stop at a parsed field.
+    /// Same wiring trace as [`fetch_concurrency_is_reachable_from_cli`].
+    #[test]
+    fn store_get_concurrency_is_reachable_from_cli() {
+        let cli = Cli::try_parse_from(["ravel-server", "--store-get-concurrency", "7"])
+            .expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.store_get_concurrency(),
+            7,
+            "the running engine's store_get_concurrency must be the configured flag"
+        );
+        // The other two unbundled knobs and the legacy field must be
+        // unaffected: this flag governs only GET concurrency.
+        assert_eq!(engine.sql_partition_count(), REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(engine.promql_fetch_fanout(), REFERENCE_FETCH_CONCURRENCY);
+    }
+
+    /// ADR-1195 reachability: `--sql-partition-count` must reach the
+    /// `EngineConfig` `crates/ravel-sql/src/session.rs` reads for
+    /// `target_partitions`. Same wiring trace as
+    /// [`fetch_concurrency_is_reachable_from_cli`].
+    #[test]
+    fn sql_partition_count_is_reachable_from_cli() {
+        let cli = Cli::try_parse_from(["ravel-server", "--sql-partition-count", "5"])
+            .expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.sql_partition_count(),
+            5,
+            "the running engine's sql_partition_count must be the configured flag"
+        );
+        assert_eq!(engine.store_get_concurrency(), REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(engine.promql_fetch_fanout(), REFERENCE_FETCH_CONCURRENCY);
+    }
+
+    /// ADR-1195 reachability: `--promql-fetch-fanout` must reach the
+    /// `EngineConfig` the running engine enforces. Same wiring trace as
+    /// [`fetch_concurrency_is_reachable_from_cli`].
+    #[test]
+    fn promql_fetch_fanout_is_reachable_from_cli() {
+        let cli = Cli::try_parse_from(["ravel-server", "--promql-fetch-fanout", "3"])
+            .expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.promql_fetch_fanout(),
+            3,
+            "the running engine's promql_fetch_fanout must be the configured flag"
+        );
+        assert_eq!(engine.store_get_concurrency(), REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(engine.sql_partition_count(), REFERENCE_FETCH_CONCURRENCY);
+    }
+
+    /// ADR-1195: with none of the four fetch-concurrency-family flags set, all
+    /// three unbundled knobs derive independently from the host, at the same
+    /// value `fetch_concurrency` itself derives to, each reported at source
+    /// `derived`.
+    #[test]
+    fn reference_host_resolves_the_three_unbundled_knobs() {
+        let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        assert_eq!(resolved.store_get_concurrency, 32);
+        assert_eq!(resolved.sql_partition_count, 32);
+        assert_eq!(resolved.promql_fetch_fanout, 32);
+        assert_eq!(resolved.sources.store_get_concurrency, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.sql_partition_count, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.promql_fetch_fanout, PERF_SOURCE_DERIVED);
+    }
+
+    /// ADR-1195: on a tiny host the three unbundled knobs floor at
+    /// `MIN_DERIVED_FETCH_CONCURRENCY`, exactly like `fetch_concurrency` does.
+    #[test]
+    fn small_host_floors_the_three_unbundled_knobs_at_the_minimum() {
+        let tiny = resolve_performance_defaults(
+            HostProfile::new(1, Some(8 * 1024 * 1024 * 1024)),
+            PerformanceFlags::default(),
+        );
+        assert_eq!(tiny.store_get_concurrency, MIN_DERIVED_FETCH_CONCURRENCY);
+        assert_eq!(tiny.sql_partition_count, MIN_DERIVED_FETCH_CONCURRENCY);
+        assert_eq!(tiny.promql_fetch_fanout, MIN_DERIVED_FETCH_CONCURRENCY);
+    }
+
+    /// ADR-1195 legacy precedence: `--fetch-concurrency` alone sets all three
+    /// unbundled knobs together, at source `legacy-flag`, exactly like the
+    /// pre-1195 single-knob behaviour.
+    #[test]
+    fn legacy_fetch_concurrency_sets_all_three_unbundled_knobs() {
+        let cli =
+            Cli::try_parse_from(["ravel-server", "--fetch-concurrency", "9"]).expect("flag parses");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.store_get_concurrency, 9);
+        assert_eq!(resolved.sql_partition_count, 9);
+        assert_eq!(resolved.promql_fetch_fanout, 9);
+        assert_eq!(
+            resolved.sources.store_get_concurrency,
+            PERF_SOURCE_LEGACY_FLAG
+        );
+        assert_eq!(
+            resolved.sources.sql_partition_count,
+            PERF_SOURCE_LEGACY_FLAG
+        );
+        assert_eq!(
+            resolved.sources.promql_fetch_fanout,
+            PERF_SOURCE_LEGACY_FLAG
+        );
+
+        let engine = engine_from(&cli);
+        assert_eq!(engine.store_get_concurrency(), 9);
+        assert_eq!(engine.sql_partition_count(), 9);
+        assert_eq!(engine.promql_fetch_fanout(), 9);
+    }
+
+    /// Issue #1196 / ADR-1196: `--logs-fetch-policy latency-first` carries no
+    /// concurrency default of its own. With no `--store-get-concurrency`, no
+    /// `--sql-partition-count`, no `--promql-fetch-fanout`, and no legacy
+    /// `--fetch-concurrency`, all three ADR-1195 knobs must resolve to the
+    /// same values AND the same sources as under `cost-based` (the shipped
+    /// default): the host-derived value, source `"derived"`.
+    ///
+    /// Prove-the-test: reintroduce a policy-sourced override for
+    /// `store_get_concurrency` in `Cli::resolve_performance` and the first
+    /// assertion panics, reading `left: 256, right: 32`.
+    #[test]
+    fn latency_first_resolves_all_three_knobs_exactly_like_cost_based() {
+        let cost_based = Cli::try_parse_from(["ravel-server"]).expect("no flags parses");
+        let latency_first =
+            Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "latency-first"])
+                .expect("flag parses");
+
+        let cost_based_resolved = resolved_from(&cost_based);
+        let latency_first_resolved = resolved_from(&latency_first);
+
+        assert_eq!(
+            latency_first_resolved.store_get_concurrency,
+            cost_based_resolved.store_get_concurrency
+        );
+        assert_eq!(
+            latency_first_resolved.store_get_concurrency,
+            REFERENCE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            latency_first_resolved.sources.store_get_concurrency,
+            PERF_SOURCE_DERIVED
+        );
+
+        assert_eq!(
+            latency_first_resolved.sql_partition_count,
+            cost_based_resolved.sql_partition_count
+        );
+        assert_eq!(
+            latency_first_resolved.sql_partition_count,
+            REFERENCE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            latency_first_resolved.sources.sql_partition_count,
+            PERF_SOURCE_DERIVED
+        );
+
+        assert_eq!(
+            latency_first_resolved.promql_fetch_fanout,
+            cost_based_resolved.promql_fetch_fanout
+        );
+        assert_eq!(
+            latency_first_resolved.promql_fetch_fanout,
+            REFERENCE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            latency_first_resolved.sources.promql_fetch_fanout,
+            PERF_SOURCE_DERIVED
+        );
+
+        let engine = engine_from(&latency_first);
+        assert_eq!(engine.store_get_concurrency(), REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(engine.sql_partition_count(), REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(engine.promql_fetch_fanout(), REFERENCE_FETCH_CONCURRENCY);
+    }
+
+    /// ADR-1195: combining `--fetch-concurrency` with any of the three new
+    /// flags is a startup error naming both flags, not a silent precedence
+    /// rule.
+    #[test]
+    fn fetch_concurrency_conflicts_with_each_new_flag() {
+        for (flag, value) in [
+            ("--store-get-concurrency", "4"),
+            ("--sql-partition-count", "4"),
+            ("--promql-fetch-fanout", "4"),
+        ] {
+            let cli =
+                Cli::try_parse_from(["ravel-server", "--fetch-concurrency", "9", flag, value])
+                    .expect("flags parse at the CLI layer");
+            let err = cli.validate().expect_err(&format!(
+                "--fetch-concurrency combined with {flag} must fail startup"
+            ));
+            let message = err.to_string();
+            assert!(
+                message.contains("--fetch-concurrency") && message.contains(flag),
+                "error must name both conflicting flags: {message}"
+            );
+        }
+    }
+
+    /// ADR-1195: a `0` value in any of the four fetch-concurrency-family
+    /// flags is refused at validation, before configuration resolution builds
+    /// any fetcher, engine, or SQL session, with the flag named in the error.
+    #[test]
+    fn zero_value_in_any_fetch_concurrency_family_flag_is_a_startup_error() {
+        for flag in [
+            "--fetch-concurrency",
+            "--store-get-concurrency",
+            "--sql-partition-count",
+            "--promql-fetch-fanout",
+        ] {
+            let cli = Cli::try_parse_from(["ravel-server", flag, "0"])
+                .expect("0 parses at the CLI layer");
+            let err = cli
+                .validate()
+                .expect_err(&format!("{flag} 0 must fail startup"));
+            assert!(
+                err.to_string().contains(flag),
+                "error must name the offending flag: {err}"
+            );
+        }
     }
 
     /// ADR-0088 reachability: `--max-segments` must reach the `EngineConfig` the
@@ -4065,11 +6862,15 @@ mod tests {
              not EngineConfig::default()'s 1024"
         );
 
+        // Unset: the DERIVED cap reaches the same field (issue #1141), not the
+        // compiled-in 1024.
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert_eq!(
             engine_from(&cli).max_segments,
-            EngineConfig::default().max_segments,
+            DERIVED_MAX_SEGMENTS,
+            "an unset --max-segments must reach the engine as the derived 1,000,000"
         );
+        assert_ne!(DERIVED_MAX_SEGMENTS, EngineConfig::default().max_segments);
     }
 
     /// ADR-0107 reachability: `--logs-block-range-threshold` must reach the
@@ -4164,26 +6965,28 @@ mod tests {
         );
     }
 
-    /// ADR-0088 default-unchanged guard: a server built with none of the four
-    /// new flags carries budgets bit-for-bit identical to the compiled-in
-    /// values the engine used before the flags existed. Pins each default to its
-    /// source constant so a future edit to any default fails loudly here.
+    /// ADR-0088 as amended by issue #1141: a server built with none of the four
+    /// budget flags carries the HOST-DERIVED budgets, and every other field of
+    /// [`QueryBudgets`] is still exactly its compiled-in value. Pins each to its
+    /// source constant so a future edit to any of them fails loudly here.
     #[test]
-    fn query_budget_defaults_match_compiled_in_constants() {
+    fn query_budget_defaults_are_derived_from_the_host() {
         use ravel_query::EngineConfig;
 
-        let budgets = Cli::try_parse_from(["ravel-server"])
-            .expect("defaults parse")
-            .query_budgets()
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let budgets = cli
+            .query_budgets(&resolved_from(&cli))
             .expect("budgets resolve");
-        assert_eq!(budgets, QueryBudgets::default());
-        assert_eq!(
-            budgets.fetch_concurrency,
-            EngineConfig::default().fetch_concurrency
+        assert_eq!(budgets.fetch_concurrency, REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(budgets.max_segments, DERIVED_MAX_SEGMENTS);
+        assert_eq!(budgets.sql_max_query_bytes, REFERENCE_SQL_MAX_QUERY_BYTES);
+        assert_eq!(budgets.sql_tenant_max_bytes, REFERENCE_SQL_TENANT_MAX_BYTES);
+        assert_ne!(
+            budgets,
+            QueryBudgets::default(),
+            "guard: the derived budgets must differ from the library-constant baseline, or \
+             this test would pass on a server that never derived anything"
         );
-        assert_eq!(budgets.max_segments, EngineConfig::default().max_segments);
-        assert_eq!(budgets.sql_max_query_bytes, DEFAULT_SQL_MAX_QUERY_BYTES);
-        assert_eq!(budgets.sql_tenant_max_bytes, DEFAULT_SQL_TENANT_MAX_BYTES);
         assert!(
             budgets.sql_parallel_final_aggregation,
             "ADR-0094 amendment (#741): exact-typed final-aggregation repartitioning defaults on"
@@ -4193,10 +6996,10 @@ mod tests {
             EngineConfig::default().logs_max_fetch_run_bytes,
             "the --logs-max-fetch-run-bytes default is the engine's own 64 MiB bound"
         );
-        // The concurrency/segment defaults leave a base config untouched. The
-        // two logs fetch quantities do NOT: ADR-0996 decision 2 ships
-        // `cost-based` as the default policy, and at the reference profile
-        // (transfer and retrieval free) that resolves to request-minimal
+        // Everything the derivation does NOT govern must still be untouched.
+        // The two logs fetch quantities are the exception ADR-0996 decision 2
+        // ships: `cost-based` is the default policy, and at the reference
+        // profile (transfer and retrieval free) it resolves to request-minimal
         // behaviour. That is the ADR's argued default, not an accident, so it
         // is pinned to the exact resolved values here.
         let engine = budgets
@@ -4207,11 +7010,990 @@ mod tests {
             EngineConfig {
                 logs_request_cost_bytes: u64::MAX,
                 logs_block_range_threshold: u64::MAX,
+                fetch_concurrency: REFERENCE_FETCH_CONCURRENCY,
+                max_segments: DERIVED_MAX_SEGMENTS,
+                // ADR-1195: `apply_to_engine` always sets the three unbundled
+                // knobs from `QueryBudgets`, which resolved them at the same
+                // derived value as `fetch_concurrency` (none of the four flags
+                // was set).
+                store_get_concurrency: Some(REFERENCE_FETCH_CONCURRENCY),
+                sql_partition_count: Some(REFERENCE_FETCH_CONCURRENCY),
+                promql_fetch_fanout: Some(REFERENCE_FETCH_CONCURRENCY),
                 ..EngineConfig::default()
             },
-            "unset flags must perturb only the two quantities the default cost-based policy \
-             resolves at the reference profile"
+            "unset flags must perturb only the derived budgets, the ADR-1195 unbundled knobs, \
+             and the two quantities the default cost-based policy resolves at the reference \
+             profile"
         );
+    }
+
+    /// Issue #1141's headline: with no flags at all, the reference host of the
+    /// #968 ClickBench result (16 cores, 30 GiB) resolves to exactly the settings
+    /// that measurement ran under. Exact integers, not ranges: a rule that
+    /// produced "about 24 GiB" would be a different rule.
+    ///
+    /// Prove-the-test: flip `CACHE_MEMORY_PERCENT` from 25 to 20 and the cache
+    /// assertion reads 6,012,954,214 against the expected 7,516,192,768; flip
+    /// `FETCH_CONCURRENCY_PER_CORE` from 2 to 1 and the concurrency assertion
+    /// reads 16 against the expected 32.
+    #[test]
+    fn reference_host_resolves_the_clickbench_settings() {
+        let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+
+        assert_eq!(resolved.fetch_concurrency, 32);
+        // ADR-1170 decision 3: carved from memory_budget_bytes (MemTotal minus
+        // the overhead reserve), not raw MemTotal -- 25% of 30,064,771,072.
+        assert_eq!(resolved.memory_budget_bytes, 30_064_771_072);
+        assert_eq!(resolved.cache_max_bytes, 7_516_192_768);
+        // The catalog byte cache derives at its own 5% share, a separate
+        // ceiling from the fetcher cache's 25%, so the pair does not commit
+        // 50% of the budget.
+        assert_eq!(resolved.catalog_cache_max_bytes, 1_503_238_553);
+        // Both hard caps together, and what the derivation leaves for the
+        // shared SQL/fetch MemoryBudget accountant: budget = hard_caps + remainder.
+        assert_eq!(resolved.memory_hard_caps_bytes, 9_019_431_321);
+        assert_eq!(resolved.memory_remainder_bytes, 21_045_339_751);
+        assert_eq!(resolved.sql_max_query_bytes, 8_053_063_680);
+        assert_eq!(resolved.sql_tenant_max_bytes, 16_106_127_360);
+        assert_eq!(resolved.max_segments, 1_000_000);
+        assert_eq!(resolved.query_deadline, Duration::from_secs(660));
+
+        // Every one of them derived, none a fallback: on a host whose memory is
+        // readable, a `fallback` source would mean the derivation silently did
+        // not run.
+        assert_eq!(resolved.sources.fetch_concurrency, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_BUDGET_CARVE);
+        assert_eq!(
+            resolved.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE
+        );
+        assert_eq!(resolved.sources.sql_max_query_bytes, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.sql_tenant_max_bytes, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.max_segments, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.query_deadline, PERF_SOURCE_DERIVED);
+        assert!(!resolved.sql_max_query_bytes_clamped);
+        assert!(!resolved.sql_tenant_max_bytes_raised);
+    }
+
+    /// A smaller host gets proportional, safe values from the same rules: 4
+    /// cores and 8 GiB. The fetch concurrency lands exactly on the floor here
+    /// (2 * 4 == 8 == MIN_DERIVED_FETCH_CONCURRENCY). At 25% the cache share
+    /// divides memory_budget_bytes (6,442,450,944) evenly, so the truncation
+    /// the rounding rule specifies is only observable on the catalog cache's
+    /// 5% here.
+    ///
+    /// Prove-the-test: round the percentage up (`(product + 99) / 100` in
+    /// `percent_of`) and the CATALOG assertion reads 322,122,548 against the
+    /// expected 322,122,547. The cache assertion cannot serve as the rounding
+    /// witness at this size: memory_budget_bytes * 25% is exact, so both
+    /// rules agree on 1,610,612,736 and the mutation would pass unnoticed.
+    #[test]
+    fn small_host_resolves_proportional_settings() {
+        let host = HostProfile::new(4, Some(8 * 1024 * 1024 * 1024));
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+
+        assert_eq!(resolved.fetch_concurrency, 8);
+        assert_eq!(resolved.memory_budget_bytes, 6_442_450_944);
+        assert_eq!(resolved.cache_max_bytes, 1_610_612_736);
+        // Catalog cache is 5% of the same budget, truncated.
+        assert_eq!(resolved.catalog_cache_max_bytes, 322_122_547);
+        assert_eq!(resolved.memory_hard_caps_bytes, 1_932_735_283);
+        assert_eq!(resolved.memory_remainder_bytes, 4_509_715_661);
+        assert_eq!(resolved.sql_max_query_bytes, 2_147_483_648);
+        assert_eq!(resolved.sql_tenant_max_bytes, 4_294_967_296);
+        // The two host-independent rules do not shrink with the host: a
+        // segment-count cap and a deadline are not resident bytes.
+        assert_eq!(resolved.max_segments, 1_000_000);
+        assert_eq!(resolved.query_deadline, Duration::from_secs(660));
+
+        // A one-core host still gets the floor, never 2.
+        let tiny = resolve_performance_defaults(
+            HostProfile::new(1, Some(8 * 1024 * 1024 * 1024)),
+            PerformanceFlags::default(),
+        );
+        assert_eq!(tiny.fetch_concurrency, MIN_DERIVED_FETCH_CONCURRENCY);
+    }
+
+    /// The IMDSv2-confirmed `MemTotal` of the c6a.4xlarge box issue #1395
+    /// bisected the ClickBench warm-run regression to: 16 vCPU, no cgroup cap.
+    const CLICKBENCH_HOST_MEM_BYTES: u64 = 32_903_794_688;
+    /// The ClickBench corpus size on that same box, in bytes.
+    const CLICKBENCH_CORPUS_BYTES: u64 = 11_732_474_917;
+
+    /// Exact fetch-cache carve on the real regressed host, parameterized on
+    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`] rather than a duplicated literal, so a
+    /// future calibration of that constant recomputes this assertion instead
+    /// of silently going stale. A second, separate assertion records whether
+    /// the carve is large enough to hold the whole ClickBench corpus resident
+    /// at once; ADR-1170 decision 3 fixes the carve's BASIS (budget, not raw
+    /// `MemTotal`), not the corpus's fit, so this is a fact to record, not a
+    /// pass/fail bar the derivation must clear.
+    ///
+    /// Prove-the-test: change `percent_of(memory_budget_bytes,
+    /// CACHE_MEMORY_PERCENT)` in `resolve_performance_defaults` back to
+    /// `percent_of(total, CACHE_MEMORY_PERCENT)` (the pre-ADR-1170 flat basis)
+    /// and the first assertion reads 8,225,948,672 against the expected
+    /// 7,689,077,760.
+    #[test]
+    fn clickbench_host_derives_the_expected_fetch_cache_carve() {
+        let host = HostProfile::new(16, Some(CLICKBENCH_HOST_MEM_BYTES));
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+
+        let expected_budget = CLICKBENCH_HOST_MEM_BYTES - MEMORY_OVERHEAD_RESERVE_BYTES;
+        let expected_cache = percent_of(expected_budget, CACHE_MEMORY_PERCENT);
+        assert_eq!(resolved.memory_budget_bytes, expected_budget);
+        assert_eq!(resolved.cache_max_bytes, expected_cache);
+
+        // Separate statement: the derived carve does not fit the reference
+        // corpus at the placeholder reserve value of
+        // MEMORY_OVERHEAD_RESERVE_BYTES (2,147,483,648) -- 7,689,077,760 is
+        // below the 11,732,474,917-byte corpus, so the whole corpus cannot sit
+        // resident in the fetch cache at once on this host at today's
+        // provisional reserve.
+        assert!(expected_cache < CLICKBENCH_CORPUS_BYTES);
+    }
+
+    /// The budget-derived carve and a flat 25%-of-`MemTotal` carve (the
+    /// pre-ADR-1170 basis issue #1395 bisected the ClickBench regression to)
+    /// disagree on any host with known memory, because
+    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`] is nonzero: the reference host's
+    /// budget-derived carve is 7,516,192,768 while the flat share of the same
+    /// host's raw `MemTotal` would be 8,053,063,680. The resolved value must
+    /// be the budget-derived one.
+    ///
+    /// Prove-the-test: change `percent_of(memory_budget_bytes,
+    /// CACHE_MEMORY_PERCENT)` in `resolve_performance_defaults` back to
+    /// `percent_of(total, CACHE_MEMORY_PERCENT)` and `resolved.cache_max_bytes`
+    /// reads 8,053,063,680 (the flat value) against the expected
+    /// 7,516,192,768, so `assert_ne!` below no longer distinguishes anything
+    /// and the final `assert_eq!` fails.
+    #[test]
+    fn the_budget_derived_carve_differs_from_a_flat_share_of_mem_total() {
+        let host = reference_host();
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+
+        let flat_share_of_mem_total = percent_of(REFERENCE_MEM_BYTES, CACHE_MEMORY_PERCENT);
+        assert_eq!(flat_share_of_mem_total, 8_053_063_680);
+        assert_ne!(resolved.cache_max_bytes, flat_share_of_mem_total);
+        assert_eq!(resolved.cache_max_bytes, 7_516_192_768);
+    }
+
+    /// Memory unknown (a non-Linux host, or an unreadable `/proc/meminfo`):
+    /// every memory-derived default falls back to its compiled-in constant and
+    /// says `fallback`, while the core-derived and host-independent rules still
+    /// derive. A percentage of an unknown total is not a number, so guessing one
+    /// would size a 24 GiB cache on a host that may have 2 GB.
+    ///
+    /// Prove-the-test: make the `(None, None)` arms of `resolve_performance_defaults`
+    /// derive from an assumed total (say `percent_of(8 << 30, CACHE_MEMORY_PERCENT)`)
+    /// and the cache assertion reads 6,871,947,673 against the expected
+    /// 268,435,456.
+    #[test]
+    fn unknown_memory_falls_back_to_the_compiled_in_constants() {
+        let host = HostProfile::new(16, None);
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+
+        assert_eq!(resolved.cache_max_bytes, 268_435_456);
+        assert_eq!(resolved.cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
+        // The catalog byte cache falls back to the same constant: a percentage
+        // of an unknown total is not a number.
+        assert_eq!(resolved.catalog_cache_max_bytes, 268_435_456);
+        assert_eq!(resolved.catalog_cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
+        assert_eq!(
+            resolved.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_FALLBACK
+        );
+        assert_eq!(resolved.sql_max_query_bytes, DEFAULT_SQL_MAX_QUERY_BYTES);
+        assert_eq!(resolved.sql_tenant_max_bytes, DEFAULT_SQL_TENANT_MAX_BYTES);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FALLBACK);
+        assert_eq!(resolved.sources.sql_max_query_bytes, PERF_SOURCE_FALLBACK);
+        assert_eq!(resolved.sources.sql_tenant_max_bytes, PERF_SOURCE_FALLBACK);
+        // The two fallbacks already satisfy query <= tenant, so neither side moved.
+        assert!(!resolved.sql_max_query_bytes_clamped);
+        assert!(!resolved.sql_tenant_max_bytes_raised);
+
+        // Cores are still known, so fetch concurrency is still derived.
+        assert_eq!(resolved.fetch_concurrency, 32);
+        assert_eq!(resolved.sources.fetch_concurrency, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.max_segments, DERIVED_MAX_SEGMENTS);
+        assert_eq!(resolved.query_deadline, DERIVED_QUERY_DEADLINE);
+
+        // Issue #1255 finding 1, configuration 2: "we could not measure the
+        // host" must resolve to no derived ceiling (`u64::MAX`), not to `0`.
+        // A `0` process_memory_budget_bytes (main.rs) becomes
+        // `MemoryBudget::new(0)` (lib.rs), which refuses every real
+        // reservation on every non-Linux host unconditionally.
+        //
+        // Prove-the-test: this assertion fails against the pre-fix `None =>
+        // (0, PERF_SOURCE_FALLBACK)` arm in `resolve_performance_defaults`,
+        // reading `resolved.memory_budget_bytes == 0` against the expected
+        // `u64::MAX`.
+        assert_eq!(resolved.memory_budget_bytes, u64::MAX);
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_FALLBACK);
+        // The remainder that sizes the shared SQL/fetch `MemoryBudget` must
+        // not collapse to `0` just because the two flat-constant caches were
+        // subtracted from an unlimited budget.
+        assert_eq!(
+            resolved.memory_remainder_bytes,
+            u64::MAX - resolved.memory_hard_caps_bytes
+        );
+        assert_ne!(resolved.memory_remainder_bytes, 0);
+    }
+
+    /// Issue #1255 finding 1, configuration 1: a host whose measured memory is
+    /// at or below `MEMORY_OVERHEAD_RESERVE_BYTES` derives
+    /// `memory_budget_bytes == 0` (a real, DERIVED figure, not a fallback),
+    /// which then carves `memory_hard_caps_bytes == 0` too (0% of 0 is 0).
+    /// The pre-fix `>` comparison in `check_memory_budget` read `0 > 0 ==
+    /// false` and let the process start with an unusable `0/0/0` triple: it
+    /// looks healthy (`SELECT 1` reserves nothing) and then refuses every
+    /// real query permanently. Startup must refuse instead.
+    ///
+    /// The refusal message is asserted, not just the refusal: with a `0`
+    /// budget no `--cache-max-bytes` value satisfies the check (any `n >= 1`
+    /// makes the sum `2n > 0`, and `0` still fails the `>=` comparison), so a
+    /// message naming that flag as the fix sends the operator after a knob
+    /// that cannot help. The zero-budget arm must point at the host's memory
+    /// (or its cgroup limit) and at the overhead reserve instead.
+    ///
+    /// Prove-the-test: this test fails against the pre-fix `>` comparison
+    /// (`resolve_performance` returns `Ok` instead of the expected
+    /// `MemoryBudgetExceeded`, so `expect_err` panics). The message
+    /// assertions below fail against a `Display` that emits the single
+    /// "lower --cache-max-bytes or raise the host's available memory" tail on
+    /// every path.
+    #[test]
+    fn host_at_or_below_the_overhead_reserve_refuses_to_start() {
+        let host = HostProfile::new(4, Some(MEMORY_OVERHEAD_RESERVE_BYTES));
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.memory_budget_bytes, 0);
+        assert_eq!(resolved.memory_hard_caps_bytes, 0);
+
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let err = cli.resolve_performance(host).expect_err(
+            "a 0-byte derived budget must refuse to start, not silently run with a \
+                         0/0/0 memory-budget triple",
+        );
+        let exceeded = err
+            .downcast_ref::<MemoryBudgetExceeded>()
+            .expect("typed MemoryBudgetExceeded error");
+        assert_eq!(exceeded.hard_caps_total, 0);
+        assert_eq!(exceeded.memory_budget_bytes, 0);
+
+        let message = exceeded.to_string();
+        assert!(
+            message.contains("no --cache-max-bytes value can satisfy this check"),
+            "the zero-budget refusal must say the flag cannot fix it: {message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "overhead reserve ({MEMORY_OVERHEAD_RESERVE_BYTES} bytes)"
+            )),
+            "the zero-budget refusal must name the reserve that consumed the host's memory: \
+             {message}"
+        );
+        assert!(
+            message.contains("give the process more memory, or raise its cgroup memory limit"),
+            "the zero-budget refusal must name the action that helps: {message}"
+        );
+        assert!(
+            !message.contains("lower --cache-max-bytes"),
+            "the zero-budget refusal must not point at a flag that cannot satisfy it: {message}"
+        );
+
+        // The satisfiable case keeps the flag-oriented advice: a budget with a
+        // positive remainder available to it really is fixable by lowering the
+        // flag, and this arm is what that message is for.
+        let fixable = MemoryBudgetExceeded {
+            cache_max_bytes: 8 * 1024 * 1024 * 1024,
+            catalog_cache_max_bytes: 8 * 1024 * 1024 * 1024,
+            hard_caps_total: 16 * 1024 * 1024 * 1024,
+            memory_budget_bytes: 14 * 1024 * 1024 * 1024,
+        };
+        let fixable_message = fixable.to_string();
+        assert!(
+            fixable_message.contains("lower --cache-max-bytes"),
+            "a refusal against a positive budget must still name the flag: {fixable_message}"
+        );
+        assert!(
+            !fixable_message.contains("no --cache-max-bytes value can satisfy this check"),
+            "the unsatisfiable wording must not leak onto the fixable case: {fixable_message}"
+        );
+    }
+
+    /// An explicit flag wins over the derived value, one field at a time: each
+    /// case sets exactly one flag and asserts that field took the flag while
+    /// every other field kept its reference-host derivation. A resolution that
+    /// let one flag disturb another (or that ignored a flag) fails on the
+    /// untouched fields, not just the set one.
+    ///
+    /// Prove-the-test: drop the `Some(n) => (n, PERF_SOURCE_FLAG)` arm from any
+    /// one match in `resolve_performance_defaults` and that field's assertion
+    /// reads its derived value against the expected flag value (for
+    /// `cache_max_bytes`: 7,516,192,768 against the expected 4096).
+    #[test]
+    fn an_explicit_flag_overrides_each_derived_value_independently() {
+        let derived = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+
+        let with_fetch = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                fetch_concurrency: Some(3),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(with_fetch.fetch_concurrency, 3);
+        assert_eq!(with_fetch.sources.fetch_concurrency, PERF_SOURCE_FLAG);
+        assert_eq!(with_fetch.cache_max_bytes, derived.cache_max_bytes);
+        assert_eq!(with_fetch.max_segments, derived.max_segments);
+
+        let with_segments = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                max_segments: Some(1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(with_segments.max_segments, 1024);
+        assert_eq!(with_segments.sources.max_segments, PERF_SOURCE_FLAG);
+        assert_eq!(with_segments.fetch_concurrency, derived.fetch_concurrency);
+
+        let with_cache = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                cache_max_bytes: Some(4096),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(with_cache.cache_max_bytes, 4096);
+        assert_eq!(with_cache.sources.cache_max_bytes, PERF_SOURCE_FLAG);
+        // An explicit --cache-max-bytes bounds BOTH caches at that value,
+        // preserving the pre-#1141 single-number coupling.
+        assert_eq!(with_cache.catalog_cache_max_bytes, 4096);
+        assert_eq!(with_cache.sources.catalog_cache_max_bytes, PERF_SOURCE_FLAG);
+        assert_eq!(
+            with_cache.sql_max_query_bytes, derived.sql_max_query_bytes,
+            "the cache flag must not disturb the SQL pools"
+        );
+
+        let with_query_pool = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_max_query_bytes: Some(7 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(with_query_pool.sql_max_query_bytes, 7 * 1024 * 1024);
+        assert_eq!(
+            with_query_pool.sources.sql_max_query_bytes,
+            PERF_SOURCE_FLAG
+        );
+        assert_eq!(
+            with_query_pool.sql_tenant_max_bytes, derived.sql_tenant_max_bytes,
+            "a per-query flag below the derived tenant ceiling leaves the ceiling alone"
+        );
+        assert!(!with_query_pool.sql_max_query_bytes_clamped);
+        assert!(!with_query_pool.sql_tenant_max_bytes_raised);
+
+        let with_tenant_pool = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_tenant_max_bytes: Some(20 * 1024 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(
+            with_tenant_pool.sql_tenant_max_bytes,
+            20 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            with_tenant_pool.sources.sql_tenant_max_bytes,
+            PERF_SOURCE_FLAG
+        );
+        assert_eq!(
+            with_tenant_pool.sql_max_query_bytes, derived.sql_max_query_bytes,
+            "a tenant ceiling above the derived per-query pool leaves it alone"
+        );
+
+        let with_deadline = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                query_deadline: Some(Duration::from_secs(30)),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(with_deadline.query_deadline, Duration::from_secs(30));
+        assert_eq!(with_deadline.sources.query_deadline, PERF_SOURCE_FLAG);
+        assert_eq!(with_deadline.max_segments, derived.max_segments);
+    }
+
+    /// The per-query SQL pool is clamped to an EXPLICIT per-tenant ceiling. A
+    /// tenant ceiling the operator set below the derived per-query pool must
+    /// pull the per-query pool down to it, not raise the ceiling the operator
+    /// just set: raising it would silently widen the multi-tenant isolation
+    /// bound. (The reverse case, an explicit per-query pool over a ceiling
+    /// nobody set, raises the ceiling instead; see
+    /// `an_explicit_query_pool_raises_a_non_explicit_tenant_ceiling`.)
+    ///
+    /// Prove-the-test: replace the clamp with
+    /// `let sql_max_query_bytes = unclamped_query_bytes;` and the first
+    /// assertion reads 8,053,063,680 against the expected 1,048,576.
+    #[test]
+    fn the_per_query_sql_pool_is_clamped_to_the_per_tenant_ceiling() {
+        let clamped = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_tenant_max_bytes: Some(1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(
+            clamped.sql_max_query_bytes,
+            1024 * 1024,
+            "the derived per-query pool must be clamped down to the flag's tenant ceiling"
+        );
+        assert_eq!(
+            clamped.sql_tenant_max_bytes,
+            1024 * 1024,
+            "the tenant ceiling the operator set must be used verbatim, never raised to fit \
+             the per-query pool"
+        );
+        assert!(clamped.sql_max_query_bytes_clamped);
+
+        // Both set, crossed: the same rule applies to two explicit flags.
+        let both = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_max_query_bytes: Some(8 * 1024 * 1024),
+                sql_tenant_max_bytes: Some(4 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(both.sql_max_query_bytes, 4 * 1024 * 1024);
+        assert_eq!(both.sql_tenant_max_bytes, 4 * 1024 * 1024);
+        assert!(both.sql_max_query_bytes_clamped);
+        assert!(!both.sql_tenant_max_bytes_raised);
+    }
+
+    /// The catalog byte cache is a SEPARATE derived ceiling from the fetcher
+    /// cache (issue #1141): unset, it takes 5% of `memory_budget_bytes` while
+    /// the fetcher cache takes 25% of the same budget (ADR-1170 decision 3),
+    /// so the two independent LRU caches do not each claim the full share; an
+    /// explicit `--cache-max-bytes` sets both equal, the pre-#1141 coupling.
+    /// Exact integers, one host shape each.
+    ///
+    /// Prove-the-test: change [`CATALOG_CACHE_MEMORY_PERCENT`] from 5 to 80 and
+    /// the reference assertion reads 24,051,816,857 against the expected
+    /// 1,503,238,553; drop the `(Some(n), _)` arm of the catalog match and the
+    /// explicit-flag case reads the derived 1,503,238,553 against 12,345,678.
+    #[test]
+    fn the_catalog_cache_derives_at_its_own_share_and_the_flag_couples_both() {
+        // Reference profile: fetcher 25%, catalog 5% of the same budget.
+        let reference = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        assert_eq!(reference.cache_max_bytes, 7_516_192_768);
+        assert_eq!(reference.catalog_cache_max_bytes, 1_503_238_553);
+
+        // 4 cores / 8 GiB.
+        let small = resolve_performance_defaults(
+            HostProfile::new(4, Some(8 * 1024 * 1024 * 1024)),
+            PerformanceFlags::default(),
+        );
+        assert_eq!(small.catalog_cache_max_bytes, 322_122_547);
+
+        // Unknown memory: both fall back to the compiled-in constant.
+        let unknown =
+            resolve_performance_defaults(HostProfile::new(16, None), PerformanceFlags::default());
+        assert_eq!(unknown.catalog_cache_max_bytes, 268_435_456);
+        assert_eq!(
+            unknown.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_FALLBACK
+        );
+
+        // Explicit flag: both caches take the flag value verbatim.
+        let flagged = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                cache_max_bytes: Some(12_345_678),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(flagged.cache_max_bytes, 12_345_678);
+        assert_eq!(flagged.catalog_cache_max_bytes, 12_345_678);
+        assert_eq!(flagged.sources.catalog_cache_max_bytes, PERF_SOURCE_FLAG);
+    }
+
+    /// Issue #1141 clamp rule: an EXPLICIT per-query pool RAISES a non-explicit
+    /// (derived or fallback) per-tenant ceiling to fit rather than being cut to
+    /// it. An operator who typed `--sql-max-query-bytes` on a host whose
+    /// `MemTotal` was unknown must not have it silently clamped to the 1 GiB
+    /// fallback tenant ceiling they never set.
+    ///
+    /// Prove-the-test: replace the raise branch with the clamp
+    /// (`sql_max_query_bytes = sql_tenant_max_bytes`) and the first assertion
+    /// reads 1,073,741,824 against the expected 8,589,934,592.
+    #[test]
+    fn an_explicit_query_pool_raises_a_non_explicit_tenant_ceiling() {
+        // Flag per-query 8 GiB against the FALLBACK tenant ceiling (memory
+        // unknown, so tenant is the 1 GiB compiled-in default).
+        let raised_over_fallback = resolve_performance_defaults(
+            HostProfile::new(16, None),
+            PerformanceFlags {
+                sql_max_query_bytes: Some(8 * 1024 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(
+            raised_over_fallback.sql_max_query_bytes,
+            8 * 1024 * 1024 * 1024,
+            "the explicit per-query flag must be used verbatim, not clamped to the fallback tenant \
+             ceiling"
+        );
+        assert_eq!(
+            raised_over_fallback.sql_tenant_max_bytes,
+            8 * 1024 * 1024 * 1024,
+            "the non-explicit tenant ceiling is raised to the per-query flag"
+        );
+        assert!(raised_over_fallback.sql_tenant_max_bytes_raised);
+        assert!(!raised_over_fallback.sql_max_query_bytes_clamped);
+
+        // Flag per-query 20 GiB against the DERIVED tenant ceiling on the
+        // reference host (16 GiB): the derived ceiling is raised to 20 GiB.
+        let raised_over_derived = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_max_query_bytes: Some(20 * 1024 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(
+            raised_over_derived.sql_max_query_bytes,
+            20 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            raised_over_derived.sql_tenant_max_bytes,
+            20 * 1024 * 1024 * 1024
+        );
+        assert!(raised_over_derived.sql_tenant_max_bytes_raised);
+        assert!(!raised_over_derived.sql_max_query_bytes_clamped);
+    }
+
+    /// Issue #1141 clamp rule, the other side: an EXPLICIT per-tenant ceiling
+    /// clamps an explicit per-query pool down (never raises the ceiling the
+    /// operator set), and a derived-vs-derived pair never crosses so neither
+    /// flag fires.
+    ///
+    /// Prove-the-test: make the clamp branch raise instead
+    /// (`sql_tenant_max_bytes = unclamped_query_bytes`) and the first tenant
+    /// assertion reads 8,589,934,592 against the expected 1,073,741,824.
+    #[test]
+    fn an_explicit_tenant_ceiling_clamps_an_explicit_query_pool() {
+        // Both explicit, crossed: the tenant ceiling wins and the per-query
+        // pool is clamped to it.
+        let clamped = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_max_query_bytes: Some(8 * 1024 * 1024 * 1024),
+                sql_tenant_max_bytes: Some(1024 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(clamped.sql_max_query_bytes, 1024 * 1024 * 1024);
+        assert_eq!(
+            clamped.sql_tenant_max_bytes,
+            1024 * 1024 * 1024,
+            "the explicit tenant ceiling is used verbatim, never raised to fit the per-query flag"
+        );
+        assert!(clamped.sql_max_query_bytes_clamped);
+        assert!(!clamped.sql_tenant_max_bytes_raised);
+
+        // Derived vs derived on the reference host: 25% <= 50% by construction,
+        // so no crossing and neither flag fires.
+        let derived = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        assert_eq!(derived.sql_max_query_bytes, 8_053_063_680);
+        assert_eq!(derived.sql_tenant_max_bytes, 16_106_127_360);
+        assert!(!derived.sql_max_query_bytes_clamped);
+        assert!(!derived.sql_tenant_max_bytes_raised);
+    }
+
+    /// The derived fetch-concurrency floor is the compiled-in library default,
+    /// as [`MIN_DERIVED_FETCH_CONCURRENCY`]'s doc comment claims: a 1-2 core
+    /// host keeps today's fan-out rather than dropping below it. Pinned so a
+    /// change to either constant that breaks the equality fails here rather than
+    /// silently lowering the floor.
+    #[test]
+    fn min_derived_fetch_concurrency_matches_compiled_in_default() {
+        assert_eq!(
+            MIN_DERIVED_FETCH_CONCURRENCY,
+            ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            "the derived fetch-concurrency floor must equal the compiled-in library default it \
+             claims to be"
+        );
+    }
+
+    /// `/proc/meminfo` parsing: the real shape, and every malformed shape
+    /// yielding `None` rather than a wrong total. A wrong total silently
+    /// resizes three of the six settings.
+    ///
+    /// Prove-the-test: drop the `checked_mul(1024)` (return `Some(value)` for
+    /// the `kB` arm) and the first assertion reads 32,137,720 against the
+    /// expected 32,909,025,280.
+    #[test]
+    fn mem_total_is_parsed_from_proc_meminfo() {
+        let real = "MemTotal:       32137720 kB\nMemFree:         1234567 kB\n";
+        assert_eq!(parse_mem_total_bytes(real), Some(32_909_025_280));
+
+        // MemTotal not first, and a key that merely starts similarly must not
+        // be mistaken for it.
+        let shuffled = "MemAvailable:    100 kB\nMemTotal:       1024 kB\n";
+        assert_eq!(parse_mem_total_bytes(shuffled), Some(1024 * 1024));
+
+        // Malformed inputs: no guess.
+        assert_eq!(parse_mem_total_bytes(""), None);
+        assert_eq!(parse_mem_total_bytes("MemFree: 100 kB\n"), None);
+        assert_eq!(parse_mem_total_bytes("MemTotal:       lots kB\n"), None);
+        assert_eq!(parse_mem_total_bytes("MemTotal:       12 furlongs\n"), None);
+    }
+
+    /// cgroup limit parsing: a finite v2 or v1 limit is a cap; "max", the v1
+    /// no-limit sentinel, zero, and anything malformed are `None`, so an
+    /// unlimited or absent cgroup never caps a derivation.
+    ///
+    /// Prove-the-test: drop the `bytes >= 1 << 60` arm and the v1 sentinel
+    /// assertion reads `Some(9_223_372_036_854_771_712)` against `None`.
+    #[test]
+    fn cgroup_memory_limit_is_parsed_and_unlimited_is_none() {
+        // cgroup v2 memory.max with a finite limit, with and without the newline.
+        assert_eq!(
+            parse_cgroup_memory_limit("17179869184\n"),
+            Some(17_179_869_184)
+        );
+        assert_eq!(
+            parse_cgroup_memory_limit("17179869184"),
+            Some(17_179_869_184)
+        );
+        // cgroup v2 unlimited.
+        assert_eq!(parse_cgroup_memory_limit("max\n"), None);
+        // cgroup v1 unlimited: the page-rounded i64::MAX the kernel writes.
+        assert_eq!(parse_cgroup_memory_limit("9223372036854771712\n"), None);
+        // A zero limit is not a cap either, and malformed content is not a guess.
+        assert_eq!(parse_cgroup_memory_limit("0\n"), None);
+        assert_eq!(parse_cgroup_memory_limit(""), None);
+        assert_eq!(parse_cgroup_memory_limit("lots\n"), None);
+    }
+
+    /// The effective total is `MemTotal` capped by a finite cgroup limit, and
+    /// either one alone when the other is unknown.
+    ///
+    /// Prove-the-test: replace `total.min(limit)` with `total` and the first
+    /// assertion reads 32,212,254,720 against the expected 17,179,869,184.
+    #[test]
+    fn effective_memory_total_is_mem_total_capped_by_the_cgroup_limit() {
+        assert_eq!(
+            effective_memory_total(Some(32_212_254_720), Some(17_179_869_184)),
+            Some(17_179_869_184)
+        );
+        // A limit above MemTotal does not raise the total.
+        assert_eq!(
+            effective_memory_total(Some(32_212_254_720), Some(64_424_509_440)),
+            Some(32_212_254_720)
+        );
+        assert_eq!(
+            effective_memory_total(Some(32_212_254_720), None),
+            Some(32_212_254_720)
+        );
+        assert_eq!(
+            effective_memory_total(None, Some(17_179_869_184)),
+            Some(17_179_869_184)
+        );
+        assert_eq!(effective_memory_total(None, None), None);
+    }
+
+    /// `--cache-max-bytes` reachability (issue #1141): the resolved value is
+    /// what `main` hands `store::build_store` and `ServerConfig`, whether it was
+    /// derived or typed. Both directions asserted, because a resolution that
+    /// dropped the flag and one that dropped the derivation each look correct
+    /// from one side only.
+    ///
+    /// Prove-the-test: change `main`'s `cache_max_bytes: performance.cache_max_bytes`
+    /// back to a raw flag read and the unset case can no longer produce
+    /// 7,516,192,768 at all.
+    #[test]
+    fn cache_max_bytes_resolves_from_the_flag_or_the_host() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            resolved_from(&cli).cache_max_bytes,
+            REFERENCE_CACHE_MAX_BYTES
+        );
+
+        let cli = Cli::try_parse_from(["ravel-server", "--cache-max-bytes", "4096"])
+            .expect("flag parses");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.cache_max_bytes, 4096);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FLAG);
+    }
+
+    /// Startup refuses, never clamps, a flag combination whose two hard cache
+    /// caps together exceed `memory_budget_bytes` (ADR-1170 decision 3). An
+    /// explicit `--cache-max-bytes` bounds BOTH the fetcher and catalog caches
+    /// at that one value (the pre-#1141 coupling), so a value above half the
+    /// reference host's 30,064,771,072-byte budget makes their sum exceed it.
+    ///
+    /// Prove-the-test: replace `self.memory_hard_caps_bytes >=
+    /// self.memory_budget_bytes` in `check_memory_budget` with `false` and
+    /// `expect_err` panics because `resolve_performance` returns `Ok` instead
+    /// of the expected `MemoryBudgetExceeded`.
+    #[test]
+    fn startup_refuses_hard_caps_over_the_memory_budget() {
+        let cli = Cli::try_parse_from(["ravel-server", "--cache-max-bytes", "20000000000"])
+            .expect("flag parses");
+
+        let err = cli
+            .resolve_performance(reference_host())
+            .expect_err("hard caps of 40,000,000,000 must exceed the 30,064,771,072 budget");
+        let exceeded = err
+            .downcast_ref::<MemoryBudgetExceeded>()
+            .expect("typed MemoryBudgetExceeded error");
+        assert_eq!(exceeded.cache_max_bytes, 20_000_000_000);
+        assert_eq!(exceeded.catalog_cache_max_bytes, 20_000_000_000);
+        assert_eq!(exceeded.hard_caps_total, 40_000_000_000);
+        assert_eq!(exceeded.memory_budget_bytes, 30_064_771_072);
+
+        // Every figure an operator needs to act on the refusal is in the
+        // message itself, not just the typed struct.
+        let message = exceeded.to_string();
+        assert!(message.contains("20000000000"));
+        assert!(message.contains("40000000000"));
+        assert!(message.contains("30064771072"));
+    }
+
+    /// Issue #1255 finding 1, configuration 3: hard caps landing EXACTLY at
+    /// the memory budget must also refuse, not just caps strictly above it.
+    /// `memory_hard_caps_bytes == memory_budget_bytes` leaves a remainder of
+    /// exactly `0`, which builds `MemoryBudget::new(0)` downstream
+    /// (`lib.rs`'s `with_process_budget`): every real reservation is then
+    /// refused while `SELECT 1` (which reserves nothing) still answers, so
+    /// the server looks healthy and fails every non-trivial query
+    /// permanently. This exact input was previously asserted `Ok` by
+    /// `startup_accepts_hard_caps_exactly_at_the_memory_budget`, the test
+    /// this one replaces: that assertion encoded the bug as correct
+    /// behavior.
+    ///
+    /// Prove-the-test: this test fails against the pre-fix `>` comparison in
+    /// `check_memory_budget` (`resolve_performance` returns `Ok` instead of
+    /// the expected `MemoryBudgetExceeded`, so `expect_err` panics), which is
+    /// exactly the behavior the now-deleted `startup_accepts_...` test
+    /// pinned.
+    #[test]
+    fn startup_refuses_hard_caps_leaving_no_remainder() {
+        let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        let budget = resolved.memory_budget_bytes;
+        let half = budget / 2;
+        assert_eq!(
+            half * 2,
+            budget,
+            "the reference host's budget must be even for `half` to land hard caps exactly \
+             at the budget"
+        );
+
+        let cli = Cli::try_parse_from(["ravel-server", "--cache-max-bytes", &half.to_string()])
+            .expect("flag parses");
+        let err = cli
+            .resolve_performance(reference_host())
+            .expect_err("hard caps landing exactly at the budget must leave zero remainder");
+        let exceeded = err
+            .downcast_ref::<MemoryBudgetExceeded>()
+            .expect("typed MemoryBudgetExceeded error");
+        assert_eq!(exceeded.hard_caps_total, budget);
+        assert_eq!(exceeded.memory_budget_bytes, budget);
+    }
+
+    /// `--disable-cache` builds no fetcher cache (`store::build_cache` returns
+    /// `None`) and no catalog byte cache (`query::build_catalog` forces the
+    /// `0` sentinel), so both hard caps hold no memory and the whole budget
+    /// belongs to the shared SQL/fetch accountant. Startup must not refuse a
+    /// process that holds no read-cache memory, on either of the two
+    /// configurations that otherwise refuse:
+    ///
+    /// - hard caps above the budget, where the docs name this exact flag as
+    ///   the remedy (`docs/guides/caching.md`: "the flag to set in a
+    ///   memory-constrained container");
+    /// - a host whose effective memory is at or below
+    ///   [`MEMORY_OVERHEAD_RESERVE_BYTES`], where the budget derives to `0`
+    ///   and `0 >= 0` refuses with no flag value that can satisfy it. A 2 GiB
+    ///   container is that case, and it started before ADR-1170.
+    ///
+    /// Prove-the-test, one half of the fix at a time. Dropping
+    /// `|| self.cache_disabled` from `check_memory_budget`'s early return
+    /// panics the second `expect`: "a container that ran before ADR-1170 must
+    /// keep starting" against a `0 >= 0` refusal on the 0-byte budget.
+    /// Restoring that and replacing the `flags.disable_cache` branch in
+    /// `resolve_performance_defaults` with the plain
+    /// `cache_max_bytes.saturating_add(catalog_cache_max_bytes)` panics the
+    /// first hard-caps assertion instead, reading 40,000,000,000 against the
+    /// expected 0. Both halves are needed: caps of `0` do not survive the
+    /// `>=` comparison against a budget of `0`.
+    #[test]
+    fn disabling_the_cache_starts_where_the_hard_caps_would_refuse() {
+        // Configuration 1: caps an operator set well above the budget, with
+        // the caches turned off. 20 GB bounds both caches, so the sum is
+        // 40 GB against the reference host's 30,064,771,072-byte budget.
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--disable-cache",
+            "--cache-max-bytes",
+            "20000000000",
+        ])
+        .expect("flags parse");
+        let resolved = cli.resolve_performance(reference_host()).expect(
+            "a process that builds no cache holds no cache memory, so the two fictitious hard \
+             caps must not refuse startup",
+        );
+        assert!(resolved.cache_disabled);
+        assert_eq!(
+            resolved.memory_hard_caps_bytes, 0,
+            "neither cache is built, so neither ceiling charges the budget"
+        );
+        assert_eq!(
+            resolved.memory_remainder_bytes, resolved.memory_budget_bytes,
+            "the whole budget is available to the shared SQL/fetch accountant"
+        );
+        // The resolved ceilings themselves are untouched: they are what the
+        // operator typed, and they are simply not carved from the budget.
+        assert_eq!(resolved.cache_max_bytes, 20_000_000_000);
+        assert_eq!(resolved.catalog_cache_max_bytes, 20_000_000_000);
+
+        // Configuration 2: the small container. Effective memory at the
+        // overhead reserve derives a `0` budget, which refuses with the caches
+        // on (`host_at_or_below_the_overhead_reserve_refuses_to_start`) and
+        // must start with them off.
+        let tiny = HostProfile::new(2, Some(MEMORY_OVERHEAD_RESERVE_BYTES));
+        let cli = Cli::try_parse_from(["ravel-server", "--disable-cache"]).expect("flag parses");
+        let resolved = cli
+            .resolve_performance(tiny)
+            .expect("a container that ran before ADR-1170 must keep starting with --disable-cache");
+        assert_eq!(resolved.memory_budget_bytes, 0);
+        assert_eq!(resolved.memory_hard_caps_bytes, 0);
+        assert_eq!(resolved.memory_remainder_bytes, 0);
+
+        // Without the flag, that same host still refuses: this test must not
+        // be passing because the refusal stopped working altogether.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        cli.resolve_performance(tiny)
+            .expect_err("the refusal still fires for a process that does build caches");
+    }
+
+    /// The four ADR-1170 decision 3/4 emit lines -- `memory_budget_bytes`,
+    /// `memory_overhead_reserve_bytes`, `memory_hard_caps_bytes`, and
+    /// `memory_remainder_bytes` -- must each appear on the existing
+    /// "performance default resolved" pattern exactly once per `emit()` call,
+    /// carrying the exact value the derivation computed.
+    ///
+    /// Prove-the-test: duplicate the `memory_budget_bytes` `tracing::info!`
+    /// call in `emit()` (call it a second time) and
+    /// `occurrences("setting=\"memory_budget_bytes\"")` reads 2, not 1.
+    #[test]
+    fn emit_logs_each_new_memory_figure_exactly_once() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        let captured: std::sync::Arc<parking_lot::Mutex<Vec<String>>> = Default::default();
+        let subscriber = tracing_subscriber::registry().with(InfoEventCapture(captured.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        resolved.emit(reference_host());
+
+        let lines = captured.lock();
+        let joined = lines.join("\n");
+
+        for (setting, value) in [
+            ("memory_budget_bytes", "30064771072"),
+            ("memory_overhead_reserve_bytes", "2147483648"),
+            ("memory_hard_caps_bytes", "9019431321"),
+            ("memory_remainder_bytes", "21045339751"),
+        ] {
+            let needle = format!("setting=\"{setting}\"");
+            let occurrences = joined.matches(&needle).count();
+            assert_eq!(
+                occurrences, 1,
+                "setting={setting} must appear exactly once, found {occurrences}"
+            );
+            let with_value = format!("value={value}");
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(&needle) && l.contains(&with_value)),
+                "setting={setting} must carry {with_value}, lines: {lines:?}"
+            );
+        }
+    }
+
+    /// `--gc-max-query-duration` reachability under the derived default: unset,
+    /// the resolved deadline is 11 minutes and it is the value the `sys/gc`
+    /// validation runs on (and passes, against the durable 1h default). Set, the
+    /// flag is used verbatim, exactly as before.
+    ///
+    /// Prove-the-test: return `ravel_query::EngineConfig::default().deadline`
+    /// from the `None` arm of the deadline match and the first assertion reads
+    /// 30s against the expected 660s.
+    #[test]
+    fn the_derived_query_deadline_is_what_sys_gc_validates() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.query_deadline, Duration::from_secs(660));
+        let runtime = cli
+            .resolve_gc_runtime(resolved.query_deadline)
+            .expect("resolves");
+        assert_eq!(
+            runtime.query_deadline,
+            Duration::from_secs(660),
+            "the deadline the compactor/engine path carries must be the resolved one"
+        );
+        crate::gc_config::validate_query(
+            &ravel_maintain::GcConfigValues::maintain_defaults(),
+            runtime.query_deadline,
+        )
+        .expect("11 minutes must pass validation against the durable 1h max_query_duration");
+
+        // An explicit flag still wins and is still what is validated.
+        let cli = Cli::try_parse_from(["ravel-server", "--gc-max-query-duration", "45s"])
+            .expect("flag parses");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.query_deadline, Duration::from_secs(45));
+        assert_eq!(resolved.sources.query_deadline, PERF_SOURCE_FLAG);
+        assert_eq!(
+            cli.resolve_gc_runtime(resolved.query_deadline)
+                .expect("resolves")
+                .query_deadline,
+            Duration::from_secs(45)
+        );
+    }
+
+    /// The reference host of issue #1141: the 16-core / 30 GiB box the #968
+    /// ClickBench result was measured on. Every test in this module resolves
+    /// against this injected profile; none reads the real host, so a green run
+    /// on a 4-core CI runner means the same thing as on a 64-core one.
+    const REFERENCE_CORES: usize = 16;
+    /// The reference host's `MemTotal`, exactly 30 GiB in bytes.
+    const REFERENCE_MEM_BYTES: u64 = 32_212_254_720;
+    /// What the reference host resolves each derived budget to. Spelled as
+    /// literal integers rather than recomputed from the percentages, so a
+    /// change to the rule has to restate the number it produces.
+    const REFERENCE_FETCH_CONCURRENCY: usize = 32;
+    const REFERENCE_CACHE_MAX_BYTES: u64 = 7_516_192_768;
+    const REFERENCE_SQL_MAX_QUERY_BYTES: usize = 8_053_063_680;
+    const REFERENCE_SQL_TENANT_MAX_BYTES: usize = 16_106_127_360;
+
+    /// The reference [`HostProfile`], injected.
+    fn reference_host() -> HostProfile {
+        HostProfile::new(REFERENCE_CORES, Some(REFERENCE_MEM_BYTES))
+    }
+
+    /// The performance defaults a parsed CLI resolves on the reference host.
+    fn resolved_from(cli: &Cli) -> ResolvedPerformanceDefaults {
+        cli.resolve_performance(reference_host())
+            .expect("performance defaults resolve")
     }
 
     /// The `EngineConfig` a parsed CLI produces through the exact wiring
@@ -4220,7 +8002,7 @@ mod tests {
     /// drives this rather than reading a parsed field, so a green result means
     /// a running binary's engine carries the value.
     fn engine_from(cli: &Cli) -> ravel_query::EngineConfig {
-        cli.query_budgets()
+        cli.query_budgets(&resolved_from(cli))
             .expect("budgets resolve")
             .apply_to_engine(ravel_query::EngineConfig::default())
             .expect("engine config resolves")
@@ -4229,7 +8011,7 @@ mod tests {
     /// The [`LogsFetchStamp`] a parsed CLI resolves, the provenance surface
     /// `start` logs.
     fn stamp_from(cli: &Cli) -> LogsFetchStamp {
-        cli.query_budgets()
+        cli.query_budgets(&resolved_from(cli))
             .expect("budgets resolve")
             .logs_fetch_stamp()
     }
@@ -4308,6 +8090,120 @@ mod tests {
             ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
         );
         assert_eq!(engine.logs_block_range_threshold, 524_288);
+
+        // latency-first (issue #1196) resolves the same two byte quantities
+        // as byte-minimal, and the stamp names the policy and byte-minimal's
+        // figures, not cost-based's saturated ones.
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "latency-first"])
+            .expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(engine.logs_request_cost_bytes, 1_887_437);
+        assert_eq!(engine.logs_block_range_threshold, 524_288);
+        assert_eq!(
+            engine.logs_fetch_policy,
+            ravel_query::LogsFetchPolicy::LatencyFirst
+        );
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.policy, "latency-first");
+        assert_eq!(stamp.request_cost_bytes, 1_887_437);
+        assert_eq!(stamp.block_range_threshold, 524_288);
+    }
+
+    /// ADR-1196: the memory precondition must be operator-visible in the
+    /// startup stamp. Only `latency-first` stamps
+    /// `latency_first_measured_concurrency`, and it stamps the measured
+    /// concurrency (256), not whatever `store_get_concurrency` happens to
+    /// resolve to -- the two are independent (this policy carries no
+    /// concurrency default of its own).
+    ///
+    /// Prove-the-test: stamp `Some(self.store_get_concurrency)` instead of
+    /// `Some(ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY)` in
+    /// `logs_fetch_stamp`, and the FIRST assertion is the one that fails,
+    /// reading `left: Some(32), right: Some(256)`: the reference host's
+    /// resolved concurrency in place of the measured constant. The assertions
+    /// after it are what keep that a real distinction rather than a tautology,
+    /// by pinning the two values apart on this host.
+    #[test]
+    fn latency_first_stamps_the_measured_concurrency_and_cost_based_stamps_none() {
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "latency-first"])
+            .expect("flag parses");
+        let stamp = stamp_from(&cli);
+        assert_eq!(
+            stamp.latency_first_measured_concurrency,
+            Some(ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY)
+        );
+        assert_eq!(ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY, 256);
+        assert_eq!(stamp.store_get_concurrency, REFERENCE_FETCH_CONCURRENCY);
+        assert_ne!(
+            stamp.latency_first_measured_concurrency,
+            Some(stamp.store_get_concurrency),
+            "the stamped measured concurrency is a constant, not this run's resolved value"
+        );
+
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.latency_first_measured_concurrency, None);
+    }
+
+    /// ADR-1196: the startup line must not tell an operator who has already
+    /// raised the concurrency to raise it. `emit` words that line from
+    /// `latency_first_precondition_met`, so both of its branches are pinned
+    /// here: unmet at the reference host's derived concurrency, met once
+    /// `--fetch-concurrency` reaches the measured one, and absent under every
+    /// other policy.
+    ///
+    /// Prove-the-test: weaken the comparison in
+    /// `latency_first_precondition_met` from `>=` to `>` and the second
+    /// assertion fails with `left: Some(false), right: Some(true)`, because
+    /// exactly-at-the-measured-concurrency is the boundary an operator lands
+    /// on when following the flag's own help.
+    #[test]
+    fn latency_first_precondition_is_met_only_at_the_measured_concurrency() {
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "latency-first"])
+            .expect("flag parses");
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.store_get_concurrency, REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(stamp.latency_first_precondition_met(), Some(false));
+
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--logs-fetch-policy",
+            "latency-first",
+            "--fetch-concurrency",
+            "256",
+        ])
+        .expect("flags parse");
+        let stamp = stamp_from(&cli);
+        assert_eq!(
+            stamp.store_get_concurrency,
+            ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY
+        );
+        assert_eq!(stamp.latency_first_precondition_met(), Some(true));
+
+        // Raising the GET permits alone does not reach the measured shape:
+        // logs still scan at the derived partition count, which is not what
+        // was measured. This is the case the precondition existed to catch and
+        // originally reported as met.
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--logs-fetch-policy",
+            "latency-first",
+            "--store-get-concurrency",
+            "256",
+        ])
+        .expect("flags parse");
+        let stamp = stamp_from(&cli);
+        assert_eq!(
+            stamp.store_get_concurrency,
+            ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY
+        );
+        assert_eq!(stamp.sql_partition_count, REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(stamp.latency_first_precondition_met(), Some(false));
+
+        let cli = Cli::try_parse_from(["ravel-server", "--fetch-concurrency", "256"])
+            .expect("flags parse");
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.latency_first_precondition_met(), None);
     }
 
     /// ADR-0996 decision 2's "Knob relations": `request-minimal` overrides an
@@ -4415,7 +8311,7 @@ mod tests {
         let cli = Cli::try_parse_from(["ravel-server", "--logs-max-fetch-run-bytes", "0"])
             .expect("flag parses");
         let resolved = cli
-            .query_budgets()
+            .query_budgets(&resolved_from(&cli))
             .expect("budgets resolve")
             .apply_to_engine(ravel_query::EngineConfig::default());
         assert_eq!(
@@ -4509,7 +8405,7 @@ mod tests {
         ])
         .expect("flag parses");
         let err = cli
-            .query_budgets()
+            .query_budgets(&resolved_from(&cli))
             .expect_err("an unknown key must refuse startup")
             .to_string();
         assert!(
@@ -4533,7 +8429,7 @@ mod tests {
         ])
         .expect("flag parses");
         let err = cli
-            .query_budgets()
+            .query_budgets(&resolved_from(&cli))
             .expect_err("a blank profile name must refuse startup")
             .to_string();
         assert!(
@@ -4549,7 +8445,7 @@ mod tests {
         ])
         .expect("flag parses");
         let err = cli
-            .query_budgets()
+            .query_budgets(&resolved_from(&cli))
             .expect_err("an unreadable profile must refuse startup")
             .to_string();
         assert!(
@@ -4558,22 +8454,23 @@ mod tests {
         );
     }
 
-    /// ADR-0088 pins the two SQL byte defaults equal to the compiled-in
-    /// constants they mirror, so the CLI default and the ravel-sql / server
-    /// constant are one value. `sql`-gated because `DEFAULT_MAX_TENANT_BYTES`
-    /// is.
+    /// ADR-0088 pins the two SQL byte FALLBACKS equal to the compiled-in
+    /// constants they mirror, so the value an unknown-memory host resolves and
+    /// the ravel-sql / server constant are one value (issue #1141 moved the
+    /// unset-flag default to a host-derived share; these constants are what it
+    /// falls back to). `sql`-gated because `DEFAULT_MAX_TENANT_BYTES` is.
     #[cfg(feature = "sql")]
     #[test]
-    fn sql_budget_defaults_match_compiled_in_constants() {
+    fn sql_budget_fallbacks_match_compiled_in_constants() {
         assert_eq!(
             DEFAULT_SQL_MAX_QUERY_BYTES,
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
-            "the --sql-max-query-bytes default must equal ravel-sql's compiled-in per-query pool"
+            "the --sql-max-query-bytes fallback must equal ravel-sql's compiled-in per-query pool"
         );
         assert_eq!(
             DEFAULT_SQL_TENANT_MAX_BYTES,
             crate::query::DEFAULT_MAX_TENANT_BYTES,
-            "the --sql-tenant-max-bytes default must equal the compiled-in per-tenant ceiling"
+            "the --sql-tenant-max-bytes fallback must equal the compiled-in per-tenant ceiling"
         );
     }
 
@@ -4594,7 +8491,9 @@ mod tests {
         // is the same value that was validated (not silently reduced).
         let cli = Cli::try_parse_from(["ravel-server", "--gc-max-query-duration", "2h"])
             .expect("flag parses");
-        let runtime = cli.resolve_gc_runtime().expect("resolves");
+        let runtime = cli
+            .resolve_gc_runtime(resolved_from(&cli).query_deadline)
+            .expect("resolves");
         assert_eq!(runtime.query_deadline, Duration::from_secs(2 * 3600));
         let err = crate::gc_config::validate_query(&stored, runtime.query_deadline)
             .expect_err("a deadline above sys/gc.max_query_duration must be rejected, not clamped");
@@ -4612,7 +8511,9 @@ mod tests {
         // verbatim.
         let cli = Cli::try_parse_from(["ravel-server", "--gc-max-query-duration", "1h"])
             .expect("flag parses");
-        let runtime = cli.resolve_gc_runtime().expect("resolves");
+        let runtime = cli
+            .resolve_gc_runtime(resolved_from(&cli).query_deadline)
+            .expect("resolves");
         assert_eq!(runtime.query_deadline, Duration::from_secs(3600));
         crate::gc_config::validate_query(&stored, runtime.query_deadline)
             .expect("a deadline equal to sys/gc.max_query_duration must pass");
@@ -4836,6 +8737,76 @@ mod tests {
         );
     }
 
+    /// Issue #1238 review round: `--catalog-resolve-concurrency 0` must be
+    /// rejected here, at `Cli::validate`, not only later inside
+    /// `Catalog::new`. Deleting the bail at the top of `Cli::validate`
+    /// leaves every other test green (startup still fails, just later,
+    /// through `Catalog::new`'s own zero check) -- this test pins the
+    /// flag-level rejection specifically.
+    #[test]
+    fn catalog_resolve_concurrency_zero_is_rejected_at_startup() {
+        let cli = Cli::try_parse_from(["ravel-server", "--catalog-resolve-concurrency", "0"])
+            .expect("flag parses at the CLI layer");
+        let err = cli
+            .validate()
+            .expect_err("startup must reject --catalog-resolve-concurrency 0");
+        assert!(
+            err.to_string().contains("--catalog-resolve-concurrency"),
+            "expected the catalog-resolve-concurrency error, got: {err}"
+        );
+    }
+
+    /// `--audit-max-batch 0` must be rejected here, at `Cli::validate`, not
+    /// only later when `main` builds `ServerConfig` -- by then startup has
+    /// already pinned the tenancy marker and written key-epoch state.
+    /// Deleting the `resolve_audit_pipeline_config()?` line added to
+    /// `Cli::validate` leaves this test green (startup still fails, just
+    /// later, through the `main.rs` call site's own check) -- this test pins
+    /// the flag-level rejection specifically.
+    #[test]
+    fn audit_max_batch_zero_is_rejected_at_startup() {
+        let cli = Cli::try_parse_from(["ravel-server", "--audit-max-batch", "0"])
+            .expect("flag parses at the CLI layer");
+        let err = cli
+            .validate()
+            .expect_err("startup must reject --audit-max-batch 0");
+        assert!(
+            err.to_string().contains("--audit-max-batch"),
+            "expected an --audit-max-batch error, got: {err}"
+        );
+    }
+
+    /// Issue #1238 review round: a `--catalog-resolve-concurrency` above
+    /// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY` must be rejected here,
+    /// not left to panic inside `tokio::sync::Semaphore::new` at startup.
+    #[test]
+    fn catalog_resolve_concurrency_above_max_is_rejected_at_startup() {
+        let over_max = (ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY + 1).to_string();
+        let cli = Cli::try_parse_from(["ravel-server", "--catalog-resolve-concurrency", &over_max])
+            .expect("flag parses at the CLI layer");
+        let err = cli.validate().expect_err(
+            "startup must reject a --catalog-resolve-concurrency above MAX_RESOLVE_GET_CONCURRENCY",
+        );
+        assert!(
+            err.to_string().contains("--catalog-resolve-concurrency"),
+            "expected the catalog-resolve-concurrency error, got: {err}"
+        );
+    }
+
+    /// Issue #1238 review round: a `--catalog-resolve-concurrency` exactly at
+    /// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY` is the inclusive boundary
+    /// and must be accepted, not rejected.
+    #[test]
+    fn catalog_resolve_concurrency_at_max_is_accepted_at_startup() {
+        let at_max = ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY.to_string();
+        let cli = Cli::try_parse_from(["ravel-server", "--catalog-resolve-concurrency", &at_max])
+            .expect("flag parses at the CLI layer");
+        cli.validate().expect(
+            "--catalog-resolve-concurrency == MAX_RESOLVE_GET_CONCURRENCY must be accepted \
+             (inclusive boundary)",
+        );
+    }
+
     /// ADR-0076 decision 4: a `--max-flush-delay` whose DERIVED
     /// `strict_visibility_budget_ns` (`max_flush_delay +
     /// STRICT_VISIBILITY_RESERVE_NS`) meets or exceeds
@@ -4953,6 +8924,54 @@ mod tests {
         let mut argv = vec!["ravel-server"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv).expect("flags parse")
+    }
+
+    /// The identity the qualification gate compares against is the exact string
+    /// `ravel-cli store qualify` records, in both the endpoint and no-endpoint
+    /// forms, and the exempt memory store supplies none. Pinned here because
+    /// the check is warn-only: a reader that built the string differently (the
+    /// two arguments are both `Option<&str>`, so swapping them compiles) would
+    /// warn on every start against a correctly qualified bucket, and nothing
+    /// would fail.
+    #[test]
+    fn backend_identity_matches_the_recorded_format() {
+        assert_eq!(
+            cli(&[]).backend_identity(),
+            None,
+            "the memory store is exempt, so there is nothing to compare"
+        );
+
+        let with_endpoint = cli(&[
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ]);
+        assert_eq!(
+            with_endpoint.backend_identity().as_deref(),
+            Some("s3://ravel-test@http://127.0.0.1:9000")
+        );
+
+        let without_endpoint = cli(&[
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ]);
+        assert_eq!(
+            without_endpoint.backend_identity().as_deref(),
+            Some("s3://ravel-test")
+        );
     }
 
     /// Reachability (ADR-0074): the shipped
@@ -5457,6 +9476,223 @@ mod tests {
     }
 
     #[test]
+    fn dev_insecure_tenant_header_on_non_loopback_grpc_fails_validate() {
+        // --listen-http stays loopback; only --listen-grpc is public. The dev
+        // header resolver backs the gRPC/Flight listener too, so this must
+        // refuse startup even though HTTP alone was fine (issue #1293).
+        let err = cli(&[
+            "--dev-insecure-tenant-header",
+            "--listen-http",
+            "127.0.0.1:4318",
+            "--listen-grpc",
+            "0.0.0.0:4317",
+        ])
+        .validate()
+        .expect_err("non-loopback --listen-grpc with the dev header must refuse startup");
+        assert!(
+            err.to_string().contains("--dev-insecure-tenant-header"),
+            "error names the flag: {err}"
+        );
+        assert!(
+            err.to_string().contains("--listen-grpc"),
+            "error names the gRPC listener: {err}"
+        );
+    }
+
+    #[test]
+    fn dev_insecure_tenant_header_on_loopback_grpc_validates() {
+        // Positive control so the grpc half of the guard cannot be vacuous:
+        // both listeners loopback validates.
+        cli(&[
+            "--dev-insecure-tenant-header",
+            "--listen-http",
+            "127.0.0.1:4318",
+            "--listen-grpc",
+            "127.0.0.1:4317",
+        ])
+        .validate()
+        .expect("both listeners loopback with the dev header is fine");
+    }
+
+    #[test]
+    fn mcp_on_a_public_http_listener_still_requires_the_allowlist() {
+        // The original case: `--listen-http` is public, so the empty allowlist
+        // would serve an origin-unchecked POST /mcp on a reachable address.
+        let err = cli(&["--mcp", "--listen-http", "0.0.0.0:8080"])
+            .validate()
+            .expect_err("--mcp on a public --listen-http must refuse startup");
+        let message = err.to_string();
+        assert!(
+            message.contains("--mcp-allowed-origins"),
+            "error names the flag: {message}"
+        );
+        assert!(
+            message.contains("--listen-http 0.0.0.0:8080"),
+            "error names the public listener: {message}"
+        );
+        assert!(
+            !message.contains("--mtls-listener"),
+            "no mTLS listener is configured, so none is named: {message}"
+        );
+    }
+
+    #[test]
+    fn mcp_on_a_public_mtls_listener_requires_the_origin_allowlist() {
+        // `--listen-http` is loopback, so the pre-#1381 rule passed this
+        // configuration. `lib.rs` mounts POST /mcp on the mTLS router too, so
+        // it served an origin-unchecked route on 0.0.0.0:8443.
+        let err = cli(&[
+            "--mcp",
+            "--listen-http",
+            "127.0.0.1:8080",
+            "--mtls-enabled",
+            "--mtls-listener",
+            "0.0.0.0:8443",
+        ])
+        .validate()
+        .expect_err("--mcp on a public --mtls-listener must refuse startup");
+        let message = err.to_string();
+        assert!(
+            message.contains("--mcp-allowed-origins"),
+            "error names the flag: {message}"
+        );
+        assert!(
+            message.contains("--mtls-listener 0.0.0.0:8443"),
+            "error names the public listener: {message}"
+        );
+        assert!(
+            !message.contains("--listen-http"),
+            "the loopback HTTP listener is not the reason: {message}"
+        );
+    }
+
+    #[test]
+    fn mcp_on_loopback_listeners_needs_no_allowlist() {
+        // Positive control so neither half of the guard can be vacuous: both
+        // listeners loopback, empty allowlist, and startup proceeds.
+        cli(&[
+            "--mcp",
+            "--listen-http",
+            "127.0.0.1:8080",
+            "--mtls-enabled",
+            "--mtls-listener",
+            "127.0.0.1:8443",
+        ])
+        .validate()
+        .expect("--mcp on loopback listeners needs no allowlist");
+    }
+
+    #[test]
+    fn mcp_allowlist_admits_a_public_listener() {
+        // The allowlist is what the refusals above are about: with one origin
+        // configured, the same public listeners start.
+        cli(&[
+            "--mcp",
+            "--mcp-allowed-origins",
+            "https://console.example",
+            "--listen-http",
+            "0.0.0.0:8080",
+            "--mtls-enabled",
+            "--mtls-listener",
+            "0.0.0.0:8443",
+        ])
+        .validate()
+        .expect("a non-empty allowlist admits public listeners");
+    }
+
+    #[test]
+    fn mcp_in_a_non_query_mode_is_refused() {
+        // POST /mcp is mounted only from inside lib.rs's
+        // `installs_query_audit_pipeline` block (Mode::All | Mode::Query), so
+        // under gateway or maintain mode --mcp would be silently inert.
+        let err = cli(&["--mode", "gateway", "--mcp"])
+            .validate()
+            .expect_err("--mcp under gateway mode must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("--mcp"), "error names the flag: {msg}");
+        assert!(
+            msg.contains("--mode all") && msg.contains("--mode query"),
+            "error names the supported modes: {msg}"
+        );
+
+        let err = cli(&["--mode", "maintain", "--mcp"])
+            .validate()
+            .expect_err("--mcp under maintain mode must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("--mcp"), "error names the flag: {msg}");
+    }
+
+    #[test]
+    fn mcp_in_query_and_all_modes_is_accepted() {
+        // Positive control so the mode check above cannot be vacuous: the two
+        // query-serving modes still start with --mcp.
+        cli(&["--mode", "all", "--mcp"])
+            .validate()
+            .expect("--mcp under --mode all is accepted");
+        cli(&["--mode", "query", "--mcp"])
+            .validate()
+            .expect("--mcp under --mode query is accepted");
+    }
+
+    #[test]
+    fn fragment_flags_under_gateway_mode_fail_validate() {
+        // Issue #94: fragment_service is built only under Mode::All | Mode::Query
+        // (lib.rs), so --distributed-query under gateway mode is silently inert.
+        // Refuse it, naming the supported modes.
+        let key = tempfile::NamedTempFile::new().expect("temp key file");
+        std::fs::write(key.path(), format!("{}\n", "ab".repeat(32))).expect("write key");
+        let err = cli(&[
+            "--mode",
+            "gateway",
+            "--distributed-query",
+            "--fragment-key-file",
+            key.path().to_str().expect("utf8 path"),
+        ])
+        .validate()
+        .expect_err("--distributed-query under gateway mode must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--mode all") && msg.contains("--mode query"),
+            "error names the supported modes: {err}"
+        );
+    }
+
+    #[test]
+    fn fragment_listener_under_maintain_mode_fails_validate() {
+        // Same rule for --fragment-listener under a non-query-serving mode.
+        let err = cli(&[
+            "--mode",
+            "maintain",
+            "--fragment-listener",
+            "127.0.0.1:4319",
+        ])
+        .validate()
+        .expect_err("--fragment-listener under maintain mode must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--mode all") && msg.contains("--mode query"),
+            "error names the supported modes: {err}"
+        );
+    }
+
+    #[test]
+    fn distributed_query_under_query_mode_validates() {
+        // Positive control: under a fragment-serving mode the flag validates,
+        // so the #94 guard is not vacuously rejecting the flag everywhere.
+        let key = tempfile::NamedTempFile::new().expect("temp key file");
+        std::fs::write(key.path(), format!("{}\n", "ab".repeat(32))).expect("write key");
+        cli(&[
+            "--mode",
+            "query",
+            "--distributed-query",
+            "--fragment-key-file",
+            key.path().to_str().expect("utf8 path"),
+        ])
+        .validate()
+        .expect("--distributed-query under query mode is fine");
+    }
+
+    #[test]
     fn mtls_listener_without_mtls_enabled_fails_validate() {
         let err = cli(&["--mtls-listener", "127.0.0.1:9443"])
             .validate()
@@ -5776,6 +10012,53 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_timeout_defaults_when_unset() {
+        assert_eq!(
+            cli(&[])
+                .parse_shutdown_timeout()
+                .expect("an unset --shutdown-timeout defaults"),
+            crate::DEFAULT_SHUTDOWN_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_rejects_zero() {
+        let err = cli(&["--shutdown-timeout", "0s"])
+            .parse_shutdown_timeout()
+            .expect_err("a zero --shutdown-timeout must be rejected");
+        assert!(
+            err.to_string().contains("must be a positive duration"),
+            "the zero rejection must name the reason, got: {err}"
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_accepts_the_maximum() {
+        let at_max = humantime::format_duration(crate::MAX_SHUTDOWN_TIMEOUT).to_string();
+        assert_eq!(
+            cli(&["--shutdown-timeout", &at_max])
+                .parse_shutdown_timeout()
+                .expect("the maximum --shutdown-timeout is accepted"),
+            crate::MAX_SHUTDOWN_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_rejects_above_the_maximum() {
+        // Above the cap but well within what `humantime` parses, so the value
+        // reaches the cap check rather than being rejected as unparseable, and
+        // far below the `Duration`-overflow point the cap exists to head off.
+        let err = cli(&["--shutdown-timeout", "2h"])
+            .parse_shutdown_timeout()
+            .expect_err("a --shutdown-timeout above the cap must be rejected at startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds the maximum"),
+            "the cap rejection must name the maximum, got: {msg}"
+        );
+    }
+
+    #[test]
     fn merge_with_no_tenant_tokens_still_folds_maintain_tenants() {
         // An OIDC/mTLS-only deployment has no
         // --tenant-token entries at all.
@@ -5784,6 +10067,189 @@ mod tests {
         assert_eq!(
             merge_fold_tenants(&none, &from_maintain),
             vec![TenantId::new("acme").hash()]
+        );
+    }
+
+    #[test]
+    fn tenant_token_file_matches_repeated_flags() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(file.path(), "dev=acme\nother=beta\nhas=equals=gamma\n")
+            .expect("write tenant token file");
+
+        let from_file = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect("file-sourced tenant tokens parse");
+
+        let from_flags = cli(&[
+            "--tenant-token",
+            "dev=acme",
+            "--tenant-token",
+            "other=beta",
+            "--tenant-token",
+            "has=equals=gamma",
+        ])
+        .parse_tenant_tokens()
+        .expect("flag-sourced tenant tokens parse");
+
+        assert_eq!(
+            from_file, from_flags,
+            "--tenant-token-file must produce the same map as the equivalent \
+             --tenant-token flags"
+        );
+        // The third row pins that the file path reuses the split_once loop:
+        // a value containing '=' is mis-parsed (only the first '=' splits)
+        // the same way for both sources.
+        assert_eq!(from_file.get("has"), Some(&TenantId::new("equals=gamma")));
+    }
+
+    #[test]
+    fn tenant_token_file_and_flag_together_refuse_startup() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(file.path(), "dev=acme\n").expect("write tenant token file");
+
+        let err = cli(&[
+            "--tenant-token",
+            "dev=acme",
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .validate()
+        .expect_err("--tenant-token and --tenant-token-file together must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--tenant-token ") && msg.contains("--tenant-token-file"),
+            "the refusal must name the plain flag on its own, not only as a \
+             substring of --tenant-token-file, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tenant_token_file_missing_path_fails_startup() {
+        let err = cli(&[
+            "--tenant-token-file",
+            "/nonexistent/ravel-tenant-tokens.txt",
+        ])
+        .parse_tenant_tokens()
+        .expect_err("a missing --tenant-token-file path must be a typed error, not an empty map");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/nonexistent/ravel-tenant-tokens.txt"),
+            "the error must name the path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tenant_token_file_skips_blank_and_comment_lines() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(
+            file.path(),
+            "# comment\n\ndev=acme\n   \n# another comment\nother=beta\n",
+        )
+        .expect("write tenant token file");
+
+        let map = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect("blank lines and comments must be skipped, not parsed as pairs");
+
+        let mut expected = HashMap::new();
+        expected.insert("dev".to_string(), TenantId::new("acme"));
+        expected.insert("other".to_string(), TenantId::new("beta"));
+        assert_eq!(map, expected);
+    }
+
+    #[test]
+    fn tenant_token_file_malformed_line_names_path_and_line_not_token() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(file.path(), "dev=acme\nsecrettoken\n").expect("write tenant token file");
+
+        let err = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect_err("a line with no '=' must fail, not silently drop the pair");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(file.path().to_str().expect("utf8 path")) && msg.contains("line 2"),
+            "the error must name the file path and line number, got: {msg}"
+        );
+        assert!(
+            !msg.contains("secrettoken"),
+            "the error must never echo the malformed line's content, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tenant_token_file_empty_tenant_line_names_path_and_line_not_token() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(file.path(), "secrettoken=\n").expect("write tenant token file");
+
+        let err = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect_err("a line with an empty tenant must fail, not map to an empty TenantId");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(file.path().to_str().expect("utf8 path")) && msg.contains("line 1"),
+            "the error must name the file path and line number, got: {msg}"
+        );
+        assert!(
+            !msg.contains("secrettoken"),
+            "the error must never echo the malformed line's content, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tenant_token_file_strips_leading_bom() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        let mut bytes = vec![0xEFu8, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"dev=acme\n");
+        std::fs::write(file.path(), bytes).expect("write BOM-prefixed tenant token file");
+
+        let map = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect("a leading BOM must be stripped, not folded into the first token");
+
+        let mut expected = HashMap::new();
+        expected.insert("dev".to_string(), TenantId::new("acme"));
+        assert_eq!(map, expected);
+    }
+
+    #[test]
+    fn tenant_token_file_crlf_matches_lf() {
+        let lf = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(lf.path(), "dev=acme\nother=beta\n").expect("write LF tenant token file");
+        let crlf = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(crlf.path(), "dev=acme\r\nother=beta\r\n")
+            .expect("write CRLF tenant token file");
+
+        let from_lf = cli(&[
+            "--tenant-token-file",
+            lf.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect("LF tenant token file parses");
+        let from_crlf = cli(&[
+            "--tenant-token-file",
+            crlf.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_tokens()
+        .expect("CRLF tenant token file parses");
+
+        assert_eq!(
+            from_lf, from_crlf,
+            "a CRLF tenant token file must parse to the same map as its LF equivalent"
         );
     }
 }

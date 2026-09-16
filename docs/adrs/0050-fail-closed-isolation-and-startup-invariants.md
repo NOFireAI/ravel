@@ -1,6 +1,10 @@
 # ADR-0050: Fail-closed isolation and startup invariants
 
-Status: Accepted
+Status: Accepted. Section 6's write-once qualification record superseded
+(2026-09-12) by
+[ADR-1302](1302-cas-guarded-re-record-of-a-stale-qualification.md), which makes
+`sys/qualification` re-recordable once per bucket per suite version and guards
+the replacing write with `CasVersion`. The rest stands.
 
 ## Context
 
@@ -289,6 +293,16 @@ explicitly deferred to its own ADR; this decision makes the current
 value safe, not changeable.
 
 ### 6. Store backends are qualified empirically, once per bucket
+
+> Superseded in part by
+> [ADR-1302](1302-cas-guarded-re-record-of-a-stale-qualification.md). The
+> `CreateIfAbsent`-only write and the "once per bucket, not per boot" rule below
+> are no longer write-once: `CONFORMANCE_SUITE_VERSION` is now 2, qualification
+> is once per bucket per suite version, and a record left under an older suite
+> version is re-recorded by a re-run, guarded by `CasVersion` on the read
+> version so a concurrent newer record is not downgraded. The paragraphs below
+> describe the original write-once mechanism and are retained as the historical
+> record.
 
 A new `conformance` module in ravel-object-store implements an
 empirical qualification suite run against a live backend under a scratch

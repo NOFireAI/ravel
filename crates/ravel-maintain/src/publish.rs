@@ -296,7 +296,7 @@ async fn resolve_already_exists(
     let existing = store.get(record_key, GetRange::Full).await;
     note_get(ledger, RequestPhase::Publish, &existing);
     let existing = existing?;
-    let winner = CompactionRecord::decode(existing.data.as_ref())
+    let winner = ravel_commit::record::decode_compaction(existing.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("winner record decode failed: {e}")))?;
     // The winner's key must reconstruct to the key we fetched it at.
     keys::verify_compaction_record_key(&winner, record_key)?;

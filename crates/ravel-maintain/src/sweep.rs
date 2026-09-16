@@ -2,19 +2,28 @@
 //! (docs/consistency-model.md "Deletion
 //! and GC"). This is the first implementation of any deletion in Ravel.
 //!
-//! 1. **Orphan GC** (ADR-0010 §11): an `l0/` data object with no commit
-//!    record, older than `grace + max_flush_lifetime`. The writer interlock
-//!    (a writer abandons any flush older than `max_flush_lifetime` and never
-//!    publishes it afterward) is what makes this safe: a record-less object
-//!    that old can never gain a commit record later, so deleting it cannot
-//!    orphan a future reader. Commit-record absence is re-verified with one
-//!    fresh strongly consistent LIST shared by every candidate in the pass
-//!    (ADR-0048 decision 5), then gated by a mass-orphan circuit breaker
-//!    (ADR-0048 decision 4): a pass that would delete at least
-//!    `orphan_breaker_min_count` candidates AND more than
-//!    `orphan_breaker_max_ratio` of the shard's listed L0 objects deletes
-//!    nothing and halts, because that shape is the signature of an
-//!    out-of-band commit-record loss, not routine cleanup.
+//! 1. **Orphan GC** (ADR-0010 §11, quarantine ADR-0058 amendment): an `l0/`
+//!    data object with no commit record, older than `grace +
+//!    max_flush_lifetime`. The writer interlock (a writer abandons any flush
+//!    older than `max_flush_lifetime` and never publishes it afterward) is what
+//!    makes this safe: a record-less object that old can never gain a commit
+//!    record later, so removing it cannot orphan a future reader. Commit-record
+//!    absence is re-verified with one fresh strongly consistent LIST shared by
+//!    every candidate in the pass (ADR-0048 decision 5), then gated by a
+//!    mass-orphan circuit breaker (ADR-0048 decision 4): a pass that would
+//!    collect at least `orphan_breaker_min_count` candidates AND more than
+//!    `orphan_breaker_max_ratio` of the shard's listed L0 objects collects
+//!    nothing and halts, because that shape is the signature of an out-of-band
+//!    commit-record loss, not routine cleanup. Below those thresholds the
+//!    breaker does not trip, and the same small or thinly-spread loss used to
+//!    be deleted permanently. So orphan GC no longer deletes a candidate
+//!    directly: it copies the object to `quarantine/<original key>/q<ns>`
+//!    (copy first, then delete the live key, never the reverse) and
+//!    [`sweep_quarantine`] physically deletes the copy only after a second
+//!    horizon (`quarantine_horizon_ns`, default 7 days) measured from the
+//!    quarantine timestamp embedded in the key. A small record loss under the
+//!    breaker is then recoverable for a week and reported by
+//!    [`SweepReport::orphans_quarantined`], instead of vanishing silently.
 //! 2. **Superseded-input sweep** (ADR-0018): the L0 commit records and data
 //!    objects a compaction record names in its input list, once
 //!    `now >= record.created_unix_ns + protection_horizon` AND the live catalog
@@ -104,11 +113,12 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use prost::Message;
 use ravel_catalog::select_authoritative_compaction_records;
 use ravel_commit::keys::{self, BucketEntry, KeyError, parse_ingest_hour_string};
 use ravel_commit::record;
-use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError, list_all};
+use ravel_object_store::{
+    GetRange, ObjectMeta, ObjectStoreBackend, PutOptions, StoreError, list_all,
+};
 use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionRecord, ErasureCompletion, RewriteRecord,
 };
@@ -151,8 +161,39 @@ impl LeaseCheck for NoLeases {
 /// What one sweep pass over a `(tenant, signal, shard)` deleted, per rule.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepReport {
-    /// Rule 1: record-less `l0/` data objects deleted (orphan GC).
+    /// Rule 1: record-less `l0/` data objects removed from the live keyspace
+    /// (orphan GC). Since the ADR-0058 quarantine amendment these are moved to
+    /// the `quarantine/` prefix rather than deleted outright, so this counts
+    /// objects quarantined this pass, equal to [`Self::orphans_quarantined`];
+    /// the name is retained because the operator-facing meaning ("orphan
+    /// candidates GC removed from the live L0 set") is unchanged.
+    ///
+    /// This is NOT the pass's whole orphan-candidate count. A candidate whose
+    /// copy failed is left live and counted only in
+    /// [`Self::orphans_quarantine_refused`], so the present total is
+    /// `orphans_deleted + orphans_withheld + orphans_quarantine_refused`. That
+    /// third term is what the ADR-0058 decision-1 `orphans_present` gauge in
+    /// `ravel-server` adds: a refused candidate is still present, and it is
+    /// refused precisely in the store-fault case where the gauge matters most,
+    /// so leaving it out would drop the signal exactly when it fires.
     pub orphans_deleted: usize,
+    /// Rule 1: record-less `l0/` data objects moved to `quarantine/` this pass
+    /// (ADR-0058 amendment). Equal to [`Self::orphans_deleted`]; a distinctly
+    /// named counter an operator can alert on to see quarantine activity
+    /// (small out-of-band commit-record loss below the mass-orphan breaker).
+    pub orphans_quarantined: usize,
+    /// Rule 1: orphan candidates NOT quarantined this pass because the copy to
+    /// `quarantine/` failed, so the live object was left in place (fail-closed:
+    /// the dangerous delete never runs when its safe copy did not). A persistent
+    /// nonzero value is an operator signal that quarantine cannot make progress
+    /// (a store fault, a permissions or capacity problem on the prefix), not the
+    /// ordinary steady state, which is `0`.
+    pub orphans_quarantine_refused: usize,
+    /// The quarantine reaper ([`sweep_quarantine`]): objects physically deleted
+    /// from `quarantine/` this pass because their embedded quarantine timestamp
+    /// is more than `quarantine_horizon_ns` behind the clock. This is the only
+    /// place orphan-GC'd data is ever physically removed.
+    pub quarantine_reaped: usize,
     /// Rule 2: superseded L0 commit records deleted.
     pub superseded_records_deleted: usize,
     /// Rule 2: superseded L0 data objects deleted.
@@ -226,17 +267,44 @@ pub async fn sweep_shard_with_holds(
     superseded_holds.absorb(&superseded);
     let unreferenced_parts_deleted =
         sweep_unreferenced_parts(store, clock, config, lease, tenant, signal, shard).await?;
-    let (orphans_deleted, orphan_breaker_tripped, orphans_withheld, orphan_breaker_overridden) =
-        match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
-            Ok(outcome) => (outcome.deleted, false, 0, outcome.breaker_overridden),
-            Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
-                (0, true, candidates, false)
-            }
-            Err(e) => return Err(e),
-        };
+    let (
+        orphans_deleted,
+        orphans_refused,
+        orphan_breaker_tripped,
+        orphans_withheld,
+        orphan_breaker_overridden,
+    ) = match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
+        Ok(outcome) => (
+            outcome.deleted,
+            outcome.refused,
+            false,
+            0,
+            outcome.breaker_overridden,
+        ),
+        Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
+            (0, 0, true, candidates, false)
+        }
+        Err(e) => return Err(e),
+    };
+    // The quarantine reaper is the second horizon on rule 1's output. It runs
+    // every pass so it is reachable from the same maintain tick as the sweep,
+    // and whole-shard because quarantine keys are not hour-bucketed.
+    //
+    // It is skipped on a pass whose mass-orphan breaker tripped: a trip means
+    // a record loss large enough to page is live now, and reaping during one
+    // destroys the copies taken before the loss grew. A `force_orphan_gc`
+    // override is not a trip, so an operator who has decided still reclaims.
+    let quarantine = if orphan_breaker_tripped {
+        QuarantineSweepOutcome::default()
+    } else {
+        sweep_quarantine(store, clock, config, lease, tenant, signal, shard).await?
+    };
     Ok((
         SweepReport {
             orphans_deleted,
+            orphans_quarantined: orphans_deleted,
+            orphans_quarantine_refused: orphans_refused,
+            quarantine_reaped: quarantine.reaped,
             superseded_records_deleted: superseded.records_deleted,
             superseded_data_deleted: superseded.data_deleted,
             unreferenced_parts_deleted,
@@ -325,17 +393,41 @@ pub async fn sweep_shard_zoned_with_holds(
         Some(hours),
     )
     .await?;
-    let (orphans_deleted, orphan_breaker_tripped, orphans_withheld, orphan_breaker_overridden) =
-        match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
-            Ok(outcome) => (outcome.deleted, false, 0, outcome.breaker_overridden),
-            Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
-                (0, true, candidates, false)
-            }
-            Err(e) => return Err(e),
-        };
+    let (
+        orphans_deleted,
+        orphans_refused,
+        orphan_breaker_tripped,
+        orphans_withheld,
+        orphan_breaker_overridden,
+    ) = match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
+        Ok(outcome) => (
+            outcome.deleted,
+            outcome.refused,
+            false,
+            0,
+            outcome.breaker_overridden,
+        ),
+        Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
+            (0, 0, true, candidates, false)
+        }
+        Err(e) => return Err(e),
+    };
+    // The quarantine reaper runs on every pass, including the zone-scoped one,
+    // so a per-tick sweep reaps expired quarantine too; it is whole-shard
+    // because quarantine keys are not hour-bucketed (like rule 1 itself). It
+    // is skipped on a tripped-breaker pass for the reason given in
+    // `sweep_all`.
+    let quarantine = if orphan_breaker_tripped {
+        QuarantineSweepOutcome::default()
+    } else {
+        sweep_quarantine(store, clock, config, lease, tenant, signal, shard).await?
+    };
     Ok((
         SweepReport {
             orphans_deleted,
+            orphans_quarantined: orphans_deleted,
+            orphans_quarantine_refused: orphans_refused,
+            quarantine_reaped: quarantine.reaped,
             superseded_records_deleted: superseded.records_deleted,
             superseded_data_deleted: superseded.data_deleted,
             unreferenced_parts_deleted,
@@ -387,25 +479,45 @@ fn log_superseded_holds(
 /// fields for callers that run the whole shard.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OrphanSweepOutcome {
-    /// Record-less `l0/` data objects deleted this pass.
+    /// Record-less `l0/` data objects removed from the live keyspace this pass.
+    /// Since the ADR-0058 quarantine amendment "removed" means moved to
+    /// `quarantine/` (copy then delete of the live key), not physically
+    /// deleted; the field keeps its name because it is the count of orphan
+    /// candidates GC took out of the live L0 set.
     pub deleted: usize,
+    /// Orphan candidates left in place this pass because the copy to
+    /// `quarantine/` failed. The live object is untouched (fail-closed), and
+    /// the candidate is retried next pass.
+    pub refused: usize,
     /// This pass exceeded the breaker's threshold but proceeded anyway
     /// because [`CompactorConfig::force_orphan_gc`] was set (ADR-0048
     /// decision 4's one-shot operator override).
     pub breaker_overridden: bool,
 }
 
-/// Delete every record-less `l0/` data object older than the orphan age
-/// gate. Three phases (ADR-0048 decisions 4 and 5): (a) candidate selection
-/// over one listing of the shard's L0 data objects, filtered by the
-/// commit-record identities already present, the age gate, and lease
-/// protection; (b) one fresh strongly consistent LIST of the commit prefix,
-/// shared by every candidate, dropping any whose identity now appears
-/// (replacing the old per-candidate full-shard LIST, the dominant request
-/// cost of a sweep); (c) the mass-orphan circuit breaker gate; (d) delete.
-/// A tripped, non-overridden breaker returns
-/// [`MaintainError::OrphanBreakerTripped`] before phase (d), so the pass is
-/// all-or-nothing: either every surviving candidate is deleted, or none are.
+/// Quarantine every record-less `l0/` data object older than the orphan age
+/// gate (ADR-0058 amendment). Four phases (ADR-0048 decisions 4 and 5): (a)
+/// candidate selection over one listing of the shard's L0 data objects,
+/// filtered by the commit-record identities already present, the age gate, and
+/// lease protection; (b) one fresh strongly consistent LIST of the commit
+/// prefix, shared by every candidate, dropping any whose identity now appears
+/// (replacing the old per-candidate full-shard LIST, the dominant request cost
+/// of a sweep); (c) the mass-orphan circuit breaker gate; (d) move each
+/// surviving candidate to the `quarantine/` prefix (copy then delete the live
+/// key). A tripped, non-overridden breaker returns
+/// [`MaintainError::OrphanBreakerTripped`] before phase (d), so the breaker is
+/// all-or-nothing: either every surviving candidate is quarantined, or none
+/// are. Physical deletion of a quarantined object happens only later, in
+/// [`sweep_quarantine`], after a second horizon.
+///
+/// The move is copy-first, delete-second, per object: the bytes are copied to
+/// `quarantine/<original key>/q<quarantined_at_ns>` and only then is the live
+/// key deleted, so a crash or store fault between the two leaves the object in
+/// at least one location, never none. A candidate whose copy fails is left
+/// live and reported in [`OrphanSweepOutcome::refused`] (fail-closed: the
+/// delete never runs when its copy did not), and retried on the next pass.
+/// [`OrphanSweepOutcome::deleted`] counts candidates successfully moved out of
+/// the live keyspace this pass.
 pub async fn sweep_orphans(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -471,18 +583,102 @@ pub async fn sweep_orphans(
         });
     }
 
-    // Phase (d): delete. All-or-nothing: phase (c) already returned if the
-    // pass should delete zero.
+    // Phase (d): quarantine. The breaker (phase (c)) already returned if the
+    // pass should collect zero; here every surviving candidate is moved to the
+    // `quarantine/` prefix, copy first and delete of the live key second, so a
+    // crash or fault between the two never destroys the only copy. A copy
+    // failure leaves the object live and is counted, not fatal: nothing is
+    // deleted that was not first safely copied.
+    let quarantined_at_ns = now;
+    let mut quarantined = 0usize;
+    let mut refused = 0usize;
     for (meta, _) in &candidates {
-        if !config.dry_run {
-            store.delete(&meta.key).await?;
+        if config.dry_run {
+            quarantined += 1;
+            continue;
+        }
+        let dest = quarantine_key(&meta.key, quarantined_at_ns);
+        match quarantine_object(store, &meta.key, &dest).await {
+            Ok(QuarantineMove::Copied) => {
+                store.delete(&meta.key).await?;
+                quarantined += 1;
+            }
+            // The live object vanished between the listing and the copy (a
+            // concurrent pass, or a prior crashed pass that had already
+            // deleted it): nothing to move, and idempotent.
+            Ok(QuarantineMove::SourceGone) => {}
+            Err(e) => {
+                tracing::warn!(
+                    tenant_hash = %tenant.to_hex(),
+                    signal = signal.key_prefix(),
+                    shard,
+                    key = %meta.key,
+                    error = %e,
+                    "orphan GC: copy to quarantine failed; leaving the object live and \
+                     retrying next pass (fail-closed: never delete what was not copied)"
+                );
+                refused += 1;
+            }
         }
     }
 
+    if quarantined > 0 || refused > 0 {
+        tracing::warn!(
+            tenant_hash = %tenant.to_hex(),
+            signal = signal.key_prefix(),
+            shard,
+            quarantined,
+            refused,
+            l0_objects_listed,
+            breaker_overridden = would_trip && config.force_orphan_gc,
+            "orphan GC: moved record-less L0 data objects to quarantine (recoverable for \
+             quarantine_horizon_ns before physical deletion); a nonzero count below the \
+             mass-orphan breaker's thresholds can be small out-of-band commit-record loss"
+        );
+    }
+
     Ok(OrphanSweepOutcome {
-        deleted: candidate_count,
+        deleted: quarantined,
+        refused,
         breaker_overridden: would_trip && config.force_orphan_gc,
     })
+}
+
+/// Whether [`quarantine_object`] copied the source or found it already gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuarantineMove {
+    /// The source bytes were copied to the quarantine key.
+    Copied,
+    /// The source object was already absent (NotFound): nothing to copy, and
+    /// the live-key delete is skipped. Idempotent with a prior crashed pass.
+    SourceGone,
+}
+
+/// Copy one object's bytes to its quarantine key (`quarantine/<original
+/// key>/q<ns>`). NotFound on the source is reported as
+/// [`QuarantineMove::SourceGone`] rather than an error: the object vanished
+/// between the listing and the copy, which is not a fault.
+///
+/// The overwrite [`PutOptions`] make a retry idempotent WITHIN one pass only.
+/// The destination key embeds that pass's `quarantined_at_ns`, so a crash
+/// between the copy and the live-key delete leaves the object live, and the
+/// next pass quarantines it again under a different `/q<ns>`: a second copy,
+/// not an overwrite of the first. The duplicate is self-cleaning, since the
+/// reaper collects both on their own horizons, and the live object is never
+/// deleted without a copy of it existing. Do not read the overwrite as
+/// cross-pass idempotence.
+async fn quarantine_object(
+    store: &dyn ObjectStoreBackend,
+    src: &str,
+    dest: &str,
+) -> Result<QuarantineMove> {
+    let got = match store.get(src, GetRange::Full).await {
+        Ok(got) => got,
+        Err(StoreError::NotFound) => return Ok(QuarantineMove::SourceGone),
+        Err(e) => return Err(MaintainError::Store(e)),
+    };
+    store.put(dest, got.data, PutOptions::default()).await?;
+    Ok(QuarantineMove::Copied)
 }
 
 /// The set of L0 commit-record identities `(writer_id, epoch, seq)` present in
@@ -519,6 +715,140 @@ async fn referenced_l0_identities(
         }
     }
     Ok(out)
+}
+
+// --- Rule 1b: quarantine reaper (ADR-0058 amendment) -----------------------
+
+/// Top-level prefix every quarantined orphan lives under. A new additive
+/// key space alongside `t/` and `sys/`, listed only by [`sweep_quarantine`]
+/// and never by any other sweep rule, so no `t/`-scoped listing ever sees it.
+const QUARANTINE_PREFIX: &str = "quarantine/";
+
+/// The quarantine key for one live object: `quarantine/<original key>/q<ns>`.
+/// The whole original key is preserved verbatim (strip the `quarantine/`
+/// prefix and the trailing `/q<ns>` segment to recover it for a restore), and
+/// the trailing segment records when the object was quarantined so
+/// [`sweep_quarantine`] can gate the second horizon on the injected clock
+/// rather than on the copy's store `last_modified` (which, like every other
+/// GC age signal that can, this path reads from the key, not the object; see
+/// rule 4's ingest-hour marker). Zero-padded to a fixed width so the segment
+/// is unambiguous and lexicographically ordered.
+fn quarantine_key(original: &str, quarantined_at_ns: i64) -> String {
+    format!("{QUARANTINE_PREFIX}{original}/q{quarantined_at_ns:020}")
+}
+
+/// `quarantine/t/<tenant_hash>/<signal>/l0/<shard>/` -- the prefix covering
+/// every quarantined orphan for one `(tenant, signal, shard)`, the quarantine
+/// mirror of [`l0_data_prefix`].
+fn quarantine_l0_data_prefix(tenant: &TenantHash, signal: Signal, shard: u32) -> Result<String> {
+    Ok(format!(
+        "{QUARANTINE_PREFIX}{}",
+        l0_data_prefix(tenant, signal, shard)?
+    ))
+}
+
+/// The quarantine timestamp encoded in a quarantine key's trailing `/q<ns>`
+/// segment, or `None` if it is absent or unparseable. `None` is treated as
+/// not-yet-expired by [`sweep_quarantine`] (fail-closed: a malformed key is
+/// never reaped early).
+fn parse_quarantine_timestamp(quarantine_key: &str) -> Option<i64> {
+    quarantine_key
+        .rsplit('/')
+        .next()
+        .and_then(|seg| seg.strip_prefix('q'))
+        .and_then(|digits| digits.parse::<i64>().ok())
+}
+
+/// The live key a quarantine key was copied from: strip the `quarantine/`
+/// prefix and the trailing `/q<ns>` segment.
+///
+/// The reaper asks the lease check about this as well as about the quarantine
+/// key itself. A legal-hold scope is validated to start with `t/<tenant_hex>/`
+/// and `LegalHoldCheck::is_protected` is a prefix match, so a hold can never
+/// match a `quarantine/...` key. Without this, a hold placed after an object
+/// was quarantined would not stop the reap.
+fn original_key_from_quarantine(quarantine_key: &str) -> Option<&str> {
+    let without_prefix = quarantine_key.strip_prefix(QUARANTINE_PREFIX)?;
+    let (original, stamp) = without_prefix.rsplit_once('/')?;
+    stamp.strip_prefix('q')?;
+    Some(original)
+}
+
+/// What one quarantine-reaper pass did (ADR-0058 amendment).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuarantineSweepOutcome {
+    /// Objects physically deleted from `quarantine/` this pass, past the second
+    /// horizon.
+    pub reaped: usize,
+    /// Objects left in quarantine this pass, still inside the second horizon
+    /// (or with an unparseable timestamp, or held: a hold on the recovered
+    /// original key binds to its quarantine copy).
+    pub retained: usize,
+}
+
+/// Physically delete quarantined orphan objects for one `(tenant, signal,
+/// shard)` whose embedded quarantine timestamp is more than
+/// `quarantine_horizon_ns` behind the clock (ADR-0058 amendment).
+///
+/// This is the second and final horizon on orphan-GC'd data and the only place
+/// it is ever physically removed: [`sweep_orphans`] moved these objects out of
+/// the live keyspace into `quarantine/`, giving an operator a recovery window
+/// for a small out-of-band commit-record loss the mass-orphan breaker does not
+/// catch. It runs whole-shard like rule 1 (quarantine keys are not
+/// hour-bucketed), is stateless and idempotent (deleting a missing key is a
+/// success), and fails closed on a malformed key (an unparseable age is never
+/// reaped). The age is read from the key, not the copy's store
+/// `last_modified`, so the horizon is deterministic under the injected clock.
+pub async fn sweep_quarantine(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<QuarantineSweepOutcome> {
+    let now = clock.now_ns();
+    let horizon = config.quarantine_horizon_ns;
+    let prefix = quarantine_l0_data_prefix(tenant, signal, shard)?;
+    let objects = list_all(store, &prefix).await?;
+
+    let mut reaped = 0usize;
+    let mut retained = 0usize;
+    for meta in objects {
+        let Some(quarantined_at_ns) = parse_quarantine_timestamp(&meta.key) else {
+            retained += 1;
+            continue;
+        };
+        if now.saturating_sub(quarantined_at_ns) <= horizon {
+            retained += 1;
+            continue;
+        }
+        let held = lease.is_protected(&meta.key)
+            || original_key_from_quarantine(&meta.key).is_some_and(|k| lease.is_protected(k));
+        if held {
+            retained += 1;
+            continue;
+        }
+        if !config.dry_run {
+            store.delete(&meta.key).await?;
+        }
+        reaped += 1;
+    }
+
+    if reaped > 0 {
+        tracing::warn!(
+            tenant_hash = %tenant.to_hex(),
+            signal = signal.key_prefix(),
+            shard,
+            reaped,
+            retained,
+            "quarantine reaper: physically deleted orphan-GC'd objects past the second \
+             horizon; this is the point at which quarantined data becomes unrecoverable"
+        );
+    }
+
+    Ok(QuarantineSweepOutcome { reaped, retained })
 }
 
 // --- Rule 2: superseded-input sweep (ADR-0018) -----------------------------
@@ -1598,7 +1928,7 @@ async fn get_compaction_record_opt(
 ) -> Result<Option<CompactionRecord>> {
     match store.get(key, GetRange::Full).await {
         Ok(got) => {
-            let record = CompactionRecord::decode(got.data.as_ref()).map_err(|e| {
+            let record = record::decode_compaction(got.data.as_ref()).map_err(|e| {
                 MaintainError::Invariant(format!("compaction record decode failed: {e}"))
             })?;
             keys::verify_compaction_record_key(&record, key)?;
@@ -1948,10 +2278,11 @@ pub struct CatalogSweepOutcome {
 ///   between the two reads -- is dropped, so a part a completed fold just
 ///   published is never swept.
 /// - **Reference set from a present, decodable HEAD only.** The referenced set
-///   is HEAD's `parts[].key`, its optional `postings.key`, and its optional
-///   column-statistics keys (`column_stats.key` field 11, `column_stats_part.key`
-///   field 13). An object under the two prefixes but not in that set is
-///   superseded or orphaned.
+///   is HEAD's `parts[].key`, its optional `postings.key`, and each part's
+///   optional per-part column-statistics key (`parts[].column_stats.key`,
+///   field 7). An object under the two prefixes but not in that set is
+///   superseded or orphaned. ADR-1413 decision 6 retired the whole-object
+///   forms, so a legacy v1/v2 `.cstat` is named by no HEAD and is swept.
 /// - **No anchor, no sweep.** An absent HEAD sweeps nothing for the
 ///   (tenant, signal), matching rule 3's neither-record-nor-tombstone bucket
 ///   exactly. This is not an over-abundance of caution: a recovery fold with no
@@ -2099,8 +2430,8 @@ pub async fn sweep_unreferenced_catalog_objects(
 /// [`read_head_reference`] fails the whole pass on it (fail-closed).
 enum HeadReference {
     /// HEAD is present and decoded: the set of keys it names (every
-    /// `parts[].key`, the optional `postings.key`, and the optional
-    /// column-statistics keys `column_stats.key`/`column_stats_part.key`).
+    /// `parts[].key`, the optional `postings.key`, and each part's optional
+    /// per-part column-statistics key `parts[].column_stats.key`).
     Present(HashSet<String>),
     /// HEAD is absent. There is no anchor to compare against, so rule 5 sweeps
     /// nothing for this (tenant, signal) (a fold rebuilding from no HEAD adopts
@@ -2126,33 +2457,25 @@ async fn read_head_reference(
                      nothing this pass rather than treating a live snapshot as unreferenced"
                 ))
             })?;
-            let mut referenced = HashSet::with_capacity(
-                head.parts.len()
-                    + usize::from(head.postings.is_some())
-                    + usize::from(head.column_stats.is_some())
-                    + usize::from(head.column_stats_part.is_some()),
-            );
+            let mut referenced =
+                HashSet::with_capacity(head.parts.len() * 2 + usize::from(head.postings.is_some()));
             for part in &head.parts {
                 referenced.insert(part.key.clone());
+                // Additive, ADR-1413. `part.column_stats` (field 7,
+                // `SnapshotColumnStatsPartRef`) names a per-part v3
+                // column-stats object living under the same `idx/` prefix
+                // this sweep lists. It is reachable only through the part
+                // that carries it, never through SnapshotHead field 11/13, so
+                // it must be added to the set here or a live v3 object goes
+                // unreferenced and is swept once its age crosses the
+                // protection horizon, even though a sealed part never gets
+                // rewritten and the HEAD still names it (issue #1482).
+                if let Some(column_stats) = &part.column_stats {
+                    referenced.insert(column_stats.key.clone());
+                }
             }
             if let Some(postings) = &head.postings {
                 referenced.insert(postings.key.clone());
-            }
-            // A live snapshot's column-statistics object is an immutable,
-            // reachable object under the same `idx/` prefix this sweep lists
-            // (fold.rs writes `.cstat` there), so omitting it lets the sweep
-            // delete an object a resolvable snapshot still references (#958).
-            // Both carriers are covered: field 11 `column_stats`
-            // (`SnapshotColumnStatsRef`, ADR-0850) is what folds write today,
-            // and field 13 `column_stats_part` (`SnapshotColumnStatsPartRef`,
-            // ADR-0942's part-hash re-keying) is additive and may be written by
-            // a later fold path. Whichever a HEAD carries names a `.cstat` key
-            // that must be spared exactly like a part or the postings object.
-            if let Some(column_stats) = &head.column_stats {
-                referenced.insert(column_stats.key.clone());
-            }
-            if let Some(column_stats_part) = &head.column_stats_part {
-                referenced.insert(column_stats_part.key.clone());
             }
             Ok(HeadReference::Present(referenced))
         }
@@ -2636,7 +2959,7 @@ async fn get_compaction_record(
     key: &str,
 ) -> Result<CompactionRecord> {
     let got = store.get(key, GetRange::Full).await?;
-    let record = CompactionRecord::decode(got.data.as_ref())
+    let record = record::decode_compaction(got.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("compaction record decode failed: {e}")))?;
     keys::verify_compaction_record_key(&record, key)?;
     Ok(record)
@@ -2752,8 +3075,7 @@ mod tests {
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_proto::catalog::v1::{
-        SnapshotColumnStatsPartRef, SnapshotColumnStatsRef, SnapshotHead, SnapshotPartRef,
-        SnapshotPostingsRef,
+        SnapshotColumnStatsPartRef, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef,
     };
     use ravel_types::TenantId;
 
@@ -2958,6 +3280,457 @@ mod tests {
                 "batched: only two commit-prefix LISTs per pass, regardless of candidate count"
             );
         }
+    }
+
+    // --- Quarantine (ADR-0058 amendment, issue #528) -----------------------
+
+    /// The L0 data key `put_orphan` writes for `seq`, so a test can assert the
+    /// exact key set that ended up quarantined.
+    fn orphan_data_key(tenant: &TenantHash, signal: Signal, shard: u32, seq: u64) -> String {
+        let writer_id = Uuid::from_u128(u128::from(seq) + 1);
+        keys::data_key(tenant, signal, shard, writer_id, 1, seq, &[7u8; 32])
+            .expect("valid data key")
+    }
+
+    /// A referenced (non-orphan) L0 data object: its data object plus a commit
+    /// record at the matching identity, so it counts toward `l0_objects_listed`
+    /// (the breaker ratio's denominator) but is never an orphan candidate.
+    /// `referenced_l0_identities` reads commit-record KEYS only, so an empty
+    /// object at a valid commit key is enough to mark the data object
+    /// referenced.
+    async fn put_referenced(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        seq: u64,
+    ) {
+        let writer_id = Uuid::from_u128(u128::from(seq) + 1_000_000);
+        let data = keys::data_key(tenant, signal, shard, writer_id, 1, seq, &[9u8; 32])
+            .expect("valid data key");
+        let commit = keys::commit_key(tenant, signal, shard, 0, writer_id, 1, seq)
+            .expect("valid commit key");
+        store
+            .put(&data, Bytes::new(), PutOptions::default())
+            .await
+            .expect("seed referenced data");
+        store
+            .put(&commit, Bytes::new(), PutOptions::default())
+            .await
+            .expect("seed commit record");
+    }
+
+    /// Recover the original object key from a quarantine key
+    /// (`quarantine/<original>/q<ns>`): strip the prefix and the trailing
+    /// `/q<ns>` segment. This is the operator's recovery path, exercised as an
+    /// assertion.
+    fn recover_original(quarantine_key: &str) -> String {
+        let without_prefix = quarantine_key
+            .strip_prefix(QUARANTINE_PREFIX)
+            .expect("quarantine prefix present");
+        let (original, last) = without_prefix
+            .rsplit_once('/')
+            .expect("trailing timestamp segment present");
+        assert!(last.starts_with('q'), "trailing segment is the q<ns> stamp");
+        original.to_string()
+    }
+
+    async fn keys_under(store: &dyn ObjectStoreBackend, prefix: &str) -> BTreeSet<String> {
+        list_all(store, prefix)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|m| m.key)
+            .collect()
+    }
+
+    /// The ticket's own case: fewer than `orphan_breaker_min_count` orphan
+    /// candidates, so the breaker does NOT trip. Pre-fix this deleted the
+    /// objects permanently; now they are recoverable from `quarantine/`, pinned
+    /// by exact key set.
+    #[tokio::test]
+    async fn small_loss_below_breaker_is_quarantined_not_deleted() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 7;
+        let store = MemoryStore::new();
+        for seq in 0..3u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+        let now = clock.now_ns();
+
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("3 candidates is below orphan_breaker_min_count: no trip");
+        assert_eq!(outcome.deleted, 3, "all three moved out of the live set");
+        assert_eq!(outcome.refused, 0);
+
+        // Nothing is left in the live L0 keyspace.
+        assert!(
+            keys_under(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+                .await
+                .is_empty(),
+            "orphans removed from the live keyspace"
+        );
+
+        // All three are recoverable from quarantine, by exact key set.
+        let expected_originals: BTreeSet<String> = (0..3u64)
+            .map(|seq| orphan_data_key(&tenant, signal, shard, seq))
+            .collect();
+        let quarantined = keys_under(
+            &store,
+            &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+        )
+        .await;
+        assert_eq!(quarantined.len(), 3, "exactly three quarantined");
+        let recovered: BTreeSet<String> = quarantined.iter().map(|k| recover_original(k)).collect();
+        assert_eq!(
+            recovered, expected_originals,
+            "the exact orphan keys are recoverable from quarantine"
+        );
+        // The embedded timestamp is the quarantine instant.
+        for k in &quarantined {
+            assert_eq!(parse_quarantine_timestamp(k), Some(now));
+        }
+    }
+
+    /// The thin-spread case: orphan candidates under the ratio on a large
+    /// shard, so neither the count nor the ratio condition trips. Same
+    /// assertion: recoverable, not deleted.
+    #[tokio::test]
+    async fn thin_spread_loss_under_ratio_is_quarantined() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 8;
+        let store = MemoryStore::new();
+        // 5 orphans among 100 listed L0 objects = 5% < 10%, and 5 < 50, so the
+        // breaker's ratio condition is what would otherwise matter and it does
+        // not trip.
+        for seq in 0..95u64 {
+            put_referenced(&store, &tenant, signal, shard, seq).await;
+        }
+        for seq in 1000..1005u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("5/100 is under the ratio and under the count: no trip");
+        assert_eq!(outcome.deleted, 5);
+        assert_eq!(outcome.refused, 0);
+
+        let expected_originals: BTreeSet<String> = (1000..1005u64)
+            .map(|seq| orphan_data_key(&tenant, signal, shard, seq))
+            .collect();
+        let quarantined = keys_under(
+            &store,
+            &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+        )
+        .await;
+        let recovered: BTreeSet<String> = quarantined.iter().map(|k| recover_original(k)).collect();
+        assert_eq!(
+            recovered, expected_originals,
+            "only the five orphans are quarantined; the 95 referenced objects are untouched"
+        );
+        // The referenced data objects stay live.
+        assert_eq!(
+            keys_under(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+                .await
+                .len(),
+            95,
+            "referenced L0 data objects remain live"
+        );
+    }
+
+    /// The dangerous half: fail the copy to quarantine and assert nothing was
+    /// deleted and the refusal is counted. Copy-first/delete-second means a
+    /// failed copy leaves the live object in place.
+    #[tokio::test]
+    async fn copy_failure_leaves_object_and_counts_refusal() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 9;
+        let mem = MemoryStore::new();
+        for seq in 0..3u64 {
+            put_orphan(&mem, &tenant, signal, shard, seq).await;
+        }
+        // Every PUT under the quarantine prefix fails: the copy half never
+        // completes, so the delete half must never run.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Timeout)
+                .with_key_contains(QUARANTINE_PREFIX)
+                .with_occurrence(Occurrence::Always),
+        );
+        let store = FaultStore::new(mem, plan);
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("a copy failure is per-object, not fatal to the pass");
+        assert_eq!(outcome.deleted, 0, "nothing was moved out of the live set");
+        assert_eq!(outcome.refused, 3, "all three refusals counted");
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Timeout),
+            3,
+            "the copy PUT faulted for each candidate",
+        );
+
+        // Every live object is still present; nothing reached quarantine.
+        assert_eq!(
+            keys_under(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+                .await
+                .len(),
+            3,
+            "fail-closed: the live objects are untouched",
+        );
+        assert!(
+            keys_under(
+                &store,
+                &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+            )
+            .await
+            .is_empty(),
+            "no partial quarantine copy survived the failed put",
+        );
+
+        // The ADR-0058 decision-1 `orphans_present` gauge sums the sweep's
+        // deleted and withheld counts, and now its refused count too. A
+        // refused candidate is still present, and it is refused exactly in
+        // the store-fault case the gauge exists for, so the pre-fix sum read
+        // zero at the moment the signal mattered. `withheld` lives on the
+        // whole-sweep report rather than this per-rule outcome, so the two
+        // terms available here are the ones asserted.
+        assert_eq!(
+            outcome.deleted, 0,
+            "the pre-fix sum contributed nothing for these three candidates",
+        );
+        assert_eq!(
+            outcome.deleted + outcome.refused,
+            3,
+            "all three are still present and must reach the gauge",
+        );
+    }
+
+    /// The reaper: an object past the second horizon is physically deleted; one
+    /// inside it is not. Run under `with_page_size(2)` so listing pagination is
+    /// exercised. Exact key sets.
+    #[tokio::test]
+    async fn reaper_deletes_past_horizon_keeps_within() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 5;
+        let store = MemoryStore::with_page_size(2);
+        let config = CompactorConfig::default();
+
+        // Quarantine A at t1.
+        put_orphan(&store, &tenant, signal, shard, 0).await;
+        let t1 = config.orphan_age_gate_ns() + 1;
+        let clock = FixedClock::new(t1);
+        let out = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("quarantine A");
+        assert_eq!(out.deleted, 1);
+
+        // Quarantine B one whole horizon later, at t2 = t1 + horizon.
+        put_orphan(&store, &tenant, signal, shard, 1).await;
+        let t2 = t1 + config.quarantine_horizon_ns;
+        clock.set(t2);
+        let out = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("quarantine B");
+        assert_eq!(out.deleted, 1);
+
+        // Reap at t2 + 1: A (age horizon + 1) is past the horizon; B (age 1) is
+        // not.
+        clock.set(t2 + 1);
+        let reaped = sweep_quarantine(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("reap");
+        assert_eq!(reaped.reaped, 1, "only A, past the horizon");
+        assert_eq!(reaped.retained, 1, "B is still inside the horizon");
+
+        let key_b = orphan_data_key(&tenant, signal, shard, 1);
+        let remaining = keys_under(
+            &store,
+            &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+        )
+        .await;
+        let recovered: BTreeSet<String> = remaining.iter().map(|k| recover_original(k)).collect();
+        assert_eq!(
+            recovered,
+            BTreeSet::from([key_b]),
+            "exactly B remains quarantined; A is physically gone"
+        );
+    }
+
+    /// A quarantine key whose timestamp segment is unparseable is never reaped
+    /// (fail-closed): an unreadable age is treated as not-yet-expired.
+    #[tokio::test]
+    async fn reaper_never_deletes_malformed_key() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 6;
+        let store = MemoryStore::new();
+        // A quarantine-prefixed key with no `/q<ns>` stamp.
+        let malformed = format!(
+            "{}bogus-object",
+            quarantine_l0_data_prefix(&tenant, signal, shard).unwrap()
+        );
+        store
+            .put(&malformed, Bytes::new(), PutOptions::default())
+            .await
+            .expect("seed malformed");
+        assert_eq!(parse_quarantine_timestamp(&malformed), None);
+
+        let config = CompactorConfig::default();
+        // Clock far past any horizon.
+        let clock = FixedClock::new(config.quarantine_horizon_ns * 100);
+        let reaped = sweep_quarantine(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("reap");
+        assert_eq!(reaped.reaped, 0, "a malformed key is never reaped");
+        assert_eq!(reaped.retained, 1);
+    }
+
+    /// A legal hold placed after an object was quarantined still stops the
+    /// reap. Hold scopes are validated to start with `t/<tenant_hex>/` and
+    /// `is_protected` is a prefix match, so the hold is asked about the
+    /// recovered original key, not only about the `quarantine/...` key it
+    /// could never match.
+    ///
+    /// Flip to watch it fail: drop the `original_key_from_quarantine` arm of
+    /// the reaper's `held` check and the first assertion reaps 1.
+    #[tokio::test]
+    async fn a_hold_on_the_original_key_stops_the_quarantine_reap() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 12;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+
+        put_orphan(&store, &tenant, signal, shard, 0).await;
+        let t1 = config.orphan_age_gate_ns() + 1;
+        let clock = FixedClock::new(t1);
+        sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("quarantine the single candidate");
+
+        // Past the second horizon, so only the hold can save it.
+        clock.set(t1 + config.quarantine_horizon_ns + 1);
+
+        // The hold names the live keyspace, which is the only shape a real
+        // hold scope can take.
+        let hold = HoldPrefix(l0_data_prefix(&tenant, signal, shard).unwrap());
+        assert!(
+            !hold.is_protected(
+                &keys_under(
+                    &store,
+                    &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+                )
+                .await
+                .into_iter()
+                .next()
+                .expect("one quarantined object")
+            ),
+            "the hold cannot match the quarantine key itself; that is the point"
+        );
+
+        let out = sweep_quarantine(&store, &clock, &config, &hold, &tenant, signal, shard)
+            .await
+            .expect("reap under a hold");
+        assert_eq!(out.reaped, 0, "a held original protects its copy");
+        assert_eq!(out.retained, 1);
+
+        // Same object, same clock, hold released: it is reaped.
+        let out = sweep_quarantine(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("reap without a hold");
+        assert_eq!(out.reaped, 1, "nothing else was keeping it");
+    }
+
+    /// A pass whose mass-orphan breaker trips reaps nothing, even quarantine
+    /// that is past its own horizon. The two horizons are not independent:
+    /// reaping while the breaker signals a live record loss destroys the copies
+    /// taken before that loss grew, which is this mechanism's own failure mode
+    /// one horizon later.
+    ///
+    /// Both directions are asserted in one test so the gate cannot be dropped
+    /// silently. Flip to watch it fail: delete the `orphan_breaker_tripped`
+    /// arm in `sweep_shard_with_holds` and the first assertion reaps 1.
+    #[tokio::test]
+    async fn a_tripped_breaker_holds_the_quarantine_reaper() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 11;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+
+        // One object quarantined at t1, well below the breaker's thresholds.
+        put_orphan(&store, &tenant, signal, shard, 0).await;
+        let t1 = config.orphan_age_gate_ns() + 1;
+        let clock = FixedClock::new(t1);
+        let out = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("one candidate does not trip the breaker");
+        assert_eq!(out.deleted, 1);
+
+        // A whole horizon later that copy is reapable. The loss has also grown:
+        // 60 record-less objects now trip the breaker on this pass.
+        let t2 = t1 + config.quarantine_horizon_ns + 1;
+        clock.set(t2);
+        for seq in 1..61u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+
+        let report = sweep_shard(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("a tripped breaker is reported, not an error, at this layer");
+        assert!(report.orphan_breaker_tripped, "60 of 60 trips the breaker");
+        assert_eq!(
+            report.quarantine_reaped, 0,
+            "the reaper is held while the breaker signals a live loss"
+        );
+        let still_quarantined = keys_under(
+            &store,
+            &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            still_quarantined.len(),
+            1,
+            "the expired copy survives a tripped-breaker pass"
+        );
+
+        // Same store, same clock, same expired copy: once the mass loss is
+        // resolved the breaker no longer trips and the reaper collects it.
+        for seq in 1..61u64 {
+            store
+                .delete(&orphan_data_key(&tenant, signal, shard, seq))
+                .await
+                .expect("clear the mass loss");
+        }
+        let report = sweep_shard(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("sweep with the breaker no longer tripping");
+        assert!(!report.orphan_breaker_tripped);
+        assert_eq!(
+            report.quarantine_reaped, 1,
+            "the same expired copy is reaped once the breaker is quiet"
+        );
+        assert!(
+            keys_under(
+                &store,
+                &quarantine_l0_data_prefix(&tenant, signal, shard).unwrap(),
+            )
+            .await
+            .is_empty(),
+            "nothing left in quarantine"
+        );
     }
 
     fn idem_receipt(written_count: u64) -> IdempotencyReceipt {
@@ -3350,6 +4123,7 @@ mod tests {
             entry_count: 1,
             watermark_hour: 100,
             min_hour: 0,
+            column_stats: None,
         }
     }
 
@@ -3373,8 +4147,6 @@ mod tests {
             folder_id: vec![0u8; 16],
             created_unix_ns: 0,
             postings,
-            column_stats: None,
-            column_stats_part: None,
             shard_generation_count: 1,
         };
         let bytes = ravel_catalog::encode_head(&head).expect("valid HEAD encodes");
@@ -3388,17 +4160,45 @@ mod tests {
             .expect("seed HEAD");
     }
 
-    /// Like [`put_head`] but also names a column-statistics object through
-    /// field 11 (`SnapshotColumnStatsRef`) and/or field 13
-    /// (`SnapshotColumnStatsPartRef`). Each ref's `part_blake3` mirrors the
-    /// parts' hashes, as `encode_head`'s own validation requires.
-    async fn put_head_with_column_stats(
+    /// Appends a length-delimited field to an already-encoded protobuf
+    /// message. Fields 11 and 13 on `SnapshotHead` (ADR-1413 decision 6,
+    /// #1600) are `reserved` and have no struct field to set, so this is the
+    /// only way to construct a HEAD that still carries one, the way a HEAD
+    /// folded before this change would. `SnapshotHead::decode` (a plain
+    /// `prost::Message::decode`) skips a field number it does not recognize,
+    /// so appending is equivalent to the field having been encoded in its
+    /// original position.
+    fn append_raw_field(
+        mut message_bytes: Vec<u8>,
+        field_number: u32,
+        field_value: &impl prost::Message,
+    ) -> Vec<u8> {
+        prost::encoding::encode_key(
+            field_number,
+            prost::encoding::WireType::LengthDelimited,
+            &mut message_bytes,
+        );
+        let payload = field_value.encode_to_vec();
+        prost::encoding::encode_varint(payload.len() as u64, &mut message_bytes);
+        message_bytes.extend_from_slice(&payload);
+        message_bytes
+    }
+
+    /// Like [`put_head`] but also plants a stale whole-object column-stats ref
+    /// on `field_number` (11 or 13, the retired `SnapshotColumnStatsRef`/
+    /// `SnapshotColumnStatsPartRef` whole-tenant forms), the way a HEAD folded
+    /// before ADR-1413 decision 6 would. Both fields are `reserved` now (no
+    /// struct field to set), so the ref is planted with [`append_raw_field`]
+    /// after `encode_head` produces well-formed bytes for the rest of the
+    /// message. `part_blake3` mirrors the parts' hashes so a decoder that did
+    /// still validate the retired field would find it internally consistent.
+    async fn put_head_with_stale_whole_object_column_stats(
         store: &dyn ObjectStoreBackend,
         tenant: &TenantHash,
         signal: Signal,
         parts: Vec<SnapshotPartRef>,
-        column_stats_key: Option<&str>,
-        column_stats_part_key: Option<&str>,
+        field_number: u32,
+        column_stats_key: &str,
     ) {
         let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
         let part_blake3: Vec<Vec<u8>> = parts.iter().map(|p| p.blake3.clone()).collect();
@@ -3412,23 +4212,17 @@ mod tests {
             folder_id: vec![0u8; 16],
             created_unix_ns: 0,
             postings: None,
-            column_stats: column_stats_key.map(|key| SnapshotColumnStatsRef {
-                key: key.to_string(),
-                blake3: [9u8; 32].to_vec(),
-                size: 1,
-                segment_count: 1,
-                part_blake3: part_blake3.clone(),
-            }),
-            column_stats_part: column_stats_part_key.map(|key| SnapshotColumnStatsPartRef {
-                key: key.to_string(),
-                blake3: [9u8; 32].to_vec(),
-                size: 1,
-                segment_count: 1,
-                part_blake3: part_blake3.clone(),
-            }),
             shard_generation_count: 1,
         };
         let bytes = ravel_catalog::encode_head(&head).expect("valid HEAD encodes");
+        let stale_ref = SnapshotColumnStatsPartRef {
+            key: column_stats_key.to_string(),
+            blake3: [9u8; 32].to_vec(),
+            size: 1,
+            segment_count: 1,
+            part_blake3,
+        };
+        let bytes = append_raw_field(bytes, field_number, &stale_ref);
         store
             .put(
                 &catalog_head_key(tenant, signal),
@@ -3621,15 +4415,22 @@ mod tests {
         );
     }
 
-    /// #958: a column-statistics `.cstat` object named by `HEAD.column_stats`
-    /// (field 11, ADR-0850) is immutable and reachable and must survive the
-    /// sweep, exactly like a part or the postings object. It lives under the
-    /// `idx/` prefix the sweep lists, so before the fix its key was absent from
-    /// the reachability set and the sweep deleted it. An unrelated old `.cstat`
-    /// not named by HEAD is still swept. The exact surviving/deleted key sets
-    /// are asserted.
+    /// ADR-1413 decision 6 (#1600): a stale `.cstat` object named ONLY by the
+    /// retired whole-tenant field 11 (`HEAD.column_stats`, `SnapshotColumnStatsRef`,
+    /// ADR-0850) is no longer referenced at all -- `read_head_reference` never
+    /// reads field 11 (it has no struct field to read; the proto field is
+    /// `reserved`), so the object is swept once it crosses the protection
+    /// horizon exactly like any other unreferenced `.cstat`, even though a
+    /// pre-#1600 HEAD still carries the raw bytes naming it. The live part
+    /// survives on its own account (`parts[].key`), unaffected by field 11.
+    ///
+    /// Prove-the-test: reintroducing a field-11 fallback read in
+    /// `read_head_reference` makes this fail: `outcome.deleted` becomes 0 and
+    /// the object added back to `referenced` before this fix at
+    /// `crates/ravel-maintain/src/sweep.rs:2138` (there is now no code at all
+    /// reading `head.column_stats`) would again be found there.
     #[tokio::test]
-    async fn catalog_sweep_spares_referenced_column_stats() {
+    async fn catalog_sweep_no_longer_spares_stale_field_eleven_column_stats() {
         let tenant = tenant();
         let signal = Signal::Metrics;
         let store = MemoryStore::new();
@@ -3641,9 +4442,9 @@ mod tests {
             "{}20260101T00.aaaa.csnap",
             catalog_snap_prefix(&tenant, signal)
         );
-        // The live column-stats object HEAD references (fold.rs keys `.cstat`
-        // under `idx/`), and an unrelated stale one no HEAD names.
-        let referenced_cstat = format!(
+        // A `.cstat` only a stale field-11 ref names, and an unrelated stale
+        // one no HEAD field names at all -- both are unreferenced now.
+        let field_eleven_cstat = format!(
             "{}20260101T00.cccc.cstat",
             catalog_idx_prefix(&tenant, signal)
         );
@@ -3652,15 +4453,15 @@ mod tests {
             catalog_idx_prefix(&tenant, signal)
         );
         put_catalog_object(&store, &part).await;
-        put_catalog_object(&store, &referenced_cstat).await;
+        put_catalog_object(&store, &field_eleven_cstat).await;
         put_catalog_object(&store, &stale_cstat).await;
-        put_head_with_column_stats(
+        put_head_with_stale_whole_object_column_stats(
             &store,
             &tenant,
             signal,
             vec![part_ref(&part, part_blake3)],
-            Some(&referenced_cstat),
-            None,
+            11,
+            &field_eleven_cstat,
         )
         .await;
 
@@ -3670,13 +4471,16 @@ mod tests {
                 .await
                 .expect("sweep must succeed");
 
-        // Exact sets: only the stale, unreferenced `.cstat` is deleted; the
-        // part, the referenced `.cstat`, and the HEAD survive.
-        assert_eq!(outcome.deleted, 1, "only the stale column-stats object");
-        assert_eq!(outcome.kept, 2, "the part and the referenced .cstat");
+        // Exact sets: both unreferenced `.cstat` objects are deleted; only the
+        // part survives.
+        assert_eq!(
+            outcome.deleted, 2,
+            "the field-11-only and the wholly-unreferenced column-stats objects"
+        );
+        assert_eq!(outcome.kept, 1, "the part alone");
         assert!(
-            present(&store, &referenced_cstat).await,
-            "a column-stats object the live HEAD names must never be swept (#958)"
+            !present(&store, &field_eleven_cstat).await,
+            "a retired field-11 ref no longer keeps its object alive"
         );
         assert!(
             present(&store, &part).await,
@@ -3688,12 +4492,12 @@ mod tests {
         );
     }
 
-    /// The ADR-0942 part-hash-keyed carrier, field 13
-    /// (`SnapshotColumnStatsPartRef`): a `.cstat` named there is reachable and
-    /// spared just like the field-11 form, so the fix does not depend on which
-    /// field a fold chose to write.
+    /// The ADR-0942 part-hash-keyed carrier, field 13 (`SnapshotColumnStatsPartRef`):
+    /// a stale `.cstat` named only there is equally unreferenced now, so the
+    /// fix does not depend on which retired field a pre-#1600 fold had chosen
+    /// to write.
     #[tokio::test]
-    async fn catalog_sweep_spares_referenced_column_stats_part() {
+    async fn catalog_sweep_no_longer_spares_stale_field_thirteen_column_stats() {
         let tenant = tenant();
         let signal = Signal::Metrics;
         let store = MemoryStore::new();
@@ -3705,19 +4509,19 @@ mod tests {
             "{}20260101T00.aaaa.csnap",
             catalog_snap_prefix(&tenant, signal)
         );
-        let referenced_cstat = format!(
+        let field_thirteen_cstat = format!(
             "{}20260101T00.eeee.cstat",
             catalog_idx_prefix(&tenant, signal)
         );
         put_catalog_object(&store, &part).await;
-        put_catalog_object(&store, &referenced_cstat).await;
-        put_head_with_column_stats(
+        put_catalog_object(&store, &field_thirteen_cstat).await;
+        put_head_with_stale_whole_object_column_stats(
             &store,
             &tenant,
             signal,
             vec![part_ref(&part, part_blake3)],
-            None,
-            Some(&referenced_cstat),
+            13,
+            &field_thirteen_cstat,
         )
         .await;
 
@@ -3727,15 +4531,131 @@ mod tests {
                 .await
                 .expect("sweep must succeed");
 
-        assert_eq!(outcome.deleted, 0, "nothing unreferenced to delete");
-        assert_eq!(outcome.kept, 2, "the part and the field-13 .cstat");
+        assert_eq!(outcome.deleted, 1, "the field-13-only column-stats object");
+        assert_eq!(outcome.kept, 1, "the part alone");
         assert!(
-            present(&store, &referenced_cstat).await,
-            "a field-13 column-stats object the live HEAD names must be spared (#958)"
+            !present(&store, &field_thirteen_cstat).await,
+            "a retired field-13 ref no longer keeps its object alive"
         );
         assert!(
             present(&store, &part).await,
             "the HEAD-named part is spared"
+        );
+    }
+
+    /// A part ref carrying a per-part v3 column-stats ref (field 7,
+    /// `SnapshotColumnStatsPartRef`, ADR-1413).
+    fn part_ref_with_v3_stats(
+        key: &str,
+        blake3: [u8; 32],
+        min_hour: u32,
+        watermark_hour: u32,
+        v3_stats_key: &str,
+    ) -> SnapshotPartRef {
+        SnapshotPartRef {
+            min_hour,
+            watermark_hour,
+            column_stats: Some(SnapshotColumnStatsPartRef {
+                key: v3_stats_key.to_string(),
+                blake3: [9u8; 32].to_vec(),
+                size: 1,
+                segment_count: 1,
+                part_blake3: vec![blake3.to_vec()],
+            }),
+            ..part_ref(key, blake3)
+        }
+    }
+
+    /// Issue #1482: a per-part v3 column-stats object (`SnapshotPartRef.
+    /// column_stats`, field 7, ADR-1413) is reachable only through the part
+    /// that carries it, never through `SnapshotHead.column_stats` (field 11)
+    /// or `column_stats_part` (field 13). Before the fix, `read_head_reference`
+    /// only walked those two HEAD-level fields, so a live v3 object crossed
+    /// the protection horizon and was swept out from under a sealed part the
+    /// current HEAD still names -- and, unlike a `.csnap` part, a sealed part
+    /// is never rewritten, so the object was never recreated. Two parts each
+    /// carry a field-7 ref; a third, unrelated `.cstat` is unreferenced. All
+    /// three are older than the horizon. Only the unreferenced one is swept.
+    #[tokio::test]
+    async fn catalog_sweep_spares_referenced_v3_per_part_column_stats() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let part_a = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let part_b = format!(
+            "{}20260102T00.bbbb.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let v3_stats_a = format!(
+            "{}20260101T00.aaaa.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        let v3_stats_b = format!(
+            "{}20260102T00.bbbb.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        let unreferenced_cstat = format!(
+            "{}20251231T00.zzzz.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+
+        put_catalog_object(&store, &part_a).await;
+        put_catalog_object(&store, &part_b).await;
+        put_catalog_object(&store, &v3_stats_a).await;
+        put_catalog_object(&store, &v3_stats_b).await;
+        put_catalog_object(&store, &unreferenced_cstat).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![
+                part_ref_with_v3_stats(&part_a, [1u8; 32], 0, 100, &v3_stats_a),
+                part_ref_with_v3_stats(&part_b, [2u8; 32], 101, 200, &v3_stats_b),
+            ],
+            None,
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        // Exact key set: only the unreferenced `.cstat` is deleted; both
+        // parts and both field-7-referenced v3 objects survive. Without the
+        // field-7 walk this assertion fails: `outcome.deleted == 3`,
+        // with `v3_stats_a` and `v3_stats_b` both gone, because
+        // `read_head_reference` never walked `part.column_stats` -- only the
+        // line adding it to `referenced` inside the `for part in &head.parts`
+        // loop distinguishes the two runs.
+        assert_eq!(outcome.deleted, 1, "only the unreferenced v3 object");
+        assert_eq!(outcome.kept, 4, "both parts and both referenced v3 objects");
+        assert!(
+            present(&store, &v3_stats_a).await,
+            "a v3 object a live part still references (field 7) must survive (#1482)"
+        );
+        assert!(
+            present(&store, &v3_stats_b).await,
+            "a v3 object a live part still references (field 7) must survive (#1482)"
+        );
+        assert!(
+            present(&store, &part_a).await,
+            "the HEAD-named part a is spared"
+        );
+        assert!(
+            present(&store, &part_b).await,
+            "the HEAD-named part b is spared"
+        );
+        assert!(
+            !present(&store, &unreferenced_cstat).await,
+            "an old v3 object no part references must still be swept"
         );
     }
 
@@ -4021,8 +4941,6 @@ mod tests {
                 folder_id: vec![0u8; 16],
                 created_unix_ns: 0,
                 postings: None,
-                column_stats: None,
-                column_stats_part: None,
                 shard_generation_count: 1,
             };
             Bytes::from(ravel_catalog::encode_head(&head).expect("valid swapped HEAD"))
@@ -4148,6 +5066,59 @@ mod tests {
         assert!(
             present(&store, &part).await,
             "no object is deleted when the HEAD cannot be decoded"
+        );
+    }
+
+    /// A compaction record stamped a future `format_version` in a bucket is
+    /// refused by the superseded sweep's bucket read (ADR-0066 decision 2), not
+    /// read as version 1: the pass fails before it deletes anything, so the
+    /// record and every input it would have named survive. The record is
+    /// otherwise fully self-consistent (its identity fields reconstruct its own
+    /// key), so the version gate is the only thing that can reject it. Removing
+    /// that gate makes this test fail: the record then decodes as version 1,
+    /// the pass proceeds, and `sweep_superseded` returns `Ok`.
+    #[tokio::test]
+    async fn superseded_sweep_refuses_a_future_version_compaction_record() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 0;
+        let store = MemoryStore::new();
+
+        let mut record = CompactionRecord {
+            format_version: 2,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal).into(),
+            shard,
+            ingest_hour_bucket: 1,
+            input_set_hash: vec![0x22; 32],
+            ..Default::default()
+        };
+        record.parts.clear();
+        let key = keys::compaction_record_key_for(&record).expect("key");
+        store
+            .put(
+                &key,
+                record::encode_compaction(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed put");
+
+        let config = CompactorConfig::default();
+        let clock = FixedClock::new(config.orphan_age_gate_ns() + 1);
+        let err = sweep_superseded(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect_err("a version-2 compaction record must fail the pass, not read as v1");
+        match &err {
+            MaintainError::Invariant(msg) => assert!(
+                msg.contains("format_version") && msg.contains("2"),
+                "the failure names the version gate and the version seen: {msg}"
+            ),
+            other => panic!("expected Invariant from the version gate, got {other:?}"),
+        }
+        assert!(
+            present(&store, &key).await,
+            "a failed superseded pass deletes nothing from the bucket"
         );
     }
 }

@@ -3,6 +3,7 @@
 
 pub mod admission_reconcile;
 pub mod alert_sink;
+pub mod alert_state_memo;
 pub mod alerting;
 pub mod analytics;
 pub mod bucket_protection;
@@ -31,8 +32,12 @@ pub mod ingest_concurrency;
 pub mod lifecycle_refresh;
 pub mod logs_ingest;
 pub mod maintain;
+#[cfg(feature = "mcp")]
+pub mod mcp;
+pub mod mem_stats;
 pub mod metadata_sink_task;
 pub mod metrics;
+pub mod normalize_reject_metrics;
 #[cfg(feature = "otap")]
 pub mod otap_grpc;
 pub mod otlp_grpc;
@@ -47,6 +52,7 @@ pub mod query_admission_reconcile;
 pub mod query_postings_metrics;
 pub mod remote_write;
 pub mod scrub;
+pub mod service;
 #[cfg(feature = "sql")]
 pub mod sql;
 #[cfg(feature = "flight-sql")]
@@ -95,6 +101,19 @@ pub use maintain::MaintenanceTaskConfig;
 pub use ravel_ingest::IngestByteBudgetLimit;
 
 const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Grace added to `--audit-max-age` to bound the query-audit drain in
+/// [`Running::shutdown`] (ADR-0062 decision 2b).
+///
+/// The drain is one final flush per tenant in the buffered batch: a data-object
+/// PUT plus a commit publish, each under the commit retry ladder (five
+/// attempts, about 0.3 s of total backoff). Five seconds is over ten times that
+/// ladder, so a store that is merely slow finishes inside the bound. It is a
+/// ceiling on the work, not a deadline for it: an object store that never
+/// answers must not be able to keep the process alive, and shutdown has already
+/// stopped every listener that could submit, so the only records at risk are
+/// the ones already in the batch.
+const AUDIT_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// Emits a prominent startup warning when the dev-only insecure tenant header
 /// is enabled. The `--dev-insecure-tenant-header` flag lets a client name its
@@ -160,6 +179,213 @@ pub fn warn_plaintext_federation(clusters: &[config::RemoteClusterConfig]) {
             cluster.endpoint
         );
     }
+}
+
+/// The reason a resolver derives the tenant from a request header or a token
+/// claim, or `None` when the static bearer map is the whole tenant set. Under
+/// any of these, a tenant that appears in no `--tenant-token` can still resolve,
+/// so the token map bounds neither how many tenants there are nor which.
+fn dynamic_resolver_reason(
+    dev_insecure_tenant_header: bool,
+    auth: &config::AuthResolverSettings,
+) -> Option<String> {
+    if auth.oidc.is_some() {
+        return Some(
+            "--oidc-issuer resolves the tenant from a JWT claim, so any tenant can resolve"
+                .to_string(),
+        );
+    }
+    if auth.mtls_header.is_some() {
+        // The mTLS resolver backs its own listener, but that listener serves the
+        // same query surface on the same shared engine, so a federated fan-out
+        // still runs under the one process credential for whichever tenant the
+        // client certificate names.
+        return Some(
+            "--mtls-enabled resolves the tenant from a client-certificate header, so any tenant \
+             can resolve"
+                .to_string(),
+        );
+    }
+    if dev_insecure_tenant_header {
+        return Some(
+            "--dev-insecure-tenant-header resolves the tenant from a request header, so any \
+             tenant can resolve"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Every local tenant this coordinator runs queries for, as hashes.
+///
+/// Two sources, not one. The distinct `--tenant-token` values are the tenants a
+/// REQUEST can authenticate as. `--alert-rules-file` names more: `alerting::
+/// spawn` starts one evaluator per tenant in the rules document, against the
+/// same `QueryEngine` the federation context is installed on, and those queries
+/// originate from no request. So a tenant named only there federates exactly
+/// like a token-mapped one, and the token map alone is not the tenant set.
+///
+/// Hashes rather than [`ravel_types::TenantId`]s because that is what
+/// `Federation::remotes_for` compares: `alerting::parse_rules` keys its map by
+/// `TenantId::new(&spec.tenant).hash()` and `ravel_server::start` keys each
+/// remote by `rc.tenant.hash()`, the same derivation under the same installed
+/// scheme, so comparing hashes here asks the question the dispatch actually
+/// answers.
+fn local_tenant_hashes(
+    tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
+    alert_rule_tenants: &[ravel_types::TenantHash],
+) -> std::collections::HashSet<ravel_types::TenantHash> {
+    tenant_tokens
+        .values()
+        .map(|t| t.hash())
+        .chain(alert_rule_tenants.iter().copied())
+        .collect()
+}
+
+/// The reason this coordinator runs queries for more than one local tenant, or
+/// `None` when at most one tenant can ever be queried for. Any dynamic resolver
+/// qualifies on its own; otherwise the set is bounded by
+/// [`local_tenant_hashes`].
+fn multi_tenant_resolver_reason(
+    tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
+    alert_rule_tenants: &[ravel_types::TenantHash],
+    dev_insecure_tenant_header: bool,
+    auth: &config::AuthResolverSettings,
+) -> Option<String> {
+    if let Some(reason) = dynamic_resolver_reason(dev_insecure_tenant_header, auth) {
+        return Some(reason);
+    }
+    let from_tokens: std::collections::HashSet<ravel_types::TenantHash> =
+        tenant_tokens.values().map(|t| t.hash()).collect();
+    let all = local_tenant_hashes(tenant_tokens, alert_rule_tenants);
+    if all.len() > 1 {
+        let alert_only = all.len() - from_tokens.len();
+        return Some(if alert_only == 0 {
+            format!(
+                "{} distinct static bearer tenants are configured",
+                from_tokens.len()
+            )
+        } else {
+            format!(
+                "{} distinct local tenants are configured: {} from the static bearer map and \
+                 {alert_only} named only in --alert-rules-file",
+                all.len(),
+                from_tokens.len()
+            )
+        });
+    }
+    None
+}
+
+/// Refuse a `--remote-cluster` that names no local tenant on a coordinator that
+/// runs queries for more than one.
+///
+/// A remote cluster's credential authorizes one tenant's data on that remote, so
+/// it belongs to one local tenant, named by the spec's `tenant` key. A spec
+/// without that key serves every local tenant: correct where only one can be
+/// queried for, and on a multi-tenant coordinator exactly the exposure the key
+/// exists to remove, since every local tenant's federated metric selectors and
+/// discovery calls would then fan out under that one credential and receive
+/// another tenant's series.
+///
+/// Also refuses a mapping that can never fire: when the tenant set is fully
+/// known (static configuration only, no resolver that derives a tenant from a
+/// request), a `tenant` naming a tenant outside it is a typo whose only symptom
+/// would be a remote that silently answers nobody.
+///
+/// `alert_rule_tenants` is the tenant set of `--alert-rules-file`
+/// (`alerting::parse_rules`'s map keys). It counts on both sides: the alert
+/// evaluators query the same engine, under no request, so a tenant named only
+/// there is a second local tenant for the unkeyed-spec refusal AND a valid
+/// target for a `tenant` key. See [`local_tenant_hashes`].
+///
+/// Call this at startup once the resolver inputs, alert rules, and remote
+/// clusters are parsed, before any listener binds; it is a no-op when no remote
+/// cluster is configured.
+pub fn ensure_federation_tenant_mapping(
+    remote_clusters: &[config::RemoteClusterConfig],
+    tenant_tokens: &std::collections::HashMap<String, ravel_types::TenantId>,
+    alert_rule_tenants: &[ravel_types::TenantHash],
+    dev_insecure_tenant_header: bool,
+    auth: &config::AuthResolverSettings,
+) -> anyhow::Result<()> {
+    if remote_clusters.is_empty() {
+        return Ok(());
+    }
+    if let Some(reason) = multi_tenant_resolver_reason(
+        tenant_tokens,
+        alert_rule_tenants,
+        dev_insecure_tenant_header,
+        auth,
+    ) {
+        let unkeyed: Vec<&str> = remote_clusters
+            .iter()
+            .filter(|rc| rc.tenant.is_none())
+            .map(|rc| rc.name.as_str())
+            .collect();
+        if !unkeyed.is_empty() {
+            anyhow::bail!(
+                "--remote-cluster {} names no local tenant on a coordinator that runs queries for \
+                 more than one local tenant ({reason}). A remote cluster holds one remote credential \
+                 and cannot express one credential per local tenant, so every local tenant's \
+                 federated metric selectors and discovery calls would fan out under that single \
+                 credential and receive another tenant's series. Add tenant=<local tenant> to \
+                 each of those specs, naming the one local tenant whose queries may use that \
+                 remote's credential (write one --remote-cluster per local tenant that needs the \
+                 same remote, each with its own name and credential-file), or run one local \
+                 tenant, or remove --remote-cluster.",
+                unkeyed
+                    .iter()
+                    .map(|n| format!("'{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    // The static configuration is the whole tenant set only when no resolver
+    // derives a tenant from a request, and an empty set configures no tenants at
+    // all rather than asserting there are none. Outside those two cases a
+    // `tenant` value that is absent here may still resolve at request time, so
+    // there is nothing to check. Note this is NOT gated on the coordinator being
+    // single-tenant: two static tenants are two tenants and still a fully known
+    // set, which is exactly the multi-tenant deployment the mapping is for.
+    let known = local_tenant_hashes(tenant_tokens, alert_rule_tenants);
+    if dynamic_resolver_reason(dev_insecure_tenant_header, auth).is_none() && !known.is_empty() {
+        for rc in remote_clusters {
+            if let Some(tenant) = &rc.tenant
+                && !known.contains(&tenant.hash())
+            {
+                // Only the token map carries tenant NAMES; the alert-rules map
+                // is keyed by hash, so it can be counted here but not listed.
+                let mut names: Vec<&str> = tenant_tokens.values().map(|t| t.as_str()).collect();
+                names.sort_unstable();
+                names.dedup();
+                anyhow::bail!(
+                    "--remote-cluster '{}' maps to local tenant '{}', which no --tenant-token \
+                     configures and no --alert-rules-file rule names (--tenant-token tenants: {}; \
+                     --alert-rules-file adds {} more, matched by hash). Nothing on this \
+                     coordinator can ever run a query for that tenant, so this remote would answer \
+                     nothing at all. Fix the tenant name, configure a --tenant-token for it, or \
+                     give it an alert rule.",
+                    rc.name,
+                    tenant.as_str(),
+                    if names.is_empty() {
+                        "none".to_string()
+                    } else {
+                        names.join(", ")
+                    },
+                    known.len().saturating_sub(
+                        tenant_tokens
+                            .values()
+                            .map(|t| t.hash())
+                            .collect::<std::collections::HashSet<_>>()
+                            .len()
+                    )
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The dedicated listener the mTLS resolver runs on (ADR-0050 section 1).
@@ -360,20 +586,57 @@ pub struct ServerConfig {
     /// a memory-constrained `--disable-cache` deployment does not silently keep
     /// a 512 MiB catalog byte cache.
     pub disable_cache: bool,
-    /// `--cache-max-bytes`: the shared RAM budget for the ADR-0046 read caches.
-    /// `main` sets it from `Cli::cache_max_bytes`; it bounds the fetcher cache
-    /// (via `store::build_cache`) and the catalog byte cache (via
-    /// [`query::build_catalog`]) from one number. Ignored when
+    /// The resolved RAM budget for the query fetcher cache
+    /// (`ResolvedPerformanceDefaults::cache_max_bytes`), recorded here for
+    /// provenance. Nothing on the library path reads it: `main` builds the
+    /// fetcher cache from the resolved struct (`store::build_store`) before this
+    /// config exists, and [`start`] hands the catalog byte cache its own
+    /// [`Self::catalog_cache_max_bytes`]. The two are independent LRU ceilings,
+    /// so neither claims the other's derived share of RAM. Ignored when
     /// `disable_cache` is set.
     pub cache_max_bytes: u64,
+    /// The resolved RAM budget for the catalog byte cache
+    /// (`ResolvedPerformanceDefaults::catalog_cache_max_bytes`), a SEPARATE LRU
+    /// ceiling from [`Self::cache_max_bytes`]. `main` fills it from the resolved
+    /// struct; [`start`] passes THIS value, not `cache_max_bytes`, to
+    /// [`query::build_catalog`]. Unset, it derives to a smaller share than the
+    /// fetcher cache; an explicit `--cache-max-bytes` sets both equal. Ignored
+    /// when `disable_cache` is set.
+    pub catalog_cache_max_bytes: u64,
+    /// The ADR-1170 decisions 1/3/4 process-wide memory budget: the shared
+    /// remainder left after both hard cache carves
+    /// (`ResolvedPerformanceDefaults::memory_remainder_bytes`), which `main`
+    /// fills from the resolved struct. [`start`] wraps this in ONE
+    /// `Arc<ravel_memory::MemoryBudget>` shared by the `sql`-featured
+    /// `SqlExecutor` (via `SqlExecutor::with_process_memory_budget`) and the
+    /// `/metrics` gauges on `MetricsState`, so a tenant's SQL reservation and
+    /// the exposed gauges read the SAME counter rather than two
+    /// independently drifting instances.
+    pub process_memory_budget_bytes: u64,
+    /// Whether [`Self::process_memory_budget_bytes`] was sized from
+    /// [`config::PERF_SOURCE_FALLBACK`] (host memory unknown), rather than
+    /// derived from a measured host. On that path the raw remainder is
+    /// `u64::MAX` minus the two hard cache carves, not `u64::MAX` itself; the
+    /// `/metrics` `ravel_memory_budget_bytes` gauge clamps to `u64::MAX` when
+    /// this is `true` so a dashboard's `== u64::MAX` unlimited check matches.
+    pub process_memory_budget_is_fallback: bool,
     /// `--cache-dir`: the ADR-0046 local-disk cache tier's directory (#97),
     /// `None` when the flag is unset. `main` sets it from `Cli::cache_dir`.
     /// When `Some` and `disable_cache` is off, [`query::build_catalog`] attaches
-    /// a `DiskCache` to the catalog byte cache, and `store::build_cache` (reading
-    /// `Cli::cache_dir` directly) attaches one to the fetcher cache; each tier is
-    /// bounded by `cache_max_bytes`. `None` keeps the RAM-only path, byte-for-byte
-    /// today's behavior.
+    /// a `DiskCache` to the catalog byte cache, bounded by
+    /// [`Self::catalog_cache_max_bytes`], and `store::build_cache` (reading
+    /// `Cli::cache_dir` directly) attaches one to the fetcher cache, bounded by
+    /// the resolved fetcher budget ([`Self::cache_max_bytes`]); the two tiers
+    /// share one directory and no separate disk-capacity flag, not one number.
+    /// `None` keeps the RAM-only path, byte-for-byte today's behavior.
     pub cache_dir: Option<std::path::PathBuf>,
+    /// `--catalog-resolve-concurrency`: the number of in-flight object-store
+    /// requests `Catalog::resolve_impl` keeps in flight at once, from
+    /// `Cli::catalog_resolve_concurrency`. `None` when the flag is unset,
+    /// which leaves `ravel_catalog::CatalogConfig`'s own default (currently
+    /// 128) in place; [`start`] passes this straight through to
+    /// [`query::build_catalog`].
+    pub catalog_resolve_concurrency: Option<usize>,
     /// The process-wide in-flight ingest-request ceiling, from
     /// `--max-inflight-ingest-requests` (default `Bounded(1024)`, `0` maps to
     /// `Unlimited`). [`start`] builds one shared
@@ -423,8 +686,189 @@ pub struct ServerConfig {
     /// sends its matchers and window to each remote under the operator credential
     /// configured here, never the calling client's. Independent of `distrib`
     /// above: federation is coordinator-side and needs no local fragment surface.
+    ///
+    /// Each remote is reached only by the local tenant its
+    /// [`RemoteClusterConfig::tenant`](crate::config::RemoteClusterConfig::tenant)
+    /// names, so a coordinator serving several local tenants keeps one remote
+    /// credential per local tenant instead of sharing one across all of them. A
+    /// local tenant no remote names runs a fully local query.
     pub remote_clusters: Vec<crate::config::RemoteClusterConfig>,
+    /// The resolved query-audit pipeline config (ADR-0062 decision 2b), from
+    /// `--audit-mode`/`--audit-max-batch`/`--audit-max-age`. In a query-serving
+    /// mode ([`Mode::All`]/[`Mode::Query`]) [`start`] spawns one
+    /// [`ravel_maintain::AuditPipeline`] from this and installs its sink on
+    /// every query surface; `Mode::Maintain`/`Mode::Gateway` serve no query
+    /// surface and install [`ravel_maintain::NoopQueryAuditSink`] instead,
+    /// ignoring this field.
+    pub audit_pipeline: ravel_maintain::AuditPipelineConfig,
+    /// How a query-audit record's `query.text` is recorded (ADR-0062 decision
+    /// 2e), resolved from `--audit-text` and the audit token key by
+    /// [`crate::config::resolve_audit_text_policy`]. [`start`] wraps the
+    /// pipeline's sink with it, so the posture applies to every query surface
+    /// at once and the pipeline itself only ever sees text this policy
+    /// allowed. Defaults to
+    /// [`AuditTextPolicy::Plaintext`](ravel_maintain::AuditTextPolicy::Plaintext)
+    /// for an embedding that configures no key; a `ravel-server` process
+    /// refuses to start under `--audit-text redacted` without one.
+    pub audit_text: ravel_maintain::AuditTextPolicy,
+    /// Upper bound on how long [`Running::shutdown`] spends draining ingest
+    /// buffers and joining background tasks, from `--shutdown-timeout` (default
+    /// [`DEFAULT_SHUTDOWN_TIMEOUT`]). Graceful shutdown flips readiness to
+    /// draining, waits a short settle interval so probes observe 503, then
+    /// bounds the whole drain by this value; if the drain overruns, shutdown
+    /// returns an error, which `main` logs at error level before exiting
+    /// non-zero, so the process still exits before Kubernetes escalates to
+    /// SIGKILL. The default is deliberately below the Kubernetes
+    /// default `terminationGracePeriodSeconds` ([`K8S_DEFAULT_GRACE_PERIOD`]),
+    /// leaving headroom for the pod's preStop hook and the SIGTERM-to-exit path
+    /// (the operator half of issue #1291 sets the pod grace period and preStop).
+    pub shutdown_timeout: Duration,
+    /// How long [`Running::shutdown`] waits, after flipping readiness to
+    /// draining, before it closes any listener (default
+    /// [`DEFAULT_DRAIN_SETTLE_INTERVAL`]). The window lets an in-flight `/readyz`
+    /// probe observe 503 over a still-open listener, so Kubernetes stops routing
+    /// new connections before the sockets close. It is a settle delay, paid once
+    /// per shutdown and NOT counted against [`ServerConfig::shutdown_timeout`];
+    /// the ADR-0071 heartbeat delete runs concurrently with it. In-process tests
+    /// set it to zero so a suite that shuts a server down on every case does not
+    /// pay it hundreds of times.
+    pub drain_settle_interval: Duration,
+    /// The coordinated ingest-lag bound, from `--max-ingest-lag` (default
+    /// [`DEFAULT_MAX_INGEST_LAG`], 2h), ADR-0051 section 4. One value drives BOTH
+    /// the catalog listing window (`ravel_catalog::CatalogConfig::max_ingest_lag_ns`,
+    /// set first) AND the three OTLP admission bounds
+    /// (`IngestLimits`/`LogIngestLimits`/`SpanIngestLimits::max_ingest_lag_ns`,
+    /// set second) at every ingest construction site [`start`] builds, so
+    /// ADR-0051's "widen the window first, then the admission bound" order holds
+    /// by construction and the two can never be set inconsistently. [`start`]
+    /// resolves it through [`resolve_ingest_lag`], which validates the pair
+    /// before building the catalog or any limits. Raise it to replay telemetry
+    /// older than the default after an outage or bulk import; the change reaches
+    /// the OTLP HTTP, OTLP gRPC, OTAP, Remote Write, and span surfaces at once.
+    pub max_ingest_lag: Duration,
 }
+
+/// Default `--shutdown-timeout`: the ceiling on the graceful-shutdown drain.
+/// Kept below [`K8S_DEFAULT_GRACE_PERIOD`] so the process finishes draining and
+/// exits on its own before Kubernetes escalates SIGTERM to SIGKILL, leaving
+/// headroom for the preStop hook and final flush that the operator half of
+/// issue #1291 configures.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Default `--max-ingest-lag`: how far behind ingest time a data point's event
+/// time may fall before admission rejects it as [`ravel_otlp::Rejection::TooOld`]
+/// (2h, ADR-0051 section 4). Sourced from [`ravel_catalog::DEFAULT_MAX_INGEST_LAG_NS`]
+/// so this server-side default cannot drift from the catalog listing window's
+/// own default; a test also pins it equal to the three OTLP limit defaults
+/// ([`ravel_otlp::IngestLimits`], [`ravel_otlp::LogIngestLimits`],
+/// [`ravel_otlp::SpanIngestLimits`]). One flag drives both the admission bound
+/// and the catalog window (see [`resolve_ingest_lag`]), so a deployment that
+/// leaves it unset sees byte-identical behavior to before the flag existed.
+pub const DEFAULT_MAX_INGEST_LAG: Duration =
+    Duration::from_nanos(ravel_catalog::DEFAULT_MAX_INGEST_LAG_NS as u64);
+
+/// The coordinated ingest-lag pair resolved from a single `--max-ingest-lag`
+/// value (ADR-0051 section 4): the catalog listing window and the OTLP admission
+/// bound, in nanoseconds. Kept as two fields, not one, so the invariant that
+/// makes late data discoverable -- the admission bound must never exceed the
+/// listing window -- is a value a validator can check, not merely a convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestLagConfig {
+    /// The catalog listing window (`ravel_catalog::CatalogConfig::max_ingest_lag_ns`):
+    /// how far behind a query's range start the commit listing extends. This is
+    /// what decides whether old data is *discoverable*.
+    pub catalog_window_ns: i64,
+    /// The OTLP admission bound
+    /// (`IngestLimits`/`LogIngestLimits`/`SpanIngestLimits::max_ingest_lag_ns`):
+    /// how far behind ingest time an event may lag before it is rejected as too
+    /// old. This is what decides whether old data is *admitted*.
+    pub admission_lag_ns: i64,
+}
+
+/// Why a configured ingest-lag pair was refused at startup: the admission bound
+/// exceeds the catalog listing window, so a point admitted in the gap between
+/// them would be stored and acknowledged yet invisible to every non-token query
+/// (ADR-0051, "Backfill and replay"). Both values are
+/// named so the operator can see the exact inconsistency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "admission max_ingest_lag of {admission_lag_ns} ns exceeds the catalog listing window of \
+     {catalog_window_ns} ns: a point admitted in that gap would be stored and acknowledged but \
+     invisible to every listing-window query. Widen the catalog window first, then the admission \
+     bound (ADR-0051)."
+)]
+pub struct IngestLagWindowError {
+    pub catalog_window_ns: i64,
+    pub admission_lag_ns: i64,
+}
+
+/// Build the coordinated ingest-lag pair from one resolved `--max-ingest-lag`
+/// duration. The catalog listing window is assigned FIRST, then the admission
+/// bound is derived from the same value, so ADR-0051's "widen the window first,
+/// then the admission bound" order holds by construction and the two can never
+/// be set inconsistently through this path. The validation is still run: it is
+/// the mechanical guard (the docs' "startup equality assertion") that a future
+/// edge which decouples the two is caught at startup rather than silently losing
+/// data, and it is what [`validate_ingest_lag_window`] pins by test.
+pub fn resolve_ingest_lag(max_ingest_lag: Duration) -> anyhow::Result<IngestLagConfig> {
+    let ns = crate::config::duration_nanos_saturating(max_ingest_lag);
+    // Window first, then admission bound: both from the same source, so the
+    // admission bound cannot exceed the window by construction.
+    let catalog_window_ns = ns;
+    let admission_lag_ns = ns;
+    validate_ingest_lag_window(catalog_window_ns, admission_lag_ns)?;
+    Ok(IngestLagConfig {
+        catalog_window_ns,
+        admission_lag_ns,
+    })
+}
+
+/// Refuse an ingest-lag pair whose admission bound exceeds the catalog listing
+/// window, with a typed [`IngestLagWindowError`] naming both values. Split out
+/// from [`resolve_ingest_lag`] so a test can drive an inconsistent pair through
+/// it directly: the production path always feeds it equal values, so this is the
+/// only way to exercise the refusal.
+pub fn validate_ingest_lag_window(
+    catalog_window_ns: i64,
+    admission_lag_ns: i64,
+) -> Result<(), IngestLagWindowError> {
+    if admission_lag_ns > catalog_window_ns {
+        Err(IngestLagWindowError {
+            catalog_window_ns,
+            admission_lag_ns,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Upper bound accepted for `--shutdown-timeout`. The CLI rejects a larger
+/// value at flag parse (`Cli::parse_shutdown_timeout`); `start` copies the
+/// public [`ServerConfig::shutdown_timeout`] field verbatim with no further
+/// check, so a library embedder that sets that field directly is the only
+/// caller who can carry a larger value into shutdown, where
+/// [`listener_join_budget`] multiplies it by four and `Duration`'s checked
+/// arithmetic would panic on an absurd value (a duration whose seconds exceed a
+/// quarter of `u64::MAX`), turning a fat-fingered flag into a crash at the
+/// moment the process is trying to shut down cleanly. One hour is far above any
+/// real grace period yet nowhere near the overflow point, so the cap only ever
+/// catches a mistake.
+pub const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// The Kubernetes default `terminationGracePeriodSeconds` (30s). Not read at
+/// runtime: it pins the invariant that [`DEFAULT_SHUTDOWN_TIMEOUT`] stays below
+/// the grace period, so the drain cannot be cut off mid-flight by a SIGKILL the
+/// process could have beaten. A test asserts the ordering numerically.
+pub const K8S_DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(30);
+
+/// Default [`ServerConfig::drain_settle_interval`]: how long
+/// [`Running::shutdown`] waits, after flipping readiness to draining, before it
+/// begins closing listeners. This gives an in-flight readiness probe time to
+/// observe 503 while the process is still routing, so Kubernetes stops sending
+/// new connections before the listeners actually close. Small and fixed: it is a
+/// settle delay, not part of the bounded drain budget. Tests set it to zero to
+/// avoid paying it on every in-process shutdown.
+pub const DEFAULT_DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
 /// leaves the background listener tasks detached; always shut down explicitly.
@@ -455,6 +899,27 @@ pub struct Running {
     /// The supervised background flush loop still owns the production cadence
     /// (`metadata_sink_task`); this handle shares the same `Arc`.
     pub metadata_sink: Option<Arc<ravel_ingest::MetadataSink>>,
+    /// The process's one query cost aggregator: the instance every query
+    /// surface records into and `/metrics` renders the `ravel_query_*` family
+    /// from. Public by design as a test seam, like [`Running::metadata_sink`]:
+    /// the per-query outcome split
+    /// ([`metrics::QueryAccountingMetrics::outcome_snapshot`]) is recorded on
+    /// every exit path, the failed ones included, but is not rendered on
+    /// `/metrics`, so an end-to-end test has no other way to assert that a
+    /// query which failed after execution still left a usage record.
+    pub query_accounting: Arc<metrics::QueryAccountingMetrics>,
+    /// The query service backing the public HTTP router's query surfaces,
+    /// `Some` in the query-serving modes that build one. Not layered onto the
+    /// router itself: the MCP adapter (issue #1381) is the in-process
+    /// transport that receives it, through its own router state rather than
+    /// an axum route.
+    pub query_service: Option<service::QueryService>,
+    /// The query service backing the mTLS router's query surfaces, `Some`
+    /// exactly when a query-serving mode was configured with an mTLS
+    /// listener. A separate instance from [`Running::query_service`] because
+    /// the two listeners authenticate against different resolvers; everything
+    /// else the controls need is shared between them.
+    pub mtls_query_service: Option<service::QueryService>,
     log_ingest_router: Option<Arc<LogIngestRouter>>,
     span_ingest_router: Option<Arc<SpanIngestRouter>>,
     fold_tasks: fold::FoldTasks,
@@ -468,87 +933,573 @@ pub struct Running {
     lifecycle_refresh_task: lifecycle_refresh::LifecycleRefreshTask,
     idle_tenant_state_task: idle_tenant_state::IdleTenantStateTask,
     metadata_sink_task: metadata_sink_task::MetadataSinkTask,
+    /// The query-audit pipeline (ADR-0062 decision 2b), `Some` exactly in the
+    /// query-serving modes that spawned one. `shutdown` drains it last, after
+    /// every query surface that could still submit to it has been signalled to
+    /// stop and, unless the listener join was abandoned at its sub-budget,
+    /// actually joined.
+    audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>>,
+    /// The bound on that drain: `--audit-max-age` plus [`AUDIT_DRAIN_GRACE`].
+    audit_drain_timeout: Duration,
+    /// The readiness handle, so [`Running::shutdown`] can flip it to draining
+    /// before any listener closes. The `/readyz` handler holds a clone; both
+    /// observe the same one-way drain latch.
+    readiness: health::Readiness,
+    /// The upper bound on the graceful-shutdown drain, copied from
+    /// [`ServerConfig::shutdown_timeout`].
+    shutdown_timeout: Duration,
+    /// The pre-close readiness settle delay, copied from
+    /// [`ServerConfig::drain_settle_interval`].
+    drain_settle_interval: Duration,
+    /// The ADR-0071 query-worker heartbeat handle, `Some` exactly when this
+    /// process spawned one (a `--distributed-query` query-serving mode with a
+    /// bound gRPC listener). [`Running::shutdown`] stops it before draining the
+    /// routers so a draining process stops advertising itself to sibling
+    /// coordinators.
+    query_worker_heartbeat: Option<QueryWorkerHeartbeat>,
+}
+
+/// Handle to the ADR-0071 query-worker heartbeat loop, held on [`Running`] so
+/// graceful shutdown stops it deterministically rather than leaving it detached.
+/// [`QueryWorkerHeartbeat::shutdown`] signals the loop, which deletes this
+/// process's `sys/query/workers/<uuid>` record before returning, then joins the
+/// task.
+///
+/// That join is unbounded on its own: the loop's final `delete_heartbeat` ends
+/// in [`ObjectStoreBackend::delete`], which takes no deadline. Every caller
+/// must therefore impose one; [`Running::shutdown`] uses
+/// [`heartbeat_stop_budget`].
+struct QueryWorkerHeartbeat {
+    shutdown: oneshot::Sender<()>,
+    handle: JoinHandle<()>,
+}
+
+impl QueryWorkerHeartbeat {
+    /// Stop the heartbeat loop and wait for it to delete its record and exit.
+    /// Unbounded by construction (see the type's own docs): call it under a
+    /// timeout. Dropping the returned future on that timeout detaches the task
+    /// rather than cancelling the delete, so a store that answers late can
+    /// still complete it before the process exits.
+    async fn shutdown(self) {
+        // The receiver is dropped only when the loop exits, so a send error
+        // means it already stopped; either way we then join it.
+        let _ = self.shutdown.send(());
+        if let Err(err) = self.handle.await {
+            tracing::warn!(
+                error = %err,
+                "query-worker heartbeat task did not exit cleanly during shutdown (panic or \
+                 cancellation)"
+            );
+        }
+    }
+}
+
+/// Flatten a listener task's `JoinHandle` result: a task that returned `Err`
+/// and a task that panicked (a `JoinError`) both become the `Err`, so neither a
+/// listener error nor a listener panic is silently swallowed.
+fn flatten_join(joined: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<()> {
+    match joined {
+        Ok(inner) => inner,
+        Err(join_err) => Err(anyhow::Error::new(join_err)),
+    }
+}
+
+/// The slice of `--shutdown-timeout` the listener join may consume before the
+/// rest of the drain must proceed. A listener held open by an in-flight request
+/// (a query can run to its own wall deadline, which the shipped defaults put
+/// ABOVE `--shutdown-timeout`) must not spend the whole budget joining sockets:
+/// the ingest flush is ATTEMPTED BEFORE this join, so a join that overruns this
+/// fraction is abandoned and the remaining shutdown steps still run within the
+/// overall budget. Four fifths leaves a reserve for those steps while still
+/// giving connections almost the full window to close cleanly.
+fn listener_join_budget(shutdown_timeout: Duration) -> Duration {
+    shutdown_timeout * 4 / 5
+}
+
+/// The bound on stopping the ADR-0071 heartbeat, expressed as a slice of
+/// `--shutdown-timeout`.
+///
+/// The stop cannot move inside the bounded drain block: the delete has to be
+/// ATTEMPTED while the listeners still serve, so a sibling coordinator drops
+/// this worker from its live set before the fragment socket disappears, and the
+/// drain block runs after the close signal. It therefore carries a bound of its
+/// own. It needs one: [`QueryWorkerHeartbeat::shutdown`] awaits a loop whose
+/// final step is [`ObjectStoreBackend::delete`], which takes no deadline, and
+/// the S3 backend retries a deadline-less operation internally for about
+/// `retry_timeout + request_timeout` (roughly 200s; the numbers are stated in
+/// `ravel_object_store::s3`, whose comment rests on every caller passing a
+/// deadline). Unbounded, an unreachable store holds the process there while the
+/// ingest buffers are still unflushed and the kubelet escalates to SIGKILL,
+/// which is the failure issue #1291 exists to fix.
+///
+/// A tenth of the budget is ample for one DELETE against a reachable store, and
+/// it runs concurrently with the pre-close readiness settle, so on the healthy
+/// path it costs nothing at all. It also keeps this bound plus
+/// `--shutdown-timeout` below [`K8S_DEFAULT_GRACE_PERIOD`] at the shipped
+/// defaults, which `default_shutdown_timeout_is_below_the_kubernetes_grace_period`
+/// pins. A delete cut off here self-corrects, but not instantly: the record
+/// ages out of a sibling's live set only once its stamp passes the staleness
+/// window (`liveness_factor * heartbeat_interval`, three heartbeat intervals,
+/// about 180s at the `ravel_fleet` defaults of a 60s interval and a factor of
+/// 3). For that whole window a sibling coordinator can still route a fragment
+/// to this draining worker; the delete-before-close ordering above is what
+/// keeps the healthy path from paying it.
+fn heartbeat_stop_budget(shutdown_timeout: Duration) -> Duration {
+    shutdown_timeout / 10
+}
+
+/// Await every (already-signalled) listener task and return the first error a
+/// listener surfaced (a returned `Err` or a panic), or `Ok(())` if all closed
+/// cleanly. Every task is awaited before any error is returned, so one listener
+/// erroring never leaves a sibling unjoined.
+async fn join_listeners(listener_tasks: Vec<JoinHandle<anyhow::Result<()>>>) -> anyhow::Result<()> {
+    let mut first_err: anyhow::Result<()> = Ok(());
+    for task in listener_tasks {
+        if let Err(err) = flatten_join(task.await)
+            && first_err.is_ok()
+        {
+            first_err = Err(err);
+        }
+    }
+    first_err
+}
+
+/// An ingest router whose shard actors graceful shutdown drains. Flushing takes
+/// `&self`, so it can be attempted regardless of how many clones are live (it
+/// does not, on its own, establish that every buffered record reached the
+/// store); joining the shard actors consumes the sole `Arc`
+/// owner. The trait exists so [`drain_router`] can be one helper over all three
+/// concrete routers (metrics, logs, spans) and be unit-tested against a fake,
+/// which is what pins the "flush always runs, join is best-effort" contract.
+trait DrainRouter: Send + Sync + 'static {
+    /// Attempt to flush every shard buffer. `&self`, so it runs even while
+    /// another task still holds a clone of this router.
+    fn flush_all(&self) -> impl std::future::Future<Output = ()> + Send;
+    /// Join the shard actors, consuming the sole owner.
+    fn join_actors(self) -> impl std::future::Future<Output = ()> + Send;
+}
+
+impl DrainRouter for IngestRouter {
+    fn flush_all(&self) -> impl std::future::Future<Output = ()> + Send {
+        IngestRouter::flush_all(self)
+    }
+    fn join_actors(self) -> impl std::future::Future<Output = ()> + Send {
+        self.shutdown()
+    }
+}
+
+impl DrainRouter for LogIngestRouter {
+    fn flush_all(&self) -> impl std::future::Future<Output = ()> + Send {
+        LogIngestRouter::flush_all(self)
+    }
+    fn join_actors(self) -> impl std::future::Future<Output = ()> + Send {
+        self.shutdown()
+    }
+}
+
+impl DrainRouter for SpanIngestRouter {
+    fn flush_all(&self) -> impl std::future::Future<Output = ()> + Send {
+        SpanIngestRouter::flush_all(self)
+    }
+    fn join_actors(self) -> impl std::future::Future<Output = ()> + Send {
+        self.shutdown()
+    }
+}
+
+/// The ingest health sources the readiness probe consults (issue #1299).
+///
+/// Deliberately returns the router's METRICS handle, never a clone of the
+/// router `Arc` itself. `drain_router` below joins the shard actors only when
+/// it is the sole `Arc` owner, and `readiness` lives for the whole process, so
+/// a router clone parked in readiness makes that `Arc::try_unwrap` fail on
+/// every graceful shutdown and the actors are never joined. The metrics handle
+/// carries the same condemned-shard count, is shared by design, and keeps
+/// reading correctly after the router itself is dropped, which a `Weak` would
+/// not.
+fn ingest_health_sources(router: Option<&Arc<IngestRouter>>) -> Vec<Arc<dyn health::IngestHealth>> {
+    router
+        .map(|router| vec![router.metrics_handle() as Arc<dyn health::IngestHealth>])
+        .unwrap_or_default()
+}
+
+/// Attempt to flush a router's buffers, then join its shard actors only as a
+/// best-effort step. The flush ALWAYS runs (it takes `&self`); the join runs
+/// only when this is the sole `Arc` owner, because joining consumes the router.
+/// If another task still holds a clone the flush still runs but the actors are
+/// not joined, which is safe: the join only reaps the actors and adds no
+/// durability that the flush did not already attempt. Factored out of
+/// [`Running::shutdown`] so the "flush is unconditional, join is best-effort"
+/// contract is unit-testable; deleting the flush here makes that test fail
+/// rather than passing on the incidental flush a later owner's own shutdown
+/// would perform.
+async fn drain_router<R: DrainRouter>(router: Option<Arc<R>>, label: &str) {
+    let Some(router) = router else {
+        return;
+    };
+    router.flush_all().await;
+    match Arc::try_unwrap(router) {
+        Ok(sole) => sole.join_actors().await,
+        Err(_) => tracing::warn!(
+            "{label} ingest router still has outstanding references; ingest flush completed, shard \
+             actors not joined"
+        ),
+    }
 }
 
 impl Running {
-    /// Stops accepting new connections, waits for both listeners to drain,
-    /// then flushes and joins every ingest shard actor: metrics, logs, and
-    /// spans alike.
+    /// Whether `start` spawned a query-audit pipeline for this process
+    /// (`true` in [`Mode::All`]/[`Mode::Query`], `false` in
+    /// [`Mode::Maintain`]/[`Mode::Gateway`], which serve no query surface).
+    pub fn has_audit_pipeline(&self) -> bool {
+        self.audit_pipeline.is_some()
+    }
+
+    /// Gracefully stop the server: flip readiness to draining so a probe sees
+    /// 503 before any listener closes, delete the ADR-0071 heartbeat
+    /// concurrently with a short settle wait, then attempt to flush ingest
+    /// buffers before joining the listeners, join the listeners under their own
+    /// sub-budget, and join the shard actors and background tasks.
+    ///
+    /// Every step carries a bound. The drain from the listener close signal
+    /// onwards is bounded by `--shutdown-timeout`, with the listener join carved
+    /// into its own sub-budget inside it; the heartbeat stop runs ahead of that
+    /// close signal and so carries a tenth of `--shutdown-timeout` as its own
+    /// bound instead. Nothing on the path awaits an object-store operation
+    /// without a bound above it.
+    ///
+    /// The flush runs BEFORE the listener join precisely so the listener join
+    /// cannot consume the budget the flush needs: a connection held open to its
+    /// wall deadline (above `--shutdown-timeout` by default) cannot stop the
+    /// flush from being attempted. A listener error is surfaced only after the
+    /// drain runs, never in place of it; a drain that overruns the timeout
+    /// returns an error so the process exits non-zero rather than reporting a
+    /// clean shutdown it did not achieve. The query-audit pipeline is drained
+    /// last of all, inside that same budget.
     pub async fn shutdown(self) -> anyhow::Result<()> {
-        let _ = self.http_shutdown.send(());
-        self.http_task.await??;
+        let Running {
+            http_shutdown,
+            http_task,
+            grpc_shutdown,
+            grpc_task,
+            mtls_shutdown,
+            mtls_task,
+            fragment_shutdown,
+            fragment_task,
+            ingest_router,
+            log_ingest_router,
+            span_ingest_router,
+            fold_tasks,
+            maintenance_tasks,
+            alert_tasks,
+            jwks_refresh_task,
+            store_probe_task,
+            admission_reconcile_task,
+            query_admission_reconcile_task,
+            scrub_task,
+            lifecycle_refresh_task,
+            idle_tenant_state_task,
+            metadata_sink_task,
+            audit_pipeline,
+            audit_drain_timeout,
+            readiness,
+            shutdown_timeout,
+            drain_settle_interval,
+            query_worker_heartbeat,
+            // `..` drops the fields with no shutdown behavior: the bound addresses
+            // and the `metadata_sink`/`query_service`/`mtls_query_service`
+            // handles. The struct has no `Drop`, so they are released here. This
+            // is load-bearing: a future field holding a *clone* of an ingest
+            // router would be dropped silently here, keeping that clone alive and
+            // making the best-effort `try_unwrap` join in `drain_router` fail on
+            // every shutdown. Name any such field explicitly above and release it
+            // before the router join.
+            ..
+        } = self;
 
-        if let Some(tx) = self.grpc_shutdown {
-            let _ = tx.send(());
-        }
-        if let Some(task) = self.grpc_task {
-            task.await??;
-        }
-
-        if let Some(tx) = self.mtls_shutdown {
-            let _ = tx.send(());
-        }
-        if let Some(task) = self.mtls_task {
-            task.await??;
-        }
-
-        if let Some(tx) = self.fragment_shutdown {
-            let _ = tx.send(());
-        }
-        if let Some(task) = self.fragment_task {
-            task.await??;
-        }
-
-        if let Some(router) = self.ingest_router {
-            match Arc::try_unwrap(router) {
-                Ok(router) => router.shutdown().await,
-                Err(_) => {
+        // Flip readiness to draining FIRST, before any listener closes, and stop
+        // the ADR-0071 heartbeat CONCURRENTLY with the settle wait. Deleting the
+        // heartbeat record while the fragment listener is still open lets a
+        // sibling coordinator drop this worker from its live set before the
+        // socket closes, instead of routing a fragment to a listener that is
+        // about to disappear mid-join. The settle wait then gives an in-flight
+        // `/readyz` probe time to observe 503 over the still-open listeners, so
+        // Kubernetes stops sending new connections before they close.
+        //
+        // That stop carries `heartbeat_stop_budget` rather than the drain
+        // block's `--shutdown-timeout`, because it has to run BEFORE the close
+        // signal below and it awaits a deadline-less object-store DELETE:
+        // unbounded, an unreachable store would hold the process here with
+        // every ingest buffer still unflushed.
+        readiness.begin_drain();
+        let settle = tokio::time::sleep(drain_settle_interval);
+        match query_worker_heartbeat {
+            Some(heartbeat) => {
+                let heartbeat_budget = heartbeat_stop_budget(shutdown_timeout);
+                let stop = tokio::time::timeout(heartbeat_budget, heartbeat.shutdown());
+                let (stopped, _) = tokio::join!(stop, settle);
+                if stopped.is_err() {
                     tracing::warn!(
-                        "ingest router still has outstanding references; shard actors not drained"
+                        timeout_ms = heartbeat_budget.as_millis(),
+                        "query-worker heartbeat stop did not finish within its bound; proceeding \
+                         with the drain, and the record ages out of sibling live sets on its own"
                     );
                 }
             }
+            None => settle.await,
         }
 
-        if let Some(router) = self.log_ingest_router {
-            match Arc::try_unwrap(router) {
-                Ok(router) => router.shutdown().await,
-                Err(_) => {
-                    tracing::warn!(
-                        "log ingest router still has outstanding references; shard actors not \
-                         drained"
-                    );
+        // Signal every listener to stop. These sends are synchronous; the tasks
+        // close their sockets and finish on their own, joined below.
+        let _ = http_shutdown.send(());
+        if let Some(tx) = grpc_shutdown {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = mtls_shutdown {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = fragment_shutdown {
+            let _ = tx.send(());
+        }
+
+        let mut listener_tasks: Vec<JoinHandle<anyhow::Result<()>>> = vec![http_task];
+        listener_tasks.extend(grpc_task);
+        listener_tasks.extend(mtls_task);
+        listener_tasks.extend(fragment_task);
+
+        // A listener error captured inside the drain must survive even if the
+        // OUTER `--shutdown-timeout` fires and drops the drain future, so it is
+        // parked here rather than returned out of `drain`.
+        let listener_err_cell: Arc<std::sync::Mutex<Option<anyhow::Error>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let listener_err_writer = listener_err_cell.clone();
+
+        // Whether the three ingest `flush_all` calls (the FIRST steps of the
+        // drain) completed. The outer `--shutdown-timeout` can fire DURING that
+        // flush against an unreachable store -- `IngestRouter::flush_all` awaits
+        // a per-shard flush bounded only by `max_flush_lifetime` (an hour by
+        // default), far above the drain budget -- and in that case nothing is
+        // durable. Set true only after all three flushes return, and read when
+        // building the overrun error so the operator-facing line states which
+        // side of the flush the timeout cut on, rather than asserting a
+        // durability fact the drain never reached.
+        let flush_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flush_completed_writer = flush_completed.clone();
+
+        // The drain, bounded as a whole by `--shutdown-timeout`, with the
+        // listener join carved out its OWN inner sub-budget so a connection held
+        // open to its wall deadline cannot starve the remaining steps.
+        let drain = async move {
+            // Attempt the flush BEFORE joining the listeners. `flush_all` takes
+            // `&self`, so it runs regardless of how long the listeners take to
+            // close; it does not on its own establish that every record reached
+            // the store (see the note after the calls). The shard actors are
+            // joined later, once the listeners and the idle-tenant sweep have
+            // released their router clones.
+            if let Some(router) = ingest_router.as_ref() {
+                router.flush_all().await;
+            }
+            if let Some(router) = log_ingest_router.as_ref() {
+                router.flush_all().await;
+            }
+            if let Some(router) = span_ingest_router.as_ref() {
+                router.flush_all().await;
+            }
+            // The ingest flush has now completed for every buffered record: each
+            // is durable, or was abandoned after exhausting its retry budget, and
+            // `flush_all` returns either way. The flag therefore records that the
+            // flush RETURNED, not that every record reached the store. A later
+            // overrun of the outer budget can still cut off a background-task
+            // join, but not the flush; an overrun that fires before this point
+            // leaves this false and the error says the records may not be durable.
+            // In query/maintain mode all three routers are absent, so this marks
+            // the completion of a no-op flush: vacuously true, and correct, since
+            // there was nothing left unflushed.
+            flush_completed_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+
+            // Join the listeners under their own budget. The flush above has
+            // already been attempted for every buffered record, so a join that
+            // overruns is abandoned (logged) and the rest of the drain still
+            // runs within the overall budget. A listener error is parked and
+            // surfaced by the caller only after the whole drain has run, never
+            // in place of it.
+            match tokio::time::timeout(
+                listener_join_budget(shutdown_timeout),
+                join_listeners(listener_tasks),
+            )
+            .await
+            {
+                Ok(Err(err)) => {
+                    if let Ok(mut slot) = listener_err_writer.lock() {
+                        *slot = Some(err);
+                    }
+                }
+                Ok(Ok(())) => {}
+                Err(_) => tracing::warn!(
+                    "listener join exceeded its shutdown sub-budget; abandoning the join and \
+                     proceeding to drain (the ingest flush already completed)"
+                ),
+            }
+
+            // Stop the idle-tenant sweep, which holds a strong clone of each
+            // ingest router; releasing those clones is what lets the best-effort
+            // `try_unwrap` join in `drain_router` succeed.
+            idle_tenant_state_task.shutdown().await;
+
+            // Flush again (idempotent; catches anything buffered while the
+            // listeners closed) and best-effort join each router's shard actors.
+            drain_router(ingest_router, "metrics").await;
+            drain_router(log_ingest_router, "log").await;
+            drain_router(span_ingest_router, "span").await;
+
+            fold_tasks.shutdown().await;
+            maintenance_tasks.shutdown().await;
+            alert_tasks.shutdown().await;
+            jwks_refresh_task.shutdown().await;
+            store_probe_task.shutdown().await;
+            admission_reconcile_task.shutdown().await;
+            query_admission_reconcile_task.shutdown().await;
+            scrub_task.shutdown().await;
+            lifecycle_refresh_task.shutdown().await;
+            // Last among the task shutdowns: its final flush writes whatever the
+            // in-progress window observed, so it runs after the ingest surfaces
+            // that feed it have been signalled and the shard actors drained. On
+            // the normal path those surfaces are also joined by now and nothing
+            // can feed it after this point. On the abandoned-join path above a
+            // listener may still be accepting, so the ordering is a preference
+            // rather than a guarantee: metadata observed after this flush is not
+            // persisted by this process, and the next process to see the series
+            // writes it on its own window.
+            metadata_sink_task.shutdown().await;
+
+            // The query-audit pipeline drains last of all, inside this block so
+            // `--shutdown-timeout` bounds it too and an audit drain that hangs
+            // cannot outlive the grace period. Every query surface that could
+            // submit to it has been signalled to stop, and on the normal path
+            // the HTTP/gRPC/mTLS listener tasks above have been joined, so
+            // nothing can submit after this drain. On the abandoned-join path
+            // (the join overran its sub-budget and was logged) a listener may
+            // still be serving, so a submission CAN arrive during or after this
+            // drain. That is safe without reordering anything:
+            // `AuditPipeline::submit` has a stopped fast path that returns an
+            // error rather than panicking, and in the required audit mode the
+            // late query fails closed on that error instead of answering
+            // unaudited.
+            //
+            // Doubly bounded: the drain awaits a flush that ends in object-store
+            // calls, and an unreachable store would otherwise hold the process
+            // open with every listener already stopped. On its own inner bound,
+            // the records still in the batch are lost and the warning says so;
+            // the pipeline's `Drop` has already signalled the flush task, so a
+            // store that recovers within the process's remaining lifetime can
+            // still complete the write.
+            if let Some(pipeline) = audit_pipeline {
+                match tokio::time::timeout(audit_drain_timeout, pipeline.shutdown()).await {
+                    Ok(result) => result?,
+                    Err(_) => tracing::warn!(
+                        timeout_ms = audit_drain_timeout.as_millis(),
+                        "query-audit drain did not finish within its bound; shutting down without \
+                         it, so records still buffered may not be durable"
+                    ),
                 }
             }
+
+            Ok(())
+        };
+
+        let outcome: Result<anyhow::Result<()>, tokio::time::error::Elapsed> =
+            tokio::time::timeout(shutdown_timeout, drain).await;
+        let timed_out = outcome.is_err();
+        let drain_err = outcome.ok().and_then(anyhow::Result::err);
+        let captured = listener_err_cell
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        let flushed = flush_completed.load(std::sync::atomic::Ordering::SeqCst);
+        shutdown_outcome(timed_out, flushed, drain_err, captured, shutdown_timeout)
+    }
+}
+
+/// Map the drain outcome to `shutdown`'s return value. A drain that overran
+/// `--shutdown-timeout` is an ERROR, not a swallowed success, and the process
+/// must exit non-zero and log at error level rather than report a clean
+/// shutdown. The overrun wording is conditional on `flush_completed`: the
+/// ingest flush is the FIRST step of the drain, so an overrun can land after it
+/// (the flush returned, some background join unfinished) or during it (an
+/// unreachable store whose per-shard flush deadline dwarfs the drain budget,
+/// the flush never returned). On the second path nothing is durable, so the
+/// message must not claim any flush happened, or an operator greps the line,
+/// reads that it did, and does not investigate the loss.
+///
+/// On the FIRST path the honest sentence is "the ingest flush completed", not
+/// "buffered records were flushed": `flush_completed` records only that the
+/// three `flush_all` calls RETURNED. `flush_all` returns identically on success
+/// and on abandonment -- a shard whose data PUT or commit publish exhausts its
+/// retry budget latches the abandoned counter, acks the write as abandoned, and
+/// returns Ok -- so a returned flush does NOT establish that every record
+/// reached the store. Claiming the records were flushed would assert durability
+/// the flag never proves; "the flush completed" is exactly what it knows.
+///
+/// Three failures can be live at once, so they are ranked rather than raced. An
+/// overrun outranks both others: the drain was cut off, so nothing after that
+/// point ran at all. Below it, a `drain_err` (today only the query-audit
+/// pipeline's own drain, the last step in the block) outranks a captured
+/// listener error, because a listener error is deliberately parked and surfaced
+/// only after the drain has run, never in place of it.
+///
+/// The lower-ranked error is not dropped, and the ranking has to survive into
+/// the rendering an operator actually reads. anyhow's `Display` for a context
+/// error prints ONLY the context and demotes what it wraps to `source()`, and
+/// `main.rs` logs this with `%err`, which is `Display`. So the higher-ranked
+/// error becomes the CONTEXT and the lower-ranked one the wrapped error: the
+/// single structured line leads with the overrun (or the drain error) and still
+/// says a listener errored, and the listener error's own text stays reachable as
+/// the `source()` that `{:#}` and the `Debug` dump both render. Wrapping the
+/// other way round put the LISTENER message in that line and demoted the
+/// overrun to a cause, so the one line an operator greps omitted the fact that
+/// the drain was cut off.
+fn shutdown_outcome(
+    timed_out: bool,
+    flush_completed: bool,
+    drain_err: Option<anyhow::Error>,
+    captured_listener_err: Option<anyhow::Error>,
+    shutdown_timeout: Duration,
+) -> anyhow::Result<()> {
+    let primary = if timed_out {
+        // The ingest flush is the FIRST step of the drain, so an overrun can
+        // land on either side of it. Only say the flush completed when
+        // `flush_completed` says the three `flush_all` calls actually returned;
+        // even then that is all it establishes (a flush abandons on retry-budget
+        // exhaustion and returns just as it does on success), so the message
+        // states the flush completed, not that the records were flushed. An
+        // overrun that fired during the flush (an unreachable store, whose
+        // per-shard flush deadline dwarfs the drain budget) has nothing durable,
+        // and the operator must be told to investigate loss, not reassured.
+        let msg = if flush_completed {
+            format!(
+                "graceful shutdown drain exceeded --shutdown-timeout ({shutdown_timeout:?}); \
+                 the ingest flush completed but shutdown did not complete cleanly"
+            )
+        } else {
+            format!(
+                "graceful shutdown drain exceeded --shutdown-timeout ({shutdown_timeout:?}) \
+                 before the ingest flush completed; buffered records may not be durable"
+            )
+        };
+        Some(anyhow::anyhow!(msg))
+    } else {
+        drain_err
+    };
+    match (primary, captured_listener_err) {
+        (Some(primary), Some(listener_err)) => {
+            // `{primary:#}` so the headline carries the primary's own chain
+            // too, not just its outermost message.
+            Err(listener_err.context(format!(
+                "{primary:#}; a listener also errored during shutdown"
+            )))
         }
-
-        if let Some(router) = self.span_ingest_router {
-            match Arc::try_unwrap(router) {
-                Ok(router) => router.shutdown().await,
-                Err(_) => {
-                    tracing::warn!(
-                        "span ingest router still has outstanding references; shard actors not \
-                         drained"
-                    );
-                }
-            }
-        }
-
-        self.fold_tasks.shutdown().await;
-        self.maintenance_tasks.shutdown().await;
-        self.alert_tasks.shutdown().await;
-        self.jwks_refresh_task.shutdown().await;
-        self.store_probe_task.shutdown().await;
-        self.admission_reconcile_task.shutdown().await;
-        self.query_admission_reconcile_task.shutdown().await;
-        self.scrub_task.shutdown().await;
-        self.lifecycle_refresh_task.shutdown().await;
-        self.idle_tenant_state_task.shutdown().await;
-        // Last: its final flush writes whatever the in-progress window
-        // observed, and it must not race the ingest surfaces that feed it.
-        self.metadata_sink_task.shutdown().await;
-
-        Ok(())
+        (Some(primary), None) => Err(primary),
+        (None, Some(listener_err)) => Err(listener_err),
+        (None, None) => Ok(()),
     }
 }
 
@@ -564,38 +1515,54 @@ fn gateway_state(
     provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
     ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
     ingest_byte_metrics: &Arc<ingest_byte_metrics::IngestByteMetrics>,
+    normalize_reject_metrics: &Arc<normalize_reject_metrics::NormalizeRejectMetrics>,
+    ingest_buffer_budget: &Arc<ravel_ingest::IngestByteBudget>,
     metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
+    max_ingest_lag_ns: i64,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
         ingest: ingest::IngestState {
             router: ingest_router.clone(),
-            limits: IngestLimits::default(),
+            limits: IngestLimits {
+                max_ingest_lag_ns,
+                ..IngestLimits::default()
+            },
             ack_deadline: DEFAULT_ACK_DEADLINE,
             admission: admission.clone(),
             recovery: recovery.clone(),
             provisioning: provisioning.clone(),
             metadata_sink: metadata_sink.clone(),
+            normalize_metrics: normalize_reject_metrics.clone(),
         },
         logs_ingest: logs_ingest::LogIngestState {
             router: log_ingest_router.clone(),
-            limits: LogIngestLimits::default(),
+            limits: LogIngestLimits {
+                max_ingest_lag_ns,
+                ..LogIngestLimits::default()
+            },
             ack_deadline: DEFAULT_ACK_DEADLINE,
             admission: admission.clone(),
             store: store.clone(),
             recovery: recovery.clone(),
             provisioning: provisioning.clone(),
+            normalize_metrics: normalize_reject_metrics.clone(),
         },
         traces_ingest: traces_ingest::SpanIngestState {
             router: span_ingest_router.clone(),
-            limits: SpanIngestLimits::default(),
+            limits: SpanIngestLimits {
+                max_ingest_lag_ns,
+                ..SpanIngestLimits::default()
+            },
             ack_deadline: DEFAULT_ACK_DEADLINE,
             admission: admission.clone(),
             store: store.clone(),
             recovery: recovery.clone(),
             provisioning: provisioning.clone(),
+            normalize_metrics: normalize_reject_metrics.clone(),
         },
         admission: admission.clone(),
+        budget: ingest_buffer_budget.clone(),
         ingest_concurrency: ingest_concurrency.clone(),
         ingest_byte_metrics: ingest_byte_metrics.clone(),
     })
@@ -610,11 +1577,16 @@ fn remote_write_state(
     provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
     ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
     metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
+    ingest_buffer_budget: &Arc<ravel_ingest::IngestByteBudget>,
+    max_ingest_lag_ns: i64,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
         tenant_resolver,
         router: ingest_router.clone(),
-        limits: IngestLimits::default(),
+        limits: IngestLimits {
+            max_ingest_lag_ns,
+            ..IngestLimits::default()
+        },
         ack_deadline: DEFAULT_ACK_DEADLINE,
         metrics: remote_write::RemoteWriteMetrics::default(),
         admission: admission.clone(),
@@ -623,6 +1595,37 @@ fn remote_write_state(
         ingest_concurrency: ingest_concurrency.clone(),
         clock: Arc::new(SystemClock),
         metadata_sink: metadata_sink.clone(),
+        budget: ingest_buffer_budget.clone(),
+    })
+}
+
+/// The MCP route's settings, for one listener (ADR-1374 decision 3).
+///
+/// `engine_config` is the engine's own resolved ceilings, which is what every
+/// tool call's budgets clamp down to; the MCP-layer ceilings stay at their D6
+/// defaults, because the flags configure the request body cap and the origin
+/// allowlist, not the response-byte ceiling. `protection_horizon_ns` is the
+/// deployment's GC horizon as a duration; the adapter subtracts it from each
+/// call's own instant to get the oldest instant a cursor may still name.
+#[cfg(feature = "mcp")]
+fn mcp_settings(
+    config: &ServerConfig,
+    engine_config: &ravel_query::EngineConfig,
+) -> anyhow::Result<mcp::McpSettings> {
+    let mcp_config = &config.query_budgets.mcp;
+    let max_body_bytes = usize::try_from(mcp_config.max_body_bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "--mcp-max-body-bytes {} exceeds this platform's addressable size",
+            mcp_config.max_body_bytes
+        )
+    })?;
+    Ok(mcp::McpSettings {
+        allowed_origins: mcp_config.allowed_origins.clone(),
+        max_body_bytes,
+        engine_config: *engine_config,
+        budget_config: ravel_mcp::budget::McpBudgetConfig::default(),
+        protection_horizon_ns: config.gc.protection_horizon_ns,
+        clock: Arc::new(SystemClock),
     })
 }
 
@@ -906,6 +1909,14 @@ pub async fn start(
     // wire-bytes family sums the same tenants the admission family does.
     let ingest_byte_metrics = Arc::new(ingest_byte_metrics::IngestByteMetrics::new());
 
+    // Normalization-layer admission counters (ADR-0051 section 3, layer 3), on
+    // the same terms: one shared instance per process, threaded into every
+    // ingest surface (OTLP HTTP and gRPC, OTAP, both listeners) and read at
+    // scrape time. Sharing the instance is what makes the `skew` and
+    // `structural` reasons transport-independent.
+    let normalize_reject_metrics =
+        Arc::new(normalize_reject_metrics::NormalizeRejectMetrics::new());
+
     // Per-query cost aggregator (ADR-0044 section 4): one per
     // process, shared with every query handler below and read at scrape time by
     // the `/metrics` route. Its per-tenant allowlist is the tenants an operator
@@ -932,13 +1943,34 @@ pub async fn start(
     // ADR-0076 decision 2 per-tenant PUT attribution family the same way.
     let metrics_tenant_allowlist = Arc::new(metrics_tenant_allowlist);
 
+    // The ADR-1170 process-wide memory accountant, sized from
+    // `ResolvedPerformanceDefaults::memory_remainder_bytes` (the shared
+    // headroom left after both hard cache carves, `main`'s
+    // `config.process_memory_budget_bytes`). Built once, here, before
+    // `metrics_state` and the `sql`-featured executor below so both install
+    // the SAME instance rather than two independently drifting counters: the
+    // SQL executor reserves against it via
+    // `SqlExecutor::with_process_memory_budget`, and the `/metrics` gauges
+    // read it back at scrape time.
+    let process_memory_budget = Arc::new(ravel_memory::MemoryBudget::new(
+        config.process_memory_budget_bytes,
+    ));
+
     // Liveness/readiness routes are served in every mode, including
     // maintain (whose router is otherwise empty). `readiness` starts false
     // and is latched to true below, once both listeners are bound and the
     // capability gate (enforced in `store::build_store` before `start` is
     // called) has already passed. Merged like every other mode's routes, so
     // `/healthz` truly reflects "the axum server task can route requests".
-    let readiness = health::Readiness::new();
+    // Wire the metrics ingest router's shard-supervisor health into readiness
+    // (issue #1299): once one of its shard actors exhausts its respawn budget
+    // and is condemned, `/readyz` turns 503, which sheds traffic (Kubernetes
+    // drops the pod from its Service endpoints) but does not restart or
+    // reschedule the pod, so an operator has to roll it. The log and span
+    // routers do not yet respawn or condemn (they share the same
+    // single-point-of-permanent-failure spawn), so they contribute no source.
+    let readiness =
+        health::Readiness::new().with_ingest_health(ingest_health_sources(ingest_router.as_ref()));
     let mut http_router = Router::new().merge(health::router(readiness.clone()));
     // The dedicated mTLS listener's router (ADR-0050 section 1): built up in
     // parallel with `http_router` below, merging the same tenant-resolving
@@ -947,6 +1979,21 @@ pub async fn start(
     // configured. Deliberately serves no health or metrics routes - those
     // carry no tenant identity and stay on the public listener only.
     let mut mtls_router = Router::new();
+    // The per-listener query service layers, kept on `Running` so an
+    // in-process transport takes the one belonging to the listener it serves
+    // rather than whichever instance it can reach.
+    let mut query_service_handle: Option<service::QueryService> = None;
+    let mut mtls_query_service_handle: Option<service::QueryService> = None;
+    // The process's one query-audit pipeline (ADR-0062 decision 2b), `Some`
+    // exactly in the query-serving modes that spawn one; carried out to
+    // `Running` so `shutdown` can drain it.
+    let mut running_audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>> = None;
+    // The coordinated ingest-lag pair (ADR-0051 section 4), resolved once here so
+    // the catalog listing window and every OTLP admission bound below are built
+    // from the same value. `resolve_ingest_lag` assigns the window first and
+    // derives the admission bound from it, so the "widen the window first" order
+    // holds by construction, and it validates the pair before either is built.
+    let ingest_lag = resolve_ingest_lag(config.max_ingest_lag)?;
     if let (Some(router), Some(log_router), Some(span_router)) =
         (&ingest_router, &log_ingest_router, &span_ingest_router)
     {
@@ -961,7 +2008,10 @@ pub async fn start(
             &provisioning_writer,
             &ingest_concurrency,
             &ingest_byte_metrics,
+            &normalize_reject_metrics,
+            &ingest_buffer_budget,
             &metadata_sink,
+            ingest_lag.admission_lag_ns,
         );
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(
@@ -972,6 +2022,8 @@ pub async fn start(
             &provisioning_writer,
             &ingest_concurrency,
             &metadata_sink,
+            &ingest_buffer_budget,
+            ingest_lag.admission_lag_ns,
         );
         http_router = http_router.merge(remote_write::router(rw_state));
 
@@ -987,7 +2039,10 @@ pub async fn start(
                 &provisioning_writer,
                 &ingest_concurrency,
                 &ingest_byte_metrics,
+                &normalize_reject_metrics,
+                &ingest_buffer_budget,
                 &metadata_sink,
+                ingest_lag.admission_lag_ns,
             );
             let mtls_rw_state = remote_write_state(
                 router,
@@ -997,6 +2052,8 @@ pub async fn start(
                 &provisioning_writer,
                 &ingest_concurrency,
                 &metadata_sink,
+                &ingest_buffer_budget,
+                ingest_lag.admission_lag_ns,
             );
             mtls_router = mtls_router
                 .merge(otlp_http::router(mtls_state))
@@ -1007,8 +2064,10 @@ pub async fn start(
         store.clone(),
         config.shard_count,
         config.disable_cache,
-        config.cache_max_bytes,
+        config.catalog_cache_max_bytes,
         config.cache_dir.clone(),
+        config.catalog_resolve_concurrency,
+        Some(ingest_lag.catalog_window_ns),
     )?;
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
     // The two cache flags reach the catalog byte cache here, not only the
@@ -1056,6 +2115,18 @@ pub async fn start(
         tracker
     });
 
+    // ADR-1195: the single process-owned GET concurrency limiter. Every
+    // fetcher this process constructs (RSEG, RLOG, RSPAN, in-process or
+    // distributed) shares this one `Arc`, so `--store-get-concurrency` (or
+    // the legacy `--fetch-concurrency`) bounds concurrent object-store GETs
+    // process-wide rather than per fetcher. Built from `config.query_budgets`
+    // directly, ahead of `engine_config` below, because the distributed
+    // fragment service's fetcher is constructed before that point.
+    let get_limiter = Arc::new(
+        ravel_query::GetLimiter::new(config.query_budgets.store_get_concurrency)
+            .map_err(|err| anyhow::anyhow!("invalid store GET concurrency: {err}"))?,
+    );
+
     // --- ADR-0071 distributed read fan-out scaffolding ---
     // The coordinator (a `RoutingSliceFetcher` wrapped in a `Distributed`), the
     // worker-side `FragmentService`, and their shared `FragmentMetrics` are
@@ -1095,6 +2166,7 @@ pub async fn start(
             cache.clone(),
             Arc::new(SystemClock),
             metrics.clone(),
+            get_limiter.clone(),
         );
         // When this process runs a dedicated TLS fragment listener (ADR-0071
         // amendment decision 1), its coordinator dials remote workers' TLS
@@ -1128,11 +2200,17 @@ pub async fn start(
         distributed = None;
     }
 
+    // Built in every mode, like `admission` itself, so `/metrics` can render
+    // the reconciliation family unconditionally. The reconciliation loop that
+    // adds to it is spawned only in the ingest-serving modes below; in the
+    // others it stays at the zero every counter starts from.
+    let reconcile_cycle_metrics = Arc::new(admission_reconcile::ReconcileCycleMetrics::default());
+
     // Mounted unconditionally: the store and catalog above are built in every
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
     // where today only /healthz and /readyz exist. Cloned here, before
     // `catalog` is moved into `fold::spawn` below in every non-maintain mode.
-    let metrics_state = metrics::MetricsState {
+    let mut metrics_state = metrics::MetricsState {
         mode: config.mode,
         store_metrics,
         ingest_router: ingest_router.clone(),
@@ -1148,7 +2226,11 @@ pub async fn start(
         cache_disk_metrics: cache.as_ref().and_then(|c| c.disk_metrics()),
         catalog_cache_metrics: catalog.byte_cache_metrics(),
         catalog_cache_disk_metrics: catalog.byte_cache_disk_metrics(),
+        cache: cache.clone(),
+        cache_max_bytes: config.cache_max_bytes,
+        catalog_cache_max_bytes: config.catalog_cache_max_bytes,
         admission: admission.clone(),
+        reconcile_cycle: reconcile_cycle_metrics.clone(),
         metrics_tenant_labels: config.metrics_tenant_labels,
         query_accounting: query_accounting.clone(),
         metrics_tenant_allowlist: metrics_tenant_allowlist.clone(),
@@ -1157,9 +2239,15 @@ pub async fn start(
         distrib: distrib_metrics.clone(),
         durable_auth: durable_auth.clone(),
         ingest_byte_metrics: ingest_byte_metrics.clone(),
+        normalize_reject_metrics: normalize_reject_metrics.clone(),
         metadata_cache: metadata_cache.clone(),
+        // Filled in below, once the query-serving block has spawned the
+        // pipeline; the metrics router is merged after that block for the
+        // same reason.
+        audit_pipeline: None,
+        process_memory_budget: process_memory_budget.clone(),
+        process_memory_budget_is_fallback: config.process_memory_budget_is_fallback,
     };
-    http_router = http_router.merge(metrics::router(metrics_state));
 
     // Held past the HTTP wiring so the Flight SQL service can register
     // against the same executor rather than building a second one; `None`
@@ -1206,7 +2294,32 @@ pub async fn start(
     // same store.
     let mut alert_tasks = alerting::AlertEvalTasks::none();
 
-    if matches!(config.mode, Mode::All | Mode::Query) {
+    if config.mode.installs_query_audit_pipeline() {
+        // ADR-0062 decision 2b: one AuditPipeline for the process, shared by
+        // every query surface below (SQL, Flight SQL, PromQL, labels,
+        // label_values, series, analytics, exemplars) so `kind = query`
+        // records land through a single group-committing writer rather than
+        // one pipeline per surface. The pipeline holds no tenant of its own:
+        // each event carries the tenant the request resolved to, and a flush
+        // groups its batch by that field, so one process-wide pipeline serves
+        // every tenant without needing a static tenant list (which an
+        // OIDC/mTLS deployment legitimately does not have).
+        let audit_pipeline_handle = Arc::new(ravel_maintain::AuditPipeline::spawn(
+            store.clone(),
+            config.audit_pipeline.clone(),
+        ));
+        // ADR-0062 decision 2e: the `--audit-text` posture is applied here,
+        // once, by wrapping the sink every surface below installs. Under
+        // `redacted` the pipeline receives already-tokenized text, so no
+        // plaintext query text reaches the RLOG object or its commit record;
+        // under `plaintext` this hands back the pipeline itself unwrapped.
+        let audit_sink: Arc<dyn ravel_maintain::QueryAuditSink> =
+            config.audit_text.wrap(audit_pipeline_handle.clone());
+        // `/metrics` reads the pipeline's failure counter at scrape time, so it
+        // takes the pipeline itself rather than a snapshot taken here.
+        metrics_state.audit_pipeline = Some(audit_pipeline_handle.clone());
+        running_audit_pipeline = Some(audit_pipeline_handle);
+
         // The real query engine's deadline is the value `main` validated
         // against `sys/gc` (ADR-0050 section 4, EC4), not an independent
         // `EngineConfig::default()`: the deadline validated is the deadline
@@ -1264,6 +2377,13 @@ pub async fn start(
                 remotes.push(ravel_query::distrib::RemoteCluster {
                     name: rc.name.clone(),
                     fetcher: Arc::new(fetcher),
+                    // Hashed here rather than at parse time so the derivation
+                    // runs under the scheme `install_tenant_hash_scheme`
+                    // resolved from the bucket's `sys/tenancy` marker, the same
+                    // scheme the tenant resolver hashes an incoming request's
+                    // tenant under. Comparing two hashes from one scheme is what
+                    // makes the mapping match at query time.
+                    tenant: rc.tenant.as_ref().map(ravel_types::TenantId::hash),
                     skip_unavailable: rc.skip_unavailable,
                     soft_timeout: rc.soft_timeout,
                 });
@@ -1276,17 +2396,32 @@ pub async fn start(
             config.tenant_resolver.clone(),
             cache.clone(),
             engine_config,
+            get_limiter.clone(),
             query_accounting.clone(),
             query_admission.clone(),
             distributed.clone(),
             federation,
             metadata_cache.clone(),
         );
+        // `build_app_state` installs `NoopQueryAuditSink` internally; override
+        // with the process-wide pipeline (ADR-0062 decision 2b) so PromQL
+        // instant/range queries, labels, label_values, and series all reach
+        // it too, same as the SQL and exemplars/analytics surfaces below.
+        let app_state = app_state.with_audit_sink(audit_sink.clone());
         // Bound without an initializer and assigned exactly once inside the
         // block below, which always runs under this feature: a `None` default
         // would be an assignment no reader ever sees.
         #[cfg(feature = "sql")]
         let alert_sql_executor: Option<Arc<ravel_sql::SqlExecutor>>;
+        // The SQL surface's state, kept for the process-wide `QueryService`
+        // assembled below.
+        #[cfg(feature = "sql")]
+        let sql_query_state: sql::SqlState;
+        // The same state under the mTLS listener's resolver, kept for that
+        // listener's own `QueryService`. `None` when no mTLS listener is
+        // configured.
+        #[cfg(feature = "sql")]
+        let mtls_sql_query_state: Option<sql::SqlState>;
         #[cfg(feature = "sql")]
         {
             // Mounted alongside the Prometheus-shaped routes on the same
@@ -1319,6 +2454,7 @@ pub async fn start(
                 config.tenant_resolver.clone(),
                 cache.clone(),
                 engine_config,
+                get_limiter.clone(),
                 // ADR-0088: the per-query SQL pool ceiling and the per-tenant
                 // SQL ceiling, from `--sql-max-query-bytes` /
                 // `--sql-tenant-max-bytes`. Without threading these,
@@ -1334,8 +2470,22 @@ pub async fn start(
                 query_accounting.clone(),
                 query_admission.clone(),
                 Some(declared_columns),
+                // ADR-1170 decisions 1/3: the same process-wide accountant
+                // installed on `metrics_state` above, so a tenant's SQL
+                // reservation and the `/metrics` gauges agree on one counter.
+                process_memory_budget.clone(),
             )?;
+            // `build_sql_state` installs `NoopQueryAuditSink` internally;
+            // override with the process-wide pipeline (ADR-0062 decision 2b).
+            // `mtls_sql_query_state` below is built from `state.clone()` after
+            // this, so the mTLS SQL surface (and Flight SQL, which shares this
+            // same `state` via `sql_state` further down) inherit it too.
+            let state = sql::SqlState {
+                audit_sink: audit_sink.clone(),
+                ..state
+            };
             alert_sql_executor = Some(state.executor.clone());
+            sql_query_state = state.clone();
             // The same executor the idle-tenant sweep evicts idle accountants
             // from (ADR-0069 decision 2): built once here, shared, never a
             // second instance with its own per-tenant accounting.
@@ -1345,11 +2495,11 @@ pub async fn start(
             // once above) rather than calling `build_sql_state` a second
             // time, which would stand up a second `Catalog`/`SqlExecutor`
             // pair with its own per-tenant memory accounting.
-            if let Some(mtls) = &config.mtls_listener {
-                let mtls_state = sql::SqlState {
-                    tenant_resolver: mtls.resolver.clone(),
-                    ..state.clone()
-                };
+            mtls_sql_query_state = config.mtls_listener.as_ref().map(|mtls| sql::SqlState {
+                tenant_resolver: mtls.resolver.clone(),
+                ..state.clone()
+            });
+            if let Some(mtls_state) = mtls_sql_query_state.clone() {
                 mtls_router = mtls_router.merge(sql::router(mtls_state));
             }
             #[cfg(feature = "flight-sql")]
@@ -1366,21 +2516,30 @@ pub async fn start(
             tenant_resolver: config.tenant_resolver.clone(),
             clock: Arc::new(SystemClock),
             query_accounting: query_accounting.clone(),
-            // Analytics routes through the QueryAuditSink seam; the
-            // process-wide AuditPipeline install is a separate step, so this is
-            // the no-op sink today (the handler already submits and awaits through it).
-            audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+            // Analytics routes through the QueryAuditSink seam (ADR-0062
+            // decision 2b): the process-wide AuditPipeline built above.
+            audit_sink: audit_sink.clone(),
+            // The one shared fleet ceiling: an analytics call is the same range
+            // evaluation /api/v1/query_range runs, so it competes for the same
+            // permits rather than running outside them.
+            query_admission: query_admission.clone(),
         };
+        let analytics_state_for_service = analytics_state.clone();
         http_router = http_router.merge(analytics::router(analytics_state));
-        if let Some(mtls) = &config.mtls_listener {
-            let mtls_analytics_state = analytics::AnalyticsState {
-                engine: app_state.engine.clone(),
-                tenant_resolver: mtls.resolver.clone(),
-                clock: Arc::new(SystemClock),
-                query_accounting: query_accounting.clone(),
-                audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
-            };
-            mtls_router = mtls_router.merge(analytics::router(mtls_analytics_state));
+        let mtls_analytics_state =
+            config
+                .mtls_listener
+                .as_ref()
+                .map(|mtls| analytics::AnalyticsState {
+                    engine: app_state.engine.clone(),
+                    tenant_resolver: mtls.resolver.clone(),
+                    clock: Arc::new(SystemClock),
+                    query_accounting: query_accounting.clone(),
+                    audit_sink: audit_sink.clone(),
+                    query_admission: query_admission.clone(),
+                });
+        if let Some(state) = mtls_analytics_state.clone() {
+            mtls_router = mtls_router.merge(analytics::router(state));
         }
 
         // POST /api/v1/admin/fold (issue #785): the on-demand form of the
@@ -1437,17 +2596,107 @@ pub async fn start(
             store.clone(),
             config.tenant_resolver.clone(),
             Arc::new(SystemClock),
-        );
-        http_router = http_router.merge(exemplars::router(exemplars_state));
-        if let Some(mtls) = &config.mtls_listener {
-            let mtls_exemplars_state = exemplars::ExemplarsState::from_engine(
+            get_limiter.clone(),
+        )
+        .with_query_admission(query_admission.clone())
+        .with_query_accounting(query_accounting.clone())
+        .with_audit_sink(audit_sink.clone());
+        http_router = http_router.merge(exemplars::router(exemplars_state.clone()));
+        let mtls_exemplars_state = config.mtls_listener.as_ref().map(|mtls| {
+            exemplars::ExemplarsState::from_engine(
                 &app_state.engine,
                 catalog.clone(),
                 store.clone(),
                 mtls.resolver.clone(),
                 Arc::new(SystemClock),
-            );
-            mtls_router = mtls_router.merge(exemplars::router(mtls_exemplars_state));
+                get_limiter.clone(),
+            )
+            .with_query_admission(query_admission.clone())
+            .with_query_accounting(query_accounting.clone())
+            .with_audit_sink(audit_sink.clone())
+        });
+        if let Some(state) = mtls_exemplars_state.clone() {
+            mtls_router = mtls_router.merge(exemplars::router(state));
+        }
+
+        // The one query service layer for this process (ADR-1374 decision 3):
+        // the same controls every route mounted above runs its query through,
+        // with every query surface this process serves attached to it. Each
+        // route's own state builds an equivalent facade per request out of the
+        // same `Arc`s, so this instance and theirs share one admission
+        // controller, one cost recorder, one usage sink, and one audit sink.
+        // Held on `Running::query_service` rather than layered onto the
+        // router: an in-process transport that is not an axum route (the MCP
+        // adapter, issue #1381) takes it from there instead.
+        let query_service = service::QueryService::with_metrics(
+            config.tenant_resolver.clone(),
+            Arc::new(SystemClock),
+            query_admission.clone(),
+            query_accounting.clone(),
+            audit_sink.clone(),
+        )
+        .with_engine(app_state.engine.clone())
+        .with_analytics(analytics_state_for_service)
+        .with_exemplars(exemplars_state);
+        #[cfg(feature = "sql")]
+        let query_service = query_service.with_sql(sql_query_state);
+        // `POST /mcp` (ADR-1374 decision 7), on the same listener and behind
+        // the same tenant resolver as the HTTP query routes above. Mounted
+        // from the query service just built rather than from a facade of its
+        // own, so an MCP tool call and an HTTP query share one admission
+        // controller, one cost recorder, one usage sink, and one audit sink.
+        #[cfg(feature = "mcp")]
+        if config.query_budgets.mcp.enabled {
+            http_router = http_router.merge(mcp::router(
+                query_service.clone(),
+                mcp_settings(&config, app_state.engine.config())?,
+            )?);
+        }
+        query_service_handle = Some(query_service);
+
+        // The mTLS listener gets its own instance. Everything a control needs
+        // is shared with the primary one (the same admission controller, cost
+        // recorder, usage sink, audit sink, and engine), but the tenant
+        // resolver is not: `mtls.resolver` derives the tenant from the peer
+        // certificate, and `config.tenant_resolver` from a bearer token. An
+        // in-process transport that took the primary listener's instance off an
+        // mTLS request would authenticate a certificate-identified caller
+        // against the bearer-token resolver, which is the wrong credential and,
+        // where both are configured, the wrong tenant.
+        if let Some(mtls) = &config.mtls_listener {
+            let mtls_query_service = service::QueryService::with_metrics(
+                mtls.resolver.clone(),
+                Arc::new(SystemClock),
+                query_admission.clone(),
+                query_accounting.clone(),
+                audit_sink.clone(),
+            )
+            .with_engine(app_state.engine.clone());
+            let mtls_query_service = match mtls_analytics_state {
+                Some(state) => mtls_query_service.with_analytics(state),
+                None => mtls_query_service,
+            };
+            let mtls_query_service = match mtls_exemplars_state {
+                Some(state) => mtls_query_service.with_exemplars(state),
+                None => mtls_query_service,
+            };
+            #[cfg(feature = "sql")]
+            let mtls_query_service = match mtls_sql_query_state {
+                Some(state) => mtls_query_service.with_sql(state),
+                None => mtls_query_service,
+            };
+            // The mTLS listener's own MCP route, from the instance built just
+            // above: a certificate-identified caller must be authenticated by
+            // `mtls.resolver`, not by the primary listener's bearer-token
+            // resolver.
+            #[cfg(feature = "mcp")]
+            if config.query_budgets.mcp.enabled {
+                mtls_router = mtls_router.merge(mcp::router(
+                    mtls_query_service.clone(),
+                    mcp_settings(&config, app_state.engine.config())?,
+                )?);
+            }
+            mtls_query_service_handle = Some(mtls_query_service);
         }
 
         // Same `QueryEngine` (and, under the `sql` feature, the same
@@ -1467,7 +2716,9 @@ pub async fn start(
             let mut mtls_app_state =
                 ravel_query::http::AppState::new(app_state.engine.clone(), mtls.resolver.clone())
                     .with_cost_recorder(query_accounting.clone())
-                    .with_query_admission(query_admission.clone());
+                    .with_usage_sink(query_accounting.clone())
+                    .with_query_admission(query_admission.clone())
+                    .with_audit_sink(audit_sink.clone());
             // Same read-side metadata cache the primary listener serves from
             // (ADR-0085 decision 1): the mTLS `/api/v1/metadata` must serve the
             // same per-tenant record, not fall back to the empty object.
@@ -1488,10 +2739,21 @@ pub async fn start(
         // attached to the query paths above, cloned before `catalog` is
         // moved into `fold::spawn` below.
         if let Some(cache) = &cache {
-            cache_warm::warm_cache(store.clone(), catalog.clone(), cache.clone(), &SystemClock)
-                .await;
+            cache_warm::warm_cache(
+                store.clone(),
+                catalog.clone(),
+                cache.clone(),
+                &SystemClock,
+                get_limiter.clone(),
+            )
+            .await;
         }
     }
+
+    // Merged after the query-serving block so the exposition can carry that
+    // block's audit pipeline. Route order is irrelevant: `/metrics` collides
+    // with nothing above.
+    http_router = http_router.merge(metrics::router(metrics_state));
 
     // Fold optimizes query-resolve cost; a maintain-only process serves no
     // query surface, so folding would be wasted work. Skip it in maintain mode
@@ -1596,7 +2858,10 @@ pub async fn start(
             &provisioning_writer,
             &ingest_concurrency,
             &ingest_byte_metrics,
+            &normalize_reject_metrics,
+            &ingest_buffer_budget,
             &metadata_sink,
+            ingest_lag.admission_lag_ns,
         )),
         _ => None,
     };
@@ -1683,8 +2948,15 @@ pub async fn start(
                 // The Flight SQL lane derives its ticket-signing key from a
                 // stable cluster secret; feed it the fragment-key-derived secret
                 // so the whole cluster agrees (ADR-0071 amendment, decision 2).
+                // The self-id cell keeps this coordinator out of its own SQL
+                // roster: it reads its own slices locally, so a slice
+                // dispatched to itself over Flight is a wasted hop. The cell is
+                // filled below, once the gRPC listener has bound and the
+                // heartbeat identity exists; the roster resolves per query, so
+                // the exclusion takes effect from that point on.
                 sql_distrib::distributed_flight_config(
                     distrib_live_workers.clone(),
+                    distrib_self_id.clone(),
                     settings.thresholds,
                     &settings.sql_ticket_secret(),
                 )
@@ -1835,32 +3107,48 @@ pub async fn start(
     // the shared `distrib_self_id` cell so the router recognizes self-mapped
     // slices (before this, the cell is empty and every slice runs locally). The
     // heartbeat loop then writes `sys/query/workers/<uuid>` and refreshes the
-    // live set on its cadence. Spawned detached: it runs for the process's life
-    // and needs no join at shutdown (a stale record ages out on its own).
-    let _query_worker_heartbeat: Option<JoinHandle<()>> = match (distributed.as_ref(), grpc_addr) {
-        (Some(_), Some(addr)) => {
-            // Advertise the dedicated TLS fragment listener as the endpoint
-            // remote coordinators dial (ADR-0071 amendment decision 1 and section
-            // 3: `fragment_endpoint` now names the dedicated TLS listener). When
-            // no dedicated listener is configured, fall back to the public gRPC
-            // address, the pre-amendment behavior.
-            let fragment_endpoint = fragment_addr.unwrap_or(addr);
-            let workers = Arc::new(ravel_fleet::query_workers::QueryWorkers::with_defaults(
-                fragment_endpoint.to_string(),
-                ravel_query::distrib::codec::PROTOCOL_VERSION,
-            ));
-            // Ignore a set() race: `start` sets this exactly once, so the
-            // first (only) write wins and any later call is a no-op.
-            let _ = distrib_self_id.set(workers.process_id());
-            Some(distrib::spawn_heartbeat(
-                workers,
-                store.clone(),
-                Arc::new(SystemClock),
-                distrib_live_workers.clone(),
-            ))
-        }
-        _ => None,
-    };
+    // live set on its cadence. Its handle and a shutdown sender live on
+    // `Running` (not detached) so graceful shutdown can stop the loop, which
+    // deletes this process's worker record before returning; a draining process
+    // must stop advertising itself to sibling coordinators, not linger in their
+    // live set until its stamp ages past the staleness window.
+    let query_worker_heartbeat: Option<QueryWorkerHeartbeat> =
+        match (distributed.as_ref(), grpc_addr) {
+            (Some(_), Some(addr)) => {
+                // Two endpoints, one per distributed lane (ADR-0071 amendment,
+                // decision 1). The PromQL lane's `SeriesFetch` moves to the
+                // dedicated TLS fragment listener when one is configured;
+                // otherwise it stays on the public gRPC address (pre-amendment).
+                // The SQL lane's Flight SQL `DoGet` always lives on the public
+                // gRPC listener (`addr`), which is never the TLS-only fragment
+                // listener, so it is advertised separately: dialing the fragment
+                // endpoint for a Flight `DoGet` reaches a port with no Flight
+                // service (issue #1296).
+                let fragment_endpoint = fragment_addr.unwrap_or(addr);
+                let flight_sql_endpoint = addr;
+                let workers = Arc::new(ravel_fleet::query_workers::QueryWorkers::with_defaults(
+                    fragment_endpoint.to_string(),
+                    flight_sql_endpoint.to_string(),
+                    ravel_query::distrib::codec::PROTOCOL_VERSION,
+                ));
+                // Ignore a set() race: `start` sets this exactly once, so the
+                // first (only) write wins and any later call is a no-op.
+                let _ = distrib_self_id.set(workers.process_id());
+                let (hb_shutdown, hb_rx) = oneshot::channel::<()>();
+                let handle = distrib::spawn_heartbeat(
+                    workers,
+                    store.clone(),
+                    Arc::new(SystemClock),
+                    distrib_live_workers.clone(),
+                    hb_rx,
+                );
+                Some(QueryWorkerHeartbeat {
+                    shutdown: hb_shutdown,
+                    handle,
+                })
+            }
+            _ => None,
+        };
 
     // The dedicated mTLS listener (ADR-0050 section 1): bound only when
     // `--mtls-listener` was configured, serving `mtls_router` built up above.
@@ -1936,6 +3224,7 @@ pub async fn start(
             admission.clone(),
             store.clone(),
             config.admission_reconcile_interval,
+            reconcile_cycle_metrics.clone(),
         )
     } else {
         admission_reconcile::AdmissionReconcileTask::none()
@@ -2060,6 +3349,9 @@ pub async fn start(
         fragment_task,
         ingest_router,
         metadata_sink,
+        query_accounting,
+        query_service: query_service_handle,
+        mtls_query_service: mtls_query_service_handle,
         log_ingest_router,
         span_ingest_router,
         fold_tasks,
@@ -2073,5 +3365,475 @@ pub async fn start(
         lifecycle_refresh_task,
         idle_tenant_state_task,
         metadata_sink_task,
+        audit_pipeline: running_audit_pipeline,
+        audit_drain_timeout: config.audit_pipeline.max_age + AUDIT_DRAIN_GRACE,
+        // Clone the readiness handle onto `Running` so `shutdown` can flip it to
+        // draining; the `/readyz` route holds the other clone.
+        readiness: readiness.clone(),
+        shutdown_timeout: config.shutdown_timeout,
+        drain_settle_interval: config.drain_settle_interval,
+        query_worker_heartbeat,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod shutdown_drain_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// `join_listeners` awaits every listener and surfaces the FIRST error. A
+    /// failing listener at position 0 (where `http_task` always sits) plus a
+    /// clean one: both tasks are awaited (each sets its own flag) and the first
+    /// error is returned, so one listener erroring never leaves a sibling
+    /// unjoined.
+    #[tokio::test]
+    async fn join_listeners_returns_the_first_listener_error() {
+        let first_ran = Arc::new(AtomicBool::new(false));
+        let second_ran = Arc::new(AtomicBool::new(false));
+
+        let f = first_ran.clone();
+        let failing: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+            f.store(true, Ordering::SeqCst);
+            Err(anyhow::anyhow!("listener boom"))
+        });
+        let s = second_ran.clone();
+        let ok: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+            s.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let result = join_listeners(vec![failing, ok]).await;
+
+        assert!(
+            first_ran.load(Ordering::SeqCst) && second_ran.load(Ordering::SeqCst),
+            "every listener must be awaited even when an earlier one errored"
+        );
+        let err = result.expect_err("the first listener error must be surfaced");
+        assert!(
+            err.to_string().contains("listener boom"),
+            "the surfaced error must be the listener's, got: {err}"
+        );
+    }
+
+    /// With no listener error `join_listeners` returns `Ok`.
+    #[tokio::test]
+    async fn join_listeners_ok_when_all_clean() {
+        let ok: JoinHandle<anyhow::Result<()>> = tokio::spawn(async { Ok(()) });
+        join_listeners(vec![ok])
+            .await
+            .expect("clean listeners join Ok");
+    }
+
+    /// A listener held open forever (an in-flight request that never completes)
+    /// must be abandoned at the join sub-budget, not consume the whole
+    /// `--shutdown-timeout`. Virtual time (`start_paused`) makes this exact and
+    /// wall-clock-free: the join future never resolves, so the budget timeout is
+    /// the only thing that can fire.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_listener_is_abandoned_at_the_join_budget() {
+        let pending: JoinHandle<anyhow::Result<()>> =
+            tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+        let budget = listener_join_budget(Duration::from_secs(10));
+        let outcome = tokio::time::timeout(budget, join_listeners(vec![pending])).await;
+        assert!(
+            outcome.is_err(),
+            "a never-completing listener must hit the join budget, not block forever"
+        );
+    }
+
+    /// The listener join sub-budget must be strictly below the whole shutdown
+    /// timeout AND leave a positive reserve for the remaining drain steps, so the
+    /// listener join can never starve them. This is the numeric relation
+    /// [`Running::shutdown`] relies on.
+    #[test]
+    fn listener_join_budget_is_below_the_shutdown_timeout_with_reserve() {
+        for secs in [1u64, 5, 25, 300] {
+            let t = Duration::from_secs(secs);
+            let budget = listener_join_budget(t);
+            assert!(
+                budget < t,
+                "listener join budget ({budget:?}) must be below the shutdown timeout ({t:?})"
+            );
+            assert!(
+                t - budget > Duration::ZERO,
+                "the reserve left for the rest of the drain ({:?}) must be positive",
+                t - budget
+            );
+        }
+    }
+
+    /// `drain_router` calls the router's flush even when another task still
+    /// holds a clone of the router, and in that case flushes-but-does-not-join.
+    /// Holding a second `Arc` clone live across the call forces the `try_unwrap`
+    /// join to fail, which is exactly the "flushed but not joined" branch: the
+    /// flush must still have been called (the counter reads 1), the join must
+    /// not have (the clone is alive). The fake's flush only bumps a counter, so
+    /// this pins that the call happens, not that any record reached a store.
+    #[tokio::test]
+    async fn drain_router_calls_flush_but_not_join_with_an_outstanding_clone() {
+        let flushed = Arc::new(AtomicUsize::new(0));
+        let joined = Arc::new(AtomicBool::new(false));
+        let router = Arc::new(FakeRouter {
+            flushed: flushed.clone(),
+            joined: joined.clone(),
+        });
+        let keep_alive = router.clone();
+
+        drain_router(Some(router), "metrics").await;
+
+        assert_eq!(
+            flushed.load(Ordering::SeqCst),
+            1,
+            "the flush must be called even with an outstanding router clone"
+        );
+        assert!(
+            !joined.load(Ordering::SeqCst),
+            "with an outstanding clone the shard actors must be flushed but NOT joined"
+        );
+        drop(keep_alive);
+    }
+
+    /// The sole owner both flushes and joins.
+    #[tokio::test]
+    async fn drain_router_joins_the_shard_actors_when_sole_owner() {
+        let flushed = Arc::new(AtomicUsize::new(0));
+        let joined = Arc::new(AtomicBool::new(false));
+        let router = Arc::new(FakeRouter {
+            flushed: flushed.clone(),
+            joined: joined.clone(),
+        });
+
+        drain_router(Some(router), "metrics").await;
+
+        assert_eq!(
+            flushed.load(Ordering::SeqCst),
+            1,
+            "the sole owner must flush before joining"
+        );
+        assert!(
+            joined.load(Ordering::SeqCst),
+            "the sole owner must join the shard actors"
+        );
+    }
+
+    /// `None` (a mode that built no such router) is a no-op.
+    #[tokio::test]
+    async fn drain_router_on_none_is_a_noop() {
+        drain_router::<FakeRouter>(None, "metrics").await;
+    }
+
+    /// Wiring readiness to the ingest router must leave the router's reference
+    /// count at one, or `drain_router`'s `Arc::try_unwrap` takes the `Err` arm
+    /// and the shard actors are never joined on a graceful shutdown of `all` or
+    /// `gateway` (issue #1299). Builds the sources through
+    /// `ingest_health_sources`, the same call `start` makes, so returning a
+    /// router clone from it fails here. With
+    /// `drain_router_joins_the_shard_actors_when_sole_owner` above proving that
+    /// sole ownership selects the join arm, sole ownership is the whole
+    /// condition.
+    ///
+    /// Also pins the reason the metrics handle was chosen over `Arc::downgrade`:
+    /// the source still reads after the router is dropped, so a probe racing
+    /// shutdown gets the real condemned count rather than a vanished `Weak`.
+    #[tokio::test]
+    async fn readiness_registration_still_allows_the_shard_actor_join() {
+        let store = Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let router = Arc::new(IngestRouter::new(
+            IngestConfig::default(),
+            store,
+            Signal::Metrics,
+            Arc::new(SystemClock),
+        ));
+
+        let readiness =
+            health::Readiness::new().with_ingest_health(ingest_health_sources(Some(&router)));
+        readiness.mark_ready();
+
+        assert_eq!(
+            Arc::strong_count(&router),
+            1,
+            "readiness must hold no reference to the ingest router"
+        );
+        assert!(readiness.is_ready(), "no shard condemned yet");
+
+        drain_router(Some(router), "metrics").await;
+
+        assert!(
+            readiness.is_ready(),
+            "the health source must keep answering after the router is dropped"
+        );
+    }
+
+    /// A fake [`DrainRouter`] recording that its flush and join ran, so the
+    /// `drain_router` contract can be tested without standing up a real ingest
+    /// router. Flush counts (not just a bool) so a second flush during a drain
+    /// window would be visible.
+    struct FakeRouter {
+        flushed: Arc<AtomicUsize>,
+        joined: Arc<AtomicBool>,
+    }
+
+    impl DrainRouter for FakeRouter {
+        fn flush_all(&self) -> impl std::future::Future<Output = ()> + Send {
+            let flushed = self.flushed.clone();
+            async move {
+                flushed.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn join_actors(self) -> impl std::future::Future<Output = ()> + Send {
+            let joined = self.joined.clone();
+            async move {
+                joined.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A clean drain with no listener error returns `Ok`.
+    #[test]
+    fn shutdown_outcome_ok_when_clean() {
+        shutdown_outcome(false, true, None, None, Duration::from_secs(25))
+            .expect("a clean drain with no listener error is Ok");
+    }
+
+    /// A completed drain that captured a listener error surfaces it.
+    #[test]
+    fn shutdown_outcome_surfaces_a_captured_listener_error() {
+        let err = shutdown_outcome(
+            false,
+            true,
+            None,
+            Some(anyhow::anyhow!("listener boom")),
+            Duration::from_secs(25),
+        )
+        .expect_err("a captured listener error must be surfaced");
+        assert!(err.to_string().contains("listener boom"), "got: {err}");
+    }
+
+    /// An error raised INSIDE the drain (today the query-audit pipeline's own
+    /// drain, the last step in the block) reaches `shutdown`'s return value
+    /// rather than being swallowed with the drain's `()`.
+    #[test]
+    fn shutdown_outcome_surfaces_a_drain_error() {
+        let err = shutdown_outcome(
+            false,
+            true,
+            Some(anyhow::anyhow!("audit drain boom")),
+            None,
+            Duration::from_secs(25),
+        )
+        .expect_err("an error raised inside the drain must be surfaced");
+        assert!(err.to_string().contains("audit drain boom"), "got: {err}");
+    }
+
+    /// A drain error outranks a captured listener error, and folds it in as the
+    /// returned error's `source()` rather than dropping it.
+    ///
+    /// The assertions are on the PLAIN `Display` form, which is what `main.rs`
+    /// logs with `%err`: the alternate `{:#}` form renders the whole chain and
+    /// therefore reads the same whichever way round the two are wrapped, so it
+    /// cannot pin which one is the headline.
+    #[test]
+    fn shutdown_outcome_drain_error_folds_in_the_listener_error() {
+        let err = shutdown_outcome(
+            false,
+            true,
+            Some(anyhow::anyhow!("audit drain boom")),
+            Some(anyhow::anyhow!("listener boom")),
+            Duration::from_secs(25),
+        )
+        .expect_err("a drain error is an error");
+        let headline = err.to_string();
+        assert!(
+            headline.contains("audit drain boom"),
+            "the higher-ranked drain error must BE the logged headline, got: {headline}"
+        );
+        assert!(
+            !headline.contains("listener boom"),
+            "the lower-ranked listener error must be the cause, not the headline, got: {headline}"
+        );
+        assert!(
+            headline.contains("a listener also errored"),
+            "the headline must still say a listener errored, got: {headline}"
+        );
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("listener boom"),
+            "the captured listener error must stay reachable in the chain, got: {chain}"
+        );
+    }
+
+    /// An overrun is an ERROR, not a silent `Ok`: this is the branch that makes
+    /// `main` exit non-zero instead of printing "shutdown complete" after
+    /// dropping work. Reverting it (the old `Err(_) => Ok(())` arm) fails here.
+    #[test]
+    fn shutdown_outcome_overrun_is_an_error() {
+        let err = shutdown_outcome(true, true, None, None, Duration::from_secs(25))
+            .expect_err("a drain that overran the timeout must be an error");
+        assert!(
+            err.to_string().contains("exceeded --shutdown-timeout"),
+            "the overrun error must name the timeout it exceeded, got: {err}"
+        );
+    }
+
+    /// An overrun that fired AFTER the ingest flush completed says the flush
+    /// COMPLETED, not that the records were flushed: `flush_completed = true`
+    /// records only that `flush_all` returned, which it does on abandonment as
+    /// well as on success, so the message must not assert durability. This is
+    /// the branch `flush_completed = true` selects.
+    #[test]
+    fn shutdown_outcome_overrun_after_flush_says_the_flush_completed() {
+        let err = shutdown_outcome(true, true, None, None, Duration::from_secs(25))
+            .expect_err("an overrun is an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("the ingest flush completed but shutdown did not complete cleanly"),
+            "an overrun after the flush must report the flush completed, got: {msg}"
+        );
+        assert!(
+            !msg.contains("buffered records were flushed"),
+            "the message must NOT assert the records were flushed (durability the flag never \
+             proves), got: {msg}"
+        );
+        assert!(
+            !msg.contains("may not be durable"),
+            "an overrun after the flush must NOT warn of possible loss, got: {msg}"
+        );
+    }
+
+    /// An overrun that fired BEFORE the ingest flush completed (an unreachable
+    /// store held the flush open past the whole budget) must NOT claim the
+    /// records were flushed: nothing is durable, and the operator has to
+    /// investigate loss. This is the branch `flush_completed = false` selects,
+    /// and it is the defect F1 fixes: the message used to be unconditional.
+    #[test]
+    fn shutdown_outcome_overrun_before_flush_warns_records_may_not_be_durable() {
+        let err = shutdown_outcome(true, false, None, None, Duration::from_secs(25))
+            .expect_err("an overrun is an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("before the ingest flush completed") && msg.contains("may not be durable"),
+            "an overrun during the flush must warn the records may not be durable, got: {msg}"
+        );
+        assert!(
+            !msg.contains("buffered records were flushed"),
+            "an overrun during the flush must NOT claim the records were flushed, got: {msg}"
+        );
+    }
+
+    /// An overrun outranks a captured listener error, and folds it in rather
+    /// than dropping it.
+    ///
+    /// On the PLAIN `Display` form, for the reason
+    /// [`shutdown_outcome_drain_error_folds_in_the_listener_error`] gives: this
+    /// is the one line `main.rs` logs, and an operator who greps it for the
+    /// overrun has to find it there. The `{:#}` form passed with the two errors
+    /// wrapped either way round, so it pinned nothing.
+    #[test]
+    fn shutdown_outcome_overrun_folds_in_the_listener_error() {
+        let err = shutdown_outcome(
+            true,
+            true,
+            None,
+            Some(anyhow::anyhow!("listener boom")),
+            Duration::from_secs(25),
+        )
+        .expect_err("an overrun is an error");
+        let headline = err.to_string();
+        assert!(
+            headline.contains("exceeded --shutdown-timeout"),
+            "the overrun must BE the logged headline, not a demoted cause, got: {headline}"
+        );
+        assert!(
+            !headline.contains("listener boom"),
+            "the lower-ranked listener error must be the cause, not the headline, got: {headline}"
+        );
+        assert!(
+            headline.contains("a listener also errored"),
+            "the headline must still say a listener errored, got: {headline}"
+        );
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("listener boom"),
+            "the captured listener error must stay reachable in the chain, got: {chain}"
+        );
+    }
+
+    /// The default shutdown timeout must stay strictly below the Kubernetes
+    /// default `terminationGracePeriodSeconds`, so the process finishes draining
+    /// and exits on its own before the kubelet escalates SIGTERM to SIGKILL. The
+    /// operator half of issue #1291 owns the pod grace period; this pins the
+    /// server-side default against the number it must stay under.
+    ///
+    /// This bounds only the in-`shutdown` path: the heartbeat stop (a tenth of
+    /// the budget) plus the `--shutdown-timeout`-bounded drain, 27.5s at the
+    /// defaults. It is NOT the whole SIGTERM-to-exit worst case, and the 2.5s of
+    /// slack this leaves under the 30s grace period is not free room for the
+    /// preStop hook. After `Running::shutdown` returns, `main` flushes the OTLP
+    /// trace exporter (`trace_guard.flush`, ADR-0060 decision 7), and that
+    /// provider's `shutdown` is hard-capped at 5s in the OpenTelemetry SDK this
+    /// workspace pins. With an `--otlp-trace-endpoint` set and the collector
+    /// unreachable, that step alone runs the full 5s, so the real worst case
+    /// before any preStop hook is 27.5s + 5s = 32.5s -- ABOVE the 30s default
+    /// grace period. That overrun costs traces and a clean exit, not buffered
+    /// records (the ingest flush already ran inside the drain), and the exporter
+    /// step predates this branch, so it is not restructured here. The figure the
+    /// operator half of issue #1291 must size `terminationGracePeriodSeconds`
+    /// (plus preStop) against is 32.5s at the shipped defaults, not 27.5s.
+    #[test]
+    fn default_shutdown_timeout_is_below_the_kubernetes_grace_period() {
+        assert!(
+            DEFAULT_SHUTDOWN_TIMEOUT < K8S_DEFAULT_GRACE_PERIOD,
+            "default --shutdown-timeout ({:?}) must be below the Kubernetes default \
+             terminationGracePeriodSeconds ({:?}), leaving headroom for preStop and final exit",
+            DEFAULT_SHUTDOWN_TIMEOUT,
+            K8S_DEFAULT_GRACE_PERIOD,
+        );
+        // The default settle interval must fit inside the timeout too: the drain
+        // budget must not be entirely consumed by the pre-close readiness settle.
+        assert!(
+            DEFAULT_DRAIN_SETTLE_INTERVAL < DEFAULT_SHUTDOWN_TIMEOUT,
+            "the readiness settle interval must be smaller than the drain timeout"
+        );
+        // The heartbeat stop runs AHEAD of the bounded drain, so what has to
+        // stay below the grace period is that pre-drain segment plus
+        // `--shutdown-timeout`, not `--shutdown-timeout` alone. `Running::shutdown`
+        // runs the heartbeat stop and the readiness settle together under
+        // `tokio::join!`, so that segment costs the MAX of the two bounds, not
+        // their sum; the `None` (non-distributed) arm pays the settle alone,
+        // which is the smaller of the two, so the max is the true worst case.
+        let pre_drain =
+            heartbeat_stop_budget(DEFAULT_SHUTDOWN_TIMEOUT).max(DEFAULT_DRAIN_SETTLE_INTERVAL);
+        let worst_case = DEFAULT_SHUTDOWN_TIMEOUT + pre_drain;
+        // Pin the exact figure, not merely that it stays under the grace period:
+        // an operator sizes `terminationGracePeriodSeconds` against this number,
+        // so the test must fail if any input moves it even while it stays below
+        // 30s. 25s drain + max(2.5s heartbeat stop, 0.5s settle) = 27.5s.
+        assert_eq!(
+            worst_case,
+            Duration::from_millis(27_500),
+            "the in-shutdown worst case (drain budget plus the pre-drain heartbeat-stop/settle \
+             segment) must be exactly 27.5s at the shipped defaults, got {worst_case:?}",
+        );
+        assert!(
+            worst_case < K8S_DEFAULT_GRACE_PERIOD,
+            "the pre-drain segment plus --shutdown-timeout ({worst_case:?}) must stay below \
+             the Kubernetes default terminationGracePeriodSeconds ({K8S_DEFAULT_GRACE_PERIOD:?})",
+        );
+        // After `shutdown` returns, `main` flushes the OTLP trace exporter, whose
+        // provider shutdown the pinned OpenTelemetry SDK hard-caps at 5s. The full
+        // SIGTERM-to-exit worst case is therefore 32.5s, the figure
+        // docs/architecture.md tells the operator to size the pod grace period
+        // above. Pinned here so that doc figure cannot drift from the code.
+        const TRACE_EXPORTER_FLUSH_CAP: Duration = Duration::from_secs(5);
+        assert_eq!(
+            worst_case + TRACE_EXPORTER_FLUSH_CAP,
+            Duration::from_millis(32_500),
+            "the documented SIGTERM-to-exit worst case (docs/architecture.md) must be 32.5s, \
+             got {:?}",
+            worst_case + TRACE_EXPORTER_FLUSH_CAP,
+        );
+    }
 }

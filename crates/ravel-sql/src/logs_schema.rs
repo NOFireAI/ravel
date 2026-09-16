@@ -50,6 +50,21 @@ pub const LOG_COL_ATTRS: usize = 8;
 /// column in list order is index `FIRST_DECLARED_COL + k`.
 pub const FIRST_DECLARED_COL: usize = LOG_COL_ATTRS + 1;
 
+/// The Arrow field name a synthetic per-key attribute column occupies (issue
+/// #1768). A per-key column renders one `attrs['k']` subscript as a `Utf8`
+/// column using the merged map's own rules, so a projection that reaches the
+/// map only through literal-key subscripts can take the columnar path and
+/// decode only that key's FIELD_DIR pages. The name is deliberately
+/// unspellable through the SQL surface (no client can declare an attribute
+/// whose name starts with `__ravel_`), so it never collides with a fixed or
+/// declared column name and never reaches a query result: the
+/// `AttrsPerKeyProjection` rule that introduces these columns rewrites the
+/// `get_field(attrs, 'k')` above the scan into a reference to this column and
+/// the client-visible output name stays whatever alias the projection carried.
+pub fn attr_key_field_name(key: &str) -> String {
+    format!("__ravel_attr[{key}]")
+}
+
 /// Byte width of a trace id (`ravel_logseg::record::TRACE_ID_WIDTH`).
 pub const TRACE_ID_WIDTH: i32 = 16;
 /// Byte width of a span id (`ravel_logseg::record::SPAN_ID_WIDTH`).

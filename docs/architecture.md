@@ -36,9 +36,14 @@ process never compacts or deletes anything.
 The ingest surfaces are OTLP over HTTP and gRPC, Prometheus Remote Write,
 and OTAP behind a cargo feature. The query surfaces are the
 Prometheus-compatible `/api/v1/*` routes, `POST /api/v1/sql`, Flight SQL
-behind a cargo feature, and `POST /api/v1/analytics`. The ingest protocols
-share one pipeline: Remote Write payloads normalise to the shape OTLP
-produces and enter the same router call, so there is no second flush or
+behind a cargo feature, and `POST /api/v1/analytics`. The
+Prometheus-compatible routes also serve the logs signal: a selector with
+exact `__name__` equality on the reserved `ravel_log_lines` or
+`ravel_log_bytes` metric name is answered from log data, evaluated locally
+by the query coordinator rather than federated (ADR-1103; see
+[docs/guides/query.md](guides/query.md#promql-over-logs)). The ingest
+protocols share one pipeline: Remote Write payloads normalise to the shape
+OTLP produces and enter the same router call, so there is no second flush or
 commit path to hold correct.
 
 Two capabilities that the decision records discuss do not exist in the
@@ -102,9 +107,37 @@ depends on store reachability, so a store outage cannot get healthy processes
 killed. `/readyz` gates on completed startup and then follows a background
 store probe with asymmetric hysteresis: four consecutive probe failures flip
 it to 503 and one success recovers it, and the kubelet path reads an
-in-memory atomic rather than touching the store. `/metrics` is the third
-unconditional route, rendering a fixed and deliberately small label set so
-Ravel's own telemetry cannot explode
+in-memory atomic rather than touching the store. A third input is ingest
+health: once a shard actor exhausts its respawn budget and is condemned, this
+process's `/readyz` is 503 for good. Readiness only sheds traffic (a 503
+removes the pod from its Service endpoints); it never restarts or reschedules
+the pod, which is why liveness is a separate route and why a condemned shard
+needs an operator to roll the process
+([guides/operations/troubleshooting.md](guides/operations/troubleshooting.md)).
+On SIGTERM this same
+`/readyz` is the drain signal: the process flips it to 503 first and deletes
+its distributed query heartbeat record while it waits a short settle interval,
+so a probe observes the 503 and a sibling coordinator drops this worker from
+its live set while the listeners are still open. It then signals the listeners
+closed, attempts to flush every ingest shard actor (metrics, logs, and spans)
+before waiting on those sockets, and stops the background tasks. The drain
+from that close signal onwards is bounded by `--shutdown-timeout` (default
+25s), and the heartbeat delete, which runs ahead of it, carries a tenth of
+that as its own bound (2.5s), so neither a wedged flush nor an unreachable
+object store can hold the *drain* past 27.5s at the defaults. That is not the
+whole SIGTERM-to-exit budget: after the drain returns, `main` flushes the OTLP
+trace exporter, whose provider shutdown is hard-capped at 5s, and with a trace
+endpoint set and its collector unreachable that step runs the full 5s. The
+worst case an operator must size `terminationGracePeriodSeconds` against is
+therefore 27.5s + 5s = 32.5s (25s drain + 2.5s heartbeat stop + 5s trace
+flush), ABOVE the 30s Kubernetes default: an unreachable trace collector can
+push the process past the grace period and cost it a SIGKILL. That overrun
+costs traces and a clean exit, not buffered records, which the drain has
+already attempted to flush. The operator half of this work sets the pod grace
+period above 32.5s accordingly.
+
+`/metrics` is the third unconditional route, rendering a fixed and
+deliberately small label set so Ravel's own telemetry cannot explode
 ([guides/observability.md](guides/observability.md)).
 
 ## How ingest, query, and maintenance interact
@@ -190,7 +223,20 @@ encryption headers.
 Startup on any non-memory store is also gated on a durable qualification
 record: a deployment runs `ravel-cli store qualify` once before its first
 server starts, which proves the backend honours the semantics the commit
-protocol depends on before any data rides on them. The capability table, the
+protocol depends on before any data rides on them. On Kubernetes the
+operator makes that run itself: before it creates any serving Deployment for
+a `RavelCluster`, it applies a one-shot `<cluster>-qualify` Job running
+`ravel-cli store qualify` against that cluster's bucket and gates the gateway,
+query, and maintain Deployments on the Job completing, so a cluster never
+comes up as three tiers crash-looping on a backend that fails the contract.
+It records the qualified inputs (bucket, region, endpoint, image, the
+credentials Secret name, and that Secret's `resourceVersion`) in a
+`StoreQualified` status condition and a durable `status.storeQualifiedHash`,
+re-runs qualification only when those inputs change (never on a schedule), and
+leaves a running cluster's Deployments up while re-qualifying (ADR-0034).
+Because the credentials Secret's `resourceVersion` is one of those inputs,
+rotating that Secret in place (same name, new content, bumped
+`resourceVersion`) is a changed input and re-runs qualification. The capability table, the
 qualification suite, and the retry and timeout contract are in
 [docs/object-store-contract.md](object-store-contract.md).
 
@@ -217,6 +263,48 @@ segment reference, storage credential, or client credential crosses the
 boundary. A slow or unreachable remote degrades to partial coverage, and that
 state is always visible in the query's stats and warnings
 ([guides/distributed-query.md](guides/distributed-query.md)).
+
+One query service layer sits between every query transport and the engine,
+and it is the single place the per-query controls live: admission against the
+fleet-global concurrency ceiling, the deadline and request-budget clamps
+(which may only lower a server ceiling), the usage record folded on every
+exit path including a client disconnect, the evidential audit event whose
+durability is awaited before an answer is released, the partial-coverage
+consent gate, and the redaction a failure passes through on the way out. A
+transport parses its request, authenticates it, calls one operation, and
+encodes the outcome; it holds none of those controls itself. Authentication
+stays on the transport side and runs before admission, so an unauthenticated
+request cannot consume a permit. It is also the one thing the service layer
+does not share across listeners: a process serving both the public listener
+and the mTLS listener runs an instance of the layer per listener, identical
+in every control and differing only in the tenant resolver, because the two
+listeners derive tenant identity from different credentials. Adding a
+transport therefore cannot add a surface that queries outside the ceiling,
+spends without recording, or answers without an audit trail.
+
+Two boundaries of the layer are deliberate. The admission permit is released
+when the operation returns, before the transport encodes the response, so a
+slow client does not hold a fleet-wide slot for the length of its download;
+encoding is CPU-bound work over a result the query budgets already capped.
+And a request the transport rejects before it calls an operation, a metadata
+selector that does not parse for instance, produces no audit event, because
+the audit trail records queries that reached execution for a resolved tenant
+and this one never did.
+
+The usage record a disconnect folds carries the spend the query had actually
+reached, not a zero. Every operation hands the engine a live view of the
+counters the read spends through and hands the same view to its usage guard,
+so a future dropped in the middle of a resolve is billed for the store
+requests it had already issued. On the PromQL, metadata, and analytics
+operations that view is additive, because one request can spend through
+several counter blocks: the metrics lane and the log lane of a query naming
+both signals, one block per `match[]` selector of a metadata request, and one
+block per attempt when a snapshot is invalidated and the read re-resolves. The
+record sums all of them. The exemplars and SQL operations hold one block at a
+time and replace it when an attempt retries, so a cancellation there is billed
+for the retried attempt alone and not also for the discarded one. A surface
+that recorded zero would let a client cancel its way out of the cost of the
+work it started.
 
 The failure boundaries are the two PUTs of a write and the compare-and-swap
 of a fold. A failure on either side of them has a defined outcome and never

@@ -56,11 +56,18 @@ pub struct LogIngestMetrics {
     /// paths. Excludes each path's first attempt.
     put_retries: AtomicU64,
     /// Flushes abandoned because a PUT exhausted its retry budget or
-    /// `max_flush_lifetime` elapsed first ([`crate::LogWriteError::Abandoned`]).
-    /// A durability signal: the input was fine, the object store did not
-    /// accept it in time. Nothing was acknowledged and the whole write stays
-    /// retryable.
+    /// `max_flush_lifetime` elapsed while the flush's own store calls were in
+    /// flight ([`crate::LogWriteError::Abandoned`]). A durability signal about
+    /// the object store: the flush held a permit and its PUTs did not land in
+    /// time. Nothing was acknowledged and the whole write stays retryable.
+    /// Split from `abandoned_queue_deadline`, which never reached a store call.
     abandoned_retry_exhausted: AtomicU64,
+    /// Flushes abandoned because their flush-open deadline elapsed while still
+    /// queued for a `max_inflight_flushes` permit, before any store call
+    /// ([`crate::LogWriteError::Abandoned`], issue #1739). A contention signal,
+    /// distinct from `abandoned_retry_exhausted` so a deadline reached in the
+    /// queue is not read as the store failing to accept a PUT.
+    abandoned_queue_deadline: AtomicU64,
     /// Flushes abandoned because the input could not be turned into a durable
     /// object at all: the RLOG build, data-key derivation, or commit-record
     /// build failed ([`crate::LogWriteError::SegmentBuild`]). A client
@@ -83,6 +90,25 @@ pub struct LogIngestMetrics {
     /// different `stream_attrs` (the fail-loud collision check
     /// `RlogWriter::finish()` performs).
     stream_id_collisions: AtomicU64,
+    /// Flush-open stamps raised to this writer's monotonic floor because the
+    /// injected clock read below the previous stamp (ADR-1307), the log-pipeline
+    /// counterpart of [`crate::IngestMetrics`]'s own counter. Intended for
+    /// Prometheus export under the name `ravel_ingest_clock_regressions_total`
+    /// (#1473).
+    clock_regressions: AtomicU64,
+    /// Flushes refused because the backwards step exceeded the monotonic hold
+    /// bound `MAX_FLUSH_CLOCK_HOLD_NS` (ADR-1307): counted separately from
+    /// `clock_regressions` (absorbed). Intended for Prometheus export under the
+    /// name `ravel_ingest_clock_regressions_refused_total` (#1473).
+    clock_regressions_refused: AtomicU64,
+    /// Tenants still buffered after a TEARDOWN `flush_all` (`Shutdown`, channel
+    /// close) exhausted its bounded retry passes (ADR-1307 finding F1): a lost
+    /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
+    /// durability defect, logged at ERROR beside this bump. Residue on a
+    /// `FlushNow` drain is not counted here: the actor keeps running with those
+    /// tenants buffered, so the next trigger retries them and nothing is lost
+    /// (logged at WARN instead).
+    flush_all_residue_tenants: AtomicU64,
     /// Multi-shard Strict writes that returned
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably and at least one sibling then failed in the same
@@ -157,7 +183,13 @@ pub struct LogIngestMetrics {
     dynamic_columns_used_max: AtomicU64,
     /// Per-shard count of flushes whose flush task has been spawned but has
     /// not yet acked its waiters (ADR-0067 decisions 1-2, the log-pipeline
-    /// counterpart of [`crate::IngestMetrics`]'s own gauge). Keyed by shard
+    /// counterpart of [`crate::IngestMetrics`]'s own gauge), counted from the
+    /// moment the buffer leaves the actor: a task still waiting for its
+    /// `max_inflight_flushes` permit is included, because it holds a flush
+    /// window of memory and its ADR-0069 byte charge exactly as an executing
+    /// one does (ADR-1642). So this can exceed `max_inflight_flushes` per
+    /// shard: the bound caps concurrent execution, not how many flushes are
+    /// spawned and waiting. Keyed by shard
     /// index; a shard with no flush in flight has no entry, equivalent to 0.
     /// Not part of [`LogIngestMetricsSnapshot`]'s flat counters because it is a
     /// gauge with a per-shard dimension, unlike everything else here; read it
@@ -209,12 +241,30 @@ pub struct LogIngestMetricsSnapshot {
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
+    /// Flushes abandoned by their flush-open deadline while queued for a permit,
+    /// before any store call (issue #1739). Distinct from
+    /// `abandoned_retry_exhausted` (a store failure).
+    pub abandoned_queue_deadline: u64,
     pub abandoned_input_rejected: u64,
     pub buffered_bytes_total: u64,
     pub buffered_records_total: u64,
     pub acks_ok: u64,
     pub acks_err: u64,
     pub stream_id_collisions: u64,
+    /// Flush-open stamps raised to this writer's monotonic floor after a
+    /// backwards clock step (ADR-1307). Intended for export as
+    /// `ravel_ingest_clock_regressions_total` (#1473).
+    pub clock_regressions: u64,
+    /// Flushes refused because the backwards step exceeded the monotonic hold
+    /// bound (ADR-1307). Intended for export as
+    /// `ravel_ingest_clock_regressions_refused_total` (#1473).
+    pub clock_regressions_refused: u64,
+    /// Tenants left buffered after a teardown `flush_all` (`Shutdown`, channel
+    /// close) exhausted its retry passes (ADR-1307 finding F1): a lost
+    /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
+    /// durability defect. A `FlushNow` drain does not bump it (the actor keeps
+    /// running and retries the residue).
+    pub flush_all_residue_tenants: u64,
     /// Multi-shard Strict writes returned as
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): a partial
     /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
@@ -231,6 +281,17 @@ pub struct LogIngestMetricsSnapshot {
     pub dynamic_columns_used_total: u64,
     pub dynamic_columns_overflowed_total: u64,
     pub dynamic_columns_used_max: u64,
+    /// Sum across shards of [`LogIngestMetrics::in_flight_flushes_by_shard`] at
+    /// snapshot time. The per-shard breakdown does not fit this struct's flat
+    /// Copy shape; call `in_flight_flushes_by_shard` directly for that.
+    pub in_flight_flushes_total: u64,
+    /// Sum across shards of `flush_permit_wait_ns` from
+    /// [`LogIngestMetrics::shard_skew_by_shard`] at snapshot time: total
+    /// injected-`Clock` nanoseconds every flush task has spent waiting on its
+    /// shard's `max_inflight_flushes` semaphore. The per-shard breakdown does
+    /// not fit this struct's flat Copy shape; call `shard_skew_by_shard`
+    /// directly for that.
+    pub flush_permit_wait_ns_total: u64,
 }
 
 /// One shard's flush count split by the trigger that opened each flush (issue
@@ -378,10 +439,20 @@ impl LogIngestMetrics {
         self.put_retries.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A flush abandoned by retry-budget or lifetime exhaustion
-    /// ([`crate::LogWriteError::Abandoned`]): a durability signal, retryable.
+    /// A flush abandoned by retry-budget or lifetime exhaustion while its own
+    /// store calls were in flight ([`crate::LogWriteError::Abandoned`]): a
+    /// durability signal, retryable.
     pub(crate) fn record_abandoned_retry_exhausted(&self) {
         self.abandoned_retry_exhausted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A flush abandoned because its flush-open deadline elapsed while it was
+    /// queued for a permit, before any store call
+    /// ([`crate::LogWriteError::Abandoned`], issue #1739): a contention signal,
+    /// retryable.
+    pub(crate) fn record_abandoned_queue_deadline(&self) {
+        self.abandoned_queue_deadline
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -409,6 +480,28 @@ impl LogIngestMetrics {
         self.stream_id_collisions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush whose flush-open stamp was raised to this writer's monotonic
+    /// floor because the clock read below the previous stamp (ADR-1307).
+    pub(crate) fn record_clock_regression(&self) {
+        self.clock_regressions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush refused because the backwards step exceeded the monotonic hold
+    /// bound `MAX_FLUSH_CLOCK_HOLD_NS` (ADR-1307).
+    pub(crate) fn record_clock_regression_refused(&self) {
+        self.clock_regressions_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `count` tenants still buffered after a teardown `flush_all` drained
+    /// (ADR-1307 finding F1). Called once per teardown drain that leaves a
+    /// residue; never from the `FlushNow` drain, which retries its residue on
+    /// the next trigger.
+    pub(crate) fn record_flush_all_residue(&self, count: u64) {
+        self.flush_all_residue_tenants
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     /// One multi-shard Strict write returned as
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably before a sibling failed. Recorded once per such write,
@@ -421,9 +514,10 @@ impl LogIngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Adjusts shard `shard`'s in-flight-flush gauge by `delta` (+1 when a
-    /// flush task is spawned, -1 when it ends, including on panic via
-    /// `log_shard`'s `InFlightFlushGuard`). Poison recovery rather than a panic
+    /// Adjusts shard `shard`'s in-flight-flush gauge by `delta`. Both deltas
+    /// belong to `log_shard`'s `InFlightFlushGuard`: +1 in its constructor, -1
+    /// in its `Drop`, including on panic. Nothing else may call this, or the
+    /// two can disagree. Poison recovery rather than a panic
     /// on a poisoned lock: a gauge is best-effort self-observability, not a
     /// durability path, so a prior panicked holder must not take this one down
     /// with it.
@@ -449,6 +543,20 @@ impl LogIngestMetrics {
             .collect();
         counts.sort_unstable_by_key(|&(shard, _)| shard);
         counts
+    }
+
+    /// Shard `shard`'s raw signed in-flight-flush count, before the clamp
+    /// [`LogIngestMetrics::in_flight_flushes_by_shard`] applies on read. Tests
+    /// only: the clamp is what hides an unbalanced increment/decrement pair
+    /// from the public reader, so a test that the pair cannot come apart has
+    /// to see the sign.
+    #[cfg(test)]
+    pub(crate) fn in_flight_flushes_signed(&self, shard: u32) -> i64 {
+        let map = self
+            .in_flight_flushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&shard).copied().unwrap_or(0)
     }
 
     pub(crate) fn record_stale_provisioning_flush(&self) {
@@ -511,12 +619,16 @@ impl LogIngestMetrics {
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
+            abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
             abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
             buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),
             buffered_records_total: self.buffered_records_total.load(Ordering::Relaxed),
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
             acks_err: self.acks_err.load(Ordering::Relaxed),
             stream_id_collisions: self.stream_id_collisions.load(Ordering::Relaxed),
+            clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
+            clock_regressions_refused: self.clock_regressions_refused.load(Ordering::Relaxed),
+            flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
@@ -538,6 +650,16 @@ impl LogIngestMetrics {
                 .dynamic_columns_overflowed_total
                 .load(Ordering::Relaxed),
             dynamic_columns_used_max: self.dynamic_columns_used_max.load(Ordering::Relaxed),
+            in_flight_flushes_total: self
+                .in_flight_flushes_by_shard()
+                .into_iter()
+                .map(|(_, count)| count)
+                .sum(),
+            flush_permit_wait_ns_total: self
+                .shard_skew_by_shard()
+                .into_iter()
+                .map(|(_, stats)| stats.flush_permit_wait_ns)
+                .sum(),
         }
     }
 }
@@ -602,6 +724,13 @@ mod tests {
             },
         );
         assert_only(
+            LogIngestMetrics::record_abandoned_queue_deadline,
+            LogIngestMetricsSnapshot {
+                abandoned_queue_deadline: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
             LogIngestMetrics::record_abandoned_input_rejected,
             LogIngestMetricsSnapshot {
                 abandoned_input_rejected: 1,
@@ -612,6 +741,27 @@ mod tests {
             LogIngestMetrics::record_stream_id_collision,
             LogIngestMetricsSnapshot {
                 stream_id_collisions: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_clock_regression,
+            LogIngestMetricsSnapshot {
+                clock_regressions: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_clock_regression_refused,
+            LogIngestMetricsSnapshot {
+                clock_regressions_refused: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_flush_all_residue(3),
+            LogIngestMetricsSnapshot {
+                flush_all_residue_tenants: 3,
                 ..Default::default()
             },
         );
@@ -677,6 +827,10 @@ mod tests {
                     postings_distinct_max: 25,
                     dynamic_columns_used: 7,
                     dynamic_columns_overflowed: 2,
+                    #[cfg(feature = "stage-timing")]
+                    bloom_total_ns: 0,
+                    #[cfg(feature = "stage-timing")]
+                    bloom_blocks: 0,
                 })
             },
             LogIngestMetricsSnapshot {

@@ -118,7 +118,7 @@ Small PRs with a clear purpose are easier to review than large mixed changes.
 
 Review is part of the contribution process. Maintainers may ask for a different approach, additional tests, a smaller scope, or an ADR before a change can be merged.
 
-Ravel also runs CodeRabbit, but only when a maintainer asks it to. Opening a pull request does not start a review, and neither does a label or an `@coderabbitai` comment. A maintainer starts one by commenting `/coderabbit review`, and that command does nothing for anyone else. CodeRabbit then posts a single comment review of one revision, which neither approves nor blocks. Treat its findings as one more opinion to answer, not as a gate. See [ADR-0091](docs/adrs/0091-maintainer-gated-coderabbit-reviews.md).
+Ravel also runs an agent review, and only when somebody asks for it. Opening a pull request does not start a review, and neither does a label. Somebody with write access to the repository starts one by commenting `@claude-fleet review` on the pull request. If you do not have write access, ask a maintainer to start it for you. The review arrives as a single comment review of one commit, minutes later. It neither approves nor blocks: a person decides that. Treat its findings as one more opinion to answer, not as a gate. See [ADR-1586](docs/adrs/1586-fleet-review-bot-as-the-review-path.md).
 
 ## Licensing
 

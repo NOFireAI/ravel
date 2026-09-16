@@ -13,7 +13,9 @@
 
 use std::sync::Arc;
 
-use ravel_catalog::{AbsentPolicy, ProvisioningCheck, append_generation, validate_or_adopt};
+use ravel_catalog::{
+    AbsentPolicy, ProvisioningCheck, ProvisioningError, append_generation, validate_or_adopt,
+};
 use ravel_maintain::write_reshard_audit;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantId};
@@ -52,7 +54,7 @@ pub async fn adopt(
         None => vec![Signal::Metrics, Signal::Logs, Signal::Spans],
     };
 
-    let mut refused = false;
+    let mut last_refusal: Option<ProvisioningError> = None;
     for signal in signals {
         let sig = signal.key_prefix();
         match validate_or_adopt(
@@ -68,8 +70,14 @@ pub async fn adopt(
             Ok(ProvisioningCheck::Written) => {
                 println!("{sig}: adopted (wrote provisioning record with shard_count={shards})");
             }
-            Ok(ProvisioningCheck::Matched) => {
-                println!("{sig}: already provisioned; recorded shard_count matches {shards}");
+            Ok(ProvisioningCheck::RecordPresent {
+                recorded_shard_count,
+            }) => {
+                println!(
+                    "{sig}: already provisioned; recorded shard_count is {recorded_shard_count}, \
+                     live --shards default is {shards} (routing uses the recorded generation \
+                     history)"
+                );
             }
             Ok(ProvisioningCheck::FreshNoData) => {
                 println!(
@@ -78,17 +86,45 @@ pub async fn adopt(
                 );
             }
             Err(err) => {
-                refused = true;
                 println!("{sig}: REFUSED: {err}");
+                last_refusal = Some(err);
             }
         }
     }
 
-    if refused {
+    if let Some(err) = last_refusal {
+        let (cause, remedy): (&str, &str) = match err {
+            ProvisioningError::AdoptionWouldHideData { .. } => (
+                "the configured --shards would hide existing data (one possible refusal cause)",
+                "Re-run with a shard count that covers every observed shard index.",
+            ),
+            ProvisioningError::Decode { .. } => (
+                "the provisioning record could not be decoded",
+                "The record above must be repaired or removed before adopting.",
+            ),
+            ProvisioningError::CorruptRecord { .. } => (
+                "the provisioning record is misfiled (its contents don't match the key it was \
+                 read under)",
+                "The record above must be repaired or removed before adopting.",
+            ),
+            ProvisioningError::CorruptGenerations { .. } => (
+                "the provisioning record's shard-generation history is structurally invalid",
+                "The record above must be repaired or removed before adopting.",
+            ),
+            ProvisioningError::UnsupportedVersion { .. } => (
+                "the provisioning record declares a format_version this build does not \
+                 understand",
+                "Upgrade the binary reading this record, or repair the record's version.",
+            ),
+            _ => (
+                "the refusal above",
+                "See the specific error above for the required remediation.",
+            ),
+        };
         anyhow::bail!(
-            "provision adopt refused for at least one signal: the configured --shards would hide \
-             existing data. Nothing was written for a refused signal. Re-run with a shard count \
-             that covers every observed shard index."
+            "provision adopt refused for at least one signal: {cause}. Nothing was written for a \
+             refused signal. {remedy} See the specific error above for the exact cause per \
+             signal."
         );
     }
     Ok(())
@@ -337,6 +373,48 @@ mod tests {
         assert!(
             record.generations.is_empty(),
             "a refused reshard appends nothing"
+        );
+    }
+
+    /// Direct pin on the [`MIN_LEAD_HOURS`] boundary: a lead of exactly the
+    /// minimum is accepted, one hour below it is refused with the exact
+    /// message the check returns.
+    #[tokio::test]
+    async fn reshard_refuses_an_activation_lead_below_min_lead_hours() {
+        let accepted_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        seed_record(accepted_store.as_ref(), Signal::Metrics, 4).await;
+        reshard(
+            accepted_store.clone(),
+            TENANT,
+            SignalArg::Metrics,
+            8,
+            MIN_LEAD_HOURS,
+            10 * NS_PER_HOUR,
+        )
+        .await
+        .expect("a lead of exactly MIN_LEAD_HOURS is accepted");
+
+        let refused_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        seed_record(refused_store.as_ref(), Signal::Metrics, 4).await;
+        let below_min = MIN_LEAD_HOURS - 1;
+        let err = reshard(
+            refused_store.clone(),
+            TENANT,
+            SignalArg::Metrics,
+            8,
+            below_min,
+            10 * NS_PER_HOUR,
+        )
+        .await
+        .expect_err("a lead one hour below MIN_LEAD_HOURS must be refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "--lead-hours {below_min} is below the minimum {MIN_LEAD_HOURS} (ceil(C) + 1 with \
+                 the router's default 60s refresh interval): a shorter lead could let a live \
+                 writer route past the activation on a view it had not yet refreshed. Nothing was \
+                 written."
+            )
         );
     }
 

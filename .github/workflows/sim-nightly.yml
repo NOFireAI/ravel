@@ -29,6 +29,13 @@ concurrency:
   group: sim-nightly
   cancel-in-progress: false
 
+# Workflow-level permissions floor (issue #1717). The one job here checks out
+# the tree and runs cargo, which runs a dependency build script for each crate
+# in the graph with this token in the environment. It reports through the job
+# result alone, so `contents: read` is all it needs.
+permissions:
+  contents: read
+
 jobs:
   seed-batch:
     runs-on: ubuntu-latest
@@ -38,6 +45,11 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing after this checkout runs git against the remote, so the
+          # workflow token has no reason to sit in .git/config where a
+          # dependency build script could read it.
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show

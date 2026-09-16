@@ -284,7 +284,9 @@ it can no longer report, and the metrics in decision 5 need both numbers.
   HTTP cap, in the worst case. That memory is held while a concurrency permit is
   held, and ADR-0069's ingest buffer budget does not account for it. On the
   small hosts this project targets, that product belongs in an operator's sizing
-  arithmetic, so the operations guide must state it.
+  arithmetic, so the operations guide must state it. Amended by the ADR-0069
+  amendment for #1297, which charges the inflate per retained chunk against
+  the ingest byte budget.
 - OTLP HTTP and Remote Write now charge the ingest byte rate on different bases:
   decompressed for OTLP, compressed for Remote Write. This is a real
   inconsistency, recorded here deliberately. It should be resolved by moving

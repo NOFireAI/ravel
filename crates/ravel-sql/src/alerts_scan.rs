@@ -19,6 +19,12 @@
 //! DataFusion re-applies the originals above the scan and any residual predicate
 //! (`state = 'firing'`, `attrs['label.env'] = 'prod'`, ...) is evaluated there
 //! against the emitted columns.
+//!
+//! Each emitted record carries the write identity of the object it came from
+//! (`writer_id`/`writer_epoch`/`writer_seq`, ADR-1101 decision 1's row
+//! contract), stamped from that object's [`SegmentRef`] as the partition is
+//! fetched. Those three columns are what give a SQL fold over the history a
+//! total order; see crate::alerts_schema.
 
 use std::fmt;
 use std::future::Future;
@@ -27,7 +33,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::array::{
-    ArrayRef, Int64Builder, MapBuilder, StringBuilder, TimestampNanosecondArray,
+    ArrayRef, Int64Builder, MapBuilder, StringBuilder, TimestampNanosecondArray, UInt64Builder,
 };
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -52,7 +58,7 @@ use ravel_types::accounting::QueryAccounting;
 
 use crate::alerts_schema::{ALERT_ID_KEY, GENERATION_KEY, RULE_ID_KEY, STATE_KEY, alerts_schema};
 use crate::error::SqlError;
-use crate::rlog_attrs::{attr_value_to_string, find_attr, merged_attrs, retain_unerased};
+use crate::rlog_attrs::{attr_value_to_string, find_attr, merged_attrs, retain_unerased_by};
 
 /// Rows accumulated into one output batch before it is emitted.
 const BATCH_ROWS: usize = 8192;
@@ -213,9 +219,36 @@ impl ExecutionPlan for AlertsScanExec {
     }
 }
 
+/// The write identity of the object a record was read from (ADR-1101 decision
+/// 1's row contract): the three [`SegmentRef`] fields the `alerts` table
+/// promotes to columns. Carried per record rather than per partition because a
+/// partition fetches several objects and the records are then sorted together.
+#[derive(Clone)]
+struct WriteIdentity {
+    writer_id: String,
+    writer_epoch: u64,
+    writer_seq: u64,
+}
+
+impl WriteIdentity {
+    fn from_segment(seg: &SegmentRef) -> Self {
+        WriteIdentity {
+            // The hyphenated uuid string, the same spelling the commit record's
+            // own writer id renders to.
+            writer_id: seg.writer_id.to_string(),
+            writer_epoch: seg.writer_epoch,
+            writer_seq: seg.writer_seq,
+        }
+    }
+}
+
+/// One fetched alert record and the identity of the object it came from.
+type StampedRecord = (LogRecord, WriteIdentity);
+
 /// Fetch every segment in this partition and return its records sorted by
-/// `ts_ns` ascending. The ts range and the `alert_id`/`rule_id` equalities prune
-/// the fetch exactly; the residual re-applies everything above.
+/// `ts_ns` ascending, each stamped with its object's write identity. The ts
+/// range and the `alert_id`/`rule_id` equalities prune the fetch exactly; the
+/// residual re-applies everything above.
 #[allow(clippy::too_many_arguments)]
 async fn prepare_partition(
     fetcher: LogSegmentFetcher,
@@ -226,13 +259,13 @@ async fn prepare_partition(
     content: Arc<Vec<Predicate>>,
     erasure: Arc<Vec<ErasurePredicate>>,
     accounting: QueryAccounting,
-) -> DFResult<Vec<LogRecord>> {
+) -> DFResult<Vec<StampedRecord>> {
     let mut query = LogQuery::new(ts_min, ts_max).with_erasure((*erasure).clone());
     for c in content.iter() {
         query = query.with_content(c.clone());
     }
 
-    let mut out: Vec<LogRecord> = Vec::new();
+    let mut out: Vec<StampedRecord> = Vec::new();
     for seg in &segs {
         let Some(output) = fetcher
             .fetch_accounted_with_tenant(seg, tenant_hash, &query, &accounting)
@@ -241,24 +274,36 @@ async fn prepare_partition(
         else {
             continue;
         };
-        out.extend(output.records);
+        // Stamped here, where the record and the `SegmentRef` it was read from
+        // are both in hand: once the partition's records are merged and sorted
+        // there is no way back to the object.
+        let identity = WriteIdentity::from_segment(seg);
+        out.extend(
+            output
+                .records
+                .into_iter()
+                .map(|record| (record, identity.clone())),
+        );
     }
     // Scan-layer selective-erasure exclusion (ADR-0064). This is the
     // authoritative exclusion because it sees the same merged `attrs` view the
     // surface returns (resource + scope + record), so a subject named only in a
     // resource/scope attribute is dropped; the fetcher-level filter matches
     // per-record attributes alone and cannot see it.
-    retain_unerased(&mut out, &erasure)?;
+    retain_unerased_by(&mut out, &erasure, |(record, _)| record)?;
     // Stable sort so records with equal ts keep the reader's emission order.
-    out.sort_by_key(|r| r.ts_ns);
+    out.sort_by_key(|(record, _)| record.ts_ns);
     Ok(out)
 }
 
-type PrepareFuture = Pin<Box<dyn Future<Output = DFResult<Vec<LogRecord>>> + Send>>;
+type PrepareFuture = Pin<Box<dyn Future<Output = DFResult<Vec<StampedRecord>>> + Send>>;
 
 enum AlertScanState {
     Fetching(PrepareFuture),
-    Emitting { records: Vec<LogRecord>, pos: usize },
+    Emitting {
+        records: Vec<StampedRecord>,
+        pos: usize,
+    },
     Done,
 }
 
@@ -320,27 +365,36 @@ impl RecordBatchStream for AlertScanStream {
     }
 }
 
-/// Decode a slice of records into one `alerts`-schema [`RecordBatch`]. The four
-/// scalar fields are promoted from each record's merged attributes ([`find_attr`]
-/// over [`merged_attrs`]), and the full merged map is rendered into the `attrs`
-/// column, so a promoted column and the `attrs` map for the same key never
-/// disagree.
-fn build_batch(records: &[LogRecord], schema: SchemaRef) -> DFResult<RecordBatch> {
-    let ts = TimestampNanosecondArray::from(records.iter().map(|r| r.ts_ns).collect::<Vec<_>>());
+/// Decode a slice of stamped records into one `alerts`-schema [`RecordBatch`].
+/// The four scalar fields are promoted from each record's merged attributes
+/// ([`find_attr`] over [`merged_attrs`]), the full merged map is rendered into
+/// the `attrs` column, so a promoted column and the `attrs` map for the same key
+/// never disagree, and the three write-identity columns come from the object's
+/// own [`SegmentRef`], never from an attribute.
+fn build_batch(records: &[StampedRecord], schema: SchemaRef) -> DFResult<RecordBatch> {
+    let ts =
+        TimestampNanosecondArray::from(records.iter().map(|(r, _)| r.ts_ns).collect::<Vec<_>>());
 
     let mut alert_id = StringBuilder::new();
     let mut rule_id = StringBuilder::new();
     let mut state = StringBuilder::new();
     let mut generation = Int64Builder::new();
+    let mut writer_id = StringBuilder::new();
+    let mut writer_epoch = UInt64Builder::new();
+    let mut writer_seq = UInt64Builder::new();
     let mut attrs = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
 
-    for r in records {
+    for (r, identity) in records {
         let merged = merged_attrs(r)?;
 
         append_str_attr(&mut alert_id, find_attr(&merged, ALERT_ID_KEY));
         append_str_attr(&mut rule_id, find_attr(&merged, RULE_ID_KEY));
         append_str_attr(&mut state, find_attr(&merged, STATE_KEY));
         append_generation(&mut generation, find_attr(&merged, GENERATION_KEY));
+
+        writer_id.append_value(&identity.writer_id);
+        writer_epoch.append_value(identity.writer_epoch);
+        writer_seq.append_value(identity.writer_seq);
 
         for (k, v) in &merged {
             attrs.keys().append_value(k);
@@ -357,6 +411,9 @@ fn build_batch(records: &[LogRecord], schema: SchemaRef) -> DFResult<RecordBatch
         Arc::new(rule_id.finish()),
         Arc::new(state.finish()),
         Arc::new(generation.finish()),
+        Arc::new(writer_id.finish()),
+        Arc::new(writer_epoch.finish()),
+        Arc::new(writer_seq.finish()),
         Arc::new(attrs.finish()),
     ];
     debug_assert_eq!(schema.fields().len(), columns.len());

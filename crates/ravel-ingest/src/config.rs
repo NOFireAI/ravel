@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::budget::IngestByteBudgetLimit;
+
 /// RSEG trailer version every flush emits. ADR-0027 leaves v7 the only
 /// writable version (ADR-0092 bumped it from v6), so this is no longer a
 /// configurable knob; it mirrors `ravel_segment`'s `VERSION_V7` constant, and
@@ -121,6 +123,191 @@ pub(crate) fn checked_ingest_hour_bucket(flush_open_ns: i64) -> Result<u32, Stri
     })
 }
 
+/// Upper bound on how far the per-writer monotonic floor (ADR-1307) may hold a
+/// flush-open stamp above the raw clock reading before the flush is refused
+/// rather than stamped.
+///
+/// A backwards clock step within this bound is absorbed: the stamp is held at
+/// the floor so duplicate resolution stays monotonic, the step is counted
+/// (`clock_regressions`), and the flush proceeds. A hold larger than this is
+/// refused with a typed, retryable error (counted as `clock_regressions_refused`)
+/// and the floor re-anchors to the raw reading, because a hold this large can
+/// only arise two ways, both of which must fail loud rather than be papered over:
+///
+/// - a genuine multi-minute backwards step, which the floor cannot absorb
+///   without drifting the stamp arbitrarily far from wall time and into a
+///   stale ingest-hour bucket; and
+/// - the tail of a spurious forward glitch that already ratcheted the floor
+///   ahead of wall time. Absorbing here would stamp every later flush into a
+///   future ingest hour that LIST-discovered resolve never scans, so one glitch
+///   would silently strand all subsequent writes. Re-anchoring on refusal means
+///   exactly the one flush that crosses the bound fails; the next normal
+///   reading proceeds.
+///
+/// Sized as the catalog clock-skew allowance alone, derived from
+/// [`ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`] rather than a literal.
+/// That allowance is the only term that governs the *future* end of the resolve
+/// window: `Catalog::window_hour_bounds` caps a token-less query's hour listing
+/// at `now + clock_skew_allowance`, so a stamp held at most this far above wall
+/// time still lands in an hour bucket that query lists. The fold safety margin
+/// does not belong in this bound: it feeds the seal watermark, which governs how
+/// far *back* the unsealed tail is scanned, not how far forward a query lists. A
+/// stamp held past `now + clock_skew_allowance` sits in a future hour bucket a
+/// token-less query skips (a hole in the result, not staleness), which is why
+/// the bound is the clock-skew allowance and nothing more.
+///
+/// Known limitation: `clock_skew_allowance_ns` is operator-configurable per
+/// catalog (`ravel_catalog::CatalogConfig`). This bound is fixed at compile time
+/// from the *default* allowance, so an operator who lowers the catalog's
+/// allowance below it widens the window in which an absorbed stamp is
+/// undiscoverable. A runtime cross-check against the configured allowance is a
+/// follow-up (reported, not fixed here).
+pub const MAX_FLUSH_CLOCK_HOLD_NS: i64 = ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
+
+/// Bound on the number of drain passes a graceful `flush_all` makes before it
+/// gives up and records the residue (ADR-1307 finding F1).
+///
+/// `flush_all` re-buffers a clock-refused flush and must retry it in the same
+/// call, because on a graceful teardown there is no later actor tick to retry
+/// it (the map is snapshotted per pass, and a refusal re-inserts a key the
+/// snapshot already consumed). A refusal re-anchors the monotonic floor to the
+/// raw reading, so with any clock that does not keep stepping backwards the
+/// very next pass stamps that reading and proceeds: a normal drain finishes in
+/// one pass, and a single absorbed regression in two. The bound exists only so
+/// a pathological clock that steps back on *every* reading cannot spin the
+/// drain forever; `4` leaves generous headroom above the two passes the
+/// ADR-guaranteed "at most one flush refused per backwards step" needs while
+/// still terminating such a clock in a handful of iterations. Residue that
+/// survives all passes is never dropped silently: how it is reported depends on
+/// whether the caller can still retry it, which is what [`DrainIntent`]
+/// carries.
+pub const MAX_FLUSH_ALL_PASSES: usize = 4;
+
+/// What the caller of a shard actor's `flush_all` does after the drain returns,
+/// which decides how residue left by the pass cap is reported.
+///
+/// Residue is the same state either way: the tenants are still in the actor's
+/// buffer map with their arrival bookkeeping intact. Whether that state is a
+/// durability defect depends entirely on whether anything will flush them
+/// later, and only the caller knows that.
+pub(crate) enum DrainIntent {
+    /// The actor stops when the drain returns (`Shutdown`, or the channel-close
+    /// arm): nothing will retry residue, so acknowledged buffered-mode rows are
+    /// lost on a graceful path. Logged at ERROR and counted
+    /// (`flush_all_residue_tenants`).
+    Teardown,
+    /// The actor keeps running (`FlushNow`, reachable from the router's
+    /// `flush_all`, which benches, tests, and the `ravel-cli` load path call on
+    /// a repeating ticker): residue stays buffered with its
+    /// `oldest_arrival_ns`, so the age tick and the next explicit flush both
+    /// retry it and nothing is lost. Logged at WARN and not counted, so a stuck
+    /// tenant under a bad clock cannot grow a durability-defect counter without
+    /// bound, or page on a ticker. The refusals behind it are still counted
+    /// per flush attempt (`clock_regressions_refused`).
+    Retryable,
+}
+
+/// Why [`monotonic_flush_open_ns`] declined to produce a flush-open stamp. The
+/// two arms surface different write errors because they are different failures.
+///
+/// [`monotonic_flush_open_ns`]: crate::shard::ShardActor::monotonic_flush_open_ns
+pub(crate) enum FlushClockError {
+    /// The raw flush-open reading is not a usable wall-clock value: non-positive,
+    /// below the 2020 plausibility floor, or yielding no representable
+    /// ingest-hour bucket. A grossly broken host clock, not a transient step:
+    /// the next flush reads the same broken clock until an operator fixes it, so
+    /// this is surfaced fail-loud as the non-retryable `SegmentBuild` (ADR-0051
+    /// amendment) and counted as `abandoned_input_rejected`.
+    InvalidReading(String),
+    /// The per-writer floor would have to hold the stamp more than
+    /// [`MAX_FLUSH_CLOCK_HOLD_NS`] above the raw reading (ADR-1307): a backwards
+    /// step too large to absorb, or the tail of a spurious forward glitch. A
+    /// transient condition the next flush recovers from once the floor
+    /// re-anchors, and nothing in this flush was acknowledged, so it is surfaced
+    /// as the retryable `Abandoned` and counted as `clock_regressions_refused`,
+    /// never as an `abandoned_input_rejected` client signal.
+    RegressionRefused(String),
+}
+
+/// Share of the process-wide ADR-0069 ceiling that one (shard, tenant) buffer
+/// may hold before the memory backstop fires: an eighth, so seven eighths of
+/// the budget stay available to every other tenant while one buffer fills
+/// toward `target_bytes`.
+const BUFFER_MEMORY_BACKSTOP_BUDGET_DIVISOR: u64 = 8;
+
+/// Cap on the per-buffer memory backstop, so an operator who raises
+/// `--max-ingest-buffer-bytes` to tens of gigabytes does not thereby let one
+/// buffer hold gigabytes of RAM. An eighth of the 512 MiB default ceiling, so
+/// the default sizing is unchanged by the cap.
+const BUFFER_MEMORY_BACKSTOP_CAP_BYTES: usize = 64 * 1024 * 1024;
+
+/// The memory a single (shard, tenant) buffer may hold before the size trigger
+/// fires regardless of how few object bytes it would write.
+///
+/// The size trigger is stated in object bytes, and the ratio between object
+/// bytes and buffered memory is client-controlled: a series with many short
+/// labels holds roughly twenty times more RAM than the bytes it contributes to
+/// the object. Without this backstop such a tenant would fill RAM toward the
+/// ADR-0069 shed ceiling instead of flushing, and shedding a write is worse
+/// than writing a smaller object.
+///
+/// Derived from the ceiling the operator configured, not from the default one:
+/// `--max-ingest-buffer-bytes` is what a shed is measured against, so a
+/// constant backstop calibrated against the default inverts this rationale on
+/// any replica sized below it. At `Bounded(64 MiB)` a constant 64 MiB backstop
+/// lets one label-heavy buffer hold the entire process budget and shed every
+/// other tenant's write until an age trigger releases it.
+/// [`IngestByteBudgetLimit::Unlimited`] has no ceiling to take a share of, so
+/// the cap applies alone: nothing sheds under it, and the cap is what keeps one
+/// buffer's resident memory bounded.
+///
+/// Never below `target_bytes`: a backstop under the target would fire first on
+/// every buffer and make the memory figure, not the object estimate, the
+/// effective size trigger, which is the defect issue #1305 fixed. When an
+/// eighth of the ceiling is itself below `target_bytes` (a ceiling under
+/// `8 * target_bytes`, so under 64 MiB at the default target) `target_bytes`
+/// wins and one buffer's share of the budget is larger than an eighth. That
+/// configuration is already degenerate: a ceiling that holds only a few
+/// target-sized objects sheds on tenant count whatever the backstop does.
+pub(crate) fn buffer_memory_backstop_bytes(
+    config: &IngestConfig,
+    ceiling: IngestByteBudgetLimit,
+) -> usize {
+    let share = match ceiling {
+        IngestByteBudgetLimit::Unlimited => BUFFER_MEMORY_BACKSTOP_CAP_BYTES,
+        IngestByteBudgetLimit::Bounded(limit) => {
+            usize::try_from(limit / BUFFER_MEMORY_BACKSTOP_BUDGET_DIVISOR)
+                .unwrap_or(usize::MAX)
+                .min(BUFFER_MEMORY_BACKSTOP_CAP_BYTES)
+        }
+    };
+    share.max(config.target_bytes)
+}
+
+/// The size trigger, shared by the metrics, log, and span shard actors:
+/// `flush_est_bytes` is the object-bytes estimate for the flush this buffer
+/// would write and gates `target_bytes`; `est_bytes` is the conservative
+/// buffered-memory figure the ADR-0069 ceiling charges and gates only the
+/// memory backstop, whose bound comes from `ceiling`. Keeping both here keeps
+/// one rule in one place rather than three copies that drift (issue #1305).
+///
+/// The backstop can only pre-empt the target when a buffer holds more memory
+/// than the object bytes it would write, which is the case it exists for. The
+/// reverse happens too and the backstop is silent there: a native histogram
+/// charges a flat 16 bytes per point to `est_bytes` while contributing up to
+/// `32 + 8 * (buckets + spans + custom_values)` object bytes, and a log record
+/// with no attributes charges 32 against 48 object bytes. Those buffers reach
+/// `target_bytes` on the object estimate first, which is the intended trigger.
+pub(crate) fn size_trigger_fires(
+    flush_est_bytes: usize,
+    est_bytes: usize,
+    config: &IngestConfig,
+    ceiling: IngestByteBudgetLimit,
+) -> bool {
+    flush_est_bytes >= config.target_bytes
+        || est_bytes >= buffer_memory_backstop_bytes(config, ceiling)
+}
+
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestConfig {
@@ -130,7 +317,16 @@ pub struct IngestConfig {
     pub shard_count: u32,
     /// Bounded mpsc channel depth per shard.
     pub channel_depth: usize,
-    /// Flush a tenant's buffer once its estimated size reaches this many bytes.
+    /// Flush a tenant's buffer once the object that flush would write is
+    /// estimated to reach this many bytes.
+    ///
+    /// Estimated in object bytes, not in buffered memory (issue #1305): the
+    /// size trigger reads the per-signal flush-size estimator, while the
+    /// process-wide memory ceiling (ADR-0069) keeps charging its own
+    /// conservative figure. The two are no longer one number, so raising this
+    /// to get larger objects no longer weakens the memory ceiling.
+    /// [`buffer_memory_backstop_bytes`] is what bounds the memory a single
+    /// buffer may hold while filling toward this target.
     pub target_bytes: usize,
     /// Flush a tenant's buffer once its oldest point is at least this old.
     pub max_flush_delay: Duration,
@@ -145,9 +341,12 @@ pub struct IngestConfig {
     /// paying a PUT every `max_flush_delay` regardless of how little data it
     /// holds.
     pub max_flush_delay_idle: Duration,
-    /// A buffer at or above this many estimated bytes is never treated as
-    /// idle for the age trigger, even with no strict-mode waiter: it is
-    /// already worth the PUT cost `max_flush_delay` pays for.
+    /// A buffer whose flush would write at least this many object bytes is
+    /// never treated as idle for the age trigger, even with no strict-mode
+    /// waiter: it is already worth the PUT cost `max_flush_delay` pays for.
+    /// Same estimator and same units as `target_bytes` (issue #1305): "worth a
+    /// PUT" is a statement about the object, not about the RAM the buffer
+    /// occupies while building it.
     pub min_flush_bytes: usize,
     /// Retries after the first attempt for the data-object PUT (total
     /// attempts = this + 1). Also bounds retries of the commit-record PUT.
@@ -240,6 +439,111 @@ impl Default for IngestConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The trigger reads the object-bytes estimate, and the memory backstop is
+    /// the bound on the other side: a buffer whose struct headers dwarf its
+    /// payload still flushes before it can hold an unbounded amount of RAM.
+    #[test]
+    fn size_trigger_reads_object_bytes_with_a_memory_backstop() {
+        let cfg = IngestConfig {
+            target_bytes: 8 * 1024 * 1024,
+            ..IngestConfig::default()
+        };
+        let default_ceiling = IngestByteBudgetLimit::Bounded(512 * 1024 * 1024);
+        let backstop = buffer_memory_backstop_bytes(&cfg, default_ceiling);
+        assert_eq!(backstop, 64 * 1024 * 1024);
+
+        // Object bytes decide, whatever the buffer holds.
+        assert!(!size_trigger_fires(
+            cfg.target_bytes - 1,
+            0,
+            &cfg,
+            default_ceiling
+        ));
+        assert!(size_trigger_fires(
+            cfg.target_bytes,
+            0,
+            &cfg,
+            default_ceiling
+        ));
+        assert!(
+            !size_trigger_fires(0, cfg.target_bytes, &cfg, default_ceiling),
+            "buffered bytes at target_bytes no longer fire the trigger"
+        );
+
+        // Backstop decides when the buffer runs far past the payload it holds.
+        assert!(!size_trigger_fires(0, backstop - 1, &cfg, default_ceiling));
+        assert!(size_trigger_fires(0, backstop, &cfg, default_ceiling));
+
+        // A target above the cap raises the backstop with it, so the
+        // backstop can never pre-empt the trigger it backs.
+        let wide = IngestConfig {
+            target_bytes: 256 * 1024 * 1024,
+            ..IngestConfig::default()
+        };
+        assert_eq!(
+            buffer_memory_backstop_bytes(&wide, default_ceiling),
+            256 * 1024 * 1024
+        );
+    }
+
+    /// The backstop is a share of the ceiling an operator configured, not of
+    /// the default one. A replica sized with `--max-ingest-buffer-bytes
+    /// 67108864` must not let one (shard, tenant) buffer hold the whole process
+    /// budget and shed every other tenant's write.
+    #[test]
+    fn memory_backstop_is_a_share_of_the_configured_ceiling() {
+        let cfg = IngestConfig {
+            target_bytes: 8 * 1024 * 1024,
+            ..IngestConfig::default()
+        };
+        let small = 64 * 1024 * 1024_u64;
+        let backstop = buffer_memory_backstop_bytes(&cfg, IngestByteBudgetLimit::Bounded(small));
+        assert_eq!(
+            backstop,
+            8 * 1024 * 1024,
+            "an eighth of the configured ceiling, not the 64 MiB the default ceiling earns"
+        );
+        assert_eq!(
+            backstop as u64 * BUFFER_MEMORY_BACKSTOP_BUDGET_DIVISOR,
+            small,
+            "one buffer holds an eighth of the budget, leaving seven eighths"
+        );
+        assert!(
+            size_trigger_fires(0, backstop, &cfg, IngestByteBudgetLimit::Bounded(small)),
+            "the buffer flushes at an eighth of the budget"
+        );
+        assert!(
+            size_trigger_fires(
+                0,
+                small as usize - 1,
+                &cfg,
+                IngestByteBudgetLimit::Bounded(small)
+            ),
+            "a buffer one byte short of the whole ceiling has long since flushed"
+        );
+
+        // Unlimited has no ceiling to take a share of: the cap alone bounds a
+        // buffer's resident memory, and nothing sheds under it.
+        assert_eq!(
+            buffer_memory_backstop_bytes(&cfg, IngestByteBudgetLimit::Unlimited),
+            64 * 1024 * 1024
+        );
+        // A ceiling far above the default does not raise the backstop with it.
+        assert_eq!(
+            buffer_memory_backstop_bytes(
+                &cfg,
+                IngestByteBudgetLimit::Bounded(64 * 1024 * 1024 * 1024)
+            ),
+            64 * 1024 * 1024
+        );
+        // `Bounded(0)` sheds every non-empty write, so nothing can buffer to a
+        // backstop at all; `target_bytes` is the floor that remains.
+        assert_eq!(
+            buffer_memory_backstop_bytes(&cfg, IngestByteBudgetLimit::Bounded(0)),
+            8 * 1024 * 1024
+        );
+    }
 
     #[test]
     fn defaults_match_sizing_table() {

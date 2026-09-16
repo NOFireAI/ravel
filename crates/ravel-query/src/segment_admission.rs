@@ -66,11 +66,19 @@ pub fn request_budget_exceeded(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::time::Duration;
 
-    use super::request_budget_exceeded;
-    use crate::config::{RequestLimit, derive_max_s3_requests};
+    use ravel_catalog::{
+        DeclaredColumnStats, SegmentLevel, SegmentOrigin, SegmentOrigins, Snapshot,
+    };
+    use uuid::Uuid;
+
+    use super::{admit, request_budget_exceeded};
+    use crate::config::{ByteLimit, EngineConfig, RequestLimit, derive_max_s3_requests};
+    use crate::error::QueryError;
+    use crate::request_budgets::RequestBudgets;
 
     /// The shard count a `ravel-server` process runs with by default
     /// (`services/ravel-server`'s `--shards`, `default_value_t = 4`). Named
@@ -166,5 +174,131 @@ mod tests {
         let open_hour_4 = 4 * (3_600_000u64 / 500);
         assert!(!RequestLimit::Bounded(four).is_exceeded_by(open_hour_4));
         assert!(RequestLimit::Bounded(OLD_FLAT_CAP).is_exceeded_by(open_hour_4));
+    }
+
+    /// A snapshot of `sealed` sealed, below-watermark segments and one recent
+    /// (exempt) one, with `origins` parallel to `segments` as `admit`'s
+    /// debug assertion requires.
+    fn snapshot_with_sealed(sealed: usize) -> (Snapshot, SegmentOrigins) {
+        let segment = ravel_catalog::SegmentRef {
+            data_object_key: "irrelevant".to_string(),
+            object_size: 4_096,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 1,
+            ingest_hour_bucket: 0,
+            sample_count: 1,
+            series_count: 1,
+            shard: 0,
+            content_hash: [0u8; 32],
+            writer_id: Uuid::nil(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: 1,
+            declared_column_stats: DeclaredColumnStats::default(),
+        };
+        let mut origins = SegmentOrigins::default();
+        for _ in 0..sealed {
+            origins.push(SegmentOrigin::SealedBelowWatermark);
+        }
+        origins.push(SegmentOrigin::Recent);
+        let snapshot = Snapshot {
+            segments: vec![segment; sealed + 1],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        (snapshot, origins)
+    }
+
+    /// ADR-1374 decision 3: a caller-supplied [`RequestBudgets`] can only
+    /// LOWER a server ceiling. A value above the ceiling resolves to the
+    /// ceiling, a value below it resolves to itself, and an absent value
+    /// leaves the ceiling untouched.
+    ///
+    /// Asserted through the two enforcement seams, not only through `clamp`:
+    /// the clamped values are what `admit` and `request_budget_exceeded`
+    /// actually read, so a clamp that computed the right number but never
+    /// reached the check would pass a `clamp`-only test.
+    #[test]
+    fn request_budget_cannot_be_raised_above_server_ceiling() {
+        let ceiling = EngineConfig {
+            max_segments: 10,
+            max_bytes_scanned: ByteLimit::Bounded(1_000),
+            max_s3_requests: RequestLimit::Bounded(100),
+            ..EngineConfig::default()
+        };
+
+        // Above the ceiling in every field: each one clamps down to the
+        // ceiling's exact value, never the caller's.
+        let raised = RequestBudgets {
+            max_bytes_scanned: Some(ByteLimit::Bounded(1_000_000)),
+            max_store_requests: Some(RequestLimit::Bounded(50_000)),
+            max_segments: Some(9_999),
+        }
+        .clamp(&ceiling);
+        assert_eq!(raised.max_bytes_scanned, ByteLimit::Bounded(1_000));
+        assert_eq!(raised.max_store_requests, RequestLimit::Bounded(100));
+        assert_eq!(raised.max_segments, 10);
+
+        // `Unlimited` is the strongest possible ask and still cannot lift a
+        // bounded ceiling.
+        let unbounded = RequestBudgets {
+            max_bytes_scanned: Some(ByteLimit::Unlimited),
+            max_store_requests: Some(RequestLimit::Unlimited),
+            max_segments: None,
+        }
+        .clamp(&ceiling);
+        assert_eq!(unbounded.max_bytes_scanned, ByteLimit::Bounded(1_000));
+        assert_eq!(unbounded.max_store_requests, RequestLimit::Bounded(100));
+        assert_eq!(unbounded.max_segments, 10);
+
+        // Below the ceiling: the caller's own value, exactly.
+        let lowered = RequestBudgets {
+            max_bytes_scanned: Some(ByteLimit::Bounded(256)),
+            max_store_requests: Some(RequestLimit::Bounded(7)),
+            max_segments: Some(2),
+        }
+        .clamp(&ceiling);
+        assert_eq!(lowered.max_bytes_scanned, ByteLimit::Bounded(256));
+        assert_eq!(lowered.max_store_requests, RequestLimit::Bounded(7));
+        assert_eq!(lowered.max_segments, 2);
+
+        // Absent entirely: byte-identical to the pre-ADR-1374 behavior.
+        let absent = RequestBudgets::default().clamp(&ceiling);
+        assert_eq!(absent.max_bytes_scanned, ceiling.max_bytes_scanned);
+        assert_eq!(absent.max_store_requests, ceiling.max_s3_requests);
+        assert_eq!(absent.max_segments, ceiling.max_segments);
+        assert_eq!(absent, RequestBudgets::clamp_optional(None, &ceiling));
+
+        // The request-budget check reads the effective value. 50 requests is
+        // under the ceiling of 100 and over the lowered 7.
+        assert!(request_budget_exceeded(50, raised.max_store_requests).is_none());
+        assert!(request_budget_exceeded(50, absent.max_store_requests).is_none());
+        match request_budget_exceeded(50, lowered.max_store_requests) {
+            Some(QueryError::RequestBudgetExceeded { requests, max }) => {
+                assert_eq!(requests, 50);
+                assert_eq!(max, 7);
+            }
+            other => panic!("a lowered request budget must reject 50 requests, got {other:?}"),
+        }
+
+        // `admit` reads the effective segment count the same way: 5 sealed
+        // segments fit the ceiling of 10 and the raise-attempt's clamped 10,
+        // and are rejected under the lowered 2.
+        let (snapshot, origins) = snapshot_with_sealed(5);
+        for effective in [raised, absent] {
+            let admitted = admit(&snapshot, &origins, &effective.applied_to(&ceiling))
+                .expect("5 sealed segments fit a ceiling of 10");
+            assert_eq!(admitted.sealed_count, 5);
+            assert_eq!(admitted.exempt_count, 1);
+        }
+        match admit(&snapshot, &origins, &lowered.applied_to(&ceiling)) {
+            Err(QueryError::TooManySegments { count, max }) => {
+                assert_eq!(count, 5);
+                assert_eq!(max, 2);
+            }
+            other => panic!("a lowered max_segments must reject 5 sealed segments, got {other:?}"),
+        }
     }
 }

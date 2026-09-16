@@ -22,6 +22,12 @@
 //! one, so a typo in the configuration cannot silently scatter scratch across
 //! a node's filesystem.
 //!
+//! On Unix that subdirectory is created `0o700` explicitly rather than at the
+//! ambient umask, so a default `0o022` cannot leave one query's spilled rows
+//! readable by every local user. It is the only permission control this crate
+//! has over spill: the files beneath it are created by DataFusion's disk
+//! manager. The configured directory's own mode is the operator's.
+//!
 //! Cleaning up scratch left by a process that died mid-query is explicitly NOT
 //! done here (no startup sweep, no node-wide or per-tenant scratch quota):
 //! those need an owner outside a single query's lifetime and are follow-up
@@ -101,6 +107,25 @@ fn next_scratch_name() -> String {
     )
 }
 
+/// Creates one query's scratch subdirectory owner-only rather than at the
+/// ambient umask.
+///
+/// Non-recursive, exactly like `create_dir`, so a name already taken still
+/// surfaces as `AlreadyExists` and [`SpillScratch::create_named`]'s retry is
+/// unaffected. This directory's mode is the whole of the permission control
+/// available here: the spill files inside it are created by DataFusion's disk
+/// manager, not by this crate.
+#[cfg(unix)]
+fn create_scratch_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_scratch_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(dir)
+}
+
 /// One query's scratch subdirectory, removed when this value drops.
 ///
 /// Held by the query's [`PinnedQuery`](crate::PinnedQuery) and moved into its
@@ -162,7 +187,7 @@ impl SpillScratch {
         let mut collided = Vec::new();
         for _ in 0..SCRATCH_NAME_ATTEMPTS {
             let dir = root.join(name());
-            match std::fs::create_dir(&dir) {
+            match create_scratch_dir(&dir) {
                 Ok(()) => return Ok(SpillScratch { dir }),
                 Err(err) if err.kind() == ErrorKind::AlreadyExists => {
                     collided.push(dir);
@@ -325,6 +350,38 @@ mod tests {
         assert!(!dir.exists(), "the scratch subdirectory must be removed");
         assert!(sibling.is_dir(), "an unrelated sibling must survive");
         assert!(root.path().is_dir(), "the configured root must survive");
+    }
+
+    /// The scratch subdirectory is owner-only under every usual umask (a
+    /// umask can only narrow the mode the builder asks for).
+    /// DataFusion's disk manager writes the spill files inside it, so this
+    /// mode is what keeps another local user from reading one query's spilled
+    /// rows. The bits asserted here are the ones `create_scratch_dir` sets
+    /// explicitly; this test neither reads nor changes the umask.
+    ///
+    /// FLIP (non-vacuity): restore `std::fs::create_dir(&dir)` in
+    /// `SpillScratch::create_named`. Under `umask 022` the assertion then
+    /// reads `0o755`.
+    #[cfg(unix)]
+    #[test]
+    fn the_scratch_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temp root");
+        let config = SpillConfig {
+            dir: root.path().to_path_buf(),
+            max_bytes: 1 << 20,
+        };
+        let scratch = SpillScratch::create(&config).expect("scratch created");
+        let mode = std::fs::metadata(scratch.dir())
+            .expect("scratch metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "one query's spill files must not be readable by other local users"
+        );
     }
 
     /// Two concurrent queries under one configured directory get distinct

@@ -73,21 +73,53 @@ docker compose -f deploy/metricsbench/docker-compose.yml down -v
 deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
 ```
 
-Exit 0 means every image reference in the deployment carries an `@sha256:`
-digest, every ADR-0927-required comparator is present, and the number of image
-references equals the expected count. Any unpinned reference, any missing
-required comparator, or a reference count that drifts from the expected number
-fails the check with a non-zero exit. The script prints what it checked and how
-many references it found.
+Originally scoped to this directory's compose file alone (issue #934), the
+script now also checks the two repo-wide supply-chain pins issue #1310 added,
+plus the quickstart compose files issue #1720 added: every `FROM`/`ARG` base
+image in the root `Dockerfile` and `Dockerfile.prebuilt`, every `uses:` action
+reference under `.github/workflows/` and `.github/actions/`, and every
+`image:` reference in `deploy/docker-compose/ravel.yml` and
+`deploy/docker-compose/minio.yml`. All four categories run in one invocation
+and each is checked against its own expected count:
 
-This check is **not yet run by CI**. Wiring it into `scripts/gates.sh` or a CI
-workflow is a deliberate follow-up: those are shared files outside issue #934's
-scope.
+- **Compose images** (this directory): every image reference carries an
+  `@sha256:` digest, every ADR-0927-required comparator is present, and the
+  number of image references equals the expected count.
+- **Dockerfile base images**: every `FROM`/`ARG` base image reference in the
+  root `Dockerfile` and `Dockerfile.prebuilt` carries an `@sha256:` digest
+  (`FROM scratch` is exempt: no registry manifest exists for it), and the
+  number of references equals the expected count.
+- **Workflow actions**: every `uses:` reference in every workflow and
+  composite action carries a 40-hex commit SHA pin, and the number of
+  references equals the expected count.
+- **Quickstart compose images** (`deploy/docker-compose/ravel.yml` and
+  `deploy/docker-compose/minio.yml`): every `image:` reference except the two
+  `${RAVEL_IMAGE:-...}` references in `ravel.yml` (Ravel's own released
+  image, excluded by exact match) carries an `@sha256:` digest, and both the
+  total image-line count (8, across both files) and the pin-required count
+  (6) equal their expected totals. Scoped to these two files: `deploy/k8s`
+  carries four registry images that are not yet pinned (`minio.yaml` lines
+  49 and 140, `floci.yaml` lines 74 and 157) plus two locally built
+  placeholders (`ravel-server`, `ravel-operator`); pinning the k8s manifests
+  is a separate ticket.
+
+Exit 0 means all four categories passed. Any unpinned reference, any missing
+required comparator, or a reference count that drifts from any category's
+expected number fails the check with a non-zero exit. The script prints what
+it checked and how many references it found in each category.
+
+This check runs in CI, wired into the `doc-scripts` job in
+`.github/workflows/ci.yml`.
 
 ## Pinned image digests
 
-Every digest below is the multi-arch manifest-list digest reported by the Docker
-Hub registry v2 API for the named tag, resolved with:
+Every digest below is the multi-arch manifest-list digest reported by the
+named tag's own registry. The recipe differs by registry, so the two below
+are not interchangeable: substituting a quay.io repo path into the Docker
+Hub URL (or vice versa) resolves nothing.
+
+**`prom/prometheus`, `victoriametrics/victoria-metrics`, and `grafana/mimir`**
+are still on Docker Hub and resolve with the Docker Hub registry v2 API:
 
 ```sh
 curl -sI -H "Authorization: Bearer $TOKEN" \
@@ -96,16 +128,58 @@ curl -sI -H "Authorization: Bearer $TOKEN" \
   | grep -i docker-content-digest
 ```
 
+**`quay.io/minio/minio` and `quay.io/minio/mc`** (see deploy/README.md for why
+the MinIO pair lives on quay.io) resolve with quay's own v2 API instead: quay
+issues a bearer token from a separate auth endpoint rather than accepting one
+minted for Docker Hub.
+
+This is written as two curl steps rather than a one-liner so the token is
+carried over by hand instead of captured into a shell variable.
+
+```sh
+# 1. Get a bearer token scoped to the repo, and read the token field out
+#    of the JSON it prints.
+curl -s "https://quay.io/v2/auth?service=quay.io&scope=repository:minio/minio:pull" \
+  | jq -r .token
+
+# 2. HEAD the manifest list, pasting that token in place of <TOKEN> below,
+#    with the manifest-list Accept header.
+curl -sI -H "Authorization: Bearer <TOKEN>" \
+  -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+  https://quay.io/v2/minio/minio/manifests/RELEASE.2025-04-08T15-41-24Z \
+  | grep -i docker-content-digest
+
+# 3. The docker-content-digest response header is the pinned digest.
+```
+
 | Image | Tag | Digest |
 |---|---|---|
 | `prom/prometheus` | `v3.13.1` | `sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893` |
 | `victoriametrics/victoria-metrics` | `v1.115.0` | `sha256:d8ac3a1776c8a9beead8bbd42a489c82249b1bfe9071dfd4813f34ebe36354bb` |
 | `grafana/mimir` | `2.14.2` | `sha256:2d3912435771d356ec03ae4729fb584b4d76a5f035d9dda40b563a55bb6760e3` |
-| `minio/minio` | `RELEASE.2025-04-08T15-41-24Z` | `sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b` |
-| `minio/mc` | `RELEASE.2025-04-08T15-39-49Z` | `sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952` |
+| `quay.io/minio/minio` | `RELEASE.2025-04-08T15-41-24Z` | `sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b` |
+| `quay.io/minio/mc` | `RELEASE.2025-04-08T15-39-49Z` | `sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952` |
 
 The tag is kept in each `image:` reference alongside the digest for human
 readability; the digest is what pins the run.
+
+### Pins shared with deploy/docker-compose/ravel.yml and minio.yml (issue #1720)
+
+The two quickstart compose files (`deploy/docker-compose/ravel.yml` and
+`deploy/docker-compose/minio.yml`) are scanned by the same script as its
+fourth category (see above), so their pins are recorded here too. The MinIO
+pair is the exact same tag and digest this directory already uses above,
+and is identical across both quickstart files (`minio.yml` is `ravel.yml`'s
+standalone MinIO mirror); the other two are `ravel.yml`-only.
+
+| Image | Tag | Digest |
+|---|---|---|
+| `quay.io/minio/minio` | `RELEASE.2025-04-08T15-41-24Z` | `sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b` |
+| `quay.io/minio/mc` | `RELEASE.2025-04-08T15-39-49Z` | `sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952` |
+| `ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib` | `0.160.0` | `sha256:799dc6cf12c96192af37b5bdba804da8c10b3bc563b43cb90c3f3c58d9572ad6` |
+| `grafana/grafana` | `13.2.2` | `sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0` |
+
+See `deploy/README.md` for why these four registries were chosen.
 
 ## Note on the acceptance check name
 

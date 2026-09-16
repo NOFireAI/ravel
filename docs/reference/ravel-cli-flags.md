@@ -123,6 +123,7 @@ One-shot catalog fold for one (tenant, signal)
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
+| `--json` |  |  | Print the full `FoldReport` as JSON instead of the human-readable text report. Either form carries every counter on the report |
 | `--max-flush-lifetime` |  |  | Override the fold's `max_flush_lifetime` (humantime duration, e.g. `30m`, `0s`; the same grammar and unit as the `maintain compact-bucket` / `compact-tenant` flag and ravel-server's `--gc-max-flush-lifetime`). An hour seals only at its end plus this plus the clock-skew allowance plus the fold safety margin, so a freshly finished load waits over an hour before its last hours can be folded; lowering this seals them sooner. The flag asserts that no writer is still flushing, not that this host's clock is exact: the clock-skew allowance and the fold safety margin keep their defaults. UNSAFE under a live writer: a commit record published into a bucket this fold already sealed is never picked up by a later incremental fold, which re-lists only hours after the watermark. The default is the safe 1h; use this only for a tenant known quiescent, such as one whose bulk load has finished and whose writer process has exited |
 | `--shards` |  | `4` |  |
 | `--signal` |  | `metrics` | Which signal's snapshot to fold. Defaults to metrics, so an existing invocation keeps its meaning |
@@ -145,6 +146,20 @@ Re-list sealed commit records for one (tenant, signal) and diff against that sig
 | --- | --- | --- | --- |
 | `--signal` |  | `metrics` | Which signal's snapshot to verify. Defaults to metrics |
 | `--tenant` |  |  |  |
+
+## inspect
+
+Inspect a standalone object by key or local path, outside the segment/rlog/rspan/commit/catalog families above
+
+_No flags._
+
+### inspect cstat
+
+Decode a column-statistics (`.cstat`) object's envelope and header (ADR-0850/ADR-0942/ADR-1413), and report whether its declared `body_uncompressed_len` exceeds the decode ceiling, without ever decompressing the body
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `<KEY>` |  |  | Local file path or object store key |
 
 ## maintain
 
@@ -248,7 +263,9 @@ _No flags._
 
 Run the conformance suite against the configured backend and, on a pass, record the outcome at `sys/qualification`
 
-_No flags._
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--list-page-size` |  | `1000` | List page size to build the store with and declare to the conformance suite's listing probes. Defaults to the production S3 page size, so a default run proves a real continuation-token boundary is crossed; must match the store this command builds, so the cross-page probe judges a real pagination boundary rather than a mismatched, meaningless one. The upper bound is the number of objects a run would write: each listing probe puts the page size plus two scratch objects into the bucket, so a page size beyond a million is a typo that would fill a bucket, not a page size any backend serves |
 
 ## hold
 
@@ -344,6 +361,14 @@ Print the bucket's `sys/tenancy` marker: its scheme and, for a keyed bucket, the
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--tenant-hash-key-file` |  |  | Optional 32-byte deployment key file (64 hex chars or 32 raw bytes) to verify against the marker's fingerprint |
+
+### tenancy resolve
+
+Hash a tenant id under the bucket's resolved scheme and print its object-store prefix (`t/<hash>/`) on stdout and nothing else (issue #1180): the one entry point for turning a tenant id into the prefix a bytes-summed total, a lifecycle rule, or an erasure check needs, instead of scraping it off a failure message. Exits nonzero when the bucket's marker is `v2-keyed` and the global `--tenant-hash-key-file` was not given: that flag supplies the key the derivation needs. The global `--tenant-hash-unkeyed` is not an alternative way to satisfy a keyed marker: it selects the `v1-unkeyed` derivation, and is itself rejected against a keyed bucket
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `<TENANT>` |  |  | Tenant id to resolve (hashed under the bucket's pinned scheme) |
 
 ## provision
 

@@ -79,6 +79,20 @@ pub struct RavelClusterSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_key_secret_ref: Option<LocalSecretRef>,
 
+    /// Secret with a single key `key` holding 64 hex characters, the
+    /// query-audit token key the query tier reads as
+    /// `RAVEL_AUDIT_TOKEN_KEY` (#1487). Query tier only: gateway and
+    /// maintain never read a query-audit token. Omit on a cluster with
+    /// `deploymentKeySecretRef` set -- the server derives the key from the
+    /// deployment key. Omitting both leaves the query tier unable to start
+    /// audit tokenization: the operator does not generate this Secret
+    /// (issue #126's `secrets get`-only posture forbids the create/patch
+    /// that would need), so a cluster with neither ref set reports
+    /// `AuditTokenKeyMissing` and its query tier's Deployment is left as it
+    /// is until this field is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_token_key_secret_ref: Option<LocalSecretRef>,
+
     /// Gateway (ingest + query API) tier.
     #[serde(default)]
     pub gateway: GatewaySpec,
@@ -213,6 +227,17 @@ pub struct GatewaySpec {
     /// a CEL rule attached to the `gateway` object (see [`ravel_cluster_crd`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposure: Option<GatewayExposureSpec>,
+
+    /// Per-shard cross-tenant flush isolation bound (`--max-inflight-flushes`).
+    /// It caps how many flushes a shard actor runs at once, so one tenant's
+    /// stalled flush cannot block co-resident tenants beyond this many permits.
+    /// Ingest runs only in the gateway tier (the query and maintain modes never
+    /// enter the ingest path), so this is a gateway-only field, like `fold`.
+    /// Omit to keep `ravel-server`'s own default of 1 (today's non-pipelined
+    /// behavior). The CRD schema enforces a minimum of 1 at admission:
+    /// `ravel-server` rejects 0 as a flush deadlock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_flushes: Option<u32>,
 }
 
 impl Default for GatewaySpec {
@@ -224,6 +249,7 @@ impl Default for GatewaySpec {
             fold: None,
             ingest_affinity: None,
             exposure: None,
+            max_inflight_flushes: None,
         }
     }
 }
@@ -738,6 +764,60 @@ pub struct RavelClusterStatus {
     #[serde(default)]
     pub gc_bootstrap_waiting_since: Option<String>,
 
+    /// The qualify-Job input hash (bucket, region, endpoint, image, credentials
+    /// Secret name) that store qualification last succeeded against (issue #36).
+    /// The operator gates serving on `ravel-cli store qualify` before it creates any
+    /// Deployment; recording the qualified inputs here makes that gate durable:
+    /// a later pass whose inputs still hash to this value proceeds without
+    /// re-running qualification even after the one-shot Job has been
+    /// TTL-garbage-collected, and a pass whose inputs no longer match re-runs it
+    /// (the `StoreQualified` condition flips back to `Pending`) without tearing
+    /// down the running Deployments. Absent until the first qualification
+    /// succeeds. Qualification is never re-run on a schedule; only an input
+    /// change re-triggers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_qualified_hash: Option<String>,
+
+    /// Consecutive qualify-Job failures for the current inputs (issue #36, finding
+    /// 3). Drives the capped exponential recreation backoff and the terminal
+    /// cooldown: the operator does not recreate a failing qualify Job unboundedly,
+    /// it spaces the recreations out and, past a threshold, holds. Reset to absent
+    /// on a successful qualification and on any input change (a moving
+    /// `storeQualifiedHash` input); never part of the qualified-input hash, so
+    /// counting failures never re-runs a qualification that would otherwise pass.
+    ///
+    /// Serialized even when absent (as explicit `null`) so the status merge patch
+    /// clears it on success; a skipped field would leave a stale count behind.
+    #[serde(default)]
+    pub qualify_failure_count: Option<i32>,
+
+    /// RFC3339 instant before which the operator creates no new qualify Job after
+    /// a failure (issue #36, finding 3): the next point on the capped exponential
+    /// backoff, or the terminal cooldown's expiry. Absent when not holding.
+    ///
+    /// Serialized even when absent (as explicit `null`) so the status merge patch
+    /// clears it; a skipped field would leave a stale deadline behind.
+    #[serde(default)]
+    pub qualify_next_retry_time: Option<String>,
+
+    /// The qualify-Job input hash the persisted `qualifyFailureCount` and
+    /// `qualifyNextRetryTime` were recorded against (issue #36, finding 3). The
+    /// retry state is meaningful only for the inputs that produced the failures:
+    /// when the desired inputs no longer hash to this value the operator resets
+    /// the count and next-retry and qualifies the new inputs at once, whether or
+    /// not the failing Job still exists. Without this key the operator cannot tell
+    /// a changed-input pass from an unchanged one once the Failed Job is
+    /// TTL-garbage-collected (both observe the Job absent), so a config edit made
+    /// after the Job's TTL collected it would wait out the old inputs' cooldown and
+    /// inherit their failure count. This is never part of the qualified-input hash
+    /// itself, so recording it never re-runs a qualification that would pass.
+    ///
+    /// Serialized even when absent (as explicit `null`) so the status merge patch
+    /// clears it on reset or success; a skipped field would leave a stale key
+    /// behind.
+    #[serde(default)]
+    pub qualify_retry_hash: Option<String>,
+
     /// Standard Kubernetes conditions: `Available`, `Progressing`, `Degraded`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
@@ -854,8 +934,8 @@ fn inject_shards_immutability(crd: &mut CustomResourceDefinition) {
 }
 
 /// Attach OpenAPI `minimum: 1` bounds to the count fields that must be positive:
-/// `spec.shards`, `spec.gateway.replicas`, `spec.query.replicas`, and
-/// `spec.maintain.replicas`.
+/// `spec.shards`, `spec.gateway.replicas`, `spec.query.replicas`,
+/// `spec.maintain.replicas`, and `spec.gateway.maxInflightFlushes`.
 ///
 /// Without this, `shards: 0` or a negative replica count passes CRD validation
 /// and only fails much later as a confusing Deployment-apply error or a
@@ -893,6 +973,17 @@ fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
             {
                 replicas.minimum = Some(1.0);
             }
+        }
+        // schemars renders a u32 with `minimum: 0.0`, which is not a positive
+        // floor. ravel-server rejects `--max-inflight-flushes 0` as a flush
+        // deadlock, so the CRD must refuse it at admission rather than let the
+        // pod crashloop.
+        if let Some(max_inflight) = spec_props
+            .get_mut("gateway")
+            .and_then(|g| g.properties.as_mut())
+            .and_then(|p| p.get_mut("maxInflightFlushes"))
+        {
+            max_inflight.minimum = Some(1.0);
         }
     }
 }
@@ -1299,6 +1390,43 @@ mod tests {
         });
         let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
         assert_eq!(spec.deployment_key_secret_ref, None);
+    }
+
+    #[test]
+    fn audit_token_key_secret_ref_is_in_the_schema_and_optional() {
+        // #1487: the CRD carries an optional auditTokenKeySecretRef at the top
+        // level, sibling to deploymentKeySecretRef. Must be visible in the
+        // schema and default to None so an existing spec still deserializes
+        // unchanged.
+        let crd = ravel_cluster_crd();
+        let version = &crd.spec.versions[0];
+        let spec_props = version
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props");
+        assert!(
+            spec_props.contains_key("auditTokenKeySecretRef"),
+            "spec must expose auditTokenKeySecretRef in its schema"
+        );
+
+        let json = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(spec.audit_token_key_secret_ref, None);
     }
 
     #[test]
@@ -1866,6 +1994,61 @@ mod tests {
         assert_eq!(gateway_api.gateway_ref.namespace, None);
         assert!(gateway_api.grpc, "grpc defaults to true");
         assert_eq!(gateway_api.hostnames, Vec::<String>::new());
+    }
+
+    #[test]
+    fn max_inflight_flushes_is_optional_and_carries_a_minimum_one_bound() {
+        // #1743: the gateway-only flush-isolation bound surfaces under the
+        // gateway schema with minimum 1.0 (injected by inject_minimum_bounds,
+        // since schemars renders a u32 with minimum 0.0). Omitting it still
+        // deserializes with None, so an existing spec is unaffected.
+        let props = gateway_schema_props();
+        assert_eq!(
+            props
+                .get("maxInflightFlushes")
+                .expect("maxInflightFlushes prop")
+                .minimum,
+            Some(1.0),
+            "maxInflightFlushes must reject 0 at admission"
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.gateway.max_inflight_flushes, None);
+
+        // A set value reaches the field, so the serde attributes are wired
+        // to the right name.
+        let mut with_field = base;
+        with_field["gateway"] = serde_json::json!({ "maxInflightFlushes": 4 });
+        let spec: RavelClusterSpec =
+            serde_json::from_value(with_field).expect("deserialize with field");
+        assert_eq!(spec.gateway.max_inflight_flushes, Some(4));
+
+        // Gateway only: the query and maintain schemas carry no such property,
+        // so a field added to another tier without a renderer cannot hide here.
+        let crd = ravel_cluster_crd();
+        let spec_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .and_then(|s| s.properties.as_ref())
+            .expect("spec properties");
+        for tier in ["query", "maintain"] {
+            let props = spec_props
+                .get(tier)
+                .and_then(|t| t.properties.as_ref())
+                .expect("tier properties");
+            assert!(
+                !props.contains_key("maxInflightFlushes"),
+                "{tier} must not carry maxInflightFlushes"
+            );
+        }
     }
 
     #[test]

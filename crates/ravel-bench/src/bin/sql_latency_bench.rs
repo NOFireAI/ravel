@@ -24,10 +24,11 @@
 #![allow(clippy::expect_used)]
 
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use ravel_bench::harness::{StoreKind, store_from_env};
+use ravel_bench::harness::{DelayedGetStore, StoreKind, store_from_env};
 use ravel_bench::sql_corpus::{checked_default_corpus, load_external_corpus};
 use ravel_bench::sql_latency::{
     Compaction, DatasetInfo, FlightTarget, GenerateConfig, Provenance, RunAccounting,
@@ -130,6 +131,14 @@ struct Args {
     /// declared `duration_ms` column.
     #[arg(long, default_value_t = 16)]
     extra_attrs: usize,
+    /// Sleep this many milliseconds inside every object-store `get` before
+    /// serving it, wrapping whichever store `--store` selected. A measurement
+    /// device for the scan's exposed open time against a known stall, not a
+    /// model of any backend: the report's `store_backend` is suffixed
+    /// `+get-delay-<N>ms` so no figure produced this way can be read as a
+    /// store's own latency. Unset injects nothing and leaves the store as is.
+    #[arg(long = "inject-get-delay-ms", value_name = "MS")]
+    inject_get_delay_ms: Option<u64>,
 
     // --- tenant lane knobs ------------------------------------------------
     /// The operator's belief about which layout the tenant is in, checked
@@ -180,6 +189,24 @@ struct Args {
     /// earlier run used; recorded in the report's provenance.
     #[arg(long, default_value_t = ravel_query::DEFAULT_FETCH_CONCURRENCY)]
     fetch_concurrency: usize,
+    /// Explicit override for DataFusion's `target_partitions` (ADR-1195),
+    /// unbundled from `fetch_concurrency`: the same knob as `ravel-server
+    /// --sql-partition-count`. Unset falls back to `--fetch-concurrency`,
+    /// leaving today's behaviour byte-for-byte unchanged; set, it lets a
+    /// measurement vary the scan's partition count at a fixed GET
+    /// concurrency. Recorded in the report's provenance alongside the
+    /// requested value.
+    #[arg(long = "sql-partition-count", value_name = "N")]
+    sql_partition_count: Option<usize>,
+    /// Explicit override for the process-wide in-flight object-store GET cap
+    /// (ADR-1195), unbundled from `fetch_concurrency`: the same knob as
+    /// `ravel-server --store-get-concurrency`. Unset falls back to
+    /// `--fetch-concurrency`, leaving today's behaviour byte-for-byte
+    /// unchanged; set, it lets a measurement vary the GET concurrency at a
+    /// fixed partition count. Recorded in the report's provenance alongside
+    /// the requested value.
+    #[arg(long = "store-get-concurrency", value_name = "N")]
+    store_get_concurrency: Option<usize>,
     /// The logs fetch policy (ADR-0996 decision 2), the same knob and the same
     /// value names as `ravel-server --logs-fetch-policy`, resolved here through
     /// the same `ravel_query::resolve_logs_fetch` the server calls at startup.
@@ -293,8 +320,10 @@ struct Args {
 /// The `--logs-fetch-policy` values, the CLI-facing mirror of
 /// [`ravel_query::LogsFetchPolicy`] (which lives in a crate that does not depend
 /// on clap). The variant names are the server flag's, so clap derives the same
-/// spellings: `request-minimal`, `byte-minimal`, `cost-based`. No value exists
-/// here that the server's flag does not accept.
+/// spellings: `request-minimal`, `byte-minimal`, `cost-based`, `latency-first`.
+/// No value exists here that the server's flag does not accept, and
+/// `every_engine_policy_is_reachable_from_the_bench_flag` fails if a value the
+/// server accepts is missing here.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
 enum LogsFetchPolicyArg {
     /// Minimize object-store requests: every object is read whole in one
@@ -308,6 +337,11 @@ enum LogsFetchPolicyArg {
     /// behaviour.
     #[default]
     CostBased,
+    /// Spend requests to save wall-clock: the byte-minimizing quantities,
+    /// chosen as an intent rather than from prices. It pays off only at the
+    /// concurrency the trade was measured at, which the pass sets through
+    /// `--fetch-concurrency` here.
+    LatencyFirst,
 }
 
 impl LogsFetchPolicyArg {
@@ -317,6 +351,7 @@ impl LogsFetchPolicyArg {
             LogsFetchPolicyArg::RequestMinimal => ravel_query::LogsFetchPolicy::RequestMinimal,
             LogsFetchPolicyArg::ByteMinimal => ravel_query::LogsFetchPolicy::ByteMinimal,
             LogsFetchPolicyArg::CostBased => ravel_query::LogsFetchPolicy::CostBased,
+            LogsFetchPolicyArg::LatencyFirst => ravel_query::LogsFetchPolicy::LatencyFirst,
         }
     }
 }
@@ -413,8 +448,12 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
         Some(path) => load_external_corpus(path)?,
         None => checked_default_corpus()?,
     };
-    let (store_backend, region, endpoint) = provenance_strings(args.store);
-    let store = store_from_env(args.store);
+    let (mut store_backend, region, endpoint) = provenance_strings(args.store);
+    let mut store = store_from_env(args.store);
+    if let Some(ms) = args.inject_get_delay_ms {
+        store = Arc::new(DelayedGetStore::new(store, Duration::from_millis(ms)));
+        store_backend = format!("{store_backend}+get-delay-{ms}ms");
+    }
 
     // `--explain` requires `--explain-dir` (clap enforces it), so a set
     // `--explain` always carries a directory; an unset flag writes no plans.
@@ -455,6 +494,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
+                sql_partition_count: args.sql_partition_count,
+                store_get_concurrency: args.store_get_concurrency,
                 logs_request_cost_bytes: args.logs_request_cost_bytes,
                 logs_fetch_policy: args.logs_fetch_policy.policy(),
                 logs_block_range_threshold: args.logs_block_range_threshold,
@@ -498,6 +539,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 deadline: Duration::from_secs(args.deadline_secs),
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
+                sql_partition_count: args.sql_partition_count,
+                store_get_concurrency: args.store_get_concurrency,
                 logs_request_cost_bytes: args.logs_request_cost_bytes,
                 logs_fetch_policy: args.logs_fetch_policy.policy(),
                 logs_block_range_threshold: args.logs_block_range_threshold,
@@ -595,6 +638,28 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
         p.deadline_secs
     ));
     out.push_str(&format!("  fetch conc : {}\n", p.fetch_concurrency));
+    out.push_str(&format!(
+        "  sql part   : requested={}  effective={}\n",
+        match p.sql_partition_count_requested {
+            Some(v) => v.to_string(),
+            None => "unset".to_string(),
+        },
+        match p.sql_partition_count_effective {
+            Some(v) => v.to_string(),
+            None => unresolved_effective_label(&p.source).to_string(),
+        }
+    ));
+    out.push_str(&format!(
+        "  get conc   : requested={}  effective={}\n",
+        match p.store_get_concurrency_requested {
+            Some(v) => v.to_string(),
+            None => "unset".to_string(),
+        },
+        match p.store_get_concurrency_effective {
+            Some(v) => v.to_string(),
+            None => unresolved_effective_label(&p.source).to_string(),
+        }
+    ));
     out.push_str(&format!(
         "  req cost   : requested={} bytes  effective={}\n",
         p.logs_request_cost_bytes_requested,
@@ -755,6 +820,7 @@ fn print_human_table(report: &SqlLatencyReport) {
     }
     print_open_shapes(report);
     print_fetch_amplification(report);
+    print_scan_timing(report);
     if !report.skipped.is_empty() {
         eprintln!("\n  skipped (unsatisfied declared column):");
         for s in &report.skipped {
@@ -769,11 +835,78 @@ fn print_human_table(report: &SqlLatencyReport) {
     }
 }
 
+/// The cold run's logs-scan wall-clock split (`SqlStats::scan_timing`) beside
+/// the process CPU time the run consumed. Every `ms` column except `cold`,
+/// `first_batch`, `plan_init` and `open_max` is a SUM over the scan's
+/// partitions, whose intervals overlap in wall time, so those sums are
+/// comparable with each other and with `cpu_ms`, never with `cold`. `open_max`
+/// is not a sum: it is the single partition that waited longest on segment
+/// opens, which is the only open figure that can sit on the critical path.
+fn print_scan_timing(report: &SqlLatencyReport) {
+    let rows: Vec<(&str, f64, &RunAccounting)> = report
+        .entries
+        .iter()
+        .filter_map(|e| match e.per_run_accounting.as_deref() {
+            Some([cold, ..]) if cold.scan_timing.is_some() => {
+                Some((e.id.as_str(), e.cold_ms, cold))
+            }
+            _ => None,
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let ms = |ns: u64| ns as f64 / 1e6;
+    eprintln!(
+        "\n  logs-scan timing, cold run: partition-summed ms (overlapping), plus the per-partition"
+    );
+    eprintln!("  max open stall, the once-per-query plan barrier, and process CPU ms for the run.");
+    eprintln!(
+        "  {:<32} | {:>8} | {:>8} | {:>9} | {:>9} | {:>9} | {:>8} | {:>9} | {:>6} | {:>7} | {:>8}",
+        "id",
+        "cold",
+        "cpu_ms",
+        "decode",
+        "emit",
+        "open_sum",
+        "open_max",
+        "plan_init",
+        "opens",
+        "pending",
+        "first_b",
+    );
+    eprintln!(
+        "  {:-<32}-+-{:-<8}-+-{:-<8}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<8}-+-{:-<9}-+-{:-<6}-+-{:-<7}-+-{:-<8}",
+        "", "", "", "", "", "", "", "", "", "", ""
+    );
+    for (id, cold_ms, acc) in rows {
+        let Some(t) = acc.scan_timing.as_ref() else {
+            continue;
+        };
+        eprintln!(
+            "  {:<32} | {:>8.3} | {:>8} | {:>9.3} | {:>9.3} | {:>9.3} | {:>8.3} | {:>9.3} | {:>6} | {:>7} | {:>8.3}",
+            id,
+            cold_ms,
+            acc.cpu_ms
+                .map_or_else(|| "-".to_string(), |c| format!("{c:.1}")),
+            ms(t.decode_build_elapsed_ns),
+            ms(t.emit_elapsed_ns),
+            ms(t.open_elapsed_ns),
+            ms(t.open_elapsed_max_ns),
+            ms(t.plan_init_elapsed_ns),
+            t.segments_opened,
+            t.open_pending_polls,
+            ms(t.first_batch_elapsed_min_ns),
+        );
+    }
+}
+
 /// The cold run's logs-scan fast-path opens, split by the read shape the router
-/// chose (issue #904), printed next to the request accounting the main table
-/// already shows so a reader can pair the two: `backend_bills_requests` (in the
-/// report's request accounting) says whether the backend charges for requests,
-/// and this split says which read shape produced them.
+/// chose (issue #904), printed next to the request count the main table already
+/// shows so a reader can see which read shape produced those requests. Whether
+/// the backend charges per request is not stamped anywhere in this report:
+/// `harness::backend_bills_requests` answers it for a `StoreKind`, but this
+/// binary does not call it and `SqlLatencyReport` carries no such field.
 ///
 /// The unit is a SEGMENT OPEN, not a request and not a statement: one statement
 /// spanning several segments contributes one open per segment and can take both
@@ -897,6 +1030,33 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
 mod tests {
     use super::*;
 
+    /// A new `ravel_query::LogsFetchPolicy` value must not silently desync this
+    /// binary's mirror enum, which the internal ClickBench notes describe as
+    /// carrying the same values as the server flag. The match below is
+    /// exhaustive over the engine policy, so adding a variant there stops this
+    /// file from compiling until the flag grows the same value, and the
+    /// assertion pins the round trip through `policy()`.
+    ///
+    /// Prove-the-test: map `LatencyFirst` to `ByteMinimal` in `policy()` and
+    /// this fails with `left: ByteMinimal, right: LatencyFirst`.
+    #[test]
+    fn every_engine_policy_is_reachable_from_the_bench_flag() {
+        for policy in [
+            ravel_query::LogsFetchPolicy::RequestMinimal,
+            ravel_query::LogsFetchPolicy::ByteMinimal,
+            ravel_query::LogsFetchPolicy::CostBased,
+            ravel_query::LogsFetchPolicy::LatencyFirst,
+        ] {
+            let arg = match policy {
+                ravel_query::LogsFetchPolicy::RequestMinimal => LogsFetchPolicyArg::RequestMinimal,
+                ravel_query::LogsFetchPolicy::ByteMinimal => LogsFetchPolicyArg::ByteMinimal,
+                ravel_query::LogsFetchPolicy::CostBased => LogsFetchPolicyArg::CostBased,
+                ravel_query::LogsFetchPolicy::LatencyFirst => LogsFetchPolicyArg::LatencyFirst,
+            };
+            assert_eq!(arg.policy(), policy);
+        }
+    }
+
     /// The Flight lane's effective-aggregation label is "server-controlled",
     /// not "server default" (issue #763): a `None` effective value means only
     /// that this process cannot know the server's setting, and an explicit
@@ -933,6 +1093,10 @@ mod tests {
             cache_bytes: 0,
             deadline_secs: 30,
             fetch_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            sql_partition_count_requested: None,
+            sql_partition_count_effective: Some(ravel_query::DEFAULT_FETCH_CONCURRENCY),
+            store_get_concurrency_requested: None,
+            store_get_concurrency_effective: Some(ravel_query::DEFAULT_FETCH_CONCURRENCY),
             logs_request_cost_bytes_requested: cost,
             logs_request_cost_bytes_effective: Some(cost),
             logs_fetch_policy: ravel_query::LogsFetchPolicy::ByteMinimal

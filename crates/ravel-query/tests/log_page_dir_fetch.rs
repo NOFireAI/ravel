@@ -804,7 +804,7 @@ async fn plan_segment_on_a_version_4_object_fetches_no_page_bytes() {
     let query = LogQuery::new(i64::MIN, i64::MAX).with_prune(code_between(0, 0));
     let acc = QueryAccounting::new();
 
-    let (survivors, stats, footer) = fetcher
+    let (survivors, stats, footer, _whole_object) = fetcher
         .plan_segment(&seg, TENANT, &query, &acc)
         .await
         .expect("plan_segment")
@@ -847,6 +847,121 @@ async fn plan_segment_on_a_version_4_object_fetches_no_page_bytes() {
     assert!(
         footer.is_some(),
         "the footer is carried forward so the scan skips its own probe"
+    );
+}
+
+/// The skip-decidable plan path's own directory decompression lands in the
+/// PLAN phase, not phase-less or pooled away: `plan_segment` decodes SKIP_IDX
+/// and FIELD_DIR through `plan_section_raw`, and both are always zstd (the
+/// writer stores every whole-read directory section COMP_ZSTD unconditionally,
+/// docs/log-segment-format.md), so a caller threading a [`PhaseAccounting`]'s
+/// `plan()` handle through must see the exact sum of their `uncomp_len` show up
+/// under `snapshot().plan.decompressed_bytes` (issue #1401 finding 2).
+#[tokio::test]
+async fn plan_segment_charges_directory_decompression_to_the_plan_phase() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let store: Arc<dyn ObjectStoreBackend> = store_with(&bytes).await;
+
+    let f = footer_of(&bytes);
+    let mut expected = 0u64;
+    for k in [kind::SKIP_IDX, kind::FIELD_DIR] {
+        let desc = *f.section(k).expect("section present");
+        assert_eq!(
+            desc.comp,
+            footer::COMP_ZSTD,
+            "fixture section {k} must be zstd for this test"
+        );
+        expected += desc.uncomp_len;
+    }
+
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&store))
+        .with_block_range_threshold(0)
+        .with_block_range(ranged(store, &bytes));
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    let query = LogQuery::new(i64::MIN, i64::MAX).with_prune(code_between(0, 0));
+    let phase = ravel_query::PhaseAccounting::new();
+
+    let (survivors, _stats, _footer, _whole_object) = fetcher
+        .plan_segment(&seg, TENANT, &query, phase.plan())
+        .await
+        .expect("plan_segment")
+        .expect("relevant segment");
+    assert_eq!(survivors, 1, "the numeric arm keeps one block");
+
+    let snap = phase.snapshot();
+    assert_eq!(
+        snap.plan.decompressed_bytes, expected,
+        "plan_segment's skip-decidable path charges exactly SKIP_IDX + \
+         FIELD_DIR's zstd uncomp_len to the plan phase"
+    );
+}
+
+/// The plan FALLBACK (a predicate SKIP_IDX cannot decide: here a `has_word`
+/// content arm) opens the reader over the fetched object to count survivors.
+/// That open decodes STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR, and those
+/// bytes ride in the reader's own `ScanStats`, not on any handle, so
+/// `plan_segment` must charge them to the plan phase itself: the exact sum of
+/// the four sections' `uncomp_len` (each zstd on this fixture), and nothing on
+/// the scan phase, since counting survivors decodes no block.
+///
+/// Read whole on purpose: with the block-range threshold at `u64::MAX` the
+/// fallback's `tenant_bytes` is one whole-object GET with no fetcher-side
+/// directory decode, so the reader's open is the only decompression there is
+/// and the oracle is exactly those four sections.
+#[tokio::test]
+async fn plan_segment_fallback_charges_the_reader_open_to_the_plan_phase() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let store: Arc<dyn ObjectStoreBackend> = store_with(&bytes).await;
+
+    let f = footer_of(&bytes);
+    let mut expected = 0u64;
+    for k in [
+        kind::STREAM_DIR,
+        kind::FIELD_DIR,
+        kind::SKIP_IDX,
+        kind::PAGE_DIR,
+    ] {
+        let desc = *f.section(k).expect("section present");
+        assert_eq!(
+            desc.comp,
+            footer::COMP_ZSTD,
+            "fixture section {k} must be zstd for this test"
+        );
+        expected += desc.uncomp_len;
+    }
+
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&store)).with_block_range_threshold(u64::MAX);
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    // A body word the filler alphabet cannot spell as a token: a bloom-only
+    // arm SKIP_IDX cannot decide, which is what sends `plan_segment` down the
+    // fallback.
+    let query = LogQuery::new(i64::MIN, i64::MAX).with_content(Predicate::HasWord {
+        field: FieldSel::Body,
+        word: "no.such.word".into(),
+    });
+    let phase = ravel_query::PhaseAccounting::new();
+
+    let (_survivors, _stats, carried_footer, _whole_object) = fetcher
+        .plan_segment(&seg, TENANT, &query, phase.plan())
+        .await
+        .expect("plan_segment")
+        .expect("relevant segment");
+    assert!(
+        carried_footer.is_none(),
+        "the fallback carries no footer forward"
+    );
+
+    let snap = phase.snapshot();
+    assert_eq!(
+        snap.plan.decompressed_bytes, expected,
+        "the fallback plan read charges exactly the reader's four directory \
+         decodes to the plan phase"
+    );
+    assert_eq!(
+        snap.scan.decompressed_bytes, 0,
+        "counting survivors decodes no block, so the scan phase stays at zero"
     );
 }
 

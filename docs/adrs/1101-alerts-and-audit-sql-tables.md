@@ -1,6 +1,6 @@
 # ADR-1101: Register the `alerts` and `audit` SQL tables
 
-Status: Proposed
+Status: Accepted (2026-09-03)
 
 ## Context
 

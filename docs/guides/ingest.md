@@ -121,8 +121,16 @@ ravel-server --tenant-token devtoken=acme --tenant-token other=other-co ...
 
 A request must send `Authorization: Bearer devtoken` to resolve as
 tenant `acme`. There is no default tenant and no anonymous access. A
-deployment is unauthenticated only if you never pass `--tenant-token`,
-which is a conscious choice, not an oversight.
+deployment is unauthenticated only if you pass no `--tenant-token` and no
+`--tenant-token-file`, which is a conscious choice, not an oversight.
+
+`--tenant-token-file PATH` (env `RAVEL_TENANT_TOKEN_FILE` for the path) is a
+file-based alternative so a token never has to sit in argv or a process
+listing: one `TOKEN=TENANT` pair per line, blank lines and `#` comments
+ignored. Each line is split on the first `=`, exactly like `--tenant-token`,
+so a token value containing `=` is mis-parsed the same way either way.
+`--tenant-token` and `--tenant-token-file` are mutually exclusive;
+`ravel-server` refuses to start with both set.
 
 `--dev-insecure-tenant-header` adds a second resolver, tried only if the
 bearer lookup fails. It reads the tenant name directly from an
@@ -143,11 +151,27 @@ Every write has a mode. The default is strict:
   shard). After you have that ack, the data survives the crash of any Ravel
   process, because it survives everything the object store survives
   ([docs/consistency-model.md](../consistency-model.md)).
-- **Buffered**: the call returns as soon as Ravel validates the request and
-  enqueues it into its shard's in-memory buffer, before any flush. This is
-  lower latency but not durable. A crash between the ack and the next flush
-  loses that buffered window, bounded by `max_flush_delay` (2s default).
-  Ravel issues no commit token, because there is nothing yet to point one at.
+- **Buffered**: the call returns as soon as Ravel admits the request and
+  enqueues it to its shard actor, before any flush. This is lower latency but
+  not durable, and Ravel issues no commit token, because there is nothing yet
+  to point one at. `max_flush_delay` (2s default) bounds when the shard's
+  flush is triggered, not when it completes: the flush task then waits for a
+  `max_inflight_flushes` permit on its shard before it issues its store
+  calls, so a shard whose permits are held by a stalled flush widens the
+  window a crash between the ack and the flush would lose. Already-acked rows
+  are dropped with no crash at all when the flush's own store calls, made
+  after it holds the permit, cannot complete in time: `max_flush_lifetime`,
+  the budget for those store calls, defaults to 3600 s. It runs from the
+  moment the permit is granted rather than from flush open, and it is not
+  tunable from the server, so that case is a stuck backend and not a queue
+  wait. A flush already past its flush-open deadline is abandoned without
+  taking a permit, and its rows are lost the same way. A flush queued behind
+  a stalled co-resident prefix reaches the store once the stall clears, so a
+  co-resident stall on its own is not a buffered-mode loss.
+  `ravel_ingest_abandoned_retry_exhausted_total` counts
+  the flushes abandoned for store-call exhaustion and
+  `ravel_ingest_abandoned_queue_deadline_total` those abandoned at the queue
+  deadline ([docs/consistency-model.md](../consistency-model.md)).
 
 To use buffered mode for one request, send `x-ravel-ingest-mode: buffered` as
 an HTTP header or as gRPC metadata on the export. For strict mode, omit it or
@@ -169,10 +193,12 @@ Every rejection reason:
 | Rejection | Meaning |
 |---|---|
 | `TooManyDataPoints` | The whole request exceeds `max_data_points_per_request`. Ravel admits nothing in the request. |
+| `TooManyExplodedPoints` | The request fits `max_data_points_per_request` in data points, but the normalized points its classic histograms and summaries explode into do not. Ravel admits nothing in the request. The reported rejected count stays in data points, the unit the sender sent. |
 | `TooManyResourceAttributes` | A `Resource` has more attributes than `max_resource_attributes`. Ravel rejects every point under it. |
 | `MetricNameTooLong` | The metric name (before sanitization) exceeds `max_metric_name_len`. Ravel rejects every point on that metric. |
 | `EmptyMetricName` | The metric name sanitizes to empty. Ravel rejects every point on that metric. |
 | `TooManyAttributes` | One data point has more attributes than `max_attributes_per_point`. |
+| `TooManyHistogramBuckets` | One classic `Histogram` data point has more `explicit_bounds` than `max_histogram_buckets`. Only that data point is rejected. |
 | `LabelNameTooLong` | A label name (after sanitization) exceeds `max_label_name_len`. This also applies to the synthesized `job` label after its `namespace/name` join. |
 | `LabelValueTooLong` | A label value exceeds `max_label_value_len`. |
 | `DuplicateLabelName` | Two attributes sanitize to the same label name (or a data-point attribute collides with a synthesized `job`/`instance` label). |
@@ -183,6 +209,9 @@ Every rejection reason:
 | `FutureSkew` | The event timestamp is ahead of ingest time by more than `max_future_skew_ns`. |
 | `TooOld` | The event timestamp is behind ingest time by more than `max_ingest_lag_ns`. |
 | `OversizedSeriesComponent` | A series identity component (tenant, metric name, or label set) is too large to encode. |
+| `HistogramMinMaxDropped` | Informational. The point is stored; its `min`/`max` fields are not, because they have no Prometheus-convention representation. Zero rejected points; see [Zero-count partial success](#zero-count-partial-success). |
+| `HistogramExemplarsDropped` | Informational. The point is stored; some of its exemplars were malformed or fell past the per-series admission cap. Applies to any metric type, not only histograms. Zero rejected points. |
+| `IntegerValuePrecisionLoss` | Informational. The point is stored, but its `as_int` value has a magnitude above 2^53 and was stored as the nearest `f64`. Zero rejected points. |
 
 Two behaviors are worth knowing about, both intentional:
 
@@ -192,6 +221,109 @@ Two behaviors are worth knowing about, both intentional:
   with `_` in place. It does not shift or prefix. A metric named `1foo` and
   one named `_foo` both sanitize to `_foo` and become the same series. This
   is a documented consequence of the sanitization rule, not a bug.
+
+### Zero-count partial success
+
+Some rejections cost the sender nothing. A histogram data point whose `min`
+and `max` fields have no Prometheus-convention representation is stored
+without them; exemplars past the per-series admission cap are not carried;
+an OTLP `as_int` value with a magnitude above
+2^53 is stored as the nearest `f64`. The same is true of a log record or a
+span with one bad attribute: the attribute is dropped and the record or span
+is stored. In each case the unit itself was admitted, so it contributes zero
+to the rejected count.
+
+Ravel reports these anyway. **The rule every OTLP surface follows is to emit a
+partial success whenever anything was rejected at all, never when some unit
+count is above zero.** A drop of this kind comes back as
+`rejected_data_points = 0` (or `rejected_log_records = 0`, or
+`rejected_spans = 0`) together with a populated `error_message` naming it.
+The OTLP proto documents `error_message` as a channel for warnings on an
+otherwise successful response, and a zero count with a message is that
+channel. Gating on the count instead would return a response byte-identical
+to a clean write, and a sender losing a field on every export would never
+learn it.
+
+Which transport you use decides whether the report reaches you, and the
+transports do not agree:
+
+- **OTLP over HTTP and gRPC**, for metrics, logs, and spans: reported, as
+  above.
+- **OTAP** (metrics only): not reported. `BatchStatus` carries one
+  `status_message` string, and Ravel spends it on the active-series-cap
+  drop count and the commit tokens; no normalization-layer rejection,
+  informational or not, reaches it. The drop is still visible in the
+  per-tenant rejection counters.
+- **Remote Write**: not reported, and there is no partial-success message on
+  that surface to report it in. Its only per-request feedback is the
+  `x-prometheus-remote-write-samples-written` family of headers, which count
+  what was admitted.
+
+## Delta temporality metrics
+
+Ravel stores cumulative metrics only. A `Sum`, `Histogram`, or
+`ExponentialHistogram` whose `aggregation_temporality` is delta (or
+unspecified) is rejected as `UnsupportedTemporality`, and the response reports
+every point under that metric as rejected. This is not a temporary
+restriction: converting delta to cumulative means holding the running total
+for every series between requests, and a Ravel compute process keeps no
+durable local state, so it has nowhere correct to hold it. A process restart
+mid-stream would silently reset the totals.
+
+Temporality is a property of the metric, not of the individual point: the
+`aggregation_temporality` field sits on the `Sum` and `Histogram` messages,
+above the data points, so a metric cannot carry a mix. Rejecting the whole
+metric rejects exactly the points that share the delta temporality, and no
+others.
+
+Convert in the collector instead, which is a stateful process that owns local
+memory. The `deltatocumulative` processor
+(`otel/opentelemetry-collector-contrib`) holds the per-series accumulators and
+emits cumulative points:
+
+```yaml
+processors:
+  deltatocumulative:
+    # Forget a series after this long without a point, so a churning series
+    # set cannot grow memory without bound.
+    max_stale: 5m
+    # Ceiling on tracked series. Points for an untracked series past it are
+    # dropped by the processor, not buffered and not forwarded.
+    max_streams: 1000000
+  batch:
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      # Convert before batching, so batches carry converted points.
+      processors: [deltatocumulative, batch]
+      exporters: [otlphttp]
+```
+
+Two consequences to plan for. The processor's memory is proportional to the
+number of live series, so `max_streams` is a real ceiling and not a formality;
+size it above the tenant's active series count. Reaching it costs data rather
+than memory: once the processor is tracking `max_streams` series, a point for
+a series it is not already tracking is dropped inside the collector. It is not
+buffered and it is not forwarded unconverted, so nothing about it reaches
+Ravel and no Ravel rejection counter moves. The only signal is the collector's
+own `otelcol_deltatocumulative_datapoints_total{error="limit"}`; alert on it,
+because from the database's side this loss is invisible. And the first point
+of each series after a collector restart re-bases that series' accumulator,
+which appears downstream as a counter reset. PromQL's `rate` and `increase`
+handle resets, so query results stay correct, but a dashboard reading a raw
+counter value shows the drop.
+
+The alternative is to configure the sender for cumulative temporality
+directly, which most OpenTelemetry SDKs support through the
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative` environment
+variable. That avoids the conversion and its memory entirely, and is the
+better fix where the sender is yours to configure.
+
+Watch `ravel_admission_rejected_total{reason="structural"}`
+([observability guide](observability.md#reading-the-reason-label)) to confirm
+the rejections stopped.
 
 ## Metric metadata and OTLP name suffixing
 
@@ -247,12 +379,31 @@ Defaults. No `ravel-server` flag configures them:
 |---|---|
 | `max_data_points_per_request` | 100,000 |
 | `max_attributes_per_point` | 64 |
+| `max_histogram_buckets` | 160 |
 | `max_label_name_len` | 256 bytes |
 | `max_label_value_len` | 4,096 bytes |
 | `max_metric_name_len` | 512 bytes |
 | `max_resource_attributes` | 128 |
 | `max_future_skew_ns` | 10 minutes |
 | `max_ingest_lag_ns` | 2 hours |
+
+`max_data_points_per_request` is checked twice: once against the data points
+the request carries on the wire, and once against the normalized points those
+data points expand into, since one classic `Histogram` data point becomes one
+point per explicit bound plus `+Inf`, `_sum`, and `_count`, and one `Summary`
+data point becomes one point per quantile plus `_sum` and `_count`. Both
+checks read vector lengths only, so neither costs an allocation. The count a
+rejection reports back to the sender stays in wire data points.
+
+`max_histogram_buckets` bounds the `explicit_bounds` of a single classic
+`Histogram` data point. It exists because that bound list is the sender's to
+choose and each bound it carries becomes a stored series with its own copy of
+the point's labels; it is a memory-safety bound, not a shape you are meant to
+tune. The default is an order of magnitude above the widest bound list a real
+exporter emits (the Prometheus Go client's `DefBuckets` is 11 bounds, the
+OpenTelemetry SDK's default explicit boundaries are 15), so a real histogram
+never meets it. Exponential (native) histograms are not exploded and are not
+subject to it.
 
 ## Event-time skew bounds
 
@@ -311,12 +462,14 @@ that flushed, exactly like a metrics export. An unresolvable tenant returns
 pipeline cannot accept returns `503`.
 
 Log records are durable in RLOG objects under the tenant's `l` keyspace after
-the strict ack returns. **Logs are queryable over SQL**: the `logs` table is
-registered on the `POST /api/v1/sql` endpoint, and
-[query.md](query.md#sql-over-samples-logs-and-spans) documents its schema and usage.
-PromQL does not query logs, so log data is reachable only through SQL. You can
-also read a log object back directly with `ravel-cli rlog inspect`
-([inspecting-data.md](inspecting-data.md)).
+the strict ack returns. **Logs are queryable two ways**: over SQL, where the
+`logs` table is registered on the `POST /api/v1/sql` endpoint
+([query.md](query.md#sql-over-samples-logs-and-spans) documents its schema
+and usage), and over PromQL, through the reserved `ravel_log_lines` and
+`ravel_log_bytes` metric names
+([query.md](query.md#promql-over-logs) documents the label mapping and
+routing rule). You can also read a log object back directly with
+`ravel-cli rlog inspect` ([inspecting-data.md](inspecting-data.md)).
 
 ### Log admission limits
 
@@ -350,6 +503,11 @@ The partial-success contract is the same as metrics, with
 length is capped. A request rejected wholesale therefore does not produce a
 response string proportional to its record count.
 
+A dropped attribute is reported the same way, with `rejected_log_records` at 0:
+the record itself was stored, so it costs the sender no record. See
+[Zero-count partial success](#zero-count-partial-success) for the rule and for
+which transports carry it.
+
 Every rejection reason:
 
 | Rejection | Meaning |
@@ -361,7 +519,7 @@ Every rejection reason:
 | `AttributeKeyTooLong` | An attribute key exceeds `max_attribute_key_len`. Ravel drops that one attribute, not the record. |
 | `AttributeValueTooLong` | An attribute value's payload exceeds `max_attribute_value_len` (nested list and map entries count toward it). Ravel drops that one attribute, not the record. |
 | `BodyTooLong` | The record body, after normalization to a string, exceeds `max_body_len`. Ravel rejects that record. |
-| `UnsupportedBodyKind` | The body is an OTLP `ArrayValue`, `KvlistValue`, or string-table reference. A structured body has no lossless string form, so Ravel rejects the record rather than stringify it by guess. |
+| `UnsupportedBodyKind` | The body is a string-table reference, which indexes a table the record does not carry, so there is nothing to store. Array and map bodies are converted, not rejected; see below. |
 | `MissingAttributeValue` | An attribute arrived with its `value` field unset. Ravel drops and reports that one attribute; it never silently discards it. |
 | `UnsupportedAttributeValue` | An attribute value is a string-table reference (`strindex`), which carries no value of its own. Ravel drops that one attribute. |
 | `Grouped` | Not a reason of its own. It carries one of the reasons above plus the number of records it applies to, for a rejection that covers a whole resource or scope. Ravel reports it as that inner reason with a count. |
@@ -371,6 +529,46 @@ and `IntValue` become their plain string form. `DoubleValue` uses the same
 float formatting that the metrics path uses. `BytesValue` becomes a hex
 string. A record with no body at all normalizes to an empty body, which is
 legal OTLP, not a rejection.
+
+An `ArrayValue` or `KvlistValue` body is stored as JSON text. The rendering is
+canonical, so two exports of the same body always produce byte-identical
+stored text:
+
+- Map keys are ordered by the same rule that orders attributes in stream
+  identity, which is a byte ordering on the key and then on the encoded value,
+  not the sender's order and not lexicographic ordering of the JSON text. Two
+  entries with the same key are both kept, ordered by their values.
+- Array elements keep the sender's order, which is part of the value.
+- Nested arrays and maps render recursively under the same rules. Nesting is
+  bounded by the same depth limit that applies to attribute values. A body
+  past that depth, or one holding an unset value or a nested string-table
+  reference, is rejected as `UnsupportedBodyKind`: what the sender lost is the
+  body, so the record is reported that way rather than as an attribute
+  problem.
+- A bytes value inside the body renders as a lowercase hex string. A
+  non-finite double renders as the JSON string `"NaN"`, `"+Inf"`, or `"-Inf"`,
+  since JSON has no literal for them. Those are the exact three strings a
+  query predicate has to match; they are the same forms a top-level double
+  body of the same value takes.
+
+The converted text is bounded by `max_body_len` like any other body, so a
+large structured body can still be rejected as `BodyTooLong`. The bound is
+applied while the text is produced rather than to a finished string: the
+sender chooses how much text its value renders to, so conversion stops at the
+first byte that would carry the text past `max_body_len` and rejects there,
+without rendering the rest. The `len` such a rejection reports is that
+stopping point, one byte past the limit, not the length the full text would
+have had.
+
+Conversions are counted per tenant and signal in
+`ravel_ingest_body_conversions_total`. That counter is not a rejection
+counter, and it is not a count of stored records either: it is incremented at
+normalization, before the active-stream cap and before the write, so a
+counted record can still be dropped by the cap or lost with a failed write.
+It exists so that a query returning JSON text where a reader expected a plain
+message has a place to check. The
+[observability guide](observability.md#reading-the-reason-label) holds the
+normative description.
 
 Malformed `trace_id`/`span_id` byte lengths normalize to absent; Ravel does
 not pad or truncate them. Padding would fabricate an id that never existed.

@@ -52,13 +52,12 @@ use ravel_logseg::{
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::erasure::snapshot_pending_erasure_predicates;
-use ravel_query::{CacheFetchError, LogSegmentFetcher};
+use ravel_query::{CacheFetchError, LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, FIRST_DECLARED_COL, LOG_COL_ATTRS, LogsScanExec,
     logs_schema_with_declared,
 };
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::log_stream_id;
 use uuid::Uuid;
 
@@ -350,6 +349,7 @@ struct ScanRun {
     rowpath_batches: usize,
     pages_decoded: usize,
     pages_skipped: usize,
+    reopens: usize,
 }
 
 /// Execute a `LogsScanExec` directly over `segments` with the given projection,
@@ -380,7 +380,7 @@ async fn run_scan(
         Arc::new(Vec::new()),
         Arc::new(erasure),
         projection.as_ref(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
         full_schema,
         Arc::new(declared),
     )
@@ -402,6 +402,7 @@ async fn run_scan(
         rowpath_batches: count("rowpath_batches"),
         pages_decoded: count("pages_decoded"),
         pages_skipped: count("pages_skipped"),
+        reopens: count("reopens"),
         batches,
     }
 }
@@ -468,7 +469,7 @@ async fn run_scan_tp(
         Arc::new(Vec::new()),
         Arc::new(erasure),
         projection.as_ref(),
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
         full_schema,
         Arc::new(declared),
     )
@@ -910,12 +911,12 @@ async fn a_declared_key_set_at_both_levels_resolves_record_over_resource() {
 /// one carries an overflow page, so the fast path emits block 0, then re-opens
 /// the segment on the row path and discards the blocks it already emitted.
 ///
-/// That discard loop (`LogScanState::Rows`'s `skip`) is the one place in the
-/// columnar change where a row can be emitted twice or dropped, and a fixture of
-/// one block can never reach it: the fallback there fires on block 0 with
-/// `skip == 0`. Here `columnar_batches == 1` and `rowpath_batches == 1` prove
-/// both halves ran, and the `ts` multiset proves every row was emitted exactly
-/// once across the switch.
+/// That discard loop (`LogScanState::RowFallbackBlock`'s `skip`) is the one
+/// place in the columnar change where a row can be emitted twice or dropped,
+/// and a fixture of one block can never reach it: the fallback there fires on
+/// block 0 with `skip == 0`. Here `columnar_batches == 1` and
+/// `rowpath_batches == 1` prove both halves ran, and the `ts` multiset proves
+/// every row was emitted exactly once across the switch.
 ///
 /// The spill is forced with `max_dynamic_columns = 1`: `filler` (earlier in the
 /// writer's `(name, type)` order) takes the single dynamic column, so `tags`
@@ -1038,6 +1039,246 @@ async fn a_later_block_with_attrs_raw_falls_back_without_losing_or_repeating_row
     );
 }
 
+/// Issue #1769 (the format-free half): the `attrs_raw` fallback must narrow to
+/// just the block that carries the overflow page, then resume the columnar
+/// fast path for the blocks after it, instead of falling the rest of the
+/// segment to the row path.
+///
+/// Three two-record blocks: block 0 (ts 0, 1) carries the overflow page,
+/// blocks 1 (ts 2, 3) and 2 (ts 4, 5) are clean. Before this change, the
+/// re-opened row scan (`LogScanState::Rows` in the old state machine) never
+/// returned to `Columnar`, so blocks 1 and 2 -- clean, and perfectly able to
+/// decode columnar -- were dragged through the row path too. Pinning
+/// `columnar_batches == 2` here is what a reversion of
+/// `crates/ravel-sql/src/logs_scan.rs`'s `ReopenRows` ready-arm (constructing
+/// `LogScanState::Rows { scan: Box::new(scan), skip }` instead of
+/// `LogScanState::RowFallbackBlock { scan: Box::new(scan), skip }`) flips back
+/// to 0: with that line reverted, this block-0-only-overflow fixture has
+/// nothing to distinguish it from the whole-segment-falls-to-rows behavior the
+/// `no_match_erasure` baseline below already exercises, so `run` and
+/// `baseline` collapse to the same counts and this assertion goes red.
+///
+/// Because the overflow sits on the very FIRST block, `block_cursor == 0` at
+/// the moment of the first (and, under this change, only) fallback: the
+/// pre-change whole-segment row fallback and today's `no_match_erasure`
+/// forced-ineligible baseline decode the identical block sequence from the
+/// identical starting point, so the baseline run below stands in for what the
+/// pre-change binary would have produced for this exact fixture, and the row
+/// comparison against it is the byte-identical-output check.
+#[tokio::test]
+async fn the_first_block_with_attrs_raw_falls_back_only_for_that_block_and_resumes_columnar_after()
+{
+    let declared = vec![DeclaredColumn::new("tags", DeclaredType::Str)];
+    let resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let mk = |ts: i64, spilled: bool| LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: "b".into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: {
+            let mut attrs = vec![("filler".to_string(), AttrValue::Str("f".into()))];
+            if spilled {
+                attrs.push(("tags".to_string(), AttrValue::Str(format!("spilled-{ts}"))));
+            }
+            attrs
+        },
+    };
+    // Block 0 (ts 0, 1) carries the `attrs_raw` page; blocks 1 (ts 2, 3) and 2
+    // (ts 4, 5) are clean.
+    let records = vec![
+        mk(0, true),
+        mk(1, true),
+        mk(2, false),
+        mk(3, false),
+        mk(4, false),
+        mk(5, false),
+    ];
+    let cfg = RlogConfig {
+        block_target_records: 2,
+        max_dynamic_columns: 1,
+        ..RlogConfig::default()
+    };
+
+    let store = MemoryStore::new();
+    let seg = write_object(&store, "logs/firstspill.rlog", &records, cfg).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    let projection = vec![0usize, FIRST_DECLARED_COL];
+    let run = run_scan(
+        Arc::clone(&store),
+        vec![seg.clone()],
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await;
+
+    assert_eq!(
+        run.rowpath_batches, 1,
+        "only the spilled first block goes through the row path; columnar={}, \
+         rowpath={}",
+        run.columnar_batches, run.rowpath_batches
+    );
+    assert_eq!(
+        run.columnar_batches, 2,
+        "both clean blocks after the spilled one resume the columnar fast \
+         path instead of falling back with it; columnar={}, rowpath={}",
+        run.columnar_batches, run.rowpath_batches
+    );
+
+    let want = vec![
+        vec![Cell::Ts(0), Cell::OptStr(Some("spilled-0".to_string()))],
+        vec![Cell::Ts(1), Cell::OptStr(Some("spilled-1".to_string()))],
+        vec![Cell::Ts(2), Cell::OptStr(None)],
+        vec![Cell::Ts(3), Cell::OptStr(None)],
+        vec![Cell::Ts(4), Cell::OptStr(None)],
+        vec![Cell::Ts(5), Cell::OptStr(None)],
+    ];
+    let got = rows(&run.batches, &projection, &declared);
+    assert_eq!(
+        got, want,
+        "every row exactly once, in original partition order, across the \
+         row/columnar resume"
+    );
+
+    // The pre-change stand-in: forced fully ineligible, so it decodes the
+    // same three blocks from the same starting point (`block_cursor == 0`)
+    // the old whole-segment fallback would have, entirely via the row path.
+    let baseline = run_scan(
+        store,
+        vec![seg],
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        no_match_erasure(),
+    )
+    .await;
+    assert_eq!(
+        baseline.columnar_batches, 0,
+        "the forced baseline must take the row path only"
+    );
+    assert_eq!(
+        baseline.rowpath_batches, 3,
+        "the pre-change stand-in falls the whole segment to the row path, \
+         one batch per block"
+    );
+    assert_eq!(
+        got,
+        rows(&baseline.batches, &projection, &declared),
+        "the narrowed fallback must return byte-identical rows to the \
+         pre-change whole-segment fallback"
+    );
+}
+
+/// Issue #1769 (bounded, follow-up to the initial per-block narrowing): a
+/// segment where EVERY block carries an `attrs_raw` overflow page must still
+/// return every row exactly once, AND must not pay one reopen per block.
+///
+/// `max_dynamic_columns` is a PER-OBJECT budget
+/// (`crates/ravel-logseg/src/writer.rs`, `block.rs`), so once a tenant's key
+/// count exceeds it, the overflow recurs across most of that object's
+/// blocks: the every-block-spills shape this fixture pins is the common
+/// high-cardinality-attribute case, not a corner. Retrying columnar once per
+/// offending block (redecoding the growing already-emitted prefix each time)
+/// is therefore O(N^2) in the block count for exactly the tenants already
+/// slowest on this path, so it is bounded instead:
+/// `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS` (`crates/ravel-sql/src/logs_scan.rs`)
+/// tolerates one fallback with a columnar retry (the sparse case covered by
+/// `the_first_block_with_attrs_raw_falls_back_only_for_that_block_and_resumes_columnar_after`
+/// above), but a second fallback in a row with no clean columnar block
+/// between them commits the rest of this partition's block list to the row
+/// path in one reopen instead of reopening again per remaining block.
+///
+/// Five blocks all overflow here (more than the 3 the fixture used before
+/// this bound existed), specifically so the reopen count pins a property of
+/// the code rather than of a fixture sized to match it: `reopens == 2`
+/// regardless of block count once the bound has kicked in, not `reopens ==
+/// block_count - 1`. `columnar_batches == 0` throughout, since there is
+/// never a clean block to resume into.
+#[tokio::test]
+async fn every_block_with_attrs_raw_still_returns_every_row_exactly_once() {
+    let declared = vec![DeclaredColumn::new("tags", DeclaredType::Str)];
+    let resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let mk = |ts: i64| LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: "b".into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: vec![
+            ("filler".to_string(), AttrValue::Str("f".into())),
+            ("tags".to_string(), AttrValue::Str(format!("spilled-{ts}"))),
+        ],
+    };
+    // Five blocks of two records each, every one carrying the `attrs_raw`
+    // page.
+    let records: Vec<_> = (0..10).map(i64::from).map(mk).collect();
+    let cfg = RlogConfig {
+        block_target_records: 2,
+        max_dynamic_columns: 1,
+        ..RlogConfig::default()
+    };
+
+    let store = MemoryStore::new();
+    let seg = write_object(&store, "logs/allspill.rlog", &records, cfg).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    let projection = vec![0usize, FIRST_DECLARED_COL];
+    let run = run_scan(
+        Arc::clone(&store),
+        vec![seg],
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await;
+
+    assert_eq!(
+        run.columnar_batches, 0,
+        "no block is clean, so nothing resumes columnar; columnar={}, \
+         rowpath={}",
+        run.columnar_batches, run.rowpath_batches
+    );
+    assert_eq!(
+        run.rowpath_batches, 5,
+        "every one of the five blocks is still emitted through the row \
+         path; columnar={}, rowpath={}",
+        run.columnar_batches, run.rowpath_batches
+    );
+    assert_eq!(
+        run.reopens, 2,
+        "bounded to MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS + 1 = 2 reopens \
+         regardless of block count: the first fallback (block 0) still \
+         retries columnar once, the second fallback (block 1, with no clean \
+         columnar block in between) commits the remaining three blocks to \
+         the row path with no further reopen; reopens={}",
+        run.reopens
+    );
+
+    let want: Vec<_> = (0..10)
+        .map(|ts| vec![Cell::Ts(ts), Cell::OptStr(Some(format!("spilled-{ts}")))])
+        .collect();
+    let got = rows(&run.batches, &projection, &declared);
+    assert_eq!(
+        got, want,
+        "every row exactly once, in original partition order, even when \
+         every block falls back"
+    );
+}
+
 /// The strided sibling of the test above, for intra-segment scan partitioning
 /// (ADR-0102, deliverable 4): the single most important test in this item,
 /// because a wrong `ReopenRows` fallback drops or duplicates rows *silently* --
@@ -1049,7 +1290,7 @@ async fn a_later_block_with_attrs_raw_falls_back_without_losing_or_repeating_row
 /// The `attrs_raw` overflow is placed on positions 2 and 3 (the LATER block each
 /// partition owns), so on each partition the fallback fires on a block it does
 /// NOT own contiguously from the start of the segment: it has already emitted
-/// its position-0/1 block columnar (`seg_columnar_blocks == 1`) and must skip
+/// its position-0/1 block columnar (`block_cursor == 1`) and must skip
 /// exactly ONE position of its OWN index list, not one block of the whole
 /// segment.
 ///
@@ -1292,17 +1533,54 @@ async fn block_striping_is_row_identical_to_single_partition() {
     // NOT partition-count-invariant once an attrs_raw fallback is involved
     // (issue #474): each partition that independently hits a spilled block
     // within its own owned subset abandons its own columnar cursor and
-    // re-decodes its own blocks from the start, so finer striping can create
-    // MORE independent fallback points than a single partition ever would,
-    // each paying its own one-time double-decode. `blocks_scanned` now
-    // counts that work honestly (record_scan publishes the abandoned
-    // cursor's stats before it is dropped), so `under`, striped far finer
-    // than `baseline`, can only ever report as much or more real decode
-    // work, never less.
+    // re-decodes its own blocks from the start. `blocks_scanned` counts that
+    // work honestly (record_scan publishes the abandoned cursor's stats
+    // before it is dropped).
+    //
+    // Issue #1769 narrowed the fallback to the offending block only, resuming
+    // columnar afterward instead of falling the rest of the partition's own
+    // block list to rows. Unbounded, that made each reopen's re-decode cost a
+    // function of how many blocks THIS PARTITION had already emitted before
+    // the block it was reopening for, and with this fixture's spill roughly
+    // every third record (dense, not sparse, per the per-object
+    // `max_dynamic_columns` budget), a coarser partitioning packed more
+    // already-emitted blocks ahead of each later spill, making the cost grow
+    // with the SQUARE of a partition's own block count.
+    //
+    // `MAX_CONSECUTIVE_ATTR_RAW_FALLBACKS` (`crates/ravel-sql/src/logs_scan.rs`)
+    // removes that growth: a segment escalates to committing the rest of a
+    // partition's own block list to the row path after its second consecutive
+    // fallback, so each (partition, segment) pair this fixture's near-every-
+    // block spill touches pays at most 2 reopens with a small, bounded
+    // re-decode prefix (the position of that second fallback, not the whole
+    // list) -- independent of how many blocks that partition owns in the
+    // segment. What now scales with partition count is the number of DISTINCT
+    // (partition, segment) pairs paying that small bounded overhead: striping
+    // a segment's blocks across more partitions means more partitions
+    // independently open it and each pays its own bounded 1-2 reopens, so
+    // FINER striping can now ADD reopen overhead rather than shrink it -- the
+    // same direction the pre-#1769 whole-segment fallback had (this bound's
+    // per-partition tail-commit is functionally close to that behavior once
+    // escalation fires), and the reverse of the unbounded per-block
+    // narrowing's square-of-block-count blowup this replaces. Pinned exactly,
+    // not just by direction, per this fixture's actual block layout and spill
+    // pattern.
+    assert_eq!(
+        baseline.blocks_scanned, 19,
+        "single-partition baseline touches each of the four segments once, \
+         each paying at most the bounded 2-reopen chain"
+    );
+    assert_eq!(
+        under.blocks_scanned, 20,
+        "12-way striping touches each segment from more partitions, each \
+         independently paying its own small bounded reopen chain, so the sum \
+         is slightly higher than the single-partition baseline"
+    );
     assert!(
         under.blocks_scanned >= baseline.blocks_scanned,
-        "finer striping can only add fallback-driven re-decode work, never \
-         remove it: under={} baseline={}",
+        "bounded per-(partition, segment) reopen overhead can only add up \
+         across more partition-segment pairs, never shrink below the \
+         single-partition baseline: under={} baseline={}",
         under.blocks_scanned,
         baseline.blocks_scanned
     );
@@ -1451,7 +1729,7 @@ async fn an_uncached_fetcher_caps_partitions_at_the_segment_count() {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Some(&projection),
-            QueryAccounting::new(),
+            PhaseAccounting::new(),
             Arc::clone(&full_schema),
             Arc::new(declared.clone()),
         )
@@ -1517,7 +1795,7 @@ async fn logs_scan_declares_no_output_ordering() {
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         None,
-        QueryAccounting::new(),
+        PhaseAccounting::new(),
         logs_schema_with_declared(&[]),
         Arc::new(Vec::new()),
     )

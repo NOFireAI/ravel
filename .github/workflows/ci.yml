@@ -9,6 +9,24 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Workflow-level permissions floor (issue #1717), the fuzz-nightly.yml and
+# supply-chain-nightly.yml pattern applied to the lane that runs on every push
+# and every pull request. The repository default workflow permission is write,
+# so a job without a permissions block of its own compiles the workspace with a
+# read-write GITHUB_TOKEN in the environment of every dependency build script
+# cargo runs. `contents: read` is what actions/checkout and the cargo lanes
+# need and nothing more. Jobs needing anything else declare it themselves:
+# `coverage` adds id-token: write for the Codecov OIDC upload. Nothing in this
+# workflow writes an issue, a comment, a package or a release.
+#
+# Every checkout below carries `persist-credentials: false` for the same
+# reason from the other side: no job here runs git against the remote after
+# checking out (the merge-base filters in `changes`, `docker-build` and
+# `quickstart` read only what fetch-depth: 0 already fetched), so the token
+# must not sit in .git/config where that build-script code could read it.
+permissions:
+  contents: read
+
 # Cancel a superseded run for the same ref so a force-push to an open PR does
 # not leave the old run burning coverage/k8s minutes to completion (ADR-0053
 # D3). Keyed on the workflow plus the ref for PR and merge-queue refs, where
@@ -55,6 +73,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: check
         run: |
           # Emit all six outputs from a single point so no code path forgets
@@ -165,8 +184,19 @@ jobs:
           # in the same diff must still force every area true for the
           # unlisted crate's sake, even though sql_area is already true.
           area_paths='^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$|^crates/ravel-sql/|^crates/ravel-query/|^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/'
-          if echo "$changed" | grep -E '^crates/|^services/' | grep -qvE "$area_paths"; then
-            echo "::notice::changed crate/service not in any named area list, running every area"
+          # Provably irrelevant to every Rust lane: prose, the TLA+ models, and
+          # the TLA+ harness (all three already handled above, and listed again
+          # here so this test can be read on its own).
+          known_irrelevant='\.(md|svg)$|^formal/|^scripts/check-tla\.sh$'
+          # Any changed path that is neither in a named area list nor provably
+          # irrelevant forces every area. The previous form asked this only of
+          # paths under crates/ or services/, so a change to deny.toml, the
+          # Makefile, or anything under scripts/ left every area false and
+          # skipped five REQUIRED checks (sql, flight-sql, object-store-contract,
+          # promql-difftest, tla). GitHub scores a skipped required check as
+          # passing, so those merges were gated by nothing.
+          if echo "$changed" | grep -qvE "${area_paths}|${known_irrelevant}"; then
+            echo "::notice::changed path not in any named area list, running every area"
             server_or_operator=true
             sql_area=true
             promql_area=true
@@ -202,6 +232,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Supply-chain pin check cases (issue #1720)
+        run: bash deploy/metricsbench/tests/every_comparator_pins_an_image_digest.test.sh
+      - name: Supply-chain pin check (issue #1310)
+        run: deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
       - name: Check derived-doc drift (docs/query-engine.md)
         run: scripts/check-doc-drift.sh
       # Documentation gate (ADR-1040 D3). Run UNPIPED: a pipeline's exit code is
@@ -211,10 +247,159 @@ jobs:
         run: python3 scripts/check_docs.py
       - name: Check workspace version drift (ADR-0086 D8)
         run: scripts/check-workspace-versions.sh
+      # Format docs vs the reader's SUPPORTED_VERSIONS (issue #531). The checker
+      # runs its own mismatch self-check first, so a broken checker fails here
+      # rather than reporting a false clean; run UNPIPED for the same exit-code
+      # reason as the documentation gate above.
+      - name: Format-version doc consistency self-check (issue #531)
+        run: python3 scripts/check_format_version_docs.py --selftest
+      - name: Format-version doc consistency (issue #531)
+        run: python3 scripts/check_format_version_docs.py
       - name: Test-hygiene guard cases
         run: bash scripts/guards/check-test-hygiene.test.sh
       - name: Test-hygiene guard (issue #778)
         run: scripts/guards/check-test-hygiene.sh
+      # No local gate compiles .github/, so a workflow added without a
+      # top-level permissions floor is invisible until it runs on main with
+      # the repository default, which is write. Cases first, same reason as
+      # the hygiene guard above.
+      - name: Workflow-permissions guard cases (issue #1717)
+        run: bash scripts/guards/check-workflow-permissions.test.sh
+      - name: Workflow-permissions guard (issue #1717)
+        run: scripts/guards/check-workflow-permissions.sh
+      - name: Injected-clock helper guard cases (issue #1260)
+        run: bash scripts/tests/check-injected-clock-helpers.test.sh
+      - name: Injected-clock helper guard (issue #1260)
+        run: bash scripts/check-injected-clock-helpers.sh
+      # One guarded SQL parse, and nothing else in ravel-sql may reach a parser
+      # front end (issue #1760). Its cases run first for the same reason the
+      # hygiene ones do: a guard broken into always-passing fails here rather
+      # than going quiet, and this one passes everything if its anchor moves.
+      - name: Guarded-SQL-parse guard cases (issue #1760)
+        run: bash scripts/guards/check-guarded-sql-parse.test.sh
+      - name: Guarded-SQL-parse guard (issue #1760)
+        run: bash scripts/guards/check-guarded-sql-parse.sh
+      # A parsed tenant query could reach an evaluator unreachable!() arm and
+      # abort the process instead of rejecting the query (issue #1701). Cases
+      # first, same reason as the guards above.
+      - name: PromQL-unreachable guard cases (issue #1701)
+        run: bash scripts/guards/check-promql-unreachable.test.sh
+      - name: PromQL-unreachable guard (issue #1701)
+        run: bash scripts/guards/check-promql-unreachable.sh
+      # A user guide must not keep a figure a later record superseded (issue
+      # #1736): an operator picks a flag value from it. Cases first, same reason
+      # as the guards above, and this one passes everything if its anchor page
+      # is gone.
+      - name: Superseded-figures guard cases (issue #1736)
+        run: bash scripts/guards/check-superseded-figures.test.sh
+      - name: Superseded-figures guard (issue #1736)
+        run: bash scripts/guards/check-superseded-figures.sh
+      # deny.toml's quick-xml ignore comment must name every direct Cargo.lock
+      # parent of RUSTSEC-2026-0194/-0195 (issue #1718). Cases first, same
+      # reason as the guards above.
+      - name: quick-xml entry-point guard cases (issue #1718)
+        run: bash scripts/guards/check-quick-xml-entry-points.test.sh
+      - name: quick-xml entry-point guard (issue #1718)
+        run: bash scripts/guards/check-quick-xml-entry-points.sh
+      # check-quick-xml-shipped-reachability.sh itself needs a real cargo
+      # toolchain and dependency graph (it stays in the supply-chain job
+      # below, not here), but its own cases run against a stubbed cargo on
+      # PATH and cost nothing here, same reason as the entry-points cases.
+      - name: quick-xml shipped-reachability guard cases (issue #1718)
+        run: bash scripts/guards/check-quick-xml-shipped-reachability.test.sh
+      # ci-sweep-cancelled.sh must not blind-rerun a job that hit its own
+      # timeout-minutes (issue #1590): a rerun on a faster runner can pass and
+      # hide the missing headroom. These cases stub gh, hit no network, and
+      # prove the timeout-vs-supersede distinction still holds. Bash and
+      # coreutils only, no toolchain.
+      - name: ci-sweep-cancelled.sh cases (issue #1590)
+        run: bash scripts/tests/ci-sweep-cancelled.test.sh
+      # The merge-readiness script's own cases: its jq filters, its verdict
+      # order, and the end-to-end runs that drive the real script against
+      # fixtures with stand-in gh and git. Bash and jq only, no toolchain. It
+      # ran in no job until now, which is how it went stale and non-hermetic
+      # without anything noticing.
+      - name: pr-review-status.sh cases
+        run: bash scripts/pr-review-status.test.sh
+      # Requires lsof, which is what reads a process cwd and is the entire
+      # scoping property; the guard refuses to run without it. If this step
+      # fails on the runner for that reason, that is worth knowing, because
+      # CLAUDE.md tells sessions to arm the guard and it would be inert.
+      # The TLA+ harness's own resource-resolution and timeout logic. It drives
+      # shell functions only, with no JVM and no TLC jar, so it belongs beside
+      # the other bash-only guard suites and runs once here rather than once
+      # per area in the tla-models matrix.
+      - name: check-tla.sh self-test
+        run: bash scripts/check-tla.test.sh
+      - name: Disk-watchdog guard cases
+        run: bash scripts/guards/disk-watchdog.test.sh
+      # Same reason as the two above: a guard suite that runs in no job is
+      # decorative from the day it lands. Bash and coreutils only, and it
+      # sets FLEET_DISK_REAP=0 itself so it cannot reap a runner workspace.
+      - name: Disk-headroom guard cases
+        run: bash scripts/guards/check-disk-headroom.test.sh
+      # Its IDENTICAL branch is the whole point of the guard and cannot be
+      # exercised against live data: the one real duplicate pair it was
+      # written for was closed within the hour of being found. These cases
+      # build the collision synthetically, so the branch is covered by
+      # something rather than by nothing.
+      - name: Duplicate-work guard cases
+        run: bash scripts/guards/check-duplicate-work.test.sh
+      # The orchestration guards. Each of these suites drives the real script
+      # against stubbed `gh` (and, for the pre-push hook, real local
+      # repositories), so they need no toolchain and no network.
+      - name: Epic orchestrator cases (state, resume, reconcile)
+        run: bash scripts/tests/epic-orchestrator.test.sh
+      - name: Duplicate-dispatch guard cases
+        run: bash scripts/tests/assert-no-duplicate-dispatch.test.sh
+      # The dispatch chokepoint. Its refusals are the only thing standing
+      # between a hurried session and a second task on a ticket someone is
+      # already working; before these cases the script had no suite at all.
+      - name: Dispatch-intent cases
+        run: bash scripts/tests/fleet-dispatch-intent.test.sh
+      # verify-dispatch-gates.sh is the tier-1 check every fleet result is
+      # merged on, and its own cases ran in no job: the worktree-collision
+      # defect below shipped under a suite that was green and never executed.
+      # Stubs cargo and gates.sh, so no toolchain and no build.
+      - name: Verify-dispatch gate cases
+        run: bash scripts/tests/verify-dispatch-gates-with-gates.test.sh
+      - name: Green-before-merge guard cases
+        run: bash scripts/tests/assert-green-head.test.sh
+      - name: Destructive pre-push hook cases
+        run: bash scripts/tests/pre-push-destructive.test.sh
+      # The PreToolUse guard decides what every session in this repository is
+      # allowed to run, and until now its 107 cases ran in no job at all: a
+      # regression in it would have been found by a session hitting it, not
+      # by CI. Needs node, which this runner already has.
+      - name: PreToolUse guard cases
+        run: bash .claude/guards/pretooluse.test.sh
+      # Issue #1834. These five ran in no job: each was green locally from the
+      # day it landed and proved nothing, and flag-doc-guard.test.sh had in
+      # fact been RED for some time -- its fixture sed was pinned to a
+      # sentence in config.rs that got reworded, which the suite's own
+      # fixture-differs assertion caught and nobody saw. Bash only, except
+      # the nudge cases, which shell out to node the way the PreToolUse step
+      # above does -- both survive a runner image change only while it ships
+      # node, and that is worth knowing in one place rather than implied.
+      - name: Epic-status nudge cases (needs node)
+        run: bash .claude/guards/epic-status-nudge.test.sh
+      - name: Disk-reap cases
+        run: bash scripts/disk-reap.test.sh
+      - name: Reproduce-figure cases
+        run: bash scripts/reproduce-figure.test.sh
+      - name: Flag-doc guard cases (issue #1297)
+        run: bash scripts/tests/flag-doc-guard.test.sh
+      - name: Fleet-result-merge squash cases
+        run: bash scripts/tests/fleet-result-merge-squash.test.sh
+      # And the check that keeps this list honest. Python suites are enrolled
+      # by `unittest discover -p 'test_*.py'`, so they cannot be orphaned;
+      # shell suites are enumerated by hand and a new one runs nowhere until
+      # somebody remembers. This asserts every tracked *.test.sh is named in
+      # some workflow.
+      - name: Orphan-suite guard cases (issue #1834)
+        run: bash scripts/tests/check-test-suites-run.test.sh
+      - name: Every shell test suite runs somewhere (issue #1834)
+        run: bash scripts/guards/check-test-suites-run.sh
       - name: Python script unit tests
         run: make test-python
 
@@ -223,13 +408,41 @@ jobs:
   # per-PR budget and runs in tla-nightly.yml instead. The `ci` subcommand runs
   # smoke, the negative controls, and traceability under a single run id, and
   # its own exit code is the gate.
-  tla:
+  # TLA+ fast lane (ADR-1113), fanned out one job per model area. The areas
+  # under formal/tla are independent inputs to check-tla.sh, which already
+  # takes `-a AREA`, so running them concurrently explores exactly the state
+  # space the single job explored: same configs, same budgets, same negative
+  # controls and traceability checks, only on six runners instead of one.
+  # This is a scheduling change, not a verification-policy change.
+  #
+  # Measured on job 101914957416: the serial job spent 250s in
+  # maintenance/MCCompactionClaims and 195s in maintenance/MCMaintenanceOwnership
+  # against 3s for lifecycle/MCLifecycleGC, so the serial 16.3m p50 is set by
+  # one area while five short ones wait behind it.
+  #
+  # The matrix is enumerated rather than discovered because a required check
+  # must not be able to shrink silently: `tla` below asserts this list still
+  # equals the directories under formal/tla, so adding an area without adding
+  # it here fails instead of quietly going unchecked.
+  tla-models:
     needs: changes
     if: needs.changes.outputs.formal_area == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 30m per area, not the serial job's 45m for all six. maintenance is the
+    # long pole at about 8.6m warm; the headroom is for a cold JVM on a slow
+    # runner. Deliberately not tight: a timeout-minutes breach reports as
+    # `cancelled`, and publish-images.yml's release gate fails closed on a
+    # cancelled ci run for the tagged SHA.
+    timeout-minutes: 30
     permissions:
       contents: read
+    strategy:
+      # Report every area's real result. fail-fast would cancel siblings and
+      # report them as `cancelled`, which the aggregator cannot tell from an
+      # infrastructure loss.
+      fail-fast: false
+      matrix:
+        area: [catalog, commit, common, lifecycle, maintenance, resharding]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -241,14 +454,136 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: Fast lane (smoke, negatives, traceability)
-        run: scripts/check-tla.sh ci
+        env:
+          RAVEL_TLA_WORKERS: auto
+        run: scripts/check-tla.sh ci -a ${{ matrix.area }}
+      # One marker per area that finished. The aggregate `result` of a matrix
+      # is success when every leg that RAN succeeded, so it cannot by itself
+      # distinguish six green legs from five green legs and one that never
+      # produced a result. `tla` counts these instead.
+      - name: Record that this area ran
+        run: |
+          mkdir -p tla-marker
+          echo "ok" > "tla-marker/${{ matrix.area }}"
+      - name: Upload the area marker
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tla-ok-${{ matrix.area }}
+          path: tla-marker/
+          retention-days: 1
       - name: Upload TLC logs on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: tla-logs
+          name: tla-logs-${{ matrix.area }}
           path: .cache/tla/logs
           if-no-files-found: ignore
+
+  # The required check. It keeps the name `tla` so main's protect-main ruleset
+  # needs no edit, and it is the only thing that decides whether the formal
+  # lane passed.
+  #
+  # `if: always()` because a required check must report in every case the
+  # matrix can end in. That makes every non-success outcome this job's problem
+  # to classify, so it enumerates them rather than testing for failure: a
+  # cancelled matrix, a matrix that never ran because an upstream job failed,
+  # and a skipped matrix on a change that IS formal all have to be red. Only
+  # two states are green: every area succeeded, or formal_area was false and
+  # the lane legitimately did not apply.
+  tla:
+    needs: [changes, tla-models]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      # The area set, once for this whole job. It must equal the tla-models
+      # matrix above; the marker step below is what asserts that, by comparing
+      # the marker names (each written by the matrix entry that produced it)
+      # against this value.
+      EXPECTED: catalog commit common lifecycle maintenance resharding
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Matches the tla-models checkout: nothing here needs the token, so
+          # do not leave it in .git/config for the download step.
+          persist-credentials: false
+      - name: Assert the matrix covers every area under formal/tla
+        if: needs.changes.outputs.formal_area == 'true'
+        run: |
+          # Same area test scripts/check-tla.sh uses: a directory under
+          # formal/tla is an area when it holds a bare smoke.cfg or any
+          # per-module MC*.smoke.cfg. An empty result is a broken scan, not
+          # an empty repository, and fails rather than asserting against
+          # nothing.
+          actual=$(for d in formal/tla/*/; do
+            if [ -f "${d}smoke.cfg" ] || ls "${d}"MC*.smoke.cfg >/dev/null 2>&1; then
+              basename "$d"
+            fi
+          done | sort | tr '\n' ' ' | sed 's/ $//')
+          if [ -z "$actual" ]; then
+            echo "::error::found no model areas under formal/tla; the scan itself is broken"
+            exit 1
+          fi
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::formal/tla areas ($actual) do not match the tla-models matrix ($EXPECTED)"
+            echo "::error::add the new area to the matrix in .github/workflows/ci.yml"
+            exit 1
+          fi
+          echo "areas covered: $actual"
+      - name: Collect the area markers
+        if: needs.changes.outputs.formal_area == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: tla-ok-*
+          path: tla-markers
+          merge-multiple: true
+      - name: Assert every area reported a result
+        if: needs.changes.outputs.formal_area == 'true'
+        run: |
+          # A leg that never ran leaves no marker while the matrix's aggregate
+          # result can still read success, so the markers are what decide this.
+          #
+          # Compare their NAMES, not their count. Each marker is named by the
+          # matrix entry that wrote it, so name equality also asserts the thing
+          # nothing else does: that the matrix list equals EXPECTED. With the
+          # step above pinning EXPECTED to the directories on disk, the chain
+          # closes as matrix == EXPECTED == formal/tla, and there is no third
+          # copy of the area set to drift.
+          got=$(find tla-markers -type f -exec basename {} \; 2>/dev/null \
+            | sort | tr '\n' ' ' | sed 's/ $//')
+          if [ "$got" != "$EXPECTED" ]; then
+            echo "::error::area markers present ($got) do not match the expected areas ($EXPECTED)"
+            exit 1
+          fi
+          echo "every expected area reported: $got"
+      - name: Decide the formal lane
+        env:
+          FORMAL: ${{ needs.changes.outputs.formal_area }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          MODELS_RESULT: ${{ needs.tla-models.result }}
+        run: |
+          echo "formal_area=$FORMAL changes=$CHANGES_RESULT tla-models=$MODELS_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::the changes job did not succeed ($CHANGES_RESULT); the formal lane cannot be judged"
+            exit 1
+          fi
+          if [ "$FORMAL" != "true" ]; then
+            # Not a formal change. The matrix is expected to have skipped; any
+            # other result means the gating itself is wrong.
+            if [ "$MODELS_RESULT" != "skipped" ]; then
+              echo "::error::formal_area is false but tla-models reported $MODELS_RESULT"
+              exit 1
+            fi
+            echo "formal_area is false; no model areas apply"
+            exit 0
+          fi
+          if [ "$MODELS_RESULT" != "success" ]; then
+            echo "::error::tla-models reported $MODELS_RESULT; the formal lane is not green"
+            exit 1
+          fi
+          echo "every model area passed"
 
   # Lint the workflow files themselves (ADR-0086 decision 7). actionlint is
   # cheap and uses no cargo toolchain, so like doc-scripts it runs on every
@@ -278,6 +613,8 @@ jobs:
       SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install pinned shellcheck and actionlint
         run: |
           bin_dir="${RUNNER_TEMP}/lint-bin"
@@ -334,33 +671,31 @@ jobs:
   # alternatives ruled out serializing them behind a prior job.
   #
   # No free-disk-space: this job builds no images and runs no tests, so it does
-  # not need the headroom the heavier lanes clear. It DOES keep sccache and
-  # rust-cache: `cargo clippy --all-targets` over a 26-member workspace is a
-  # near-full compile of every crate's lib and test targets, so a cold run
-  # without the shared caches would be ~15-20m (far past the ~4-5m warm
-  # estimate ADR-0053 D3 assumes), which would undercut the whole point of a
-  # fast first-stage kill. With the caches warm from sibling jobs it lands in
-  # the ADR's window.
+  # not need the headroom the heavier lanes clear. It DOES keep rust-cache:
+  # `cargo clippy --all-targets` over a 26-member workspace is a near-full
+  # compile of every crate's lib and test targets, so a cold run without the
+  # shared cache would be ~15-20m (far past the ~4-5m warm estimate ADR-0053
+  # D3 assumes), which would undercut the whole point of a fast first-stage
+  # kill. With the cache warm from sibling jobs it lands in the ADR's window.
   lint:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -377,34 +712,35 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
-    env:
-      # Share compiled objects across the six workspace-compiling jobs via the
-      # GitHub Actions cache backend. rust-cache only restores the dependency
-      # registry; sccache reuses the built artifacts themselves.
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test
         run: cargo nextest run --locked --workspace --cargo-profile ci
-      # nextest does not run doctests; keep them covered separately.
+      # nextest does not run doctests; keep them covered separately. Same
+      # `ci` profile as the step above (ADR-0053 D4, and what scripts/gates.sh
+      # has always run): on the default profile this is a second target
+      # subtree and so a second build of the workspace inside one job.
+      # profile.ci inherits dev, so debug_assertions and overflow checks are
+      # unchanged and only debug info is dropped.
       - name: Doctests
-        run: cargo test --locked --doc --workspace
+        run: cargo test --locked --doc --profile ci --workspace
 
   # The SQL surface. Two things the `check` job cannot
   # cover:
@@ -432,26 +768,25 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: SQL endpoint tests
         run: cargo nextest run --locked -p ravel-server --features sql
       - name: Differential correctness gate
@@ -483,39 +818,33 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Flight SQL tests
         run: cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql
 
-  # Never-compiled feature combinations (ADR-0053 D6). Five cargo
+  # Never-compiled ravel-bench feature combinations (ADR-0053 D6). Six cargo
   # features are off by default and no other job builds them, so a break in
   # any of them -- an unreachable e2e test path, four bench binaries that
   # never link -- ships undetected. This lane proves each combination still
-  # compiles (`cargo check`), and for one of them also runs its tests:
-  #   - ravel-server --features otap            (links ravel-otap + arrow tree;
-  #                                              the image lanes build it in
-  #                                              release together with sql and
-  #                                              flight-sql, this is the fast
-  #                                              probe of the feature alone)
+  # compiles (`cargo check`), and for three of them also runs their tests:
   #   - ravel-bench --features parquet-baseline (arrow/parquet/object_store)
   #   - ravel-bench --features flight-egress    (ravel-sql/datafusion/flight)
   #   - ravel-bench --features profiling        (pprof/inferno flamegraph lane)
@@ -531,9 +860,15 @@ jobs:
   #                                              ADR-0104. RUNS its test, does
   #                                              not merely compile it)
   #
-  # `flight-sql` used to be probed here too. It moved to the `flight-sql` job
-  # above, which lints and RUNS it: a compile-only probe let every test behind
-  # that feature ship unexecuted.
+  # The `ravel-server --features otap` lane used to live here too. It was split
+  # out into `features-otap` below (issue #1590): commit 6951146b added the
+  # otap lane's `--all-targets` clippy plus lib-test AND raised this job's cap
+  # 30m -> 40m in the same change, so main's cap for the combined job is 40m,
+  # not 30m. Against that 40m cap, 28m13s is 70% of budget, not a near-timeout;
+  # splitting is not fixing an imminent timeout. It is still worth doing so the
+  # next feature added to one crate does not push the other crate's lane
+  # toward a shared cap. `flight-sql` was similarly probed here once and moved
+  # to its own job.
   #
   # This job is a required check (main's protect-main ruleset lists it), so a
   # break here blocks a merge. A feature added to ravel-bench therefore
@@ -542,28 +877,42 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    # 30m, not 20m: four separate, mutually non-sharing compile
-    # configurations (arrow, parquet, object_store, datafusion, arrow-flight
-    # all appear across the four probes) with no shared incremental state.
-    timeout-minutes: 30
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
+    # 45m, measured (issue #1793). The ravel-bench probes are separate,
+    # mutually non-sharing compile configurations (arrow, parquet,
+    # object_store, datafusion, arrow-flight all appear across them), so this
+    # job pays a full build per lane and a cache miss is expensive:
+    #
+    #   warm cache  15m43s  (main run 34839481011)
+    #   cold cache  28m35s  (main run 34882054056, "No cache found")
+    #               30m15s  (PR #1783, same, over the old 30m and reported as
+    #                        `cancelled` rather than as a timeout)
+    #
+    # The old 30m covered the warm case only, so every cache eviction was a
+    # coin flip on a required check. 45m covers the measured cold run with
+    # margin. The spread is cache state, not growth: between the two runs
+    # above every compile step scaled by roughly the same factor.
+    #
+    # Two steps carry over half of a cold run (Test sql-latency 7m41s, Test
+    # sql-latency,profiling,flight-lane 7m07s). Splitting them into their own
+    # job would let both halves fit, and would also need the new job added to
+    # the required-checks set or it drops out of the merge gate; #1793 holds
+    # that.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Check ravel-server --features otap
-        run: cargo check --locked -p ravel-server --features otap
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check ravel-bench --features parquet-baseline
         run: cargo check --locked -p ravel-bench --features parquet-baseline
       - name: Check ravel-bench --features flight-egress
@@ -598,6 +947,98 @@ jobs:
         # the crate that declares the feature.
       - name: Test ravel-bench --features stage-timing
         run: cargo test --locked -p ravel-bench --features stage-timing
+      - name: Clippy ravel-logseg + ravel-ingest --features stage-timing
+        run: cargo clippy --locked -p ravel-logseg -p ravel-ingest --features stage-timing --all-targets -- -D warnings
+        # The step above enables ravel-logseg/stage-timing and
+        # ravel-ingest/stage-timing transitively, so it does type-check their
+        # production code. It cannot reach their TESTS: `-p ravel-bench` builds
+        # both crates as library dependencies, and cargo never compiles a
+        # dependency's `#[cfg(test)]` module. Every
+        # `#[cfg(feature = "stage-timing")]` test in those two crates was
+        # unreachable from any lane -- including the ones that pin the logs
+        # stage set and the per-block bloom sample count (issue #1516). This
+        # pair of steps is the lane that compiles and runs them.
+        #
+        # services/ravel-cli also declares stage-timing and is deliberately NOT
+        # in this selection: its stage-timing test is broken on main under
+        # issue #1522, so including it would make this lane red for a reason
+        # unrelated to the seam.
+      - name: Test ravel-logseg + ravel-ingest --features stage-timing
+        run: cargo test --locked -p ravel-logseg -p ravel-ingest --features stage-timing
+
+  # The `ravel-server --features otap` lane (issue #1590), split out of
+  # `features` above so no single job carries every feature lane. This links
+  # ravel-otap and the arrow tree: the image lanes build it in release together
+  # with sql and flight-sql; this is the debug lane for the feature alone.
+  # LINTED with --all-targets and RUNS its tests (commit 6951146b): a compile
+  # probe (`cargo check`) left the feature's own tests unexecuted and a clippy
+  # finding in feature-gated code could not fail anything.
+  #
+  # Same runner, toolchain, and `changes` gate as `features`; it carries no
+  # ravel-bench step, and the two run fully in parallel (no `needs` between
+  # them). They are NOT free of shared compile state: ravel-bench (default
+  # build) and `ravel-server --features otap` both pull in most of the same
+  # internal crate graph (ravel-types, ravel-object-store, ravel-catalog,
+  # ravel-commit, ravel-maintain, ravel-ingest, ravel-logseg, ravel-otlp,
+  # ravel-promql, ravel-proto, ravel-query, ravel-segment). Splitting this job
+  # out of `features` therefore costs a second compile of that shared internal
+  # graph on a second runner. Each job below uses its own default job-scoped
+  # rust-cache key (no `shared-key`): Swatinem/rust-cache does not cache
+  # workspace-member artifacts by default (`cache-workspace-crates` defaults
+  # to false, and `cleanTargetDir`/`cleanProfileTarget` strip every ravel-*
+  # crate before saving), so a shared key across these two jobs would not
+  # actually reuse the internal graph above -- it would only share external
+  # dependency crates, and because both jobs would then compute an identical
+  # key with no job-id component, only one of the two would ever populate it
+  # (the loser recompiles its exclusive dependencies cold on every run,
+  # forever). There is no cache mechanism here that reclaims the shared
+  # internal graph's compile cost; the second compile is the accepted price of
+  # the split.
+  #
+  # NOTE: this job is NOT yet a required check. Until main's protect-main
+  # ruleset lists `features-otap`, a break in the otap lane does not block a
+  # merge. Tracked in issue #1673 ("Add features-otap to main's required
+  # status checks"); branch protection is not edited here.
+  features-otap:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    # 25m (provisional): this lane compiles, lints (--all-targets), and
+    # lib-tests a single ravel-server feature, the same shape and crate as the
+    # `sql` job, which carries a 25m budget, and is used as a starting point
+    # here rather than a measured figure. The "~10-13m own share" this cap was
+    # previously derived from was itself a subtraction of the same
+    # combined-job samples used (and rejected) as the `features` job's
+    # baseline above -- those samples already include the otap lane, so they
+    # cannot supply a "before otap" side for that subtraction either. This
+    # job's own duration has not been measured; tighten or loosen 25m once a
+    # run of this split job supplies it.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy ravel-server --features otap
+        run: cargo clippy --locked -p ravel-server --features otap --all-targets -- -D warnings
+        # `--lib`, not the whole test set: `tests/cli_reference.rs` asserts
+        # `docs/reference/ravel-server-flags.md` matches the flags of a build
+        # with NO optional features, and that page says in its own header that
+        # `--otap` is absent for that reason. Under `--features otap` the
+        # binary grows `--otap` and that test fails by construction, on any
+        # tree. `--all-targets` on the clippy step above still compiles it.
+      - name: Test ravel-server --features otap
+        run: cargo test --locked -p ravel-server --features otap --lib
 
   # Supply-chain gate. deny.toml encodes an advisory,
   # license, ban, and source policy that `make audit` runs locally but no
@@ -614,15 +1055,32 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 15, matching supply-chain-nightly.yml's timeout: the eight cold
+    # `cargo tree` invocations below (issue #1718) resolve the full
+    # dependency graph with no warm cache, and this job's own pin-count
+    # fixture (deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh)
+    # lives outside this round's edit scope, so a Swatinem/rust-cache step
+    # is not added here; raising the ceiling is the change available without
+    # touching that fixture.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install cargo-deny
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: cargo-deny
       - name: cargo deny check
         run: cargo deny check
+      # deny.toml ignores RUSTSEC-2026-0194/-0195 on the premise that no
+      # shipped binary's feature set reaches an affected quick-xml version
+      # (issue #1718). `cargo tree -i` needs the pinned toolchain, which
+      # cargo-deny (a static binary from the action above) does not.
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: quick-xml shipped-reachability guard (issue #1718)
+        run: scripts/guards/check-quick-xml-shipped-reachability.sh
 
   # Corrupt-input mutation fuzzing for the byte parsers. Runs the stable-only
   # proptest mutation targets for the
@@ -636,35 +1094,52 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 20 rather than 15 as headroom for a cold compile of ravel-logseg and
+    # ravel-rspan plus their test binaries, which this job did not build
+    # before. Observed 4m21s on a cache hit (rust-cache) for the run on
+    # 4045c1e978865d313329d93b4af230f63fa85396, so 20 is roughly four times
+    # that rather than a measured ceiling. It is sized for the misses: a
+    # Cargo.lock change, a toolchain bump, or an evicted cache. Nothing
+    # declares `needs: fuzz`, so a generous ceiling blocks no other job.
+    timeout-minutes: 20
     env:
       # Bounded case count keeps wall-clock in check while exploring far more
       # of the corrupt-input space than the 256-case default.
       PROPTEST_CASES: 4096
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Fuzz RSEG codecs (varint, gorilla, delta-varint)
         run: cargo nextest run --locked -p ravel-segment --lib fuzz_mutation
       - name: Fuzz RSEG footer/section reader
         run: cargo nextest run --locked -p ravel-segment --test fuzz_mutation
       - name: Fuzz OTAP Arrow IPC decode
         run: cargo nextest run --locked -p ravel-otap --test fuzz_mutation
+      # RLOG has a real hostile-input suite but it otherwise runs only in the
+      # ordinary test job at the 256-case default; RLOG is the largest format in
+      # the tree, so run it here at the elevated PROPTEST_CASES for the deeper
+      # exploration the other decoders already get.
+      - name: Fuzz RLOG decode (corrupt-input suite)
+        run: cargo nextest run --locked -p ravel-logseg --test corrupt
+      # RSPAN had no corrupt-input coverage in CI at all. Same never-panic,
+      # never-return-wrong-records property as the RLOG suite above.
+      - name: Fuzz RSPAN decode (corrupt-input suite)
+        run: cargo nextest run --locked -p ravel-rspan --test corrupt
 
   # Runs the object-store contract suite (docs/object-store-contract.md)
   # against real S3-compatible endpoints: MinIO, and floci. Without this job
@@ -695,33 +1170,35 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Start MinIO
         run: |
+          # Docker Hub's anonymous pull allowance is per-IP and shared across
+          # every project on a runner, so an unauthenticated pull there fails
+          # unpredictably; quay.io does not share that allowance.
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+            quay.io/minio/minio:latest server /data
       - name: Wait for MinIO to be live
         run: |
           for _ in $(seq 1 30); do
@@ -736,7 +1213,8 @@ jobs:
           exit 1
       - name: Create the contract-suite bucket
         run: |
-          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+          # quay.io rationale: see this job's "Start MinIO" step above.
+          docker run --rm --network host --entrypoint sh quay.io/minio/mc:latest -c "
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/ravel-object-store-test"
       # The contract suite's S3/MinIO case is gated on RAVEL_MINIO_URL; set it
@@ -868,33 +1346,33 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Start MinIO
         run: |
+          # quay.io rationale: see object-store-contract's "Start MinIO" step.
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+            quay.io/minio/minio:latest server /data
       - name: Wait for MinIO to be live
         run: |
           for _ in $(seq 1 30); do
@@ -909,7 +1387,8 @@ jobs:
           exit 1
       - name: Create the bench-smoke bucket
         run: |
-          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+          # quay.io rationale: see object-store-contract's "Start MinIO" step.
+          docker run --rm --network host --entrypoint sh quay.io/minio/mc:latest -c "
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/ravel-object-store-test"
       # minio_ingest_read_smoke is gated on RAVEL_MINIO_URL, same convention
@@ -963,25 +1442,24 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.promql_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Fetch pinned Prometheus binary
         id: fetch-prometheus
         run: echo "bin_path=$(scripts/fetch-prometheus.sh)" >> "$GITHUB_OUTPUT"
@@ -1036,9 +1514,9 @@ jobs:
   # The release binaries are built on the runner and the images assembled from
   # them (Dockerfile.prebuilt) instead of letting kind-up.sh run the root
   # Dockerfile's builder stage: that stage recompiles the whole workspace inside
-  # Docker with CARGO_BUILD_JOBS=2 and no access to this workflow's caches (57
+  # Docker with CARGO_BUILD_JOBS=2 and no access to this workflow's cache (57
   # minutes measured on an 8 GiB arm64 host). RAVEL_SKIP_IMAGE_BUILD=1 exists
-  # for exactly this split, and the sccache/rust-cache setup here is the same one
+  # for exactly this split, and the rust-cache setup here is the same one
   # `check` uses, so the release build starts warm.
   k8s-build:
     needs: changes
@@ -1057,12 +1535,10 @@ jobs:
     runs-on: ubuntu-latest
     # 55m: the original single job's 60m covered the release build plus the
     # kind half; this half is build + docker save + artifact upload only, but
-    # a cold-sccache release build alone has been observed near 45m, and the
+    # a cold release build alone has been observed near 45m, and the
     # save/upload adds real minutes on top of that, not headroom to spend.
     timeout-minutes: 55
     env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
       # The tags the assembly step writes; k8s-integration loads them into the
       # cluster and points the RavelCluster at them, so both jobs set the same
       # values. Not the script's `:kind-dev` default on purpose: a developer's
@@ -1072,18 +1548,21 @@ jobs:
       RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       # First, before anything pulls: two Ravel images and a release target
       # directory together need real headroom.
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      # No save-if here, unlike every other rust-cache step in this file. This
+      # job's gate includes github.event_name == 'pull_request', so it runs
+      # only on labelled PRs and never on a push to main: save-if would always
+      # be false AND no main-scoped entry under its key could ever be written,
+      # leaving the step pure overhead and every labelled run a cold release
+      # build against a 55m cap. Its PR-scoped saves are kept so a second push
+      # to a labelled PR still restores the first push's entry; the lane is
+      # label-gated and rare, so its share of the write amplification is small.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Exactly what the root Dockerfile's builder stage compiles for these
       # images, including ravel-cli: scripts/kind-up.sh's store-qualification
@@ -1156,12 +1635,14 @@ jobs:
       RAVEL_KIND_CLUSTER: ravel-ci
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       # Still disk-hungry: a kind node image, two Ravel images, and floci all
       # land on this runner even though the release build moved to k8s-build.
       - uses: ./.github/actions/free-disk-space
       # This job compiles nothing (kind-up.sh runs with RAVEL_SKIP_IMAGE_BUILD=1
-      # and the node-image resolve step is a sed), so it carries no toolchain,
-      # sccache, or rust-cache setup -- only the images k8s-build produced.
+      # and the node-image resolve step is a sed), so it carries no toolchain
+      # or rust-cache setup -- only the images k8s-build produced.
       - name: Download the assembled images
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -1316,7 +1797,7 @@ jobs:
   #
   # Path-gated rather than run on every push. This Dockerfile recompiles the
   # whole workspace inside Docker at CARGO_BUILD_JOBS=2 (the cap that keeps it
-  # from OOM-killing) with no access to this workflow's sccache --
+  # from OOM-killing) with no access to this workflow's cache --
   # 57 minutes measured on an 8 GiB arm64 host, per k8s-integration's notes --
   # so running it on every PR push would be by far the most expensive job here.
   # Every regression the issue names (a broken COPY path, a bad stage name, a
@@ -1334,7 +1815,7 @@ jobs:
     runs-on: ubuntu-latest
     # 60m, not the ~10m the no-op path suggests: when Dockerfile/.dockerignore
     # actually change this job runs a full workspace compile inside Docker at
-    # CARGO_BUILD_JOBS=2 with no access to this workflow's sccache (~57m
+    # CARGO_BUILD_JOBS=2 with no access to this workflow's cache (~57m
     # measured on a constrained host per the notes below). A single timeout
     # covers the whole job regardless of which path it takes, so it must be
     # sized to the build path or it would kill every real Dockerfile change;
@@ -1344,6 +1825,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: dockerfile-changed
         run: |
           # merge_group events carry merge_group.base_sha, not event.before;
@@ -1412,22 +1894,21 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
@@ -1456,7 +1937,7 @@ jobs:
   # Container-first quickstart verification (ADR-0081 decisions 5, 6, 7). Builds
   # the pull request's OWN ravel-server (the shipping `--features
   # sql,flight-sql,otap`) and ravel-cli on the
-  # runner with the shared sccache/rust-cache, assembles a runtime image from
+  # runner with the shared rust-cache, assembles a runtime image from
   # them via Dockerfile.prebuilt (both binaries, because that file's `server`
   # target COPYs ravel-cli for the store-qualification path too), brings up
   # deploy/docker-compose/ravel.yml pointed at that image, drives real telemetry
@@ -1480,8 +1961,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
       # The tag the assemble step writes and compose consumes via RAVEL_IMAGE.
       RAVEL_IMAGE: ravel-server:quickstart-ci
       COMPOSE_FILE: deploy/docker-compose/ravel.yml
@@ -1496,6 +1975,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       # Inline merge-base path filter (decision 7). Runs on a README-only change
       # but skips the expensive build/bring-up when nothing this job covers
       # changed, the same shape docker-build uses for its Dockerfile guard.
@@ -1529,16 +2009,15 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         if: steps.filter.outputs.run == 'true'
         run: rustup show
-      - name: Install sccache
-        id: sccache
-        if: steps.filter.outputs.run == 'true'
-        continue-on-error: true
-        uses: ./.github/actions/setup-sccache
-      - name: Disable sccache if its install flaked
-        if: steps.filter.outputs.run == 'true' && steps.sccache.outcome == 'failure'
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.filter.outputs.run == 'true'
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Both binaries: Dockerfile.prebuilt's `server` target COPYs ravel-server
       # AND ravel-cli, so a context missing the CLI fails the docker build.
       - name: Build ravel-server (sql,flight-sql,otap) and ravel-cli on the host
@@ -1573,10 +2052,17 @@ jobs:
           echo "::error::ravel-server did not become ready in time"
           docker compose -f "$COMPOSE_FILE" logs --no-color || true
           exit 1
-      # telemetrygen injects a deterministic series (`gen`) for the assertions,
-      # alongside the collector's host metrics (ADR-0081 D5). OTLP/HTTP to the
-      # published loopback port, with the demo bearer token; --network host so
-      # 127.0.0.1:4318 resolves to the mapped port.
+      # First of two telemetrygen steps: this one injects the deterministic
+      # metric series (`gen`), alongside the collector's host metrics; the logs
+      # step below injects the deterministic log records the PromQL-over-logs
+      # block asserts on (ADR-0081 D5). OTLP/HTTP to the published loopback
+      # port, with the demo bearer token; --network host so 127.0.0.1:4318
+      # resolves to the mapped port. --rate 0 disables telemetrygen's default
+      # one-record-per-second-per-worker throttle so all 500 records are emitted
+      # as a burst in seconds rather than the 8m20s a rate of 1 would take; the
+      # README assertions count records over a window and only require a
+      # non-empty result, so a burst satisfies them at least as easily as a
+      # trickle.
       - name: Generate deterministic telemetry with telemetrygen
         if: steps.filter.outputs.run == 'true'
         run: |
@@ -1588,7 +2074,31 @@ jobs:
             --otlp-insecure \
             --otlp-header 'Authorization="Bearer demo-token"' \
             --metric-type Gauge \
+            --rate 0 \
             --metrics 500
+      # Second telemetrygen step: injects deterministic LOG records so the
+      # README's PromQL-over-logs block (`sum by (job) (count_over_time(
+      # ravel_log_lines [5m]))`, README.md:185) has a log source to match. The
+      # collector's own internal-logs export is not a CI-usable source: its
+      # record count and timing depend on log level, so the assertion would
+      # flake. The resource `service.name` becomes the `job` label the query
+      # groups by (crates/ravel-query/src/log_series.rs). Mirrors the metrics
+      # step: --network host, OTLP/HTTP to the loopback port, demo bearer token,
+      # and --rate 0 to burst all 500 records instead of throttling to one per
+      # second.
+      - name: Generate deterministic logs with telemetrygen
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          docker run --rm --network host \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            logs \
+            --otlp-http \
+            --otlp-endpoint 127.0.0.1:4318 \
+            --otlp-insecure \
+            --otlp-header 'Authorization="Bearer demo-token"' \
+            --otlp-attributes 'service.name="quickstart-logs"' \
+            --rate 0 \
+            --logs 500
       # Assert the collector is actually delivering, from its own counters
       # (#209). telemetrygen supplies the series the README assertions query, so
       # without this step a total collector failure is invisible to this job:

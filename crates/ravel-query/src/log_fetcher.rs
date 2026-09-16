@@ -54,6 +54,7 @@ use crate::config::EngineConfigError;
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::ReadCache;
 use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
+use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
@@ -65,14 +66,13 @@ use ravel_logseg::skip_index::{Level0Entry, NumRangeArm, SkipIndex, merge_stats}
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
     AttrValue, BlockScan, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError, LogStreamId,
-    Predicate, RlogConfig, RlogReader, ScanStats, SuffixOutcome, decode_section, open_from_suffix,
-    read_section,
+    Predicate, RlogConfig, RlogReader, ScanStats, SuffixOutcome, decode_section_accounted,
+    open_from_suffix, read_section_accounted,
 };
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::logstream::canonical_attr_bytes;
-use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 /// Upper bound on STREAM_DIR entries accepted when decoding the directory out
@@ -441,6 +441,8 @@ impl LogSegmentScan {
         let stats = self.scan.stats();
         self.span.record("blocks_scanned", stats.blocks_scanned);
         self.span.record("blocks_total", stats.blocks_total);
+        self.span
+            .record("decompressed_bytes", stats.decompressed_bytes);
         // Decode-time column-filtering accounting (ADR-0107 decision 4), folded
         // once at exhaustion into the query's handle: page_bytes_fetched vs.
         // page_bytes_decoded expose how much of each fetched block a narrow
@@ -450,6 +452,13 @@ impl LogSegmentScan {
             .add_page_bytes_fetched(stats.page_bytes_fetched);
         self.accounting
             .add_page_bytes_decoded(stats.page_bytes_decoded);
+        // Bytes zstd produced opening this object's directory sections and
+        // decoding its scanned block pages (issue #1401). This is the scan
+        // funnel's decompressed-byte output; charged to the `scan` phase, the
+        // same handle its page-byte figures land on, so a warm-cache scan that
+        // moves no wire bytes still reports the decode work it did.
+        self.accounting
+            .add_decompressed_bytes(stats.decompressed_bytes);
     }
 }
 
@@ -511,6 +520,37 @@ pub enum LogFetchError {
     /// (ADR-0107 decision 1).
     #[error("etag changed between reads of log segment {key}: store returned inconsistent data")]
     EtagChanged { key: String },
+    /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
+    /// reservation for the bytes this GET would materialize. Carries only the
+    /// three accounting figures, never an object key or tenant value: the
+    /// refusal is a resource condition, not corruption, and must not leak which
+    /// object or tenant provoked it. Mirrors
+    /// [`crate::FetchError::FetchMemoryExhausted`].
+    #[error(
+        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget already reserved"
+    )]
+    FetchMemoryExhausted {
+        requested: u64,
+        reserved: u64,
+        limit: u64,
+    },
+    /// A [`CarriedWholeObject`] produced by one `plan_segment` read was supplied
+    /// to a read of a different object, or of the same object under a different
+    /// tenant. The carry short-circuits the fetch, so decoding it would answer
+    /// from the wrong object's bytes whenever both are decodable, rather than
+    /// fail; the mismatch is rejected before any decode. Terminal like
+    /// `SpanFetchError::TenantMismatch`, never a retry: the pairing is fixed by
+    /// the caller, so the same request retried anywhere reproduces it.
+    #[error(
+        "carried whole object from {carried_key} (tenant {carried_tenant:?}) was supplied to a \
+         read of log segment {key} (tenant {tenant:?})"
+    )]
+    CarryMismatch {
+        key: String,
+        carried_key: String,
+        tenant: TenantHash,
+        carried_tenant: TenantHash,
+    },
 }
 
 /// Fetches and scans one RLOG log segment at a time. Constructed with the same
@@ -539,6 +579,16 @@ pub struct LogSegmentFetcher {
     /// The block-range fetcher used for objects above `block_range_threshold`.
     /// Kept in sync with `store`/`cfg`/`cache` by the builders.
     block_range: BlockRangeFetcher,
+    /// Bounds this fetcher's OWN whole-object GETs (`fetch_accounted` and
+    /// `whole_object_bytes`'s two sites), the funnel every object at or below
+    /// `block_range_threshold` routes through. Distinct from
+    /// `block_range`'s limiter, which bounds only the above-threshold
+    /// ranged path; [`Self::with_get_limiter`] sets both to the same `Arc` so
+    /// a caller shares one pool across both funnels, and
+    /// [`Self::with_block_range`] re-applies this field's current limiter to
+    /// the replacement `BlockRangeFetcher` so builder order cannot silently
+    /// drop it (ADR-1195).
+    get_limiter: Arc<crate::GetLimiter>,
     /// Per-phase tail-section probe misses across every read this fetcher has
     /// served (#883). Shared by every clone, like `block_range`'s GET semaphore,
     /// and read through [`probe_miss_counter`](Self::probe_miss_counter).
@@ -549,19 +599,35 @@ pub struct LogSegmentFetcher {
     /// fetcher's ranged GETs accumulate into one set of totals. Read through
     /// [`phase_wire_byte_counter`](Self::phase_wire_byte_counter).
     wire_bytes: PhaseWireByteCounter,
+    /// The process-wide fetch memory budget (ADR-1170 decision 2). This
+    /// fetcher's own whole-object GETs (`fetch_accounted` and
+    /// `whole_object_bytes`) reserve the object's size against it before the
+    /// GET and own the reservation for the fetched buffer's lifetime;
+    /// `block_range` reserves its own ranged reads against the same budget,
+    /// which every builder below keeps in sync (like `wire_bytes` and
+    /// `get_limiter`). Default [`ravel_memory::MemoryBudget::unlimited`], so a
+    /// fetcher built with plain `new` never refuses.
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
 }
 
 impl LogSegmentFetcher {
     pub fn new(store: Arc<dyn ObjectStoreBackend>) -> Self {
         let wire_bytes = PhaseWireByteCounter::new();
+        let memory_budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
         LogSegmentFetcher {
             store: store.clone(),
             cfg: RlogConfig::default(),
             cache: None,
             block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
-            block_range: BlockRangeFetcher::new(store).with_wire_byte_counter(wire_bytes.clone()),
+            block_range: BlockRangeFetcher::new(store)
+                .with_wire_byte_counter(wire_bytes.clone())
+                .with_memory_budget(memory_budget.clone()),
+            get_limiter: Arc::new(crate::GetLimiter::new_unchecked(
+                DEFAULT_LOG_MAX_CONCURRENT_GETS,
+            )),
             probe_misses: ProbeMissCounter::new(),
             wire_bytes,
+            memory_budget,
         }
     }
 
@@ -648,15 +714,105 @@ impl LogSegmentFetcher {
         self
     }
 
-    /// Bounds the in-flight object-store GETs of the block-range path (ADR-0107
-    /// decision 1's permit pool, [`DEFAULT_LOG_MAX_CONCURRENT_GETS`] by
-    /// default). This is the seam `--fetch-concurrency` (ADR-0088) reaches the
-    /// logs signal through; a scan planned at more partitions than this pool
-    /// has permits queues on it (issue #700).
+    /// Bounds the in-flight object-store GETs of BOTH RLOG paths with one
+    /// private [`crate::GetLimiter`] of `n` permits (0 is clamped to 1): the
+    /// fetcher's own whole-object funnel and the block-range path share it, so
+    /// a standalone fetcher built this way is governed by `n` on either path
+    /// and not by [`DEFAULT_LOG_MAX_CONCURRENT_GETS`]. This is the seam
+    /// `--fetch-concurrency` (ADR-0088) reaches the logs signal through; a scan
+    /// planned at more partitions than this pool has permits queues on it
+    /// (issue #700). A fetcher a `QueryEngine` owns is wired with
+    /// [`Self::with_get_limiter`] to the engine's shared limiter instead.
     #[must_use]
-    pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
-        self.block_range = self.block_range.with_max_concurrent_gets(n);
+    pub fn with_max_concurrent_gets(self, n: usize) -> Self {
+        let limiter = Arc::new(crate::GetLimiter::new_unchecked(n.max(1)));
+        self.with_get_limiter(limiter)
+    }
+
+    /// Wires this fetcher's OWN whole-object GETs and the block-range path to
+    /// the same caller-owned [`crate::GetLimiter`] (ADR-1195), so both funnels
+    /// draw permits from the same pool as every other fetcher (and, via
+    /// [`crate::QueryEngine::with_get_limiter`], every other engine) holding
+    /// the same `Arc`.
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: std::sync::Arc<crate::GetLimiter>) -> Self {
+        self.get_limiter = Arc::clone(&limiter);
+        self.block_range = self.block_range.with_get_limiter(limiter);
         self
+    }
+
+    /// Wires this fetcher's OWN whole-object GETs and the block-range path to
+    /// the same caller-owned [`ravel_memory::MemoryBudget`] (ADR-1170 decision
+    /// 2), so both funnels reserve against the same budget as every other
+    /// fetcher (and, via [`crate::QueryEngine::with_memory_budget`], every other
+    /// engine) holding the same `Arc`. Mirrors [`Self::with_get_limiter`].
+    #[must_use]
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.memory_budget = Arc::clone(&budget);
+        self.block_range = self.block_range.with_memory_budget(budget);
+        self
+    }
+
+    /// This fetcher's own memory budget (bounds `fetch_accounted` and
+    /// `whole_object_bytes`), for a test to `Arc::ptr_eq` against another
+    /// fetcher's or an engine's, proving they share one budget. See
+    /// [`Self::block_range_memory_budget_for_test`] for the block-range path's.
+    #[cfg(test)]
+    pub(crate) fn memory_budget_for_test(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
+    }
+
+    /// The block-range path's current memory budget, for the same `Arc::ptr_eq`
+    /// purpose as [`Self::memory_budget_for_test`].
+    #[cfg(test)]
+    pub(crate) fn block_range_memory_budget_for_test(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        self.block_range.memory_budget_for_test()
+    }
+
+    /// Reserves `n` bytes against this fetcher's budget before a whole-object
+    /// GET, mapping a refusal to [`LogFetchError::FetchMemoryExhausted`]. The
+    /// guard is owned for the fetched buffer's lifetime (ADR-1170 decision 2).
+    fn reserve_fetch(&self, n: u64) -> Result<ravel_memory::Reservation, LogFetchError> {
+        self.memory_budget
+            .reserve(n)
+            .map_err(|e| LogFetchError::FetchMemoryExhausted {
+                requested: e.requested,
+                reserved: e.reserved,
+                limit: e.limit,
+            })
+    }
+
+    /// This fetcher's own limiter (bounds `fetch_accounted` and
+    /// `whole_object_bytes`), for a test to `Arc::ptr_eq` against another
+    /// fetcher's or an engine's, proving two fetchers actually share one
+    /// `GetLimiter` rather than each holding an equal-but-distinct one. See
+    /// [`Self::block_range_get_limiter_for_test`] for the block-range path's
+    /// limiter.
+    #[cfg(test)]
+    pub(crate) fn get_limiter_for_test(&self) -> &std::sync::Arc<crate::GetLimiter> {
+        &self.get_limiter
+    }
+
+    /// The block-range path's current limiter, for the same `Arc::ptr_eq`
+    /// purpose as [`Self::get_limiter_for_test`]. Kept separate because
+    /// `with_block_range` can, in principle, be handed a `BlockRangeFetcher`
+    /// wired to a different limiter than this instance's own before this
+    /// builder re-applies the shared one; a test asserting both proves that
+    /// re-apply actually happened.
+    #[cfg(test)]
+    pub(crate) fn block_range_get_limiter_for_test(&self) -> &std::sync::Arc<crate::GetLimiter> {
+        self.block_range.get_limiter_for_test()
+    }
+
+    /// This fetcher's `GetLimiter` permit count (ADR-1195): the bound both
+    /// its own whole-object funnel and the block-range path draw from, and,
+    /// when wired via [`Self::with_get_limiter`], the process-wide GET
+    /// concurrency bound shared with every other fetcher and engine holding
+    /// the same `Arc`. Mirrors
+    /// [`SegmentFetcher::get_limiter_permits`](crate::fetcher::SegmentFetcher::get_limiter_permits).
+    #[must_use]
+    pub fn get_limiter_permits(&self) -> usize {
+        self.get_limiter.permits()
     }
 
     /// Pins the block-range fetcher's suffix-probe length
@@ -704,9 +860,19 @@ impl LogSegmentFetcher {
     /// counter (#913), so a caller that took the handle from
     /// [`phase_wire_byte_counter`](Self::phase_wire_byte_counter) before or
     /// after this call reads the same totals either way.
+    ///
+    /// It is also re-wired to this instance's current `get_limiter` (ADR-1195),
+    /// overriding whatever limiter `block_range` was built with. This makes
+    /// builder order irrelevant: `with_get_limiter().with_block_range(...)`
+    /// and `with_block_range(...).with_get_limiter(...)` both end with the
+    /// block-range path sharing this fetcher's limiter, rather than the first
+    /// order silently dropping it in favor of the replacement's own.
     #[must_use]
     pub fn with_block_range(mut self, block_range: BlockRangeFetcher) -> Self {
-        self.block_range = block_range.with_wire_byte_counter(self.wire_bytes.clone());
+        self.block_range = block_range
+            .with_wire_byte_counter(self.wire_bytes.clone())
+            .with_get_limiter(Arc::clone(&self.get_limiter))
+            .with_memory_budget(Arc::clone(&self.memory_budget));
         self
     }
 
@@ -856,12 +1022,17 @@ impl LogSegmentFetcher {
     /// limitation in its user-facing query semantics. Silently inheriting this
     /// over-approximation into a user-facing query would violate the "exact
     /// semantics by default, approximation is opt-in and visible" invariant.
+    ///
+    /// `accounting` receives the STREAM_DIR decompression this decode performs
+    /// (issue #1401 finding 3); `bytes` is assumed already fetched and its wire
+    /// bytes already charged by the caller.
     pub fn matching_streams(
         &self,
         bytes: &[u8],
         filters: &[StreamAttrEquals],
+        accounting: &QueryAccounting,
     ) -> Result<Vec<LogStreamId>, LogSegError> {
-        let dir = self.decode_stream_dir(bytes)?;
+        let dir = self.decode_stream_dir(bytes, accounting)?;
         let needles: Vec<Vec<u8>> = filters.iter().map(stream_attr_needle).collect();
         let mut out = Vec::new();
         for entry in dir.entries() {
@@ -914,13 +1085,17 @@ impl LogSegmentFetcher {
     /// Accounted counterpart of [`fetch`](Self::fetch): identical behavior,
     /// plus the object GET is recorded against `accounting` (ADR-0044 "2.
     /// Accounting is recorded at existing funnels only" -- this call is the
-    /// funnel `LogSegmentFetcher` did not have before). `engine.rs` has no
-    /// references to `LogSegmentFetcher` at all; the real production callers
-    /// (ravel-sql's `logs_provider`, `alerts_scan`, `audit_scan`, and
-    /// `audit_provider`) still call the unaccounted [`fetch`](Self::fetch).
-    /// Wiring them onto this funnel is future work; `fetch` stays the
-    /// unaccounted entry point until then, so those callers need no
-    /// signature change yet.
+    /// funnel `LogSegmentFetcher` did not have before). `engine.rs` builds
+    /// its own `LogSegmentFetcher` (`QueryEngine::log_fetcher`) and drives
+    /// it through the tenant-aware
+    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant) (via
+    /// `log_series::fetch_log_series`), not this entry point; ravel-sql's
+    /// `logs_scan` reaches the same funnel through
+    /// `scan_accounted_with_tenant`/`scan_accounted_with_tenant_subset`,
+    /// while `audit_scan` and `alerts_scan` call
+    /// [`fetch_accounted_with_tenant`](Self::fetch_accounted_with_tenant).
+    /// This untenanted `fetch`/`fetch_accounted` pair has no production
+    /// caller left; only tests exercise it.
     pub async fn fetch_accounted(
         &self,
         seg_ref: &SegmentRef,
@@ -943,11 +1118,17 @@ impl LogSegmentFetcher {
             // whole-object GET, then the STREAM_DIR resolve + `RlogReader` scan in
             // `scan_bytes`. They are named `page_fetch` and `decode` to match the
             // metric path's phase names. This entry point is reached by the
-            // unaccounted `fetch` (and by tests); the real production log/alerts/
-            // audit callers in `ravel-sql` go through
-            // `fetch_accounted_with_tenant`, which carries its own copy of these
-            // spans over its own (cache-aware) GET path. Wiring those callers onto
-            // an accounted funnel at all is separate, still-open future work.
+            // unaccounted `fetch` (and by tests). Production callers in
+            // `ravel-sql` do not come here: the logs scan uses
+            // `scan_accounted_with_tenant` and `_subset`, and the alerts and
+            // audit scans use `fetch_accounted_with_tenant`; each carries its
+            // own copy of these spans over its own (cache-aware) GET path.
+            // Reserve the whole object's bytes before the GET (ADR-1170
+            // decision 2): a refusal fails this fetch typed with zero GETs
+            // issued. Held to the end of this block, so it covers the decode
+            // that reads `got.data`; released when this fully-decoded funnel
+            // returns its owned records.
+            let _reservation = self.reserve_fetch(seg_ref.object_size)?;
             let fetch_span = tracing::debug_span!(
                 "page_fetch",
                 signal = "logs",
@@ -955,6 +1136,18 @@ impl LogSegmentFetcher {
                 s3_bytes = tracing::field::Empty,
             );
             let got = async {
+                // Held across the GET only: dropped when this inner block
+                // returns, before `decode_spanned` below (ADR-1195).
+                let _permit =
+                    self.get_limiter
+                        .acquire()
+                        .await
+                        .map_err(|_| LogFetchError::Store {
+                            key: key.to_string(),
+                            source: StoreError::Transient(
+                                "GetLimiter semaphore closed unexpectedly".to_string(),
+                            ),
+                        })?;
                 self.store
                     .get(key, GetRange::Full)
                     .await
@@ -974,7 +1167,7 @@ impl LogSegmentFetcher {
             // This funnel issues exactly one whole-object GET per call.
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", got.data.len() as u64);
-            self.decode_spanned(key, &got.data, query)
+            self.decode_spanned(key, &got.data, query, accounting)
         }
         .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
@@ -994,11 +1187,12 @@ impl LogSegmentFetcher {
     /// `LogSegmentFetcher`, because the one production instance
     /// (`services/ravel-server/src/query.rs`) is shared across every tenant;
     /// a per-instance tenant would make that instance usable by exactly one
-    /// tenant. Wiring production callers (`ravel-sql`'s `logs_provider`,
-    /// `alerts_scan`, `audit_scan`, `audit_provider`) onto this method
-    /// instead of [`fetch_accounted`](Self::fetch_accounted) is out of
-    /// scope here: it is a `ravel-sql` change, and moving those callers onto
-    /// the accounted funnel is separately tracked future work.
+    /// tenant. Production callers in `ravel-sql` all reach a tenant-aware
+    /// funnel: the logs scan through
+    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant) and
+    /// its `_subset` form, the alerts and audit scans through this method.
+    /// The untenanted [`fetch_accounted`](Self::fetch_accounted) remains for
+    /// tests and for the unaccounted `fetch`.
     ///
     /// With no cache configured (`with_cache` never called), this fetches
     /// exactly like [`fetch_accounted`](Self::fetch_accounted): every GET
@@ -1014,10 +1208,11 @@ impl LogSegmentFetcher {
         // whole-object GET) and the block-range path it falls through to
         // above threshold both do data reads with no separate plan step of
         // their own here, so this funnel's GETs are charged to `scan`.
-        // `decode_spanned` (below) records no accounting of its own -- unlike
-        // the `LogSegmentScan`-returning funnels below, this one fully
-        // decodes and returns before this function returns, so buffering into
-        // a disposable `PhaseAccounting` and merging once is safe here.
+        // `decode_spanned` (below) charges only the decode's decompressed
+        // bytes (issue #1401) -- unlike the `LogSegmentScan`-returning funnels
+        // below, this one fully decodes and returns before this function
+        // returns, so buffering into a disposable `PhaseAccounting` and
+        // merging once is safe here.
         let phase = PhaseAccounting::new();
         let accounting = phase.scan();
         // This funnel's decode (`scan_bytes`) reads every column, so the fetch
@@ -1038,7 +1233,7 @@ impl LogSegmentFetcher {
             else {
                 return Ok(None);
             };
-            self.decode_spanned(&seg_ref.data_object_key, &bytes, query)
+            self.decode_spanned(&seg_ref.data_object_key, &bytes, query, accounting)
         }
         .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
@@ -1109,7 +1304,7 @@ impl LogSegmentFetcher {
         };
         let key = &seg_ref.data_object_key;
         let span = decode_span();
-        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns))?;
+        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns, accounting))?;
         Ok(Some(LogSegmentScan {
             bytes,
             scan,
@@ -1164,7 +1359,7 @@ impl LogSegmentFetcher {
             .await?;
         let key = &seg_ref.data_object_key;
         let span = decode_span();
-        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns))?;
+        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns, accounting))?;
         Ok(Some(LogSegmentScan {
             bytes,
             scan,
@@ -1224,7 +1419,15 @@ impl LogSegmentFetcher {
         tenant_hash: TenantHash,
         query: &LogQuery,
         caller_accounting: &QueryAccounting,
-    ) -> Result<Option<(usize, ScanStats, Option<footer::LogFooter>)>, LogFetchError> {
+    ) -> Result<
+        Option<(
+            usize,
+            ScanStats,
+            Option<footer::LogFooter>,
+            Option<CarriedWholeObject>,
+        )>,
+        LogFetchError,
+    > {
         let phase = PhaseAccounting::new();
         let accounting = phase.plan();
         let result = async {
@@ -1260,7 +1463,9 @@ impl LogSegmentFetcher {
                     .await?;
                 // Footer-carrying branch: no block byte is read here, so the
                 // touch is the scan that follows a nonzero survivor count.
-                return Ok(Some((n, stats, Some(footer), n > 0)));
+                // No whole-object bytes to carry either: this branch reads
+                // only the footer, never a block.
+                return Ok(Some((n, stats, Some(footer), n > 0, None)));
             }
 
             // Skip-index-only survivor count (#761): when every block-level predicate
@@ -1325,13 +1530,21 @@ impl LogSegmentFetcher {
                     pages_skipped: 0,
                     page_bytes_fetched: 0,
                     page_bytes_decoded: 0,
+                    decompressed_bytes: 0,
                     bloom_degraded: false,
                     postings_degraded: false,
                 };
                 // Footer-carrying branch: only the probe, SKIP_IDX and FIELD_DIR
                 // were read, no block byte, so the touch is the scan a nonzero
-                // survivor count will drive.
-                return Ok(Some((survivors, plan_stats, Some(footer), survivors > 0)));
+                // survivor count will drive. No whole-object bytes either, for
+                // the same reason as the fast path above.
+                return Ok(Some((
+                    survivors,
+                    plan_stats,
+                    Some(footer),
+                    survivors > 0,
+                    None,
+                )));
             }
 
             // Fallback: a predicate the skip index cannot decide (a `has_word`/text
@@ -1341,7 +1554,11 @@ impl LogSegmentFetcher {
             // buffer -- and hand no footer forward. This whole-object plan read is the
             // amplification #761 could not remove for these shapes; the caller counts
             // it (a `None` footer on a relevant segment) as a `plan_full_reads` so a
-            // report can see which queries still pay it.
+            // report can see which queries still pay it. Issue #835: when it resolved
+            // the WHOLE object (`blocks_read` is `None`), these bytes are carried
+            // forward as a [`CarriedWholeObject`] so the scan that follows does not
+            // pay a second wire GET for them -- the amplification #761 could not
+            // remove from this plan read no longer forces a second one at scan time.
             let all = ColumnSelection::all();
             let Some((bytes, blocks_read)) = self
                 .tenant_bytes(
@@ -1358,7 +1575,14 @@ impl LogSegmentFetcher {
             };
             let key = &seg_ref.data_object_key;
             let span = decode_span();
-            let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &all))?;
+            let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &all, accounting))?;
+            // Opening the scan decoded the four directory sections over the
+            // fetched buffer (and ran the POSTINGS probe for an eligible prune
+            // arm); those bytes sit in the reader's own stats, not on any
+            // handle, so charge them to the plan phase here (issue #1401). No
+            // block is decoded on this branch: the scan exists for its
+            // survivor count.
+            accounting.add_decompressed_bytes(scan.stats().decompressed_bytes);
             // This fallback read fetched blocks iff `tenant_bytes` resolved at
             // least one (ranged path) or read the whole object (`None`, every
             // block present). A ranged read that pruned every block resolved zero
@@ -1369,7 +1593,28 @@ impl LogSegmentFetcher {
                 None => true,
                 Some(n) => n > 0,
             };
-            Ok(Some((scan.remaining_blocks(), scan.stats(), None, touched)))
+            // `blocks_read` is `None` exactly when the whole object is present in
+            // `bytes` (the below-threshold path, or an above-threshold read that
+            // crossed over to a whole-object GET): safe to carry forward whatever
+            // the scan's own column selection turns out to be. `Some(_)` is a
+            // ranged read fetched under `ColumnSelection::all`, which is not
+            // necessarily what the scan will select on a version-4 object (ADR-0699
+            // decision 5), so it is not carried.
+            let carried = match blocks_read {
+                None => Some(CarriedWholeObject {
+                    bytes: bytes.clone(),
+                    source_key: seg_ref.data_object_key.clone(),
+                    source_tenant: tenant_hash,
+                }),
+                Some(_) => None,
+            };
+            Ok(Some((
+                scan.remaining_blocks(),
+                scan.stats(),
+                None,
+                touched,
+                carried,
+            )))
         }
         .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
@@ -1412,12 +1657,14 @@ impl LogSegmentFetcher {
         // fallback from whether `tenant_bytes` read any block (contract:
         // `ravel_types::accounting`, blocks read are cache-inclusive, so the
         // signal is resolved blocks, never wire bytes).
-        if let Ok(Some((_, _, _, touched))) = &result
+        if let Ok(Some((_, _, _, touched, _))) = &result
             && *touched
         {
             caller_accounting.add_data_objects_touched(1);
         }
-        result.map(|opt| opt.map(|(survivors, stats, footer, _)| (survivors, stats, footer)))
+        result.map(|opt| {
+            opt.map(|(survivors, stats, footer, _, carried)| (survivors, stats, footer, carried))
+        })
     }
 
     /// Whether [`plan_segment`](Self::plan_segment)'s survivor count can be read
@@ -1526,6 +1773,7 @@ impl LogSegmentFetcher {
             pages_skipped: 0,
             page_bytes_fetched: 0,
             page_bytes_decoded: 0,
+            decompressed_bytes: 0,
             bloom_degraded: false,
             postings_degraded: false,
         };
@@ -1668,6 +1916,14 @@ impl LogSegmentFetcher {
     /// [`fetch_object_with_footer`](Self::fetch_object_with_footer)); `None`
     /// probes as before. It changes only the read shape, never the bytes decoded.
     ///
+    /// `carried_whole`, when `Some`, is the whole-object [`Bytes`] a prior
+    /// [`plan_segment`](Self::plan_segment) fallback already fetched for this
+    /// exact (immutable) object (issue #835). Supplying it skips this call's own
+    /// wire GET entirely -- no cache lookup, no store round trip -- and charges
+    /// the reused bytes to `accounting.add_bytes_reused` instead of a cache hit
+    /// or miss. `None` fetches as before (cache-aware whole-object or ranged
+    /// read, per [`tenant_bytes_with_footer`](Self::tenant_bytes_with_footer)).
+    ///
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
     ///
     /// Issue #796: `scan` phase, same reasoning and the same not-buffered
@@ -1683,6 +1939,7 @@ impl LogSegmentFetcher {
         columns: &ColumnSelection,
         indices: &[usize],
         footer: Option<&footer::LogFooter>,
+        carried_whole: Option<CarriedWholeObject>,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
         let Some((bytes, _blocks_read)) = self
@@ -1692,6 +1949,7 @@ impl LogSegmentFetcher {
                 query,
                 columns,
                 footer,
+                carried_whole,
                 ProbePhase::Scan,
                 accounting,
             )
@@ -1701,7 +1959,8 @@ impl LogSegmentFetcher {
         };
         let key = &seg_ref.data_object_key;
         let span = decode_span();
-        let scan = span.in_scope(|| self.open_scan_subset(key, &bytes, query, columns, indices))?;
+        let scan = span
+            .in_scope(|| self.open_scan_subset(key, &bytes, query, columns, indices, accounting))?;
         Ok(Some(LogSegmentScan {
             bytes,
             scan,
@@ -1748,6 +2007,7 @@ impl LogSegmentFetcher {
             query,
             columns,
             None,
+            None,
             phase,
             accounting,
         )
@@ -1779,6 +2039,17 @@ impl LogSegmentFetcher {
     /// a caller decide "were this object's blocks read" from the blocks actually
     /// resolved, not from wire bytes, which a fully-pruned ranged read moves none
     /// of even though the read happened.
+    ///
+    /// `carried_whole`, when `Some`, is a [`CarriedWholeObject`] a prior
+    /// `plan_segment` fallback fetched for this exact object (issue #835): its
+    /// bytes are the whole object, valid for any `columns` selection, so this
+    /// short-circuits both the below- and above-threshold branches below,
+    /// issuing no store GET and no cache lookup at all. The reused bytes are
+    /// charged to `accounting.add_bytes_reused`, not to a cache hit -- the
+    /// object was never asked of the cache on this call. Safe with no etag
+    /// re-check: see [`CarriedWholeObject`]'s doc. A carry whose own
+    /// `(key, tenant)` is not this call's is rejected as
+    /// [`LogFetchError::CarryMismatch`] before any decode.
     #[allow(clippy::too_many_arguments)]
     async fn tenant_bytes_with_footer(
         &self,
@@ -1787,11 +2058,29 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         columns: &ColumnSelection,
         footer: Option<&footer::LogFooter>,
+        carried_whole: Option<CarriedWholeObject>,
         phase: ProbePhase,
         accounting: &QueryAccounting,
     ) -> Result<Option<(Bytes, Option<u64>)>, LogFetchError> {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
             return Ok(None);
+        }
+
+        if let Some(carried) = carried_whole {
+            // The carry answers without consulting `seg_ref`, so a carry paired
+            // with another segment would decode that segment's rows out of these
+            // bytes wherever both objects are decodable. Prove the pairing first.
+            if carried.source_key != seg_ref.data_object_key || carried.source_tenant != tenant_hash
+            {
+                return Err(LogFetchError::CarryMismatch {
+                    key: seg_ref.data_object_key.clone(),
+                    carried_key: carried.source_key,
+                    tenant: tenant_hash,
+                    carried_tenant: carried.source_tenant,
+                });
+            }
+            accounting.add_bytes_reused(carried.bytes.len() as u64);
+            return Ok(Some((carried.bytes, None)));
         }
 
         // #913: which phase this read's metadata GETs and its BLOCKS-section
@@ -1955,8 +2244,27 @@ impl LogSegmentFetcher {
             s3_bytes = tracing::field::Empty,
         );
 
+        // Reserve the whole object's bytes before the direct whole-object GET
+        // (ADR-1170 decision 2), so a refusal fails typed with zero GETs. The
+        // guard travels with the returned `Bytes` (below), owned for the
+        // fetched buffer's lifetime rather than released when the GET completes.
+        let reservation = self.reserve_fetch(seg_ref.object_size)?;
+
         let Some(cache) = &self.cache else {
             let got = async {
+                // Held across the GET only: dropped when this inner block
+                // returns, before this function hands the bytes to its
+                // caller's decode (ADR-1195).
+                let _permit =
+                    self.get_limiter
+                        .acquire()
+                        .await
+                        .map_err(|_| LogFetchError::Store {
+                            key: key.to_string(),
+                            source: StoreError::Transient(
+                                "GetLimiter semaphore closed unexpectedly".to_string(),
+                            ),
+                        })?;
                 self.store
                     .get(key, GetRange::Full)
                     .await
@@ -1972,7 +2280,7 @@ impl LogSegmentFetcher {
             self.wire_bytes.record(phase, got.data.len() as u64);
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", got.data.len() as u64);
-            return Ok(got.data);
+            return Ok(attach_reservation(got.data, reservation));
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
@@ -1982,6 +2290,13 @@ impl LogSegmentFetcher {
         let (bytes, source) = async {
             cache
                 .get_or_fetch(cache_key, || async move {
+                    // Held across the GET only: dropped before this closure
+                    // returns the bytes to its caller's decode (ADR-1195).
+                    let _permit = self.get_limiter.acquire().await.map_err(|_| {
+                        StoreError::Transient(
+                            "GetLimiter semaphore closed unexpectedly".to_string(),
+                        )
+                    })?;
                     let got = self.store.get(key, GetRange::Full).await?;
                     accounting.record_s3_request(AccountedOp::Get);
                     accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
@@ -1998,6 +2313,7 @@ impl LogSegmentFetcher {
         // verifies nothing, so those arms are unreachable here rather than
         // wrong.
         .map_err(|err| from_cache_error(key, err))?;
+        let mut reservation = reservation;
         match source {
             Source::Cache => {
                 accounting.record_cache_hit();
@@ -2005,6 +2321,14 @@ impl LogSegmentFetcher {
                 // Served from cache: no S3 GET on this call.
                 fetch_span.record("s3_requests", 0u64);
                 fetch_span.record("s3_bytes", 0u64);
+                // The returned `Bytes` is a clone of the cache entry's, so the
+                // same allocation is under the cache's byte ledger AND this
+                // fetch guard for as long as the caller holds it. That is the
+                // two-ledger overlap decision 2's handoff rule describes, and
+                // it is no less real for arriving by a hit than by an insert:
+                // leaving it unmarked understates `handoff_overlap` by every
+                // cache hit, which is what makes the `unique` term inexact.
+                reservation.mark_handed_off();
             }
             // A miss issues one store GET for the resulting bytes. A
             // single-flight follower that rode another caller's GET is the
@@ -2015,76 +2339,94 @@ impl LogSegmentFetcher {
                 accounting.record_cache_miss();
                 fetch_span.record("s3_requests", 1u64);
                 fetch_span.record("s3_bytes", bytes.len() as u64);
+                // The fetched buffer was just admitted to the read cache, which
+                // has its own byte ledger (ADR-1170 decision 2's handoff rule):
+                // mark this reservation handed off so the transient overlap is
+                // visible while both this returned buffer and the cache entry
+                // hold the same bytes. The overlap clears when this guard drops.
+                reservation.mark_handed_off();
             }
         }
-        Ok(bytes)
+        Ok(attach_reservation(bytes, reservation))
     }
 
     /// Runs [`scan_bytes`](Self::scan_bytes) inside the log path's `decode`
     /// span, recording the reader's block-scan counts on it afterward.
     ///
-    /// # Why this span's field set diverges from the metric path's `decode`
+    /// # How this span's field set relates to the metric path's `decode`
     ///
     /// The metric path's `decode` span (`crate::fetcher`) carries `page_kind`,
     /// `series_count`, and `decompressed_bytes`. This one carries `signal =
-    /// "logs"` plus `blocks_scanned`/`blocks_total`, and no `decompressed_bytes`
-    /// (documented in docs/guides/tracing.md). No decompressed-byte
-    /// count is cheaply available here: [`ScanStats`] carries block counts, not
-    /// bytes, and decompression happens per block inside
-    /// [`RlogReader::scan_pruned`] (`read_block`) where the total is never
-    /// summed. Surfacing one would need a new `ScanStats` field and a structural
-    /// change to `ravel-logseg`, out of scope for that fix.
+    /// "logs"`, `blocks_scanned`/`blocks_total`, and `decompressed_bytes`
+    /// (documented in docs/guides/tracing.md). The byte figure is
+    /// [`ScanStats::decompressed_bytes`]: what zstd produced opening the
+    /// object's directory sections, probing POSTINGS, and decoding the drained
+    /// blocks, the same total `scan_bytes` charges to the accounting handle.
     ///
-    /// `blocks_scanned`/`blocks_total` are instead a real, already-computed
-    /// pruning-effectiveness signal -- how much of the object's block index the
-    /// scan actually had to touch after skip-index, POSTINGS, and bloom pruning
-    /// -- analogous to the metric path's `catalog_resolve` `segments_pruned`,
-    /// which is likewise a pruning count rather than a byte count. Every phase
-    /// span in the codebase carries at least one count field; before this the
-    /// logs `decode` span carried none.
+    /// `blocks_scanned`/`blocks_total` are a pruning-effectiveness signal --
+    /// how much of the object's block index the scan actually had to touch
+    /// after skip-index, POSTINGS, and bloom pruning -- analogous to the
+    /// metric path's `catalog_resolve` `segments_pruned`, which is likewise a
+    /// pruning count rather than a byte count.
     fn decode_spanned(
         &self,
         key: &str,
         bytes: &Bytes,
         query: &LogQuery,
+        accounting: &QueryAccounting,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
         let span = decode_span();
-        let out = span.in_scope(|| self.scan_bytes(key, bytes, query))?;
-        if let Some(output) = &out {
-            span.record("blocks_scanned", output.stats.blocks_scanned);
-            span.record("blocks_total", output.stats.blocks_total);
-        }
-        Ok(out)
+        span.in_scope(|| self.scan_bytes(key, bytes, query, accounting, &span))
     }
 
     /// Shared tail of both fetch entry points: open the pruned scan and drain
     /// every block of it. This is [`LogSegmentScan`] collected eagerly, so the
     /// two paths cannot drift: same predicate, same prune channel, same
     /// per-record erasure exclusion, same order.
+    ///
+    /// `span` is the `decode` span this runs inside; its counters are recorded
+    /// here, at the same point the accounting handle is charged, so a drain
+    /// that stops on a corrupt block still reports what it did before the
+    /// error rather than leaving the span's fields empty.
     fn scan_bytes(
         &self,
         key: &str,
         bytes: &Bytes,
         query: &LogQuery,
+        accounting: &QueryAccounting,
+        span: &tracing::Span,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
-        let mut scan = self.open_scan(key, bytes, query, &ColumnSelection::all())?;
+        let mut scan = self.open_scan(key, bytes, query, &ColumnSelection::all(), accounting)?;
         let mut records = Vec::new();
-        loop {
-            let block = scan.next_block(bytes).map_err(|s| corrupt(key, s))?;
-            let Some(mut rows) = block else { break };
-            // Selective-erasure exclusion (ADR-0064 decision 2): drop every
-            // row a pending erasure predicate matches. Applied here, on the
-            // decoded records, so it excludes rows identically whether `bytes`
-            // came from the store or from a cache hit -- the whole point of
-            // filtering after fetch and after cache. A no-op when
-            // `query.erasure` is empty.
-            crate::erasure::retain_log_records(&mut rows, &query.erasure);
-            records.extend(rows);
-        }
-        Ok(Some(LogFetchOutput {
-            records,
-            stats: scan.stats(),
-        }))
+        let drained = loop {
+            match scan.next_block(bytes) {
+                Ok(Some(mut rows)) => {
+                    // Selective-erasure exclusion (ADR-0064 decision 2): drop
+                    // every row a pending erasure predicate matches. Applied
+                    // here, on the decoded records, so it excludes rows
+                    // identically whether `bytes` came from the store or from
+                    // a cache hit -- the whole point of filtering after fetch
+                    // and after cache. A no-op when `query.erasure` is empty.
+                    crate::erasure::retain_log_records(&mut rows, &query.erasure);
+                    records.extend(rows);
+                }
+                Ok(None) => break Ok(()),
+                Err(source) => break Err(corrupt(key, source)),
+            }
+        };
+        // The eager counterpart of `LogSegmentScan::finish`: the bytes zstd
+        // produced opening the directories, probing POSTINGS, and decoding the
+        // drained blocks are charged once, to the handle this funnel's GET
+        // already landed on, whether the drain finished or stopped on a
+        // corrupt block (issue #1401). Work done before an error is still work
+        // done.
+        let stats = scan.stats();
+        accounting.add_decompressed_bytes(stats.decompressed_bytes);
+        span.record("blocks_scanned", stats.blocks_scanned);
+        span.record("blocks_total", stats.blocks_total);
+        span.record("decompressed_bytes", stats.decompressed_bytes);
+        drained?;
+        Ok(Some(LogFetchOutput { records, stats }))
     }
 
     /// Resolve stream-attribute equalities against STREAM_DIR
@@ -2104,8 +2446,9 @@ impl LogSegmentFetcher {
         bytes: &Bytes,
         query: &LogQuery,
         columns: &ColumnSelection,
+        accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
-        let pred = self.combined_predicate(key, bytes, query)?;
+        let pred = self.combined_predicate(key, bytes, query, accounting)?;
         let reader = RlogReader::new(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
         // `prune` is passed as the reader's prune-only channel, never folded
         // into `pred`: an arm there would become an exact per-row filter and
@@ -2131,8 +2474,9 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         columns: &ColumnSelection,
         indices: &[usize],
+        accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
-        let pred = self.combined_predicate(key, bytes, query)?;
+        let pred = self.combined_predicate(key, bytes, query, accounting)?;
         let reader = RlogReader::new(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
         reader
             .scan_blocks_subset(&pred, &query.prune, columns, indices)
@@ -2149,12 +2493,13 @@ impl LogSegmentFetcher {
         key: &str,
         bytes: &Bytes,
         query: &LogQuery,
+        accounting: &QueryAccounting,
     ) -> Result<Predicate, LogFetchError> {
         let stream_ids = if query.stream_attrs.is_empty() {
             None
         } else {
             Some(
-                self.matching_streams(bytes, &query.stream_attrs)
+                self.matching_streams(bytes, &query.stream_attrs, accounting)
                     .map_err(|source| corrupt(key, source))?,
             )
         };
@@ -2174,16 +2519,139 @@ impl LogSegmentFetcher {
         Ok(Predicate::And(arms))
     }
 
+    /// Fetch and decode just the STREAM_DIR section (ADR-1103 decision 2's
+    /// cost model): the same ADR-0107 probe [`fetch_footer`](Self::fetch_footer)
+    /// issues, then the one front section the footer's directory locates it
+    /// at, reading no BLOCKS byte and no other directory section. Mirrors
+    /// [`fetch_skip_index`](Self::fetch_skip_index)'s shape; the only
+    /// difference is that STREAM_DIR sits at the object FRONT, so unlike
+    /// SKIP_IDX it is essentially never covered by the tail suffix probe and
+    /// [`plan_section_raw`](Self::plan_section_raw) issues its own range GET
+    /// for it.
+    ///
+    /// Returns `None` when the object's footer carries no STREAM_DIR section
+    /// at all (never observed on a real object today, but the same
+    /// "kind the footer does not carry is skipped" tolerance
+    /// [`place_front_sections`](Self::place_front_sections) documents applies
+    /// here rather than treating an absent directory as corruption). Otherwise
+    /// returns every entry's stream id and its raw (still-encoded)
+    /// stream-attrs blob, for the caller to decode with
+    /// [`ravel_logseg::record::decode_stream_attrs`].
+    ///
+    /// At or below [`Self::block_range_threshold`] this takes the same
+    /// whole-object crossover [`plan_segment`](Self::plan_segment) and
+    /// [`tenant_bytes`](Self::tenant_bytes) apply, via
+    /// [`whole_object_bytes`](Self::whole_object_bytes): a ranged probe would
+    /// pay for a second cache key on an object [`fetch_footer`](Self::fetch_footer)'s
+    /// doc explains is already read whole in one GET below the threshold. Above
+    /// it, the ranged probe-then-section path below is what actually saves the
+    /// BLOCKS bytes the ADR-1103 cost model counts on.
+    pub(crate) async fn fetch_stream_dir(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<Vec<(LogStreamId, Vec<u8>)>>, LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let dir: Option<StreamDir> = if seg_ref.object_size > self.block_range_threshold {
+            // The `page_fetch` phase span the other plan paths carry (#782), so
+            // the trace shows the probe and section GETs this method issues.
+            // `s3_bytes` reports block bytes only, which are structurally zero
+            // here; the directory-overhead bytes are recorded in `accounting`.
+            let fetch_span = tracing::debug_span!(
+                "page_fetch",
+                signal = "logs",
+                s3_requests = tracing::field::Empty,
+                s3_bytes = tracing::field::Empty,
+                probe_misses = tracing::field::Empty,
+            );
+            let (dir, stats) = async {
+                let mut stats = BlockRangeStats::default();
+                let pin = EtagPin::default();
+                let phase = ReadPhases::PLAN.metadata;
+                let (footer, resident) = self
+                    .block_range
+                    .probe_footer(seg_ref, tenant_hash, phase, &pin, accounting, &mut stats)
+                    .await?;
+
+                let dir = match footer.section(kind::STREAM_DIR).copied() {
+                    None => None,
+                    Some(stream_desc) => {
+                        let raw = self
+                            .block_range
+                            .plan_section_raw(
+                                seg_ref,
+                                tenant_hash,
+                                &stream_desc,
+                                &resident,
+                                phase,
+                                &pin,
+                                accounting,
+                                &mut stats,
+                            )
+                            .await?;
+                        Some(
+                            StreamDir::decode(&raw, MAX_STREAMS)
+                                .map_err(|source| corrupt(key, source))?,
+                        )
+                    }
+                };
+                Ok::<_, LogFetchError>((dir, stats))
+            }
+            .instrument(fetch_span.clone())
+            .await?;
+            let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
+            fetch_span.record("s3_requests", requests);
+            fetch_span.record("s3_bytes", stats.block_bytes_fetched);
+            // Probe misses (#883): a footer chase or section miss here is a
+            // probe too short to reach it, reported per phase beside the
+            // request/byte counts like every other plan-phase read.
+            self.record_probe_misses(&fetch_span, &stats, ProbePhase::Plan);
+            dir
+        } else {
+            let bytes = self
+                .whole_object_bytes(seg_ref, tenant_hash, QueryPhase::Plan, accounting)
+                .await?;
+            let footer = footer::open(&bytes).map_err(|source| corrupt(key, source))?;
+            match footer.section(kind::STREAM_DIR).copied() {
+                None => None,
+                Some(desc) => {
+                    let raw = read_section_accounted(&bytes, &desc, &self.cfg, accounting)
+                        .map_err(|source| corrupt(key, source))?;
+                    Some(
+                        StreamDir::decode(&raw, MAX_STREAMS)
+                            .map_err(|source| corrupt(key, source))?,
+                    )
+                }
+            }
+        };
+        Ok(dir.map(|dir| {
+            dir.entries()
+                .iter()
+                .map(|entry| (entry.stream_id, entry.blob.clone()))
+                .collect()
+        }))
+    }
+
     /// Decodes the STREAM_DIR section of an object from its own public section
     /// descriptor, using the crate's public whole-section reader.
     /// This does not go through [`RlogReader`], which decodes STREAM_DIR
     /// internally but exposes no accessor for it.
-    fn decode_stream_dir(&self, bytes: &[u8]) -> Result<StreamDir, LogSegError> {
+    ///
+    /// Charges the bytes zstd produced to `accounting` (issue #1401 finding 3):
+    /// `bytes` was already fetched by the caller, so this is the one
+    /// in-memory decompression this method itself performs, and it lands
+    /// under whichever phase handle the caller is threading.
+    fn decode_stream_dir(
+        &self,
+        bytes: &[u8],
+        accounting: &QueryAccounting,
+    ) -> Result<StreamDir, LogSegError> {
         let footer = footer::open(bytes)?;
         let desc = footer
             .section(kind::STREAM_DIR)
             .ok_or_else(|| LogSegError::Corrupted("missing STREAM_DIR section".into()))?;
-        let raw = read_section(bytes, desc, &self.cfg)?;
+        let raw = read_section_accounted(bytes, desc, &self.cfg, accounting)?;
         StreamDir::decode(&raw, MAX_STREAMS)
     }
 }
@@ -2599,6 +3067,54 @@ pub struct CarriedFooter<'a> {
     pub tail_misses_counted: bool,
 }
 
+/// The whole-object bytes [`LogSegmentFetcher::plan_segment`]'s whole-object
+/// fallback already fetched for this exact (immutable) `SegmentRef`, carried
+/// into the scan so it does not issue a second wire GET for the same object
+/// (issue #835).
+///
+/// Reuse needs no etag re-check, unlike [`CarriedFooter`]'s scan read: the
+/// plan and the scan of one statement share the very same `SegmentRef` out of
+/// one resolved snapshot, and `LogSegmentFetcher`'s whole-object cache key is
+/// keyed on `seg_ref.content_hash` (see [`EtagPin`]'s doc: "a cache key
+/// carries the object's `content_hash`, so an entry is by construction bytes
+/// of this exact content rather than of whatever the store holds now"). No
+/// live GET spans the gap between the plan read and the scan read for this
+/// carry to defend against -- there is no second live GET at all -- so the
+/// same reasoning that exempts a cache hit from the pin applies here.
+///
+/// Always the ENTIRE object: the plan fallback only carries these bytes
+/// forward when its own read resolved every block (the below-threshold
+/// whole-object path, or an above-threshold read that crossed over to a
+/// whole-object GET), never a column-selection-scoped ranged read. So the
+/// bytes are valid for the scan's column selection whatever it is, even
+/// though the plan fetched with [`ColumnSelection::all`].
+///
+/// The bytes travel with the identity of the read that produced them, and a
+/// consumer proves the pairing before decoding. Nothing in the type system
+/// stops a caller from handing this carry to a read of a different segment:
+/// the carry branch answers from these bytes without consulting the supplied
+/// `SegmentRef` at all, so a mismatched pairing would return the wrong
+/// object's rows wherever both objects decode. The key alone would settle it
+/// in practice (a data-object key embeds the tenant hex), but the tenant is
+/// stored and checked too rather than inferred from that.
+#[derive(Clone)]
+pub struct CarriedWholeObject {
+    bytes: Bytes,
+    /// `data_object_key` of the segment the plan read fetched these bytes for.
+    source_key: String,
+    /// Tenant the plan read fetched them under.
+    source_tenant: TenantHash,
+}
+
+impl CarriedWholeObject {
+    /// The carried object's byte length, for a caller that needs to account
+    /// for held-but-not-yet-consumed carry bytes (issue #835's memory bound)
+    /// without decoding or copying them.
+    pub fn byte_len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+}
+
 /// One candidate block's absolute byte extent in the object and its stored crc,
 /// resolved from a `SkipIndex` level-0 entry (`block_offset`/`block_len`/
 /// `block_crc32c`). The extent start is absolute: `blocks_offset + block_offset`
@@ -2653,9 +3169,15 @@ const MAX_IDLE_ASSEMBLY_BUFFERS: usize = DEFAULT_LOG_MAX_CONCURRENT_GETS;
 /// this, and a single buffer longer than the whole budget is never retained.
 const MAX_IDLE_ASSEMBLY_BYTES: usize = 128 * 1024 * 1024;
 
-/// Reuse counters for one [`BlockRangeFetcher`]'s assembly-buffer pool
-/// ([`BlockRangeFetcher::assembly_buffer_stats`], issue #894). Cumulative over
-/// the fetcher's life and shared by all its clones; nothing resets them.
+/// Assembly-buffer pool figures for one [`BlockRangeFetcher`]
+/// ([`BlockRangeFetcher::assembly_buffer_stats`], issues #894 and #1771),
+/// shared by all its clones.
+///
+/// Two kinds, which do not read the same way. [`Self::allocated`],
+/// [`Self::reused`] and [`Self::zeroed_bytes`] are counters, cumulative over
+/// the fetcher's life, and nothing resets them. [`Self::live_bytes`] is a
+/// gauge that rises and falls as buffers are checked out and returned, and
+/// [`Self::peak_live_bytes`] is its high-water mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AssemblyBufferStats {
     /// Ranged reads that found no idle buffer and allocated one.
@@ -2667,6 +3189,21 @@ pub struct AssemblyBufferStats {
     /// plus each later growth. A read served by a buffer already at least as
     /// long as its object adds nothing, which is the whole point of the pool.
     pub zeroed_bytes: u64,
+    /// Bytes currently checked OUT of the pool, the live set. The retention
+    /// bounds cap what sits idle here, not what scans hold: a query holds one
+    /// object-sized buffer per in-flight ranged read, and nothing else reports
+    /// that.
+    ///
+    /// Zero wherever the resolved request cost saturates the routing
+    /// threshold, so that every object is read whole and never touches this
+    /// pool. That includes `cost-based` at the reference
+    /// `s3-intra-region-2026` profile, which prices transfer and retrieval at
+    /// zero; the same policy on an egress-billed deployment resolves a finite
+    /// rate, routes objects above the threshold through the ranged path, and
+    /// charges this gauge.
+    pub live_bytes: u64,
+    /// High-water mark of [`Self::live_bytes`] over this pool's life.
+    pub peak_live_bytes: u64,
 }
 
 /// Object-sized assembly buffers, reused across the ranged reads one
@@ -2696,6 +3233,8 @@ struct AssemblyBufferPool {
     allocated: AtomicU64,
     reused: AtomicU64,
     zeroed_bytes: AtomicU64,
+    live_bytes: AtomicU64,
+    peak_live_bytes: AtomicU64,
 }
 
 impl Default for AssemblyBufferPool {
@@ -2707,6 +3246,8 @@ impl Default for AssemblyBufferPool {
             allocated: AtomicU64::new(0),
             reused: AtomicU64::new(0),
             zeroed_bytes: AtomicU64::new(0),
+            live_bytes: AtomicU64::new(0),
+            peak_live_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -2746,6 +3287,26 @@ impl AssemblyBufferPool {
                 .fetch_add((len - buf.len()) as u64, Ordering::Relaxed);
             buf.resize(len, 0);
         }
+        // Charged on the resident length rather than the requested one: a
+        // reused buffer keeps the length of the largest object it has served,
+        // and those bytes are held whether or not this read addresses them.
+        let charged = buf.len() as u64;
+        let live = self.live_bytes.fetch_add(charged, Ordering::Relaxed) + charged;
+        // Raise the high-water mark, retrying only while another thread's
+        // observed peak is lower than ours; a concurrent higher peak wins and
+        // ends the loop.
+        let mut seen = self.peak_live_bytes.load(Ordering::Relaxed);
+        while seen < live {
+            match self.peak_live_bytes.compare_exchange_weak(
+                seen,
+                live,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => seen = actual,
+            }
+        }
         AssemblyBuffer {
             buf,
             len,
@@ -2757,6 +3318,11 @@ impl AssemblyBufferPool {
         if buf.capacity() == 0 {
             return;
         }
+        // Released on the same basis it was charged, before the retention
+        // bounds decide whether to keep it: a buffer dropped instead of pooled
+        // still left the live set.
+        self.live_bytes
+            .fetch_sub(buf.len() as u64, Ordering::Relaxed);
         if let Ok(mut idle) = self.idle.lock()
             && idle.bufs.len() < self.max_idle_bufs
             && idle.bytes + buf.len() <= self.max_idle_bytes
@@ -2771,6 +3337,8 @@ impl AssemblyBufferPool {
             allocated: self.allocated.load(Ordering::Relaxed),
             reused: self.reused.load(Ordering::Relaxed),
             zeroed_bytes: self.zeroed_bytes.load(Ordering::Relaxed),
+            live_bytes: self.live_bytes.load(Ordering::Relaxed),
+            peak_live_bytes: self.peak_live_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -2831,13 +3399,42 @@ impl Drop for AssemblyBuffer {
 struct ObjectAssembler {
     buf: AssemblyBuffer,
     placed: Vec<(u64, u64)>,
+    /// The fetch-layer memory reservation (ADR-1170 decision 2) covering the
+    /// object this assembler materializes. Reserved once, before the assembler
+    /// issues any GET, for the whole object size. Handed to
+    /// [`into_bytes`](Self::into_bytes) so it travels with the returned `Bytes`
+    /// and releases exactly when the reader drops them, never when the
+    /// assembling GETs completed. `None` only on paths built with an unlimited
+    /// budget's guard omitted, which the constructors never do in production.
+    reservation: Option<ravel_memory::Reservation>,
+}
+
+/// Owns an [`AssemblyBuffer`] together with the fetch-layer reservation for the
+/// object it holds, so [`Bytes::from_owner`] can attach the reservation guard
+/// to the assembled `Bytes` (ADR-1170 decision 2): the guard is released when
+/// the last `Bytes` clone is dropped. `AsRef<[u8]>` forwards to the buffer, so
+/// the returned `Bytes` view the assembled object exactly as before.
+struct AssembledBytes {
+    buf: AssemblyBuffer,
+    _reservation: Option<ravel_memory::Reservation>,
+}
+
+impl AsRef<[u8]> for AssembledBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_ref()
+    }
 }
 
 impl ObjectAssembler {
-    fn new(pool: &Arc<AssemblyBufferPool>, total_size: usize) -> Self {
+    fn new(
+        pool: &Arc<AssemblyBufferPool>,
+        total_size: usize,
+        reservation: Option<ravel_memory::Reservation>,
+    ) -> Self {
         ObjectAssembler {
             buf: pool.acquire(total_size),
             placed: Vec::new(),
+            reservation,
         }
     }
 
@@ -2883,7 +3480,10 @@ impl ObjectAssembler {
     }
 
     fn into_bytes(self) -> Bytes {
-        Bytes::from_owner(self.buf)
+        Bytes::from_owner(AssembledBytes {
+            buf: self.buf,
+            _reservation: self.reservation,
+        })
     }
 }
 
@@ -2981,16 +3581,17 @@ pub struct BlockRangeFetcher {
     /// The largest single covering sub-range GET this fetcher (and every clone)
     /// has issued, in bytes: the peak wire size of one request on the segmented
     /// covering path, which never exceeds `max_fetch_run_bytes`. The resident
-    /// assembly buffer is NOT bounded by this -- the frozen `ravel-logseg`
-    /// reader ([`RlogReader::new`]) needs a contiguous object-indexed buffer, so
-    /// a covering read of an object above the bound still holds `object_size` --
-    /// but the request wire size is, which is what this records.
+    /// assembly buffer is NOT bounded by this -- see the resident-memory note
+    /// on [`Self::covering_read`] (issue #1007): this field only ever reports
+    /// the wire side.
     peak_fetch_run: Arc<AtomicU64>,
-    /// Bounds in-flight byte-range GETs. Its own instance, never shared with
-    /// `SegmentFetcher`'s RSEG semaphore (ADR-0107 decision 1).
-    get_semaphore: Arc<Semaphore>,
+    /// Bounds in-flight byte-range GETs. By default its own private instance
+    /// (ADR-0107 decision 1); [`Self::with_get_limiter`] wires it to the one
+    /// process-shared limiter every query-side fetcher can hold instead
+    /// (ADR-1195).
+    get_limiter: Arc<crate::GetLimiter>,
     /// Reusable object-sized assembly buffers (issue #894), shared by every
-    /// clone of this fetcher the way `get_semaphore` is, so the one production
+    /// clone of this fetcher the way `get_limiter` is, so the one production
     /// `LogSegmentFetcher` pools across every read of the process rather than
     /// per query.
     assembly_pool: Arc<AssemblyBufferPool>,
@@ -3000,6 +3601,12 @@ pub struct BlockRangeFetcher {
     /// the owning [`LogSegmentFetcher`], which sets its own counter here so one
     /// execution's whole-object and ranged reads land in the same totals.
     wire_bytes: PhaseWireByteCounter,
+    /// The process-wide fetch memory budget (ADR-1170 decision 2). Every ranged
+    /// read reserves against it before its GETs: the whole object size once,
+    /// held by the [`ObjectAssembler`] for the assembled buffer's lifetime, plus
+    /// the transient summed run length before each `join_all`. Default unlimited
+    /// (never refuses); [`Self::with_memory_budget`] wires the shared one.
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
 }
 
 impl BlockRangeFetcher {
@@ -3015,10 +3622,43 @@ impl BlockRangeFetcher {
             request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
             max_fetch_run_bytes: crate::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
             peak_fetch_run: Arc::new(AtomicU64::new(0)),
-            get_semaphore: Arc::new(Semaphore::new(DEFAULT_LOG_MAX_CONCURRENT_GETS)),
+            get_limiter: Arc::new(crate::GetLimiter::new_unchecked(
+                DEFAULT_LOG_MAX_CONCURRENT_GETS,
+            )),
             assembly_pool: Arc::new(AssemblyBufferPool::default()),
             wire_bytes: PhaseWireByteCounter::new(),
+            memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         }
+    }
+
+    /// Wires this fetcher's ranged reads to a caller-owned
+    /// [`ravel_memory::MemoryBudget`] (ADR-1170 decision 2), so they reserve
+    /// against the same budget as the owning [`LogSegmentFetcher`]'s
+    /// whole-object funnel and every other fetcher holding the same `Arc`.
+    #[must_use]
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    /// This fetcher's current memory budget, for a test to `Arc::ptr_eq` the
+    /// way [`Self::get_limiter_for_test`] serves the limiter.
+    #[cfg(test)]
+    pub(crate) fn memory_budget_for_test(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
+    }
+
+    /// Reserves `n` bytes against this fetcher's budget before a ranged read,
+    /// mapping a refusal to [`LogFetchError::FetchMemoryExhausted`]. The guard
+    /// is owned for the covered buffer's lifetime (ADR-1170 decision 2).
+    fn reserve_fetch(&self, n: u64) -> Result<ravel_memory::Reservation, LogFetchError> {
+        self.memory_budget
+            .reserve(n)
+            .map_err(|e| LogFetchError::FetchMemoryExhausted {
+                requested: e.requested,
+                reserved: e.reserved,
+                limit: e.limit,
+            })
     }
 
     /// Records this fetcher's WIRE bytes into `counter` instead of its own
@@ -3039,10 +3679,12 @@ impl BlockRangeFetcher {
         self.wire_bytes.clone()
     }
 
-    /// This fetcher's assembly-buffer reuse counters (issue #894): how many
-    /// ranged reads had to allocate an object-sized buffer, how many were served
-    /// by a pooled one, and how many bytes the pool has ever zeroed. Cumulative
-    /// and shared by every clone.
+    /// This fetcher's assembly-buffer pool figures (issues #894 and #1771):
+    /// the cumulative counters -- how many ranged reads had to allocate an
+    /// object-sized buffer, how many were served by a pooled one, how many
+    /// bytes the pool has ever zeroed -- plus the live set currently checked
+    /// out and its high-water mark. Shared by every clone; the counters are
+    /// cumulative, the live figure is a gauge.
     #[must_use]
     pub fn assembly_buffer_stats(&self) -> AssemblyBufferStats {
         self.assembly_pool.stats()
@@ -3180,13 +3822,46 @@ impl BlockRangeFetcher {
     ///   and its cap too on this unaligned split, since no run is short of the
     ///   bound except the last).
     ///
-    /// NOTE (reported for ADR-0996): the assembled buffer is still `object_size`
-    /// on the segmented path, because [`RlogReader::new`] in the frozen
-    /// `ravel-logseg` crate needs a contiguous object-indexed buffer. Bounding
-    /// the RESIDENT buffer below the bound would need a decode-side change
-    /// (independent per-sub-range decode) in `ravel-logseg`/`ravel-sql`, out of
-    /// this task's scope; [`Self::peak_fetch_run_bytes`] bounds the request wire
-    /// size, which is what stays in scope here.
+    /// NOTE (issue #1007 finding, superseding the ADR-0996 note this replaces):
+    /// the assembled buffer is still `object_size` on the segmented path. This
+    /// is a bounded-window case in principle, not a genuine whole-object need
+    /// (option (b), not (c), in #1007's terms) -- `decode_v4_block`
+    /// (`ravel_logseg::reader`, `pub(crate)`) already takes a `base: u64` naming
+    /// the absolute offset of its `bytes[0]`, and `RlogRangeReader`
+    /// (`ravel_logseg::ranged`) already exploits exactly that to decode one row
+    /// group or one block at a time for the compactor merge, holding only
+    /// directories plus the one span resident, never the whole object
+    /// (`ranged.rs` module doc, `decode_one_block`). But `BlockScan::decode_block`
+    /// (`reader.rs:882-915`), the only decode entry point this fetcher's callers
+    /// use (`open_scan`/`open_scan_subset`, `log_fetcher.rs:2109,2136`, both via
+    /// `RlogReader::new`), hardcodes `base = 0` (`reader.rs:909`) and its
+    /// `next_block` contract requires `object_bytes` to be the whole object
+    /// from offset 0 (`reader.rs:775-778`) -- neither of those signatures is
+    /// touched by this commit, so `RlogReader`'s and `BlockScan`'s public API is
+    /// unchanged. Bounding this read's resident memory to the window needs a
+    /// reader change of a stated scope, not a local fix: (1) in `ravel-logseg`,
+    /// a windowed decode entry point that accepts `base != 0` for the general
+    /// predicate/prune-pruned case `BlockScan` serves (`RlogRangeReader`'s
+    /// existing windowed methods all filter to one caller-named stream, which
+    /// this fetcher's arbitrary ts-range/content/postings/bloom predicates do
+    /// not fit); and (2) in `ravel-query`, restructuring every `covering_read`
+    /// caller (this function's 4 call sites) to fetch and parse the directory
+    /// sections ahead of the covering loop -- STREAM_DIR, SKIP_IDX and
+    /// FIELD_DIR for any object, plus PAGE_DIR for a version-4 one, since v3
+    /// carries no PAGE_DIR and its blocks are contiguous byte ranges
+    /// (`ravel_logseg::footer`) -- (today `covering_read` knows nothing about
+    /// block boundaries and writes `[0, total_size)`
+    /// unconditionally), choose split points at block boundaries, and decode
+    /// each sub-range's complete blocks immediately and discard its buffer
+    /// before the next sub-range is fetched, instead of assembling into one
+    /// `object_size` buffer before ever calling `RlogReader::new`. That is a
+    /// decode-entry-point change plus a fetch-shape change on a
+    /// query-correctness-critical path, not a bounded local patch; forcing a
+    /// partial version through in one pass risks exactly the kind of
+    /// half-finished critical-path change this repo's invariants forbid. Not
+    /// implemented here; see the commit this note ships with for the full
+    /// evidence trail. [`Self::peak_fetch_run_bytes`] still bounds only the
+    /// request wire size, unchanged by this finding.
     #[allow(clippy::too_many_arguments)]
     async fn covering_read(
         &self,
@@ -3198,6 +3873,23 @@ impl BlockRangeFetcher {
         pin: &EtagPin,
         accounting: &QueryAccounting,
     ) -> Result<(Bytes, u64, u64), LogFetchError> {
+        // Reserve the covering read's whole extent before any GET (ADR-1170
+        // decision 2): a refusal fails typed with zero GETs. The guard travels
+        // with the returned `Bytes` -- attached directly in the single-GET
+        // branch, or carried by the `ObjectAssembler` in the segmented branch --
+        // so it releases when the reader drops the assembled buffer.
+        //
+        // This always reserves fresh, and a coverage crossover holding a live
+        // assembler for the same object drops it first rather than handing its
+        // guard across. Accepting a caller's live reservation would mean
+        // proving, at every such call site, that no borrow into the assembler's
+        // buffer survives the await, and a caller that got that wrong would
+        // leave the buffer resident under no ledger, which is the gap decision 2
+        // forbids. The cost of reserving fresh is that a saturated budget can
+        // hand the freed extent to another task in between, turning a fetch that
+        // a handover would have completed into a typed refusal. That is
+        // fail-closed and allowed.
+        let mut reservation = self.reserve_fetch(total_size)?;
         if total_size <= self.max_fetch_run_bytes {
             let (bytes, live) = self
                 .cached_extent(
@@ -3213,14 +3905,33 @@ impl BlockRangeFetcher {
                 .await?;
             if live {
                 self.observe_fetch_run(total_size);
+                if self.cache.is_some() {
+                    // Cache miss that just admitted these bytes: `cached_extent`'s
+                    // leader-miss insert put them under the cache's own ledger too,
+                    // the same overlap the whole-object funnel's `Source::Upstream`
+                    // arm marks. `live` alone cannot distinguish this from an
+                    // uncached direct GET (`cached_extent` reports `live = true`
+                    // for both), so the cache-configured check decides it here.
+                    reservation.mark_handed_off();
+                }
+            } else {
+                // Cache hit: `bytes` clones the cache entry's allocation, so
+                // the cache cap and this guard both cover it for as long as
+                // the caller holds it (ADR-1170 decision 2), same as the
+                // whole-object funnel's hit arm.
+                reservation.mark_handed_off();
             }
             let live_bytes = if live { total_size } else { 0 };
-            return Ok((bytes, u64::from(live), live_bytes));
+            return Ok((
+                attach_reservation(bytes, reservation),
+                u64::from(live),
+                live_bytes,
+            ));
         }
 
         let key = seg_ref.data_object_key.as_str();
         let total = usize::try_from(total_size).map_err(|_| corrupt_range(key))?;
-        let mut asm = ObjectAssembler::new(&self.assembly_pool, total);
+        let mut asm = ObjectAssembler::new(&self.assembly_pool, total, Some(reservation));
         let mut live_gets = 0u64;
         // Wire bytes actually moved: a sub-range served from cache moves none,
         // so `bytes.len()` (the whole object) must never be charged as fetched
@@ -3290,8 +4001,25 @@ impl BlockRangeFetcher {
 
     #[must_use]
     pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
-        self.get_semaphore = Arc::new(Semaphore::new(n.max(1)));
+        self.get_limiter = Arc::new(crate::GetLimiter::new_unchecked(n.max(1)));
         self
+    }
+
+    /// Wires this fetcher to a caller-owned [`crate::GetLimiter`] (ADR-1195),
+    /// so it draws GET permits from the same pool as every other fetcher (and,
+    /// via [`crate::QueryEngine::with_get_limiter`], every other engine)
+    /// holding the same `Arc`.
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: Arc<crate::GetLimiter>) -> Self {
+        self.get_limiter = limiter;
+        self
+    }
+
+    /// This fetcher's current limiter, for a test to `Arc::ptr_eq` against
+    /// another fetcher's or an engine's.
+    #[cfg(test)]
+    pub(crate) fn get_limiter_for_test(&self) -> &Arc<crate::GetLimiter> {
+        &self.get_limiter
     }
 
     /// Whether ADR-0046's read cache is wired into this fetcher. Every GET the
@@ -3322,12 +4050,14 @@ impl BlockRangeFetcher {
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, LogFetchError> {
         let _permit = self
-            .get_semaphore
+            .get_limiter
             .acquire()
             .await
             .map_err(|_| LogFetchError::Store {
                 key: key.to_string(),
-                source: StoreError::Transient("fetch concurrency semaphore closed".to_string()),
+                source: StoreError::Transient(
+                    "GetLimiter semaphore closed unexpectedly".to_string(),
+                ),
             })?;
         let got = self
             .store
@@ -3760,7 +4490,13 @@ impl BlockRangeFetcher {
                 bytes
             }
         };
-        decode_section(&stored, desc, &self.cfg).map_err(|source| corrupt(key, source))
+        // A planning read decompresses this directory section to count survivors
+        // or resolve columns; charge what zstd produced to the phase handle this
+        // read belongs to (issue #1401), the same handle its GETs are charged
+        // against above. Separate from the scan's own directory decode in
+        // `RlogReader::new`, which the scan phase charges through `ScanStats`.
+        decode_section_accounted(&stored, desc, &self.cfg, accounting)
+            .map_err(|source| corrupt(key, source))
     }
 
     /// Read the footer, SKIP_IDX, and FIELD_DIR for one segment and decode all
@@ -4046,7 +4782,14 @@ impl BlockRangeFetcher {
         // footer parsed at wrong absolute offsets is a `Corrupt`.
         let total_size = seg_ref.object_size;
         let total = usize::try_from(total_size).map_err(|_| corrupt_range(key))?;
-        let mut asm = ObjectAssembler::new(&self.assembly_pool, total);
+        // Reserve the object-sized assembly buffer before any block GET
+        // (ADR-1170 decision 2): the pooled buffer is object-sized regardless of
+        // how few blocks the pruned read places into it, so the object size is
+        // the memory this read holds. The guard is owned by the assembler and
+        // travels with its `into_bytes` result, releasing when the reader drops
+        // the assembled buffer. A refusal fails typed with zero GETs.
+        let reservation = self.reserve_fetch(total_size)?;
+        let mut asm = ObjectAssembler::new(&self.assembly_pool, total, Some(reservation));
 
         // Footer: reused from the plan phase when carried (deliverable 2), else
         // read via the etag-establishing suffix probe. The probe is a suffix GET
@@ -4198,8 +4941,11 @@ impl BlockRangeFetcher {
         .await?;
 
         // Decode the skip index (now resident) and resolve the candidate blocks.
+        // A ranged read of this shape, so charged to whichever phase handle the
+        // caller passed in (issue #1401 finding 3): `decode_section_accounted`
+        // has no phase tag of its own, only the handle it is given.
         let skip_stored = asm.slice(key, skip_desc.offset, skip_desc.len)?;
-        let skip_raw = decode_section(skip_stored, skip_desc, &self.cfg)
+        let skip_raw = decode_section_accounted(skip_stored, skip_desc, &self.cfg, accounting)
             .map_err(|source| corrupt(key, source))?;
         let skip =
             SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
@@ -4260,6 +5006,14 @@ impl BlockRangeFetcher {
         let candidate_bytes: u64 = extents.iter().map(|e| e.len).sum();
         let coverage = candidate_bytes as f64 / blocks_desc.len.max(1) as f64;
         if coverage >= self.coverage_threshold {
+            // `extents` is already owned (resolved above from the decoded skip
+            // index, not borrowed from `asm`), so the assembler holds no live
+            // borrow here. Drop it -- releasing both its object-sized buffer
+            // and its reservation guard -- BEFORE the covering GET reserves
+            // fresh (ADR-1170 decision 2): the object is materialized once, so
+            // only one object-sized reservation is ever live, never the
+            // assembler's plus a second one for the covering read.
+            drop(asm);
             // Keyed and single-flighted like every other GET here, on the same
             // `(0, object_size)` key the whole-object funnel uses: without that,
             // N partitions all crossing over would issue N whole-object GETs,
@@ -4503,10 +5257,10 @@ impl BlockRangeFetcher {
             &mut stats,
         )
         .await?;
-        let skip_raw = self.placed_section_raw(key, &asm, &skip_desc)?;
+        let skip_raw = self.placed_section_raw(key, &asm, &skip_desc, accounting)?;
         let skip =
             SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
-        let page_raw = self.placed_section_raw(key, &asm, &page_desc)?;
+        let page_raw = self.placed_section_raw(key, &asm, &page_desc, accounting)?;
         let page_dir = PageDir::decode(&page_raw).map_err(|source| corrupt(key, source))?;
         page_dir
             .validate_extents(blocks_desc.len)
@@ -4566,6 +5320,13 @@ impl BlockRangeFetcher {
         let wanted_bytes: u64 = wanted.iter().map(|e| e.len).sum();
         let coverage = wanted_bytes as f64 / blocks_desc.len.max(1) as f64;
         if coverage >= self.coverage_threshold {
+            // `wanted` is already owned (resolved above from the decoded skip
+            // index and page directory, not borrowed from `asm`), so dropping
+            // the assembler here is safe, as the version-3 coverage crossover
+            // does: it releases the buffer and its reservation guard BEFORE
+            // the covering GET reserves fresh, so only one object-sized
+            // reservation is ever live (ADR-1170 decision 2).
+            drop(asm);
             // Bounded by the fetch bound (ADR-0996 decision 2), like the
             // version-3 coverage crossover above.
             let (bytes, live_gets, live_bytes) = self
@@ -4708,6 +5469,14 @@ impl BlockRangeFetcher {
             // `asm` at the right offsets already.
             .filter(|r| !asm.covers(r.abs_start, r.abs_end()))
             .collect();
+        // Reserve the transient wire buffers the coalesced runs materialize
+        // before `join_all` issues a GET (ADR-1170 decision 2): a refusal fails
+        // typed with zero GETs. Held to the end of this call, covering the
+        // per-run buffers until each is copied into `asm` (whose object-sized
+        // reservation, taken at construction, is the durable one). A transient
+        // peak, released when this call returns.
+        let reserved: u64 = runs.iter().map(|r| r.len).fold(0u64, u64::saturating_add);
+        let _reservation = self.reserve_fetch(reserved)?;
         let outcomes = futures::future::join_all(runs.iter().map(|run| async move {
             let (bytes, live) = self
                 .cached_extent(
@@ -4787,15 +5556,20 @@ impl BlockRangeFetcher {
     }
 
     /// Decode one whole-compressed section out of the assembled buffer, where an
-    /// earlier `place_*` call already put its stored bytes.
+    /// earlier `place_*` call already put its stored bytes. Charges the bytes
+    /// zstd produced to `accounting` (issue #1401 finding 3): a ranged read's
+    /// SKIP_IDX and PAGE_DIR decode, so its callers pass the same handle their
+    /// GETs are charged against.
     fn placed_section_raw(
         &self,
         key: &str,
         asm: &ObjectAssembler,
         desc: &SectionDesc,
+        accounting: &QueryAccounting,
     ) -> Result<Vec<u8>, LogFetchError> {
         let stored = asm.slice(key, desc.offset, desc.len)?;
-        decode_section(stored, desc, &self.cfg).map_err(|source| corrupt(key, source))
+        decode_section_accounted(stored, desc, &self.cfg, accounting)
+            .map_err(|source| corrupt(key, source))
     }
 
     /// Resolve each candidate block index (from `skip.candidate_blocks`) to its
@@ -4950,8 +5724,8 @@ impl BlockRangeFetcher {
         )
         .await?;
         let stored = asm.slice(key, desc.offset, desc.len)?;
-        let raw =
-            decode_section(stored, &desc, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let raw = decode_section_accounted(stored, &desc, &self.cfg, accounting)
+            .map_err(|source| corrupt(key, source))?;
         FieldDir::decode(&raw, MAX_FIELDS).map_err(|source| corrupt(key, source))
     }
 
@@ -5056,9 +5830,16 @@ impl BlockRangeFetcher {
 
         // Every coalesced run concurrently, not one await at a time (mirrors
         // `crate::fetcher::SegmentFetcher::ensure_ranges`' `join_all`). Awaiting
-        // the runs in series made `get_semaphore` inert: a sequential loop never
+        // the runs in series made `get_limiter` inert: a sequential loop never
         // has more than one GET in flight to bound.
         let runs = coalesce_extents(&missing, self.effective_coalesce_gap());
+        // Reserve the transient wire buffers the coalesced runs materialize
+        // before `join_all` issues a GET (ADR-1170 decision 2): a refusal fails
+        // typed with zero GETs. Held to the end of this call, until each run's
+        // blocks are copied into `asm` (whose object-sized reservation is the
+        // durable one). A transient peak, released when this call returns.
+        let reserved: u64 = runs.iter().map(|r| r.len).fold(0u64, u64::saturating_add);
+        let _reservation = self.reserve_fetch(reserved)?;
         let outcomes = futures::future::join_all(runs.iter().map(|run| {
             let blocks: Vec<BlockExtent> = missing
                 .iter()
@@ -5364,6 +6145,30 @@ fn to_cache_error(err: LogFetchError) -> crate::fetcher::CacheFetchError {
             key,
             message: source.to_string(),
         },
+        // Unreachable in practice: every fetch-memory reservation (ADR-1170
+        // decision 2) is taken BEFORE the `get_or_fetch` closure this channel
+        // carries, so a refusal fails the caller before any cache single-flight
+        // begins and never travels to a follower. Mapped to a transient store
+        // error so the exhaustive match holds without inventing a cache-channel
+        // variant for a class that cannot arrive here.
+        LogFetchError::FetchMemoryExhausted { .. } => {
+            crate::fetcher::CacheFetchError::Store(Arc::new(StoreError::Transient(
+                "fetch memory exhausted inside cache single-flight (unreachable)".to_string(),
+            )))
+        }
+        // A carry mismatch is refused before any fetch, so it never reaches a
+        // single-flight waiter today. Preserved as hard corruption rather than
+        // flattened, so it stays in its class if a carry ever fronts the cache.
+        carry @ LogFetchError::CarryMismatch { .. } => {
+            let key = match &carry {
+                LogFetchError::CarryMismatch { key, .. } => key.clone(),
+                _ => String::new(),
+            };
+            crate::fetcher::CacheFetchError::Corrupt {
+                key,
+                message: carry.to_string(),
+            }
+        }
     }
 }
 
@@ -5571,6 +6376,7 @@ fn decode_span() -> tracing::Span {
         signal = "logs",
         blocks_scanned = tracing::field::Empty,
         blocks_total = tracing::field::Empty,
+        decompressed_bytes = tracing::field::Empty,
     )
 }
 
@@ -5729,7 +6535,7 @@ mod plan_fast_path_tests {
 
         // Predicate-free, ts window strictly contains [min, max].
         let query = LogQuery::new(i64::MIN, i64::MAX);
-        let (count, stats, _footer) = f
+        let (count, stats, _footer, _carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
@@ -5767,7 +6573,7 @@ mod plan_fast_path_tests {
 
         // Exact span bounds: ts_min == min_event_ts_ns, ts_max == max_event_ts_ns.
         let query = LogQuery::new(seg.min_event_ts_ns, seg.max_event_ts_ns);
-        let (count, _stats, _footer) = f
+        let (count, _stats, _footer, _carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
@@ -5799,7 +6605,7 @@ mod plan_fast_path_tests {
             word: "hello".into(),
         });
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -5817,7 +6623,7 @@ mod plan_fast_path_tests {
             AttrValue::Str("svc".into()),
         ));
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -5834,7 +6640,7 @@ mod plan_fast_path_tests {
             vec![("request.id".into(), "r0".into())],
         )]);
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -5850,7 +6656,7 @@ mod plan_fast_path_tests {
         // run and the survivor count is N-2, not N.
         let q = LogQuery::new(2, i64::MAX);
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -5872,7 +6678,7 @@ mod plan_fast_path_tests {
             word: "hello".into(),
         });
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -5910,7 +6716,7 @@ mod plan_fast_path_tests {
             );
         let query = LogQuery::new(i64::MIN, i64::MAX);
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan")
@@ -5923,6 +6729,1162 @@ mod plan_fast_path_tests {
             acc.snapshot().total_s3_bytes() > tail,
             "at-threshold: block-range fetch ran, not the footer-only probe"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod whole_object_get_limiter_tests {
+    //! Pins the ADR-1195 gap the adversarial review of #1195 found: the RLOG
+    //! whole-object funnel (`fetch_accounted`, the path every object at or
+    //! below `block_range_threshold` takes) issued its GET with no permit at
+    //! all, so it could never be bounded no matter how the caller configured
+    //! `get_limiter`. The first tests drive `fetch_accounted`, which takes
+    //! the whole-object path unconditionally; the later ones drive the
+    //! production funnel `fetch_accounted_with_tenant` on objects below the
+    //! default `block_range_threshold` (`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`),
+    //! with and without a cache attached, so both `whole_object_bytes` permit
+    //! sites are covered on the path the cost-based default policy takes for
+    //! small objects.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const CONTENT_HASH: [u8; 32] = [9u8; 32];
+    const KEY: &str = "t/whole.rlog";
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "hello world".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("request.id".to_string(), AttrValue::Str(format!("r{ts}")))],
+        }
+    }
+
+    fn build_object() -> Vec<u8> {
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        w.push(record(0)).expect("push");
+        w.finish().expect("finish")
+    }
+
+    fn seg_ref(size: u64) -> SegmentRef {
+        seg_ref_with(KEY, CONTENT_HASH, size)
+    }
+
+    fn seg_ref_with(key: &str, content_hash: [u8; 32], size: u64) -> SegmentRef {
+        SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: size,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            ingest_hour_bucket: 0,
+            sample_count: 1,
+            series_count: 0,
+            shard: 0,
+            content_hash,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    async fn store_with_object(bytes: Vec<u8>) -> MemoryStore {
+        let store = MemoryStore::new();
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        store
+    }
+
+    /// Object well under `DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`, so every
+    /// fetcher below takes the unconditional whole-object GET in
+    /// `fetch_accounted`, never `block_range`.
+    async fn small_object_backend() -> (Arc<FaultStore<MemoryStore>>, SegmentRef) {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        assert!(
+            size < DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            "fixture object must stay below the whole-object threshold"
+        );
+        let store = store_with_object(bytes).await;
+        let fault = Arc::new(FaultStore::new(store, FaultPlan::default()));
+        (fault, seg_ref(size))
+    }
+
+    const CONTENT_HASH_A: [u8; 32] = [10u8; 32];
+    const CONTENT_HASH_B: [u8; 32] = [11u8; 32];
+    const KEY_A: &str = "t/whole_a.rlog";
+    const KEY_B: &str = "t/whole_b.rlog";
+
+    /// Two objects with distinct store keys and content hashes, so two
+    /// concurrent fetches never collapse into one cache single-flight (the
+    /// cache key is `content_hash`, not the store key): each independently
+    /// reaches its own `whole_object_bytes` GET and its own permit
+    /// acquisition, which is what makes the cache-attached test below prove
+    /// the `GetLimiter`, not incidental single-flight serialization, bounds
+    /// concurrency.
+    async fn two_object_backend() -> (Arc<FaultStore<MemoryStore>>, SegmentRef, SegmentRef) {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        assert!(
+            size < DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            "fixture object must stay below the whole-object threshold"
+        );
+        let store = MemoryStore::new();
+        store
+            .put(KEY_A, Bytes::from(bytes.clone()), PutOptions::default())
+            .await
+            .expect("put a");
+        store
+            .put(KEY_B, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put b");
+        let fault = Arc::new(FaultStore::new(store, FaultPlan::default()));
+        (
+            fault,
+            seg_ref_with(KEY_A, CONTENT_HASH_A, size),
+            seg_ref_with(KEY_B, CONTENT_HASH_B, size),
+        )
+    }
+
+    /// Two `LogSegmentFetcher`s sharing one `GetLimiter::new(1)` must never
+    /// let both whole-object GETs be in flight at once.
+    ///
+    /// Non-vacuity: before Deliverable 1 wired a private `get_limiter` field
+    /// onto `LogSegmentFetcher` and threaded it through `fetch_accounted`'s
+    /// GET (the `let _permit = self.get_limiter.acquire()...` block added
+    /// ahead of `self.store.get(key, GetRange::Full)` there), that GET took
+    /// no permit at all, so `gate.wait_until_held(2)` below would resolve
+    /// immediately instead of timing out and this test would fail at the
+    /// `is_err()` assertion.
+    #[tokio::test]
+    async fn shared_get_limiter_bounds_whole_object_gets_to_one() {
+        let (fault, seg) = small_object_backend().await;
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let shared = Arc::new(crate::GetLimiter::new(1).expect("1 permit is valid"));
+        let fetcher_a = LogSegmentFetcher::new(backend.clone()).with_get_limiter(shared.clone());
+        let fetcher_b = LogSegmentFetcher::new(backend).with_get_limiter(shared);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let seg_a = seg.clone();
+        let query_a = query.clone();
+        let handle_a = tokio::spawn(async move { fetcher_a.fetch(&seg_a, &query_a).await });
+        let seg_b = seg.clone();
+        let query_b = query.clone();
+        let handle_b = tokio::spawn(async move { fetcher_b.fetch(&seg_b, &query_b).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("one of the two fetches issues its GET within 30 s");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(2)
+            )
+            .await
+            .is_err(),
+            "one shared permit must cap in-flight whole-object GETs at exactly 1"
+        );
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "peak in-flight whole-object GETs must be exactly 1"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing the first permit lets the second GET proceed within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must now be the only one held"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a")
+            .expect("fetch a found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
+    }
+
+    /// Control for the test above: two `LogSegmentFetcher`s with PRIVATE
+    /// `GetLimiter::new(1)` instances (not shared) must reach 2 in-flight
+    /// whole-object GETs, proving the shared case above bounds because the
+    /// limiter is shared, not because the store or fixture serializes them.
+    #[tokio::test]
+    async fn private_get_limiters_do_not_share_a_bound() {
+        let (fault, seg) = small_object_backend().await;
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let fetcher_a = LogSegmentFetcher::new(backend.clone()).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(1).expect("1 permit is valid"),
+        ));
+        let fetcher_b = LogSegmentFetcher::new(backend).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(1).expect("1 permit is valid"),
+        ));
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let seg_a = seg.clone();
+        let query_a = query.clone();
+        let handle_a = tokio::spawn(async move { fetcher_a.fetch(&seg_a, &query_a).await });
+        let seg_b = seg.clone();
+        let query_b = query.clone();
+        let handle_b = tokio::spawn(async move { fetcher_b.fetch(&seg_b, &query_b).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(2))
+            .await
+            .expect("both fetches issue their GET within 30 s: private limiters do not share");
+        assert_eq!(
+            gate.held_count(),
+            2,
+            "private limiters must let both whole-object GETs be in flight at once"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a")
+            .expect("fetch a found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
+    }
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+
+    /// `with_get_limiter` followed by `with_block_range` must leave the
+    /// replacement `BlockRangeFetcher` sharing this instance's limiter, not
+    /// the private default `BlockRangeFetcher::new` builds for itself.
+    ///
+    /// Non-vacuity: deleting the
+    /// `.with_get_limiter(Arc::clone(&self.get_limiter))` re-apply inside
+    /// `with_block_range` (log_fetcher.rs:768) leaves the second assertion
+    /// below comparing `shared` against the replacement's own default
+    /// limiter, a distinct `Arc`, so it fails.
+    #[test]
+    fn with_block_range_reapplies_shared_limiter_onto_the_replacement() {
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let shared = Arc::new(crate::GetLimiter::new(2).expect("2 permits is valid"));
+        let fetcher = LogSegmentFetcher::new(backend.clone())
+            .with_get_limiter(shared.clone())
+            .with_block_range(BlockRangeFetcher::new(backend));
+
+        assert!(
+            Arc::ptr_eq(fetcher.get_limiter_for_test(), &shared),
+            "with_block_range must not disturb this fetcher's own limiter"
+        );
+        assert!(
+            Arc::ptr_eq(fetcher.block_range_get_limiter_for_test(), &shared),
+            "with_block_range must re-apply the shared limiter onto the \
+             replacement BlockRangeFetcher, not leave it on its own default"
+        );
+    }
+
+    /// `with_max_concurrent_gets(n)` must wire the SAME private limiter onto
+    /// both the whole-object path and the block-range path, with `n` permits.
+    ///
+    /// Non-vacuity: if the builder set only `self.block_range`'s limiter (the
+    /// bug shape this pins), `get_limiter_for_test` would still report the
+    /// default `DEFAULT_LOG_MAX_CONCURRENT_GETS`-permit limiter `new` built,
+    /// so the `ptr_eq` below fails and `permits()` reads
+    /// `DEFAULT_LOG_MAX_CONCURRENT_GETS`, not 3.
+    #[test]
+    fn with_max_concurrent_gets_wires_both_paths_to_one_private_limiter() {
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let fetcher = LogSegmentFetcher::new(backend).with_max_concurrent_gets(3);
+
+        assert!(
+            Arc::ptr_eq(
+                fetcher.get_limiter_for_test(),
+                fetcher.block_range_get_limiter_for_test()
+            ),
+            "with_max_concurrent_gets must wire one private limiter onto both \
+             the whole-object and block-range paths"
+        );
+        assert_eq!(fetcher.get_limiter_for_test().permits(), 3);
+    }
+
+    /// Two standalone fetchers each built with `with_max_concurrent_gets(1)`
+    /// hold PRIVATE limiters: two concurrent `fetch_accounted_with_tenant`
+    /// calls per fetcher (the production tenant-aware entry point, not
+    /// `fetch_accounted`) must peak at exactly 2 in-flight whole-object GETs
+    /// (one per fetcher's own 1-permit limiter), never 1 and never 3+.
+    #[tokio::test]
+    async fn max_concurrent_gets_one_bounds_whole_object_funnel_per_fetcher() {
+        let (fault, seg) = small_object_backend().await;
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let fetcher_a = LogSegmentFetcher::new(backend.clone()).with_max_concurrent_gets(1);
+        let fetcher_b = LogSegmentFetcher::new(backend).with_max_concurrent_gets(1);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let mut handles = Vec::new();
+        for fetcher in [fetcher_a.clone(), fetcher_a, fetcher_b.clone(), fetcher_b] {
+            let seg = seg.clone();
+            let query = query.clone();
+            handles.push(tokio::spawn(async move {
+                fetcher
+                    .fetch_accounted_with_tenant(&seg, TENANT, &query, &QueryAccounting::new())
+                    .await
+            }));
+        }
+
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(2))
+                .await
+                .expect("one GET per fetcher issues within 30s");
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    gate.wait_until_held(3)
+                )
+                .await
+                .is_err(),
+                "two independent private 1-permit limiters must together peak \
+                 at exactly 2 in-flight GETs, never 3"
+            );
+            assert_eq!(
+                gate.held_count(),
+                2,
+                "peak in-flight whole-object GETs must be exactly 2"
+            );
+            for id in gate.held() {
+                assert!(gate.release(id), "held id must release");
+            }
+        }
+
+        for handle in handles {
+            let output = tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+                .await
+                .expect("fetch completes within 30s")
+                .expect("join fetch")
+                .expect("fetch")
+                .expect("fetch found the segment relevant");
+            assert_eq!(output.records.len(), 1);
+        }
+    }
+
+    /// The same two fetchers, wired instead with `with_get_limiter` to ONE
+    /// shared `GetLimiter::new(1)`, must peak at exactly 1 in-flight
+    /// whole-object GET across all four calls -- proving the private-limiter
+    /// bound above is a property of the limiter being private, not of the
+    /// fixture or store serializing calls on its own.
+    #[tokio::test]
+    async fn shared_get_limiter_bounds_whole_object_funnel_across_fetchers_tenant_aware() {
+        let (fault, seg) = small_object_backend().await;
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let shared = Arc::new(crate::GetLimiter::new(1).expect("1 permit is valid"));
+        let fetcher_a = LogSegmentFetcher::new(backend.clone()).with_get_limiter(shared.clone());
+        let fetcher_b = LogSegmentFetcher::new(backend).with_get_limiter(shared);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let mut handles = Vec::new();
+        for fetcher in [fetcher_a.clone(), fetcher_a, fetcher_b.clone(), fetcher_b] {
+            let seg = seg.clone();
+            let query = query.clone();
+            handles.push(tokio::spawn(async move {
+                fetcher
+                    .fetch_accounted_with_tenant(&seg, TENANT, &query, &QueryAccounting::new())
+                    .await
+            }));
+        }
+
+        for _ in 0..4 {
+            tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+                .await
+                .expect("next GET issues within 30s");
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    gate.wait_until_held(2)
+                )
+                .await
+                .is_err(),
+                "one shared permit across two fetchers must cap in-flight GETs \
+                 at exactly 1"
+            );
+            assert_eq!(
+                gate.held_count(),
+                1,
+                "peak in-flight whole-object GETs must be exactly 1"
+            );
+            for id in gate.held() {
+                assert!(gate.release(id), "held id must release");
+            }
+        }
+
+        for handle in handles {
+            let output = tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+                .await
+                .expect("fetch completes within 30s")
+                .expect("join fetch")
+                .expect("fetch")
+                .expect("fetch found the segment relevant");
+            assert_eq!(output.records.len(), 1);
+        }
+    }
+
+    /// `whole_object_bytes`'s NO-cache GET (log_fetcher.rs:2038) must be
+    /// bounded by the shared limiter, reached here through the production
+    /// tenant-aware funnel (`fetch_accounted_with_tenant`), not the
+    /// untenanted `fetch_accounted` the tests above use.
+    ///
+    /// Non-vacuity: removing the `let _permit =
+    /// self.get_limiter.acquire()...` at log_fetcher.rs:2038 lets both GETs
+    /// proceed immediately, so `wait_until_held(2)` below resolves instead of
+    /// timing out.
+    #[tokio::test]
+    async fn whole_object_bytes_no_cache_permit_bounds_tenant_funnel() {
+        let (fault, seg_a, seg_b) = two_object_backend().await;
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let shared = Arc::new(crate::GetLimiter::new(1).expect("1 permit is valid"));
+        let fetcher_a = LogSegmentFetcher::new(backend.clone()).with_get_limiter(shared.clone());
+        let fetcher_b = LogSegmentFetcher::new(backend).with_get_limiter(shared);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let query_a = query.clone();
+        let handle_a = tokio::spawn(async move {
+            fetcher_a
+                .fetch_accounted_with_tenant(&seg_a, TENANT, &query_a, &QueryAccounting::new())
+                .await
+        });
+        let handle_b = tokio::spawn(async move {
+            fetcher_b
+                .fetch_accounted_with_tenant(&seg_b, TENANT, &query, &QueryAccounting::new())
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("one of the two fetches issues its GET within 30s");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(2)
+            )
+            .await
+            .is_err(),
+            "one shared permit must cap in-flight no-cache whole_object_bytes \
+             GETs at exactly 1"
+        );
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "peak in-flight GETs must be exactly 1"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing the first permit lets the second GET proceed within 30s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must now be the only one held"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30s")
+            .expect("join fetch a")
+            .expect("fetch a")
+            .expect("fetch a found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
+    }
+
+    /// `whole_object_bytes`'s cache-attached GET closure
+    /// (log_fetcher.rs:2075, inside `cache.get_or_fetch`) must be bounded by
+    /// the shared limiter too. Two DISTINCT objects (content hashes) keep
+    /// this from being a single-flight no-op: same-key concurrent
+    /// `get_or_fetch` calls would collapse into one physical fetch
+    /// regardless of the permit acquisition this test exists to pin.
+    ///
+    /// Non-vacuity: removing the `let _permit =
+    /// self.get_limiter.acquire()...` inside the `cache.get_or_fetch`
+    /// closure at log_fetcher.rs:2075 lets both GETs proceed immediately, so
+    /// `wait_until_held(2)` below resolves instead of timing out.
+    #[tokio::test]
+    async fn whole_object_bytes_cache_permit_bounds_tenant_funnel() {
+        let (fault, seg_a, seg_b) = two_object_backend().await;
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+            16 * 1024 * 1024,
+            100,
+            16 * 1024 * 1024,
+        )));
+        let shared = Arc::new(crate::GetLimiter::new(1).expect("1 permit is valid"));
+        let fetcher_a = LogSegmentFetcher::new(backend.clone())
+            .with_cache(cache.clone())
+            .with_get_limiter(shared.clone());
+        let fetcher_b = LogSegmentFetcher::new(backend)
+            .with_cache(cache)
+            .with_get_limiter(shared);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let query_a = query.clone();
+        let handle_a = tokio::spawn(async move {
+            fetcher_a
+                .fetch_accounted_with_tenant(&seg_a, TENANT, &query_a, &QueryAccounting::new())
+                .await
+        });
+        let handle_b = tokio::spawn(async move {
+            fetcher_b
+                .fetch_accounted_with_tenant(&seg_b, TENANT, &query, &QueryAccounting::new())
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("one of the two fetches issues its GET within 30s");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(2)
+            )
+            .await
+            .is_err(),
+            "one shared permit must cap in-flight cached whole_object_bytes \
+             GETs at exactly 1"
+        );
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "peak in-flight GETs must be exactly 1"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing the first permit lets the second GET proceed within 30s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must now be the only one held"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30s")
+            .expect("join fetch a")
+            .expect("fetch a")
+            .expect("fetch a found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
+    }
+
+    /// Deliverable 4 (RLOG whole-object): a budget too small for one object's
+    /// bytes refuses the fetch with a typed `FetchMemoryExhausted` carrying the
+    /// requested/reserved/limit counts, BEFORE any GET reaches the store, and
+    /// leaves the budget with nothing reserved.
+    ///
+    /// Non-vacuity: replacing `self.reserve_fetch(seg_ref.object_size)?` in
+    /// `whole_object_bytes` with an infallible reserve lets the GET fire and the
+    /// fetch succeed, so the `FetchMemoryExhausted` match and the zero-GET
+    /// assertion below both fail.
+    #[tokio::test]
+    async fn whole_object_budget_refusal_issues_zero_gets() {
+        use ravel_object_store::InstrumentedStore;
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let memory = MemoryStore::new();
+        memory
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let metrics = instrumented.metrics();
+        let backend: Arc<dyn ObjectStoreBackend> = instrumented;
+
+        // One byte short of a single object: the reservation cannot be granted.
+        let limit = size - 1;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let fetcher = LogSegmentFetcher::new(backend).with_memory_budget(budget.clone());
+
+        let err = fetcher
+            .whole_object_bytes(
+                &seg_ref(size),
+                TENANT,
+                QueryPhase::Plan,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect_err("a budget below one object's size must refuse the fetch");
+        match err {
+            LogFetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit: reported_limit,
+            } => {
+                assert_eq!(requested, size, "the refusal names the object's byte size");
+                assert_eq!(reserved, 0, "nothing else was reserved on this budget");
+                assert_eq!(reported_limit, limit, "the refusal names the budget limit");
+            }
+            other => panic!("expected FetchMemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            metrics.snapshot().get.calls,
+            0,
+            "a budget refusal issues zero GETs: the reservation precedes the GET"
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "a refused reservation leaves nothing reserved"
+        );
+    }
+
+    /// Deliverable 4 (concurrent cap): four distinct objects fetched
+    /// concurrently through one fetcher whose shared `MemoryBudget` holds
+    /// exactly three objects' worth of bytes admit exactly three; the fourth
+    /// refuses typed. Every admitted buffer carries its guard, so the budget
+    /// stays at three reservations until the buffers drop, then returns to zero.
+    ///
+    /// Non-vacuity: an infallible reserve in `whole_object_bytes` admits all
+    /// four, so the `succeeded == 3` / `refused == 1` assertions fail.
+    #[tokio::test]
+    async fn four_concurrent_whole_object_fetches_admit_three_under_a_three_object_budget() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let memory = MemoryStore::new();
+        let keys = ["t/c0.rlog", "t/c1.rlog", "t/c2.rlog", "t/c3.rlog"];
+        for k in keys {
+            memory
+                .put(k, Bytes::from(bytes.clone()), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(size * 3));
+        let fetcher = Arc::new(LogSegmentFetcher::new(backend).with_memory_budget(budget.clone()));
+
+        let hashes = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+        let results = futures::future::join_all(keys.iter().zip(hashes).map(|(k, h)| {
+            let fetcher = fetcher.clone();
+            let seg = seg_ref_with(k, h, size);
+            async move {
+                fetcher
+                    .whole_object_bytes(&seg, TENANT, QueryPhase::Plan, &QueryAccounting::new())
+                    .await
+            }
+        }))
+        .await;
+
+        let succeeded = results.iter().filter(|r| r.is_ok()).count();
+        let refused = results
+            .iter()
+            .filter(|r| matches!(r, Err(LogFetchError::FetchMemoryExhausted { .. })))
+            .count();
+        assert_eq!(
+            succeeded, 3,
+            "a three-object budget admits exactly three of four concurrent fetches"
+        );
+        assert_eq!(
+            refused, 1,
+            "the fourth fetch refuses with the typed budget error"
+        );
+        assert_eq!(
+            budget.reserved(),
+            size * 3,
+            "the three admitted buffers hold their reservations while alive"
+        );
+        drop(results);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "dropping every buffer returns the budget to zero"
+        );
+    }
+
+    /// Deliverable 3 (handoff): a whole-object fetch that admits its buffer to
+    /// the read cache marks the reservation handed off, so the budget reports
+    /// the transient overlap (both the returned buffer and the cache entry hold
+    /// the same bytes) while the buffer is held, and clears it on drop.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call on the
+    /// `Source::Upstream` arm of `whole_object_bytes` leaves `handoff_overlap()`
+    /// at 0 while the buffer is held, so the first assertion fails.
+    #[tokio::test]
+    async fn cache_insert_marks_the_reservation_handed_off() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+            16 * 1024 * 1024,
+            100,
+            16 * 1024 * 1024,
+        )));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(16 * 1024 * 1024));
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_cache(cache)
+            .with_memory_budget(budget.clone());
+
+        let buf = fetcher
+            .whole_object_bytes(
+                &seg_ref(size),
+                TENANT,
+                QueryPhase::Plan,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("whole_object_bytes");
+        assert_eq!(buf.len() as u64, size);
+        assert_eq!(
+            budget.handoff_overlap(),
+            size,
+            "the cache insert marks the fetched buffer handed off while both ledgers hold it"
+        );
+        drop(buf);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the buffer drops"
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the reservation releases with the buffer"
+        );
+    }
+
+    /// The same overlap on a cache HIT, which is the case the first version of
+    /// this work left unmarked. The returned `Bytes` clones the cache entry's
+    /// allocation, so the cache cap and the fetch guard both cover it for as
+    /// long as the caller holds it, exactly as after an insert. Leaving a hit
+    /// unmarked understates `handoff_overlap` by every hit, and it is that
+    /// undercount which makes decision 3's `unique` term inexact and its
+    /// derived reserve undersized.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call on the
+    /// `Source::Cache` arm leaves `handoff_overlap()` at 0 on the second fetch
+    /// while its buffer is held, so the hit assertion fails while the insert
+    /// assertion above still passes.
+    #[tokio::test]
+    async fn cache_hit_marks_the_reservation_handed_off() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+            16 * 1024 * 1024,
+            100,
+            16 * 1024 * 1024,
+        )));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(16 * 1024 * 1024));
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_cache(cache)
+            .with_memory_budget(budget.clone());
+
+        // First fetch admits the object and is the insert case; drop it so the
+        // only overlap the second fetch can report is its own.
+        let first = fetcher
+            .whole_object_bytes(
+                &seg_ref(size),
+                TENANT,
+                QueryPhase::Plan,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("first whole_object_bytes");
+        drop(first);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the insert's overlap clears before the hit is measured"
+        );
+
+        let accounting = QueryAccounting::new();
+        let hit = fetcher
+            .whole_object_bytes(&seg_ref(size), TENANT, QueryPhase::Plan, &accounting)
+            .await
+            .expect("second whole_object_bytes");
+        assert_eq!(
+            accounting.snapshot().cache_hits,
+            1,
+            "the second fetch is served from the cache, not the store"
+        );
+        assert_eq!(
+            budget.handoff_overlap(),
+            size,
+            "a cache hit holds the same bytes under the cache cap and this guard"
+        );
+        drop(hit);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the buffer drops"
+        );
+        assert_eq!(budget.reserved(), 0, "the reservation releases with it");
+    }
+
+    /// A block-range read that crosses over to a covering whole-object read
+    /// (ADR-0107 decision 1) holds exactly one object-sized reservation AT ANY
+    /// INSTANT, never two at once. The coverage crossover drops the assembler
+    /// -- releasing both its pooled buffer and its reservation guard -- before
+    /// the covering GET reserves fresh (ADR-1170 decision 2): the object is
+    /// materialized once, so the real peak is one object width, not two.
+    ///
+    /// `with_block_range_threshold(0)` routes the object to the block-range path
+    /// and sets that path's own whole-object crossover to zero, so the object is
+    /// above it and the read skips the pre-probe crossover and reaches the
+    /// coverage crossover (a predicate-free, all-columns read makes every block a
+    /// candidate, so coverage is ~1.0, past the 0.75 default).
+    ///
+    /// Sampling `budget.reserved()` only after the fetch completes (as an
+    /// earlier version of this test did) cannot tell a true peak of one object
+    /// apart from a peak of two that happens to collapse back to one by the
+    /// time the fetch returns -- both end at `size` and drop to `0`. This test
+    /// instead holds the covering GET in flight with a `FaultStore` gate and
+    /// samples the budget from the outside while it is genuinely still
+    /// pending. This fixture's object is small enough that
+    /// `effective_suffix_len` covers the whole object in the initial suffix
+    /// probe, so the only two live `Op::Get` calls this fetch issues are: (1)
+    /// that probe, and (2) the covering GET itself. `Occurrence::Nth(2)` holds
+    /// exactly the second.
+    ///
+    /// Non-vacuity: removing the `drop(asm)` line immediately before the
+    /// `covering_read` call at the version-4 coverage crossover (the dispatch
+    /// takes that branch because `RlogWriter` always emits `PAGE_DIR`, not
+    /// because of the stamped `segment_format_version`, which it never reads)
+    /// restores the shape ADR-1170 decision 2 forbids: the assembler stays
+    /// alive holding its own reservation for the rest of the function while
+    /// `covering_read` reserves a second, independent one for the same object.
+    /// The budget below is sized for two objects specifically so this second
+    /// reservation still succeeds instead of failing closed -- with that
+    /// single line removed, `budget.reserved()` while the covering GET is
+    /// held reads `2 * size`, not `size`, and the in-flight assertion below
+    /// panics on the mismatch (confirmed by making exactly that edit and
+    /// observing the panic before reverting it).
+    ///
+    /// The version-3 crossover applies the identical `drop(asm)` fix at the
+    /// same line shape, but is not covered by a fixture here: `seg_ref_with`
+    /// stamps `segment_format_version = footer::VERSION` (4), `RlogWriter`
+    /// always emits `PAGE_DIR`, and the dispatch in `fetch_object_with_footer`
+    /// takes the version-4 branch whenever `PAGE_DIR` is present, so no object
+    /// built through the production writer ever reaches the version-3 branch.
+    /// Hand-crafting a footer without `PAGE_DIR` to reach it would mean
+    /// bypassing `RlogWriter` entirely, which is out of scope for this crate.
+    #[tokio::test]
+    async fn coverage_crossover_reserves_the_object_once() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let fault = Arc::new(FaultStore::new(store, FaultPlan::default()));
+        // The covering GET is the second live `Get` this fetch issues (see
+        // doc comment above): hold exactly that one.
+        let gate = fault.hold(Op::Get, Some(KEY.to_string()), Occurrence::Nth(2));
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+        // Room for TWO objects, not one: the in-flight sample below must be
+        // able to observe a peak of two live reservations if the code regresses
+        // to that shape, rather than have the fetch fail closed with
+        // `FetchMemoryExhausted` before the covering GET is even attempted
+        // (which would still prove a regression, just not the specific peak).
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(size * 2));
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_block_range_threshold(0)
+            .with_memory_budget(budget.clone());
+
+        let task = tokio::spawn(async move {
+            fetcher
+                .scan_accounted_with_tenant(
+                    &seg_ref(size),
+                    TENANT,
+                    &LogQuery::new(i64::MIN, i64::MAX),
+                    &ColumnSelection::all(),
+                    &QueryAccounting::new(),
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("the covering GET reaches the gate within 30 s");
+        assert_eq!(
+            budget.reserved(),
+            size,
+            "exactly one object-sized reservation is live while the covering \
+             GET is in flight -- the assembler already dropped its own before \
+             this GET reserved fresh, so the peak is one object, not two"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let scan = task
+            .await
+            .expect("join")
+            .expect("a crossover fetch of one object must fit a one-object budget")
+            .expect("the segment is relevant to a full-window query");
+
+        assert_eq!(
+            budget.reserved(),
+            size,
+            "the object is reserved exactly once across the coverage crossover, \
+             never twice"
+        );
+        drop(scan);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "dropping the scan releases the single reservation"
+        );
+    }
+
+    /// `covering_read`'s single-GET branch (`total_size <= max_fetch_run_bytes`)
+    /// on a cache HIT: `cached_extent` returns `(bytes, false)`, a clone of the
+    /// resident cache entry, so the cache cap and this fetch guard both cover
+    /// the same allocation for the buffer's life. This is the same class the
+    /// whole-object funnel's `Source::Cache` arm handles
+    /// (`cache_hit_marks_the_reservation_handed_off` above), left unmarked here
+    /// because `covering_read` is a separate call site.
+    ///
+    /// Reached via the coverage crossover (`with_block_range_threshold(0)`,
+    /// same routing `coverage_crossover_reserves_the_object_once` uses): the
+    /// object is small enough that `total_size` stays under
+    /// `max_fetch_run_bytes`, so this exercises the single-GET branch, not the
+    /// segmented loop.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call added to
+    /// the `else` arm of `covering_read`'s single-GET branch leaves
+    /// `handoff_overlap()` at 0 while the second (cache-hit) scan's buffer is
+    /// held, so the hit assertion below fails with: assertion `left == right`
+    /// failed: a covering-read cache hit holds the same bytes under the cache
+    /// cap and this guard -- left: 0, right: 477 (the fixture object's size;
+    /// confirmed by making exactly that edit, observing the failure, and
+    /// reverting it by hand).
+    #[tokio::test]
+    async fn covering_read_cache_hit_marks_the_reservation_handed_off() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+            16 * 1024 * 1024,
+            100,
+            16 * 1024 * 1024,
+        )));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(16 * 1024 * 1024));
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_block_range_threshold(0)
+            .with_cache(cache)
+            .with_memory_budget(budget.clone());
+
+        // First scan admits the object to the cache (the insert case); drop it
+        // so the only overlap the second scan can report is its own.
+        let first = fetcher
+            .scan_accounted_with_tenant(
+                &seg_ref(size),
+                TENANT,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                &ColumnSelection::all(),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("first scan")
+            .expect("the segment is relevant to a full-window query");
+        drop(first);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the insert's overlap clears before the hit is measured"
+        );
+
+        let accounting = QueryAccounting::new();
+        let hit = fetcher
+            .scan_accounted_with_tenant(
+                &seg_ref(size),
+                TENANT,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                &ColumnSelection::all(),
+                &accounting,
+            )
+            .await
+            .expect("second scan")
+            .expect("the segment is relevant to a full-window query");
+        // Two hits, not one: the suffix probe (ADR-0107) and the covering GET
+        // each read a distinct cache-keyed extent of this small object, and
+        // both are now cache-resident from the first scan.
+        assert_eq!(
+            accounting.snapshot().cache_hits,
+            2,
+            "the second scan's suffix probe and covering read are both served \
+             from the cache, not the store"
+        );
+        assert_eq!(
+            budget.handoff_overlap(),
+            size,
+            "a covering-read cache hit holds the same bytes under the cache cap \
+             and this guard"
+        );
+        drop(hit);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the buffer drops"
+        );
+        assert_eq!(budget.reserved(), 0, "the reservation releases with it");
+    }
+
+    /// `covering_read`'s single-GET branch on a cache MISS: `cached_extent`
+    /// reports `live = true` for both an uncached direct GET and a cache miss
+    /// that its own leader just inserted, so `live` alone cannot tell them
+    /// apart -- the fix branches on `self.cache.is_some()` instead. This is
+    /// the cache-configured case, the very first scan against a fresh cache
+    /// (no warm-up), which is a genuine miss for both the suffix probe and
+    /// the covering read.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call added to
+    /// the `if live` arm of `covering_read`'s single-GET branch leaves
+    /// `handoff_overlap()` at 0 while this scan's buffer is held, so the
+    /// assertion below fails with: assertion `left == right` failed: a
+    /// covering-read cache miss holds the same freshly admitted bytes under
+    /// the cache cap and this guard -- left: 0, right: 477 (the fixture
+    /// object's size; confirmed by making exactly that edit, observing the
+    /// failure, and reverting it by hand).
+    #[tokio::test]
+    async fn covering_read_cache_miss_marks_the_reservation_handed_off() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+            16 * 1024 * 1024,
+            100,
+            16 * 1024 * 1024,
+        )));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(16 * 1024 * 1024));
+        // A small, explicit suffix (unlike the sibling hit test, which relies
+        // on the default `derive_suffix_len` covering the whole object): the
+        // suffix probe then caches a distinct, smaller key than the covering
+        // read's full `(0, total_size)` key, so the covering read cannot ride
+        // the probe's own insert to a hit. With the default suffix both key
+        // the same sub-range, and the probe's insert makes the "covering GET"
+        // that follows in the same scan a hit, not a miss -- there is then no
+        // way to reach the `if live` arm on a first, fresh-cache scan at all.
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_block_range_threshold(0)
+            .with_suffix_len(16)
+            .with_cache(cache)
+            .with_memory_budget(budget.clone());
+
+        let accounting = QueryAccounting::new();
+        let scan = fetcher
+            .scan_accounted_with_tenant(
+                &seg_ref(size),
+                TENANT,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                &ColumnSelection::all(),
+                &accounting,
+            )
+            .await
+            .expect("scan")
+            .expect("the segment is relevant to a full-window query");
+        assert_eq!(
+            accounting.snapshot().cache_hits,
+            0,
+            "the very first scan against a fresh cache, with a suffix probe key \
+             distinct from the covering read's, is a genuine miss on both"
+        );
+        assert_eq!(
+            budget.handoff_overlap(),
+            size,
+            "a covering-read cache miss holds the same freshly admitted bytes \
+             under the cache cap and this guard"
+        );
+        drop(scan);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the buffer drops"
+        );
+        assert_eq!(budget.reserved(), 0, "the reservation releases with it");
     }
 }
 
@@ -6381,7 +8343,7 @@ mod plan_skip_decidable_span_tests {
             min: Some(0i64 as u64),
             max: Some(1_000i64 as u64),
         });
-        let (count, _stats, footer) = f
+        let (count, _stats, footer, carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
@@ -6390,6 +8352,10 @@ mod plan_skip_decidable_span_tests {
         assert!(
             footer.is_some(),
             "skip-decidable branch forwards the parsed footer like the fast path does"
+        );
+        assert!(
+            carried.is_none(),
+            "skip-decidable branch reads no block byte, so it carries no whole-object bytes"
         );
 
         let closed = collector.closed.lock().expect("lock");
@@ -6510,7 +8476,7 @@ mod plan_skip_decidable_span_tests {
             let f = fetcher_with_suffix(store, suffix);
             let acc = QueryAccounting::new();
 
-            let (count, _stats, footer) = f
+            let (count, _stats, footer, _carried) = f
                 .plan_segment(&seg, TENANT, &query, &acc)
                 .await
                 .expect("plan_segment")
@@ -6526,6 +8492,7 @@ mod plan_skip_decidable_span_tests {
                     &ColumnSelection::all(),
                     &indices,
                     footer.as_ref(),
+                    None,
                     &acc,
                 )
                 .await
@@ -6556,6 +8523,331 @@ mod plan_skip_decidable_span_tests {
                 "one count per missed tail section, whichever phase issued the probe"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod fetch_stream_dir_tests {
+    //! Pins two review findings on `LogSegmentFetcher::fetch_stream_dir`
+    //! (#1106): the above-threshold branch's STREAM_DIR probe must report
+    //! through the same `page_fetch` span and `record_probe_misses` channel
+    //! every other plan-phase read carries, and the below-threshold and
+    //! above-threshold branches must agree on the absent-STREAM_DIR
+    //! tolerance the method's own doc comment promises.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([31u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [33u8; 32];
+    const KEY: &str = "t/fetch-stream-dir.rlog";
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: [31u8; 16],
+            shard: 0,
+            writer_id: [6u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "hello world".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![],
+        }
+    }
+
+    fn build_object(records: &[LogRecord]) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity());
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    fn seg_ref(size: u64, records: &[LogRecord]) -> SegmentRef {
+        let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+        let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    async fn store_with_object(bytes: Vec<u8>) -> Arc<MemoryStore> {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        store
+    }
+
+    /// The subset of a `page_fetch` span's fields this test asserts on.
+    #[derive(Default, Debug)]
+    struct Captured {
+        signal: Option<String>,
+        s3_requests: Option<u64>,
+        s3_bytes: Option<u64>,
+        probe_misses: Option<u64>,
+    }
+
+    struct FieldVisitor<'a>(&'a mut Captured);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "s3_requests" => self.0.s3_requests = Some(value),
+                "s3_bytes" => self.0.s3_bytes = Some(value),
+                "probe_misses" => self.0.probe_misses = Some(value),
+                _ => {}
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "signal" {
+                self.0.signal = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    /// Records every `page_fetch` span's fields as of its close, the same
+    /// test-scoped tracing capture `plan_skip_decidable_span_tests` uses.
+    #[derive(Clone, Default)]
+    struct PageFetchCollector {
+        live: Arc<Mutex<HashMap<u64, Captured>>>,
+        closed: Arc<Mutex<Vec<Captured>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PageFetchCollector {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "page_fetch" {
+                return;
+            }
+            let mut captured = Captured::default();
+            attrs.record(&mut FieldVisitor(&mut captured));
+            if let Ok(mut live) = self.live.lock() {
+                live.insert(id.into_u64(), captured);
+            }
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Ok(mut live) = self.live.lock()
+                && let Some(captured) = live.get_mut(&id.into_u64())
+            {
+                values.record(&mut FieldVisitor(captured));
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let taken = self
+                .live
+                .lock()
+                .ok()
+                .and_then(|mut live| live.remove(&id.into_u64()));
+            if let (Some(captured), Ok(mut closed)) = (taken, self.closed.lock()) {
+                closed.push(captured);
+            }
+        }
+    }
+
+    /// `block_range_threshold(0)` routes every nonzero-size object through the
+    /// ranged branch, so the STREAM_DIR probe under test is the one this test
+    /// exercises rather than the whole-object shortcut.
+    fn fetcher_above_threshold(store: Arc<MemoryStore>) -> LogSegmentFetcher {
+        LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(0)
+            .with_block_range(BlockRangeFetcher::new(store).with_whole_object_threshold(0))
+    }
+
+    /// Finding 1 (#1106): the above-threshold
+    /// branch of `fetch_stream_dir` must open the `page_fetch` span and call
+    /// `record_probe_misses`, exactly like `plan_segment_fast`,
+    /// `plan_segment`'s skip-decidable branch, and `plan_segment_block_stats`
+    /// already do, so the STREAM_DIR read it issues shows up in the trace and
+    /// in the probe-miss counter instead of being invisible on both.
+    ///
+    /// Non-vacuity: with the `fetch_span`/`.instrument` wrapping reverted to
+    /// the bare `probe_footer`/`plan_section_raw` calls this method had before
+    /// the fix, no span named `page_fetch` closes during this call,
+    /// `closed.len()` comes out `0`, and the `expect` below panics instead of
+    /// the field assertions running.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn above_threshold_branch_opens_page_fetch_span_and_records_probe_misses() {
+        let _serial = crate::test_tracing::guard();
+
+        let collector = PageFetchCollector::default();
+        let subscriber = tracing_subscriber::registry().with(collector.clone());
+        let _guard = subscriber.set_default();
+
+        const N: usize = 4;
+        let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let seg = seg_ref(total, &records);
+        let store = store_with_object(bytes).await;
+        let f = fetcher_above_threshold(store);
+        let acc = QueryAccounting::new();
+
+        let entries = f
+            .fetch_stream_dir(&seg, TENANT, &acc)
+            .await
+            .expect("fetch_stream_dir")
+            .expect("STREAM_DIR present");
+        assert_eq!(entries.len(), 1, "one stream, every record shares it");
+
+        let closed = collector.closed.lock().expect("lock");
+        assert_eq!(
+            closed.len(),
+            1,
+            "exactly one page_fetch span for this one fetch_stream_dir call"
+        );
+        let span = &closed[0];
+        assert_eq!(span.signal.as_deref(), Some("logs"));
+        assert!(
+            span.s3_requests.is_some_and(|n| n > 0),
+            "must carry the real request count probe_footer/plan_section_raw issued, got {:?}",
+            span.s3_requests
+        );
+        assert!(
+            span.probe_misses.is_some(),
+            "probe_misses must be recorded (structurally 0 or more, but present, not Empty), \
+             got {:?}",
+            span.probe_misses
+        );
+    }
+
+    /// Finding 2 (#1106): the doc comment on
+    /// `fetch_stream_dir` says an absent STREAM_DIR section returns `None`
+    /// regardless of which branch answers the read. `RlogWriter::build_object`
+    /// always writes a STREAM_DIR section unconditionally (see the
+    /// `push_section(&mut object, &mut sections, kind::STREAM_DIR, ...)` call
+    /// both encoder paths make, `crates/ravel-logseg/src/writer.rs:716` and
+    /// `:1536`) -- there is no writer knob to omit it -- so the absent-section
+    /// case is not reachable through a real written object today, matching
+    /// the method's own doc ("never observed on a real object today"). This
+    /// test instead pins what the finding actually requires: the two branches
+    /// must agree on the same object. It drives one fixture through both the
+    /// below-threshold whole-object branch (the default threshold, well above
+    /// this small fixture's size) and the above-threshold ranged branch
+    /// (`with_block_range_threshold(0)`), and asserts they decode the same
+    /// STREAM_DIR entries.
+    #[tokio::test]
+    async fn both_threshold_branches_agree_on_the_same_object() {
+        const N: usize = 3;
+        let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let seg = seg_ref(total, &records);
+
+        // Independent ground truth for the decompressed-byte pins below (issue
+        // #1401 finding 3): STREAM_DIR is a whole-read directory section, always
+        // stored COMP_ZSTD, so its uncomp_len is the exact bytes one decode of it
+        // produces, read straight from the footer rather than through either
+        // branch under test.
+        let stream_desc = *footer::open(&bytes)
+            .expect("open")
+            .section(kind::STREAM_DIR)
+            .expect("STREAM_DIR present");
+        assert_eq!(
+            stream_desc.comp,
+            footer::COMP_ZSTD,
+            "fixture STREAM_DIR must be zstd for this test"
+        );
+        let expected = stream_desc.uncomp_len;
+
+        let below_store = store_with_object(bytes.clone()).await;
+        let below = LogSegmentFetcher::new(below_store);
+        assert!(
+            total <= below.block_range_threshold(),
+            "fixture must be small enough to take the below-threshold branch by default"
+        );
+        let below_acc = QueryAccounting::new();
+        let mut below_entries = below
+            .fetch_stream_dir(&seg, TENANT, &below_acc)
+            .await
+            .expect("fetch_stream_dir (below threshold)")
+            .expect("STREAM_DIR present");
+        assert_eq!(
+            below_acc.snapshot().decompressed_bytes,
+            expected,
+            "below-threshold branch charges exactly STREAM_DIR's zstd uncomp_len"
+        );
+
+        let above_store = store_with_object(bytes).await;
+        let above = fetcher_above_threshold(above_store);
+        let above_acc = QueryAccounting::new();
+        let mut above_entries = above
+            .fetch_stream_dir(&seg, TENANT, &above_acc)
+            .await
+            .expect("fetch_stream_dir (above threshold)")
+            .expect("STREAM_DIR present");
+        assert_eq!(
+            above_acc.snapshot().decompressed_bytes,
+            expected,
+            "above-threshold branch charges exactly STREAM_DIR's zstd uncomp_len"
+        );
+
+        below_entries.sort_by_key(|(id, _)| *id);
+        above_entries.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            above_entries, below_entries,
+            "both branches must decode the same STREAM_DIR entries for the same object"
+        );
     }
 }
 
@@ -7308,6 +9600,76 @@ mod assembly_buffer_tests {
         Arc::new(AssemblyBufferPool::default())
     }
 
+    /// The retention bounds cap idle buffers; nothing reported what scans hold.
+    /// Under `byte-minimal` that live set is one object-sized buffer per
+    /// in-flight ranged read, so it is the figure a memory question actually
+    /// needs (#1771).
+    ///
+    /// Pins magnitudes, not non-emptiness: the gauge must equal the SUM of the
+    /// checked-out sizes, fall back as each is returned, and reach exactly zero
+    /// when they all are. Charging on release instead of acquire, or forgetting
+    /// the release path, leaves a monotonically rising gauge that a
+    /// `live_bytes > 0` assertion would still pass.
+    #[test]
+    fn live_bytes_tracks_the_checked_out_set_and_returns_to_zero() {
+        let pool = pool();
+        let a = pool.acquire(1_000);
+        assert_eq!(pool.stats().live_bytes, 1_000, "one buffer out");
+        let b = pool.acquire(2_500);
+        assert_eq!(
+            pool.stats().live_bytes,
+            3_500,
+            "the sum of both, not the last"
+        );
+        let c = pool.acquire(500);
+        assert_eq!(pool.stats().live_bytes, 4_000);
+        assert_eq!(
+            pool.stats().peak_live_bytes,
+            4_000,
+            "the high-water mark is the peak simultaneous set"
+        );
+
+        drop(b);
+        assert_eq!(
+            pool.stats().live_bytes,
+            1_500,
+            "returning the middle buffer drops exactly its own bytes"
+        );
+        drop(a);
+        drop(c);
+        assert_eq!(
+            pool.stats().live_bytes,
+            0,
+            "every buffer returned leaves nothing live"
+        );
+        assert_eq!(
+            pool.stats().peak_live_bytes,
+            4_000,
+            "the peak survives the buffers that produced it"
+        );
+    }
+
+    /// A reused buffer keeps the length of the largest object it has served, so
+    /// the live charge is its resident length rather than the requested one.
+    /// Stated as a test because the two differ only after a reuse, which is
+    /// exactly when a reader would assume they agree.
+    #[test]
+    fn a_reused_buffer_charges_its_resident_length() {
+        let pool = pool();
+        let big = pool.acquire(4_000);
+        drop(big);
+        assert_eq!(pool.stats().live_bytes, 0);
+
+        let small = pool.acquire(100);
+        assert_eq!(
+            pool.stats().live_bytes,
+            4_000,
+            "the pooled buffer is still 4,000 bytes resident, whatever this read asked for"
+        );
+        drop(small);
+        assert_eq!(pool.stats().live_bytes, 0, "and all of it comes back");
+    }
+
     /// The exact allocation figures the fix is about: three same-sized reads
     /// through one pool allocate ONE buffer and zero its bytes ONCE, with the
     /// other two served by reuse. Before the fix each `ObjectAssembler::new`
@@ -7317,7 +9679,7 @@ mod assembly_buffer_tests {
     fn three_reads_allocate_and_zero_one_object_sized_buffer() {
         let pool = pool();
         for _ in 0..3 {
-            let asm = ObjectAssembler::new(&pool, 4096);
+            let asm = ObjectAssembler::new(&pool, 4096, None);
             drop(asm);
         }
         assert_eq!(
@@ -7326,6 +9688,9 @@ mod assembly_buffer_tests {
                 allocated: 1,
                 reused: 2,
                 zeroed_bytes: 4096,
+                // Sequential: each buffer is dropped before the next is taken.
+                live_bytes: 0,
+                peak_live_bytes: 4096,
             }
         );
     }
@@ -7336,15 +9701,19 @@ mod assembly_buffer_tests {
     #[test]
     fn a_pooled_buffer_zeroes_only_what_it_grows_by() {
         let pool = pool();
-        drop(ObjectAssembler::new(&pool, 4096));
-        drop(ObjectAssembler::new(&pool, 6144));
-        drop(ObjectAssembler::new(&pool, 1024));
+        drop(ObjectAssembler::new(&pool, 4096, None));
+        drop(ObjectAssembler::new(&pool, 6144, None));
+        drop(ObjectAssembler::new(&pool, 1024, None));
         assert_eq!(
             pool.stats(),
             AssemblyBufferStats {
                 allocated: 1,
                 reused: 2,
                 zeroed_bytes: 6144,
+                // The 1 KiB read reuses the grown 6 KiB buffer, so the peak is
+                // that resident length rather than the largest object asked for.
+                live_bytes: 0,
+                peak_live_bytes: 6144,
             }
         );
     }
@@ -7355,8 +9724,8 @@ mod assembly_buffer_tests {
     #[test]
     fn a_reused_buffer_is_truncated_to_the_current_objects_length() {
         let pool = pool();
-        drop(ObjectAssembler::new(&pool, 4096));
-        let asm = ObjectAssembler::new(&pool, 1024);
+        drop(ObjectAssembler::new(&pool, 4096, None));
+        let asm = ObjectAssembler::new(&pool, 1024, None);
         assert_eq!(asm.buf.as_slice().len(), 1024);
         assert_eq!(asm.into_bytes().len(), 1024);
     }
@@ -7372,7 +9741,7 @@ mod assembly_buffer_tests {
     #[test]
     fn slice_refuses_any_range_no_fetch_placed() {
         let pool = pool();
-        let mut asm = ObjectAssembler::new(&pool, 64);
+        let mut asm = ObjectAssembler::new(&pool, 64, None);
         asm.place("k", 8, &[0xABu8; 8]).expect("place");
 
         assert_eq!(asm.slice("k", 8, 8).expect("placed range"), &[0xABu8; 8]);
@@ -7407,11 +9776,11 @@ mod assembly_buffer_tests {
     #[test]
     fn a_reused_buffer_refuses_the_previous_objects_bytes() {
         let pool = pool();
-        let mut first = ObjectAssembler::new(&pool, 64);
+        let mut first = ObjectAssembler::new(&pool, 64, None);
         first.place("a", 8, &[0xABu8; 8]).expect("place");
         drop(first);
 
-        let second = ObjectAssembler::new(&pool, 64);
+        let second = ObjectAssembler::new(&pool, 64, None);
         assert_eq!(pool.stats().reused, 1, "the same buffer came back");
         assert_eq!(
             second.buf.as_slice().get(8..16),
@@ -7429,17 +9798,21 @@ mod assembly_buffer_tests {
     #[test]
     fn a_buffer_returns_to_the_pool_only_after_its_bytes_are_dropped() {
         let pool = pool();
-        let mut asm = ObjectAssembler::new(&pool, 64);
+        let mut asm = ObjectAssembler::new(&pool, 64, None);
         asm.place("a", 0, &[0xCDu8; 64]).expect("place");
         let held = asm.into_bytes();
 
-        let concurrent = ObjectAssembler::new(&pool, 64);
+        let concurrent = ObjectAssembler::new(&pool, 64, None);
         assert_eq!(
             pool.stats(),
             AssemblyBufferStats {
                 allocated: 2,
                 reused: 0,
                 zeroed_bytes: 128,
+                // Both buffers are out at once here, which is the case the
+                // gauge exists for: the idle bounds say nothing about it.
+                live_bytes: 128,
+                peak_live_bytes: 128,
             },
             "a live Bytes keeps its buffer out of the pool"
         );
@@ -7447,7 +9820,7 @@ mod assembly_buffer_tests {
         drop(concurrent);
         drop(held);
 
-        drop(ObjectAssembler::new(&pool, 64));
+        drop(ObjectAssembler::new(&pool, 64, None));
         assert_eq!(pool.stats().reused, 1, "both buffers are back");
     }
 
@@ -7458,7 +9831,7 @@ mod assembly_buffer_tests {
     fn the_idle_set_is_bounded_by_count() {
         let pool = pool();
         let live: Vec<ObjectAssembler> = (0..MAX_IDLE_ASSEMBLY_BUFFERS + 2)
-            .map(|_| ObjectAssembler::new(&pool, 64))
+            .map(|_| ObjectAssembler::new(&pool, 64, None))
             .collect();
         assert_eq!(
             pool.stats().allocated,
@@ -7480,8 +9853,8 @@ mod assembly_buffer_tests {
             max_idle_bytes: 3072,
             ..AssemblyBufferPool::default()
         });
-        let a = ObjectAssembler::new(&pool, 2048);
-        let b = ObjectAssembler::new(&pool, 2048);
+        let a = ObjectAssembler::new(&pool, 2048, None);
+        let b = ObjectAssembler::new(&pool, 2048, None);
         drop(a);
         drop(b);
         {
@@ -7496,7 +9869,7 @@ mod assembly_buffer_tests {
 
         // Takes the one idle buffer, grows it past the budget, and is therefore
         // not taken back.
-        drop(ObjectAssembler::new(&pool, 4096));
+        drop(ObjectAssembler::new(&pool, 4096, None));
         let idle = pool.idle.lock().expect("idle");
         assert!(
             idle.bufs.is_empty(),

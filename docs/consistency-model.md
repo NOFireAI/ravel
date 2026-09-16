@@ -1,7 +1,12 @@
 # Consistency, Durability, and Failure Semantics
 
-Normative. Tests in `crates/ravel-failure-tests` assert every claim here. If
-code and this document disagree, one of them is a bug and the fix updates both.
+Normative. Every claim here is asserted somewhere in the workspace, split by
+subject rather than gathered in one crate: `crates/ravel-failure-tests`
+covers acknowledgement semantics, the crash matrix, and duplicate handling;
+`crates/ravel-catalog` and `crates/ravel-maintain` cover snapshot isolation
+and staleness, compaction, online resharding, deletion and GC, and selective
+subject erasure. If code and this document disagree, one of them is a bug
+and the fix updates both.
 
 Guarantees come first in this file, mechanism second. Four distinctions run
 through it, and keeping them apart is how to read it:
@@ -38,7 +43,31 @@ Strict mode (default):
 
 Buffered mode (opt-in per request, named "buffered"):
 - Acknowledged after admission and enqueue to a shard actor. A crash between
-  ack and flush loses the buffered window (bounded by max flush delay).
+  ack and flush loses the buffered window. Max flush delay bounds when the
+  flush is triggered, not when it completes: the flush task then waits for a
+  `max_inflight_flushes` permit on its shard (ADR-1642) and runs its PUTs, so
+  a shard whose permits are held by a stalled flush widens the window until
+  the stall clears.
+- The `max_flush_lifetime` abandonment budget is measured from the moment the
+  flush's permit is granted, not from flush-open, so time spent queued behind
+  a stalled prefix does not count against it: a flush that waited behind a
+  throttled tenant still gets its full lifetime for its own store calls once it
+  holds a permit. A flush whose flush-open deadline already elapsed when its
+  task is scheduled is abandoned without taking a permit rather than wasting
+  one.
+- Loss from a stalled co-resident prefix is therefore not a buffered-mode
+  outcome: a flush queued behind the stall reaches the store once the stall
+  clears. Buffered rows are dropped with no crash only when the flush's own
+  store calls, after it holds the permit, cannot complete within
+  `max_flush_lifetime` (a genuinely stuck backend, not a queue wait), and those
+  rows were already acked. `max_flush_lifetime` defaults to 3600 s and is not
+  operator-tunable from the server.
+- Strict mode does not share the buffered loss exposure, because a strict
+  write is acked only after its flush commits and an abandoned flush returns a
+  retryable error instead. A strict write co-resident with a stalled prefix
+  instead takes `WriteError::AckTimeout` once the request's ack deadline
+  elapses while its flush is still queued for the permit, even though its own
+  prefix stayed healthy.
 - Never described as durable. No commit token is returned.
 
 Rejection: admission failures (limits, auth, quota) reject before buffering
@@ -50,10 +79,13 @@ rejected point counts and reasons.
 - A batch becomes visible to queries when its commit record exists; commit
   record creation is atomic (create-if-absent), so visibility is atomic per
   L0 object.
-- Visibility latency = flush delay + data PUT + commit PUT. The flush delay
-  is a configurable operator budget (`--max-flush-delay`), default 2 s in
-  strict mode (ADR-0076 decision 4); the p99 visibility target under target
-  load tracks that budget, not a fixed sub-second constant.
+- Visibility latency = flush delay + flush-permit wait + data PUT + commit
+  PUT. The flush delay is a configurable operator budget
+  (`--max-flush-delay`), default 2 s in strict mode (ADR-0076 decision 4);
+  the p99 visibility target under target load tracks that budget, not a fixed
+  sub-second constant. The permit wait is zero unless the shard already has
+  `max_inflight_flushes` flushes running (ADR-1642), which is where a stalled
+  tenant's throttled prefix shows up in a co-resident tenant's visibility.
 - There is no cross-shard ordering guarantee. A query snapshot may include
   commit N+1 of shard A and not commit M of shard B, regardless of wall-clock
   order. Per (writer, shard), commits are sequenced by `seq`.
@@ -226,6 +258,31 @@ and no stronger; it does not promise a single stored copy per record.
   far-past or far-future hour. The same floor extends the fail-loud flush-open
   check, so a clock that goes bad between a buffered ack and flush open fails
   the flush instead of writing a nonsense bucket.
+- That compiled floor bounds the *range* of a flush-open reading, not its
+  *order* against earlier flushes of the same writer. The flush-open reading is
+  also stamped as the commit record's `created_unix_ns`, the primary key of the
+  query-time duplicate-resolution order (docs/catalog-and-mvcc.md,
+  "Cross-segment duplicate samples"), so a backwards wall-clock step (an NTP
+  correction, a manual set) small enough to stay above the floor could stamp a
+  correction below the stale sample it supersedes and invert the resolution.
+  Each shard actor therefore holds the flush-open stamp to a per-writer
+  monotonic floor: every reading is raised to the highest stamp this writer has
+  already issued, so stamps are non-decreasing within a process lifetime and
+  each absorbed step is counted (intended for export as
+  `ravel_ingest_clock_regressions_total` once the Prometheus wiring lands). A
+  backwards step larger than
+  a bounded hold (the catalog clock-skew allowance, `DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`,
+  5 min) is refused with a typed, retryable error (`Abandoned`, 503) rather than
+  absorbed, so a spurious forward glitch cannot ratchet the floor into a future
+  ingest hour and strand every later flush. The refused flush re-anchors the
+  floor to the raw reading and re-buffers its rows rather than dropping them, so
+  the next trigger flushes them once and the refusal costs availability, not
+  durability. The floor is in-process state,
+  reset to 0 on restart by construction; the guarantee is per-process, and a
+  backwards step spanning a restart can still invert resolution. `writer_id`
+  does not close this: it is not part of the duplicate-resolution comparator,
+  only a final tiebreak in the catalog segment sort. ADR-1307 records the
+  limitation.
 - Config discipline: `max_ingest_lag` is one shared bound, not a per-signal
   one, in the sense that matters operationally, though it is not shared by
   reference: the admission checks (one `max_ingest_lag_ns` constant per
@@ -279,7 +336,7 @@ each degraded path resolves) is in docs/catalog-and-mvcc.md.
 
 ## Recent-hours read path
 
-`max_segments` (default 1024) caps only the sealed, below-watermark set a
+`max_segments` (default 1,000,000) caps only the sealed, below-watermark set a
 resolve extracts from snapshot parts. Recent segments listed live above the
 fold watermark and token-resolved segments from an explicit
 `min_commit_token` are exempt from that cap, so a hot tenant's open hour and a
@@ -376,14 +433,18 @@ tiers) is predicate-granular deletion built on the same durable-transaction,
 logical-exclusion, physical-removal shape as every other deletion. Query
 exclusion is immediate and cache-tight: no query whose snapshot resolves after
 the request ack returns matching records, from store or any cache tier, and
-in-flight queries drain within the query deadline, which is at most
-`max_query_duration`. The erasure stage bounds are a guarantee, not a target:
+in-flight queries drain within the query deadline, the engine's enforced query
+timeout, 11 min by default. That deadline is a distinct quantity from
+`max_query_duration`, the GC protection budget it fits under, 1 h by default:
+the first is what the engine cancels a query at, the second is how long the
+sweeps keep an input readable for a query that pinned it. Sizing a drain
+window uses the first. The erasure stage bounds are a guarantee, not a target:
 
 | Stage | Guarantee | Worst-case bound (defaults) |
 |---|---|---|
-| Query exclusion | No query whose snapshot resolves after the request ack returns matching records, from store or any cache tier | immediate; all in-flight queries drain within the query deadline (30 s by default, never more than `max_query_duration`, 1 h) |
-| Rewrite complete (`.done`) | Every live commit-record segment a snapshot resolves is free of matching records, verified through the catalog resolver. Index entries and derived datasets carry no subject values, so they are free of matching records by construction | `erasure_rewrite_deadline`, default 72 h; a pending request older than this raises an alarm metric |
-| Physical bytes gone from the bucket | Superseded inputs swept | `.done` + `protection_horizon` (default `max_query_duration` + `grace` + `clock_skew_allowance` = 1 h + 24 h + 5 min) + one sweep interval (default 5 min); with defaults, about four days end to end (72 h + 25 h 5 min + 5 min) |
+| Query exclusion | No query whose snapshot resolves after the request ack returns matching records, from store or any cache tier | immediate; all in-flight queries drain within the query deadline, the engine's enforced query timeout, 11 min by default, validated at startup against `max_query_duration`, the GC protection budget it fits under, 1 h by default |
+| Rewrite complete (`.done`) | Every record that existed when the request was acknowledged is gone from every live commit-record segment a snapshot resolves, verified through the catalog resolver. A bucket still open at the ack is covered once it seals: completion waits for that seal and the rewrite that follows it rather than excluding the bucket. Records ingested after the ack are outside the request's scope. Snapshot entries, part headers, and name postings hold no label or attribute value, and derived datasets are a query-time stage with nothing durable, so both are free of matching records; the per-part `.cstat` column-statistics objects are the exception the pass does not cover, because for a tenant with a `STR` or `BYTES` typed attribute column they hold that subject's own column value, so a compliance lock on the catalog family costs an erasure obligation there rather than only a reclamation delay (object store contract, "Required bucket configuration", "A lock on the catalog family") | `erasure_rewrite_deadline`, default 72 h; a pending request older than this raises an alarm metric. The wait for a bucket open at the ack is bounded by `max_ingest_lag` + one bucket span + `max_flush_lifetime` + `clock_skew_allowance` (4 h 5 min with defaults), well inside that deadline |
+| Physical bytes gone from the bucket | Superseded inputs swept. A pre-rewrite part's `.cstat` is on a separate path: it stays referenced, and so unsweepable, while the live HEAD still names that part | `.done` + `protection_horizon` (default `max_query_duration` + `grace` + `clock_skew_allowance` = 1 h + 24 h + 5 min) + one sweep interval (default 5 min); with defaults, about four days end to end (72 h + 25 h 5 min + 5 min). A scoped compliance lock on a superseded input's commit record raises that record's, and the pass's, physical-removal bound to `max(bound, R)` for the lock's retention `R`. For a tenant with a `STR` or `BYTES` typed attribute column the `.cstat` path is longer still and open-ended under the shipped Maintain IAM policy; its exact bound and the IAM ceiling are in the object store contract's "Required bucket configuration", "A lock on the catalog family" |
 | Physical bytes gone from query-node disk caches | Non-durable local copies aged out | sweep + disk-tier entry max-age (24 h); or immediately, by deleting cache directories (ADR-0046: a node with its cache directory deleted mid-flight answers every query correctly) |
 
 The mechanism behind these bounds (the durable predicate record, the

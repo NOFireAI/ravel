@@ -31,6 +31,21 @@ replica still acknowledges a strict write the moment its own commit PUT returns.
 The saving compounds with the other levers on the same bill (shard count,
 flush cadence), because they are different terms of the same product.
 
+Affinity narrows which *replicas* a tenant reaches, not which *shards*. Within
+a replica a tenant's series still hash across all of that replica's shards, so
+affinity does not isolate a tenant from a per-shard object-store stall: if one
+tenant's key prefix is being throttled (`503 SlowDown`, which the store applies
+per prefix), its stalled flush holds a permit on that shard and co-resident
+tenants' flushes queue behind it on every replica in the subset, and a smaller
+or different subset does not change that. The shard actor itself keeps running,
+so those tenants' writes are still accepted and their age triggers still fire;
+what they wait for is a permit to flush on. The control for
+cross-tenant flush isolation on a shard is `max_inflight_flushes`
+(docs/ingest.md "Shard actor"), not the subset size and not the shard count.
+Under the operator, set it with `spec.gateway.maxInflightFlushes` on the
+`RavelCluster` (see [kubernetes.md](kubernetes.md)), which renders
+`--max-inflight-flushes` onto the gateway Deployment; it defaults to 1.
+
 There is a read-side benefit too. Fewer, larger L0 objects mean fewer open-hour
 segments for a query to open, which lowers the per-query request budget.
 
@@ -225,10 +240,15 @@ is the resolved tenant, not the token. `authorizationHeader`, by contrast, moves
 a tenant on every rotation (see [Choosing the key](#choosing-the-key)).
 
 There is a real gap to know before choosing it: **the only resolver the CRD
-wires through is static tenant tokens**, via `spec.tenantTokensSecretRef`. The
-resolver chain itself can do OIDC and mTLS resolution, but there is no CRD
-field that threads OIDC issuer or JWKS, or mTLS CA configuration, into the
-router. So `canonicalTenant` works
+wires through is static tenant tokens**, via `spec.tenantTokensSecretRef`. OIDC
+is a resolver the chain can run, but no CRD field threads an issuer or JWKS URL
+into the router. mTLS resolution is not available at any layer: the router
+builds one resolver chain shared by every listener, and the mTLS resolver trusts
+a client-supplied identity header with no verification of its own, so
+`ravel-ingest-router` refuses `--mtls-enabled` outright rather than let any
+client set that header and pick its own tenant. A CRD field would not change
+that; isolating the resolver needs a dedicated mTLS listener the router does not
+have. So `canonicalTenant` works
 only for clusters authenticating with static tenant tokens. If you rely on OIDC
 or mTLS for tenancy, `canonicalTenant` is not usable for you; use
 `authorizationHeader`, which hashes the token bytes.
@@ -627,17 +647,24 @@ can pin itself onto a busy subset.
 TLS with client-certificate authentication configured. If it is not, the subject
 is empty, every request hashes to the same key, and **every tenant lands on one
 subset**, a much worse outcome than no affinity. Verify client-cert
-authentication is actually on before selecting this.
+authentication is actually on before selecting this. The router reads the
+subject from the identity header the terminating layer stamps and never
+verifies a certificate itself, so under `ravelNative` a client that can reach
+the router directly can set that header and choose its own subset, the same
+way it can under `header`. Only use this when clients cannot reach the router
+without passing through the terminating layer.
 
 **`canonicalTenant` (`ravelNative` only).** Hashes the canonical `TenantId` that
 Ravel's own resolver produces, not any raw wire value. **Immune to token
 rotation**: rotating a tenant's token does not move it to a new subset. This is
 the one key source that survives a rotation cleanly. Caveats: it is rejected on
 `backend: ingressNginx` (nginx cannot run the resolver), and it only works for
-clusters authenticating with static tenant tokens (`tenantTokensSecretRef`),
-because OIDC and mTLS resolution have no CRD surface. Selecting
-`canonicalTenant` without a resolver degrades the router with
-`CanonicalTenantResolverMissing`. See
+clusters authenticating with static tenant tokens (`tenantTokensSecretRef`):
+OIDC has no CRD surface, and mTLS resolution is not an option at all, because
+`ravel-ingest-router` refuses `--mtls-enabled` unconditionally (it builds one
+resolver chain shared by every listener, with no dedicated mTLS listener to
+isolate it behind). Selecting `canonicalTenant` without a resolver degrades
+the router with `CanonicalTenantResolverMissing`. See
 [The `canonicalTenant` key source](#the-canonicaltenant-key-source).
 
 Under the legacy backend, header names are lowercased with every character

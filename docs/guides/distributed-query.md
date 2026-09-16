@@ -213,12 +213,23 @@ node writes one object it alone ever writes:
 sys/query/workers/<process_id>
 ```
 
-The record is a small JSON control-plane payload carrying the process id, the
-`fragment_endpoint` (`host:port` of its cluster-internal gRPC listener), the
-`queryfrag` protocol version it speaks, and a liveness timestamp re-stamped on
-every beat. The write is an unconditional overwrite: one writer per key, no
-compare-and-swap, no contention. This is the same pattern `maintain` mode
-processes already use for their own heartbeats.
+The record is a small JSON control-plane payload carrying the process id, two
+endpoints, the `queryfrag` protocol version it speaks, and a liveness timestamp
+re-stamped on every beat. The two endpoints are the two surfaces the two
+distributed lanes dial:
+
+- `fragment_endpoint`: the `queryfrag` `SeriesFetch` surface the PromQL lane
+  dials. With a dedicated fragment listener it is that listener's TLS address;
+  without one it is the public gRPC listener.
+- `flight_sql_endpoint`: the Flight SQL `DoGet` surface the SQL lane dials. This
+  is always the public gRPC listener, which mounts Flight SQL, reached
+  plaintext. It is separate from `fragment_endpoint` because the dedicated
+  fragment listener serves only `SeriesFetch` and no Flight service, so a SQL
+  slice fetch must dial the public gRPC address rather than the fragment one.
+
+The write is an unconditional overwrite: one writer per key, no compare-and-swap,
+no contention. This is the same pattern `maintain` mode processes already use for
+their own heartbeats.
 
 On the same cadence (`H` = 60 s by default) every node lists the prefix and
 refreshes its view. The **live set** is itself plus every sibling whose stamp
@@ -274,6 +285,7 @@ comma-separated `key=value` spec:
 | `name` | yes | The cluster's stable operator-facing label. This is the only identity a client ever sees for the remote (in `warnings`). |
 | `endpoint` | yes | `host:port` of the remote's fragment surface. |
 | `credential-file` | yes | File holding the bearer token this coordinator presents to that remote. |
+| `tenant` | no | The one local tenant whose queries fan out to this remote. Omitting it makes the remote reachable by every local tenant, which only a coordinator resolving at most one local tenant may do. See [One remote credential per local tenant](#one-remote-credential-per-local-tenant). |
 | `tls` | no | `true` or `false`, default `true`. Those two literals only; any other value fails startup with a message naming it. |
 | `tls-ca-file` | no | CA bundle for the remote's server certificate. A spec carrying this key and no `tls` key means TLS is on with that CA trusted, and is accepted. Only the explicit `tls=false` alongside a CA file fails startup, because there the bundle would be inert. |
 | `skip-unavailable` | no | `true` or `false`, default `false`. Same two literals only. |
@@ -291,16 +303,21 @@ answered within its bound is treated as unavailable.
 Every one of these is validated at startup, not at the first federated query:
 a malformed spec, an unknown key, a `tls` or `skip-unavailable` value that is
 not `true` or `false`, a duplicate cluster name, `tls=false` next to a
-`tls-ca-file`, a zero soft timeout, or an unreadable or empty credential file
-all fail the process before it binds a listener.
+`tls-ca-file`, a zero soft timeout, an empty `tenant` value, or an unreadable or
+empty credential file all fail the process before it binds a listener. A remote
+cluster that names no local tenant on a coordinator that runs queries for more
+than one also fails startup here; see [One remote credential per local
+tenant](#one-remote-credential-per-local-tenant).
 
 ### What crosses the boundary, and what does not
 
 A federated request carries **matchers, a time window, and budgets**, never
 segment references and never object-store credentials. The remote resolves its
 own snapshot over that window and runs it through its ordinary query path, so
-it enforces its own admission limits, its own tenancy hashing, its own
-selective-erasure predicates, and its own budgets.
+it enforces its own admission limits, its own tenancy hashing, and its own
+selective-erasure predicates. The budgets travel with the request and are the
+caller's carried limits, applied by the remote; the coordinator re-enforces
+them over the folded remote spend regardless.
 
 The credential is an **operator** secret, and the tenant the remote serves is
 derived from that credential by the remote's own resolver chain. A coordinator
@@ -314,10 +331,74 @@ tenant registry.
 `RemoteClusterConfig`'s debug formatting prints `credential: <redacted>`, so a
 config dump or a panic message never leaks the operator secret.
 
+### One remote credential per local tenant
+
+A remote cluster's `credential-file` holds **one** bearer token, and the remote
+resolves **one** tenant from it. So that credential belongs to one local tenant,
+and `tenant` names which. A query from any other local tenant does not reach
+that remote at all: it presents no credential, issues no request, and gets no
+remote series.
+
+A coordinator serving local tenants `acme` and `beta`, each with its own account
+on a shared remote, writes one spec per local tenant:
+
+```sh
+ravel-server --mode query \
+  --tenant-token acme-token:acme \
+  --tenant-token beta-token:beta \
+  --remote-cluster name=eu-acme,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-acme.token,tenant=acme \
+  --remote-cluster name=eu-beta,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-beta.token,tenant=beta
+```
+
+Two specs to the same endpoint under distinct `name`s is the supported shape.
+There is no syntax for naming several local tenants on one spec, because that
+would put them back behind one credential, which is the whole problem.
+
+**A local tenant no remote names gets local data only.** Its queries and its
+discovery calls resolve against this cluster's data and nothing else. That is a
+complete answer, not partial coverage: a remote it holds no credential for is
+outside its query rather than missing from it, so no `warnings` entry and no
+`partial: true` appear. Configuring a remote for a tenant that has none is
+adding a spec with its `tenant`.
+
+Omitting `tenant` makes a remote reachable by **every** local tenant. That is
+correct on a coordinator that runs queries for only one local tenant, and it is
+what a single-tenant deployment writes. Anywhere else it is the exposure this
+key exists to remove, so **a coordinator that runs queries for more than one
+local tenant refuses to start with an unmapped remote cluster**, naming every
+spec that needs a `tenant`. A coordinator runs queries for more than one local
+tenant when:
+
+- two or more `--tenant-token` values or `--tenant-token-file` lines name
+  different tenants, or
+- `--alert-rules-file` names a tenant that no `--tenant-token` value or
+  `--tenant-token-file` line does,
+  since one alert evaluator runs per tenant in that file and its queries go
+  through the same engine, or
+- any dynamic resolver is enabled: `--dev-insecure-tenant-header`,
+  `--oidc-issuer`, or `--mtls-enabled`, each of which derives the tenant from a
+  request header or a token claim.
+
+Startup also refuses a `tenant` that no `--tenant-token`, `--tenant-token-file`,
+or `--alert-rules-file` names, where the tenant set is fully known (static
+configuration, no dynamic resolver). Such a mapping can never fire, and its only
+symptom would be a remote that quietly answers nobody. Under a dynamic resolver
+the static configuration is not the tenant set, so the check does not apply
+there.
+
+Mapping a remote to a tenant that only `--alert-rules-file` names is supported
+and is a real deployment: alert rules for a tenant whose data lives partly on a
+remote.
+
+None of this changes what the remote does with the credential it is presented:
+it resolves its own tenant from it and ignores any tenant on the wire. The
+mapping decides **which local tenant may present a given credential**; the
+remote still decides what that credential is entitled to see.
+
 Both the value-bearing endpoints (`/api/v1/query`, `/api/v1/query_range`) and
 the discovery endpoints (`/api/v1/series`, `/api/v1/labels`,
 `/api/v1/label/<name>/values`) federate, through the same coordinator and with
-the same semantics.
+the same semantics, so both honour the mapping.
 
 ### What a client sees when a remote is degraded
 
@@ -434,6 +515,24 @@ all-or-nothing.** A slice failure is retried, then absorbed locally, then
 raised as a typed error. It is never turned into a partial merge. Only
 cross-cluster federation can return partial coverage, and only when an
 operator opted that remote into it.
+
+The rule holds on both lanes for metrics. A metrics statement over the cost gate
+runs the same three steps per slice (the assigned worker, one re-dispatch to
+another worker, then a coordinator-local read of the same slice ticket), and its
+local read runs the identical worker fragment over the identical pinned
+segments, so a statement that falls back returns the same bytes it would have
+returned with every worker healthy. Two differences from the PromQL lane are
+worth knowing while reading a trace: the SQL lane places slice `k` on roster
+entry `k % len` rather than by rendezvous rank, and it keeps no quarantine map,
+so a dead worker is tried again by the next statement instead of being skipped
+until its heartbeat stamp advances. It costs one refused connection per slice
+assigned to that worker, not a failed statement. The SQL lane's own counters are
+per query rather than on `/metrics`; its coordinator logs a `warn` naming the
+slice on every re-dispatch and every local read.
+
+Log and trace *search* on the SQL lane does not have this sequence yet: a worker
+error there still fails the statement, so a dead-but-registered worker is
+visible for the rest of its staleness window on those tables.
 
 ![Failure flow: intra-cluster slice re-dispatch and local fallback, and the cross-cluster skip path](../diagrams/distributed-query-failure.svg)
 

@@ -85,10 +85,18 @@ where
 /// Both halves of ADR-0103 decision 1: whether this query may attempt
 /// order-insensitive aggregation pushdown.
 ///
-/// - `false` immediately when `federation` is `Some` (decision 1(a)): any
-///   configured remote means a local partial can be incomplete for a series the
-///   remote also holds. Unconditional, regardless of how many remotes are
-///   configured or whether they would actually contribute.
+/// - `false` immediately when `federation` is `Some` (decision 1(a)): a remote
+///   this query reaches means a local partial can be incomplete for a series
+///   the remote also holds. Unconditional, regardless of how many remotes are
+///   reachable or whether they would actually contribute.
+///
+///   `federation` is the context AS THIS QUERY'S TENANT SEES IT, which is what
+///   the caller must pass: a process-wide context holds every local tenant's
+///   remotes, and `Federation::fetch` dispatches only to the ones keyed to the
+///   caller's tenant (plus the unkeyed ones). Passing the unfiltered context
+///   would declare every tenant on a multi-tenant coordinator ineligible
+///   because one other tenant has a remote. That is safe but wrong: a tenant
+///   that fans out to nothing has no remote runs to be incomplete for.
 /// - Otherwise, `true` iff every resolved segment's `ingest_hour_bucket` is
 ///   owned by one and the same shard generation's stable interval (decision
 ///   1(b)), evaluated with [`DEFAULT_SCAN_SLACK_HOURS`].
@@ -185,6 +193,7 @@ mod tests {
         Federation::new(vec![RemoteCluster {
             name: "eu-west".to_string(),
             fetcher: Arc::new(NeverCalledFetcher),
+            tenant: None,
             skip_unavailable: false,
             soft_timeout: Duration::from_secs(1),
         }])

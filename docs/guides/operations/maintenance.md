@@ -33,7 +33,8 @@ It needs a backend that reports the `multipart` capability, and it serves no
 ingest or query routes. It still binds `--listen-http` for liveness.
 
 `--maintain-tenant <name>`, repeatable, names a tenant this process maintains in
-addition to every tenant named by `--tenant-token`. It is required for a
+addition to every tenant named by `--tenant-token` or `--tenant-token-file`.
+It is required for a
 deployment that authenticates through OIDC or mTLS, because those tenants are
 only known once a request arrives and maintenance has no other way to learn
 about them.
@@ -75,6 +76,13 @@ before anything else goes wrong.
 `--disable-fold` turns the background task off. `--fold-interval-secs` (default
 300) controls only how often it wakes up to check for newly sealed hours; it has
 no bearing on when an hour becomes eligible to seal.
+
+Disabling the fold has one monitoring consequence to know: the fold-liveness
+gauge (`ravel_catalog_fold_last_success_timestamp_seconds`) never advances past
+its `0` sentinel with no fold to stamp it, so the `RavelCatalogFoldStalled`
+alert in the observability guide pages about ten minutes after start. That is
+consistent with the unsealed span growing, but if you run a fleet with the fold
+intentionally off, drop that alert for it rather than leave it paging.
 
 ### The seal margin, and why it matters
 
@@ -307,8 +315,10 @@ ravel-cli maintain migrate --tenant <t> --signal <metrics|logs|spans> \
 target on-object format version. One invocation:
 
 1. walks buckets in shard and ingest-hour order from a durable cursor, rewriting
-   every sealed, un-tombstoned, not-yet-compacted bucket that still has an L0
-   commit record below the target version. This reuses the compaction rewrite
+   every sealed, un-tombstoned bucket that still has an L0 commit record below
+   the target version and served raw. A bucket that already carries a compaction
+   or rewrite record is visited too, because a record can leave an input served
+   raw. This reuses the compaction rewrite
    primitive, so the rewrite is bucket-atomic and produces a compaction record
    exactly as compaction does;
 2. stops early and persists the cursor once `--budget-records` is spent (`0`,
@@ -317,13 +327,33 @@ target on-object format version. One invocation:
    below the target.
 
 A refused raise, reported as "FOUND STRAGGLERS", means the fresh re-audit found
-genuine live data still below the target: a bucket too recently landed to be
-sealed and migrated yet, or data that arrived after the walk passed. Re-run
-`migrate`; that data migrates once it is sealed.
+genuine live data still below the target. Whether re-running helps depends on
+why. A bucket too recently landed to be sealed, or data that arrived after the
+walk passed, migrates on a later run. But an L0 input that only a losing
+compaction record names is served raw and the walk cannot migrate it, so that
+refusal is permanent until the overlap itself is resolved and re-running reports
+the same count forever. `buckets_blocked` in the report counts the buckets in
+that state; when it is non-zero, re-running is not the remedy.
 
-The re-audit's liveness definition already excludes a bucket's pre-rewrite L0
-commit records once that bucket carries a compaction or rewrite record. Those
-records are dead, sweepable leftovers of a rewrite this same invocation may have
+The counter is narrowed to that case deliberately. The rewrite primitive also
+refuses a bucket when a concurrent compaction or erasure lands between the
+walk's listing and its own, which is harmless and converges on a later run.
+Because the refusal alone cannot tell the two apart, the walk re-reads the
+bucket after a refusal and counts it only when a below-target record is still
+served raw.
+
+There is no command that forces the overlap to resolve. The block clears on its
+own when the loser-only inputs stop being served raw, which happens when a
+later authoritative compaction covers them or when retention ages them out.
+Until one of those occurs the floor stays where it is, which is the correct
+outcome rather than a fault: raising it would claim a format floor over an
+object the resolver still returns. The walk's output identifies the shard and
+ingest hour, so the affected bucket is known even though no command resolves
+the overlap for you.
+
+The re-audit's liveness definition excludes a bucket's pre-rewrite L0 commit
+records once an authoritative compaction or rewrite record supersedes them.
+Those records are dead, sweepable leftovers of a rewrite this same invocation may have
 just performed, not stragglers. Because of that, a clean migration converges and
 raises the floor in one invocation, and running `sweep` in between is never
 required for it to converge. The sweeper's superseded-input rule still deletes
@@ -380,9 +410,40 @@ ravel-cli hold list --tenant <id>
 ```
 
 These write and read the audit records that both maintenance drivers check
-before any destructive pass. A `--signal` and `--shard` form writes all the
-prefixes one shard needs in a single command, so the partial-hold mistake is not
-reachable from the CLI.
+before any destructive pass.
+
+One shard's objects live under three sibling prefixes, `.../l0/<shard>/`,
+`.../c/<shard>/` and `.../l1/<shard>/`, and each is checked independently, so a
+hold naming only one of them covers part of a shard and not the rest. The
+`--signal` and `--shard` form writes all three in a single command, and is the
+way to hold one shard. `hold set --scope` refuses a scope that reaches into one
+or two of the three without covering all of them, and names the sugar in the
+refusal. A broader scope is still accepted, because it cannot be partial: a
+whole tenant (`t/<tenant_hex>/`) or a whole signal (`t/<tenant_hex>/<signal>/`)
+covers all three prefixes of every shard it spans. So is a scope that reaches
+none of them, such as one under `maint/`. `hold clear` accepts any scope,
+partial ones included: the fold matches a clear to a set by the exact scope
+string, so refusing a partial clear would leave a hold written before this rule
+with no way to release it.
+
+Under a hold the physical retention sweep is all-or-nothing. If any key it
+would delete is held, including a commit record or the retention tombstone, it
+deletes nothing that pass, leaves the tombstone in place, counts the bucket, and
+reports `SweptPartial`. It does not delete around the hold: the commit records
+name the data objects and the tombstone keeps the bucket excluded, so deleting
+those while keeping the held bytes would leave bytes nothing can read and
+nothing can later sweep.
+
+The count is `ravel_maintain::retention::held_by_lease_buckets_total`, the
+process-wide seam for
+`ravel_maintain_retention_held_by_lease_buckets_total`, one per bucket per
+declining pass. Like the version-hold counter beside it
+(`held_out_of_window_objects_total`) it is a seam today and not yet on the
+scrape endpoint. A held bucket is a bucket kept past its retention window,
+so this rises for as long as the hold stands, which is expected; it goes flat
+again once the hold is cleared and the next pass retires the bucket. A total
+that keeps rising after every hold is cleared means some scope is still
+matching, and `hold list` shows which.
 
 **The hold is not effective the instant the command returns.** Each maintenance
 tick refreshes its hold snapshot once, before its destructive pass, so a hold set

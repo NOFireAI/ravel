@@ -643,7 +643,7 @@ impl FlightSqlService for RavelFlightSqlService {
                 );
                 if self.audit_sink.submit(event).await.is_err() {
                     return Err(Status::unavailable(
-                        "query audit is temporarily unavailable; retry",
+                        ravel_query::http::MSG_AUDIT_UNAVAILABLE,
                     ));
                 }
                 Err(status)

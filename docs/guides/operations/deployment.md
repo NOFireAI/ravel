@@ -55,8 +55,10 @@ needs qualification.
 `store qualify` writes transient scratch objects under `sys/qualify/<run-id>/`
 while it runs its suite, not only the final record. The Admin policy grants no
 delete anywhere, so that scratch is never cleaned up by the credential itself.
-It is bounded, one run's worth of small objects per invocation, and harmless to
-leave, but repeated runs against the same bucket accumulate it.
+It is bounded per run, but not small: the two listing probes write two keys
+more than the declared page size each, so a run at the default page size
+leaves about two thousand small objects, and repeated runs against the same
+bucket accumulate them. Sweep the prefix from a runbook when it matters.
 
 ## The bucket protection contract
 
@@ -70,9 +72,31 @@ configuration section; this is the operational summary.
 Object Lock enabled on the bucket, versioning, and the lifecycle rules that go
 with erasure obligations are bucket-layer settings. The compliance-mode
 retention on the control prefixes (`sys/*`, the provisioning records, commit
-records and the catalog HEAD history) is per-object retention that an
-operator-run mechanism applies, because Object Lock has no prefix scope of its
-own; the contract page describes the two shapes that mechanism can take.
+records and the catalog keyspace `t/*/catalog/*/*`) is per-object retention
+that an operator-run mechanism applies, because Object Lock has no prefix
+scope of its own; the contract page describes the two shapes that mechanism
+can take. Three of those four prefix families are never touched by the three
+mechanisms that physically remove tenant data (supersession GC, retention
+deletion, and subject erasure), so locking them costs nothing against those
+three. Commit records are not exempt even that far: a maintenance sweep
+physically removes a superseded commit record, and a still-locked one refuses
+that delete until its retention period elapses, so the retention period chosen
+for commit records is also a bound on how long that sweep can pause; the
+contract page's "Required bucket configuration" names the default window to
+keep it inside.
+
+One of the other three families does carry a further cost, from a fourth
+mechanism: a compliance lock on `t/*/catalog/*/*` there
+costs an erasure obligation, not only a reclamation delay. The unreferenced-catalog sweep
+deletes the snapshot and index objects the current HEAD no longer names, and
+for a tenant that declares a typed string or bytes attribute column a per-part
+column-statistics object among them holds that subject's own column value; a
+lock over the keyspace delays that delete, and the value persists until the
+fold reconciles that hour and then a further retention period. The maintenance
+IAM policy Ravel ships denies that delete outright, so the bound is open-ended
+until the policy changes. The four-step mechanism, the exact bound, the IAM
+ceiling and the HEAD-scoping advice are in the contract page's "Required
+bucket configuration" section, "A lock on the catalog family".
 
 **One lifecycle rule is not optional for any bucket Ravel writes to.**
 Configure `AbortIncompleteMultipartUpload` with a cleanup period of seven days
@@ -159,10 +183,19 @@ operator credential rather than a service credential:
 
 ## Readiness and the store reachability probe
 
-`/readyz` reflects store reachability, not just startup completion. Each process
+`/readyz` reflects store reachability, not just startup completion. It also
+reflects ingest health: an `all` or `gateway` process turns 503 permanently once
+one of its metrics shard actors exhausts its respawn budget and is condemned
+(`shards_condemned > 0` at `/metrics`), which no probe can recover and which
+needs the process rolled -- see
+[troubleshooting.md](troubleshooting.md). The rest of
+this section is about the store condition, the one that recovers on its own.
+
+Each process
 runs one background probe that reads the fixed `sys/tenancy` object every
 `--store-probe-interval` (default `30s`, jittered so replicas do not probe in
-lockstep). Readiness is the startup latch and this probe's health together:
+lockstep). Readiness ANDs the startup latch, the drain latch, ingest health and
+this probe's health; for the probe alone:
 
 - After **four consecutive** failed probes, readiness flips and `/readyz`, and
   its Prometheus spelling `/-/ready`, return 503.
@@ -190,6 +223,44 @@ nothing consumes `/readyz`:
 - `ravel_store_reachable`, a gauge labeled by mode: 1 healthy, 0 unhealthy.
 - `ravel_store_probe_failures_total`, a counter labeled by mode, incremented on
   every failed probe cycle even below the readiness threshold.
+
+## Graceful shutdown and the pod grace period
+
+On SIGTERM the server flips readiness to draining first, then flushes and joins
+every ingest shard actor before it exits. That drain is what protects
+buffered-mode ingest data on a rolling update: if the process is killed before
+the drain finishes, the unflushed buffers are lost. The drain is bounded by
+`--shutdown-timeout` (default `25s`). The full SIGTERM-to-exit worst case at the
+shipped defaults is `32.5s`: the `25s` drain, plus up to `2.5s` for the
+pre-drain heartbeat stop and readiness settle, plus a `5s` hard cap on the final
+OTLP trace-exporter flush.
+
+The operator sizes the pod's shutdown lifecycle against that budget, so the two
+numbers cannot drift apart:
+
+- `terminationGracePeriodSeconds` is set to **45s** on every ravel-server pod
+  (gateway, query, and maintain). Kubernetes runs the `preStop` hook inside the
+  grace period and only sends SIGTERM once it returns, so the grace period has
+  to cover the `preStop` sleep plus the `32.5s` server budget plus headroom:
+  `10s + 32.5s + 2.5s`, rounded up. The error is deliberately on the long side.
+  A grace period shorter than the server's budget lets SIGKILL land mid-drain
+  and lose buffered data, which is irreversible; a longer one only slows a
+  rolling update's pod turnover by a few seconds.
+- A `preStop` hook sleeps **10s** before SIGTERM. Endpoint removal and SIGTERM
+  are concurrent, not ordered: when a pod is deleted, the kubelet sends SIGTERM
+  at the same time the EndpointSlice removal begins propagating to every node's
+  kube-proxy and to any external load balancer. Without the sleep the server can
+  start draining while new requests are still routed to it. The `10s` covers
+  kube-proxy reprogramming across nodes and typical cloud load-balancer drain
+  under load. The hook uses the native `sleep` lifecycle action, not an
+  `exec` of a `sleep` binary, because the container runs with a read-only root
+  filesystem and every Linux capability dropped.
+
+The operator renders no `--shutdown-timeout` flag, so the server runs at its
+compiled default and `45s` is the correct grace period today. `--shutdown-timeout`
+is configurable on the server itself; if a future CRD field exposes it, the grace
+period must track it, staying above the new server budget plus the `preStop`
+sleep.
 
 ## Durable auth refresh
 
@@ -365,9 +436,9 @@ ravel-server --mode query \
   --remote-cluster name=apac,endpoint=apac.internal:9443,credential-file=/etc/ravel/apac.token,tls-ca-file=/etc/ravel/apac-ca.pem,soft-timeout=15s
 ```
 
-`name`, `endpoint` and `credential-file` are required. `tls` (default `true`),
-`tls-ca-file`, `skip-unavailable` (default `false`) and `soft-timeout` are
-optional. `--remote-cluster-soft-timeout` sets the default soft timeout for
+`name`, `endpoint` and `credential-file` are required. `tenant`, `tls` (default
+`true`), `tls-ca-file`, `skip-unavailable` (default `false`) and `soft-timeout`
+are optional. `--remote-cluster-soft-timeout` sets the default soft timeout for
 every remote that does not name its own; a remote that does not answer within
 its bound is treated as unavailable, which fails the query unless that remote
 has `skip-unavailable`.
@@ -375,6 +446,74 @@ has `skip-unavailable`.
 The credential is an operator secret read from a file, never an inline value. It
 is the principal the remote sees. A federated query never forwards the calling
 client's credential across a cluster boundary.
+
+**One remote credential per local tenant.** That credential authorizes one
+tenant's data on the remote, so it belongs to one local tenant. `tenant` names
+it, and a query from any other local tenant never dials that remote. A
+coordinator serving several local tenants writes one spec per local tenant, each
+with its own `name` and its own `credential-file`:
+
+```
+ravel-server --mode query \
+  --tenant-token acme-token:acme \
+  --tenant-token beta-token:beta \
+  --remote-cluster name=eu-acme,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-acme.token,tenant=acme \
+  --remote-cluster name=eu-beta,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-beta.token,tenant=beta
+```
+
+`--tenant-token` on the command line puts every bearer token into argv, which
+a pod spec or process listing exposes. `--tenant-token-file PATH` (env
+`RAVEL_TENANT_TOKEN_FILE` for the path only) reads the same `TOKEN=TENANT`
+pairs from a file instead, one per line, blank lines and `#` comments
+skipped; mount it from a Secret rather than templating tokens into args.
+`--tenant-token` and `--tenant-token-file` are mutually exclusive; startup
+refuses if both are set. The file is read once, at startup: rotating the
+mounted Secret still needs a pod restart to pick up the new tokens. An empty
+or comment-only file (a Secret mount that failed to populate looks exactly
+like this) parses to an empty map with no startup error: it authenticates
+nothing, and unless `--maintain-tenant` names tenants, background fold,
+compaction and retention widen to every tenant storage discovers.
+
+A local tenant no remote names gets local data only, reported as a complete
+result: a remote it holds no credential for is outside its query, not missing
+from it, so no warning and no `partial: true` appear.
+
+Omitting `tenant` leaves the remote reachable by every local tenant, which is
+correct only where the coordinator runs queries for one. A coordinator that runs
+queries for more than one therefore **refuses to start** with such a spec, rather
+than fanning every local tenant's selectors and discovery out under the one
+credential and returning another tenant's series. A coordinator runs queries for
+more than one local tenant when:
+
+- two or more `--tenant-token` values or `--tenant-token-file` lines name
+  different tenants;
+- an `--alert-rules-file` names a tenant no `--tenant-token` or
+  `--tenant-token-file` does. The alert
+  evaluator runs one query loop per tenant in that file, against the same engine
+  federation is installed on, so those queries federate even though no request
+  produced them;
+- any dynamic resolver is enabled (`--dev-insecure-tenant-header`,
+  `--oidc-issuer`, or `--mtls-enabled`, each of which derives the tenant from a
+  request header or a token claim).
+
+The startup error names every spec needing a `tenant` and what makes the
+deployment multi-tenant:
+
+```
+--remote-cluster 'eu' names no local tenant on a coordinator that runs queries
+for more than one local tenant (2 distinct static bearer tenants are
+configured). A remote cluster holds one remote credential and cannot express one
+credential per local tenant ... Add tenant=<local tenant> to each of those specs
+...
+```
+
+Startup also refuses a `tenant` named by no `--tenant-token`,
+`--tenant-token-file` line, or `--alert-rules-file` rule, where the tenant set
+is fully known (static bearer tokens and alert rules, no dynamic resolver): the
+mapping could never fire, and the only symptom would be a remote that quietly
+answers nobody. A tenant that only alert rules name is a valid target, and
+mapping a remote to it is the supported way to give alert rules over data that
+lives partly on a remote.
 
 **TLS is on unless the spec says otherwise.** Neither spec above names `tls`,
 and both dial over TLS, verifying the remote against the system trust roots plus

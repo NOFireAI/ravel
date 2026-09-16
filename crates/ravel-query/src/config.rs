@@ -55,7 +55,9 @@ pub const DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY: Duration = Duration::from_millis
 ///
 /// The request budget's cost is per shard-hour, not per query. A busy tenant
 /// seals `ceil(3600s / max_flush_delay)` segments per shard per open hour
-/// (7,200 at the 500ms default cadence), and a cold query over that hour GETs
+/// (1,800 at the 2s deployment cadence ADR-0076 decision 4 sets; 7,200 at the
+/// 500ms reference cadence in [`DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY`]), and a
+/// cold query over that hour GETs
 /// each one, on every shard. The old flat 25,000 cap was correct only at 3
 /// shards or fewer; at the default 4 it rejected the worst legitimate open
 /// hour (4 x 7,200 = 28,800) before it could answer. Deriving from
@@ -170,7 +172,36 @@ pub enum LogsFetchPolicy {
     /// fetching with no operator action.
     #[default]
     CostBased,
+    /// Trade money for wall-clock (issue #1196): resolves the rate and routing
+    /// threshold EXACTLY as [`Self::ByteMinimal`] (ADR-0904's ranged behaviour).
+    /// It is an intent, not a tuning constant: it says "spend requests to save
+    /// wall time", and the engine decides how; it carries no concurrency
+    /// default of its own (ADR-1196). The trade is a ratio measured at a named
+    /// commit, not a property of the policy. At `740f94b97`, on the reference
+    /// corpus (#1185, 42 statements, true cold, warm-up-empty) over 3 reps at
+    /// [`LATENCY_FIRST_MEASURED_CONCURRENCY`]: 5.30x the GET requests (570,752
+    /// vs 107,781) for 52% less cold wall-clock (235.7s vs 493.0s mean), with a
+    /// per-rep range of 50.3% to 54.2%. Against the `cost-based` default at
+    /// `s3-intra-region-2026` prices, where free transfer and retrieval
+    /// saturate the cost-based rate to whole-object reads. Cost-first stays
+    /// the default because it is right for the bill; this is an operator
+    /// opt-in for the deployments where the clock matters more than the
+    /// request bill, at a concurrency the operator raises explicitly. It
+    /// carries a memory precondition: in-flight fetch memory at the
+    /// concurrency it needs to pay off is not bounded by a process-wide
+    /// budget today (#1170, #1007).
+    LatencyFirst,
 }
+
+/// The process-wide object-store GET concurrency
+/// [`LogsFetchPolicy::LatencyFirst`]'s cold-time measurement ran at
+/// (issue #1196): a documentation constant only, naming the concurrency
+/// `--fetch-concurrency 256` set for the GET permits, the SQL partition
+/// count, and the PromQL fan-out together. `latency-first` resolves no
+/// concurrency default from this value; an operator who wants the measured
+/// trade sets `--store-get-concurrency` (and, for SQL,
+/// `--sql-partition-count`) to it explicitly.
+pub const LATENCY_FIRST_MEASURED_CONCURRENCY: usize = 256;
 
 impl LogsFetchPolicy {
     /// The policy name as it appears on the `--logs-fetch-policy` flag and in a
@@ -180,6 +211,7 @@ impl LogsFetchPolicy {
             LogsFetchPolicy::RequestMinimal => "request-minimal",
             LogsFetchPolicy::ByteMinimal => "byte-minimal",
             LogsFetchPolicy::CostBased => "cost-based",
+            LogsFetchPolicy::LatencyFirst => "latency-first",
         }
     }
 }
@@ -270,8 +302,13 @@ pub fn resolve_logs_fetch(
             // byte-minimal is today's behaviour byte for byte, which includes a
             // configured (non-default) `--logs-request-cost-bytes`: ADR-0904's
             // knob keeps its meaning under this policy rather than being
-            // silently replaced by the compiled default.
-            LogsFetchPolicy::ByteMinimal => (configured_request_cost_bytes, None),
+            // silently replaced by the compiled default. latency-first resolves
+            // the byte quantities exactly the same way (issue #1196): the
+            // GET-requests-for-wall-clock trade it makes is an operator-set
+            // concurrency, never a change to what the fetch layer sees here.
+            LogsFetchPolicy::ByteMinimal | LogsFetchPolicy::LatencyFirst => {
+                (configured_request_cost_bytes, None)
+            }
             LogsFetchPolicy::CostBased => resolve_cost_based_rate(profile),
         },
     };
@@ -335,6 +372,24 @@ pub enum EngineConfigError {
         "logs_max_fetch_run_bytes must be non-zero: the segmented covering fallback divides by it"
     )]
     ZeroFetchBound,
+    /// [`EngineConfig::fetch_concurrency`] was zero (ADR-1195: "zero is
+    /// rejected during configuration resolution").
+    #[error("fetch_concurrency must be at least 1")]
+    ZeroFetchConcurrency,
+    /// A [`GetLimiter`](crate::GetLimiter) was built with, or
+    /// [`EngineConfig::store_get_concurrency`] resolved to, zero permits
+    /// (ADR-1195's `--store-get-concurrency`): a zero-permit limiter can
+    /// never issue a GET.
+    #[error("store GET concurrency must be at least 1")]
+    ZeroGetLimiterPermits,
+    /// [`EngineConfig::sql_partition_count`] resolved to zero (ADR-1195's
+    /// `--sql-partition-count`).
+    #[error("sql_partition_count must be at least 1")]
+    ZeroSqlPartitionCount,
+    /// [`EngineConfig::promql_fetch_fanout`] resolved to zero (ADR-1195's
+    /// `--promql-fetch-fanout`).
+    #[error("promql_fetch_fanout must be at least 1")]
+    ZeroPromqlFetchFanout,
 }
 
 /// [`crate::QueryEngine`] resource limits and concurrency. Every limit is
@@ -412,15 +467,65 @@ pub struct EngineConfig {
     /// ([`Self::validate`]): the segmented fallback divides by it. Defaults to
     /// [`DEFAULT_LOG_MAX_FETCH_RUN_BYTES`] (64 MiB).
     pub logs_max_fetch_run_bytes: u64,
+    /// Explicit override for concurrent object-store GETs, process-wide
+    /// (ADR-1195's `--store-get-concurrency`), fed to the one shared
+    /// [`crate::GetLimiter`] every query-side fetcher honours. `None` falls
+    /// back to [`Self::fetch_concurrency`] (no default moves): use
+    /// [`Self::store_get_concurrency`] to read the resolved value.
+    pub store_get_concurrency: Option<usize>,
+    /// Explicit override for DataFusion `target_partitions`
+    /// (ADR-1195's `--sql-partition-count`); wired into
+    /// `crates/ravel-sql/src/session.rs` by a follow-up task. `None` falls
+    /// back to [`Self::fetch_concurrency`]: use
+    /// [`Self::sql_partition_count`] to read the resolved value.
+    pub sql_partition_count: Option<usize>,
+    /// Explicit override for PromQL `buffer_unordered` fan-out width
+    /// (ADR-1195's `--promql-fetch-fanout`). `None` falls back to
+    /// [`Self::fetch_concurrency`]: use [`Self::promql_fetch_fanout`] to read
+    /// the resolved value.
+    pub promql_fetch_fanout: Option<usize>,
 }
 
 impl EngineConfig {
+    /// The resolved concurrent-GET permit count: the explicit
+    /// [`Self::store_get_concurrency`] override if set, else the legacy
+    /// [`Self::fetch_concurrency`] (ADR-1195: no default moves).
+    pub fn store_get_concurrency(&self) -> usize {
+        self.store_get_concurrency.unwrap_or(self.fetch_concurrency)
+    }
+
+    /// The resolved DataFusion partition count: the explicit
+    /// [`Self::sql_partition_count`] override if set, else the legacy
+    /// [`Self::fetch_concurrency`] (ADR-1195: no default moves).
+    pub fn sql_partition_count(&self) -> usize {
+        self.sql_partition_count.unwrap_or(self.fetch_concurrency)
+    }
+
+    /// The resolved PromQL fan-out width: the explicit
+    /// [`Self::promql_fetch_fanout`] override if set, else the legacy
+    /// [`Self::fetch_concurrency`] (ADR-1195: no default moves).
+    pub fn promql_fetch_fanout(&self) -> usize {
+        self.promql_fetch_fanout.unwrap_or(self.fetch_concurrency)
+    }
+
     /// Refuse a configuration the fetch layer cannot run on (ADR-0996 decision
     /// 2). Called at startup resolution; a bad value is a typed
     /// [`EngineConfigError`], never a silent clamp.
     pub fn validate(&self) -> Result<(), EngineConfigError> {
         if self.logs_max_fetch_run_bytes == 0 {
             return Err(EngineConfigError::ZeroFetchBound);
+        }
+        if self.fetch_concurrency == 0 {
+            return Err(EngineConfigError::ZeroFetchConcurrency);
+        }
+        if self.store_get_concurrency() == 0 {
+            return Err(EngineConfigError::ZeroGetLimiterPermits);
+        }
+        if self.sql_partition_count() == 0 {
+            return Err(EngineConfigError::ZeroSqlPartitionCount);
+        }
+        if self.promql_fetch_fanout() == 0 {
+            return Err(EngineConfigError::ZeroPromqlFetchFanout);
         }
         Ok(())
     }
@@ -444,6 +549,9 @@ impl Default for EngineConfig {
             logs_request_cost_bytes: crate::DEFAULT_LOG_REQUEST_COST_BYTES,
             logs_fetch_policy: LogsFetchPolicy::default(),
             logs_max_fetch_run_bytes: DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
+            store_get_concurrency: None,
+            sql_partition_count: None,
+            promql_fetch_fanout: None,
         }
     }
 }
@@ -794,11 +902,135 @@ mod tests {
         assert_eq!(cb.saturated_profile, None);
     }
 
+    /// Issue #1196: `latency-first` must resolve the byte quantities exactly as
+    /// `byte-minimal` does. It carries no concurrency preference of its own
+    /// (ADR-1196): the trade it makes is an operator-set concurrency, not a
+    /// value this resolution derives.
+    ///
+    /// Prove-the-test: route `LogsFetchPolicy::LatencyFirst` through the
+    /// `CostBased` arm instead of `ByteMinimal`'s and execution stops at the
+    /// first assertion, which prints `left: 18446744073709551615, right:
+    /// 700000`: the reference profile prices bytes at zero, so the cost-based
+    /// rate saturates to `u64::MAX` where the configured request cost was
+    /// expected.
+    #[test]
+    fn latency_first_resolves_like_byte_minimal() {
+        let reference = StoreCostProfile::reference();
+        let configured = 700_000u64;
+
+        let bm = resolve_logs_fetch(
+            LogsFetchPolicy::ByteMinimal,
+            &reference,
+            None,
+            configured,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        let lf = resolve_logs_fetch(
+            LogsFetchPolicy::LatencyFirst,
+            &reference,
+            None,
+            configured,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        assert_eq!(lf.request_cost_bytes, bm.request_cost_bytes);
+        assert_eq!(lf.request_cost_bytes, configured);
+        assert_eq!(lf.block_range_threshold, bm.block_range_threshold);
+        assert_eq!(
+            lf.block_range_threshold,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+        );
+        assert_eq!(lf.overridden_block_range_threshold, None);
+        assert_eq!(lf.saturated_profile, None);
+    }
+
     #[test]
     fn zero_fetch_bound_is_refused_with_a_typed_error() {
         let mut cfg = EngineConfig::default();
         assert_eq!(cfg.validate(), Ok(()));
         cfg.logs_max_fetch_run_bytes = 0;
         assert_eq!(cfg.validate(), Err(EngineConfigError::ZeroFetchBound));
+    }
+
+    #[test]
+    fn zero_fetch_concurrency_is_refused_with_a_typed_error() {
+        let cfg = EngineConfig {
+            fetch_concurrency: 0,
+            ..EngineConfig::default()
+        };
+        assert_eq!(cfg.validate(), Err(EngineConfigError::ZeroFetchConcurrency));
+    }
+
+    /// ADR-1195: each of the three split knobs is validated on its RESOLVED
+    /// value, so a zero override is rejected even though `fetch_concurrency`
+    /// itself stays nonzero -- an operator turning one knob to 0 must not
+    /// silently fall back to the legacy value.
+    #[test]
+    fn zero_store_get_concurrency_override_is_refused_with_a_typed_error() {
+        let cfg = EngineConfig {
+            store_get_concurrency: Some(0),
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(EngineConfigError::ZeroGetLimiterPermits)
+        );
+    }
+
+    #[test]
+    fn zero_sql_partition_count_override_is_refused_with_a_typed_error() {
+        let cfg = EngineConfig {
+            sql_partition_count: Some(0),
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(EngineConfigError::ZeroSqlPartitionCount)
+        );
+    }
+
+    #[test]
+    fn zero_promql_fetch_fanout_override_is_refused_with_a_typed_error() {
+        let cfg = EngineConfig {
+            promql_fetch_fanout: Some(0),
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(EngineConfigError::ZeroPromqlFetchFanout)
+        );
+    }
+
+    /// ADR-1195: no default moves. With all three knobs unset, every
+    /// accessor must return the legacy `fetch_concurrency` value, not some
+    /// new independent default.
+    #[test]
+    fn unset_knobs_all_resolve_to_fetch_concurrency() {
+        let cfg = EngineConfig {
+            fetch_concurrency: 8,
+            ..EngineConfig::default()
+        };
+        assert_eq!(cfg.validate(), Ok(()));
+        assert_eq!(cfg.store_get_concurrency(), 8);
+        assert_eq!(cfg.sql_partition_count(), 8);
+        assert_eq!(cfg.promql_fetch_fanout(), 8);
+    }
+
+    /// Setting one knob overrides only that knob's accessor; the other two
+    /// still fall back to `fetch_concurrency` (ADR-1195: splitting the knob
+    /// changes which lever an operator turns, not what an untouched knob
+    /// resolves to).
+    #[test]
+    fn one_explicit_knob_overrides_only_its_own_accessor() {
+        let cfg = EngineConfig {
+            fetch_concurrency: 8,
+            promql_fetch_fanout: Some(3),
+            ..EngineConfig::default()
+        };
+        assert_eq!(cfg.validate(), Ok(()));
+        assert_eq!(cfg.promql_fetch_fanout(), 3);
+        assert_eq!(cfg.store_get_concurrency(), 8);
+        assert_eq!(cfg.sql_partition_count(), 8);
     }
 }

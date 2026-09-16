@@ -11,16 +11,20 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly eleven label keys: `tenant_hash`, `signal`, `mode`, `op`,
-//! `error_kind`, `workload_class`, `level`, `reason`, `cache`, `tier`, and
-//! `kind` (ADR-0044
+//! renders exactly fifteen label keys: `tenant_hash`, `signal`, `mode`, `op`,
+//! `error_kind`, `workload_class`, `level`, `reason`, `cache`, `tier`,
+//! `kind`, `outcome`, `allocator`, `stat`, and `component` (ADR-0044
 //! section 4; `reason` added by ADR-0051 section 6 for the admission-rejection
 //! family and reused by ADR-0059 section 2 for the scrub seal-divergence family,
 //! `cache` to split the read-cache family into the
 //! fetcher and catalog byte caches, `tier` added by #97 to split each of those
-//! into its RAM and local-disk tiers when a disk tier is configured, and `kind`
+//! into its RAM and local-disk tiers when a disk tier is configured, `kind`
 //! added by ADR-0065 decision 4 to split the maintenance merge-memory gauge into
-//! its transient and total high-water marks). The eleven keys come from twelve
+//! its transient and total high-water marks, `outcome` added by #532 to split
+//! the alert-tick family by how one evaluation tick ended, `allocator`/`stat`
+//! added by #1170 for the process allocator gauges, and `component` added by
+//! ADR-1170 decision 4 to split the process memory budget's reserved-bytes
+//! gauge by which side reserved it). The fifteen keys come from sixteen
 //! `Label` variants: `RejectReason` and `ScrubReason` both render `reason`.
 //! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
@@ -123,15 +127,18 @@ impl Level {
 /// 6, extended by the 2026-08-13 amendment). ADR-0051 named a closed set of
 /// six reasons `{body_size, byte_rate, series_rate, series_cap, skew,
 /// structural}`; the amendment adds a seventh, `clock`, for the receiver-clock
-/// floor. The four here are exactly the ones
-/// `AdmissionController::usage_snapshot` counts today
-/// (`ravel_ingest::TenantUsage`). The remaining three (body_size, skew,
-/// structural) are enforced at layers that keep no per-tenant counter in that
-/// snapshot yet (body size at the transport, skew and structural in
-/// normalization, surfaced there through OTLP partial success), so a variant
-/// for them would render samples no data source can fill. They join this enum
-/// when their counters do, additively, the same way a new `Signal` variant
-/// joins `signal_name`.
+/// floor. Six of the seven are here. Four come from
+/// `AdmissionController::usage_snapshot` (`ravel_ingest::TenantUsage`), which
+/// covers the byte-rate and active-cap layers plus the receiver-clock floor.
+/// The other two, `skew` and `structural`, come from
+/// [`crate::normalize_reject_metrics::NormalizeRejectMetrics`]: the
+/// normalization layer keeps no row in that snapshot, so the ingest surfaces
+/// count its decisions where they observe them.
+///
+/// The seventh, `body_size`, is enforced at the transport and still keeps no
+/// per-tenant counter, so a variant for it would render samples no data source
+/// can fill. It joins this enum when its counter does, additively, the same
+/// way a new `Signal` variant joins `signal_name`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     ByteRate,
@@ -141,17 +148,29 @@ pub enum RejectReason {
     /// non-representable), so the whole request was rejected 503 / `UNAVAILABLE`
     /// (ADR-0051 amendment). The fault is the replica's, not the data's.
     Clock,
+    /// A point, record, or span whose event timestamp fell outside the
+    /// admissible window (too far in the future, or older than the maximum
+    /// ingest lag). Counted per rejected datum, matching the count the same
+    /// request reports back to the sender through OTLP partial success.
+    Skew,
+    /// A point, record, or span rejected by a structural bound in
+    /// normalization: an unsupported metric type or aggregation temporality, a
+    /// name or attribute over its limit, a malformed identifier, an
+    /// inconsistent histogram. Counted per rejected datum, like `skew`.
+    Structural,
 }
 
 impl RejectReason {
-    /// Every reason with a counter, so the rejected family renders all four
+    /// Every reason with a counter, so the rejected family renders all six
     /// series per (tenant, signal) even when some are zero (the same
     /// zero-is-not-absence discipline the other families keep).
-    const ALL: [RejectReason; 4] = [
+    const ALL: [RejectReason; 6] = [
         RejectReason::ByteRate,
         RejectReason::SeriesRate,
         RejectReason::SeriesCap,
         RejectReason::Clock,
+        RejectReason::Skew,
+        RejectReason::Structural,
     ];
 
     fn name(self) -> &'static str {
@@ -160,6 +179,8 @@ impl RejectReason {
             RejectReason::SeriesRate => "series_rate",
             RejectReason::SeriesCap => "series_cap",
             RejectReason::Clock => "clock",
+            RejectReason::Skew => "skew",
+            RejectReason::Structural => "structural",
         }
     }
 }
@@ -230,6 +251,35 @@ pub enum Label {
     Cache(CacheFamily),
     CacheTier(CacheTier),
     MergeMemoryKind(MergeMemoryKind),
+    /// How one alert evaluation tick ended (issue #532). A closed enum owned by
+    /// [`crate::alerting`], since the outcomes are the alerting loop's own, not
+    /// a dimension this renderer invents.
+    AlertOutcome(crate::alerting::AlertTickOutcome),
+    /// The allocator this process runs under (#1170): `"jemalloc"` on every
+    /// target this repo builds, or whatever [`crate::mem_stats::read`] names
+    /// otherwise. A bare `&'static str` rather than a closed enum because the
+    /// value is compile-time-fixed per target (never derived from request or
+    /// tenant input), so there is no cardinality this label could blow up.
+    Allocator(&'static str),
+    AllocatorStat(AllocatorStat),
+    /// Which side of the ADR-1170 process memory budget a
+    /// `ravel_memory_reserved_bytes` sample is. `Fetch` always renders `0`:
+    /// decision 2 (fetch-layer reservation against this same budget) has not
+    /// landed upstream, so nothing yet charges the budget on the fetcher's
+    /// behalf. This is an honest gap, not a bug -- the gauge exists now so a
+    /// dashboard need not change shape once decision 2 lands.
+    ///
+    /// The split is not yet a real split, and landing decision 2 is more than
+    /// flipping the hardcoded `Fetch` constant to a reader. `Sql` renders
+    /// `MemoryBudget::reserved()`, the WHOLE process budget's reserved total,
+    /// which is only equal to SQL's share because SQL is the sole reserver
+    /// today. Wire a fetcher to the same instance and `component="sql"`
+    /// silently becomes the process total while `component="fetch"` reports
+    /// its own share, so the two double-count and a dashboard summing them
+    /// reads high. Decision 2 has to give the budget per-component
+    /// accounting (or give each component its own counter) before either
+    /// sample can be read as a share.
+    MemoryComponent(MemoryComponent),
 }
 
 /// Which high-water mark a `ravel_maintain_rlog_merge_peak_bytes` sample is
@@ -296,6 +346,50 @@ impl CacheTier {
     }
 }
 
+/// Which jemalloc-reported figure a `ravel_process_allocator_bytes` sample is
+/// (#1170): `allocated` is bytes the application requested, `active` adds
+/// page-rounding and thread-cache slop, `resident` additionally counts pages
+/// jemalloc has not yet returned to the OS. Three separate series, not one
+/// number, because a single process-RSS figure cannot say which of these --
+/// or which subsystem's cache -- grew, the exact ambiguity that forced two
+/// published ClickBench memory claims to be retracted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocatorStat {
+    Allocated,
+    Active,
+    Resident,
+}
+
+impl AllocatorStat {
+    fn name(self) -> &'static str {
+        match self {
+            AllocatorStat::Allocated => "allocated",
+            AllocatorStat::Active => "active",
+            AllocatorStat::Resident => "resident",
+        }
+    }
+}
+
+/// Which side of the ADR-1170 process memory budget reserved a share of it:
+/// `Sql` is the `SqlExecutor`'s per-tenant accountants
+/// (`ravel_memory::TenantMemoryAccountant`), all sharing the one process
+/// `MemoryBudget`; `Fetch` is the fetch layer's own reservation against that
+/// same budget, decision 2, not yet landed (see [`Label::MemoryComponent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryComponent {
+    Sql,
+    Fetch,
+}
+
+impl MemoryComponent {
+    fn name(self) -> &'static str {
+        match self {
+            MemoryComponent::Sql => "sql",
+            MemoryComponent::Fetch => "fetch",
+        }
+    }
+}
+
 impl Label {
     fn key(&self) -> &'static str {
         match self {
@@ -311,6 +405,10 @@ impl Label {
             Label::Cache(_) => "cache",
             Label::CacheTier(_) => "tier",
             Label::MergeMemoryKind(_) => "kind",
+            Label::AlertOutcome(_) => "outcome",
+            Label::Allocator(_) => "allocator",
+            Label::AllocatorStat(_) => "stat",
+            Label::MemoryComponent(_) => "component",
         }
     }
 
@@ -328,6 +426,10 @@ impl Label {
             Label::Cache(family) => family.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
+            Label::AlertOutcome(outcome) => alert_outcome_name(*outcome).to_string(),
+            Label::Allocator(name) => name.to_string(),
+            Label::AllocatorStat(stat) => stat.name().to_string(),
+            Label::MemoryComponent(component) => component.name().to_string(),
         }
     }
 }
@@ -342,6 +444,19 @@ fn signal_name(signal: Signal) -> &'static str {
         Signal::Profiles => "profiles",
         Signal::Alerts => "alerts",
         Signal::Audit => "audit",
+    }
+}
+
+/// Exhaustive: adding an [`crate::alerting::AlertTickOutcome`] variant breaks
+/// this compile until it is handled here, so a new tick outcome cannot reach
+/// `/metrics` without a spelling.
+fn alert_outcome_name(outcome: crate::alerting::AlertTickOutcome) -> &'static str {
+    use crate::alerting::AlertTickOutcome;
+    match outcome {
+        AlertTickOutcome::Evaluated => "evaluated",
+        AlertTickOutcome::LeaseNotHeld => "lease_not_held",
+        AlertTickOutcome::LeaseUnavailable => "lease_unavailable",
+        AlertTickOutcome::HistoryUnavailable => "history_unavailable",
     }
 }
 
@@ -608,6 +723,10 @@ pub struct IngestPipelineSnapshot {
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
+    /// Flushes abandoned by their flush-open deadline while queued for a
+    /// `max_inflight_flushes` permit, before any store call (issue #1739).
+    /// Distinct from `abandoned_retry_exhausted`, which is a store failure.
+    pub abandoned_queue_deadline: u64,
     pub abandoned_input_rejected: u64,
     pub buffered_bytes_total: u64,
     pub buffered_items_total: u64,
@@ -615,6 +734,12 @@ pub struct IngestPipelineSnapshot {
     pub acks_err: u64,
     pub collisions: Option<u64>,
     pub shard_deaths: u64,
+    /// Shards condemned after exhausting their respawn budget (issue #1299).
+    /// `Some` only for the metrics pipeline, whose router is the one readiness
+    /// consults and the only one that respawns and condemns; logs and
+    /// spans render no sample for this family, the same structural-absence
+    /// convention `collisions` and `exemplars` use.
+    pub shards_condemned: Option<u64>,
     /// Multi-shard Strict writes that committed on at least one shard and
     /// then failed on a sibling: partial multi-shard commits, reported to the
     /// client as a retryable error carrying the durable tokens.
@@ -642,12 +767,24 @@ pub struct IngestPipelineSnapshot {
     /// spans ingest snapshots all expose it, and the two form the
     /// degraded-vs-failed pair for a stale provisioning view.
     pub grace_extended_stale_flushes: u64,
-    /// The two metrics-pipeline-only flush figures ADR-0067 added: the
-    /// adaptive-delay age-trigger counter and the in-flight-flush gauge.
-    /// `Some` only for the metrics pipeline; the log and span ingest snapshots
-    /// expose neither, so logs and spans render no sample for either family,
-    /// the same structural-absence convention `exemplars` uses.
+    /// The metrics-pipeline-only adaptive-delay age-trigger counter ADR-0067
+    /// added. `Some` only for the metrics pipeline; the log and span ingest
+    /// snapshots expose no such figure, so logs and spans render no sample
+    /// for this family, the same structural-absence convention `exemplars`
+    /// uses.
     pub adaptive_flushes: Option<AdaptiveFlushCounters>,
+    /// Flush tasks spawned but not yet acked, summed across shards at
+    /// snapshot time (ADR-0067 decision 2 pipelining). A gauge, carried for
+    /// every signal: unlike `adaptive_flushes` this is not metrics-only, so
+    /// it is a flat field rather than `Option`-gated, and a logs- or
+    /// spans-only process still renders a real (possibly zero) sample.
+    pub in_flight_flushes_total: u64,
+    /// Total nanoseconds every flush on this pipeline has spent waiting for a
+    /// `max_inflight_flushes` permit (issue #865), summed across shards.
+    /// Carried for every signal for the same reason `in_flight_flushes_total`
+    /// is: it stays at zero unless a shard is actually asked for a second
+    /// concurrent flush.
+    pub flush_permit_wait_ns_total: u64,
 }
 
 /// Exemplar admission counters, mirroring
@@ -661,21 +798,17 @@ pub struct ExemplarCounters {
     pub dropped_total: u64,
 }
 
-/// The two metrics-pipeline-only flush figures from ADR-0067, mirroring
-/// [`ravel_ingest::IngestMetricsSnapshot`]'s `flushes_by_age_adaptive` and
-/// `in_flight_flushes_total`. Grouped in one struct for the same reason
-/// [`ExemplarCounters`] is: they are always present or always absent together
-/// (both exist only on the metrics pipeline), which `Option<Self>` says once
-/// instead of twice.
+/// The metrics-pipeline-only flush figure from ADR-0067, mirroring
+/// [`ravel_ingest::IngestMetricsSnapshot`]'s `flushes_by_age_adaptive`. A
+/// single-field struct rather than a flat field on
+/// [`IngestPipelineSnapshot`] because it exists only on the metrics
+/// pipeline, which `Option<Self>` says directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AdaptiveFlushCounters {
     /// Monotonic total: flushes opened because the tenant buffer aged past a
     /// per-(shard, tenant) threshold computed within the adaptive-delay
     /// corridor rather than the fixed `max_flush_delay` (ADR-0067 decision 3).
     pub flushes_by_age_adaptive: u64,
-    /// A gauge, not a counter: the sum across shards of flush tasks spawned but
-    /// not yet acked at snapshot time (ADR-0067 decision 2 pipelining).
-    pub in_flight_flushes_total: u64,
 }
 
 /// Metric metadata sink counters (ADR-0085 decision 1), mirroring
@@ -722,6 +855,7 @@ impl IngestPipelineSnapshot {
             flushes_manual: snapshot.flushes_manual,
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
+            abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_points_total,
@@ -729,6 +863,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.series_id_collisions),
             shard_deaths: snapshot.shard_deaths,
+            shards_condemned: Some(snapshot.shards_condemned),
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
@@ -745,8 +880,9 @@ impl IngestPipelineSnapshot {
             grace_extended_stale_flushes: snapshot.grace_extended_stale_flushes,
             adaptive_flushes: Some(AdaptiveFlushCounters {
                 flushes_by_age_adaptive: snapshot.flushes_by_age_adaptive,
-                in_flight_flushes_total: snapshot.in_flight_flushes_total,
             }),
+            in_flight_flushes_total: snapshot.in_flight_flushes_total,
+            flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
         }
     }
 
@@ -758,6 +894,7 @@ impl IngestPipelineSnapshot {
             flushes_manual: snapshot.flushes_manual,
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
+            abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_records_total,
@@ -765,6 +902,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.stream_id_collisions),
             shard_deaths: snapshot.shard_deaths,
+            shards_condemned: None,
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: Some(PostingsCounters {
@@ -781,6 +919,8 @@ impl IngestPipelineSnapshot {
             exemplars: None,
             grace_extended_stale_flushes: snapshot.grace_extended_stale_flushes,
             adaptive_flushes: None,
+            in_flight_flushes_total: snapshot.in_flight_flushes_total,
+            flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
         }
     }
 
@@ -792,6 +932,7 @@ impl IngestPipelineSnapshot {
             flushes_manual: snapshot.flushes_manual,
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
+            abandoned_queue_deadline: snapshot.abandoned_queue_deadline,
             abandoned_input_rejected: snapshot.abandoned_input_rejected,
             buffered_bytes_total: snapshot.buffered_bytes_total,
             buffered_items_total: snapshot.buffered_spans_total,
@@ -799,6 +940,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: None,
             shard_deaths: snapshot.shard_deaths,
+            shards_condemned: None,
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
@@ -806,6 +948,8 @@ impl IngestPipelineSnapshot {
             exemplars: None,
             grace_extended_stale_flushes: snapshot.grace_extended_stale_flushes,
             adaptive_flushes: None,
+            in_flight_flushes_total: snapshot.in_flight_flushes_total,
+            flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
         }
     }
 }
@@ -878,7 +1022,8 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
     write_header(
         out,
         "ravel_ingest_abandoned_retry_exhausted_total",
-        "Flushes abandoned by retry-budget or lifetime exhaustion, by signal.",
+        "Flushes abandoned by retry-budget or lifetime exhaustion during their \
+         own store calls, by signal.",
         "counter",
     );
     for pipeline in pipelines {
@@ -887,6 +1032,22 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_abandoned_retry_exhausted_total",
             &labels(mode, pipeline.signal),
             pipeline.abandoned_retry_exhausted,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_abandoned_queue_deadline_total",
+        "Flushes abandoned by their flush-open deadline while queued for a \
+         permit, before any store call, by signal.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_abandoned_queue_deadline_total",
+            &labels(mode, pipeline.signal),
+            pipeline.abandoned_queue_deadline,
         );
     }
 
@@ -989,7 +1150,8 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
     write_header(
         out,
         "ravel_ingest_shard_deaths_total",
-        "Distinct shard actors observed dead by the router, by signal.",
+        "Shard-actor deaths observed by the router, counted once per death including each \
+         respawned incarnation (issue #1299) so it can exceed the shard count, by signal.",
         "counter",
     );
     for pipeline in pipelines {
@@ -999,6 +1161,32 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             &labels(mode, pipeline.signal),
             pipeline.shard_deaths,
         );
+    }
+
+    // Metrics-only, like ravel_ingest_collisions_total above: only the metrics
+    // router respawns and condemns, so logs and spans render no sample here.
+    let with_condemned: Vec<_> = pipelines
+        .iter()
+        .filter(|pipeline| pipeline.shards_condemned.is_some())
+        .collect();
+    if !with_condemned.is_empty() {
+        write_header(
+            out,
+            "ravel_ingest_shards_condemned_total",
+            "Shards condemned after exhausting their respawn budget (issue #1299), counted at \
+             most once per shard per live generation (bounded by live_generations * shard_count \
+             under resharding, not shard_count); any nonzero value makes the process report \
+             /readyz 503, by signal.",
+            "counter",
+        );
+        for pipeline in with_condemned {
+            write_sample(
+                out,
+                "ravel_ingest_shards_condemned_total",
+                &labels(mode, pipeline.signal),
+                pipeline.shards_condemned.unwrap_or_default(),
+            );
+        }
     }
 
     write_header(
@@ -1168,10 +1356,10 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         }
     }
 
-    // The adaptive-delay age trigger and the in-flight-flush gauge are
-    // metrics-pipeline-only (ADR-0067), so `adaptive_flushes` is `Some` only
-    // there (the same structural-absence convention as `exemplars` above), and
-    // both families are empty in a logs- or spans-only process.
+    // The adaptive-delay age trigger is metrics-pipeline-only (ADR-0067), so
+    // `adaptive_flushes` is `Some` only there (the same structural-absence
+    // convention as `exemplars` above), and the family is empty in a logs- or
+    // spans-only process.
     let with_adaptive: Vec<_> = pipelines
         .iter()
         .filter_map(|pipeline| {
@@ -1198,24 +1386,50 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
                 counters.flushes_by_age_adaptive,
             );
         }
+    }
 
-        write_header(
+    // Unlike the adaptive-delay age trigger above, the in-flight-flush gauge
+    // (ADR-0067 decision 2 pipelining) is not metrics-only: every pipeline's
+    // permit-wait acquire runs off-actor (ADR-1642), so it is a flat field on
+    // every signal's snapshot rather than `Option`-gated, and this family
+    // renders a real sample for a logs- or spans-only process too.
+    write_header(
+        out,
+        "ravel_ingest_in_flight_flushes",
+        "Flush tasks spawned but not yet acked, summed across shards at scrape time \
+         (ADR-0067 decision 2 pipelining), by signal. A gauge: it rises as flushes start and \
+         falls as they finish, so a sustained high value means flushes are not keeping up \
+         with the load.",
+        "gauge",
+    );
+    for pipeline in pipelines {
+        write_sample(
             out,
             "ravel_ingest_in_flight_flushes",
-            "Flush tasks spawned but not yet acked, summed across shards at scrape time \
-             (ADR-0067 decision 2 pipelining), by signal. A gauge: it rises as flushes start and \
-             falls as they finish, so a sustained high value means flushes are not keeping up \
-             with the load.",
-            "gauge",
+            &labels(mode, pipeline.signal),
+            pipeline.in_flight_flushes_total,
         );
-        for (pipeline, counters) in &with_adaptive {
-            write_sample(
-                out,
-                "ravel_ingest_in_flight_flushes",
-                &labels(mode, pipeline.signal),
-                counters.in_flight_flushes_total,
-            );
-        }
+    }
+
+    // Flush permit wait (issue #865): the same off-actor acquire the
+    // in-flight gauge above measures, timed on the injected clock. Carried
+    // for every signal for the same reason.
+    write_header(
+        out,
+        "ravel_ingest_flush_permit_wait_seconds_total",
+        "Total seconds every flush on this pipeline has spent waiting for a \
+         max_inflight_flushes permit (issue #865), summed across shards, by signal. Zero unless \
+         a shard is actually asked for a second concurrent flush; a rise means \
+         max_inflight_flushes is the binding window.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample_f64(
+            out,
+            "ravel_ingest_flush_permit_wait_seconds_total",
+            &labels(mode, pipeline.signal),
+            pipeline.flush_permit_wait_ns_total as f64 / 1_000_000_000.0,
+        );
     }
 }
 
@@ -1318,10 +1532,48 @@ fn render_logs_postings_family(out: &mut String, mode: Mode, pipelines: &[Ingest
     }
 }
 
+/// One signal's fold-liveness figures. The fold runs as one independent task
+/// per [`crate::fold::FOLD_SIGNALS`] entry, so these are per signal rather
+/// than per process: a process-global set reads as healthy whenever any one
+/// of those tasks is still running, which is the blind spot a dead signal
+/// loop would otherwise sit in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogFoldCounters {
+    /// The signal these figures belong to, carried in the entry rather than
+    /// implied by its position, so the renderer cannot mislabel a series by
+    /// iterating out of step with `FOLD_SIGNALS`.
+    pub signal: Signal,
+    /// `Catalog::fold` calls for this signal that returned `Ok`, no-op cycles
+    /// included.
+    pub cycles: u64,
+    /// `Catalog::fold` calls for this signal that returned `Err`.
+    pub failures: u64,
+    /// `now_ns` of the most recent successful fold of this signal, or `0` when
+    /// none has succeeded in this process. Carried in nanoseconds (the
+    /// catalog's own unit, and an exact integer) and divided down to seconds
+    /// only at the render below, so this struct stays `Eq`-comparable in
+    /// tests.
+    pub last_success_unix_ns: i64,
+}
+
+impl CatalogFoldCounters {
+    /// One zeroed entry per folded signal: the `Default` shape of the
+    /// per-signal array, spelled here because [`Signal`] has no `Default` of
+    /// its own and the entries must still name their signals.
+    fn zeroed_per_signal() -> [CatalogFoldCounters; crate::fold::FOLD_SIGNALS.len()] {
+        crate::fold::FOLD_SIGNALS.map(|signal| CatalogFoldCounters {
+            signal,
+            cycles: 0,
+            failures: 0,
+            last_success_unix_ns: 0,
+        })
+    }
+}
+
 /// The catalog anomaly and hard-failure counters
 /// (`crates/ravel-catalog/src/catalog.rs`), decoupled from `Catalog` itself
 /// so the renderer is testable with a plain struct literal.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogCountersSnapshot {
     pub interlock_violations: u64,
     pub compaction_input_set_conflicts: u64,
@@ -1329,6 +1581,40 @@ pub struct CatalogCountersSnapshot {
     /// tenant_hash mismatch or an out-of-prefix listing result. Unlike the
     /// two counters above, each of these also failed its query.
     pub isolation_breaches: u64,
+    /// Fold liveness, one entry per signal the fold covers.
+    pub fold: [CatalogFoldCounters; crate::fold::FOLD_SIGNALS.len()],
+}
+
+impl Default for CatalogCountersSnapshot {
+    fn default() -> Self {
+        CatalogCountersSnapshot {
+            interlock_violations: 0,
+            compaction_input_set_conflicts: 0,
+            isolation_breaches: 0,
+            fold: CatalogFoldCounters::zeroed_per_signal(),
+        }
+    }
+}
+
+impl CatalogCountersSnapshot {
+    /// Read every counter off a live [`ravel_catalog::Catalog`]. The scrape
+    /// handler calls this rather than listing the reads inline, so the
+    /// catalog-to-exposition wiring is a function a test can call: a renderer
+    /// driven only by struct literals proves the formatting and nothing about
+    /// whether the numbers came from the catalog at all.
+    pub fn from_catalog(catalog: &ravel_catalog::Catalog) -> Self {
+        CatalogCountersSnapshot {
+            interlock_violations: catalog.interlock_violations(),
+            compaction_input_set_conflicts: catalog.compaction_input_set_conflicts(),
+            isolation_breaches: catalog.isolation_breaches(),
+            fold: crate::fold::FOLD_SIGNALS.map(|signal| CatalogFoldCounters {
+                signal,
+                cycles: catalog.fold_cycles(signal),
+                failures: catalog.fold_failures(signal),
+                last_success_unix_ns: catalog.fold_last_success_unix_ns(signal),
+            }),
+        }
+    }
 }
 
 fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCountersSnapshot) {
@@ -1370,6 +1656,65 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         &[Label::Mode(mode)],
         snapshot.isolation_breaches,
     );
+
+    // The three fold families carry a `signal` label because the fold is one
+    // independent task per signal (`crate::fold::FOLD_SIGNALS`). Every folded
+    // signal renders every cycle, whether or not its loop is still alive, so a
+    // loop that has died leaves its own series standing and going stale
+    // instead of vanishing into an aggregate its siblings keep fresh.
+    fn labels(mode: Mode, signal: Signal) -> [Label; 2] {
+        [Label::Mode(mode), Label::Signal(signal)]
+    }
+
+    write_header(
+        out,
+        "ravel_catalog_fold_cycles_total",
+        "Catalog folds that completed successfully, by signal, including the no-op folds that are the healthy steady state.",
+        "counter",
+    );
+    for fold in &snapshot.fold {
+        write_sample(
+            out,
+            "ravel_catalog_fold_cycles_total",
+            &labels(mode, fold.signal),
+            fold.cycles,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_catalog_fold_failures_total",
+        "Catalog folds that failed, by signal. A fold that fails every cycle leaves the unsealed ingest span growing without bound.",
+        "counter",
+    );
+    for fold in &snapshot.fold {
+        write_sample(
+            out,
+            "ravel_catalog_fold_failures_total",
+            &labels(mode, fold.signal),
+            fold.failures,
+        );
+    }
+
+    // The liveness gauge, and the only figure here that moves when the fold
+    // STOPS rather than when it runs. `0` means no fold of that signal has
+    // succeeded since this process started, which is why the alert rule in
+    // docs/guides/observability.md carries a `for:` long enough to cover a
+    // freshly started process's first fold interval.
+    write_header(
+        out,
+        "ravel_catalog_fold_last_success_timestamp_seconds",
+        "Unix time of the last successful catalog fold of this signal in this process, 0 if none has succeeded yet. Its age is the fold-liveness signal.",
+        "gauge",
+    );
+    for fold in &snapshot.fold {
+        write_sample_f64(
+            out,
+            "ravel_catalog_fold_last_success_timestamp_seconds",
+            &labels(mode, fold.signal),
+            fold.last_success_unix_ns as f64 / 1e9,
+        );
+    }
 }
 
 /// Tenancy adoption counter (ADR-0050 section 3). Counts buckets this process
@@ -1412,10 +1757,12 @@ fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u6
     );
 }
 
-/// The process-wide ingest buffer byte budget family (ADR-0069 decision 1): the current gauge of estimated buffered bytes, the configured
-/// ceiling, and the cumulative shed counter. Mode-only labeled like
-/// `render_ingest_concurrency_family` above: the budget is a single gauge
-/// shared across metrics/logs/traces with no per-signal breakdown.
+/// The process-wide ingest buffer byte budget family (ADR-0069 decision 1,
+/// amended): the current gauge of estimated buffered bytes plus in-flight
+/// OTLP HTTP gzip and Remote Write snappy decode state, the configured
+/// ceiling, and the cumulative shed counter. Mode-only labeled like `render_ingest_concurrency_family`
+/// above: the budget is a single gauge shared across metrics/logs/traces
+/// with no per-signal breakdown.
 ///
 /// `ravel_ingest_buffer_bytes_limit` is `0` when the ceiling is unlimited
 /// (`--max-ingest-buffer-bytes 0`), matching the flag's own "0 = unlimited"
@@ -1431,7 +1778,7 @@ fn render_ingest_buffer_budget_family(
     write_header(
         out,
         "ravel_ingest_buffer_bytes",
-        "Estimated buffered ingest bytes currently held across all tenants and signals (the process-wide ingest byte budget gauge, ADR-0069).",
+        "Estimated buffered ingest bytes currently held across all tenants and signals, plus in-flight OTLP HTTP gzip and Remote Write snappy decode state (the process-wide ingest byte budget gauge, ADR-0069).",
         "gauge",
     );
     write_sample(
@@ -1463,6 +1810,101 @@ fn render_ingest_buffer_budget_family(
         "ravel_ingest_buffer_shed_total",
         &[Label::Mode(mode)],
         shed_total,
+    );
+}
+
+/// Clamps the exposed `ravel_memory_budget_bytes` reading to `u64::MAX` when
+/// `is_fallback` is set (the budget was sized on an unmeasured host,
+/// `config::PERF_SOURCE_FALLBACK`). On that path `raw_limit` is
+/// `ravel_memory::MemoryBudget::limit()`'s actual value: `u64::MAX` minus
+/// the two hard cache carves (`DEFAULT_CACHE_MAX_BYTES` each), not `u64::MAX`
+/// itself, which would leave the "unlimited" doc claim on
+/// `ravel_memory_budget_bytes` unmet and a `== u64::MAX` dashboard check
+/// permanently unmatched.
+fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
+    if is_fallback { u64::MAX } else { raw_limit }
+}
+
+/// The ADR-1170 decisions 3/4 process memory budget family: the derived
+/// ceiling, the reserved share per component, and the tenant handoff overlap
+/// the same one `ravel_memory::MemoryBudget` tracks. Unconditional, like
+/// `render_ingest_buffer_budget_family` above: `MetricsState::process_memory_budget`
+/// is always built (`crate::start`), regardless of the `sql` feature or mode,
+/// so this family renders in every build even where nothing yet reserves
+/// against the budget.
+///
+/// `ravel_memory_budget_bytes` is the POST-carve remainder, not the pre-carve
+/// `memory_budget_bytes` the startup log names: `main.rs` sizes
+/// `ServerConfig::process_memory_budget_bytes` from
+/// `ResolvedPerformanceDefaults::memory_remainder_bytes`, and this gauge
+/// renders that one instance's `limit()`. That is the right quantity for a
+/// budget accountant gauge (it is what reservations are refused against), but
+/// both names appear in the startup log with a multi-GB gap between them, so
+/// the HELP string below says which one this is.
+///
+/// It is `u64::MAX` when the process was built with no derived budget
+/// (matching `ravel_memory::MemoryBudget::unlimited`'s own convention), not
+/// `0`: a `0` ceiling would misread as "everything refused."
+/// [`exposed_memory_budget_limit`] clamps that path before it reaches this
+/// family.
+///
+/// `ravel_memory_reserved_bytes{component="fetch"}` and
+/// `ravel_memory_handoff_overlap_bytes` are both always `0` here.
+/// `ravel-query`'s fetchers do reserve and mark handoffs, but against the
+/// private `MemoryBudget::unlimited` each one carries by default:
+/// `crate::query::build_sql_state` wires no fetcher to the process-wide
+/// instance, so nothing this family reads ever sees a fetch reservation. See
+/// [`Label::MemoryComponent`]'s doc comment.
+fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudgetSnapshot) {
+    write_header(
+        out,
+        "ravel_memory_budget_bytes",
+        "Ceiling of the ADR-1170 shared SQL/fetch memory budget: the startup log's memory_remainder_bytes, which is memory_budget_bytes minus memory_hard_caps_bytes (the two resolved cache ceilings), NOT the pre-carve memory_budget_bytes that log line names; u64::MAX means unlimited.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_memory_budget_bytes",
+        &[Label::Mode(mode)],
+        budget.limit,
+    );
+
+    write_header(
+        out,
+        "ravel_memory_reserved_bytes",
+        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"sql\" is the budget's whole reserved total, equal to SQL's share only because SQL is its sole reserver today; component=\"fetch\" reads 0 until decision 2 (fetch-layer reservation) lands upstream.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_memory_reserved_bytes",
+        &[
+            Label::Mode(mode),
+            Label::MemoryComponent(MemoryComponent::Sql),
+        ],
+        budget.reserved,
+    );
+    write_sample(
+        out,
+        "ravel_memory_reserved_bytes",
+        &[
+            Label::Mode(mode),
+            Label::MemoryComponent(MemoryComponent::Fetch),
+        ],
+        0,
+    );
+
+    write_header(
+        out,
+        "ravel_memory_handoff_overlap_bytes",
+        "Bytes double-counted because a tenant's memory handed off between components overlaps in the ADR-1170 process budget's accounting window; inactive (always 0) until fetch handoff accounting lands.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_memory_handoff_overlap_bytes",
+        &[Label::Mode(mode)],
+        budget.handoff_overlap,
     );
 }
 
@@ -1612,23 +2054,36 @@ fn render_metadata_cache_family(out: &mut String, mode: Mode, counters: &Metadat
     );
 }
 
-/// Dynamic-tenant `shard_count` provisioning failures (ADR-0050 section 5,
-/// EC5): a dynamically-resolved tenant's durable provisioning check failed,
-/// either a real disagreement against this process's configured `--shards`
-/// (failing that single first-touch request), an unreadable record (corrupt
-/// or a future format version, also a hard failure), or the same class of
-/// failure caught on the maintain per-tenant loop instead (which skips that
-/// tenant's tick rather than failing a request). A static tenant's mismatch
-/// refuses startup instead and never reaches this counter. A nonzero value
-/// means at least one dynamic tenant's provisioning record could not be
-/// validated as expected; the operations guide pages on any increase.
-/// Process-global atomic read from [`crate::provisioning`], single source,
-/// no labels.
-fn render_provisioning_family(out: &mut String, mode: Mode, shard_count_mismatches: u64) {
+/// The `shard_count` provisioning family (ADR-0050 section 5, EC5; ADR-0082).
+///
+/// `ravel_provisioning_shard_count_mismatch_total` counts hard provisioning
+/// failures: an unreadable record (corrupt or a future format version), a
+/// decodable record whose generation history fails structural validation
+/// (`CorruptGenerations`: a scalar/generation-0 mismatch or a nonzero first
+/// activation hour), or pre-ADR data a lower `shard_count` would hide, caught
+/// on a dynamic tenant's first touch or on the maintain per-tenant loop. A
+/// nonzero value means at least one tenant failed a hard provisioning check:
+/// either an existing record could not be validated, or an adoption was
+/// refused before any record was written; the operations guide pages on any
+/// increase.
+///
+/// `ravel_provisioning_shard_count_drift_total` counts the ADR-0082 case: a
+/// decodable record with a structurally valid generation history whose
+/// recorded generation-0 `shard_count` differs from this process's live
+/// `--shards` default (a `CorruptGenerations` record fails hard above and is
+/// never counted here). That drift is tolerated (routing uses the
+/// record's own generation history), so it is an informational signal, not a
+/// failure. Both are process-global atomic reads with no labels beyond mode.
+fn render_provisioning_family(
+    out: &mut String,
+    mode: Mode,
+    shard_count_mismatches: u64,
+    shard_count_drifts: u64,
+) {
     write_header(
         out,
         "ravel_provisioning_shard_count_mismatch_total",
-        "Dynamic-tenant provisioning checks that failed: a shard_count disagreement, an unreadable record, or a maintain-loop check catching either (ADR-0050 section 5).",
+        "Provisioning checks that failed hard: an unreadable record, a decodable record with a structurally invalid generation history, or pre-ADR data a lower shard_count would hide (ADR-0050 section 5). A recorded shard_count that merely differs from the live default is tolerated and counted by ravel_provisioning_shard_count_drift_total instead.",
         "counter",
     );
     write_sample(
@@ -1636,6 +2091,18 @@ fn render_provisioning_family(out: &mut String, mode: Mode, shard_count_mismatch
         "ravel_provisioning_shard_count_mismatch_total",
         &[Label::Mode(mode)],
         shard_count_mismatches,
+    );
+    write_header(
+        out,
+        "ravel_provisioning_shard_count_drift_total",
+        "Provisioning validations where a decodable record with a structurally valid generation history had a recorded shard_count that differed from the live --shards default; the drift is tolerated and routing uses the record's own generation history (ADR-0082).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_provisioning_shard_count_drift_total",
+        &[Label::Mode(mode)],
+        shard_count_drifts,
     );
 }
 
@@ -1695,6 +2162,33 @@ fn render_bucket_protection_family(out: &mut String, mode: Mode, unknown: u64) {
         "ravel_bucket_protection_unknown",
         &[Label::Mode(mode)],
         unknown,
+    );
+}
+
+/// The query-audit pipeline's write-failure counter (ADR-0062 decision 2c).
+///
+/// Rendered only by a process that installed a pipeline: `maintain` and
+/// `gateway` serve no query surface, and a zero for a subsystem they never ran
+/// would read as "no failures" rather than "not applicable".
+///
+/// Under `--audit-mode required` a failed write is returned to the query as a
+/// 503 and is not counted here, so any nonzero value is the best-effort
+/// posture reporting queries that were served with no durable audit record.
+/// It increments once per tenant group whose write fails within a flush, not
+/// once per flush. It carries no tenant label: that would disclose which
+/// tenant's writes failed on this unauthenticated route.
+fn render_audit_family(out: &mut String, mode: Mode, write_failures: u64) {
+    write_header(
+        out,
+        "ravel_audit_write_failures_total",
+        "Query-audit writes that failed and were released anyway under --audit-mode best-effort. Each one is a query served with no durable audit record.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_audit_write_failures_total",
+        &[Label::Mode(mode)],
+        write_failures,
     );
 }
 
@@ -1865,7 +2359,11 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// loss is resolved."
     pub orphans_withheld: u64,
     /// Orphan candidates the most recent sweep pass found, tripped or not
-    /// (ADR-0058 decision 1): `orphans_deleted + orphans_withheld`. Nonzero
+    /// (ADR-0058 decision 1): `orphans_deleted + orphans_withheld +
+    /// orphans_quarantine_refused`. The third term is not optional: a
+    /// candidate whose copy to `quarantine/` failed is left live, so it is
+    /// still present, and it fails in exactly the store-fault case this gauge
+    /// exists to surface. Nonzero
     /// for small-scale commit-record loss the breaker's ratio/count thresholds
     /// are deliberately too coarse to trip on, which is why it is a distinct
     /// gauge from `orphans_withheld` (that one stays `0` precisely when the
@@ -1873,6 +2371,22 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// most recent pass and drops as candidates are deleted or their records
     /// restored; a drop is not "resolved," just this pass's count.
     pub orphans_present: u64,
+    /// Orphan candidates moved to `quarantine/` since process start (ADR-0058
+    /// amendment). A counter, unlike the two gauges above: quarantining is an
+    /// event a later pass does not undo, and the pass-local figure
+    /// `SweepReport` reports is summed on
+    /// [`crate::maintain::MaintenanceSafetyMetrics`] rather than here.
+    pub orphans_quarantined: u64,
+    /// Orphan candidates whose copy to `quarantine/` failed since process
+    /// start, so the live object was left in place (fail-closed: the delete
+    /// never runs when its copy did not). The steady state is a flat line, so
+    /// an alert reads `increase(...) > 0` like the breaker-trip counter.
+    pub orphans_quarantine_refused: u64,
+    /// Objects physically deleted from `quarantine/` past the quarantine
+    /// horizon since process start. Read against `orphans_quarantined`: that
+    /// one climbing while this one stays flat is a quarantine prefix filling
+    /// and never being reaped.
+    pub quarantine_reaped: u64,
 }
 
 /// One scrape's maintenance-safety counters (ADR-0048 decisions 1, 4, 6): the three safety controls that, before this issue, reached
@@ -1884,6 +2398,33 @@ pub struct MaintenanceSafetySnapshot {
     /// signal and shard of that tick at once.
     pub legal_hold_refresh_failures: u64,
     pub signals: Vec<MaintenanceSafetySignalSnapshot>,
+}
+
+impl MaintenanceSafetySnapshot {
+    /// Read every counter for every maintained signal at scrape time (atomic
+    /// loads, no `.await`), like every other family's snapshot constructor.
+    ///
+    /// A constructor rather than a literal at the `/metrics` handler so a
+    /// field added to the metrics struct and left out of the exposition is a
+    /// failing render test rather than a series nobody notices is missing.
+    pub fn from_metrics(metrics: &crate::maintain::MaintenanceSafetyMetrics) -> Self {
+        MaintenanceSafetySnapshot {
+            legal_hold_refresh_failures: metrics.legal_hold_refresh_failures(),
+            signals: crate::maintain::MAINTAINED_SIGNALS
+                .iter()
+                .map(|&signal| MaintenanceSafetySignalSnapshot {
+                    signal,
+                    conservation_aborts: metrics.conservation_aborts(signal),
+                    orphan_breaker_trips: metrics.orphan_breaker_trips(signal),
+                    orphans_withheld: metrics.orphans_withheld(signal),
+                    orphans_present: metrics.orphans_present(signal),
+                    orphans_quarantined: metrics.orphans_quarantined(signal),
+                    orphans_quarantine_refused: metrics.orphans_quarantine_refused(signal),
+                    quarantine_reaped: metrics.quarantine_reaped(signal),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// No `tenant_hash` label on any series here. ADR-0048 decision 4 names
@@ -1981,6 +2522,62 @@ fn render_maintain_safety_family(
             signal.orphans_present,
         );
     }
+
+    // The quarantine leg of orphan GC (ADR-0058 amendment). Counters, not
+    // gauges like the two above: each counts what a pass did, which the next
+    // pass does not undo, so the operator question they answer is a rate.
+    write_header(
+        out,
+        "ravel_maintain_orphans_quarantined_total",
+        "Orphan candidates moved from the live L0 set to the quarantine prefix, by signal. The \
+         deletion orphan GC performs is a copy plus a delete, so this is the rate at which \
+         record-less data objects are being taken out of the live set.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_orphans_quarantined_total",
+            &labels(mode, signal.signal),
+            signal.orphans_quarantined,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_orphans_quarantine_refused_total",
+        "Orphan candidates whose copy to the quarantine prefix failed, by signal; the live \
+         object was left in place rather than deleted without a copy. The steady state is a \
+         flat line, so alert on increase() > 0: a refusal means quarantine cannot make \
+         progress, from a store fault or a permissions or capacity problem on that prefix.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_orphans_quarantine_refused_total",
+            &labels(mode, signal.signal),
+            signal.orphans_quarantine_refused,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_quarantine_reaped_total",
+        "Objects physically deleted from the quarantine prefix past the quarantine horizon, by \
+         signal. The only place orphan-GC'd data is ever physically removed. Read it against \
+         ravel_maintain_orphans_quarantined_total: that one climbing while this one stays flat \
+         is a quarantine prefix that fills and is never reaped.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_quarantine_reaped_total",
+            &labels(mode, signal.signal),
+            signal.quarantine_reaped,
+        );
+    }
 }
 
 /// One scrape's ADR-0065 stuck-owner mitigation counters: how
@@ -1994,6 +2591,13 @@ pub struct MaintenanceOwnershipSnapshot {
     pub units_stalled: u64,
     pub memo_warm_start_units: u64,
     pub full_sweep_passes_total: u64,
+    /// Unix nanoseconds the supervised maintenance loop last completed a cycle,
+    /// `0` if none has completed yet. Rendered as
+    /// `ravel_maintain_last_cycle_completed_timestamp_seconds`; its age is the
+    /// maintain-liveness signal (issue #1683).
+    pub last_cycle_completed_unix_ns: i64,
+    /// Panics the supervisor caught in the loop body and restarted after.
+    pub loop_panics_total: u64,
 }
 
 /// No `tenant_hash` label on any series here (ADR-0044 section 4): every
@@ -2075,6 +2679,42 @@ fn render_maintain_ownership_family(
         &[Label::Mode(mode)],
         snapshot.full_sweep_passes_total,
     );
+
+    // The liveness gauge, and the only figure in this family that moves when the
+    // loop STOPS rather than when it runs. Every other maintenance gauge is
+    // written at the end of a cycle that completed, so a dead loop freezes them
+    // at their last healthy values; this one's age keeps growing. `0` means no
+    // cycle has completed since this process started, which is why the alert
+    // rule in docs/guides/observability.md carries a `for:` long enough to
+    // cover a freshly started process's first interval (issue #1683, mirroring
+    // ravel_catalog_fold_last_success_timestamp_seconds).
+    write_header(
+        out,
+        "ravel_maintain_last_cycle_completed_timestamp_seconds",
+        "Unix time the maintenance loop last completed a cycle in this process, 0 if none has completed yet. Its age is the maintain-liveness signal.",
+        "gauge",
+    );
+    write_sample_f64(
+        out,
+        "ravel_maintain_last_cycle_completed_timestamp_seconds",
+        &[Label::Mode(mode)],
+        snapshot.last_cycle_completed_unix_ns as f64 / 1e9,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_loop_panics_total",
+        "Panics caught in the maintenance loop body and restarted by the supervisor. \
+         The loop's only crash record: the supervisor keeps the pod up, so an \
+         increase() here is the signal that the loop is crash-looping.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_loop_panics_total",
+        &[Label::Mode(mode)],
+        snapshot.loop_panics_total,
+    );
 }
 
 /// One scrape's RLOG k-way merge peak-bytes gauge (ADR-0065 decision 4),
@@ -2110,6 +2750,182 @@ fn render_merge_memory_family(
             Label::MergeMemoryKind(MergeMemoryKind::Total),
         ],
         tracker.peak_total_bytes(),
+    );
+}
+
+/// One scrape's alert-evaluation counters (issue #532), folded across every
+/// tenant this process evaluates, plus the loop's liveness gauge.
+///
+/// Decoupled from [`crate::alerting::AlertMetrics`] so the renderer is testable
+/// with a plain struct literal, matching [`MaintenanceOwnershipSnapshot`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AlertSnapshot {
+    pub rules_evaluated: u64,
+    pub rules_failed: u64,
+    pub records_written: u64,
+    pub repeats_queued: u64,
+    pub notifications_delivered: u64,
+    pub notifications_failed: u64,
+    /// Ticks that held the lease and evaluated every rule.
+    pub ticks_evaluated: u64,
+    /// Ticks that skipped evaluation because a peer replica held the lease.
+    /// Healthy, and the steady state of every non-holding replica.
+    pub ticks_lease_not_held: u64,
+    /// Ticks that skipped evaluation because the lease read or write failed.
+    pub ticks_lease_unavailable: u64,
+    /// Ticks that evaluated nothing because the alert history was unreadable.
+    pub ticks_history_unavailable: u64,
+    /// Unix nanoseconds the alert loop last completed a tick, `0` if none has
+    /// completed yet. Rendered as
+    /// `ravel_alert_last_tick_completed_timestamp_seconds`; its age is the
+    /// alert-loop liveness signal.
+    pub last_tick_completed_unix_ns: i64,
+}
+
+impl AlertSnapshot {
+    /// This scrape's tick count for one outcome. Exhaustive, so adding an
+    /// outcome breaks the compile here rather than rendering a silent zero.
+    fn ticks(&self, outcome: crate::alerting::AlertTickOutcome) -> u64 {
+        use crate::alerting::AlertTickOutcome;
+        match outcome {
+            AlertTickOutcome::Evaluated => self.ticks_evaluated,
+            AlertTickOutcome::LeaseNotHeld => self.ticks_lease_not_held,
+            AlertTickOutcome::LeaseUnavailable => self.ticks_lease_unavailable,
+            AlertTickOutcome::HistoryUnavailable => self.ticks_history_unavailable,
+        }
+    }
+}
+
+/// No `tenant_hash` label on any series here (ADR-0044 section 4): one process
+/// runs one evaluator per tenant that has rules, and every counter below is the
+/// sum across them. A per-tenant breakdown would put a raw tenant hash on this
+/// unauthenticated route, which that section blocks.
+///
+/// Rendered only when this process built at least one evaluator
+/// ([`crate::alerting::active_alert_metrics`]). A deployment that configured no
+/// alert rules therefore carries none of these series at all, rather than a row
+/// of permanent zeros an alert rule would have to special-case.
+fn render_alert_family(out: &mut String, mode: Mode, snapshot: &AlertSnapshot) {
+    write_header(
+        out,
+        "ravel_alert_rules_evaluated_total",
+        "Alert rules whose query ran and whose condition was decided, cumulative across ticks and tenants.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_rules_evaluated_total",
+        &[Label::Mode(mode)],
+        snapshot.rules_evaluated,
+    );
+
+    write_header(
+        out,
+        "ravel_alert_rules_failed_total",
+        "Alert rules skipped because the query, the condition, or the write failed. Every one is logged; the rule is retried next tick.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_rules_failed_total",
+        &[Label::Mode(mode)],
+        snapshot.rules_failed,
+    );
+
+    write_header(
+        out,
+        "ravel_alert_records_written_total",
+        "Alert transition records durably written.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_records_written_total",
+        &[Label::Mode(mode)],
+        snapshot.records_written,
+    );
+
+    write_header(
+        out,
+        "ravel_alert_repeats_queued_total",
+        "Repeat notifications queued for a still-firing alert. A repeat re-sends the folded latest record with no new durable write, so it advances this counter and then ravel_alert_notifications_delivered_total, never ravel_alert_records_written_total.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_repeats_queued_total",
+        &[Label::Mode(mode)],
+        snapshot.repeats_queued,
+    );
+
+    write_header(
+        out,
+        "ravel_alert_notifications_delivered_total",
+        "Notifications delivered to every configured sink, including ones carried over from an earlier tick's failure.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_notifications_delivered_total",
+        &[Label::Mode(mode)],
+        snapshot.notifications_delivered,
+    );
+
+    write_header(
+        out,
+        "ravel_alert_notifications_failed_total",
+        "Notifications still undelivered after a tick's attempt, counted once per tick per notification, so one stuck notification keeps advancing this while it is retried.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_notifications_failed_total",
+        &[Label::Mode(mode)],
+        snapshot.notifications_failed,
+    );
+
+    // One counter split by a closed outcome, not three independent flags. The
+    // outcomes are mutually exclusive per tick, and `lease_not_held` is the
+    // healthy steady state of every replica that is not the lease holder, so it
+    // has to be countable without being failure: an alert rule that sums it
+    // with the two store-failure outcomes turns a normal multi-replica
+    // deployment into a permanent alarm.
+    write_header(
+        out,
+        "ravel_alert_ticks_total",
+        "Alert evaluation ticks by outcome: evaluated (this replica held the tenant lease and evaluated every rule), lease_not_held (a peer held it, the healthy multi-replica steady state), lease_unavailable (the lease read or write failed), history_unavailable (the alert history was unreadable, so nothing was evaluated).",
+        "counter",
+    );
+    for outcome in crate::alerting::AlertTickOutcome::ALL {
+        write_sample(
+            out,
+            "ravel_alert_ticks_total",
+            &[Label::Mode(mode), Label::AlertOutcome(outcome)],
+            snapshot.ticks(outcome),
+        );
+    }
+
+    // The liveness gauge, and the only figure in this family that moves when
+    // the loop STOPS rather than when it runs. Every counter above is
+    // cumulative, so a dead evaluator leaves them frozen and indistinguishable
+    // from a healthy deployment whose rules never fire; this one's age keeps
+    // growing. `0` means no tick has completed since this process started,
+    // which is why the alert rule in docs/guides/observability.md carries a
+    // `for:` long enough to cover a freshly started process's first interval
+    // (the same shape as ravel_maintain_last_cycle_completed_timestamp_seconds).
+    // A tick that ended in lease_not_held stamps it: a standby replica is
+    // alive, and holding it back would alarm on the steady state.
+    write_header(
+        out,
+        "ravel_alert_last_tick_completed_timestamp_seconds",
+        "Unix time the alert evaluation loop last completed a tick in this process, 0 if none has completed yet. Its age is the alert-loop liveness signal.",
+        "gauge",
+    );
+    write_sample_f64(
+        out,
+        "ravel_alert_last_tick_completed_timestamp_seconds",
+        &[Label::Mode(mode)],
+        snapshot.last_tick_completed_unix_ns as f64 / 1e9,
     );
 }
 
@@ -2363,6 +3179,164 @@ fn render_cache_family(
     );
 }
 
+/// Live (not cumulative) resident bytes and entry count for the ADR-0046
+/// fetcher read cache's tiers, plus each cache's resolved startup byte
+/// ceiling, so an operator can compare held-vs-budgeted (#1170) without
+/// deriving it from a cumulative counter that cannot answer "what is
+/// resident right now" -- [`render_cache_family`] above renders that other,
+/// cumulative half of the picture (hits, misses, evictions).
+///
+/// The catalog byte cache's own live residency is deliberately NOT rendered
+/// here: reaching it requires a `pub` accessor on `crates/ravel-catalog`,
+/// outside this task's declared scope (`services/ravel-server` and
+/// `crates/ravel-cache` only). Only its resolved ceiling is exposed, under
+/// `cache="catalog"`, so the gap is a missing residency row, not a missing
+/// cache row.
+fn render_cache_residency_family(
+    out: &mut String,
+    mode: Mode,
+    fetch_ram: Option<(usize, u64)>,
+    fetch_disk: Option<(usize, u64)>,
+    fetch_max_bytes: Option<u64>,
+    catalog_max_bytes: Option<u64>,
+) {
+    // Same disk-tier-present-or-not label discipline `render_cache_family`
+    // uses: with no disk tier, the RAM sample carries only `cache=`; with one,
+    // the RAM sample gains `tier="ram"` and the disk sample carries
+    // `tier="disk"`.
+    let mut emit_tier = |name: &str, help: &str, ram: Option<u64>, disk: Option<u64>| {
+        write_header(out, name, help, "gauge");
+        if let Some(value) = ram {
+            if disk.is_some() {
+                write_sample(
+                    out,
+                    name,
+                    &[
+                        Label::Mode(mode),
+                        Label::Cache(CacheFamily::Fetch),
+                        Label::CacheTier(CacheTier::Ram),
+                    ],
+                    value,
+                );
+            } else {
+                write_sample(
+                    out,
+                    name,
+                    &[Label::Mode(mode), Label::Cache(CacheFamily::Fetch)],
+                    value,
+                );
+            }
+        }
+        if let Some(value) = disk {
+            write_sample(
+                out,
+                name,
+                &[
+                    Label::Mode(mode),
+                    Label::Cache(CacheFamily::Fetch),
+                    Label::CacheTier(CacheTier::Disk),
+                ],
+                value,
+            );
+        }
+    };
+
+    emit_tier(
+        "ravel_cache_resident_entries",
+        "Entries currently held in this read-cache tier (ADR-0046), live rather than cumulative.",
+        fetch_ram.map(|(len, _)| len as u64),
+        fetch_disk.map(|(len, _)| len as u64),
+    );
+    emit_tier(
+        "ravel_cache_resident_bytes",
+        "Payload bytes currently held in this read-cache tier (ADR-0046), live rather than cumulative.",
+        fetch_ram.map(|(_, bytes)| bytes),
+        fetch_disk.map(|(_, bytes)| bytes),
+    );
+
+    write_header(
+        out,
+        "ravel_cache_max_bytes",
+        "The resolved startup byte ceiling for this cache, shared by its RAM and disk tiers, for \
+         comparing held-vs-budgeted.",
+        "gauge",
+    );
+    if let Some(max_bytes) = fetch_max_bytes {
+        write_sample(
+            out,
+            "ravel_cache_max_bytes",
+            &[Label::Mode(mode), Label::Cache(CacheFamily::Fetch)],
+            max_bytes,
+        );
+    }
+    if let Some(max_bytes) = catalog_max_bytes {
+        write_sample(
+            out,
+            "ravel_cache_max_bytes",
+            &[Label::Mode(mode), Label::Cache(CacheFamily::Catalog)],
+            max_bytes,
+        );
+    }
+}
+
+/// This process's own allocator-reported figures (#1170), read live at
+/// scrape time via [`crate::mem_stats::read`]: a whole-process RSS number
+/// cannot say which subsystem grew, so this surfaces the allocator's own
+/// breakdown -- or names the allocator plainly when it is not jemalloc,
+/// rather than reporting zeros for stats an allocator that isn't jemalloc
+/// does not expose.
+fn render_allocator_family(
+    out: &mut String,
+    mode: Mode,
+    allocator: crate::mem_stats::AllocatorStats,
+) {
+    match allocator {
+        crate::mem_stats::AllocatorStats::Jemalloc {
+            allocated,
+            active,
+            resident,
+        } => {
+            write_header(
+                out,
+                "ravel_process_allocator_bytes",
+                "This process's jemalloc-reported byte figures, split by stat= (allocated/active/resident).",
+                "gauge",
+            );
+            for (stat, value) in [
+                (AllocatorStat::Allocated, allocated),
+                (AllocatorStat::Active, active),
+                (AllocatorStat::Resident, resident),
+            ] {
+                write_sample(
+                    out,
+                    "ravel_process_allocator_bytes",
+                    &[
+                        Label::Mode(mode),
+                        Label::Allocator("jemalloc"),
+                        Label::AllocatorStat(stat),
+                    ],
+                    value,
+                );
+            }
+        }
+        crate::mem_stats::AllocatorStats::Other { name } => {
+            write_header(
+                out,
+                "ravel_process_allocator_info",
+                "Which allocator this process runs under, when it is not jemalloc: a 1-valued info series \
+                 naming it, never a stand-in zero for figures this allocator does not expose.",
+                "gauge",
+            );
+            write_sample(
+                out,
+                "ravel_process_allocator_info",
+                &[Label::Mode(mode), Label::Allocator(name)],
+                1,
+            );
+        }
+    }
+}
+
 /// The per-(tenant, signal) admission counters (ADR-0051 section 6), read
 /// from [`AdmissionController::usage_snapshot`] at scrape time and paired with
 /// the `--metrics-tenant-labels` decision, matching every other family's
@@ -2387,6 +3361,58 @@ pub struct AdmissionCountersSnapshot {
     /// a compressed request, so the wire quantity has no home in that snapshot.
     /// Folded by the same `tenant_labels` gate as `usage`.
     pub wire_bytes: Vec<crate::ingest_byte_metrics::TenantWireBytes>,
+    /// Per-tenant normalization-layer decisions (ADR-0051 section 3, layer 3),
+    /// rendered as the `skew` and `structural` reasons of this family's
+    /// rejection counter plus the separate body-conversion counter. Sourced
+    /// from [`crate::normalize_reject_metrics::NormalizeRejectMetrics`], not
+    /// the admission `usage_snapshot`: the controller enforces layers 2 and 4
+    /// and keeps no row for a decision normalization made. Folded by the same
+    /// `tenant_labels` gate as `usage`.
+    pub normalize_rejects: Vec<crate::normalize_reject_metrics::TenantNormalizeRejects>,
+    /// What the last completed fleet-reconciliation cycle cost and saw
+    /// (ADR-0057). Process-global, not per (tenant, signal): one cycle covers
+    /// every tenant this process tracks, so its series carry `mode` alone.
+    /// All-zero before the first cycle, and in a mode that runs no
+    /// reconciliation loop at all.
+    pub reconcile_cycle: ReconcileCycleSnapshot,
+}
+
+/// The reconciliation cycle figures for one scrape (ADR-0057), assembled from
+/// the two places they live: the controller publishes the last cycle's own
+/// figures, and the exporter-side accumulator keeps the running reaped total
+/// the controller deliberately does not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileCycleSnapshot {
+    /// Last cycle's duration in nanoseconds, measured on the controller's
+    /// injected clock. Rendered in seconds.
+    pub cycle_duration_ns: i64,
+    /// Distinct non-stale sibling processes the last cycle saw, which is the
+    /// live fleet size this process reconciled against.
+    pub siblings_observed: u64,
+    /// Listed keys the last cycle did not GET because the LIST already showed
+    /// them past the staleness window.
+    pub stale_keys_skipped: u64,
+    /// Keys past the reap horizon deleted by every cycle since process start.
+    /// A running total, unlike the three figures above: see
+    /// [`crate::admission_reconcile::ReconcileCycleMetrics`] for why the
+    /// per-cycle count cannot carry the `_total` name itself.
+    pub keys_reaped_total: u64,
+}
+
+impl ReconcileCycleSnapshot {
+    /// Pair the controller's last-cycle copy with the exporter's running
+    /// reaped total, the two reads the `/metrics` handler makes.
+    pub fn from_parts(
+        last_cycle: ravel_ingest::ReconcileCycleStats,
+        keys_reaped_total: u64,
+    ) -> Self {
+        ReconcileCycleSnapshot {
+            cycle_duration_ns: last_cycle.cycle_duration_ns,
+            siblings_observed: last_cycle.siblings_observed,
+            stale_keys_skipped: last_cycle.stale_keys_skipped,
+            keys_reaped_total,
+        }
+    }
 }
 
 /// The counters this family sums per rendered series. Split out so the fold
@@ -2402,6 +3428,9 @@ struct AdmissionAcc {
     rejected_series_rate: u64,
     rejected_series_cap: u64,
     rejected_clock: u64,
+    rejected_skew: u64,
+    rejected_structural: u64,
+    body_conversions: u64,
     reconciliation_failures: u64,
 }
 
@@ -2412,6 +3441,8 @@ impl AdmissionAcc {
             RejectReason::SeriesRate => self.rejected_series_rate,
             RejectReason::SeriesCap => self.rejected_series_cap,
             RejectReason::Clock => self.rejected_clock,
+            RejectReason::Skew => self.rejected_skew,
+            RejectReason::Structural => self.rejected_structural,
         }
     }
 }
@@ -2458,6 +3489,24 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
         acc.reconciliation_failures = acc
             .reconciliation_failures
             .saturating_add(row.reconciliation_failures_total);
+    }
+
+    // Normalization-layer decisions fold into the same rows, under the same
+    // tenant-label gate. A (tenant, signal) that has only these and no
+    // admission-controller usage still gets a full row: every other counter
+    // renders zero, which is what it is, and the rejection reasons the sender
+    // was told about are visible rather than absent.
+    for row in &snapshot.normalize_rejects {
+        let key = (
+            snapshot.tenant_labels.then_some(row.tenant_hash),
+            row.signal,
+        );
+        let acc = rows.entry(key).or_default();
+        acc.rejected_skew = acc.rejected_skew.saturating_add(row.skew_total);
+        acc.rejected_structural = acc.rejected_structural.saturating_add(row.structural_total);
+        acc.body_conversions = acc
+            .body_conversions
+            .saturating_add(row.body_conversions_total);
     }
 
     // A HashMap iterates in an unspecified order; Prometheus does not require
@@ -2577,7 +3626,11 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
     write_header(
         out,
         "ravel_admission_rejected_total",
-        "Admission rejections by tenant, signal, and reason (byte_rate, series_rate, series_cap, clock).",
+        "Admission rejections by tenant, signal, and reason (byte_rate, series_rate, series_cap, \
+         clock, skew, structural). byte_rate and clock count whole requests; series_rate and \
+         series_cap count series; skew and structural count individual data points, log records, \
+         or spans rejected in normalization, matching what the sender is told through OTLP \
+         partial success.",
         "counter",
     );
     for ((hash, signal), acc) in &ordered {
@@ -2591,6 +3644,29 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
                 acc.rejected(reason),
             );
         }
+    }
+
+    // Structured log bodies converted rather than rejected. Deliberately its
+    // own family and not a `reason` on the counter above: a conversion is not
+    // a rejection, so an operator alerting on rejection reasons must see
+    // nothing from them.
+    write_header(
+        out,
+        "ravel_ingest_body_conversions_total",
+        "Log records whose structured (array or kvlist) body was converted to its canonical JSON \
+         form at normalization, by tenant and signal. Not a rejection, and not a count of stored \
+         records: it is counted before the active-stream cap and before the write. Read it as a \
+         conversion rate. A sustained rate means a sender is emitting structured bodies, which \
+         query paths see as JSON text.",
+        "counter",
+    );
+    for ((hash, signal), acc) in &ordered {
+        write_sample(
+            out,
+            "ravel_ingest_body_conversions_total",
+            &labels(mode, *hash, *signal),
+            acc.body_conversions,
+        );
     }
 
     // Fleet-global reconciliation read failures (ADR-0057 section 3). Same
@@ -2614,6 +3690,81 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
             acc.reconciliation_failures,
         );
     }
+
+    // The cycle itself, beside the failure counter above. `mode` alone, no
+    // {tenant_hash, signal}: one cycle reconciles every tenant this process
+    // tracks, so there is no per-tenant figure to label. The failure counter
+    // keeps its tenant dimension because a read failure is per (tenant,
+    // signal); nothing here is.
+    //
+    // The three per-cycle figures are gauges. Each is the last completed
+    // cycle's value and each can fall (a fleet that shrinks, a cycle that
+    // finishes faster), so none of them takes a `_total` name. Only the reaped
+    // keys accumulate, on the exporter side, and only that one is a counter.
+    let cycle = &snapshot.reconcile_cycle;
+    write_header(
+        out,
+        "ravel_admission_reconciliation_cycle_duration_seconds",
+        "Duration of the last completed fleet-admission reconciliation cycle. A cycle \
+         approaching the 2R staleness window (twice the reconciliation interval) makes every \
+         sibling snapshot read as stale, at which point each process starts enforcing the whole \
+         fleet cap alone while no failure counter moves.",
+        "gauge",
+    );
+    write_sample_f64(
+        out,
+        "ravel_admission_reconciliation_cycle_duration_seconds",
+        &[Label::Mode(mode)],
+        // The cycle saturates at zero rather than going negative if the clock
+        // steps backwards mid-cycle; clamp anyway, since a negative duration
+        // here would be a silently nonsensical sample rather than an error.
+        cycle.cycle_duration_ns.max(0) as f64 / 1_000_000_000.0,
+    );
+
+    write_header(
+        out,
+        "ravel_admission_reconciliation_siblings_observed",
+        "Distinct non-stale sibling processes the last completed reconciliation cycle saw, the \
+         live fleet size this process reconciled its share of each tenant's cap against. It \
+         falling to 0 while replicas are up means this process is reading no sibling as live.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_admission_reconciliation_siblings_observed",
+        &[Label::Mode(mode)],
+        cycle.siblings_observed,
+    );
+
+    write_header(
+        out,
+        "ravel_admission_reconciliation_stale_keys_skipped",
+        "Snapshot keys the last completed reconciliation cycle skipped reading because the LIST \
+         already showed them past the staleness window. Sustained growth alongside a flat \
+         siblings_observed is a control-plane prefix filling with dead processes' keys.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_admission_reconciliation_stale_keys_skipped",
+        &[Label::Mode(mode)],
+        cycle.stale_keys_skipped,
+    );
+
+    write_header(
+        out,
+        "ravel_admission_reconciliation_keys_reaped_total",
+        "Snapshot keys past the reap horizon deleted by reconciliation cycles since process \
+         start. A rate at zero while stale_keys_skipped climbs means the prefix is filling \
+         faster than it is being cleared.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_admission_reconciliation_keys_reaped_total",
+        &[Label::Mode(mode)],
+        cycle.keys_reaped_total,
+    );
 }
 
 /// One (tenant bucket, workload class) row's accumulated per-query cost
@@ -3388,8 +4539,16 @@ pub fn render(
     durable_auth: Option<&DurableAuthCountersSnapshot>,
     attribution: &[TenantAttributionRow],
     metadata_cache: Option<&MetadataCacheCounters>,
+    allocator: crate::mem_stats::AllocatorStats,
+    cache_ram_residency: Option<(usize, u64)>,
+    cache_disk_residency: Option<(usize, u64)>,
+    cache_max_bytes: Option<u64>,
+    catalog_cache_max_bytes: Option<u64>,
+    audit_write_failures: Option<u64>,
+    memory_budget: MemoryBudgetSnapshot,
 ) -> String {
     let mut out = String::new();
+    render_allocator_family(&mut out, mode, allocator);
     render_store_family(&mut out, mode, store);
     if !ingest.is_empty() {
         render_ingest_family(&mut out, mode, ingest);
@@ -3401,6 +4560,7 @@ pub fn render(
         &mut out,
         mode,
         crate::provisioning::shard_count_mismatch_count(),
+        ravel_catalog::shard_count_drift_count(),
     );
     render_store_probe_family(
         &mut out,
@@ -3415,6 +4575,9 @@ pub fn render(
     );
     if let Some(snapshot) = durable_auth {
         render_durable_auth_family(&mut out, mode, snapshot);
+    }
+    if let Some(write_failures) = audit_write_failures {
+        render_audit_family(&mut out, mode, write_failures);
     }
     render_query_postings_family(&mut out, mode, crate::query_postings_metrics::snapshot());
     render_typed_attr_columns_family(&mut out, mode, crate::typed_attr_metrics::stale_fallbacks());
@@ -3432,6 +4595,42 @@ pub fn render(
     }
     if let Some(tracker) = merge_memory {
         render_merge_memory_family(&mut out, mode, tracker);
+    }
+    // Read from the process-global alerting handle rather than an argument,
+    // like `crate::query_postings_metrics::snapshot` and
+    // `crate::store_probe::store_reachable` above: the evaluator is spawned per
+    // tenant from `crate::alerting::spawn` and holds no router or state struct
+    // the `/metrics` route is given. `None` when this process built no
+    // evaluator, which omits the family.
+    //
+    // That omission is load-bearing: every alert rule in
+    // `docs/guides/observability.md` relies on the family being absent, not
+    // zero, on a deployment that configured no alerting, since an expression
+    // over an absent series is the empty vector. It is deliberately not
+    // covered by a `render`-level test. The handle is a process-global
+    // `OnceLock`, so a test asserting absence passes or fails on whether some
+    // other test in the same binary spawned an evaluator first, and a test
+    // that depends on binary-internal ordering is worse than none.
+    // `render_alert_family`'s own test covers the present case.
+    if let Some(metrics) = crate::alerting::active_alert_metrics() {
+        use crate::alerting::AlertTickOutcome;
+        render_alert_family(
+            &mut out,
+            mode,
+            &AlertSnapshot {
+                rules_evaluated: metrics.rules_evaluated(),
+                rules_failed: metrics.rules_failed(),
+                records_written: metrics.records_written(),
+                repeats_queued: metrics.repeats_queued(),
+                notifications_delivered: metrics.notifications_delivered(),
+                notifications_failed: metrics.notifications_failed(),
+                ticks_evaluated: metrics.ticks(AlertTickOutcome::Evaluated),
+                ticks_lease_not_held: metrics.ticks(AlertTickOutcome::LeaseNotHeld),
+                ticks_lease_unavailable: metrics.ticks(AlertTickOutcome::LeaseUnavailable),
+                ticks_history_unavailable: metrics.ticks(AlertTickOutcome::HistoryUnavailable),
+                last_tick_completed_unix_ns: metrics.last_tick_completed_unix_ns(),
+            },
+        );
     }
     if let Some(snapshot) = scrub {
         render_scrub_family(&mut out, mode, snapshot);
@@ -3464,6 +4663,21 @@ pub fn render(
     if let Some(snapshot) = distrib {
         render_distrib_family(&mut out, mode, snapshot);
     }
+    if cache_ram_residency.is_some()
+        || cache_disk_residency.is_some()
+        || cache_max_bytes.is_some()
+        || catalog_cache_max_bytes.is_some()
+    {
+        render_cache_residency_family(
+            &mut out,
+            mode,
+            cache_ram_residency,
+            cache_disk_residency,
+            cache_max_bytes,
+            catalog_cache_max_bytes,
+        );
+    }
+    render_memory_budget_family(&mut out, mode, memory_budget);
     out
 }
 
@@ -3475,6 +4689,19 @@ pub struct IngestBufferBudgetSnapshot {
     pub in_flight_bytes: u64,
     pub ceiling: u64,
     pub shed_total: u64,
+}
+
+/// The ADR-1170 process memory budget readings the `/metrics` handler
+/// snapshots from [`ravel_memory::MemoryBudget`] at scrape time (atomic
+/// loads). `Default` (all zero) is the reading of an unpopulated test
+/// snapshot, not a real process's; a real process's `limit` is never `0`
+/// (see [`render_memory_budget_family`]'s doc comment on the `u64::MAX`
+/// unlimited convention).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryBudgetSnapshot {
+    pub limit: u64,
+    pub reserved: u64,
+    pub handoff_overlap: u64,
 }
 
 /// Router state for `GET /metrics`. Every field is a handle already built by
@@ -3528,11 +4755,37 @@ pub struct MetricsState {
     /// disabled. Rendered under `cache="catalog",tier="disk"`. Sourced from
     /// [`ravel_catalog::Catalog::byte_cache_disk_metrics`].
     pub catalog_cache_disk_metrics: Option<Arc<ravel_cache::CacheMetrics>>,
+    /// The fetcher cache handle itself (as distinct from `cache_metrics`'s
+    /// cumulative counters), for the live resident-bytes/entry-count gauges
+    /// (#1170): `Cache::len`/`total_bytes` or, tiered, `TieredCache::ram_len`/
+    /// `ram_total_bytes`/`disk_len`/`disk_total_bytes`. `None` under exactly
+    /// the same condition as `cache_metrics` (`--disable-cache`).
+    pub cache: Option<ravel_query::ReadCache>,
+    /// The resolved startup byte ceiling for the fetcher cache
+    /// (`ravel_server::store::build_cache`'s `cache_max_bytes`), rendered
+    /// under `cache="fetch"` alongside the live residency gauges above so an
+    /// operator can compare held-vs-budgeted. Meaningful only when
+    /// `cache_metrics` is `Some`; the value is otherwise whatever
+    /// `ServerConfig` resolved regardless of use.
+    pub cache_max_bytes: u64,
+    /// The resolved startup byte ceiling for the catalog byte cache
+    /// (`ravel_server::query::build_catalog`'s `cache_max_bytes`, a SEPARATE
+    /// ceiling from `cache_max_bytes` above), rendered under
+    /// `cache="catalog"`. Meaningful only when `catalog_cache_metrics` is
+    /// `Some`. The catalog cache's live residency is not rendered (see
+    /// [`render_cache_residency_family`]'s doc comment for the scope gap).
+    pub catalog_cache_max_bytes: u64,
     /// The one process-wide admission controller (ADR-0051), shared with every
     /// ingest path. Always present (built in every mode); in a mode that
     /// serves no ingest its `usage_snapshot` is simply empty, so the admission
     /// family renders its headers with no per-tenant samples.
     pub admission: Arc<AdmissionController>,
+    /// The exporter-side running total of reaped snapshot keys, shared with
+    /// [`crate::admission_reconcile`]'s loop. Always present; it stays at zero
+    /// in a mode that spawns no reconciliation loop, which is the same reading
+    /// as a loop that has reaped nothing. The last cycle's other figures come
+    /// straight off `admission` above.
+    pub reconcile_cycle: Arc<crate::admission_reconcile::ReconcileCycleMetrics>,
     /// `--metrics-tenant-labels` (ADR-0051 section 6, default off): off folds
     /// every tenant's admission counters into `tenant_hash="other"`; on renders
     /// each observed tenant's real hash. Off keeps the exposition's cardinality
@@ -3573,11 +4826,37 @@ pub struct MetricsState {
     /// that turned compression off. Always present; empty until an OTLP request
     /// is admitted. Folded by the same `--metrics-tenant-labels` gate.
     pub ingest_byte_metrics: Arc<crate::ingest_byte_metrics::IngestByteMetrics>,
+    /// Per-tenant normalization-layer decisions (ADR-0051 section 3, layer 3),
+    /// rendered as the admission family's `skew` and `structural` reasons and
+    /// its body-conversion counter. The same `Arc` every ingest surface holds.
+    /// Always present; empty until a request is normalized. Folded by the same
+    /// `--metrics-tenant-labels` gate.
+    pub normalize_reject_metrics: Arc<crate::normalize_reject_metrics::NormalizeRejectMetrics>,
     /// The per-process metric-metadata cache (ADR-0085 decision 1), read at
     /// scrape time for its four `query_metadata_cache_*` counters. `Some` only
     /// in a request-serving mode that built one (`Mode::All`/`Mode::Query`);
     /// `None` otherwise leaves the whole family off the exposition.
     pub metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
+    /// The process's one query-audit pipeline (ADR-0062 decision 2b), read at
+    /// scrape time for its write-failure counter. `Some` only in a mode that
+    /// installed one (`Mode::All`/`Mode::Query`); `None` otherwise leaves the
+    /// `ravel_audit_write_failures_total` family off the exposition.
+    pub audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>>,
+    /// The ADR-1170 decisions 1/3/4 process-wide memory accountant, the SAME
+    /// instance installed on the `sql`-featured `SqlExecutor` via
+    /// `SqlExecutor::with_process_memory_budget` (when `sql` is compiled in
+    /// and the mode serves queries) so a tenant's SQL reservation and this
+    /// gauge read one counter, not two independently drifting ones. Always
+    /// present: `crate::start` builds it in every mode from
+    /// `ServerConfig::process_memory_budget_bytes`, unconditionally of the
+    /// `sql` feature, so the gauge family renders in every build.
+    pub process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+    /// `ServerConfig::process_memory_budget_is_fallback`: whether the budget
+    /// above was sized with the host's memory unknown, so the scrape handler
+    /// clamps the exposed `ravel_memory_budget_bytes` gauge to `u64::MAX`
+    /// rather than the raw near-miss remainder. See
+    /// [`exposed_memory_budget_limit`].
+    pub process_memory_budget_is_fallback: bool,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -3604,11 +4883,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         ));
     }
 
-    let catalog_snapshot = CatalogCountersSnapshot {
-        interlock_violations: state.catalog.interlock_violations(),
-        compaction_input_set_conflicts: state.catalog.compaction_input_set_conflicts(),
-        isolation_breaches: state.catalog.isolation_breaches(),
-    };
+    let catalog_snapshot = CatalogCountersSnapshot::from_catalog(state.catalog.as_ref());
 
     let maintain_snapshot =
         state
@@ -3620,23 +4895,10 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                 tenant_discovery_failures: metrics.discovery_failures(),
             });
 
-    let maintain_safety_snapshot =
-        state
-            .maintenance_safety
-            .as_ref()
-            .map(|metrics| MaintenanceSafetySnapshot {
-                legal_hold_refresh_failures: metrics.legal_hold_refresh_failures(),
-                signals: crate::maintain::MAINTAINED_SIGNALS
-                    .iter()
-                    .map(|&signal| MaintenanceSafetySignalSnapshot {
-                        signal,
-                        conservation_aborts: metrics.conservation_aborts(signal),
-                        orphan_breaker_trips: metrics.orphan_breaker_trips(signal),
-                        orphans_withheld: metrics.orphans_withheld(signal),
-                        orphans_present: metrics.orphans_present(signal),
-                    })
-                    .collect(),
-            });
+    let maintain_safety_snapshot = state
+        .maintenance_safety
+        .as_ref()
+        .map(|metrics| MaintenanceSafetySnapshot::from_metrics(metrics));
 
     let maintain_ownership_snapshot =
         state
@@ -3648,6 +4910,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                 units_stalled: metrics.units_stalled(),
                 memo_warm_start_units: metrics.memo_warm_start_units(),
                 full_sweep_passes_total: metrics.full_sweep_passes_total(),
+                last_cycle_completed_unix_ns: metrics.last_cycle_completed_unix_ns(),
+                loop_panics_total: metrics.loop_panics_total(),
             });
 
     let scrub_snapshot = state.scrub.as_ref().map(|metrics| ScrubSnapshot {
@@ -3681,6 +4945,34 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         .as_ref()
         .map(|metrics| metrics.snapshot());
 
+    // Live (not cumulative) resident bytes/entries for the fetcher cache's
+    // tiers (#1170), read straight off the S3-FIFO structures via
+    // `ravel_query::ReadCache`'s two variants rather than `cache_metrics`'s
+    // cumulative counters, which cannot answer "what is resident right now."
+    let cache_ram_residency = state.cache.as_ref().map(|cache| match cache {
+        ravel_query::ReadCache::Ram(ram) => (ram.len(), ram.total_bytes()),
+        ravel_query::ReadCache::Tiered(tiered) => (tiered.ram_len(), tiered.ram_total_bytes()),
+    });
+    let cache_disk_residency = state.cache.as_ref().and_then(|cache| match cache {
+        ravel_query::ReadCache::Ram(_) => None,
+        ravel_query::ReadCache::Tiered(tiered) => {
+            Some((tiered.disk_len(), tiered.disk_total_bytes()))
+        }
+    });
+    let cache_max_bytes = state
+        .cache_metrics
+        .is_some()
+        .then_some(state.cache_max_bytes);
+    let catalog_cache_max_bytes = state
+        .catalog_cache_metrics
+        .is_some()
+        .then_some(state.catalog_cache_max_bytes);
+
+    // This process's own allocator figures (#1170), read live via mallctl
+    // (or named plainly when the allocator is not jemalloc) rather than
+    // relying on whole-process RSS to say which subsystem grew.
+    let allocator_stats = crate::mem_stats::read();
+
     // Read the admission counters at scrape time (a lock-and-copy, no
     // `.await`), like every other family, rather than baking a snapshot in at
     // construction.
@@ -3688,6 +4980,11 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         usage: state.admission.usage_snapshot(),
         tenant_labels: state.metrics_tenant_labels,
         wire_bytes: state.ingest_byte_metrics.snapshot(),
+        normalize_rejects: state.normalize_reject_metrics.snapshot(),
+        reconcile_cycle: ReconcileCycleSnapshot::from_parts(
+            state.admission.last_reconcile_cycle_stats(),
+            state.reconcile_cycle.keys_reaped_total(),
+        ),
     };
 
     // Per-query cost rows, read at scrape time like every other family (a
@@ -3752,6 +5049,23 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         ));
     }
 
+    // The query-audit pipeline's failure counter, read at scrape time (an
+    // atomic load). `None` in a mode that installed no pipeline.
+    let audit_write_failures = state
+        .audit_pipeline
+        .as_ref()
+        .map(|pipeline| pipeline.flush_failures());
+    // The ADR-1170 process memory budget readings (atomic loads), like every
+    // other family, rather than baking a snapshot in at construction.
+    let memory_budget_snapshot = MemoryBudgetSnapshot {
+        limit: exposed_memory_budget_limit(
+            state.process_memory_budget.limit(),
+            state.process_memory_budget_is_fallback,
+        ),
+        reserved: state.process_memory_budget.reserved(),
+        handoff_overlap: state.process_memory_budget.handoff_overlap(),
+    };
+
     let body = render(
         state.mode,
         &store_snapshot,
@@ -3774,6 +5088,13 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         durable_auth_snapshot.as_ref(),
         &attribution,
         metadata_cache_snapshot.as_ref(),
+        allocator_stats,
+        cache_ram_residency,
+        cache_disk_residency,
+        cache_max_bytes,
+        catalog_cache_max_bytes,
+        audit_write_failures,
+        memory_budget_snapshot,
     );
     (
         StatusCode::OK,
@@ -3822,6 +5143,29 @@ mod tests {
         }
     }
 
+    /// Pins the exact near-miss value `ravel_memory::MemoryBudget::limit()`
+    /// reads on a fallback (unmeasured-host) build: `u64::MAX` minus the two
+    /// hard cache carves, each `crate::config::DEFAULT_CACHE_MAX_BYTES`. This
+    /// is the value the fallback gauge clamp must catch; asserting the exact
+    /// number, not `> 0` or "large", so a change to `DEFAULT_CACHE_MAX_BYTES`
+    /// or to the clamp logic surfaces here rather than only in production.
+    #[test]
+    fn memory_budget_gauge_clamps_fallback_near_miss_to_u64_max() {
+        let raw_near_miss = u64::MAX - 2 * crate::config::DEFAULT_CACHE_MAX_BYTES;
+        assert_eq!(raw_near_miss, 18_446_744_073_172_680_703);
+        assert_eq!(exposed_memory_budget_limit(raw_near_miss, true), u64::MAX);
+    }
+
+    /// The non-fallback path exposes the raw limit unchanged: a derived
+    /// budget's ceiling is meaningful and must not be clamped away.
+    #[test]
+    fn memory_budget_gauge_exposes_raw_limit_when_not_fallback() {
+        assert_eq!(
+            exposed_memory_budget_limit(21_045_339_751, false),
+            21_045_339_751
+        );
+    }
+
     /// The acceptance test for the exposition renderer. Proves both halves: a populated
     /// `StoreMetrics` snapshot renders to well-formed exposition text with the
     /// expected sample names and values, and the renderer's label API cannot
@@ -3851,6 +5195,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -3896,7 +5247,12 @@ mod tests {
         // the fetcher and catalog byte caches; `kind` is the tenth, added by
         // ADR-0065 decision 4 for the RLOG merge-memory gauge; `tier` is the
         // eleventh, added by #97 to split each read cache into its RAM and
-        // local-disk tiers.
+        // local-disk tiers; `allocator` and `stat` are the twelfth and
+        // thirteenth, added by #1170 for the process allocator gauges;
+        // `outcome` is the fourteenth, added by #532 to split the alert
+        // evaluation tick counter; `component` is the fifteenth, added by
+        // ADR-1170 decision 4 for the process memory budget's reserved-bytes
+        // gauge.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -3910,6 +5266,10 @@ mod tests {
             Label::Cache(CacheFamily::Fetch),
             Label::CacheTier(CacheTier::Ram),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
+            Label::AlertOutcome(crate::alerting::AlertTickOutcome::Evaluated),
+            Label::Allocator("jemalloc"),
+            Label::AllocatorStat(AllocatorStat::Allocated),
+            Label::MemoryComponent(MemoryComponent::Sql),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -3926,6 +5286,10 @@ mod tests {
                 Label::Cache(_) => "cache",
                 Label::CacheTier(_) => "tier",
                 Label::MergeMemoryKind(_) => "kind",
+                Label::AlertOutcome(_) => "outcome",
+                Label::Allocator(_) => "allocator",
+                Label::AllocatorStat(_) => "stat",
+                Label::MemoryComponent(_) => "component",
             })
             .collect();
         assert_eq!(
@@ -3946,15 +5310,21 @@ mod tests {
                 "cache",
                 "tier",
                 "kind",
+                "outcome",
+                "allocator",
+                "stat",
+                "component",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), the `cache` label, #97's `tier` \
-             label, and ADR-0065 decision 4's `kind`; `shard` must never appear here"
+             label, ADR-0065 decision 4's `kind`, #532's `outcome`, #1170's \
+             `allocator`/`stat`, and ADR-1170 decision 4's `component`; `shard` \
+             must never appear here"
         );
         assert_eq!(
             one_of_each.len(),
-            12,
-            "exactly 12 label variants, 11 distinct keys"
+            16,
+            "exactly 16 label variants, 15 distinct keys"
         );
     }
 
@@ -4001,6 +5371,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let postings_lines: Vec<&str> = body
@@ -4080,6 +5457,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let lines: Vec<&str> = body
@@ -4191,6 +5575,7 @@ mod tests {
             interlock_violations: 1,
             compaction_input_set_conflicts: 2,
             isolation_breaches: 3,
+            ..Default::default()
         };
         let body = render(
             Mode::Gateway,
@@ -4214,6 +5599,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let mut declared_types: HashSet<String> = HashSet::new();
@@ -4388,6 +5780,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(body.contains(
@@ -4413,6 +5812,72 @@ mod tests {
                 "ravel_ingest_metadata_flush_gets_total{mode=\"gateway\",signal=\"spans\""
             ),
             "spans pipeline must render no metadata_sink sample"
+        );
+    }
+
+    /// `shards_condemned` renders for the metrics pipeline with the driven
+    /// value and renders nothing for logs/spans (issue #1299): only the metrics
+    /// router respawns and condemns shard actors, so this family follows the
+    /// same structural-absence convention as `metadata_sink` above. Pins the
+    /// conditional render, whose input is `Option<u64>`: a `None` that started
+    /// being unwrapped to `Some(0)` would silently export a 0 for two
+    /// pipelines that have no such concept, and a family that stopped
+    /// rendering would silently disarm the `shards_condemned > 0` alert
+    /// docs/guides/observability.md tells operators to set.
+    #[test]
+    fn shards_condemned_counters_render_for_metrics_only() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
+                shards_condemned: 2,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot::default()),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+        );
+
+        assert!(
+            body.contains(
+                "ravel_ingest_shards_condemned_total{mode=\"gateway\",signal=\"metrics\"} 2"
+            ),
+            "the metrics pipeline must render the driven condemned count"
+        );
+        assert!(
+            !body.contains("ravel_ingest_shards_condemned_total{mode=\"gateway\",signal=\"logs\""),
+            "logs pipeline must render no shards_condemned sample"
+        );
+        assert!(
+            !body.contains("ravel_ingest_shards_condemned_total{mode=\"gateway\",signal=\"spans\""),
+            "spans pipeline must render no shards_condemned sample"
         );
     }
 
@@ -4455,6 +5920,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let written = "ravel_ingest_exemplars_written_total{mode=\"gateway\",signal=\"metrics\"} 7";
@@ -4523,6 +5995,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -4540,11 +6019,12 @@ mod tests {
     }
 
     /// The three remaining flush figures render one sample each with the
-    /// family's `{mode, signal}` labels and the right TYPE. `grace_extended` is
-    /// carried for every signal (all three ingest snapshots expose it), so logs
-    /// and spans render it too; the two metrics-only ADR-0067 figures render no
-    /// logs or spans sample. Built by setting the fields directly, so this pins
-    /// the rendering alone; the conversion is pinned by
+    /// family's `{mode, signal}` labels and the right TYPE. `grace_extended`
+    /// and `in_flight_flushes_total` are carried for every signal (all three
+    /// ingest snapshots expose them), so logs and spans render them too; the
+    /// metrics-only ADR-0067 adaptive-age figure renders no logs or spans
+    /// sample. Built by setting the fields directly, so this pins the
+    /// rendering alone; the conversion is pinned by
     /// `flush_counters_survive_conversion_from_ingest_snapshot` below.
     #[test]
     fn flush_counters_render_under_the_ingest_family() {
@@ -4552,8 +6032,8 @@ mod tests {
         metrics.grace_extended_stale_flushes = 3;
         metrics.adaptive_flushes = Some(AdaptiveFlushCounters {
             flushes_by_age_adaptive: 7,
-            in_flight_flushes_total: 2,
         });
+        metrics.in_flight_flushes_total = 2;
         let ingest = vec![
             metrics,
             IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot::default()),
@@ -4581,6 +6061,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let adaptive =
@@ -4622,8 +6109,12 @@ mod tests {
             ),
             "logs pipeline must render the grace-extended counter:\n{body}"
         );
-        // The two ADR-0067 figures are metrics-only, so logs and spans render
-        // neither.
+        // The adaptive-age figure is metrics-only, so logs and spans render
+        // neither. (The in-flight gauge is NOT metrics-only; its logs/spans
+        // rendering with real nonzero values is pinned by
+        // `logs_only_process_renders_the_in_flight_gauge` and
+        // `flush_counters_survive_conversion_from_ingest_snapshot` below,
+        // since asserting a hardcoded zero here would pass vacuously.)
         assert!(
             !body.contains(
                 "ravel_ingest_flushes_by_age_adaptive_total{mode=\"gateway\",signal=\"logs\""
@@ -4636,26 +6127,136 @@ mod tests {
             ),
             "spans pipeline must render no adaptive-age sample:\n{body}"
         );
-        assert!(
-            !body.contains("ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"logs\""),
-            "logs pipeline must render no in-flight gauge sample:\n{body}"
-        );
-        assert!(
-            !body.contains("ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"spans\""),
-            "spans pipeline must render no in-flight gauge sample:\n{body}"
-        );
     }
 
     /// The values travel from the ingest crate's counters to the rendered text:
     /// a constructor that drops any of the three fields while the source
-    /// snapshot carries them fails here, not in the render test above.
+    /// snapshot carries them fails here, not in the render test above. The
+    /// log and span in-flight totals are distinct nonzero values (3 and 5,
+    /// not each other's and not the metrics pipeline's 2) so a constructor
+    /// that mixed up which snapshot's field feeds which pipeline's sample
+    /// would be caught here rather than passing on a shared placeholder.
     #[test]
     fn flush_counters_survive_conversion_from_ingest_snapshot() {
-        let ingest = vec![IngestPipelineSnapshot::from_metrics(
-            IngestMetricsSnapshot {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
                 flushes_by_age_adaptive: 7,
                 grace_extended_stale_flushes: 3,
                 in_flight_flushes_total: 2,
+                flush_permit_wait_ns_total: 11_500_000_000,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+                in_flight_flushes_total: 3,
+                flush_permit_wait_ns_total: 4_250_000_000,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot {
+                in_flight_flushes_total: 5,
+                flush_permit_wait_ns_total: 6_750_000_000,
+                ..Default::default()
+            }),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+        );
+
+        assert!(
+            body.contains(
+                "ravel_ingest_flushes_by_age_adaptive_total{mode=\"gateway\",signal=\"metrics\"} 7"
+            ),
+            "conversion must carry the adaptive-age count, not zero:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_grace_extended_stale_flushes_total{mode=\"gateway\",signal=\"metrics\"} 3"
+            ),
+            "conversion must carry the grace-extended count, not zero:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"metrics\"} 2"),
+            "conversion must carry the in-flight gauge, not zero:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"logs\"} 3"),
+            "conversion must carry the log pipeline's own in-flight gauge, not the metrics \
+             pipeline's:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"spans\"} 5"),
+            "conversion must carry the span pipeline's own in-flight gauge, not another \
+             pipeline's:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_ingest_flush_permit_wait_seconds_total counter\n"),
+            "permit-wait family must declare its TYPE as a counter:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_flush_permit_wait_seconds_total{mode=\"gateway\",signal=\"metrics\"} 11.5\n"
+            ),
+            "conversion must carry the metrics pipeline's permit-wait total in seconds, not a \
+             wrong divisor:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_flush_permit_wait_seconds_total{mode=\"gateway\",signal=\"logs\"} 4.25\n"
+            ),
+            "conversion must carry the log pipeline's own permit-wait total, not another \
+             pipeline's or a wrong divisor:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_flush_permit_wait_seconds_total{mode=\"gateway\",signal=\"spans\"} 6.75\n"
+            ),
+            "conversion must carry the span pipeline's own permit-wait total, not another \
+             pipeline's or a wrong divisor:\n{body}"
+        );
+    }
+
+    /// Issue #1741: `ravel_ingest_in_flight_flushes` must render for a
+    /// logs-only process. Before the fix, the render loop lived inside the
+    /// `with_adaptive` block, which is empty whenever no pipeline sets
+    /// `adaptive_flushes` -- true of a logs-only process, since that field is
+    /// `Some` only for the metrics pipeline. A logs-only scrape therefore
+    /// rendered neither the TYPE header nor any sample for this family.
+    ///
+    /// Prove-the-test: this exact assertion fails against the pre-fix
+    /// renderer, where both the header and sample below are absent for a
+    /// pipeline list that contains no metrics signal at all.
+    #[test]
+    fn logs_only_process_renders_the_in_flight_gauge() {
+        let ingest = vec![IngestPipelineSnapshot::from_log_metrics(
+            LogIngestMetricsSnapshot {
+                in_flight_flushes_total: 4,
+                flush_permit_wait_ns_total: 2_500_000_000,
                 ..Default::default()
             },
         )];
@@ -4681,23 +6282,32 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
-            body.contains(
-                "ravel_ingest_flushes_by_age_adaptive_total{mode=\"gateway\",signal=\"metrics\"} 7"
-            ),
-            "conversion must carry the adaptive-age count, not zero:\n{body}"
+            body.contains("# TYPE ravel_ingest_in_flight_flushes gauge"),
+            "a logs-only process must still declare the in-flight gauge's TYPE:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"logs\"} 4"),
+            "a logs-only process must render its own in-flight gauge sample:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_ingest_flush_permit_wait_seconds_total counter\n"),
+            "a logs-only process must still declare the permit-wait family's TYPE:\n{body}"
         );
         assert!(
             body.contains(
-                "ravel_ingest_grace_extended_stale_flushes_total{mode=\"gateway\",signal=\"metrics\"} 3"
+                "ravel_ingest_flush_permit_wait_seconds_total{mode=\"gateway\",signal=\"logs\"} 2.5\n"
             ),
-            "conversion must carry the grace-extended count, not zero:\n{body}"
-        );
-        assert!(
-            body.contains("ravel_ingest_in_flight_flushes{mode=\"gateway\",signal=\"metrics\"} 2"),
-            "conversion must carry the in-flight gauge, not zero:\n{body}"
+            "a logs-only process must render its own permit-wait sample:\n{body}"
         );
     }
 
@@ -4707,6 +6317,7 @@ mod tests {
             interlock_violations: 0,
             compaction_input_set_conflicts: 0,
             isolation_breaches: 5,
+            ..Default::default()
         };
         let body = render(
             Mode::Gateway,
@@ -4730,12 +6341,398 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
             body.contains("ravel_catalog_isolation_breach_total{mode=\"gateway\"} 5"),
             "isolation-breach counter must render its current value:\n{body}"
         );
+    }
+
+    /// The fold-liveness family reaches `/metrics` as one series per folded
+    /// signal, each carrying the values it was driven with (issue #1306),
+    /// following [`metadata_sink_counters_render_for_metrics_only`]: a family
+    /// whose doc comments describe it but whose renderer emits nothing is
+    /// exactly the defect that test exists for. The gauge is asserted as the
+    /// exact rendered string, so a unit slip (nanoseconds emitted where
+    /// seconds are declared) fails here rather than reading as a 54-year-old
+    /// fold.
+    ///
+    /// The three signals are driven with three DIFFERENT values, and each is
+    /// asserted against its own label set. A renderer that emitted one signal
+    /// three times, or that paired the values with the wrong signals, passes
+    /// an assertion that only checks that three series exist; it fails here.
+    /// The series count is pinned exactly too, so a fourth signal cannot
+    /// appear unnoticed.
+    #[test]
+    fn catalog_fold_liveness_family_renders_one_series_per_signal() {
+        // 1_758_000_123_500_000_000 ns is 1758000123.5 s: a value with a
+        // fractional second, so a renderer that truncated to whole seconds
+        // would not match.
+        let catalog = CatalogCountersSnapshot {
+            fold: [
+                CatalogFoldCounters {
+                    signal: Signal::Metrics,
+                    cycles: 41,
+                    failures: 3,
+                    last_success_unix_ns: 1_758_000_123_500_000_000,
+                },
+                CatalogFoldCounters {
+                    signal: Signal::Logs,
+                    cycles: 17,
+                    failures: 0,
+                    last_success_unix_ns: 1_700_000_000_500_000_000,
+                },
+                CatalogFoldCounters {
+                    signal: Signal::Spans,
+                    cycles: 0,
+                    failures: 9,
+                    last_success_unix_ns: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        let body = render(
+            Mode::All,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+        );
+
+        assert!(
+            body.contains("# TYPE ravel_catalog_fold_cycles_total counter"),
+            "the cycle counter must declare its type:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_catalog_fold_last_success_timestamp_seconds gauge"),
+            "the liveness timestamp is a gauge, not a counter:\n{body}"
+        );
+
+        // Exact label sets and exact values, per signal. Every sample line the
+        // renderer must emit is named here in full.
+        for expected in [
+            "ravel_catalog_fold_cycles_total{mode=\"all\",signal=\"metrics\"} 41",
+            "ravel_catalog_fold_cycles_total{mode=\"all\",signal=\"logs\"} 17",
+            "ravel_catalog_fold_cycles_total{mode=\"all\",signal=\"spans\"} 0",
+            "ravel_catalog_fold_failures_total{mode=\"all\",signal=\"metrics\"} 3",
+            "ravel_catalog_fold_failures_total{mode=\"all\",signal=\"logs\"} 0",
+            "ravel_catalog_fold_failures_total{mode=\"all\",signal=\"spans\"} 9",
+            "ravel_catalog_fold_last_success_timestamp_seconds{mode=\"all\",signal=\"metrics\"} 1758000123.5",
+            "ravel_catalog_fold_last_success_timestamp_seconds{mode=\"all\",signal=\"logs\"} 1700000000.5",
+            "ravel_catalog_fold_last_success_timestamp_seconds{mode=\"all\",signal=\"spans\"} 0",
+        ] {
+            assert_eq!(
+                body.lines().filter(|line| *line == expected).count(),
+                1,
+                "expected exactly one `{expected}` sample line:\n{body}"
+            );
+        }
+
+        // Exactly three series per family: an unlabelled process-global series
+        // rendered alongside the per-signal ones, or a fourth signal, fails
+        // here rather than at the alert.
+        for family in [
+            "ravel_catalog_fold_cycles_total",
+            "ravel_catalog_fold_failures_total",
+            "ravel_catalog_fold_last_success_timestamp_seconds",
+        ] {
+            let samples = body
+                .lines()
+                .filter(|line| {
+                    // `{` catches a labelled series, ` ` an unlabelled one, so
+                    // a process-global sample counts here instead of slipping
+                    // past a labelled-only match. `#` lines are HELP and TYPE.
+                    line.strip_prefix(family)
+                        .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+                })
+                .count();
+            assert_eq!(
+                samples, 3,
+                "{family} must render one series per folded signal and no other:\n{body}"
+            );
+        }
+    }
+
+    /// The maintenance-liveness gauge and panic counter render on `/metrics`
+    /// with the right TYPE lines and values (issue #1683), mirroring the fold
+    /// liveness family test above. The timestamp is driven with a fractional
+    /// second, so a renderer emitting nanoseconds where seconds are declared
+    /// (or truncating to whole seconds) fails here rather than reading as a
+    /// 54-year-old cycle at the alert.
+    #[test]
+    fn maintain_liveness_family_renders_the_gauge_and_panic_counter() {
+        let snapshot = MaintenanceOwnershipSnapshot {
+            workers_live: 1,
+            units_owned: 4,
+            units_stalled: 0,
+            memo_warm_start_units: 0,
+            full_sweep_passes_total: 7,
+            // 1_758_000_123_500_000_000 ns is 1758000123.5 s.
+            last_cycle_completed_unix_ns: 1_758_000_123_500_000_000,
+            loop_panics_total: 2,
+        };
+        let mut out = String::new();
+        render_maintain_ownership_family(&mut out, Mode::All, &snapshot);
+
+        assert!(
+            out.contains("# TYPE ravel_maintain_last_cycle_completed_timestamp_seconds gauge"),
+            "the liveness timestamp is a gauge, not a counter:\n{out}"
+        );
+        assert!(
+            out.contains("# TYPE ravel_maintain_loop_panics_total counter"),
+            "the panic tally is a counter:\n{out}"
+        );
+
+        for expected in [
+            "ravel_maintain_last_cycle_completed_timestamp_seconds{mode=\"all\"} 1758000123.5",
+            "ravel_maintain_loop_panics_total{mode=\"all\"} 2",
+            "ravel_maintain_full_sweep_passes_total{mode=\"all\"} 7",
+        ] {
+            assert_eq!(
+                out.lines().filter(|line| *line == expected).count(),
+                1,
+                "expected exactly one `{expected}` sample line:\n{out}"
+            );
+        }
+    }
+
+    /// The alerting family renders every `AlertEvalReport` figure with the
+    /// right TYPE lines and values (issue #532). Each counter gets a distinct
+    /// value, so a renderer that wires two headers to one snapshot field fails
+    /// here rather than reading as a healthy pipeline. The timestamp is driven
+    /// with a fractional second, so a renderer emitting nanoseconds where
+    /// seconds are declared reads as a 54-year-old tick at the alert and fails
+    /// here instead.
+    #[test]
+    fn alert_family_renders_every_counter_and_the_liveness_gauge() {
+        let snapshot = AlertSnapshot {
+            rules_evaluated: 11,
+            rules_failed: 2,
+            records_written: 3,
+            repeats_queued: 4,
+            notifications_delivered: 5,
+            notifications_failed: 6,
+            ticks_evaluated: 7,
+            ticks_lease_not_held: 8,
+            ticks_lease_unavailable: 9,
+            ticks_history_unavailable: 10,
+            // 1_758_000_123_500_000_000 ns is 1758000123.5 s.
+            last_tick_completed_unix_ns: 1_758_000_123_500_000_000,
+        };
+        let mut out = String::new();
+        render_alert_family(&mut out, Mode::Query, &snapshot);
+
+        for expected_type in [
+            "# TYPE ravel_alert_rules_evaluated_total counter",
+            "# TYPE ravel_alert_rules_failed_total counter",
+            "# TYPE ravel_alert_records_written_total counter",
+            "# TYPE ravel_alert_repeats_queued_total counter",
+            "# TYPE ravel_alert_notifications_delivered_total counter",
+            "# TYPE ravel_alert_notifications_failed_total counter",
+            "# TYPE ravel_alert_ticks_total counter",
+            "# TYPE ravel_alert_last_tick_completed_timestamp_seconds gauge",
+        ] {
+            assert_eq!(
+                out.lines().filter(|line| *line == expected_type).count(),
+                1,
+                "expected exactly one `{expected_type}` line:\n{out}"
+            );
+        }
+
+        for expected in [
+            "ravel_alert_rules_evaluated_total{mode=\"query\"} 11",
+            "ravel_alert_rules_failed_total{mode=\"query\"} 2",
+            "ravel_alert_records_written_total{mode=\"query\"} 3",
+            "ravel_alert_repeats_queued_total{mode=\"query\"} 4",
+            "ravel_alert_notifications_delivered_total{mode=\"query\"} 5",
+            "ravel_alert_notifications_failed_total{mode=\"query\"} 6",
+            "ravel_alert_ticks_total{mode=\"query\",outcome=\"evaluated\"} 7",
+            "ravel_alert_ticks_total{mode=\"query\",outcome=\"lease_not_held\"} 8",
+            "ravel_alert_ticks_total{mode=\"query\",outcome=\"lease_unavailable\"} 9",
+            "ravel_alert_ticks_total{mode=\"query\",outcome=\"history_unavailable\"} 10",
+            "ravel_alert_last_tick_completed_timestamp_seconds{mode=\"query\"} 1758000123.5",
+        ] {
+            assert_eq!(
+                out.lines().filter(|line| *line == expected).count(),
+                1,
+                "expected exactly one `{expected}` sample line:\n{out}"
+            );
+        }
+
+        // Four outcomes and no fifth: an outcome that renders no series on a
+        // scrape where it has not happened yet would make an alert rule's
+        // `increase()` silently undefined until the first occurrence.
+        let tick_samples = out
+            .lines()
+            .filter(|line| line.starts_with("ravel_alert_ticks_total{"))
+            .count();
+        assert_eq!(tick_samples, 4, "one series per outcome, always:\n{out}");
+    }
+
+    /// The scrape path reads the fold figures off the live `Catalog`, not off
+    /// a zero placeholder. The two render tests above drive a struct literal,
+    /// so on their own they would still pass if the handler never asked the
+    /// catalog anything; this drives a real fold through a real catalog and
+    /// asserts the snapshot carries what that fold left behind.
+    #[tokio::test]
+    async fn catalog_fold_snapshot_reads_the_live_catalog() {
+        use ravel_catalog::{Catalog, CatalogConfig};
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_types::{Signal, TenantId};
+
+        /// The snapshot entry for one signal, by the signal it names rather
+        /// than by its position in the array.
+        fn entry(
+            snapshot: &CatalogCountersSnapshot,
+            signal: Signal,
+        ) -> &super::CatalogFoldCounters {
+            snapshot
+                .fold
+                .iter()
+                .find(|fold| fold.signal == signal)
+                .expect("every folded signal has a snapshot entry")
+        }
+
+        let store = std::sync::Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, CatalogConfig::default()).expect("catalog");
+        let before = CatalogCountersSnapshot::from_catalog(&catalog);
+        assert_eq!(entry(&before, Signal::Metrics).cycles, 0);
+        assert_eq!(entry(&before, Signal::Metrics).last_success_unix_ns, 0);
+
+        // A fold over an empty store: the watermark advances over hours that
+        // hold nothing, so it publishes a first HEAD naming no entry at all.
+        // That is exactly the shape of a healthy cycle on a quiet tenant, and
+        // the cycle counter has to count it.
+        let tenant = TenantId::new("metrics-fold-snapshot").hash();
+        let now_ns = 1_758_000_123_500_000_000;
+        let report = catalog
+            .fold(
+                &tenant,
+                Signal::Metrics,
+                uuid::Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold over an empty store succeeds");
+        assert_eq!(report.entry_count, 0, "an empty store folds no entry");
+
+        let after = CatalogCountersSnapshot::from_catalog(&catalog);
+        assert_eq!(entry(&after, Signal::Metrics).cycles, 1);
+        assert_eq!(entry(&after, Signal::Metrics).failures, 0);
+        assert_eq!(
+            entry(&after, Signal::Metrics).last_success_unix_ns,
+            now_ns,
+            "the snapshot carries the catalog's own stamp, not a placeholder"
+        );
+
+        // The snapshot reads each signal's own slot: the two signals that were
+        // not folded are still at zero, so a `from_catalog` that read one
+        // signal's counters into every entry fails here.
+        for untouched in [Signal::Logs, Signal::Spans] {
+            assert_eq!(
+                entry(&after, untouched).cycles,
+                0,
+                "{untouched:?} was not folded"
+            );
+            assert_eq!(
+                entry(&after, untouched).last_success_unix_ns,
+                0,
+                "{untouched:?} was not folded"
+            );
+        }
+    }
+
+    /// A process that has never folded successfully still renders the gauge,
+    /// at `0`, rather than omitting the series. An absent series cannot be
+    /// alerted on with the `time() - gauge` expression the observability
+    /// guide publishes: the alert would simply never fire for the process
+    /// whose fold never worked at all.
+    #[test]
+    fn catalog_fold_liveness_gauge_renders_zero_before_any_successful_fold() {
+        let body = render(
+            Mode::All,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+        );
+
+        for signal in ["metrics", "logs", "spans"] {
+            assert!(
+                body.contains(&format!(
+                    "ravel_catalog_fold_last_success_timestamp_seconds{{mode=\"all\",signal=\"{signal}\"}} 0"
+                )),
+                "the {signal} liveness gauge must render its zero sentinel, not be omitted:\n{body}"
+            );
+            assert!(
+                body.contains(&format!(
+                    "ravel_catalog_fold_cycles_total{{mode=\"all\",signal=\"{signal}\"}} 0"
+                )),
+                "a zero {signal} cycle counter must render, not be omitted:\n{body}"
+            );
+            assert!(
+                body.contains(&format!(
+                    "ravel_catalog_fold_failures_total{{mode=\"all\",signal=\"{signal}\"}} 0"
+                )),
+                "a zero {signal} failure counter must render, not be omitted:\n{body}"
+            );
+        }
     }
 
     #[test]
@@ -4762,6 +6759,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -4826,6 +6830,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -4876,6 +6887,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -4918,6 +6936,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
         // Default reachability is healthy (1); the process runs no probe here.
         assert!(
@@ -5018,6 +7043,13 @@ mod tests {
             Some(&snapshot),
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         // All three counters appear, mode-labeled, carrying the driven value.
@@ -5067,6 +7099,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
         assert!(
             !body.contains("ravel_durable_auth_"),
@@ -5088,6 +7127,9 @@ mod tests {
                     orphan_breaker_trips: 2,
                     orphans_withheld: 7,
                     orphans_present: 9,
+                    orphans_quarantined: 4,
+                    orphans_quarantine_refused: 5,
+                    quarantine_reaped: 6,
                 },
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Logs,
@@ -5095,6 +7137,9 @@ mod tests {
                     orphan_breaker_trips: 0,
                     orphans_withheld: 0,
                     orphans_present: 0,
+                    orphans_quarantined: 0,
+                    orphans_quarantine_refused: 0,
+                    quarantine_reaped: 0,
                 },
             ],
         };
@@ -5120,6 +7165,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -5208,6 +7260,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         for expected in [
@@ -5279,6 +7338,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
         assert!(
             !off.contains("ravel_distrib_"),
@@ -5330,6 +7396,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -5413,10 +7486,274 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
         assert!(
             !body.contains("ravel_scrub_"),
             "no scrub series should render when the snapshot is absent:\n{body}"
+        );
+    }
+
+    /// A real cycle's figures reach `/metrics`, not just hand-built ones: run
+    /// `reconcile_once`, read the copy it published on the controller, and
+    /// render that. The duration is deterministic because the cycle measures
+    /// itself on the controller's injected clock, so a fixed step gives a
+    /// fixed rendered value and nothing here reads wall time.
+    ///
+    /// `render_includes_reconcile_cycle_series` below asserts the other three
+    /// figures against distinct values; this one pins that the chain from the
+    /// producing path to the exposition is connected at all.
+    #[tokio::test]
+    async fn reconcile_cycle_figures_reach_metrics_from_the_controller() {
+        use ravel_ingest::{AdmissionController, AdmissionLimits, Clock};
+        use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        /// Advances a fixed step on every reading and returns the value before
+        /// the step, so a cycle that takes one end stamp measures exactly one
+        /// step. No wall-clock read enters the figure.
+        struct SteppingClock {
+            now_ns: AtomicI64,
+            step_ns: i64,
+        }
+
+        impl Clock for SteppingClock {
+            fn now_ns(&self) -> i64 {
+                self.now_ns.fetch_add(self.step_ns, Ordering::Relaxed)
+            }
+        }
+
+        const STEP_NS: i64 = 250_000;
+        let clock = std::sync::Arc::new(SteppingClock {
+            now_ns: AtomicI64::new(1_700_000_000_000_000_000),
+            step_ns: STEP_NS,
+        });
+        let controller = AdmissionController::new(clock.clone(), AdmissionLimits::default());
+        let store = MemoryStore::new();
+
+        let start_ns = clock.now_ns();
+        let stats = ravel_ingest::reconcile_once(
+            &controller,
+            &store,
+            std::time::Duration::from_secs(30),
+            start_ns,
+        )
+        .await;
+        let cycle_metrics = crate::admission_reconcile::ReconcileCycleMetrics::default();
+        cycle_metrics.record_cycle(&stats);
+
+        let admission = AdmissionCountersSnapshot {
+            reconcile_cycle: ReconcileCycleSnapshot::from_parts(
+                controller.last_reconcile_cycle_stats(),
+                cycle_metrics.keys_reaped_total(),
+            ),
+            ..Default::default()
+        };
+        let body = render(
+            Mode::All,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &admission,
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+        );
+
+        assert_eq!(
+            stats.cycle_duration_ns, STEP_NS,
+            "the cycle measures one step of the injected clock"
+        );
+        assert!(
+            body.contains(
+                "ravel_admission_reconciliation_cycle_duration_seconds{mode=\"all\"} 0.00025"
+            ),
+            "the cycle's own duration must render, in seconds:\n{body}"
+        );
+    }
+
+    /// The reconciliation cycle figures reach `/metrics` (ADR-0057). Every
+    /// value asserted, and each field given a different one: a renderer that
+    /// read the wrong field, or wrote a constant, passes a presence-only test
+    /// and fails this one.
+    ///
+    /// `keys_reaped_total` is the accumulated total from
+    /// `admission_reconcile::ReconcileCycleMetrics`, not the last cycle's
+    /// count, which is why it comes in through `from_parts` separately from
+    /// the controller's per-cycle copy.
+    #[test]
+    fn render_includes_reconcile_cycle_series() {
+        let admission = AdmissionCountersSnapshot {
+            reconcile_cycle: ReconcileCycleSnapshot::from_parts(
+                ravel_ingest::ReconcileCycleStats {
+                    cycle_duration_ns: 1_250_000_000,
+                    siblings_observed: 4,
+                    stale_keys_skipped: 6,
+                    keys_reaped: 2,
+                },
+                9,
+            ),
+            ..Default::default()
+        };
+        let body = render(
+            Mode::All,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &admission,
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+        );
+
+        for (header, sample) in [
+            (
+                "# TYPE ravel_admission_reconciliation_cycle_duration_seconds gauge",
+                "ravel_admission_reconciliation_cycle_duration_seconds{mode=\"all\"} 1.25",
+            ),
+            (
+                "# TYPE ravel_admission_reconciliation_siblings_observed gauge",
+                "ravel_admission_reconciliation_siblings_observed{mode=\"all\"} 4",
+            ),
+            (
+                "# TYPE ravel_admission_reconciliation_stale_keys_skipped gauge",
+                "ravel_admission_reconciliation_stale_keys_skipped{mode=\"all\"} 6",
+            ),
+            (
+                "# TYPE ravel_admission_reconciliation_keys_reaped_total counter",
+                "ravel_admission_reconciliation_keys_reaped_total{mode=\"all\"} 9",
+            ),
+        ] {
+            assert!(body.contains(header), "missing TYPE line {header}:\n{body}");
+            assert!(body.contains(sample), "missing sample {sample}:\n{body}");
+        }
+    }
+
+    /// The quarantine leg of orphan GC reaches `/metrics` (ADR-0058
+    /// amendment), through the same `MaintenanceSafetyMetrics` the server
+    /// already feeds every `SweepReport` into. The report is what a sweep pass
+    /// returns, so this covers the whole chain the figures were stopping one
+    /// step short of: `SweepReport` to counter to rendered sample.
+    ///
+    /// Three distinct values, all asserted: a renderer reading the wrong field
+    /// of the snapshot renders a plausible number and fails here.
+    #[test]
+    fn render_includes_orphan_quarantine_series() {
+        let safety = crate::maintain::MaintenanceSafetyMetrics::default();
+        safety.record_sweep(
+            Signal::Metrics,
+            &ravel_maintain::SweepReport {
+                orphans_deleted: 5,
+                orphans_quarantined: 5,
+                orphans_quarantine_refused: 2,
+                quarantine_reaped: 3,
+                ..Default::default()
+            },
+        );
+        let snapshot = MaintenanceSafetySnapshot::from_metrics(&safety);
+        let body = render(
+            Mode::Maintain,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            Some(&snapshot),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+        );
+        for (header, sample) in [
+            (
+                "# TYPE ravel_maintain_orphans_quarantined_total counter",
+                "ravel_maintain_orphans_quarantined_total{mode=\"maintain\",signal=\"metrics\"} 5",
+            ),
+            (
+                "# TYPE ravel_maintain_orphans_quarantine_refused_total counter",
+                "ravel_maintain_orphans_quarantine_refused_total{mode=\"maintain\",\
+                 signal=\"metrics\"} 2",
+            ),
+            (
+                "# TYPE ravel_maintain_quarantine_reaped_total counter",
+                "ravel_maintain_quarantine_reaped_total{mode=\"maintain\",signal=\"metrics\"} 3",
+            ),
+        ] {
+            assert!(body.contains(header), "missing TYPE line {header}:\n{body}");
+            assert!(body.contains(sample), "missing sample {sample}:\n{body}");
+        }
+
+        // A signal the pass never touched still renders, at zero, like every
+        // other series in this family.
+        assert!(
+            body.contains(
+                "ravel_maintain_orphans_quarantined_total{mode=\"maintain\",\
+                           signal=\"logs\"} 0"
+            ),
+            "an untouched signal must still render:\n{body}"
         );
     }
 
@@ -5440,6 +7777,9 @@ mod tests {
                 orphan_breaker_trips: 1,
                 orphans_withheld: 1,
                 orphans_present: 1,
+                orphans_quarantined: 1,
+                orphans_quarantine_refused: 1,
+                quarantine_reaped: 1,
             }],
         };
         let body = render(
@@ -5464,6 +7804,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         for line in body.lines() {
@@ -5474,6 +7821,9 @@ mod tests {
                     || line.starts_with("ravel_maintain_orphan_breaker_tripped_total")
                     || line.starts_with("ravel_maintain_orphans_withheld")
                     || line.starts_with("ravel_maintain_orphans_present")
+                    || line.starts_with("ravel_maintain_orphans_quarantined_total")
+                    || line.starts_with("ravel_maintain_orphans_quarantine_refused_total")
+                    || line.starts_with("ravel_maintain_quarantine_reaped_total")
                 {
                     vec!["mode", "signal"]
                 } else {
@@ -5542,6 +7892,13 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         // Fetcher cache, labeled cache="fetch".
@@ -5766,6 +8123,13 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
         assert!(
             body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
@@ -5803,6 +8167,13 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -5810,6 +8181,107 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             "a server run with --disable-cache must not render any cache \
              family at all, neither fetch nor catalog:\n{body}"
         );
+    }
+
+    /// Exact figures (#1170), not `> 0`: on a jemalloc build the three stats
+    /// render as three distinct samples under their own `stat=` label, with
+    /// the values passed straight through, and the allocator-name info series
+    /// does not also render.
+    #[test]
+    fn allocator_family_renders_jemalloc_exact_figures() {
+        let mut out = String::new();
+        render_allocator_family(
+            &mut out,
+            Mode::Query,
+            crate::mem_stats::AllocatorStats::Jemalloc {
+                allocated: 111,
+                active: 222,
+                resident: 333,
+            },
+        );
+        assert!(out.contains(
+            "ravel_process_allocator_bytes{mode=\"query\",allocator=\"jemalloc\",stat=\"allocated\"} 111"
+        ));
+        assert!(out.contains(
+            "ravel_process_allocator_bytes{mode=\"query\",allocator=\"jemalloc\",stat=\"active\"} 222"
+        ));
+        assert!(out.contains(
+            "ravel_process_allocator_bytes{mode=\"query\",allocator=\"jemalloc\",stat=\"resident\"} 333"
+        ));
+        assert!(
+            !out.contains("ravel_process_allocator_info"),
+            "a jemalloc build renders the byte figures, never the named-allocator \
+             fallback series:\n{out}"
+        );
+    }
+
+    /// On a non-jemalloc build there are no allocated/active/resident figures
+    /// to report: the fallback is a single 1-valued info series naming the
+    /// allocator, never a stand-in zero for stats jemalloc alone exposes.
+    #[test]
+    fn allocator_family_renders_named_allocator_when_not_jemalloc() {
+        let mut out = String::new();
+        render_allocator_family(
+            &mut out,
+            Mode::Query,
+            crate::mem_stats::AllocatorStats::Other { name: "system" },
+        );
+        assert!(
+            out.contains("ravel_process_allocator_info{mode=\"query\",allocator=\"system\"} 1")
+        );
+        assert!(
+            !out.contains("ravel_process_allocator_bytes"),
+            "a non-jemalloc build must never report the jemalloc-only byte \
+             figures:\n{out}"
+        );
+    }
+
+    /// An empty fetcher cache (no tiered disk cache attached) must report
+    /// valid zeros, not omit the family: a reader scraping right after
+    /// startup needs to see `0`, not a missing series it cannot distinguish
+    /// from a scrape error.
+    #[test]
+    fn cache_residency_family_reports_valid_zeros_on_empty_cache() {
+        let mut out = String::new();
+        render_cache_residency_family(&mut out, Mode::Query, Some((0, 0)), None, Some(1000), None);
+        assert!(out.contains("ravel_cache_resident_entries{mode=\"query\",cache=\"fetch\"} 0"));
+        assert!(out.contains("ravel_cache_resident_bytes{mode=\"query\",cache=\"fetch\"} 0"));
+        assert!(out.contains("ravel_cache_max_bytes{mode=\"query\",cache=\"fetch\"} 1000"));
+        assert!(
+            !out.contains("tier="),
+            "a RAM-only cache (no disk tier) must render without a tier label:\n{out}"
+        );
+    }
+
+    /// A tiered cache with both tiers populated renders each tier's exact
+    /// entry count and byte total under its own `tier=` label, plus each
+    /// cache's resolved ceiling -- the held-vs-budgeted comparison this
+    /// family exists for.
+    #[test]
+    fn cache_residency_family_reports_exact_figures_for_both_tiers() {
+        let mut out = String::new();
+        render_cache_residency_family(
+            &mut out,
+            Mode::Query,
+            Some((3, 300)),
+            Some((5, 500)),
+            Some(1_000),
+            Some(2_000),
+        );
+        assert!(out.contains(
+            "ravel_cache_resident_entries{mode=\"query\",cache=\"fetch\",tier=\"ram\"} 3"
+        ));
+        assert!(out.contains(
+            "ravel_cache_resident_bytes{mode=\"query\",cache=\"fetch\",tier=\"ram\"} 300"
+        ));
+        assert!(out.contains(
+            "ravel_cache_resident_entries{mode=\"query\",cache=\"fetch\",tier=\"disk\"} 5"
+        ));
+        assert!(out.contains(
+            "ravel_cache_resident_bytes{mode=\"query\",cache=\"fetch\",tier=\"disk\"} 500"
+        ));
+        assert!(out.contains("ravel_cache_max_bytes{mode=\"query\",cache=\"fetch\"} 1000"));
+        assert!(out.contains("ravel_cache_max_bytes{mode=\"query\",cache=\"catalog\"} 2000"));
     }
 
     fn tenant_usage(tenant: &str, signal: Signal) -> TenantUsage {
@@ -5869,6 +8341,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             usage,
             tenant_labels: false,
             wire_bytes: Vec::new(),
+            normalize_rejects: Vec::new(),
+            reconcile_cycle: ReconcileCycleSnapshot::default(),
         };
         let body = render(
             Mode::Gateway,
@@ -5892,6 +8366,13 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert_eq!(
@@ -5946,6 +8427,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             usage: vec![byte_rate, series_rate, series_cap],
             tenant_labels: true,
             wire_bytes: Vec::new(),
+            normalize_rejects: Vec::new(),
+            reconcile_cycle: ReconcileCycleSnapshot::default(),
         };
         let body = render(
             Mode::Gateway,
@@ -5969,6 +8452,13 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let rendered = admission_tenant_hashes(&body);
@@ -6021,6 +8511,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             usage: vec![row],
             tenant_labels: true,
             wire_bytes: Vec::new(),
+            normalize_rejects: Vec::new(),
+            reconcile_cycle: ReconcileCycleSnapshot::default(),
         };
         let hash = ravel_types::TenantId::new("skewed").hash().to_hex();
         let body = render(
@@ -6045,6 +8537,13 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         );
         assert!(
             body.contains(&format!(
@@ -6052,6 +8551,81 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                  signal=\"metrics\",reason=\"clock\"}} 7"
             )),
             "clock rejection must render distinctly:\n{body}"
+        );
+    }
+
+    /// Normalization's own rejections render under the reserved `skew` and
+    /// `structural` reasons of the same family, and converted structured
+    /// bodies render as their own family rather than as a reason. The tenant
+    /// here has no admission usage row at all, so this also pins that a
+    /// normalize-only (tenant, signal) still renders a full row.
+    #[test]
+    fn admission_family_renders_the_skew_and_structural_reasons() {
+        let hash = ravel_types::TenantId::new("noisy").hash();
+        let snapshot = AdmissionCountersSnapshot {
+            usage: Vec::new(),
+            tenant_labels: true,
+            wire_bytes: Vec::new(),
+            normalize_rejects: vec![crate::normalize_reject_metrics::TenantNormalizeRejects {
+                tenant_hash: hash,
+                signal: Signal::Logs,
+                skew_total: 2,
+                structural_total: 3,
+                body_conversions_total: 4,
+            }],
+            reconcile_cycle: ReconcileCycleSnapshot::default(),
+        };
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &snapshot,
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+        );
+        let hash = hash.to_hex();
+        assert!(
+            body.contains(&format!(
+                "ravel_admission_rejected_total{{mode=\"gateway\",tenant_hash=\"{hash}\",\
+                 signal=\"logs\",reason=\"skew\"}} 2"
+            )),
+            "event-time rejections must render under reason=skew:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "ravel_admission_rejected_total{{mode=\"gateway\",tenant_hash=\"{hash}\",\
+                 signal=\"logs\",reason=\"structural\"}} 3"
+            )),
+            "structural rejections must render under reason=structural:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "ravel_ingest_body_conversions_total{{mode=\"gateway\",tenant_hash=\"{hash}\",\
+                 signal=\"logs\"}} 4"
+            )),
+            "converted bodies are their own family, not a rejection reason:\n{body}"
         );
     }
 
@@ -6097,6 +8671,13 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         )
     }
 
@@ -6313,6 +8894,13 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             &[],
             metadata_cache,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
         )
     }
 

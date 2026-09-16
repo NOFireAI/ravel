@@ -21,7 +21,8 @@ over gRPC on a second listener (`--listen-grpc`); this page documents the HTTP
 surface only.
 
 A tenant-scoped route resolves the request to a tenant before it does any work.
-The default resolver is a static bearer-token map (`--tenant-token`); a
+The default resolver is a static bearer-token map (`--tenant-token` or
+`--tenant-token-file`); a
 deployment may instead resolve the tenant from an OIDC token or a
 proxy-forwarded mTLS identity. Whichever resolver is configured, a request that
 carries no resolvable credential to a tenant-scoped route is rejected with 401
@@ -89,6 +90,7 @@ percent-encode.
 | GET, POST | `/api/v1/query_exemplars` | `query`, `start`, `end` | Prometheus exemplars JSON envelope | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | none |
 | POST | `/api/v1/analytics` | JSON: `query`, `start`, `end`, `step`, `op`, optional `timeout`, `min_commit_token`, `allow_partial` | JSON analytics envelope, one entry per series | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | none |
 | POST | `/api/v1/sql` | JSON: `query`, `start`, `end`, optional `timeout`, `min_commit_token` | Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
+| POST | `/mcp` | One MCP JSON-RPC message (revision `2026-07-28` or `2025-11-25`) | JSON or `text/event-stream`, per revision; a tool result carries the result envelope | 200, 400, 401, 403, 405, 413, 500 | Yes | `all`, `query` | `mcp` |
 
 `/api/v1/status/buildinfo` and `/api/v1/metadata` exist for Prometheus-shaped
 clients (Grafana's datasource test probes both). `/api/v1/metadata` never
@@ -99,7 +101,21 @@ than an error, and reads no object storage on that path.
 field: change point detection (`change_point`) and summary statistics
 (`summary`). An unknown `op`, a missing field, or a malformed body is 400; an
 analytics computation error or the per-call series cap is 422; partial federated
-coverage without `allow_partial: true` is 503.
+coverage without `allow_partial: true` is 503. `/api/v1/analytics` and
+`/api/v1/query_exemplars` take a permit from the same query concurrency
+ceiling as the other query routes, and a request refused by it gets the same
+503 body those routes return.
+
+`/api/v1/sql` caps its request body at 64 KiB; a larger body is 400. The
+statement itself is gated before it is parsed: a statement carrying more than
+1,000 tokens (tokens outside string literals and comments) is 400, with a
+message naming the measured count and the maximum. The gate bounds the depth
+of the expression tree a statement can build, which no body-size cap does on
+its own, and it applies to Flight SQL too, where it surfaces as
+`InvalidArgument`. A string literal costs one token however long its payload
+is, an identifier or number costs one however long it is, and a comment costs
+nothing, so the bound constrains structure rather than text length. See docs/query-engine.md, "SQL statement complexity
+gate".
 
 `/api/v1/sql` is behind the `sql` cargo feature. The published server image
 builds that feature, so the route is available there. Its response envelope is
@@ -113,8 +129,19 @@ builds that feature, so the route is available there. Its response envelope is
 with one array per row under `data.rows`. A non-finite float comes back as a
 string: `NaN`, `+Inf`, and `-Inf`. Sending `Accept:
 application/vnd.apache.arrow.stream` yields an Arrow IPC stream instead, which is
-bit-exact for every float. The SQL surface registers exactly three tables, one
-per signal: `samples`, `logs`, and `spans`.
+bit-exact for every float. The SQL surface registers exactly five tables, one
+per signal: `samples` (metrics), `logs`, `spans` (traces), `alerts` (alert
+state transitions), and `audit` (audit records, including the query-audit
+trail).
+
+`/mcp` is behind the `mcp` cargo feature and `--mcp`: a build carrying the
+feature serves no MCP route until an operator passes the flag. It is the only
+MCP path, and it serves POST only. Every request is authenticated with the
+listener's own tenant resolver before the JSON-RPC message is parsed, so a
+request with no resolvable credential is 401 whatever it asked for, including
+a legacy `initialize`. An `Origin` outside `--mcp-allowed-origins` is 403, a
+body past `--mcp-max-body-bytes` is 413, and on revision `2026-07-28` a
+`Mcp-Method` or `Mcp-Name` header that disagrees with the body is 400.
 
 For the query routes, the status codes come from one shared error mapping:
 
@@ -177,12 +204,20 @@ Unauthenticated, and served in every mode, including maintain mode.
 handler proves the server task can route, so it is 200 whenever it answers, and a
 store outage never makes it fail.
 
-`/readyz` (and `/-/ready`) is readiness: 503 until startup has completed (config
-parsed, the object-store capability gate passed, listeners bound), then 200 for
-as long as the store also stays reachable. It reads only an atomic per probe and
-issues no object-store request itself. A background store probe with hysteresis
-supplies that atomic: four consecutive failed probes flip readiness to 503, and a
-single success recovers it.
+`/readyz` (and `/-/ready`) is readiness, the AND of four conditions: startup has
+completed (config parsed, the object-store capability gate passed, listeners
+bound), the process is not draining, the store is reachable, and no ingest shard
+actor has been condemned after exhausting its respawn budget. It issues no
+object-store request itself and takes no lock: each condition is an atomic load,
+including the ingest one, which reads the condemned-shard counter. A background
+store probe with hysteresis supplies the store atomic: four consecutive failed
+probes flip readiness to 503, and a single success recovers it.
+
+Only the store condition recovers on its own. The startup latch and the drain
+latch are one-way, and a condemned ingest shard cannot recover in-process, so a
+503 from that cause persists until the process is rolled. Readiness never
+restarts the process: a 503 sheds traffic (Kubernetes removes the pod from its
+Service endpoints), which is why liveness is the separate `/healthz` route.
 
 `/metrics` is the Prometheus scrape endpoint. It is unauthenticated, so
 per-tenant labels on the admission and query families are opt-in

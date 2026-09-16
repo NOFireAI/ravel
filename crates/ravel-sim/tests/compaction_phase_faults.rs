@@ -104,6 +104,101 @@ fn each_compaction_fault_kind_recovers() {
             outcome.fault_counters
         );
 
+        // The delete fault fired during the sweep (either flavor), on the
+        // sweep's first phase-C commit-record delete. `Occurrence::Nth(1)`
+        // fires exactly once, so the sum is exactly 1, not just positive.
+        let delete = outcome
+            .fault_counters
+            .get(&(Op::Delete, FaultKind::Transient))
+            .copied()
+            .unwrap_or(0)
+            + outcome
+                .fault_counters
+                .get(&(Op::Delete, FaultKind::Throttled))
+                .copied()
+                .unwrap_or(0);
+        assert_eq!(
+            delete, 1,
+            "seed {seed}: delete fault on the sweep's first commit-record delete fired {delete} \
+             times, want exactly 1 (counters: {:?})",
+            outcome.fault_counters
+        );
+
+        // The delete fault landed on the first tenant's shard 0 -- the first
+        // sweep pass, where the `Nth(1)` rules on the one `sweep_store` fire.
+        assert_eq!(
+            outcome.faulted_sweep_pass.as_ref(),
+            Some(&("sim-tenant-000".to_string(), 0)),
+            "seed {seed}: delete fault fired on an unexpected sweep pass"
+        );
+
+        // The faulted pass re-ran rule 2 after the re-run absorbed the fault:
+        // its OWN superseded-delete counts are positive and exact.
+        // `compacting_config` fixes the workload shape (2 tenants x 8 series x 6
+        // samples across 2 shards) independently of the seed, so compaction
+        // supersedes the same L0 inputs every run. The 6 comes from the flush
+        // shape, not the series count: strict-mode ingest flushes once per
+        // sample-index batch per shard, so each (tenant, shard) publishes 6 L0
+        // commit records with 6 data objects, and rule 2 deletes all of them in
+        // the faulted pass (tenant-000/shard 0), with no unreferenced `/l1`
+        // part (this workload's compaction leaves none).
+        // On the first round's placement (delete keyed on `/l0/`, firing after
+        // every commit record of the pass was already gone) this pass reported
+        // 0/0 and the keyspace converged through orphan GC instead; these exact
+        // figures are what distinguish the rule-2 recovery from that.
+        assert_eq!(
+            outcome.faulted_pass_superseded_records_deleted, 6,
+            "seed {seed}: faulted pass superseded-records-deleted changed"
+        );
+        assert_eq!(
+            outcome.faulted_pass_superseded_data_deleted, 6,
+            "seed {seed}: faulted pass superseded-data-deleted changed"
+        );
+        assert_eq!(
+            outcome.faulted_pass_unreferenced_parts_deleted, 0,
+            "seed {seed}: faulted pass unexpectedly deleted an unreferenced part"
+        );
+
+        // The cycle's cumulative superseded deletes across all four passes:
+        // 4 passes x 6 = 24 records and 24 data objects.
+        assert_eq!(
+            outcome.sweep_superseded_records_deleted, 24,
+            "seed {seed}: cumulative superseded-records-deleted changed"
+        );
+        assert_eq!(
+            outcome.sweep_superseded_data_deleted, 24,
+            "seed {seed}: cumulative superseded-data-deleted changed"
+        );
+        assert_eq!(
+            outcome.sweep_unreferenced_parts_deleted, 0,
+            "seed {seed}: cumulative unreferenced parts changed"
+        );
+
+        // The suppression check: run the SAME seed and config with the whole
+        // fault schedule disabled, and the cumulative superseded deletes must
+        // be identical. A delete the fault suppressed (as the first round's
+        // `/l0/` placement did, leaving the faulted pass at 0 and the cumulative
+        // at 18 instead of 24) would show up here as a shortfall against the
+        // fault-free baseline.
+        let clean_config = CycleConfig {
+            inject_faults: false,
+            ..compacting_config()
+        };
+        let clean = run_cycle(MasterSeed::new(seed), &clean_config)
+            .unwrap_or_else(|err| panic!("seed {seed}: fault-free baseline cycle failed: {err}"));
+        assert_eq!(
+            outcome.sweep_superseded_records_deleted, clean.sweep_superseded_records_deleted,
+            "seed {seed}: faulted-plan superseded records ({}) differ from the fault-free \
+             baseline ({}); a delete was suppressed",
+            outcome.sweep_superseded_records_deleted, clean.sweep_superseded_records_deleted
+        );
+        assert_eq!(
+            outcome.sweep_superseded_data_deleted, clean.sweep_superseded_data_deleted,
+            "seed {seed}: faulted-plan superseded data ({}) differ from the fault-free \
+             baseline ({}); a delete was suppressed",
+            outcome.sweep_superseded_data_deleted, clean.sweep_superseded_data_deleted
+        );
+
         // Every fault the schedule declared (ingest and compaction/sweep) fired.
         for (op, kind) in &outcome.expected_faults {
             let fired = outcome

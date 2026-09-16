@@ -151,8 +151,8 @@ to reject an in-process authorization side channel.
 |---|---|---|---|---|
 | **Gateway** | `Mode::Gateway`, or the gateway half of `Mode::All` | `prov`, `idem/<key>` (dedup lookup), `sys/tenancy`, `sys/qualification`, `sys/gc` (bootstrap reads); `l0/`, `c/` (fold's own read-back of what it just built on); `catalog/<sig>/**` (HEAD, snap parts, name postings — fold reads its own prior output to fold incrementally, `fold.rs` `get_head`/part/postings reads) | `l0/**` (CreateIfAbsent), `c/**cmt` (CreateIfAbsent, L0 commit records only), `idem/**` (Put), `prov` (CreateIfAbsent, adopt path only), `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` (CreateIfAbsent); `sys/tenancy` (CreateIfAbsent, first-boot race, see §4) | none |
 | **Query** | `Mode::Query`, or the query half of `Mode::All` | `c/**` (Phase 1 listing), `l0/**`, `l1/**` (the query fetchers GET segment data directly — footer-first ranged reads — not just commit-record metadata; `ravel-query`'s fetcher, `ravel-server`'s exemplar/log/span fetchers), `catalog/<sig>/**` (snap/HEAD/idx), `prov`, `admission/query/**` (fleet-global query concurrency reconciliation, ADR-0061 decision 2: LIST the bucket-root `admission/query/` prefix and GET each sibling process's snapshot), `sys/tenancy`, `sys/qualification`, `sys/gc` | `catalog/<sig>/snap/**`, `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` — same fold grants as Gateway, per the code fact above; `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (Put, append-only query audit); `admission/query/<process_id>.snapshot` (Overwrite, this process's own fleet-concurrency snapshot, ADR-0061 decision 2 — a bucket-root key, deliberately **not** under a `t/<hash>/` prefix since the ceiling is fleet-global, not per-tenant); `sys/tenancy` (CreateIfAbsent, first-boot race) | none |
-| **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race) | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep), `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (query-audit compaction + 90-day retention sweep — see Amendment below) — **the only role with any delete grant at all** |
-| **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only), `c/**cmt` (CreateIfAbsent, reconstructed L0 commit records only, `commit reconstruct`, ADR-0058 — see Amendment below) | none (Admin never deletes; delete stays exclusively Maintain's) |
+| **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race) | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep), `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (query-audit compaction + 90-day retention sweep — see Amendment below) — **the only role with durable-data deletion** |
+| **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only), `c/**cmt` (CreateIfAbsent, reconstructed L0 commit records only, `commit reconstruct`, ADR-0058 — see Amendment below) | the qualification scratch prefix `sys/qualify/*` only, so `store qualify` can exercise the delete probe (see Amendment below); Admin still never deletes tenant data or any protected key |
 
 **Correction:**
 the table above was missing four read/write grants in its first accepted
@@ -204,6 +204,7 @@ flowchart TB
     AD -->|"CasVersion"| GC["sys/gc (set)"]
     AD -->|"CreateIfAbsent"| SYSW["sys/tenancy · sys/qualification (bootstrap)"]
     AD -->|"Put, append-only"| HOLD["u/** (legal hold)"]
+    AD -->|"Delete (scratch only)"| QSCR["sys/qualify/*\n(qualification scratch)"]
 
     subgraph deny["Deny s3:DeleteObject for every role"]
         SYS["sys/tenancy\nsys/qualification\nsys/gc"]
@@ -214,6 +215,7 @@ flowchart TB
 
     style MT fill:#fc9,stroke:#960,stroke-width:2px
     style DEL fill:#fc9,stroke:#960,stroke-width:2px
+    style QSCR fill:#fed,stroke:#960
     style deny fill:#efe,stroke:#3a3,stroke-width:2px
     style SYS fill:#dfd,stroke:#3a3
     style PROVD fill:#dfd,stroke:#3a3
@@ -222,29 +224,66 @@ flowchart TB
 ```
 
 Four distinct credentials, each scoped to one process's actual call sites.
-Only Maintain's policy grants `DeleteObject`, and only over `l0/`, `l1/`,
-`c/`, `idem/` — the same four prefixes Ravel's own sweep and retention code
-already deletes from today — plus the query-audit shard `t/<hash>/u/0001/**`
-added by the amendment below. The green box is denied to every role,
+Maintain is the only role with durable-data deletion, and only over `l0/`,
+`l1/`, `c/`, `idem/` — the same four prefixes Ravel's own sweep and retention
+code already deletes from today — plus the query-audit shard
+`t/<hash>/u/0001/**` added by the amendment below. Admin's single delete grant
+is the qualification scratch prefix `sys/qualify/*` (amendment below), which is
+neither tenant data nor a durability anchor. The green box is denied to every
+role,
 including Maintain: nothing currently deletes there, so nothing legitimate
 loses capability, and deleting `sys/tenancy` to brick every
 process's fail-closed startup becomes unreachable regardless of which
 credential is compromised.
 
-### 2. Delete stays exclusively with Maintain
+### 2. Durable-data delete stays exclusively with Maintain
 
-No role other than Maintain's IAM policy grants `s3:DeleteObject` on
-anything. This is the concrete answer to the single-credential exposure: a compromised Gateway,
-Query, or Admin credential — including a leaked `ravel-cli` credential run
-from a CI job or an operator's laptop — cannot delete a single object,
-anywhere, ever. It can corrupt or forge new data within its write grant
+No role other than Maintain's IAM policy grants `s3:DeleteObject` on tenant
+data or any protected key. Admin gains one narrow delete on the transient
+conformance scratch prefix `sys/qualify/<run-id>/**` (see the amendment
+below), which holds no tenant data and no durability anchor. This is the
+concrete answer to the single-credential exposure: a compromised Gateway or
+Query credential cannot delete a single object, anywhere, ever, and a
+compromised Admin credential — including a leaked `ravel-cli` credential run
+from a CI job or an operator's laptop — can delete only the qualification
+scratch prefix, never a tenant object or a protected key. Any of these
+credentials can corrupt or forge new data within its write grant
 (a real residual risk, unchanged by this ADR, and the reason the
 reconstruction tool and legal-hold's fail-closed posture matter
-independently), but it cannot make existing data disappear. Only a
-compromised Maintain credential retains delete capability, and only over
+independently), but it cannot make any durable object disappear. Only a
+compromised Maintain credential retains delete capability over durable data,
+and only over
 `l0/`, `l1/`, `c/`, `idem/`, and the query-audit shard `u/0001/**`
 (amendment below) — never `sys/`, `prov`, `catalog/`, or the legal-hold
-shard `u/0000/**` of the audit prefix, which brings us to §3.
+shard `u/0000/**` of the audit prefix. The last of those holds for a
+different reason than the other three. Take the delete `Allow` patterns of
+all four templates together: they match no key of the form `sys/tenancy`,
+`sys/qualification`, `sys/gc`, `t/<hash>/<signal>/prov`, or
+`t/<hash>/catalog/<signal>/...`, for any `<signal>` the object layout
+defines. So the `Deny` covering those five keyspaces withholds nothing that
+an `Allow` grants, and it is belt-and-suspenders. That disjointness is about
+the delete axis and only the delete axis: `get` and `put` grants do reach
+`prov` and `catalog/` (fold reads and writes catalog objects, the
+log-segment writer writes `prov`), and the same claim over all axes would be
+false.
+`no_delete_allow_reaches_the_disjoint_protected_keyspaces` in
+`crates/ravel-commit/tests/iam_templates.rs` enforces this: it asserts that
+no delete `Allow` pattern in any template matches a witness key of those
+five protected patterns. The set is those three named `sys/` control
+objects, not the whole `sys/` prefix, because Admin's `sys/qualify/*`
+scratch-delete grant does reach a key under `sys/` (a
+`sys/qualify/<run-id>/…` object) and is deliberately excluded. An audit
+object is keyed
+`t/<hash>/u/<l0|c|l1>/<shard>/…`, so Maintain's level-based delete grants
+(`t/*/*/l0/*` and its `c`/`l1` siblings) do match legal-hold keys, and the
+`Allow` set alone overstates the capability by exactly that much. What
+withholds it is the explicit `Deny` of §3 over the same keys, which names
+the same two delete actions: a `Deny` overrides an `Allow` only for the
+actions it names, so the deny's action coverage — not a gap in the `Allow`
+patterns — is what makes the shard undeletable. Which brings us to §3.
+Admin's
+`sys/qualify/*` delete (amendment below) reaches only the qualification scratch
+prefix, which is neither tenant data nor a durability anchor.
 
 ### 3. Deny-delete, everywhere, on the four prefixes nothing deletes
 
@@ -412,8 +451,11 @@ stays the documented, informationally-probed gap ADR-0042 already named.
   informational probe in `store qualify`). Risk tier: low for durability and
   commit-protocol correctness, despite being the highest-priority item in
   the program by leverage.
-- **A compromised Gateway, Query, or Admin credential can no longer delete
-  anything, anywhere.** A compromised Maintain credential can still delete
+- **A compromised Gateway or Query credential can no longer delete
+  anything, anywhere, and a compromised Admin credential can delete only the
+  qualification scratch prefix `sys/qualify/*` (amendment below), never
+  a tenant object or a protected key.** A compromised Maintain credential can
+  still delete
   within `l0/`, `l1/`, `c/`, `idem/`, and the query-audit shard `u/0001/**`
   (amendment below) — the same set Ravel's own maintenance code
   deletes from today — but nothing else.
@@ -465,8 +507,9 @@ Admin's write column in §1's role table therefore gains `s3:PutObject` on
   `CreateIfAbsent` and reports a conflict rather than overwriting an existing
   record), though at the IAM layer `CreateIfAbsent` is a plain `s3:PutObject`
   exactly as §1 already notes for every other create-only grant.
-- It grants **no delete**. Admin still has no delete grant anywhere; delete
-  stays exclusively Maintain's (§2), and the `DenyDeleteProtected` boundary
+- It grants **no delete**. Admin's only delete grant remains the qualification
+  scratch prefix (§2 amendment); this write adds none, and the
+  `DenyDeleteProtected` boundary
   (§3) is unchanged — `c/` was never one of the deny-delete prefixes, since
   Maintain legitimately deletes superseded and retention-swept records there.
 - No other role's grants change, and no server role gains this: reconstruction
@@ -594,9 +637,10 @@ its inputs are swept from `l0/`, `l1/`, `c/`, all inside Maintain's existing
 itself is new, and it is scoped by these four narrow grants:
 
 - **Admin** gains `s3:PutObject` (create-only, `CreateIfAbsent`) on
-  `t/*/*/del/*` — `ravel-cli erase submit` writes the `.dreq`. Admin still
-  has **no delete grant anywhere**: submitting an erasure request does not
-  delete anything, it creates a durable predicate the Maintain pass acts on.
+  `t/*/*/del/*` — `ravel-cli erase submit` writes the `.dreq`. Admin's only
+  delete grant remains the qualification scratch prefix: submitting an erasure
+  request does not delete anything, it creates a durable predicate the Maintain
+  pass acts on.
   This is the same shape as Admin's other create-only tenant-prefix write
   (`c/**cmt` for `commit reconstruct`, amendment above): a `PutObject`
   allow, no delete.
@@ -637,3 +681,53 @@ matching IAM policy JSON is added to `docs/guides/operations.md` in the same
 change. Amended here in ADR-0055 (rather than as a standalone note) so the
 per-role model stays legible end to end, following this ADR's own in-place
 amendment precedent.
+
+## Amendment (2026-09-07): Admin gains `sys/qualify/*` delete for the qualification delete probe
+
+The object-store conformance suite
+(`crates/ravel-object-store/src/conformance.rs`, run by `ravel-cli store
+qualify`) gained a `DeleteVisibility` probe: it deletes a key under the run's
+scratch prefix `sys/qualify/<run-id>/` and asserts the delete is
+acknowledged (a subsequent `get` returns `NotFound`, a listing omits it while
+still holding a sibling, and a second delete of the now-absent key succeeds).
+The suite runs the whole probe under that scratch prefix, so it now issues a
+`DELETE` there.
+
+§1's original table granted Admin `s3:PutObject` on `sys/qualify/*` (the
+`AdminWrite` statement) but no `s3:DeleteObject` anywhere, so under the
+shipped Admin credential the delete probe fails with `AccessDenied` on any
+fresh bucket: a correct backend and the shipped policy together refuse
+qualification. `store qualify` is an Admin-only, out-of-band command, so no
+other role runs it and no other template is affected.
+
+Admin's delete column in §1's role table therefore gains `s3:DeleteObject` on
+`arn:aws:s3:::my-ravel-bucket/sys/qualify/*` and nowhere else. This is safe
+and does not reopen the exposure §2 closes:
+
+- `sys/qualify/` holds no tenant data and no durability anchor. Its objects
+  are a single `store qualify` run's throwaway scratch (each run's key carries
+  a unique `<run-id>`, so runs never collide), not a control object whose
+  deletion could brick startup or roll back state. Deleting the whole prefix
+  loses nothing a running deployment depends on.
+- The grant is one prefix. It reaches no `t/**` tenant object and no key in
+  `DenyDeleteProtected` (§3), which does not list `sys/qualify/*`, so no
+  explicit `Deny` fights this `Allow` and this `Allow` widens nothing the deny
+  protects. `sys/qualification` (the final marker) and `sys/qualify/*` (the
+  scratch) are separate keys: the marker stays deny-delete-protected, the
+  scratch does not.
+- No other role gains anything: Gateway, Query, and Maintain do not run
+  qualification and their templates are unchanged.
+
+The property §2 states is preserved exactly in its load-bearing form: a
+compromised Admin credential still cannot make any tenant object or protected
+key disappear. It can delete only the qualification scratch prefix.
+
+Amended in place (§1 table Admin delete column, §2's two absolute-no-delete
+claims about Admin, and the matching Consequences bullet) for the same reason
+as the amendments above: the role
+split had not yet been provisioned against a narrower Admin credential, so no
+deployed policy predates this change. The shipped `deploy/iam/admin.json`
+(`AdminQualifyDelete` statement) and `crates/ravel-commit`'s
+`tests/iam_templates.rs` guard are updated in the same change, and
+`docs/object-store-contract.md`'s qualification section now records that the
+shipped Admin template satisfies the delete-probe requirement.

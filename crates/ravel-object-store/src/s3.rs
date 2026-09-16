@@ -110,8 +110,11 @@ use crate::instrument::{StoreMetrics, StoreOp};
 
 /// Default entries per `ListPage`, chosen to line up with S3's own
 /// `ListObjectsV2` page size. Overridable per instance via
-/// [`S3Store::with_page_size`].
-const LIST_PAGE_SIZE: usize = 1000;
+/// [`S3Store::with_page_size`]. Public so callers that must declare this
+/// store's real page size elsewhere (`ravel-cli store qualify`'s
+/// `--list-page-size` default, matching what `build_store` constructs) have
+/// one definition to reference instead of a duplicated literal.
+pub const LIST_PAGE_SIZE: usize = 1000;
 
 /// Part size [`S3Store::put`] cuts an over-threshold payload into: 8 MiB.
 ///
@@ -858,11 +861,19 @@ impl S3Store {
         Ok((builder, credential_provider, instance_role_provider))
     }
 
-    /// Same backend, a smaller `list()` page size. Mirrors
-    /// [`crate::memory::MemoryStore::with_page_size`] so the contract
-    /// suite's manual-pagination assertion can force real multi-page
-    /// continuation (via `list_with_offset`) against a real bucket without
-    /// needing 1000+ objects.
+    /// Same backend, a different `list()`/`list_after()` page size. This is a
+    /// client-side cut of one wire response, not a smaller request: nothing
+    /// here sets `ListObjectsV2`'s `MaxKeys`, so S3 answers with its default
+    /// of up to 1000 keys. [`ObjectStoreBackend::list`] opens a fresh
+    /// `object_store` listing stream per [`crate::ListPage`], pulls at most
+    /// `page_size` entries off it, and drops it, which leaves that response's
+    /// own `NextContinuationToken` unfollowed unless `page_size` exceeds what
+    /// one response carries. Shrinking `page_size` therefore only shortens
+    /// what Ravel reads out of a single S3 response; it cannot, by itself,
+    /// make the backend serve a continuation boundary.
+    /// Proving [`crate::conformance::run_conformance_suite`]'s cross-page
+    /// probe against this backend needs more keys than this store's actual
+    /// page size, not a smaller declared one.
     pub fn with_page_size(config: S3Config, page_size: usize) -> Result<Self, StoreError> {
         let mut store = Self::new(config)?;
         store.page_size = page_size.max(1);
@@ -1279,6 +1290,87 @@ impl S3Store {
         }
     }
 
+    /// Disambiguate an `AlreadyExists` from a [`PutMode::CreateIfAbsent`] PUT
+    /// with one HEAD (docs/object-store-contract.md, "Semantics adapters MUST
+    /// honor").
+    ///
+    /// `object_store` 0.14 maps a raw 409 to `AlreadyExists` and enables
+    /// conflict retry only for the update / etag-match modes, never for create.
+    /// So a 409 `ConditionalRequestConflict` — which the AWS PutObject spec
+    /// says the client MUST retry — reaches this crate looking exactly like a
+    /// genuine already-exists. The HTTP status that would tell them apart lives
+    /// in `object_store`'s crate-private error type (the same reason
+    /// [`map_put_error`] is mode-aware rather than status-aware), so it is
+    /// unreachable here; one HEAD is the disambiguation:
+    ///
+    /// - **key present** (`Ok`) → a real already-exists →
+    ///   [`StoreError::AlreadyExists`], exactly as before this method existed.
+    /// - **key absent** (`NotFound`) → the 409 could not have been a real
+    ///   collision → a transient conditional-request conflict →
+    ///   [`StoreError::Transient`], which [`StoreError::is_retryable`] routes
+    ///   back into the caller's existing retry loop (the ingest flush loop, the
+    ///   commit publish path).
+    /// - **HEAD itself failed retryably** (`Throttled`/`Timeout`/`Transient`) →
+    ///   the probe determined nothing, so the key's state is unknown. The
+    ///   result is that same retryable error, surfaced verbatim. Returning a
+    ///   terminal `AlreadyExists` here would be wrong, not merely
+    ///   conservative: the PUT already failed so nothing was written, and
+    ///   `AlreadyExists` is not retryable, so the caller would stop and treat a
+    ///   race it did not lose as lost, sending the commit publish path into
+    ///   `resolve_already_exists` to read back a winner that may not exist. A
+    ///   retryable answer cannot lose a genuine already-exists: on the retry
+    ///   the PUT conflicts again, and once a HEAD finally succeeds a present
+    ///   key still yields `AlreadyExists`, so a real collision is delayed,
+    ///   never downgraded. An inconclusive probe that keeps failing instead
+    ///   exhausts the retry budget and surfaces a retryable error, the correct
+    ///   report for a state nobody could determine.
+    /// - **HEAD itself failed terminally** (`AccessDenied`, `Permanent`, and
+    ///   the other non-retryable classes) → retrying cannot make the probe
+    ///   conclusive, so the outcome cannot improve; fall back to the
+    ///   conservative `AlreadyExists`.
+    ///
+    /// The split-brain guard on the commit path and the vanished-part guard on
+    /// the compaction path are preserved by construction: a retryable result
+    /// is returned only when the key is ABSENT or the probe was inconclusive,
+    /// and a genuine collision requires the key PRESENT, so no real
+    /// already-exists is ever downgraded to a retry.
+    ///
+    /// The arms enumerate every [`StoreError`] variant rather than leaning on a
+    /// catch-all in either direction: a catch-all that mapped every non-absent
+    /// HEAD error to `AlreadyExists` is what turned an inconclusive probe into
+    /// a terminal verdict in the first place.
+    async fn disambiguate_create_conflict(&self, key: &str) -> Result<PutOutcome, StoreError> {
+        match self.head(key).await {
+            Ok(_) => Err(StoreError::AlreadyExists),
+            Err(StoreError::NotFound) => Err(StoreError::Transient(format!(
+                "conditional-request conflict on create of {key}: 409 with the key \
+                 absent on HEAD, retryable per the AWS PutObject specification"
+            ))),
+            Err(
+                e @ (StoreError::Throttled { .. } | StoreError::Timeout | StoreError::Transient(_)),
+            ) => Err(e),
+            // The listing-drain variants are synthesized by `list_all`, never
+            // returned by `head`, so they are unreachable here. Pass them
+            // through unchanged rather than fold them into `AlreadyExists`:
+            // that keeps an impossible value honest without fabricating a
+            // terminal collision verdict. Named, not a wildcard, so a new
+            // variant still fails to compile here.
+            Err(
+                e @ (StoreError::ListRepeatedToken { .. }
+                | StoreError::ListPageCeiling { .. }
+                | StoreError::ListOrderViolation { .. }),
+            ) => Err(e),
+            Err(
+                StoreError::AccessDenied(_)
+                | StoreError::PreconditionFailed
+                | StoreError::Corrupted(_)
+                | StoreError::InvalidRange(_)
+                | StoreError::Permanent(_)
+                | StoreError::AlreadyExists,
+            ) => Err(StoreError::AlreadyExists),
+        }
+    }
+
     /// The [`MULTIPART_THRESHOLD`] path of [`ObjectStoreBackend::put`]: cut the
     /// buffer into [`MULTIPART_PART_SIZE`] parts, upload at most
     /// [`MULTIPART_UPLOAD_CONCURRENCY`] of them at a time, then complete. Any
@@ -1562,7 +1654,7 @@ impl ObjectStoreBackend for S3Store {
             };
             let path = path_of(key);
             let payload = PutPayload::from(data);
-            let result = self
+            let result = match self
                 .store
                 .put_opts(
                     &path,
@@ -1573,7 +1665,23 @@ impl ObjectStoreBackend for S3Store {
                     },
                 )
                 .await
-                .map_err(|e| map_put_error(e, &opts.mode))?;
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    let mapped = map_put_error(e, &opts.mode);
+                    // A `CreateIfAbsent` PUT that surfaced `AlreadyExists` may be
+                    // a genuine already-exists or a transient 409
+                    // `ConditionalRequestConflict` the AWS PutObject spec says
+                    // to retry; the HTTP status is unreachable here, so one HEAD
+                    // decides. See `disambiguate_create_conflict`.
+                    if matches!(mapped, StoreError::AlreadyExists)
+                        && matches!(opts.mode, PutMode::CreateIfAbsent)
+                    {
+                        return self.disambiguate_create_conflict(key).await;
+                    }
+                    return Err(mapped);
+                }
+            };
             outcome_of(key, result)
         })
         .await

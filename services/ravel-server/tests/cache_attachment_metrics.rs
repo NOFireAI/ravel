@@ -157,7 +157,8 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
     publish_segment(&store, tenant.hash(), now).await;
 
     let cli = cache_enabled_cli();
-    let cache = build_cache(&cli).expect("cache enabled by default in a cache-enabled config");
+    let cache = build_cache(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
+        .expect("cache enabled by default in a cache-enabled config");
     // The default CLI sets no --cache-dir, so this is the RAM-only variant; hold
     // its concrete `Cache` handle to assert emptiness before and after the query.
     let ReadCache::Ram(ram) = cache.clone() else {
@@ -176,8 +177,10 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
         backend.clone(),
         1,
         cli.disable_cache,
-        cli.cache_max_bytes,
+        ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
         cli.cache_dir.clone(),
+        cli.catalog_resolve_concurrency,
+        None,
     )
     .expect("catalog");
     assert!(
@@ -192,6 +195,7 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         Some(cache.clone()),
         ravel_query::EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),

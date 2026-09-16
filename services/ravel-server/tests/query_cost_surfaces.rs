@@ -166,6 +166,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         None,
         ravel_query::EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         Arc::clone(&query_accounting),
         ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,
@@ -196,6 +197,9 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
             Arc::new(SystemClock),
             AdmissionLimits::default(),
         )),
+        reconcile_cycle: Arc::new(
+            ravel_server::admission_reconcile::ReconcileCycleMetrics::default(),
+        ),
         metrics_tenant_labels: false,
         query_accounting: Arc::clone(&query_accounting),
         metrics_tenant_allowlist: Arc::new(HashSet::new()),
@@ -210,7 +214,16 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         ingest_byte_metrics: std::sync::Arc::new(
             ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),
         ),
+        normalize_reject_metrics: std::sync::Arc::new(
+            ravel_server::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+        ),
         metadata_cache: None,
+        cache: None,
+        cache_max_bytes: 0,
+        catalog_cache_max_bytes: 0,
+        audit_pipeline: None,
+        process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        process_memory_budget_is_fallback: false,
     });
 
     Surfaces {
@@ -599,6 +612,9 @@ mod flight {
                 Arc::new(SystemClock),
                 AdmissionLimits::default(),
             )),
+            reconcile_cycle: Arc::new(
+                ravel_server::admission_reconcile::ReconcileCycleMetrics::default(),
+            ),
             metrics_tenant_labels: false,
             query_accounting: Arc::clone(&query_accounting),
             metrics_tenant_allowlist: Arc::new(HashSet::new()),
@@ -614,7 +630,16 @@ mod flight {
             ingest_byte_metrics: std::sync::Arc::new(
                 ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),
             ),
+            normalize_reject_metrics: std::sync::Arc::new(
+                ravel_server::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+            ),
             metadata_cache: None,
+            cache: None,
+            cache_max_bytes: 0,
+            catalog_cache_max_bytes: 0,
+            audit_pipeline: None,
+            process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            process_memory_budget_is_fallback: false,
         });
         let scrape = scrape(&metrics).await;
         let expected = vec![

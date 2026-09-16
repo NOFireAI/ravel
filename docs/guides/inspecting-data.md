@@ -351,6 +351,59 @@ numeric signal code (`1` = metrics). `ingest_hour_bucket` is the same hour
 encoded in the object's own key, and it is what the catalog groups listings
 by.
 
+## `inspect cstat`: what a column-statistics object declares
+
+```sh
+ravel-cli inspect cstat \
+  "t/3f2a.../catalog/l/idx/20260910T09.76b5680....cstat"
+```
+
+```
+envelope_version: 3
+header_len: 84
+format_version: 1
+tenant_hash: 3f2a1c9e4b7d0a62
+signal: 3
+part_blake3: 98c85b7a1f2e3d4c
+segment_count: 2617
+body_uncompressed_len: 268427456
+over_ceiling (body_uncompressed_len > 268435456): false
+  segment shard=0 ingest_hour_bucket=496953 writer_epoch=1 writer_seq=1 column=service.name dictionary_present=true
+  segment shard=0 ingest_hour_bucket=496953 writer_epoch=1 writer_seq=1 column=http.route dictionary_present=false
+```
+
+A `.cstat` object carries the per-column minimum, maximum, count, sum and
+value dictionary a query uses to skip segments it cannot match.
+
+`signal` is the raw numeric code from the header, not a word: 1 is metrics,
+2 is spans, 3 is logs. `part_blake3` is comma-joined when a header covers
+more than one part.
+
+`body_uncompressed_len` against the `over_ceiling` verdict is the pair worth
+reading first. A reader refuses any object declaring more than 256 MiB
+**before** decompressing it, so an over-ceiling object is undecodable by
+every reader and nothing is using its statistics, however healthy the object
+looks in a listing. That is why the verdict is computed from the header
+alone: the objects most worth diagnosing are exactly the ones a full decode
+refuses. For those, the command says so instead of failing:
+
+```
+over_ceiling (body_uncompressed_len > 268435456): true
+dictionary_present listing: unavailable, body_uncompressed_len exceeds the decode ceiling and no reader can decompress this object
+```
+
+Under the ceiling, one `segment ... column=... dictionary_present=` line is
+printed per column per segment. `dictionary_present=false` means the fold
+dropped that column's value dictionary to bring the part under the ceiling;
+it drops whole dictionaries, largest first, and never truncates one, so a
+column either has its full dictionary or none of it. A run of `false` on an
+object that is itself under the ceiling means the statistics survived but
+most of the dictionaries did not, and predicate pruning falls back to
+min/max for those columns.
+
+A truncated, bad-magic, wrong-version or checksum-mismatched object fails
+with the specific reason rather than a generic error.
+
 ## `idem inspect`: what an idempotency marker says
 
 ```sh

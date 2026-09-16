@@ -1,18 +1,18 @@
-//! Durable `shard_count` acceptance test (ADR-0050 section 5, EC5).
-//! Ingest across four shards through a real in-process server (which
-//! writes the provisioning record with shard_count=4), then simulate a restart
-//! configured for two shards and assert the process refuses to start with a
-//! typed error naming the record, and that no query path serves the truncated
-//! shard range.
+//! Durable `shard_count` drift-tolerance acceptance test (ADR-0082, over
+//! ADR-0050 section 5). Ingest across four shards through a real in-process
+//! server (which writes the provisioning record with shard_count=4), then
+//! simulate a restart configured for two shards and assert the process starts
+//! cleanly and the query path serves the recorded four-shard range rather than
+//! a truncated `0..2`.
 //!
-//! The startup refusal itself lives in `main.rs`
+//! The startup check lives in `main.rs`
 //! (`ravel_server::provisioning::validate_static_provisioning`, called before
 //! any listener binds), not in `ravel_server::start`, so the "restart"
 //! phase calls that exact function the binary calls, against the same store the
-//! first process wrote. The query-path guard is exercised through a real
-//! `Catalog` built the way `build_catalog` builds it (with provisioning
-//! enforcement), so a lower-shard_count query fails rather than resolving over
-//! `0..2`.
+//! first process wrote. The query path is exercised through a real `Catalog`
+//! built the way `build_catalog` builds it (with provisioning enforcement):
+//! generation-aware resolve serves the recorded four shards even when the live
+//! `--shards` default is two.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -34,7 +34,9 @@ use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
-use ravel_types::{Signal, TenantId, TimeRange};
+use ravel_types::{
+    Label, LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantId, TimeRange, shard_for,
+};
 
 const TOKEN: &str = "testtoken";
 const TENANT: &str = "acme";
@@ -58,11 +60,14 @@ fn string_kv(key: &str, value: &str) -> KeyValue {
     }
 }
 
-/// A request carrying several distinct series so points route across shards.
-fn export_request(ts_ns: i64) -> ExportMetricsServiceRequest {
-    let metrics: Vec<Metric> = (0..12)
-        .map(|i| Metric {
-            name: format!("cpu_usage_{i}"),
+/// A request carrying one series per name in `metric_names`, all under the
+/// same `service.name=demo` resource, so points route across shards.
+fn export_request(ts_ns: i64, metric_names: &[String]) -> ExportMetricsServiceRequest {
+    let metrics: Vec<Metric> = metric_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| Metric {
+            name: name.clone(),
             data: Some(MetricData::Gauge(Gauge {
                 data_points: vec![NumberDataPoint {
                     time_unix_nano: ts_ns as u64,
@@ -88,6 +93,52 @@ fn export_request(ts_ns: i64) -> ExportMetricsServiceRequest {
     }
 }
 
+/// The label set the real OTLP normalization path (`ravel-otlp`'s
+/// `build_point`/`build_resource_labels`) attaches to a `metric` series
+/// exported with resource attribute `service.name=demo` and no point-level
+/// attributes: `service.name` maps to the label `job`, never verbatim. Must
+/// track that mapping exactly, or the `SeriesId` computed here (and the
+/// shard predicted from it) diverges from the one the real ingest path
+/// produces.
+fn export_series_labels(metric: &str) -> LabelSet {
+    LabelSet::new(vec![
+        Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: metric.to_string(),
+        },
+        Label {
+            name: "job".to_string(),
+            value: "demo".to_string(),
+        },
+    ])
+    .expect("valid labels")
+}
+
+/// The shard a `metric`'s series (as exported by [`export_request`]) hashes
+/// to under `count` (`shard_for`, the frozen write-side routing contract).
+fn metric_shard(metric: &str, count: u32) -> u32 {
+    let id = SeriesId::compute(
+        &TenantId::new(TENANT),
+        metric,
+        &export_series_labels(metric),
+    )
+    .expect("series id");
+    shard_for(&id, count)
+}
+
+/// A metric name (`<prefix>_<i>`) whose series lands in a shard satisfying
+/// `want` under `count`. Used to guarantee a segment lands outside the
+/// post-restart configured shard range.
+fn metric_in_shard(prefix: &str, count: u32, want: impl Fn(u32) -> bool) -> String {
+    for i in 0..1_000_000u32 {
+        let name = format!("{prefix}_{i}");
+        if want(metric_shard(&name, count)) {
+            return name;
+        }
+    }
+    panic!("no {prefix} series lands in the requested shard range under count {count}");
+}
+
 async fn start_server(
     store: Arc<dyn ObjectStoreBackend>,
     shard_count: u32,
@@ -96,6 +147,8 @@ async fn start_server(
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
@@ -119,6 +172,7 @@ async fn start_server(
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
@@ -131,11 +185,17 @@ async fn start_server(
         typed_attr_columns: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_is_fallback: false,
         cache_dir: None,
+        catalog_resolve_concurrency: None,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
         remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: std::time::Duration::ZERO,
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
@@ -151,11 +211,21 @@ async fn start_server(
     .expect("server starts")
 }
 
-/// Ingest 4 shards, restart at 2, assert the restart refuses with a
-/// typed error naming the record, and that no query serves the truncated range.
+/// Ingest 4 shards, restart at 2, assert the restart starts cleanly and the
+/// query path serves the recorded four-shard range (ADR-0082).
 #[tokio::test]
-async fn startup_fails_on_shard_count_mismatch() {
+async fn startup_tolerates_shard_count_drift() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+    // A series guaranteed to land at or above RESTART_SHARDS (2) under
+    // INGEST_SHARDS (4) routing, so the post-restart resolve can only serve it
+    // by scanning the record's own generation history, not a 0..RESTART_SHARDS
+    // scan.
+    let out_of_range_metric =
+        metric_in_shard("cpu_out_of_range", INGEST_SHARDS, |s| s >= RESTART_SHARDS);
+    let out_of_range_shard = metric_shard(&out_of_range_metric, INGEST_SHARDS);
+    let mut metric_names: Vec<String> = (0..12).map(|i| format!("cpu_usage_{i}")).collect();
+    metric_names.push(out_of_range_metric);
 
     // Phase 1: ingest across 4 shards through the real HTTP handler. This writes
     // the provisioning record with shard_count=4 (on the first write) and lands
@@ -167,7 +237,7 @@ async fn startup_fails_on_shard_count_mismatch() {
         .post(format!("{base}/v1/metrics"))
         .header("authorization", format!("Bearer {TOKEN}"))
         .header("content-type", "application/x-protobuf")
-        .body(export_request(now_ns()).encode_to_vec())
+        .body(export_request(now_ns(), &metric_names).encode_to_vec())
         .send()
         .await
         .expect("export request succeeds");
@@ -200,37 +270,40 @@ async fn startup_fails_on_shard_count_mismatch() {
 
     // Phase 2: simulate a restart configured for 2 shards. This is exactly what
     // `main.rs` runs before binding any listener: the static tenant ("acme",
-    // from `--tenant-token`) is validated against its record and the process
-    // refuses to start on a mismatch.
+    // from `--tenant-token`) is validated against its record. Under ADR-0082 a
+    // recorded shard_count (4) above the live default (2) is tolerated: startup
+    // proceeds rather than refusing. Before ADR-0082 this returned
+    // `ProvisioningError::ShardCountMismatch` and the `.expect(...)` panicked.
     let static_tenants = vec![TenantId::new(TENANT).hash()];
-    let err = ravel_server::provisioning::validate_static_provisioning(
+    ravel_server::provisioning::validate_static_provisioning(
         store.as_ref(),
         &static_tenants,
         RESTART_SHARDS,
         now_ns(),
     )
     .await
-    .expect_err("restart configured for 2 shards must refuse to start");
-    // A typed FieldMismatch-style error naming the record and the values.
-    assert!(
-        matches!(
-            err,
-            ravel_catalog::ProvisioningError::ShardCountMismatch { .. }
-        ),
-        "expected a typed shard_count mismatch, got: {err}"
-    );
-    let msg = err.to_string();
-    assert!(msg.contains("/prov"), "error names the record key: {msg}");
-    assert!(msg.contains("shard_count"), "error names the field: {msg}");
-    assert!(
-        msg.contains(&RESTART_SHARDS.to_string()) && msg.contains(&INGEST_SHARDS.to_string()),
-        "error names expected (2) and actual (4): {msg}"
-    );
+    .expect("a restart with a lower --shards default must tolerate the recorded count (ADR-0082)");
 
-    // Phase 3: prove the query path never serves the truncated shard range. A
-    // catalog built for 2 shards (the way `build_catalog` builds it, with
-    // provisioning enforcement) fails the resolve on the record mismatch rather
-    // than iterating `0..2` and dropping shards 2 and 3.
+    // Phase 3: prove the query path serves the recorded four-shard range, not a
+    // truncated `0..2`. A catalog built for 2 shards (the way `build_catalog`
+    // builds it, with provisioning enforcement) resolves via the record's own
+    // generation history, so the resolve succeeds and covers the recorded
+    // shards. Before ADR-0082 this failed with a provisioning error.
+    //
+    // `out_of_range_shard` (>= RESTART_SHARDS) is reachable only if the
+    // resolver scans the record's recorded generation history rather than the
+    // live `shard_count` (2): a resolver that (bug) only scans the configured
+    // `0..RESTART_SHARDS` range would still return a non-empty snapshot from
+    // the `cpu_usage_*` series, so asserting mere non-emptiness would be
+    // vacuous. FLIP (pre-fix demonstration, same as the
+    // `resolve_tolerates_provisioning_record_drift` unit test in
+    // crates/ravel-catalog/src/catalog.rs): in `Catalog::read_scan_generations`
+    // (crates/ravel-catalog/src/catalog.rs), replace the
+    // `Some(generations) => Ok(generations)` arm's body with
+    // `Ok(vec![implicit_generation_zero(self.config.shard_count)])`, so the
+    // decoded generation history is discarded in favor of the live
+    // `shard_count` (2). The segment on `out_of_range_shard` is then never
+    // scanned and the `assert!` below fails.
     let catalog = Catalog::new(
         store.clone(),
         CatalogConfig {
@@ -240,7 +313,7 @@ async fn startup_fails_on_shard_count_mismatch() {
     )
     .expect("catalog builds")
     .with_provisioning_enforcement();
-    let resolve_err = catalog
+    let snapshot = catalog
         .resolve(
             &TenantId::new(TENANT).hash(),
             Signal::Metrics,
@@ -252,10 +325,20 @@ async fn startup_fails_on_shard_count_mismatch() {
             now_ns(),
         )
         .await
-        .expect_err("a query at shard_count=2 must fail, never serve a truncated shard range");
+        .expect("a query at a lower --shards default resolves over the recorded shard range");
     assert!(
-        matches!(resolve_err, ravel_catalog::CatalogError::Provisioning(_)),
-        "expected a provisioning failure on resolve, got: {resolve_err}"
+        snapshot
+            .segments
+            .iter()
+            .any(|s| s.shard == out_of_range_shard),
+        "shard {out_of_range_shard} is at or above the configured --shards ({RESTART_SHARDS}); \
+         it is only reachable by scanning the record's own generation history (ADR-0082), got \
+         shards: {:?}",
+        snapshot
+            .segments
+            .iter()
+            .map(|s| s.shard)
+            .collect::<Vec<_>>()
     );
 }
 

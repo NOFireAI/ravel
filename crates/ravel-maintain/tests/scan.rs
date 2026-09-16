@@ -274,8 +274,8 @@ async fn warm_memo_skips_terminal_buckets_with_fewer_list_and_get_calls() {
     );
     assert_eq!(
         cold_get,
-        3 * u64::from(N),
-        "2 commit + 1 compaction GET per bucket"
+        3 * u64::from(N) + 1,
+        "2 commit + 1 compaction GET per bucket, plus one config GET per pass"
     );
 
     // Tick 3 (warm): every bucket is skipped straight from the memo.
@@ -297,14 +297,20 @@ async fn warm_memo_skips_terminal_buckets_with_fewer_list_and_get_calls() {
     assert_eq!(r3.skipped_terminal, N as usize);
     assert_eq!(r3.already_done, 0);
     // The warm steady-state tick issues only the single shard-level
-    // list_delimited: no per-bucket List, no GET.
+    // list_delimited and the one per-pass config GET (durable retention
+    // window, resolved once per pass for zone classification and the
+    // retention decision): no per-bucket List, no per-bucket GET.
     assert_eq!(list_delimited_delta(&before_warm, &after_warm), 1);
     assert_eq!(
         list_delta(&before_warm, &after_warm),
         0,
         "no per-bucket LISTs"
     );
-    assert_eq!(get_delta(&before_warm, &after_warm), 0, "no GETs");
+    assert_eq!(
+        get_delta(&before_warm, &after_warm),
+        1,
+        "one config GET per pass, no per-bucket GETs"
+    );
     assert!(0 < cold_list && 0 < cold_get, "cold tick did real work");
 }
 
@@ -363,7 +369,9 @@ async fn fresh_memo_after_restart_re_evaluates_and_skips_nothing() {
     );
 
     // Restart: a fresh, cold memo. Its first tick skips nothing and redoes the
-    // full per-bucket work (2 LISTs + 3 GETs per bucket).
+    // full per-bucket work (2 LISTs + 3 GETs per bucket), plus one config GET
+    // for the whole pass: the tenant's retention window is resolved once per
+    // pass (durable record over CLI, ADR-0078), not once per bucket.
     let mut fresh = MaintainMemo::new(DEFAULT_MEMO_REVERIFY_INTERVAL_NS);
     let before = store.metrics().snapshot();
     let r_fresh = scan_and_maintain_with_memo(
@@ -389,7 +397,9 @@ async fn fresh_memo_after_restart_re_evaluates_and_skips_nothing() {
         "every bucket re-evaluated"
     );
     assert_eq!(list_delta(&before, &after), 2 * u64::from(N));
-    assert_eq!(get_delta(&before, &after), 3 * u64::from(N));
+    // 3 GETs per bucket, plus one config GET resolving the retention window once
+    // for the pass.
+    assert_eq!(get_delta(&before, &after), 3 * u64::from(N) + 1);
     assert_eq!(fresh.len(), N as usize, "the fresh memo re-learned the set");
 }
 
@@ -609,7 +619,8 @@ async fn warm_start_skips_terminal_buckets_without_reads() {
     }
 
     // The seeded worker's first tick skips every bucket straight from the
-    // seed: no redundant per-bucket LIST, no GET, only the shard listing.
+    // seed: no redundant per-bucket LIST or GET, only the shard listing and
+    // the one per-pass config GET (durable retention window).
     let before = store.metrics().snapshot();
     let report = scan_and_maintain_with_memo(
         &mut seeded,
@@ -643,8 +654,8 @@ async fn warm_start_skips_terminal_buckets_without_reads() {
     );
     assert_eq!(
         get_delta(&before, &after),
-        0,
-        "no GETs after a durable warm start"
+        1,
+        "only the per-pass config GET after a durable warm start"
     );
 }
 
@@ -765,8 +776,8 @@ async fn ownership_handoff_seeds_successor_from_predecessor_snapshot() {
     );
     assert_eq!(
         get_delta(&before, &after),
-        0,
-        "no per-bucket GETs on handoff warm start"
+        1,
+        "only the per-pass config GET on handoff warm start"
     );
     assert_eq!(
         list_delta(&before, &after),

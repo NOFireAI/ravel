@@ -103,6 +103,11 @@ concurrency, merge memory, and the at-rest scrubber, render only in a
 the sweep, and the scrubber. An operator scraping an `all` mode process never
 sees those families move, and that is expected.
 
+The alerting family is absent unless the process built an alert evaluator,
+which needs `--alert-rules-file` naming at least one rule. It renders wherever
+rule evaluation runs, which is every `all` or `query` mode process configured
+with rules, whether or not that process currently holds a tenant's alert lease.
+
 ### Object store (`ravel_store_*`)
 
 Labels: `mode`, `op`, and `error_kind` on the error counter only.
@@ -141,7 +146,8 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_acks_ok_total` | Strict-mode waiters acked with a commit token. |
 | `ravel_ingest_acks_err_total` | Strict-mode waiters acked with a write error. |
 | `ravel_ingest_collisions_total` | Batches rejected for a series or stream identity collision. |
-| `ravel_ingest_shard_deaths_total` | Distinct shard actors observed dead by the router. |
+| `ravel_ingest_shard_deaths_total` | Shard-actor deaths observed by the router, counted once per death including each respawned incarnation, so it can exceed the shard count. A low steady rate is transient respawn recovery: the respawn budget decays to zero after a shard runs a whole `max_flush_lifetime` without dying, so deaths spread that far apart never accumulate into a condemnation. A sustained climb on one shard is a poison-pill input. |
+| `ravel_ingest_shards_condemned_total` | Shards that exhausted their respawn budget within one decay window and were condemned, counted at most once per shard per live generation and bounded by the live generation count times the shard count, not the shard count: under resharding each generation condemns a shard index independently. Any nonzero value means the process reports `/readyz` 503, which sheds traffic but does not replace the process; it stays condemned until someone rolls it. Alert on `> 0`. |
 | `ravel_ingest_partial_writes_total` | Multi-shard strict writes the router observed committing on some shards and then failing on a sibling. The client received an error that is retryable exactly when the sibling's failure was, and the durable tokens reach it only where the transport can carry them (the OTLP, remote-write, and OTAP gateways log the durable count instead); a rising figure means retries may be re-ingesting data that already committed (see the consistency model's partial multi-shard commit section). |
 | `ravel_ingest_exemplars_written_total` | Exemplars stored on flushed objects. |
 | `ravel_ingest_exemplars_dropped_total` | Exemplars discarded by the per-series admission cap. |
@@ -149,6 +155,7 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_grace_extended_stale_flushes_total` | Flushes routed on a last-known-good provisioning view inside the bounded grace window. A rising figure means the store is slow to serve the provisioning re-read and this router is running degraded-but-available. |
 | `ravel_ingest_flushes_by_age_adaptive_total` | Flushes opened on the adaptive-delay corridor age trigger rather than the fixed max_flush_delay. A rising figure means the adaptive corridor, not the fixed delay, is driving age flushes. |
 | `ravel_ingest_in_flight_flushes` | Flush tasks spawned but not yet acked, summed across shards (a gauge). A sustained high value means flushes are not keeping up with the load. |
+| `ravel_ingest_flush_permit_wait_seconds_total` | Total seconds every flush has spent waiting for a `max_inflight_flushes` permit, summed across shards. Zero unless a shard is actually asked for a second concurrent flush; a rising figure means `max_inflight_flushes` is the binding window. |
 
 The collisions family carries no `signal="spans"` series. Spans derive no
 identity that can collide, so that sample is structurally absent, not zero.
@@ -157,12 +164,18 @@ The two exemplar families carry only the `signal="metrics"` series. Exemplars
 ride on metric points, so those samples are structurally absent for logs and
 spans, not zero.
 
-The `ravel_ingest_flushes_by_age_adaptive_total` and
-`ravel_ingest_in_flight_flushes` families likewise carry only the
-`signal="metrics"` series: the adaptive-delay corridor and flush pipelining are
-metrics-pipeline features, so those samples are structurally absent for logs and
-spans, not zero. `ravel_ingest_grace_extended_stale_flushes_total` is carried
-for every signal.
+The `ravel_ingest_flushes_by_age_adaptive_total` family likewise carries only
+the `signal="metrics"` series: the adaptive-delay corridor is a
+metrics-pipeline feature, so that sample is structurally absent for logs and
+spans, not zero. `ravel_ingest_in_flight_flushes`,
+`ravel_ingest_flush_permit_wait_seconds_total`, and
+`ravel_ingest_grace_extended_stale_flushes_total` are carried for every
+signal, each for its own reason: the in-flight gauge because all three shard
+actors arm an `InFlightFlushGuard`; the permit-wait counter because the
+`max_inflight_flushes` acquire runs off-actor for all three ingest pipelines;
+the grace-extended counter because all three snapshots already expose the
+stale-provisioning counter it pairs with. A logs- or spans-only process
+therefore still renders a real (possibly zero) sample for all three.
 
 #### Per-tenant PUT attribution (`ravel_ingest_attribution_puts_total`)
 
@@ -235,17 +248,254 @@ The first two counters tally an anomaly the query resolves past. Each
 `ravel_catalog_isolation_breach_total` increment is a query that failed with
 an explicit isolation-fault error. [Troubleshooting](operations/troubleshooting.md) gives its alert rule.
 
+### Catalog fold liveness (`ravel_catalog_fold_*`)
+
+Labels: `mode`, `signal`. All three families render in every mode, with one
+series per folded signal (`metrics`, `logs`, `spans`), but only the processes
+that actually fold ever move them. Two things stop the background fold loop:
+the `maintain` mode, which never spawns it, and `--disable-fold`, which
+returns no fold tasks in any mode. The on-demand fold route is mounted only
+in `all` and `query`. A `maintain` process, and any process run with
+`--disable-fold`, therefore reports zeros permanently.
+
+The `signal` label is the family's per-signal keying, not a convenience. The
+fold runs as one independent task per signal, each with its own loop and no
+supervisor, so one signal's fold can stop while the other two keep running.
+Process-global families read as healthy throughout that, because the two
+surviving loops keep the shared figures fresh: the span history stops sealing,
+the unsealed span grows, and nothing moves. One series per signal removes that
+blind spot, and the cardinality is three values per process, the same closed
+set `signal` already carries on the ingest and postings families.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_catalog_fold_cycles_total` | Catalog folds of this signal that completed successfully, no-op folds included. |
+| `ravel_catalog_fold_failures_total` | Catalog folds of this signal that failed. The fold retries on the next tick and never fails a query directly. |
+| `ravel_catalog_fold_last_success_timestamp_seconds` | Gauge. Unix time of the last successful fold of this signal in this process, `0` if none has succeeded since it started. |
+
+A no-op fold counts as a cycle and advances the gauge. That is deliberate: a
+fold seals an ingest hour only once `max_flush_lifetime +
+clock_skew_allowance + fold_safety_margin` has elapsed past the end of that
+hour, so on a quiet tenant almost every cycle legitimately publishes nothing.
+A counter that moved only on a published snapshot would read as a stopped
+fold on exactly the tenants where nothing is wrong.
+
+The gauge is the family's point. The two counters move when the fold runs;
+only the gauge's age moves when the fold stops, and a stopped fold is the
+self-worsening failure here. The unsealed span grows for as long as nothing
+seals it, and a cold recent-window query over a wide enough unsealed span
+eventually exceeds its per-query object-store request budget and is refused
+outright. Until this gauge existed the first operator-visible symptom of a
+stopped fold was that refusal, because the fold reported its failures through
+logs alone.
+
+#### The fold-stalled alert
+
+```yaml
+groups:
+  - name: ravel-catalog-fold
+    # RavelCatalogFoldStalled fires on any deployment where some signal has
+    # no fresh fold, which includes a fleet that never folds at all: an
+    # intentionally maintain-only fleet, or one running --disable-fold
+    # everywhere. Such a fleet must drop this rule or inhibit it; the state
+    # walkthrough below explains why that opt-out is deliberate.
+    rules:
+      - alert: RavelCatalogFoldStalled
+        expr: |
+          (
+            time() - max by (signal) (
+              ravel_catalog_fold_last_success_timestamp_seconds
+            ) > 4800
+          )
+          or
+          absent(ravel_catalog_fold_last_success_timestamp_seconds)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            No Ravel process has completed a catalog fold of signal
+            {{ $labels.signal }} for longer than the unsealed ingest span the
+            configuration allows
+          description: >-
+            The unsealed span for this signal grows for as long as this holds,
+            and a cold recent-window query over a wide enough span is refused
+            for exceeding its object-store request budget. Check
+            ravel_catalog_fold_failures_total for the same signal for a fold
+            that is running and failing, and the fold task's logs for the
+            underlying store error.
+      - alert: RavelCatalogFoldFailing
+        expr: |
+          sum by (signal) (rate(ravel_catalog_fold_failures_total[15m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ravel catalog folds of {{ $labels.signal }} are failing
+          description: >-
+            The fold retries each tick, so a transient store fault clears on
+            its own. A sustained failure rate does not, and it precedes
+            RavelCatalogFoldStalled by however long the threshold there
+            allows.
+```
+
+`max by (signal)`, not a bare `max()` and not a per-instance comparison. The
+grouping and the aggregation answer two different questions.
+
+The aggregation is fleet-wide because the fold loop skips its tick entirely
+when `HEAD` is already fresher than `fold_interval`. A replica whose peers are
+folding on schedule correctly does no folding of its own, and its own gauge is
+correctly stale; the fleet-wide maximum is the figure that answers "is this
+catalog being folded."
+
+The grouping is by `signal` because there is no such thing as "the fold" to be
+alive or dead. There are three independent fold loops per process, one per
+signal, and one replica's loop going idle is the healthy case described
+above, not a failure: the fleet stays covered for that signal as long as one
+peer still folds and stamps it. A single process's loop is a point of
+failure for a signal's sealed history only in a single-folding-replica
+deployment, or fleet-wide when a signal-specific fault kills that loop on
+every replica at once -- and that fleet-wide case is what the grouping
+exists to catch. An ungrouped `max()` collapses all three signals into one
+number that two healthy loops keep fresh while the third is dead fleet-wide,
+which is the same hides-a-dead-component shape as reading a process-global
+gauge across a split-role fleet. Grouping by `signal` produces one sample per
+signal, and any one of them crossing the threshold fires with `signal` on the
+alert, so the page names which history has stopped sealing.
+
+The `or absent(...)` branch covers the outage the staleness comparison alone
+cannot see. `max by (signal)` of an empty instant vector is empty, and
+`time() - <empty>` is empty, so when the family is not being scraped at all the
+first operand produces no sample and a rule of only that operand stays silent
+through the exact outage it exists to catch: a fleet scaled to zero, a fleet
+crash-looping fast enough that its targets go stale, or a scrape-config edit
+that drops the job. `absent()` returns `1` precisely when its argument matches
+no series, so it fires on that absence. That branch carries no `signal` label,
+because there is no series to take one from; an alert from it renders an empty
+`{{ $labels.signal }}` and means the whole family stopped arriving, not that
+one signal stalled.
+
+Neither operand filters `mode`. Earlier revisions of this rule carried
+`mode!="maintain"` on both, and it is behaviour-neutral here: `render_catalog_family`
+runs in every mode, so a co-scraped `maintain` process contributes a permanent
+`0` to each signal's group, and `0` can never win a `max()` against any live
+gauge. Where the filter used to matter was a folding fleet that died beside a
+surviving `maintain` node, and the unfiltered form covers that state too, just
+through the other operand: the `0` is the only sample left in each group, so
+`time() - 0` clears any threshold and the staleness operand fires where the
+filtered form needed `absent()` to. Every state below is identical under both
+forms, so the rule carries the simpler expression. The filter also cannot be
+what makes an intentionally non-folding fleet quiet: such a fleet pages under
+both forms, for the reason in the opt-out paragraph below.
+
+The states, of the observed system rather than of the expression:
+
+| What the fleet is doing | Series at the scrape | Staleness operand | `absent()` operand | Alert |
+|---|---|---|---|---|
+| Nothing scraped at all | none | empty | fires | **fires** |
+| Only `maintain` nodes scraped, intentionally | 3, all `mode="maintain"` at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** (opt out) |
+| Healthy folding fleet | 3 per process, all fresh | under threshold for all 3 signals | silent | silent |
+| Folding fleet scraped, every fold loop stalled | 3 per process, all stale | over threshold for all 3 signals | silent | **fires** |
+| Folding fleet dead, co-scraped `maintain` alive | 3, all `mode="maintain"` at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** |
+| One signal's loop dead, other two healthy | 3 per process; 2 fresh, 1 stale | over threshold for that one signal | silent | **fires** for that signal |
+| `--disable-fold` on every non-`maintain` process | 3 per process, all at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** (opt out) |
+| Fleet whose tenants write only one signal | 3 per process, all fresh | under threshold for all 3 signals | silent | silent |
+
+The last row is the one that would be a false page if the gauge tracked
+published snapshots rather than fold cycles. Every loop folds every discovered
+tenant for its own signal every tick; a fold over a signal a tenant never
+writes is a healthy no-op cycle and stamps the gauge like any other. A fleet
+ingesting only logs still has all three gauges fresh.
+
+Do any two rows produce identical telemetry while meaning different things?
+Yes, two pairs, and both are deliberate:
+
+- "Only `maintain` nodes scraped, intentionally" and "folding fleet dead,
+  co-scraped `maintain` alive" are byte-for-byte identical at the scrape: three
+  `mode="maintain"` series at `0` and nothing else. No arrangement of these
+  operands can tell an intended topology from a fleet-wide death, because the
+  dead processes' series are gone and absence carries no intent.
+- "`--disable-fold` everywhere" and "every fold loop crashed before its first
+  success" are likewise identical: every gauge at its `0` sentinel under a full
+  set of non-`maintain` series.
+
+Both pairs resolve the same way, and the rule fires loud on all four. A fleet
+that never folds -- maintain-only, or `--disable-fold` everywhere -- must opt
+out by dropping `RavelCatalogFoldStalled` or inhibiting it (the group comment
+on the rule marks this). `--disable-fold` is documented elsewhere as a pure
+query-cost optimization, so an operator who sets it deliberately should expect
+this rule to page about ten minutes after start and should silence it as part
+of setting the flag, not treat the page as a false positive: the unsealed span
+really does grow without a fold to seal it, and that is what the rule reports.
+Firing on a real outage and forcing one deliberate silencing on a fleet that
+never folds is safer than staying silent on the outage to spare that fleet the
+page: an alert that is silent in the case it exists for manufactures
+confidence.
+
+The threshold is the unsealed span the catalog configuration implies, in
+seconds:
+
+| Term | Default | Seconds |
+|---|---|---|
+| `max_flush_lifetime` | 1 hour | 3600 |
+| `clock_skew_allowance` | 5 minutes | 300 |
+| `fold_safety_margin` | 15 minutes | 900 |
+| **Sum** | **1 h 20 min** | **4800** |
+
+3600 + 300 + 900 = 4800 seconds is the span behind the present that a fold is
+never allowed to seal, however healthy it is. A fold that has not succeeded
+for longer than that has left more history unsealed than the configuration
+ever intends to be unsealed: below the threshold the growth is inside a
+window the deployment has already accepted as un-indexed, above it every
+further second is history that should have been sealed and was not. Raise or
+lower the threshold with those three settings, not independently of them.
+
+The headroom that keeps it quiet: `fold_interval` defaults to 5 minutes and the
+loop adds up to 10% jitter, so the sleep between two cycles is at most 330
+seconds. That is the sleep ceiling, not the gauge-age ceiling. The stamp is the
+reading taken before each tenant's fold and the loop re-stamps per tenant
+within a cycle, so the widest healthy gap runs from the last tenant's stamp in
+one cycle to the first tenant's stamp in the next: 330 s, plus the
+tenant-discovery LIST that opens the cycle, plus that first tenant's fold
+duration, which on a large tenant is tens of seconds. 4800 is about 14 missed
+ticks of margin over the sleep ceiling, which no single slow cycle, restart, or
+rolling deploy reaches. Use the fuller form, not the 330, if you tighten the
+threshold on a fleet with a shorter `fold_interval`: the discovery-plus-one-fold
+term stops being noise once the sleep shrinks toward it.
+
+`for: 10m` covers process start rather than the stall itself. The gauge reads
+`0` until the first fold succeeds, which makes `time() - 0` exceed any
+threshold instantly, and the first scheduled fold lands one `fold_interval`
+plus jitter after start. Ten minutes is a little under two intervals of
+grace. Keeping the `0` rather than omitting the series is what lets the one
+expression cover both a fold that stopped and a fold that never worked at
+all.
+
+Two limits to know before relying on it. The gauge is per signal but not per
+tenant: one signal's series goes stale when that signal's fold stops, and stays
+fresh when one tenant's fold is stuck behind a permanent fault while every
+other tenant of that signal folds normally. `signal` is a closed set of three
+values and is labelled here for exactly that reason; `tenant` is not, and
+tenant-labelled fold series would carry cardinality that grows with the tenant
+count, so a stuck single tenant is found through
+`ravel_catalog_fold_failures_total` and the fold task's per-tenant logs
+instead. And a deployment that has discovered no tenants at all folds nothing
+and so trips this rule; scope the group to deployments that serve traffic.
+
 ### Tenancy adoption (`ravel_tenancy_v1_unkeyed_adoptions_total`)
 
 Labels: `mode`. Counts buckets this process pinned to the unkeyed tenant hash
 when it adopted a bucket that held `t/` data but no `sys/tenancy` marker. A
 nonzero value is the visible signal that the one-time migration happened.
 
-### Provisioning (`ravel_provisioning_shard_count_mismatch_total`)
+### Provisioning (`ravel_provisioning_shard_count_mismatch_total`, `ravel_provisioning_shard_count_drift_total`)
 
-Labels: `mode`. Counts dynamic-tenant provisioning checks that failed: a
-`shard_count` disagreement, an unreadable record, or a maintain-loop check
-catching either. [Troubleshooting](operations/troubleshooting.md) gives its alert rule.
+Labels: `mode`.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_provisioning_shard_count_mismatch_total` | Provisioning checks that failed hard: an unreadable record, a decodable record whose generation history fails structural validation, or pre-ADR data a lower `shard_count` would hide. Alert on any increase; [Troubleshooting](operations/troubleshooting.md) gives its rule. |
+| `ravel_provisioning_shard_count_drift_total` | Validations where a decodable record with a structurally valid generation history had a recorded `shard_count` that differed from the live `--shards` default (a record that fails structural validation is counted by the mismatch counter above, never here). The drift is tolerated and routing uses the record's own generation history, so this is informational: a nonzero value is expected after lowering the global default, not a fault. |
 
 ### Store reachability (`ravel_store_reachable`, `ravel_store_probe_failures_total`)
 
@@ -300,11 +550,27 @@ Labels: `mode`, plus `signal` on all but the legal-hold counter. These carry no
 | `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. |
 | `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the most recent sweep pass, by signal. |
 | `ravel_maintain_orphans_present` | Gauge. Orphan candidates the most recent sweep pass found, by signal, whether or not the breaker tripped. |
+| `ravel_maintain_orphans_quarantined_total` | Orphan candidates moved from the live L0 set to the quarantine prefix, by signal. |
+| `ravel_maintain_orphans_quarantine_refused_total` | Orphan candidates whose copy to the quarantine prefix failed, by signal; the live object was left in place rather than deleted without a copy. |
+| `ravel_maintain_quarantine_reaped_total` | Objects physically deleted from the quarantine prefix past the quarantine horizon, by signal. |
 
 [Troubleshooting](operations/troubleshooting.md) gives the alert rules and the
 breaker runbook. A zero
 value on the `orphans_withheld` or `orphans_present` gauge does not mean a
 prior trip was resolved: it is this pass's count, not a resolution signal.
+
+The three quarantine series are counters, not gauges: each counts what a sweep
+pass did, and a later quiet pass does not undo it. Read them together. A
+`ravel_maintain_orphans_quarantined_total` that climbs while
+`ravel_maintain_quarantine_reaped_total` stays flat is a quarantine prefix
+filling and never being reclaimed. Any increase in
+`ravel_maintain_orphans_quarantine_refused_total` means quarantine cannot make
+progress at all, from a store fault or a permissions or capacity problem on
+that prefix, and the candidates it counts are still live: the copy is taken
+before the delete, so a refused copy leaves the object in place rather than
+deleting it uncopied. Alert on `increase(...) > 0` there, the same shape as the
+breaker-trip counter, because the next pass retries the same candidate and
+refuses again.
 
 ### Maintenance ownership and concurrency (`ravel_maintain_workers_live`, `ravel_maintain_units_*`, `ravel_maintain_memo_warm_start_units_total`, `ravel_maintain_full_sweep_passes_total`)
 
@@ -319,6 +585,148 @@ dimension.
 | `ravel_maintain_memo_warm_start_units_total` | Units seeded from a durable memo snapshot on handoff or startup, instead of rescanning cold. |
 | `ravel_maintain_full_sweep_passes_total` | Full (unscoped) sweep passes run, as opposed to a zone-scoped sweep. |
 
+### Maintenance loop liveness (`ravel_maintain_last_cycle_completed_timestamp_seconds`, `ravel_maintain_loop_panics_total`)
+
+Labels: `mode`. Both series are process-wide, with no `tenant_hash` dimension.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_maintain_last_cycle_completed_timestamp_seconds` | Gauge. Unix time the maintenance loop last completed a cycle in this process, `0` if none has completed since it started. Its age is the maintain-liveness signal. |
+| `ravel_maintain_loop_panics_total` | Panics caught in the loop body and restarted by the supervisor. An `increase()` here is the loop crash-looping. |
+
+This is the maintenance analogue of the [catalog fold liveness
+gauge](#catalog-fold-liveness-ravel_catalog_fold_) above, and it exists for the
+same reason. Every other maintenance figure -- `ravel_maintain_tenants_maintained`,
+`ravel_maintain_units_stalled`, the safety gauges -- is written at the end of a
+cycle that completed, so if the single spawned supervisor task dies (a panic
+anywhere in the discovery or sweep call graph), they all freeze at their last
+healthy values: `tenants_maintained` still equals `tenants_discovered`,
+`units_stalled` still reads `0`, and the pod stays Running and Ready. Retention
+deletes nothing, compaction stops, and the sweeper reclaims nothing, but nothing
+on `/metrics` moves to say so until a recent-window query is refused days later.
+
+The gauge is the family's point: only its age moves when the loop stops. The
+loop now runs under a supervisor that catches a panicking cycle, counts it on
+`ravel_maintain_loop_panics_total`, and restarts the loop after a bounded
+backoff, so a single transient panic self-heals and the next completed cycle
+re-stamps the gauge. A rising panic counter with a stalling gauge is a loop
+that cannot make progress between crashes.
+
+The panic counter needs its own rule, because a crash loop does not always
+stall the gauge. An attempt that completes a cycle and then panics re-stamps
+the gauge on that cycle, and the supervisor resets the backoff to its initial
+value whenever the dead attempt completed at least one cycle. A loop that
+crashes on every attempt after one cycle therefore keeps the gauge fresh, and
+keeps the full-sweep counter moving when the panic lands after the sweep.
+Neither of the two rules above fires, and the panic counter is the only signal
+that moves.
+
+#### The maintenance-stalled alert
+
+```yaml
+groups:
+  - name: ravel-maintain-liveness
+    # These rules assume at least one maintain-mode process is scraped. A
+    # deployment that runs no maintain mode at all (retention, compaction, and
+    # GC disabled by design) has no maintenance loop to be alive, and must drop
+    # or inhibit this group; the family is absent there and the absent() branch
+    # would otherwise fire permanently.
+    rules:
+      - alert: RavelMaintenanceLoopStalled
+        # No max()/min() aggregation: unlike the fold, the maintenance loop is
+        # NOT covered by peers. Ownership of units is partitioned across
+        # replicas (ADR-0065), so a single dead loop strands its own units
+        # while healthy peers keep their gauges fresh. The rule must fire on
+        # ANY instance going stale, so it is left per-series. The operator
+        # default is one maintain replica anyway.
+        #
+        # The gauge reads 0 from process start until the first cycle
+        # completes, so this expression is true on a fresh process and the
+        # `for:` below is what suppresses it until the first cycle lands.
+        # Keep `for:` comfortably above the configured maintenance interval:
+        # a deployment that raises the interval past 10m, or that has a slow
+        # cold first scan, pages on every restart otherwise.
+        expr: |
+          (
+            time() - ravel_maintain_last_cycle_completed_timestamp_seconds > 1800
+          )
+          or
+          absent(ravel_maintain_last_cycle_completed_timestamp_seconds)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel maintenance loop has not completed a cycle for longer than
+            several maintain intervals
+          description: >-
+            Retention, compaction, and GC have stopped for the units this
+            process owns, and the pod still reads Running and Ready. Check
+            ravel_maintain_loop_panics_total for a crash-looping loop and the
+            maintain process logs for the panic. The threshold is set well
+            above the default 5m maintain interval so a slow cycle does not
+            page; a stall this long is the loop being down, not busy.
+      - alert: RavelMaintenanceNoFullSweeps
+        # A healthy loop runs an unscoped full sweep on each owned unit's
+        # interior re-verify cadence (default 1h) and on the cold first tick,
+        # so this counter advances at least hourly on a process that owns at
+        # least one unit. A window of several hours with zero increase
+        # corroborates the stall gauge for the class of hang where the loop is
+        # alive enough to scrape but is no longer sweeping.
+        #
+        # The counter advances per swept unit, so a process that owns none
+        # never moves it while completing cycles normally: an empty cluster,
+        # or a replica whose peers hold every unit under the ADR-0065 split.
+        # The `ravel_maintain_units_owned` term is what keeps that healthy
+        # case quiet, and it is why this rule is not a bare counter check.
+        expr: |
+          increase(ravel_maintain_full_sweep_passes_total[3h]) == 0
+          and
+          ravel_maintain_units_owned > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            No Ravel maintenance full sweep has run in the last several hours
+          description: >-
+            The GC sweeper reclaims nothing while this holds. It precedes the
+            operator-visible symptom (a refused recent-window query) and
+            corroborates RavelMaintenanceLoopStalled.
+      - alert: RavelMaintenanceLoopCrashLooping
+        # The shape neither rule above catches. A supervised attempt that
+        # completes a cycle and then panics re-stamps the liveness gauge on
+        # that cycle, and the supervisor resets its backoff to the initial
+        # value because the dead attempt completed at least one cycle. The
+        # gauge stays fresh, the full-sweep counter keeps moving when the
+        # panic lands after the sweep, and the panic counter is the only
+        # signal that moves. A single transient panic self-heals by design,
+        # so the threshold is a repeat rate rather than any panic at all.
+        expr: |
+          increase(ravel_maintain_loop_panics_total[1h]) > 3
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            The Ravel maintenance loop is panicking and restarting repeatedly
+          description: >-
+            The supervisor is catching a panic and restarting the loop faster
+            than the loop is making progress. Read the maintain process logs
+            for the panic itself. This fires while the liveness gauge is still
+            fresh, so it is the only signal for a crash loop that completes a
+            cycle between panics.
+```
+
+The staleness threshold is `1800s` (30 minutes, six default 5m maintain
+intervals) rather than the fold rule's `4800s`: the fold's is sized to the
+unsealed-span budget it protects, whereas here any lapse of a few cycles means
+retention and GC have stopped, so the bar is lower. The `or absent(...)` branch
+covers the same total-outage case the fold rule's does -- a maintain mode
+scaled to zero, crash-looping fast enough to go stale, or dropped from the
+scrape config -- which the staleness comparison alone cannot see because
+`time() - <empty>` is itself empty.
+
 ### Merge memory (`ravel_maintain_rlog_merge_peak_bytes`)
 
 Labels: `mode` and `kind`. No `tenant_hash`: the tracker is one process-wide
@@ -332,6 +740,168 @@ The `kind` label carries `transient` (in-flight fetched-minus-released block
 bytes at any instant during a merge) or `total` (transient plus the writer's
 buffered output bytes). This is the gauge to watch when a maintain process is
 under memory pressure during compaction merges.
+
+### Alert evaluation (`ravel_alert_*`)
+
+Labels: `mode`, plus `outcome` on the tick counter. Every series here is
+process-wide, with no `tenant_hash` dimension: one process runs one evaluator
+per tenant that has rules, and each figure is the sum across them.
+
+The whole family is absent unless this process built at least one alert
+evaluator, which means `--alert-rules-file` was given and the file named at
+least one rule. A deployment that configured no alerting exports none of these
+series rather than a row of permanent zeros, and that absence is what keeps the
+alert rules below quiet there.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_alert_rules_evaluated_total` | Alert rules whose query ran and whose condition was decided. |
+| `ravel_alert_rules_failed_total` | Alert rules skipped because the query, the condition, or the write failed. Every one is logged; the rule is retried next tick. |
+| `ravel_alert_records_written_total` | Alert transition records durably written. |
+| `ravel_alert_repeats_queued_total` | Repeat notifications queued for a still-firing alert. A repeat writes no new record, so it advances this and then the delivery counter, never `ravel_alert_records_written_total`. |
+| `ravel_alert_notifications_delivered_total` | Notifications delivered to every configured sink, including ones carried over from an earlier tick's failure. |
+| `ravel_alert_notifications_failed_total` | Notifications still undelivered after a tick's attempt, counted once per tick per notification, so one stuck notification keeps advancing it while it is retried. |
+| `ravel_alert_ticks_total` | Evaluation ticks by `outcome`. |
+| `ravel_alert_last_tick_completed_timestamp_seconds` | Gauge. Unix time the alert loop last completed a tick in this process, `0` if none has completed since it started. Its age is the alert-loop liveness signal. |
+
+The `outcome` label carries one of four values, exactly one per tick:
+
+| `outcome` | Meaning |
+|---|---|
+| `evaluated` | This replica held the tenant's alert lease and evaluated every rule. |
+| `lease_not_held` | A peer replica held the lease, so this one skipped evaluation. Healthy, and the steady state of every replica that is not the holder. |
+| `lease_unavailable` | The lease read or write failed against object storage. Evaluation was skipped and is retried next tick. |
+| `history_unavailable` | The tenant's alert history could not be read, so nothing was evaluated. The evaluator never acts on a partial history, because that would re-fire an alert that is already firing. |
+
+`lease_not_held` is deliberately its own outcome and not part of any failure
+count. In a multi-replica deployment every replica but one reports it on every
+tick, forever; a rule that sums it with the two failure outcomes pages on the
+expected steady state.
+
+The liveness gauge is this family's point, for the same reason the maintenance
+one is. Every counter above is cumulative, so an evaluator that dies leaves
+them all frozen, and a frozen `ravel_alert_rules_failed_total` looks exactly
+like a healthy pipeline whose rules never fail. Only the gauge's age moves when
+the loop stops. A tick that ended in `lease_not_held` stamps the gauge: a
+standby replica is alive and evaluating nothing by design.
+
+#### The alerting-pipeline alerts
+
+```yaml
+groups:
+  - name: ravel-alerting-pipeline
+    # None of these rules carries an `absent()` branch, unlike the maintenance
+    # group above, and that is deliberate. A deployment with no alert rules
+    # configured builds no evaluator and therefore exports none of this family,
+    # which is a legitimate steady state, not an outage. With no series to
+    # match, every expression below is the empty vector and no rule fires. The
+    # cost is that this group cannot tell "alerting was never configured" from
+    # "the whole process is gone"; the latter belongs to a scrape-level `up`
+    # rule, which covers every subsystem at once rather than this one.
+    rules:
+      - alert: RavelAlertLoopStalled
+        # Per-series, no aggregation: a replica that is not the lease holder
+        # still ticks and still stamps this gauge, so a healthy peer does not
+        # cover a dead one and the rule must fire on any instance going stale.
+        #
+        # The gauge reads 0 from process start until the first tick completes,
+        # so this expression is true on a fresh process and the `for:` below is
+        # what suppresses it until that first tick lands. Keep `for:` well above
+        # `--alert-eval-interval-secs` (default 60s).
+        expr: |
+          time() - ravel_alert_last_tick_completed_timestamp_seconds > 600
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel alert evaluation loop has not completed a tick for ten
+            evaluation intervals
+          description: >-
+            No rule is being evaluated and no transition is being written or
+            notified on this process, while the pod still reads Running and
+            Ready. The first operator-visible symptom would otherwise be an
+            alert that never arrived. Check the process logs for a panic in an
+            evaluator task. This gauge is process-wide liveness and not
+            per-tenant: the evaluator runs one task per tenant and every task
+            stamps the same gauge, so one tenant's dead evaluator stays hidden
+            while any other tenant on the process keeps ticking. Per-tenant
+            liveness cannot be a label on this route under ADR-0044, so a
+            deployment that needs it runs one tenant per process or watches
+            the alert output itself.
+      - alert: RavelAlertNotificationsAllFailing
+        # Delivery failure is retried every tick, so a genuinely broken sink
+        # advances the failure counter continuously while the delivered counter
+        # stays flat. The second term is what keeps a partial failure (one
+        # notification stuck behind a bad URL while the rest get through) out of
+        # this critical rule; it belongs to RavelAlertRuleEvaluationFailing's
+        # quieter class.
+        #
+        # Quiet on a healthy deployment with no rules configured: the family is
+        # absent, so both terms are empty. Quiet on one whose rules simply never
+        # fire: nothing is ever queued, so the failure counter never increases
+        # and the first term is false.
+        expr: |
+          increase(ravel_alert_notifications_failed_total[15m]) > 0
+          and
+          increase(ravel_alert_notifications_delivered_total[15m]) == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Every Ravel alert notification is failing to reach its sinks
+          description: >-
+            Transitions are still being written durably, so no alert history is
+            lost, but nothing is reaching Alertmanager or the configured
+            webhooks. Check the sink URLs and credentials, and the evaluator
+            logs for the per-sink delivery error.
+      - alert: RavelAlertRuleEvaluationFailing
+        # A rule whose query, condition, or write fails is retried next tick, so
+        # a persistently broken rule (a PromQL expression that no longer parses
+        # against the data, a SQL statement naming a dropped column) advances
+        # this every tick and never self-heals.
+        #
+        # Quiet with no rules configured, for the same reason as above: no
+        # series to match. Quiet on a deployment whose rules all evaluate
+        # cleanly: the counter never moves.
+        expr: |
+          increase(ravel_alert_rules_failed_total[30m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A Ravel alert rule has been failing to evaluate for half an hour
+          description: >-
+            The rule is skipped and retried every tick, so the condition it
+            watches is unguarded for as long as this holds. The evaluator logs
+            name the rule_id and the error.
+      - alert: RavelAlertPipelineBlocked
+        # The two store-failure outcomes, and ONLY those two. `lease_not_held`
+        # is excluded on purpose: it is the steady state of every replica that
+        # is not the lease holder, so including it would page on a normal
+        # two-replica deployment forever.
+        expr: |
+          increase(ravel_alert_ticks_total{outcome=~"history_unavailable|lease_unavailable"}[30m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Ravel alert evaluation is blocked on object storage
+          description: >-
+            The evaluator can neither read the tenant's alert history nor hold
+            its lease, so no rule is evaluated on these ticks. The liveness
+            gauge does not advance on them either, so a sustained case also
+            trips RavelAlertLoopStalled; this rule names the cause. Check the
+            store reachability family.
+```
+
+The `600s` staleness threshold is ten default 60s evaluation intervals. It is
+tighter than the maintenance group's `1800s` because the alert loop's interval
+is five times shorter (60s against the 300s maintain default): ten missed
+ticks here is the same evidence six missed cycles is there.
 
 ### At-rest scrubber (`ravel_scrub_*`)
 
@@ -385,8 +955,7 @@ ratios for PromQL to compute, per `cache` and per `tier`.
 Labels: `mode`, `tenant_hash`, `signal`, plus `reason` on the rejection
 counter. This family folds tenants per the rule above. The
 [admission limits guide](admission-limits.md) covers this family in
-operational depth, and [troubleshooting](operations/troubleshooting.md) gives
-its alert rules.
+operational depth.
 
 | Metric | Meaning |
 |---|---|
@@ -395,16 +964,147 @@ its alert rules.
 | `ravel_admission_admitted_bytes_total` | Charged (decompressed) bytes admitted past the ingest byte-rate layer, by tenant and signal. For a gzip OTLP request this is the decompressed size; for an uncompressed request it equals the wire size. |
 | `ravel_ingest_wire_bytes_total` | Wire (on-the-wire, compressed when the client compressed) OTLP request-body bytes admitted, by tenant and signal. |
 | `ravel_admission_rejected_total` | Admission rejections, by tenant, signal, and reason. |
+| `ravel_ingest_body_conversions_total` | Log records whose structured (array or map) body was converted to canonical JSON text at normalization, by tenant and signal. Not a rejection, and not a count of stored records: see "Neither rule alerts on" below. |
 | `ravel_admission_reconciliation_failures_total` | Fleet-admission reconciliation cycles whose sibling-snapshot read (LIST or GET) failed, by tenant and signal; the last-known soft threshold stays in force. |
 
-The `reason` label carries `byte_rate`, `series_rate`, `series_cap`, or
-`clock`. The active-streams count for logs renders under
+Four more series report the reconciliation cycle itself. They carry `mode`
+alone, with no `tenant_hash` or `signal`: one cycle reconciles every tenant the
+process tracks, so there is no per-tenant figure to label.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_admission_reconciliation_cycle_duration_seconds` | Gauge. Duration of the last completed reconciliation cycle. |
+| `ravel_admission_reconciliation_siblings_observed` | Gauge. Distinct non-stale sibling processes the last cycle saw, the live fleet size this process reconciled against. |
+| `ravel_admission_reconciliation_stale_keys_skipped` | Gauge. Snapshot keys the last cycle skipped reading because the listing already showed them past the staleness window. |
+| `ravel_admission_reconciliation_keys_reaped_total` | Snapshot keys past the reap horizon deleted by reconciliation cycles since process start. |
+
+These four move before anything else does when reconciliation degrades, and
+none of them shows up as a failure: the listings and reads all succeed. A cycle
+whose duration approaches twice the reconciliation interval ages every sibling
+snapshot past the staleness window before it is read, at which point each
+process reads the fleet as empty and starts enforcing the whole tenant cap
+alone. Alert on the duration against your configured interval, and on
+`siblings_observed` falling to zero while replicas are up. Scope both alerts
+to `mode="all"` and `mode="gateway"`: the four series render on every
+replica, but only those two modes run the reconciliation loop, so a `query`
+or `maintain` replica reports `siblings_observed` as zero for its whole
+life. Growth in
+`stale_keys_skipped` while `siblings_observed` is flat means the control-plane
+prefix is filling with dead processes' keys; if
+`rate(ravel_admission_reconciliation_keys_reaped_total[1h])` is at zero
+alongside it, the prefix is filling faster than it is being cleared.
+
+The `reason` label carries `byte_rate`, `series_rate`, `series_cap`, `clock`,
+`skew`, or `structural`. The active-streams count for logs renders under
 `ravel_admission_active_series` with `signal="logs"`, not under a separate
 metric name. A sustained nonzero
 `ravel_admission_reconciliation_failures_total` rate means a process cannot
 read its siblings' snapshots and is falling back to its last-computed soft
 threshold; admission never fails closed on it, so it signals degrading
 fleet-wide accuracy, not that ingest is down.
+
+#### Reading the `reason` label
+
+Each reason answers a different operator question, and the unit each one
+counts differs, so a rate summed across reasons means nothing. Read them
+separately.
+
+| `reason` | Counts | What it means |
+|---|---|---|
+| `byte_rate` | Requests | The tenant sent more charged bytes per second than its ingest byte-rate limit allows. |
+| `clock` | Requests | The receiving replica's own clock was implausible, so the request was refused before any data was read. The fault is the replica's. |
+| `series_rate` | Series | New series or log streams appeared faster than the creation-rate limit allows. |
+| `series_cap` | Series | The tenant is at its active series or stream cap, so points for series past the cap were dropped. |
+| `skew` | Points, records, or spans | The event timestamp sat too far ahead of, or behind, ingest time. A sender clock problem, or a backfill wider than the accepted lag. |
+| `structural` | Points, records, or spans | The data itself cannot be represented: a delta-temporality metric, an over-long label, a body kind with no stored form. Retrying the same payload always fails the same way. |
+
+`skew` and `structural` count individual points, log records, or spans, and
+they match what the sender is told in the OTLP partial-success response, so a
+client that reads `rejected_data_points` and an operator reading this counter
+see the same number. The OTLP Arrow (OTAP) surface has no partial-success
+field, so on that surface this counter is the only place the drop appears.
+
+The two reasons want different alerts. `skew` is usually a fleet-wide clock or
+backfill problem and clears on its own once the sender is fixed; `structural`
+never clears without a change to what the sender emits, so any sustained rate
+is worth paging a human who can go and read
+[the ingest guide's temporality recipe](ingest.md#delta-temporality-metrics).
+
+```yaml
+groups:
+  - name: ravel-ingest-rejections
+    rules:
+      - alert: RavelStructuralRejections
+        expr: |
+          sum by (tenant_hash, signal) (
+            rate(ravel_admission_rejected_total{reason="structural"}[5m])
+          ) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Tenant {{ $labels.tenant_hash }} is sending {{ $labels.signal }}
+            data Ravel cannot represent
+          description: >-
+            Structural rejections do not clear on retry. Check the OTLP
+            partial-success message the sender receives for the reason, then
+            fix the exporter or add a collector processor for it.
+      - alert: RavelEventTimeSkew
+        expr: |
+          sum by (tenant_hash, signal) (
+            rate(ravel_admission_rejected_total{reason="skew"}[5m])
+          ) > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Tenant {{ $labels.tenant_hash }} is dropping {{ $labels.signal }}
+            data outside the accepted event-time window
+          description: >-
+            This is an absolute rate of rejected points, records, or spans per
+            second, not a fraction of the tenant's traffic. Check sender clock
+            sync first, then whether a backfill is running outside the tenant's
+            accepted ingest lag. Raise the threshold for a tenant that runs a
+            steady expected backfill.
+```
+
+Both rules are absolute rates of rejected units per second, broken out by
+tenant and signal, because there is no per-tenant admitted-points series to
+divide by. `ravel_admission_rejected_total{reason="skew"}` counts individual
+points, records, or spans, while `ravel_admission_admitted_total` counts
+requests; dividing one by the other inflates the result by the mean points per
+request, which is three orders of magnitude at typical batching, so that ratio
+means nothing. An absolute rate tells you how much data a tenant is losing to
+the event-time window. It does not tell you what fraction of that tenant's
+traffic that is, so a large tenant with a steady backfill and a small tenant
+with a broken clock can trip the same threshold; tune the threshold per tenant
+and treat the alert as a prompt to check clock sync and backfill status, not as
+a percentage. The skew rule uses a nonzero threshold because a few late points
+are normal. The structural rule keeps `> 0` because one sender emitting a
+metric type Ravel cannot store drops every point of that metric forever, and
+that is worth seeing even at a low rate.
+
+Neither rule alerts on `ravel_ingest_body_conversions_total`. It exists so a
+query that returns JSON text where a reader expected a plain message has an
+explanation. A sustained rate means a sender is emitting structured log bodies,
+which is supported, not a fault.
+
+This paragraph is the normative description of that counter; the ingest guide,
+the admission-limits reference, and the counter's own `HELP` text point here.
+It counts conversions at normalization, not stored records. The logs ingest
+handler increments it as soon as `normalize_logs` returns, which is before the
+layer-4 active-stream cap drops the records whose stream is over the cap, and
+before the shard write runs at all. So a converted record can be counted and
+then not stored: dropped by the stream cap, or lost with every other record in
+a request whose write fails. Read it as a conversion rate, in the sense of "how
+much of this tenant's log traffic arrives with a structured body", and never as
+a count of rows in storage. It is still not a rejection counter, which is why
+it is its own family rather than a `reason` on
+`ravel_admission_rejected_total`: a record it counts was admitted by
+normalization, and an operator alerting on rejection reasons must see nothing
+from it.
 
 `ravel_ingest_wire_bytes_total` is emitted from the ingest byte-metrics tracker
 rather than the admission snapshot, so its name carries the `ravel_ingest_`
@@ -471,6 +1171,26 @@ The request hit rate is `hits / (hits + misses)`. A refresh-error rate rising
 toward the refresh rate means the metadata record is unreadable while stale data
 is still being served, which the operations guide pages on.
 
+### Query audit (`ravel_audit_write_failures_total`)
+
+Labels: `mode` only. Within one flush, the counter increments once per tenant
+group whose write fails, since a flush now writes one object per tenant. A
+`tenant_hash` label would disclose which tenant's writes failed on this
+unauthenticated route, so the family carries none. It renders only in a mode
+that installed the query-audit pipeline (`all` or `query`); a gateway- or
+maintain-only process omits the family rather than reporting a zero for a
+pipeline it never ran.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_audit_write_failures_total` | Query-audit writes that failed and were released anyway under `--audit-mode best-effort`. Each one is a query that was served with no durable audit record. |
+
+Under `--audit-mode required` (the default) a failed audit write fails the
+query with a 503 instead, and is not counted here, so this counter is always
+zero on a fail-closed deployment. On a best-effort one, any increase is the
+audit trail going incomplete while queries keep succeeding, which is why an
+operator alerts on the increase rather than on a threshold.
+
 ### Distributed read fan-out (`ravel_distrib_*`)
 
 Labels: `mode` only, plus `le` on the histogram buckets. This family carries no
@@ -482,7 +1202,7 @@ the family entirely.
 | Metric | Meaning |
 |---|---|
 | `ravel_distrib_fragment_requests_total` | Inbound fragment (`SeriesFetch`) requests served after passing token auth and fragment admission. Worker side. |
-| `ravel_distrib_fragment_auth_failures_total` | Inbound fragment requests refused for a missing or invalid cluster bearer token. |
+| `ravel_distrib_fragment_auth_failures_total` | Inbound fragment requests refused at capability auth: missing, bad MAC, expired, tenant mismatch, or query mismatch. |
 | `ravel_distrib_fragment_inflight` | Gauge. Fragment requests currently holding a fragment-admission permit. |
 | `ravel_distrib_slices_local_total` | Slices this coordinator executed locally because it owns them (self-mapped, no network hop). |
 | `ravel_distrib_slices_remote_total` | Slices this coordinator dispatched to a remote worker and read back over the wire (counts the attempt that produced the usable result, whether the primary or the re-dispatch). |
@@ -559,11 +1279,13 @@ Each example is a short procedure. Run the PromQL against Ravel's own
 
 ## Known gaps
 
-Three gaps limit what the per-query cost family can show: a failed query
-records no cost, a Flight SQL statement records two folds for one logical
-query, and an abandoned Flight fetch still records its partial cost. The
-[cost model guide](cost-model.md#per-query-cost-accounting) sets each one out
-in full, because each is a property of the accounting rather than of the
+Three gaps limit what the per-query cost family can show: a failed, timed-out,
+or cancelled query folds the cost it actually incurred, but the exported
+counters do not yet split by outcome, so that spend is indistinguishable from
+a successful query's; a Flight SQL statement records two folds for one
+logical query; and an abandoned Flight fetch still records its partial cost.
+The [cost model guide](cost-model.md#per-query-cost-accounting) sets each one
+out in full, because each is a property of the accounting rather than of the
 metric route.
 
 ## Background
@@ -574,4 +1296,5 @@ read caches and their disk tier: ADR-0046, ADR-0064. Maintenance safety,
 ownership, merge memory, and the at-rest scrubber: ADR-0048, ADR-0058,
 ADR-0059, ADR-0065. Log POSTINGS and dynamic columns: ADR-0049, ADR-0100.
 Distributed read fan-out: ADR-0071. Wire-byte accounting: ADR-0084. The metric
-metadata cache: ADR-0085.
+metadata cache: ADR-0085. Alert evaluation and its at-least-once notification
+contract: ADR-0043.

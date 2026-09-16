@@ -66,6 +66,9 @@ fn request_with_deadline(sql: &str, deadline: Duration) -> ravel_sql::SqlRequest
         min_tokens: Vec::new(),
         now_ns: NOW_NS,
         deadline,
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     }
 }
 

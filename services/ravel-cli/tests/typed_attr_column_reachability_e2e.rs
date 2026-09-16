@@ -190,6 +190,7 @@ fn build_app(store: Arc<dyn ObjectStoreBackend>, clock: Arc<AtomicI64>) -> Route
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         None,
         ravel_query::EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         ravel_server::query::DEFAULT_MAX_QUERY_BYTES,
         ravel_server::query::DEFAULT_MAX_TENANT_BYTES,
         false,
@@ -200,6 +201,7 @@ fn build_app(store: Arc<dyn ObjectStoreBackend>, clock: Arc<AtomicI64>) -> Route
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
         Some(declared),
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     )
     .expect("build_sql_state");
     state.clock = Arc::new(AdvancingClock(clock));
@@ -397,6 +399,7 @@ async fn an_explicitly_empty_declaration_overrides_the_cli_default() {
         )]))),
         None,
         ravel_query::EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         ravel_server::query::DEFAULT_MAX_QUERY_BYTES,
         ravel_server::query::DEFAULT_MAX_TENANT_BYTES,
         false,
@@ -407,6 +410,7 @@ async fn an_explicitly_empty_declaration_overrides_the_cli_default() {
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
         Some(declared),
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     )
     .expect("build_sql_state");
     state.clock = Arc::new(AdvancingClock(Arc::clone(&clock)));
