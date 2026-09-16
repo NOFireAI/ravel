@@ -23,8 +23,19 @@
 //!    with an injected `retired_at_ns`. It is durable and irreversible:
 //!    raising `R` later never resurrects a tombstoned bucket (ADR-0019
 //!    decision 2).
-//! 3. **Version hold** (ADR-0066 decisions 1 and 2) runs before any delete in
-//!    the physical sweep. Each data object the sweep is about to delete is
+//! 3. **Legal-hold gate** (ADR-0042 decision 2) is the first gate in the
+//!    physical sweep, before the version probe below, so a held bucket costs
+//!    no suffix GETs. It is all-or-nothing over the bucket: every key the pass
+//!    would delete is offered to the [`LeaseCheck`], and if any one of them is
+//!    protected the pass deletes nothing, leaves the tombstone in place,
+//!    counts the hold, and reports `SweptPartial`. Retention's deletes are one
+//!    retirement, not a set of independent deletes: the commit records and
+//!    the tombstone are what make the bucket's data objects discoverable and
+//!    sweepable, so deleting the unheld part of a held bucket loses the held
+//!    bytes by a slower route (issue #1697). A bucket that is both legally
+//!    held and version-held therefore counts on the legal-hold counter.
+//! 4. **Version hold** (ADR-0066 decisions 1 and 2) runs next, still before
+//!    any delete. Each data object the sweep is about to delete is
 //!    probed for its trailer version through a 16-byte suffix GET, and the
 //!    answer is a typed classification, never a string: readable here, outside
 //!    this build's reader window, or corrupt. An object outside the window is
@@ -35,15 +46,6 @@
 //!    before: no build can read it, holding it protects nothing. This narrows
 //!    ADR-0066 decision 4's "retention ages old-version objects out" to objects
 //!    this build can actually read; see that ADR's 2026-09-13 amendment.
-//! 4. **Legal-hold gate** (ADR-0042 decision 2) runs next, and is
-//!    all-or-nothing over the bucket: every key the pass would delete is
-//!    offered to the [`LeaseCheck`], and if any one of them is protected the
-//!    pass deletes nothing, leaves the tombstone in place, counts the hold, and
-//!    reports `SweptPartial`. Retention's deletes are one retirement, not a set
-//!    of independent deletes: the commit records and the tombstone are what
-//!    make the bucket's data objects discoverable and sweepable, so deleting
-//!    the unheld part of a held bucket loses the held bytes by a slower route
-//!    (issue #1697).
 //! 5. **Physical sweep** runs once `now >= retired_at_ns + protection_horizon`,
 //!    deleting in the fixed order L0 commit records, compaction records,
 //!    rewrite records, L0 data objects, L1 parts, then the tombstone last, and
