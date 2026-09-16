@@ -334,6 +334,8 @@ cargo feature (`cargo build -p ravel-server --features mcp`) and the
 runtime `--mcp` flag, both off by default: build with the feature, then pass
 `--mcp` (and `--mcp-allowed-origins`, required whenever the MCP listener is
 reachable from outside localhost) to mount `POST /mcp` on the query router.
+One tool is served today, `ravel_capabilities`; the other eight are
+catalogued and refuse calls until their bodies land.
 
 ## Kubernetes
 
