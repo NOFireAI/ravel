@@ -780,6 +780,155 @@ async fn trace_id_literal_wrong_length_is_a_plan_error() {
     );
 }
 
+/// Issue #1709: `trace_id != '<32-hex>'`, sent as SQL text through the real
+/// `SqlExecutor`, is the `NotEq` sibling of
+/// `trace_id_hex_string_literal_plans_and_takes_the_trace_fast_path` above.
+/// `TraceIdHexLiteralPlanner::plan_binary_op` matches `BinaryOperator::NotEq`
+/// as well as `Eq` (see the `not_eq` local in that function), so the string
+/// and `X'..'` byte-literal forms of the same `!=` comparison must record the
+/// identical `SpanQuery` and return the identical rows -- the non-matching
+/// trace's spans, and nothing from the target trace.
+///
+/// Dropping the `BinaryOperator::NotEq => true,` arm in
+/// `trace_id_planner.rs`'s `plan_binary_op` (falling through to the `_ =>`
+/// wildcard) reproduces the pre-fix `type_coercion` failure for the string
+/// form only, since the byte-literal form never needed this planner: the
+/// string-literal query then fails to plan while the byte-literal query still
+/// succeeds, so `string_outcome` is an `Err` and this test fails at the
+/// `.expect("string-literal query executes")` call.
+#[tokio::test]
+async fn trace_id_not_eq_hex_string_literal_matches_the_byte_literal_form() {
+    let target = [0x11u8; 16];
+    let other = [0x22u8; 16];
+    let records = vec![
+        span(target, 0, 100, 110, "root"),
+        span(target, 1, 120, 130, "child"),
+        span(other, 0, 200, 210, "unrelated"),
+    ];
+    let executor = executor_with_spans(&records).await;
+    let hex = to_hex(target);
+
+    let string_sql =
+        format!("SELECT trace_id, span_id, start_ts, name FROM spans WHERE trace_id != '{hex}'");
+    let binary_sql =
+        format!("SELECT trace_id, span_id, start_ts, name FROM spans WHERE trace_id != X'{hex}'");
+
+    // Both literal forms of the same `!=` comparison record the identical
+    // SpanQuery, the NotEq sibling of the Eq case's `issued.trace_id ==
+    // Some(target)` check for both forms.
+    let string_plan = spans_physical_plan(&executor, &string_sql).await;
+    let string_issued = find_spans_scan(&string_plan).expect("plan contains a SpansScanExec");
+    let binary_plan = spans_physical_plan(&executor, &binary_sql).await;
+    let binary_issued = find_spans_scan(&binary_plan).expect("plan contains a SpansScanExec");
+    assert_eq!(
+        string_issued, binary_issued,
+        "trace_id != '{hex}' and trace_id != X'{hex}' must record the same SpanQuery"
+    );
+
+    // Both forms return exactly the same rows through the real executor: the
+    // non-matching trace's spans.
+    let string_outcome = executor
+        .execute(tenant().hash(), &sql_request(&string_sql))
+        .await
+        .expect("string-literal query executes");
+    let binary_outcome = executor
+        .execute(tenant().hash(), &sql_request(&binary_sql))
+        .await
+        .expect("binary-literal query executes");
+
+    let string_rows = query_rows(string_outcome.output.batches());
+    let binary_rows = query_rows(binary_outcome.output.batches());
+
+    let mut want = BTreeSet::new();
+    want.insert((other, [0u8; 8], 200i64, "unrelated".to_string()));
+
+    assert_eq!(
+        string_rows, want,
+        "trace_id != '<hex>' must return exactly the non-matching trace's spans"
+    );
+    assert_eq!(
+        string_rows, binary_rows,
+        "the string and binary trace_id NotEq literal forms must return identical rows"
+    );
+}
+
+/// Issue #1709: the reversed operand order, `'<32-hex>' = trace_id`, takes the
+/// same `SpanQuery::trace` fast path as the column-first form. This is the
+/// `else if is_trace_id_column(&right, schema) && ...` arm of
+/// `TraceIdHexLiteralPlanner::plan_binary_op` in `trace_id_planner.rs`.
+///
+/// Dropping that arm (so only the column-first `if is_trace_id_column(&left,
+/// schema)` branch remains) leaves the reversed-operand comparison
+/// unplanned: DataFusion's `type_coercion` then has no path from `Utf8` to
+/// `FixedSizeBinary(16)` and the query fails to plan at all, so this test
+/// fails at `spans_physical_plan`'s `.expect("query plans")` call instead of
+/// reaching the `SpanQuery` assertion below.
+#[tokio::test]
+async fn trace_id_hex_string_literal_reversed_operand_order_takes_the_trace_fast_path() {
+    let target = [0x11u8; 16];
+    let other = [0x22u8; 16];
+    let records = vec![
+        span(target, 0, 100, 110, "root"),
+        span(other, 0, 200, 210, "unrelated"),
+    ];
+    let executor = executor_with_spans(&records).await;
+    let hex = to_hex(target);
+
+    let sql =
+        format!("SELECT trace_id, span_id, start_ts, name FROM spans WHERE '{hex}' = trace_id");
+    let plan = spans_physical_plan(&executor, &sql).await;
+    let issued = find_spans_scan(&plan).expect("plan contains a SpansScanExec");
+    assert_eq!(
+        issued.trace_id,
+        Some(target),
+        "'{hex}' = trace_id must compile to a SpanQuery::trace lookup, not a ts_range scan"
+    );
+
+    let outcome = executor
+        .execute(tenant().hash(), &sql_request(&sql))
+        .await
+        .expect("reversed-operand query executes");
+    let rows = query_rows(outcome.output.batches());
+    let mut want = BTreeSet::new();
+    want.insert((target, [0u8; 8], 100i64, "root".to_string()));
+    assert_eq!(
+        rows, want,
+        "'<hex>' = trace_id must return exactly the target trace's spans"
+    );
+}
+
+/// Issue #1709: a 32-character `trace_id` literal that contains one non-hex
+/// character must not plan, the sibling of
+/// `trace_id_literal_wrong_length_is_a_plan_error` above which pins only the
+/// length half of the validation in `hex_16` (`spans_pushdown.rs`). A bad
+/// nibble must fail the same way a bad length does: DataFusion's ordinary
+/// `type_coercion` error, never a silent match and never rows.
+///
+/// Loosening `hex_16`'s per-nibble validation to accept any byte (`.unwrap_or(0)`
+/// in place of the `?` on `hex_nibble`'s result) makes the literal plan
+/// successfully -- with the invalid nibble decoded as zero -- so the query
+/// executes instead of failing, and this test fails at
+/// `.expect_err("a 32-character literal containing a non-hex digit must not
+/// plan")`.
+#[tokio::test]
+async fn trace_id_literal_non_hex_character_is_a_plan_error() {
+    let records = vec![span([0x11u8; 16], 0, 100, 110, "root")];
+    let executor = executor_with_spans(&records).await;
+    let mut bad_hex = "1".repeat(31);
+    bad_hex.push('g');
+    assert_eq!(bad_hex.len(), 32);
+    let sql = format!("SELECT trace_id FROM spans WHERE trace_id = '{bad_hex}'");
+
+    let err = executor
+        .execute(tenant().hash(), &sql_request(&sql))
+        .await
+        .expect_err("a 32-character literal containing a non-hex digit must not plan");
+    assert!(
+        matches!(err, ravel_sql::SqlError::Plan(_)),
+        "expected a typed SqlError::Plan, got: {err:?}"
+    );
+}
+
 /// Reachability (ADR-0110 decisions 3-5): a `SELECT` over the `spans` table,
 /// driven through the real Flight SQL surface end to end (`GetFlightInfo` then
 /// `DoGet`), takes the columnar fast path.
