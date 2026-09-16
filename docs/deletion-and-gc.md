@@ -616,6 +616,21 @@ into them. An operator with erasure obligations must budget them deliberately.
   operators with erasure obligations to prefer scoped legal holds over
   blanket default retention, or to keep `D` inside their erasure SLA.
 
+- **`+R`, scoped per-object compliance retention on commit records
+  (`t/*/*/c/*`).** Under the scoped posture (bucket default retention OFF,
+  an operator-run mechanism applying per-object retention instead;
+  docs/object-store-contract.md "Required bucket configuration", ADR-0072
+  decision 3), a superseded commit record still under its retention period
+  `R` refuses the same sweep delete `+D` describes: `sweep_superseded`
+  deletes a chain's input commit records before its input data objects, so
+  a locked record blocks that delete and the data-delete step never runs
+  for that chain, holding the physical-removal bound at `max(bound, R)`
+  until `R` elapses. `sys/*`, `t/*/*/prov`, and `t/*/catalog/*/*` HEAD
+  history carry the same scoped retention but are never sweep targets, so
+  `+R` applies to commit records only. Keep `R` inside `protection_horizon`
+  (about 25 h with defaults) so the sweep keeps making progress on
+  superseded chains.
+
 - **`+E_v`, bucket versioning.** On a versioned bucket every physical delete
   becomes a soft delete, and the noncurrent version survives until the
   operator's required `NoncurrentDays = E_v` expiration rule reaps it. Every

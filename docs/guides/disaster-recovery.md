@@ -39,10 +39,21 @@ paired with versioning:
 
 Versioning is what makes the last of those work: a HEAD compare-and-swap
 creates a new locked version rather than overwriting one. None of those four
-prefix families holds an erasable subject value, deliberately, so locking them
-never collides with an erasure request. The scoped posture is therefore not a
-disaster-recovery choice and carries no erasure cost; it is the baseline the
-commit and catalog layers already assume.
+prefix families holds an erasable subject value, deliberately, so locking any
+of them never exposes a subject to Object Lock's own reach. That is not the
+same as carrying no erasure cost at all: the deployment records, the
+provisioning records, and the catalog HEAD history are never targets of the
+sweeps that back retention deletion and erasure, so locking those three is
+free. The commit records are not: they are physically deleted, once
+superseded, by the same sweeps, so a still-locked commit record delays that
+delete until its retention period elapses, and the sweep pass touching it
+pauses for the difference. Keep that retention period short enough for the
+sweeps to keep making progress; see the object store contract's "Required
+bucket configuration" for the bound. The scoped posture is therefore still
+not a disaster-recovery choice, and for three of the four families it
+carries no erasure cost either; it is the baseline the commit and catalog
+layers already assume, with the commit-record family carrying the sweep-delay
+cost above.
 
 Scoping the lock takes an operator-run mechanism, and it is a requirement of
 levels 0 and 1, not an optional extra. Level 2 replaces it with a bucket
@@ -60,6 +71,15 @@ these:
       compliance mode, for the chosen retention period, to new objects under
       `sys/`, the provisioning records, the commit records, and the catalog
       HEAD history.
+
+The retention period is unconstrained for the deployment records, the
+provisioning records, and the catalog HEAD history: nothing ever deletes
+them out from under a legitimate erasure request. For the commit records,
+the period is not free to pick arbitrarily long: it delays the maintenance
+sweeps that physically remove a superseded commit record, so choose a
+period the object store contract's "Required bucket configuration" bounds
+against the sweeps' own default window, or accept those sweeps pausing on
+a commit record until the period elapses.
 
 | Mechanism | What it does | Coverage window |
 |---|---|---|
@@ -417,7 +437,7 @@ record: a real end-to-end run against MinIO is what fills a row.
 
 | Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
-| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and catalog HEAD history (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None; those prefixes hold no erasable subject value | Not a recovery control |
+| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and catalog HEAD history (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None for `sys/`, provisioning records and catalog HEAD history (no erasable subject value, and never a sweep target); for commit records, `max(bound, R)` where `R` is the chosen retention period, until it elapses | Not a recovery control |
 | **level 0** (default) | Versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup; no replica | Primary `+E_v` | None; bucket loss is total loss |
 | **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended; the replica versioned with `NoncurrentDays = E_v_r` and expired-delete-marker cleanup | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound, D)`; query-time exclusion still immediate | As level 1 |

@@ -297,6 +297,61 @@ async fn row8_records_deleted_data_not_orphan_gc_converges() {
     run(Sig::Spans).await;
 }
 
+// --- Row 8b: locked commit record blocks the record-delete loop -----------
+
+/// Row 8b: a compliance-mode Object Lock retention on a commit record
+/// refuses every delete attempt against it, not just the first. The
+/// superseded sweep's record-delete loop runs before its data-delete loop
+/// (docs/deletion-and-gc.md, docs/object-store-contract.md "Required bucket
+/// configuration"), so a record that never stops faulting aborts the pass at
+/// the record loop and the data loop after it never runs: the L0 data the
+/// pass would otherwise collect is left exactly as it was.
+#[tokio::test]
+async fn row8b_locked_commit_record_delete_blocks_before_data_loop() {
+    async fn run(sig: Sig) {
+        let inner = MemoryStore::new();
+        // Always-on: every commit-record delete faults, modeling a retention
+        // period that has not elapsed rather than a one-shot transient error.
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains("/c/"));
+        let store = FaultStore::new(inner, plan);
+        let created = sealed_now_ns();
+        let clock = FixedClock::new(created);
+        let bucket = seed_and_compact(&store, &clock, sig).await;
+
+        clock.set(past_horizon(created, &cfg()));
+        let before_data = l0_data_count(&store, &bucket).await;
+        assert!(before_data > 0, "L0 data exists before the sweep");
+
+        let err = sweep_superseded(
+            &store,
+            &clock,
+            &cfg(),
+            &NoLeases,
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+        )
+        .await;
+        assert!(
+            err.is_err(),
+            "a commit record delete that never stops faulting must abort the pass"
+        );
+        assert!(
+            store.fault_count(Op::Delete, FaultKind::Timeout) >= 1,
+            "the record-delete fault must have fired"
+        );
+        assert_eq!(
+            l0_data_count(&store, &bucket).await,
+            before_data,
+            "the data loop must never run while the record loop is still failing"
+        );
+    }
+    run(Sig::Metrics).await;
+    run(Sig::Logs).await;
+    run(Sig::Spans).await;
+}
+
 // --- Row 9: pinned query outlives horizon, input deleted under it ----------
 
 /// Row 9: a query resolved and pinned a snapshot referencing the L0 inputs;
