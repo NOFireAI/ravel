@@ -328,10 +328,12 @@ foldable until the sealing window behind it has elapsed. See
 
 ## Agents (MCP)
 
-The MCP agent surface is designed and documented in
-[docs/guides/agents.md](docs/guides/agents.md). It will land behind the
-`mcp` cargo feature and the `--mcp` flag, both off by default. Until then
-neither the feature nor the flag exists in a build.
+The MCP agent surface is documented in
+[docs/guides/agents.md](docs/guides/agents.md). It ships behind the `mcp`
+cargo feature (`cargo build -p ravel-server --features mcp`) and the
+runtime `--mcp` flag, both off by default: build with the feature, then pass
+`--mcp` (and `--mcp-allowed-origins`, required whenever the MCP listener is
+reachable from outside localhost) to mount `POST /mcp` on the query router.
 
 ## Kubernetes
 
