@@ -2169,8 +2169,11 @@ pub async fn start(
         matches!(config.mode, Mode::All | Mode::Query),
     ) {
         let metrics = Arc::new(distrib::FragmentMetrics::new());
-        let admission =
-            distrib::FragmentAdmission::new(settings.max_inflight_fragments, metrics.clone());
+        let admission = distrib::AdmissionClasses::new(
+            settings.max_inflight_fragments,
+            settings.max_inflight_federated_resolves,
+            metrics.clone(),
+        );
         // Shared by the worker (verifies against every key) and the coordinator
         // (mints under the first): ADR-0071 amendment, decision 2.
         let fragment_keys = Arc::new(settings.fragment_keys.clone());

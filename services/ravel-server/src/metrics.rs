@@ -11,9 +11,9 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly fifteen label keys: `tenant_hash`, `signal`, `mode`, `op`,
+//! renders exactly sixteen label keys: `tenant_hash`, `signal`, `mode`, `op`,
 //! `error_kind`, `workload_class`, `level`, `reason`, `cache`, `tier`,
-//! `kind`, `outcome`, `allocator`, `stat`, and `component` (ADR-0044
+//! `kind`, `outcome`, `allocator`, `stat`, `component`, and `class` (ADR-0044
 //! section 4; `reason` added by ADR-0051 section 6 for the admission-rejection
 //! family and reused by ADR-0059 section 2 for the scrub seal-divergence family,
 //! `cache` to split the read-cache family into the
@@ -22,9 +22,12 @@
 //! added by ADR-0065 decision 4 to split the maintenance merge-memory gauge into
 //! its transient and total high-water marks, `outcome` added by #532 to split
 //! the alert-tick family by how one evaluation tick ended, `allocator`/`stat`
-//! added by #1170 for the process allocator gauges, and `component` added by
+//! added by #1170 for the process allocator gauges, `component` added by
 //! ADR-1170 decision 4 to split the process memory budget's reserved-bytes
-//! gauge by which side reserved it). The fifteen keys come from sixteen
+//! gauge by which side reserved it, and `class` added by ADR-0071's admission
+//! disjointness deliverable (issue #1722) to split the fragment in-flight
+//! gauge and admission-wait counters into their `Pinned` and `Resolve`
+//! classes). The sixteen keys come from seventeen
 //! `Label` variants: `RejectReason` and `ScrubReason` both render `reason`.
 //! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
@@ -280,6 +283,12 @@ pub enum Label {
     /// accounting (or give each component its own counter) before either
     /// sample can be read as a share.
     MemoryComponent(MemoryComponent),
+    /// Which ADR-0071 fragment admission class a `ravel_distrib_fragment_*`
+    /// sample belongs to (deliverable: admission disjointness): `Pinned`
+    /// (intra-cluster fan-out) or `Resolve` (cross-cluster federation). A
+    /// closed enum owned by [`crate::distrib`], since the classes are the
+    /// admission layer's own, not a dimension this renderer invents.
+    AdmissionClass(crate::distrib::AdmissionClass),
 }
 
 /// Which high-water mark a `ravel_maintain_rlog_merge_peak_bytes` sample is
@@ -409,6 +418,7 @@ impl Label {
             Label::Allocator(_) => "allocator",
             Label::AllocatorStat(_) => "stat",
             Label::MemoryComponent(_) => "component",
+            Label::AdmissionClass(_) => "class",
         }
     }
 
@@ -430,6 +440,7 @@ impl Label {
             Label::Allocator(name) => name.to_string(),
             Label::AllocatorStat(stat) => stat.name().to_string(),
             Label::MemoryComponent(component) => component.name().to_string(),
+            Label::AdmissionClass(class) => admission_class_name(*class).to_string(),
         }
     }
 }
@@ -457,6 +468,17 @@ fn alert_outcome_name(outcome: crate::alerting::AlertTickOutcome) -> &'static st
         AlertTickOutcome::LeaseNotHeld => "lease_not_held",
         AlertTickOutcome::LeaseUnavailable => "lease_unavailable",
         AlertTickOutcome::HistoryUnavailable => "history_unavailable",
+    }
+}
+
+/// Exhaustive: adding a [`crate::distrib::AdmissionClass`] variant breaks
+/// this compile until it is handled here, so a new admission class cannot
+/// reach `/metrics` without a spelling.
+fn admission_class_name(class: crate::distrib::AdmissionClass) -> &'static str {
+    use crate::distrib::AdmissionClass;
+    match class {
+        AdmissionClass::Pinned => "pinned",
+        AdmissionClass::Resolve => "resolve",
     }
 }
 
@@ -4290,7 +4312,12 @@ fn render_attribution_family(out: &mut String, mode: Mode, rows: &[TenantAttribu
 pub struct DistribSnapshot {
     pub fragment_requests_total: u64,
     pub fragment_auth_failures_total: u64,
-    pub fragment_inflight: u64,
+    /// In-flight fragment requests per ADR-0071 admission class
+    /// (`Pinned`, `Resolve`; deliverable: admission disjointness, issue
+    /// #1722).
+    pub fragment_inflight_by_class: [(crate::distrib::AdmissionClass, u64); 2],
+    /// Cumulative admission-queue waits per class (issue #1722).
+    pub fragment_admission_waits_by_class: [(crate::distrib::AdmissionClass, u64); 2],
     pub slices_local_total: u64,
     pub slices_remote_total: u64,
     pub slices_redispatched_total: u64,
@@ -4317,7 +4344,8 @@ impl DistribSnapshot {
         DistribSnapshot {
             fragment_requests_total: metrics.fragment_requests_total(),
             fragment_auth_failures_total: metrics.fragment_auth_failures_total(),
-            fragment_inflight: metrics.fragment_inflight(),
+            fragment_inflight_by_class: metrics.fragment_inflight_by_class(),
+            fragment_admission_waits_by_class: metrics.fragment_admission_waits_by_class(),
             slices_local_total: metrics.slices_local_total(),
             slices_remote_total: metrics.slices_remote_total(),
             slices_redispatched_total: metrics.slices_redispatched_total(),
@@ -4367,15 +4395,35 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
     write_header(
         out,
         "ravel_distrib_fragment_inflight",
-        "Fragment requests currently holding an admission permit.",
+        "Fragment requests currently holding an admission permit, by ADR-0071 admission \
+         class (`pinned` for intra-cluster fan-out, `resolve` for cross-cluster \
+         federation; issue #1722).",
         "gauge",
     );
-    write_sample(
+    for (class, inflight) in snapshot.fragment_inflight_by_class {
+        write_sample(
+            out,
+            "ravel_distrib_fragment_inflight",
+            &[Label::Mode(mode), Label::AdmissionClass(class)],
+            inflight,
+        );
+    }
+
+    write_header(
         out,
-        "ravel_distrib_fragment_inflight",
-        &[Label::Mode(mode)],
-        snapshot.fragment_inflight,
+        "ravel_distrib_fragment_admission_waits_total",
+        "Fragment requests that found their admission class's semaphore saturated and had \
+         to queue, by ADR-0071 admission class (issue #1722).",
+        "counter",
     );
+    for (class, waits) in snapshot.fragment_admission_waits_by_class {
+        write_sample(
+            out,
+            "ravel_distrib_fragment_admission_waits_total",
+            &[Label::Mode(mode), Label::AdmissionClass(class)],
+            waits,
+        );
+    }
 
     write_header(
         out,
@@ -5253,7 +5301,10 @@ mod tests {
         // `outcome` is the fourteenth, added by #532 to split the alert
         // evaluation tick counter; `component` is the fifteenth, added by
         // ADR-1170 decision 4 for the process memory budget's reserved-bytes
-        // gauge.
+        // gauge; `class` is the sixteenth, added by ADR-0071's admission
+        // disjointness deliverable (issue #1722) to split the fragment
+        // in-flight gauge and admission-wait counters into their `Pinned`
+        // and `Resolve` classes.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -5271,6 +5322,7 @@ mod tests {
             Label::Allocator("jemalloc"),
             Label::AllocatorStat(AllocatorStat::Allocated),
             Label::MemoryComponent(MemoryComponent::Sql),
+            Label::AdmissionClass(crate::distrib::AdmissionClass::Pinned),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -5291,6 +5343,7 @@ mod tests {
                 Label::Allocator(_) => "allocator",
                 Label::AllocatorStat(_) => "stat",
                 Label::MemoryComponent(_) => "component",
+                Label::AdmissionClass(_) => "class",
             })
             .collect();
         assert_eq!(
@@ -5315,17 +5368,18 @@ mod tests {
                 "allocator",
                 "stat",
                 "component",
+                "class",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), the `cache` label, #97's `tier` \
              label, ADR-0065 decision 4's `kind`, #532's `outcome`, #1170's \
-             `allocator`/`stat`, and ADR-1170 decision 4's `component`; `shard` \
-             must never appear here"
+             `allocator`/`stat`, ADR-1170 decision 4's `component`, and ADR-0071's `class` \
+             (issue #1722); `shard` must never appear here"
         );
         assert_eq!(
             one_of_each.len(),
-            16,
-            "exactly 16 label variants, 15 distinct keys"
+            17,
+            "exactly 17 label variants, 16 distinct keys"
         );
     }
 
@@ -7225,9 +7279,12 @@ mod tests {
 
     /// The ADR-0071 distributed read fan-out family renders under
     /// the new `ravel_distrib_*` names, and every one of its series carries only
-    /// the closed `{mode}` label: no per-shard, per-worker, or per-tenant label
-    /// (ADR-0044 section 4). Also asserts the family is absent entirely when the
-    /// snapshot is `None`, matching the "off unless --distributed-query" wiring.
+    /// the closed `{mode}` label, except the per-class fragment in-flight gauge
+    /// and admission-wait counter, which also carry `class` (ADR-0044 section 4;
+    /// `class` added by ADR-0071's admission disjointness deliverable, issue
+    /// #1722): no per-shard, per-worker, or per-tenant label. Also asserts the
+    /// family is absent entirely when the snapshot is `None`, matching the "off
+    /// unless --distributed-query" wiring.
     #[test]
     fn render_includes_distrib_family_with_only_allowlisted_labels() {
         let mut buckets = [0u64; LATENCY_BUCKET_COUNT];
@@ -7236,7 +7293,14 @@ mod tests {
         let snapshot = DistribSnapshot {
             fragment_requests_total: 11,
             fragment_auth_failures_total: 2,
-            fragment_inflight: 1,
+            fragment_inflight_by_class: [
+                (crate::distrib::AdmissionClass::Pinned, 1),
+                (crate::distrib::AdmissionClass::Resolve, 4),
+            ],
+            fragment_admission_waits_by_class: [
+                (crate::distrib::AdmissionClass::Pinned, 0),
+                (crate::distrib::AdmissionClass::Resolve, 9),
+            ],
             slices_local_total: 7,
             slices_remote_total: 4,
             slices_redispatched_total: 2,
@@ -7281,7 +7345,10 @@ mod tests {
         for expected in [
             "ravel_distrib_fragment_requests_total{mode=\"query\"} 11",
             "ravel_distrib_fragment_auth_failures_total{mode=\"query\"} 2",
-            "ravel_distrib_fragment_inflight{mode=\"query\"} 1",
+            "ravel_distrib_fragment_inflight{mode=\"query\",class=\"pinned\"} 1",
+            "ravel_distrib_fragment_inflight{mode=\"query\",class=\"resolve\"} 4",
+            "ravel_distrib_fragment_admission_waits_total{mode=\"query\",class=\"pinned\"} 0",
+            "ravel_distrib_fragment_admission_waits_total{mode=\"query\",class=\"resolve\"} 9",
             "ravel_distrib_slices_local_total{mode=\"query\"} 7",
             "ravel_distrib_slices_remote_total{mode=\"query\"} 4",
             "ravel_distrib_slices_redispatched_total{mode=\"query\"} 2",
@@ -7289,6 +7356,12 @@ mod tests {
         ] {
             assert!(body.contains(expected), "missing `{expected}`:\n{body}");
         }
+        assert_eq!(
+            body.matches("ravel_distrib_fragment_inflight{mode=")
+                .count(),
+            2,
+            "exactly one in-flight sample per admission class:\n{body}"
+        );
         // The histogram: cumulative buckets, a `_sum` in seconds, and a `_count`
         // equal to the `+Inf` bucket (5 + 3 = 8 observations).
         assert!(
@@ -7305,7 +7378,9 @@ mod tests {
         );
 
         // Every ravel_distrib_ series line carries exactly the `{mode}` label
-        // (plus `le` on histogram buckets); no disallowed label leaks in.
+        // (plus `le` on histogram buckets, and `class` on the per-admission-class
+        // fragment in-flight gauge and admission-wait counter, ADR-0071 issue
+        // #1722); no other label leaks in.
         for line in body.lines() {
             if !line.starts_with("ravel_distrib_") {
                 continue;
@@ -7318,7 +7393,7 @@ mod tests {
             for pair in labels.split(',').filter(|p| !p.is_empty()) {
                 let key = pair.split('=').next().unwrap_or(pair);
                 assert!(
-                    key == "mode" || key == "le",
+                    key == "mode" || key == "le" || key == "class",
                     "disallowed label `{key}` on ravel_distrib series: {line}"
                 );
             }
@@ -9044,7 +9119,14 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         let snapshot = DistribSnapshot {
             fragment_requests_total: 0,
             fragment_auth_failures_total: 0,
-            fragment_inflight: 0,
+            fragment_inflight_by_class: [
+                (crate::distrib::AdmissionClass::Pinned, 0),
+                (crate::distrib::AdmissionClass::Resolve, 0),
+            ],
+            fragment_admission_waits_by_class: [
+                (crate::distrib::AdmissionClass::Pinned, 0),
+                (crate::distrib::AdmissionClass::Resolve, 0),
+            ],
             slices_local_total: 0,
             slices_remote_total: 0,
             slices_redispatched_total: 0,
