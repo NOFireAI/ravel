@@ -629,6 +629,13 @@ pub struct IngestMetricsSnapshot {
     /// snapshot time. The per-shard breakdown does not fit this struct's flat
     /// Copy shape; call `in_flight_flushes_by_shard` directly for that.
     pub in_flight_flushes_total: u64,
+    /// Sum across shards of `flush_permit_wait_ns` from
+    /// [`IngestMetrics::shard_skew_by_shard`] at snapshot time: total
+    /// injected-`Clock` nanoseconds every flush task has spent waiting on its
+    /// shard's `max_inflight_flushes` semaphore. The per-shard breakdown does
+    /// not fit this struct's flat Copy shape; call `shard_skew_by_shard`
+    /// directly for that.
+    pub flush_permit_wait_ns_total: u64,
 }
 
 impl IngestMetrics {
@@ -954,6 +961,11 @@ impl IngestMetrics {
                 .in_flight_flushes_by_shard()
                 .into_iter()
                 .map(|(_, count)| count)
+                .sum(),
+            flush_permit_wait_ns_total: self
+                .shard_skew_by_shard()
+                .into_iter()
+                .map(|(_, stats)| stats.flush_permit_wait_ns)
                 .sum(),
         }
     }

@@ -111,7 +111,7 @@ impl SpanIngestRouter {
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        let metrics = Arc::new(SpanIngestMetrics::default());
+        let metrics = Arc::new(SpanIngestMetrics::new(config.shard_count));
         // Production OS-entropy source for writer ids and PUT-retry jitter
         // (ADR-0068 decision 2). Like the log router, the span pipeline has no
         // seeded-injection caller; routing through the seam still keeps

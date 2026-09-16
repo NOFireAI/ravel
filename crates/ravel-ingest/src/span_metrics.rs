@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ravel_types::TenantHash;
 
 use crate::attribution::TenantPutAttribution;
-use crate::metrics::FlushTrigger;
+use crate::metrics::{FlushTrigger, ShardSkew, ShardSkewStats};
 
 #[derive(Debug, Default)]
 pub struct SpanIngestMetrics {
@@ -129,6 +129,16 @@ pub struct SpanIngestMetrics {
     /// a gauge with a per-shard dimension, unlike everything else here; read it
     /// via [`SpanIngestMetrics::in_flight_flushes_by_shard`].
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
+    /// Per-shard ingest-skew accounting (issue #865), the span-pipeline
+    /// counterpart of [`crate::IngestMetrics`]'s own and
+    /// [`crate::LogIngestMetrics`]'s own. Only the flush-permit-wait span is
+    /// recorded on this pipeline today, at the `max_inflight_flushes` acquire
+    /// in `span_shard.rs`; the on-actor and off-actor spans issue #865 never
+    /// wired up here.
+    ///
+    /// Preallocated by [`SpanIngestMetrics::new`]; `default()` allocates none
+    /// and therefore records nothing, exactly as [`crate::IngestMetrics`] does.
+    shard_skew: ShardSkew,
     /// Bounded-cardinality per-tenant PUT attribution (ADR-0076 decision 2),
     /// the span-pipeline counterpart of [`crate::IngestMetrics`]'s own. Carries
     /// a per-tenant dimension, so it stays bounded by a top-K cap rather than
@@ -177,9 +187,54 @@ pub struct SpanIngestMetricsSnapshot {
     pub partial_writes: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
+    /// Sum across shards of [`SpanIngestMetrics::in_flight_flushes_by_shard`]
+    /// at snapshot time. The per-shard breakdown does not fit this struct's
+    /// flat Copy shape; call `in_flight_flushes_by_shard` directly for that.
+    pub in_flight_flushes_total: u64,
+    /// Sum across shards of `flush_permit_wait_ns` from
+    /// [`SpanIngestMetrics::shard_skew_by_shard`] at snapshot time: total
+    /// injected-`Clock` nanoseconds every flush task has spent waiting on its
+    /// shard's `max_inflight_flushes` semaphore. The per-shard breakdown does
+    /// not fit this struct's flat Copy shape; call `shard_skew_by_shard`
+    /// directly for that.
+    pub flush_permit_wait_ns_total: u64,
 }
 
 impl SpanIngestMetrics {
+    /// Metrics for a span router whose generation-0 set has `shard_count`
+    /// shards. Preallocates the lock-free per-shard skew accumulator (issue
+    /// #865) so the flush-permit-wait record indexes straight into the slice
+    /// with no lock; see [`crate::metrics::SHARD_SKEW_CAPACITY`] for why the
+    /// capacity is not `shard_count`.
+    ///
+    /// `SpanIngestMetrics::default()` allocates none, matching
+    /// [`crate::IngestMetrics::default`], which suits the tests and sinks that
+    /// never read the per-shard counters.
+    pub fn new(shard_count: u32) -> Self {
+        SpanIngestMetrics {
+            shard_skew: ShardSkew::with_capacity(shard_count),
+            ..Default::default()
+        }
+    }
+
+    /// One flush task's injected-`Clock` wait on shard `shard`'s
+    /// `max_inflight_flushes` semaphore (issue #865), the span-pipeline
+    /// counterpart of [`crate::LogIngestMetrics`]'s own. Recorded inside the
+    /// spawned flush task, where the acquire happens: a rising figure means
+    /// tasks are queuing for a permit while the actor keeps draining.
+    pub(crate) fn record_shard_flush_permit_wait_ns(&self, shard: u32, wait_ns: u64) {
+        self.shard_skew.record_flush_permit_wait_ns(shard, wait_ns);
+    }
+
+    /// Point-in-time per-shard skew figures, sorted by shard index (issue
+    /// #865), the span counterpart of
+    /// [`crate::IngestMetrics::shard_skew_by_shard`]. A shard with no recorded
+    /// activity is simply absent. Only `flush_permit_wait_ns` is ever nonzero
+    /// on this pipeline today; see the field doc on `shard_skew`.
+    pub fn shard_skew_by_shard(&self) -> Vec<(u32, ShardSkewStats)> {
+        self.shard_skew.by_shard()
+    }
+
     pub(crate) fn record_flush(&self, trigger: FlushTrigger) {
         let counter = match trigger {
             FlushTrigger::Size => &self.flushes_by_size,
@@ -359,6 +414,16 @@ impl SpanIngestMetrics {
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
+            in_flight_flushes_total: self
+                .in_flight_flushes_by_shard()
+                .into_iter()
+                .map(|(_, count)| count)
+                .sum(),
+            flush_permit_wait_ns_total: self
+                .shard_skew_by_shard()
+                .into_iter()
+                .map(|(_, stats)| stats.flush_permit_wait_ns)
+                .sum(),
         }
     }
 }
@@ -380,7 +445,10 @@ mod tests {
     /// the expected one, so an increment leaking into a second counter fails
     /// here rather than being read as a plausible number later.
     fn assert_only(record: impl FnOnce(&SpanIngestMetrics), expected: SpanIngestMetricsSnapshot) {
-        let metrics = SpanIngestMetrics::default();
+        // shard_skew needs a preallocated cell for shard 0 to record anything
+        // (see `ShardSkew::with_capacity`), so this builds through `new` rather
+        // than `default`; every other counter here is unaffected by shard count.
+        let metrics = SpanIngestMetrics::new(1);
         record(&metrics);
         assert_eq!(metrics.snapshot(), expected);
     }
@@ -468,6 +536,13 @@ mod tests {
             SpanIngestMetrics::record_partial_write,
             SpanIngestMetricsSnapshot {
                 partial_writes: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_shard_flush_permit_wait_ns(0, 700),
+            SpanIngestMetricsSnapshot {
+                flush_permit_wait_ns_total: 700,
                 ..Default::default()
             },
         );

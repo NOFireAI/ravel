@@ -1101,15 +1101,11 @@ impl SpanShardActor {
         // [`InFlightFlushGuard`] for why the two must be one value. A flush
         // still waiting for a permit counts as in flight, because it is holding
         // a flush window of memory.
-        //
-        // Unlike the metrics and log pipelines this one carries no per-shard
-        // skew instrumentation (issue #865 never reached it), so there is no
-        // `flush_permit_wait_ns` span to move with the acquire and no on-actor
-        // subtraction to unwind.
         let guard = InFlightFlushGuard::new(Arc::clone(&self.metrics), self.shard);
         let semaphore = Arc::clone(&self.semaphore);
         let shard = self.shard;
         let ctx = Arc::clone(&self.ctx);
+        let metrics = Arc::clone(&self.metrics);
         self.flushes.spawn(async move {
             let _guard = guard;
             let mut pinned = pinned;
@@ -1130,13 +1126,21 @@ impl SpanShardActor {
                 return;
             }
             // Wait for a flush permit here, off the actor. At the bound this task
-            // parks; the actor does not.
+            // parks; the actor does not. The wait is this shard's
+            // `flush_permit_wait_ns` (issue #865), measured on the injected clock.
+            let permit_wait_start_ns = ctx.clock.now_ns();
             let permit = match semaphore.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => panic!(
                     "ravel-ingest: span flush semaphore closed unexpectedly on shard {shard}"
                 ),
             };
+            let permit_wait_ns = ctx
+                .clock
+                .now_ns()
+                .saturating_sub(permit_wait_start_ns)
+                .max(0) as u64;
+            metrics.record_shard_flush_permit_wait_ns(shard, permit_wait_ns);
             let _permit = permit;
             // Issue #1739 part 1: re-derive the abandonment deadline from the
             // moment the permit is granted, not from flush-open. A flush that
@@ -1266,7 +1270,7 @@ mod tests {
 
         fn spawn_with_store(config: IngestConfig, store: Arc<dyn ObjectStoreBackend>) -> Self {
             let clock = TestClock::new(BASE_NS);
-            let metrics = Arc::new(SpanIngestMetrics::default());
+            let metrics = Arc::new(SpanIngestMetrics::new(config.shard_count));
             let (tx, rx) = mpsc::channel(64);
             let actor = SpanShardActor::new(
                 0,
