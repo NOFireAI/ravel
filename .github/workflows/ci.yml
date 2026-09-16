@@ -377,8 +377,11 @@ jobs:
       # day it landed and proved nothing, and flag-doc-guard.test.sh had in
       # fact been RED for some time -- its fixture sed was pinned to a
       # sentence in config.rs that got reworded, which the suite's own
-      # fixture-differs assertion caught and nobody saw. All bash-only.
-      - name: Epic-status nudge cases
+      # fixture-differs assertion caught and nobody saw. Bash only, except
+      # the nudge cases, which shell out to node the way the PreToolUse step
+      # above does -- both survive a runner image change only while it ships
+      # node, and that is worth knowing in one place rather than implied.
+      - name: Epic-status nudge cases (needs node)
         run: bash .claude/guards/epic-status-nudge.test.sh
       - name: Disk-reap cases
         run: bash scripts/disk-reap.test.sh

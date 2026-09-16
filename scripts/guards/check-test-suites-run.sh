@@ -57,6 +57,17 @@ excepted=(
   # change that added this guard)
 )
 
+# Extra entries from the environment, newline-separated, same "<path>|<reason>"
+# shape. This exists so the exception branch is reachable from a test: with the
+# array literal as the only source, `is_excepted` and `excepted_reason` shipped
+# untested and a typo in the field split would have been green.
+if [[ -n "${CHECK_TEST_SUITES_EXCEPTED:-}" ]]; then
+  while IFS= read -r extra; do
+    [[ -z "${extra}" ]] && continue
+    excepted+=("${extra}")
+  done <<<"${CHECK_TEST_SUITES_EXCEPTED}"
+fi
+
 is_excepted() {
   local want="$1" entry
   for entry in ${excepted[@]+"${excepted[@]}"}; do
@@ -90,21 +101,48 @@ if [[ -z "${suites}" ]]; then
   exit 2
 fi
 
+# Workflow text with comment lines removed, gathered ONCE.
+#
+# A YAML comment is not something running a suite, and matching the raw files
+# made the guard report a suite as run when a workflow only talked about it.
+# That was not hypothetical: the change adding this guard put two suites into
+# exactly that state, `flag-doc-guard.test.sh` through a comment in its own
+# step's explanation and `check-tla.test.sh` through two in tla-nightly.yml.
+# Deleting either `run:` line left the guard green, so the two suites carrying
+# the most explanatory prose were the two it had stopped protecting.
+#
+# Gathered into a variable rather than piped per suite: a `grep | grep -v`
+# pipeline reports the LAST stage's status, and this decides whether a suite
+# counts as covered.
+#
+# A trailing comment on a real step (`run: bash x.test.sh  # why`) keeps its
+# line, because the line is not a comment line.
+workflow_text="$(grep -rhv '^[[:space:]]*#' -- "${workflow_dir}" 2>/dev/null)"
+if [[ -z "${workflow_text}" ]]; then
+  echo "check-test-suites-run.sh: ${workflow_dir} has no non-comment content; cannot tell what CI runs" >&2
+  exit 2
+fi
+
 orphans=0
+excepted_count=0
 total=0
 while IFS= read -r suite; do
   [[ -z "${suite}" ]] && continue
   total=$((total + 1))
   base="$(basename "${suite}")"
-  # Named anywhere under the workflows dir. A basename is the right key: a
-  # step may invoke it via `bash scripts/tests/x.test.sh` or a variable path,
-  # and matching the full repo-relative path would miss the latter.
-  if grep -rqF -- "${base}" "${workflow_dir}" 2>/dev/null; then
+  # Named on a non-comment line. A basename is the right key: a step may
+  # invoke it via `bash scripts/tests/x.test.sh` or a variable path, and
+  # matching the full repo-relative path would miss the latter.
+  if grep -qF -- "${base}" <<<"${workflow_text}"; then
     ((list_all == 1)) && printf 'run       %s\n' "${suite}"
     continue
   fi
   if is_excepted "${suite}"; then
-    ((list_all == 1)) && printf 'excepted  %s (%s)\n' "${suite}" "$(excepted_reason "${suite}")"
+    excepted_count=$((excepted_count + 1))
+    # Printed whatever the mode: the summary line is what a reader uses to
+    # decide nothing is excluded, so an exception must not be visible only
+    # under --list.
+    printf 'excepted  %s (%s)\n' "${suite}" "$(excepted_reason "${suite}")"
     continue
   fi
   printf 'ORPHAN    %s runs in no workflow\n' "${suite}"
@@ -120,4 +158,8 @@ if ((orphans > 0)); then
   exit 1
 fi
 
-echo "check-test-suites-run.sh: ${total} shell test suite(s), all run by a workflow."
+if ((excepted_count > 0)); then
+  echo "check-test-suites-run.sh: ${total} shell test suite(s); $((total - excepted_count)) run by a workflow, ${excepted_count} excepted above."
+else
+  echo "check-test-suites-run.sh: ${total} shell test suite(s), all run by a workflow."
+fi
