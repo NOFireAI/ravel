@@ -4,10 +4,16 @@
 # against a temporary copy with the gzip qualification stripped from one
 # flag's doc block, each asserting the guard's exit code.
 #
-# Not wired into any CI job: the workflow that runs the other scripts/
-# guard-test cases (the doc-scripts job in .github/workflows/ci.yml) is out
-# of scope for the change that added this file. Run by hand:
+# Run by the doc-scripts job in .github/workflows/ci.yml, and by hand with
 #   bash scripts/tests/flag-doc-guard.test.sh
+#
+# It was wired in by issue #1834, which found it running in no job at all --
+# and RED, because its fixture had been pinned to a sentence in config.rs
+# that was later reworded. The sentence this comment replaces said the wiring
+# was "out of scope for the change that added this file", which was a
+# reasonable scope call that then went stale and kept the suite invisible.
+# scripts/guards/check-test-suites-run.sh now fails when any tracked
+# *.test.sh runs nowhere, so that state cannot return quietly.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -64,9 +70,12 @@ awk '
   /^[[:space:]]*\/\/\// { in_doc = 1 }
   !/^[[:space:]]*\/\/\// { if (in_doc && done_block) done = 1; in_doc = 0; done_block = 0 }
   {
-    if (!done && in_doc && tolower($0) ~ /gzip/) {
-      gsub(/gzip/, "compressed", $0)
-      gsub(/GZIP/, "COMPRESSED", $0)
+    # One condition for both: latch the block as done only when a
+    # substitution actually happened. Latching on a `tolower` match while
+    # substituting only two exact cases meant a title-case `Gzip` marked the
+    # block done without editing it, and no later block was stripped either.
+    # The bracket form covers every casing, which is what the latch accepts.
+    if (!done && in_doc && gsub(/[Gg][Zz][Ii][Pp]/, "compressed", $0) > 0) {
       done_block = 1
     }
     print
