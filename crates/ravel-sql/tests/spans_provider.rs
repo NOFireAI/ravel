@@ -685,22 +685,12 @@ fn to_hex(bytes: [u8; 16]) -> String {
 
 /// Issue #1709: `trace_id = '<32-hex>'`, sent as SQL text through the real
 /// `SqlExecutor`, plans and takes the `SpanQuery::trace` fast path exactly
-/// like the already-working `X'<32-hex>'` binary-literal form.
+/// like the already-working `X'<32-hex>'` binary-literal form. See
+/// `crate::trace_id_planner` module docs for why the string form needs a
+/// planner at all.
 ///
-/// On the unmodified tree (before `TraceIdHexLiteralPlanner` was
-/// registered), the string-literal query below failed to plan at all:
-///
-/// ```text
-/// SQL planning failed: type_coercion
-/// caused by
-/// Error during planning: Cannot infer common argument type for comparison
-/// operation FixedSizeBinary(16) = Utf8
-/// ```
-///
-/// (captured by temporarily running this same query through `executor`
-/// before `crate::session::build_session` registered the planner). Reverting
-/// the `ctx.register_expr_planner(trace_id_hex_literal_planner())?;` line in
-/// `session.rs` reproduces that failure again.
+/// Reverting the `ctx.register_expr_planner(trace_id_hex_literal_planner())?;`
+/// line in `session.rs` reproduces the pre-fix `type_coercion` failure.
 #[tokio::test]
 async fn trace_id_hex_string_literal_plans_and_takes_the_trace_fast_path() {
     let target = [0x11u8; 16];
@@ -753,6 +743,59 @@ async fn trace_id_hex_string_literal_plans_and_takes_the_trace_fast_path() {
     assert_eq!(
         string_rows, binary_rows,
         "the string and binary trace_id literal forms must return identical rows"
+    );
+}
+
+/// Issue #1709: `is_trace_id_column` (`trace_id_planner.rs`) checks the
+/// resolved schema type, `FixedSizeBinary(16)`, not just the column name
+/// `trace_id`. A `Utf8` column aliased to `trace_id` compared against a
+/// 32-hex string literal must still plan as an ordinary `Utf8 = Utf8`
+/// comparison and return the matching row, untouched by
+/// `TraceIdHexLiteralPlanner`.
+///
+/// Replacing the `matches!(schema.data_type(column), ...)` check in
+/// `is_trace_id_column` with an unconditional `true` (name check only)
+/// leaves the six other `trace_id` tests in this file passing, but breaks
+/// this query: the planner rewrites the `Utf8` literal into a
+/// `FixedSizeBinary(16)` scalar, the comparison against the `Utf8` `name`
+/// column can never match, and this test fails at
+/// `.expect("query plans and executes")` (`type_coercion` now has no path
+/// from `Utf8` to `FixedSizeBinary(16)` on the LHS-is-Utf8 side) or, if it
+/// still plans, at the `rows == 1` assertion below.
+#[tokio::test]
+async fn trace_id_hex_string_literal_against_non_trace_id_column_is_untouched() {
+    let hex = "00112233445566778899aabbccddeeff".to_string();
+    assert_eq!(hex.len(), 32);
+    let records = vec![
+        span([0x11u8; 16], 0, 100, 110, &hex),
+        span([0x22u8; 16], 0, 200, 210, "unrelated"),
+    ];
+    let executor = executor_with_spans(&records).await;
+
+    let sql = format!(
+        "SELECT t.trace_id FROM (SELECT name AS trace_id FROM spans) t WHERE t.trace_id = '{hex}'"
+    );
+
+    let outcome = executor
+        .execute(tenant().hash(), &sql_request(&sql))
+        .await
+        .expect("query plans and executes");
+
+    let mut rows = 0usize;
+    for batch in outcome.output.batches() {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("trace_id column stays Utf8, not rewritten to FixedSizeBinary");
+        for i in 0..batch.num_rows() {
+            assert_eq!(col.value(i), hex);
+            rows += 1;
+        }
+    }
+    assert_eq!(
+        rows, 1,
+        "exactly the one row whose name equals the hex string"
     );
 }
 
