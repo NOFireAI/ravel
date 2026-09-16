@@ -256,10 +256,11 @@ pub enum Probe {
     ToleranceEntry,
     /// Any entry using `mode: ravel_error_prom_success` whose `name` also
     /// contains this marker substring. The mode alone is not distinguishing:
-    /// more than one accepted divergence can use it (ADR-0030's per-node
-    /// point cap and issue #524's histogram-binop guard both do), so a
-    /// bare mode match would double-count one divergence's corpus entries
-    /// as evidence for another's `Construct` row. The marker scopes each
+    /// more than one accepted divergence can use it, so a bare mode match
+    /// would double-count one divergence's corpus entries as evidence for
+    /// another's `Construct` row. ADR-0030's per-node point cap is the only
+    /// divergence still using the mode (the histogram-binop guard's row is
+    /// gone: issue #1700 implemented the operators). The marker scopes each
     /// registry entry to only the corpus entries actually naming it (e.g.
     /// `"subquery"` for ADR-0030's `error_*subquery*` entries).
     DivergenceModeEntry(&'static str),
@@ -2333,9 +2334,11 @@ mod tests {
     #[test]
     fn divergence_probe_marker_does_not_cross_match_a_different_divergence() {
         // Two entries can both use `mode: ravel_error_prom_success` for
-        // unrelated reasons (ADR-0030's subquery point cap, issue #524's
-        // histogram-binop guard); a registry row's marker must not count
-        // the other's corpus entries as its own evidence.
+        // unrelated reasons, and a registry row's marker must not count the
+        // other's corpus entries as its own evidence. ADR-0030's subquery
+        // point cap is the only such divergence the corpus carries now, so
+        // the histogram entry below is synthetic: it stands for whatever the
+        // next accepted divergence turns out to be.
         let histogram_entry = parse_corpus(
             "name: error_binop_over_histogram\nquery: h * 2\nkind: instant\ntime: +0s\nmode: ravel_error_prom_success\n",
         )
