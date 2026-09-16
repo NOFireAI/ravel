@@ -515,6 +515,12 @@ impl FloatHistogram {
     /// `other`'s contributions.
     pub fn combine_custom_reconciled(&mut self, other: &FloatHistogram, sign: f64) -> bool {
         let collision = self.counter_reset_collision(other);
+        // Every side merges, for the reason `combine`'s equal-bounds branch
+        // gives: `count` and `sum` take the whole of `other`, so the zero
+        // count and the negative side (both admitted by Ravel's ingest even
+        // though Prometheus rejects them on an NHCB) must fold in too, or the
+        // totals disagree with the buckets.
+        self.zero_count += sign * other.zero_count;
         self.count += sign * other.count;
         self.sum += sign * other.sum;
 
@@ -527,9 +533,20 @@ impl FloatHistogram {
             sign,
             &intersected,
         );
+        let merged_neg = add_custom_buckets_with_mismatches(
+            &self.negative_index_map(),
+            &self.custom_values,
+            &other.negative_index_map(),
+            &other.custom_values,
+            sign,
+            &intersected,
+        );
         let (ps, pb) = rebuild_side(&merged);
+        let (ns, nb) = rebuild_side(&merged_neg);
         self.positive_spans = ps;
         self.positive_buckets = pb;
+        self.negative_spans = ns;
+        self.negative_buckets = nb;
         self.custom_values = intersected;
         collision
     }
@@ -1874,6 +1891,63 @@ mod tests {
     /// ravel-remote-write admits it; since `count` and `sum` take the whole of
     /// both operands, merging only the positive side would leave the totals
     /// disagreeing with the buckets.
+    #[test]
+    fn combine_custom_reconciled_merges_the_negative_side_and_the_zero_count() {
+        // Differing bounds take the reconciled path. Every side must merge
+        // there too, or count and sum would take both operands while the
+        // negative buckets and the zero count kept only the receiver's.
+        let mut a = FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: CUSTOM_BUCKETS_SCALE,
+            zero_threshold: 0.0,
+            zero_count: 3.0,
+            count: 11.0,
+            sum: 20.0,
+            // NHCB indices are 1-based: index 1 is the bucket whose upper
+            // bound is custom_values[0].
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 3,
+            }],
+            positive_buckets: vec![1.0, 1.0, 1.0],
+            negative_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_buckets: vec![5.0],
+            custom_values: vec![1.0, 2.0, 4.0],
+        };
+        let b = FloatHistogram {
+            zero_count: 1.0,
+            count: 15.0,
+            sum: 10.0,
+            positive_buckets: vec![2.0, 2.0, 2.0],
+            negative_buckets: vec![7.0],
+            custom_values: vec![1.0, 3.0, 5.0],
+            ..a.clone()
+        };
+
+        let collision = a.combine_custom_reconciled(&b, 1.0);
+
+        assert!(!collision);
+        assert_eq!(a.custom_values, vec![1.0], "the intersection of the bounds");
+        assert_eq!(
+            a.negative_buckets,
+            vec![12.0],
+            "5 + 7 on the intersected bound"
+        );
+        assert_eq!(
+            a.negative_spans,
+            vec![Span {
+                offset: 1,
+                length: 1
+            }]
+        );
+        assert_eq!(a.zero_count, 4.0, "3 + 1");
+        assert_eq!(a.count, 26.0, "11 + 15");
+        assert_eq!(a.observation_sum(), 30.0, "20 + 10");
+    }
+
     #[test]
     fn combine_custom_buckets_merges_the_negative_side_and_the_zero_count() {
         let mut a = FloatHistogram {
