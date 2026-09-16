@@ -548,8 +548,8 @@ Labels: `mode`, plus `signal` on all but the legal-hold counter. These carry no
 | `ravel_maintain_legal_hold_refresh_failures_total` | Legal-hold refresh failures. Each one skips that tenant's whole maintenance tick. |
 | `ravel_maintain_conservation_aborts_total` | Compaction publishes aborted by the record-count conservation gate, by signal. |
 | `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. |
-| `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the most recent sweep pass, by signal. |
-| `ravel_maintain_orphans_present` | Gauge. Orphan candidates the most recent sweep pass found, by signal, whether or not the breaker tripped. |
+| `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the last completed orphan pass, by signal. |
+| `ravel_maintain_orphans_present` | Gauge. Orphan candidates the last completed orphan pass found, by signal, whether or not the breaker tripped. |
 | `ravel_maintain_orphans_quarantined_total` | Orphan candidates moved from the live L0 set to the quarantine prefix, by signal. |
 | `ravel_maintain_orphans_quarantine_refused_total` | Orphan candidates whose copy to the quarantine prefix failed, by signal; the live object was left in place rather than deleted without a copy. |
 | `ravel_maintain_quarantine_reaped_total` | Objects physically deleted from the quarantine prefix past the quarantine horizon, by signal. |
@@ -558,6 +558,10 @@ Labels: `mode`, plus `signal` on all but the legal-hold counter. These carry no
 breaker runbook. A zero
 value on the `orphans_withheld` or `orphans_present` gauge does not mean a
 prior trip was resolved: it is this pass's count, not a resolution signal.
+Both gauges are refreshed only by a sweep that ran the orphan rule, which is
+the full-sweep cadence (`interior_reverify_ns`, default 6 h) rather than the
+maintain tick (default 300 s); the ticks in between skip that rule and leave
+both gauges at the last completed pass's values.
 
 The three quarantine series are counters, not gauges: each counts what a sweep
 pass did, and a later quiet pass does not undo it. Read them together. A

@@ -204,6 +204,40 @@ window would still call a Hit.
   candidate, a move to quarantine (see "Quarantine and the second horizon"
   below), never a direct delete. The breaker is all-or-nothing: a
   tripped, non-overridden breaker quarantines zero candidates that pass.
+- **Candidate selection's initial listing runs on the full-sweep cadence, not
+  every maintain tick (issue #1734).** That listing is the one phase of a
+  pass that cannot be hour-scoped (L0 data keys carry no ingest-hour
+  component), so before this change it re-listed the whole shard's `l0/`
+  data prefix on every maintain tick (default 300 s) even though rules 2 and
+  3 already list only the tick's zone-scoped hours. `ravel-maintain`'s
+  per-tick sweep now runs candidate selection only on the tick a full sweep
+  is due -- the same cadence memo (`MaintainMemo::full_sweep_due`,
+  `interior_reverify_ns`, default 6 h) that already governs when rules 2 and
+  3 fall back to their own unscoped pass. Every other tick skips candidate
+  selection entirely: no LIST of the `l0/` data prefix, and that pass's
+  orphan and breaker figures (deleted, quarantined, quarantine-refused, and
+  the breaker fields) are reported as zero rather than a value carried over
+  from the last tick that did run it. Those zeros mean "the rule did not
+  run", not "the rule looked and found nothing", and the two are
+  indistinguishable from the counts alone, so the report records which pass
+  it was and a consumer that keeps a last-observed-value gauge must not
+  publish the skipped kind. The `ravel_maintain_orphans_present` and
+  `ravel_maintain_orphans_withheld` gauges are therefore written only by a
+  pass that ran the rule: they report the last completed orphan pass and are
+  refreshed once per full-sweep interval rather than reset to zero by every
+  tick in between. Publishing the zeros would silently disable the
+  `orphans_present > 0 for 12h` alert
+  (`docs/guides/operations/troubleshooting.md`), since on the defaults 71 of
+  every 72 ticks skip the rule. The per-pass counters
+  (`orphans_quarantined`, `orphans_quarantine_refused`, `quarantine_reaped`,
+  and the breaker-trip counter) are unaffected: a skipped pass adds zero,
+  which is the truth about the events it performed. The L0 listing cost that
+  used to be paid every 300 s is now paid once per full-sweep interval
+  instead. The
+  quarantine reaper (a different rule, over the separate `quarantine/`
+  prefix) is unaffected and still runs every tick, so objects already
+  quarantined keep aging out on schedule. The key layout of `l0/` and
+  `quarantine/` is unchanged.
 - The mass-orphan circuit breaker (ADR-0048 decision 4) trips when a
   pass's surviving candidate count is at least `orphan_breaker_min_count`
   (default 50) AND exceeds `orphan_breaker_max_ratio` (default 0.10) of

@@ -896,6 +896,8 @@ pub async fn sweep(
         orphan_breaker_tripped,
         orphans_withheld,
         orphan_breaker_overridden,
+        // Always `Run` here: this is `sweep_shard`, which never gates rule 1.
+        orphan_pass: _,
         full_pass,
     } = sweep_shard(
         store.as_ref(),
