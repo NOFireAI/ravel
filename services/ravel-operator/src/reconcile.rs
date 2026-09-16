@@ -60,8 +60,10 @@ pub enum RenderError {
     /// `key.source: canonicalTenant` is selected but no resolver is configured.
     /// `ravel-ingest-router`'s own CLI refuses to start with `--key-source
     /// canonical-tenant` unless at least one resolver flag is set (a
-    /// `--tenant-token`, `--oidc-issuer`/`--oidc-jwks-url`, `--mtls-enabled`, or
-    /// `--dev-insecure-tenant-header`). The only resolver surface this CRD
+    /// `--tenant-token`, or `--oidc-issuer`/`--oidc-jwks-url`, or
+    /// `--dev-insecure-tenant-header`; `--mtls-enabled` is refused
+    /// unconditionally on this router, ADR-0050 decision 1 shape, so it is
+    /// never a usable resolver here). The only resolver surface this CRD
     /// exposes today is `tenantTokensSecretRef`, which renders the
     /// `--tenant-token` flags; with it absent the rendered command line would
     /// crashloop the router at startup, so the operator renders no router

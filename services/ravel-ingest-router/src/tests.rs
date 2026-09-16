@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, StatusCode};
 use kube_runtime::watcher::Event;
 use ravel_affinity::{ReplicaId, rank};
 
@@ -47,22 +47,29 @@ impl Clock for FakeClock {
 }
 
 type Hits = Arc<Mutex<Vec<String>>>;
+type HeaderHits = Arc<Mutex<Vec<HeaderMap>>>;
 
 /// A local backend standing in for a gateway pod. Records `"<host> <path>"` for
 /// every request it receives, so a test can prove which pod address the router
-/// actually dialed.
+/// actually dialed, plus the full forwarded header map so a test can prove a
+/// header was (or was not) stripped before forwarding.
 struct Backend {
     addr: SocketAddr,
     hits: Hits,
+    headers: HeaderHits,
 }
 
 impl Backend {
     fn recorded(&self) -> Vec<String> {
         self.hits.lock().unwrap().clone()
     }
+
+    fn recorded_headers(&self) -> Vec<HeaderMap> {
+        self.headers.lock().unwrap().clone()
+    }
 }
 
-async fn record(State(hits): State<Hits>, req: Request) -> &'static str {
+async fn record(State((hits, headers)): State<(Hits, HeaderHits)>, req: Request) -> &'static str {
     let host = req
         .headers()
         .get(axum::http::header::HOST)
@@ -71,18 +78,26 @@ async fn record(State(hits): State<Hits>, req: Request) -> &'static str {
         .to_string();
     let path = req.uri().path().to_string();
     hits.lock().unwrap().push(format!("{host} {path}"));
+    headers.lock().unwrap().push(req.headers().clone());
     "from-backend"
 }
 
 async fn spawn_backend() -> Backend {
     let hits: Hits = Arc::new(Mutex::new(Vec::new()));
-    let app = Router::new().fallback(record).with_state(hits.clone());
+    let headers: HeaderHits = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .fallback(record)
+        .with_state((hits.clone(), headers.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    Backend { addr, hits }
+    Backend {
+        addr,
+        hits,
+        headers,
+    }
 }
 
 async fn spawn_router(app: Router) -> SocketAddr {
@@ -516,6 +531,54 @@ async fn tenant_key_bytes_never_appear_in_an_error_body() {
     );
 }
 
+#[tokio::test]
+async fn client_supplied_client_cert_header_does_not_reach_the_upstream() {
+    // A client sets the mTLS identity header itself; no proxy in front ever
+    // verified it as a real client certificate. This router never installs
+    // the mTLS resolver (ADR-0050 decision 1 shape: `--mtls-enabled` is
+    // refused at startup), so the header must never reach the upstream as if
+    // a trusted proxy had stamped it. Reverting the strip in `proxy::forward`
+    // makes this header show up in `recorded_headers()` instead of being
+    // absent.
+    let backend = spawn_backend().await;
+    let store = Arc::new(EndpointStore::new(None));
+    let s = slice(
+        "gw",
+        "gw",
+        backend.addr.port() as i32,
+        &[TestEndpoint {
+            uid: "uid-a",
+            ip: "127.0.0.1",
+            ready: true,
+        }],
+    );
+    sync_one_slice(&store, s);
+
+    let state = state(store, KeyResolver::Header(AUTHORIZATION), 1);
+    let router_addr = spawn_router(build_app(state)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{router_addr}/v1/metrics"))
+        .header(AUTHORIZATION, "Bearer test-token")
+        .header("x-ravel-client-cert-cn", "victim-tenant")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let forwarded = backend.recorded_headers();
+    assert_eq!(
+        forwarded.len(),
+        1,
+        "exactly one request reached the backend"
+    );
+    assert!(
+        forwarded[0].get("x-ravel-client-cert-cn").is_none(),
+        "the client-supplied identity header must be stripped before forwarding, got {:?}",
+        forwarded[0].get("x-ravel-client-cert-cn")
+    );
+}
+
 // --- gRPC transparent-proxy tests (#184) ------------------------------------
 
 /// A real tonic gRPC backend standing in for a gateway pod. It implements the
@@ -528,28 +591,43 @@ async fn tenant_key_bytes_never_appear_in_an_error_body() {
 struct GrpcBackend {
     hits: Hits,
     tag: &'static str,
+    // The forwarded value of the `x-ravel-client-cert-cn` metadata key (gRPC
+    // metadata is carried in HTTP/2 headers), one entry per request, so a test
+    // can prove the identity header a client sets itself never reaches here.
+    cert_header: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 #[tonic::async_trait]
 impl MetricsService for GrpcBackend {
     async fn export(
         &self,
-        _request: tonic::Request<ExportMetricsServiceRequest>,
+        request: tonic::Request<ExportMetricsServiceRequest>,
     ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
         self.hits.lock().unwrap().push(self.tag.to_string());
+        let cert = request
+            .metadata()
+            .get("x-ravel-client-cert-cn")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        self.cert_header.lock().unwrap().push(cert);
         Ok(tonic::Response::new(ExportMetricsServiceResponse::default()))
     }
 }
 
-/// Spawn a real gRPC (h2c) backend on a loopback port. Returns its bound address
-/// and the hits recorder.
-async fn spawn_grpc_backend(tag: &'static str) -> (SocketAddr, Hits) {
+/// Spawn a real gRPC (h2c) backend on a loopback port. Returns its bound
+/// address, the hits recorder, and the recorder for a forwarded
+/// `x-ravel-client-cert-cn` value (`None` when the request carried none).
+async fn spawn_grpc_backend(
+    tag: &'static str,
+) -> (SocketAddr, Hits, Arc<Mutex<Vec<Option<String>>>>) {
     let hits: Hits = Arc::new(Mutex::new(Vec::new()));
+    let cert_header: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let svc = GrpcBackend {
         hits: hits.clone(),
         tag,
+        cert_header: cert_header.clone(),
     };
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -558,7 +636,7 @@ async fn spawn_grpc_backend(tag: &'static str) -> (SocketAddr, Hits) {
             .await
             .unwrap();
     });
-    (addr, hits)
+    (addr, hits, cert_header)
 }
 
 /// A gRPC client pointed at the router, carrying `authorization` metadata as the
@@ -585,8 +663,8 @@ async fn grpc_request_is_proxied_to_hrw_selected_pod_endpoint_not_service_vip() 
     // Two real gRPC backends on distinct loopback ports stand in for two gateway
     // pods. Each is injected as a Ready endpoint whose dial address IS that
     // backend's real bound address; the router knows no Service name or VIP.
-    let (addr_a, hits_a) = spawn_grpc_backend("a").await;
-    let (addr_b, hits_b) = spawn_grpc_backend("b").await;
+    let (addr_a, hits_a, _cert_a) = spawn_grpc_backend("a").await;
+    let (addr_b, hits_b, _cert_b) = spawn_grpc_backend("b").await;
 
     let store = Arc::new(EndpointStore::new(None));
     let slice_a = slice(
@@ -653,7 +731,7 @@ async fn grpc_canonical_tenant_resolution_failure_rejects_with_unauthenticated()
     // A Ready backend is registered so that any stray proxy attempt would be
     // recorded. It must not be: canonical-tenant resolution failure is
     // fail-closed and rejected as gRPC UNAUTHENTICATED, never proxied.
-    let (addr, hits) = spawn_grpc_backend("a").await;
+    let (addr, hits, _cert) = spawn_grpc_backend("a").await;
     let store = Arc::new(EndpointStore::new(None));
     let s = slice(
         "gw",
@@ -701,7 +779,7 @@ async fn grpc_rejects_traffic_before_first_watcher_sync() {
     // no backend is dialed. Prove the gRPC handler actually reaches
     // resolve_and_select under this condition, not just that the pure function
     // rejects.
-    let (addr, hits) = spawn_grpc_backend("a").await;
+    let (addr, hits, _cert) = spawn_grpc_backend("a").await;
     let store = Arc::new(EndpointStore::new(None));
     assert!(!store.is_synced());
     // Register the backend address so a (buggy) proxy attempt could reach it;
@@ -732,7 +810,7 @@ async fn grpc_unready_subset_member_falls_through_to_next_ranked_replica() {
     // next-ranked Ready replica rather than failing. This proves the gRPC
     // handler reaches the same `resolve_and_select` fallthrough the HTTP path
     // uses, over the gRPC transport.
-    let (addr, hits) = spawn_grpc_backend("a").await;
+    let (addr, hits, _cert) = spawn_grpc_backend("a").await;
 
     let key = b"Bearer grpc-token";
     let id_a = ReplicaId::new(b"uid-a".to_vec());
@@ -776,6 +854,63 @@ async fn grpc_unready_subset_member_falls_through_to_next_ranked_replica() {
         hits.lock().unwrap().len(),
         1,
         "the next-ranked Ready replica received the gRPC request over the fallthrough path"
+    );
+}
+
+#[tokio::test]
+async fn grpc_client_supplied_client_cert_header_does_not_reach_the_upstream() {
+    // gRPC twin of `client_supplied_client_cert_header_does_not_reach_the_upstream`:
+    // a client sets the mTLS identity header itself via gRPC metadata (gRPC
+    // metadata rides in HTTP/2 headers, the same frames the HTTP proxy strips
+    // it from). This router never installs the mTLS resolver (ADR-0050
+    // decision 1 shape), so the header must never reach the upstream.
+    // Reverting the strip in `grpc::forward` makes `cert_header` observe
+    // `Some("victim-tenant")` instead of `None`.
+    let (addr, hits, cert_header) = spawn_grpc_backend("a").await;
+    let store = Arc::new(EndpointStore::new(None));
+    let s = slice(
+        "gw",
+        "gw",
+        addr.port() as i32,
+        &[TestEndpoint {
+            uid: "uid-a",
+            ip: "127.0.0.1",
+            ready: true,
+        }],
+    );
+    sync_one_slice(&store, s);
+
+    let state = state(store, KeyResolver::Header(AUTHORIZATION), 1);
+    let router_addr = spawn_router(crate::grpc::build_app(state)).await;
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{router_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = MetricsServiceClient::new(channel);
+    let mut request = tonic::Request::new(ExportMetricsServiceRequest::default());
+    request
+        .metadata_mut()
+        .insert("authorization", "Bearer grpc-token".parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("x-ravel-client-cert-cn", "victim-tenant".parse().unwrap());
+
+    client
+        .export(request)
+        .await
+        .expect("gRPC export must succeed through the proxy");
+
+    assert_eq!(
+        hits.lock().unwrap().len(),
+        1,
+        "exactly one gRPC request reached the backend"
+    );
+    assert_eq!(
+        cert_header.lock().unwrap().as_slice(),
+        &[None],
+        "the client-supplied identity header must be stripped before forwarding"
     );
 }
 
