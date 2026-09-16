@@ -155,10 +155,9 @@ async fn a_concurrent_newer_record_is_not_downgraded_during_re_record() {
     );
 
     let run_store: Arc<dyn ObjectStoreBackend> = fault.clone();
-    let run =
-        tokio::spawn(
-            async move { qualify::qualify(run_store, "memory".to_string(), "run-1", 1000).await },
-        );
+    let run = tokio::spawn(async move {
+        qualify::qualify(run_store, "memory".to_string(), "run-1", 1000).await
+    });
 
     // The run has read the stale record and is parked at the CAS write. Exactly
     // one call is held: the CAS re-record put, and nothing else.
