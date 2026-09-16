@@ -1198,7 +1198,7 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:latest server /data
+            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
       - name: Wait for MinIO to be live
         run: |
           for _ in $(seq 1 30); do
@@ -1214,7 +1214,7 @@ jobs:
       - name: Create the contract-suite bucket
         run: |
           # quay.io rationale: see this job's "Start MinIO" step above.
-          docker run --rm --network host --entrypoint sh quay.io/minio/mc:latest -c "
+          docker run --rm --network host --entrypoint sh quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 -c "
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/ravel-object-store-test"
       # The contract suite's S3/MinIO case is gated on RAVEL_MINIO_URL; set it
@@ -1264,7 +1264,7 @@ jobs:
         run: |
           docker run -d --name floci \
             -p 4566:4566 \
-            floci/floci:latest
+            floci/floci@sha256:f5aa8c18302cedb4f2385f5c4e455b3efc77fee6bf7b6e5d1712b2817ba102db
       - name: Wait for floci S3 to be live
         run: |
           # floci reports per-service readiness, so wait on S3 specifically
@@ -1372,7 +1372,7 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:latest server /data
+            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
       - name: Wait for MinIO to be live
         run: |
           for _ in $(seq 1 30); do
@@ -1388,7 +1388,7 @@ jobs:
       - name: Create the bench-smoke bucket
         run: |
           # quay.io rationale: see object-store-contract's "Start MinIO" step.
-          docker run --rm --network host --entrypoint sh quay.io/minio/mc:latest -c "
+          docker run --rm --network host --entrypoint sh quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 -c "
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/ravel-object-store-test"
       # minio_ingest_read_smoke is gated on RAVEL_MINIO_URL, same convention
@@ -2067,7 +2067,7 @@ jobs:
         if: steps.filter.outputs.run == 'true'
         run: |
           docker run --rm --network host \
-            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen@sha256:49322fa664f1568e24c3b44cf00d7a48e0066e8e8a018b171662b3692c7e2ef5 \
             metrics \
             --otlp-http \
             --otlp-endpoint 127.0.0.1:4318 \
@@ -2090,7 +2090,7 @@ jobs:
         if: steps.filter.outputs.run == 'true'
         run: |
           docker run --rm --network host \
-            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen@sha256:49322fa664f1568e24c3b44cf00d7a48e0066e8e8a018b171662b3692c7e2ef5 \
             logs \
             --otlp-http \
             --otlp-endpoint 127.0.0.1:4318 \

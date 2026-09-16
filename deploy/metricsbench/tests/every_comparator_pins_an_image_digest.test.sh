@@ -165,5 +165,48 @@ check "a missing minio.yml fails naming the missing path" "${d}" 1 \
 check "a missing minio.yml also fails the total-count assertion" "${d}" 1 \
   "found 6 quickstart compose image references, expected exactly 8"
 
+# --- fifth category: docker run/pull/create image pins in workflow run: ----
+# --- blocks (issue #1338) ---------------------------------------------------
+
+# A bare-tag image on a single-line docker run fails naming the unpinned
+# reference. This is the acceptance test for issue #1338.
+d="$(new_tree docker-run-image-with-tag-only-fails)"
+mutate "${d}/.github/workflows/ci.yml" \
+  's#quay\.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727#quay.io/minio/mc:latest#'
+check "docker_run_image_with_tag_only_fails" "${d}" 1 \
+  "ci.yml:1217: quay.io/minio/mc:latest"
+
+# The three shell-variable image references this static scan cannot resolve
+# ("$RAVEL_SERVER_IMAGE"/"$RAVEL_OPERATOR_IMAGE" in ci.yml and k8s-nightly.yml,
+# "$ref" in publish-images.yml) are exempt by exact string, not flagged
+# unpinned, and the committed tree still passes despite carrying no digest on
+# any of them.
+d="$(new_tree docker-run-variable-ref-is-exempt)"
+check "docker_run_variable_ref_is_exempt: RAVEL_SERVER_IMAGE ref in ci.yml is not unpinned" \
+  "${d}" 0 'ci.yml:1597: "$RAVEL_SERVER_IMAGE"'
+check "docker_run_variable_ref_is_exempt: exempt marker is used, not [UNPINNED]" \
+  "${d}" 0 '[variable ref, exempt]'
+
+# A docker run whose image argument sits on a backslash-continued line, not
+# the same physical line as "docker run", is still found: the scanner joins
+# continuation lines before matching. Mutating the digest on the
+# continuation line (metricsbench-nightly.yml's minio start spans lines
+# 67-71, with the image on line 71) must be caught and reported at the
+# invocation's start line, proving the join actually ran rather than the
+# image happening to be on the same line as "docker run".
+d="$(new_tree docker-run-with-line-continuation-is-scanned)"
+mutate "${d}/.github/workflows/metricsbench-nightly.yml" \
+  's#quay\.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e#quay.io/minio/minio:latest#'
+check "docker_run_with_line_continuation_is_scanned" "${d}" 1 \
+  "metricsbench-nightly.yml:67: quay.io/minio/minio:latest"
+
+# Removing one docker-run invocation must fail the exact-count assertion,
+# not silently scan fewer references.
+d="$(new_tree docker-run-wrong-count)"
+mutate "${d}/.github/workflows/metricsbench-nightly.yml" \
+  '/^          docker run --rm --network host --entrypoint sh \\$/,/^            quay\.io\/minio\/mc@sha256:/d'
+check "removing a docker run line fails the docker-run-image count assertion" \
+  "${d}" 1 "found 14 docker run/pull/create image references, expected exactly 15"
+
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]

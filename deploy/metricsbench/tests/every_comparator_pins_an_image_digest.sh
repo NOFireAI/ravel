@@ -15,8 +15,10 @@
 # a moving tag or a mutable action ref is unreproducible and unauditable
 # wherever it appears, not just in this one compose file. Issue #1720 added a
 # fourth category for the same reason, scoped to the quickstart compose file.
-# It now scans four categories, each with its own exact-count assertion so a
-# scan that finds nothing in a category fails rather than passing silently:
+# Issue #1338 added a fifth, scoped to the image argument of `docker run`,
+# `docker pull`, and `docker create` inside workflow `run:` blocks. It now
+# scans five categories, each with its own exact-count assertion so a scan
+# that finds nothing in a category fails rather than passing silently:
 #
 #   1. every `image:` reference in deploy/metricsbench/docker-compose.yml
 #      (the original check, unchanged in behaviour);
@@ -40,12 +42,29 @@
 #      lines 74 and 157) plus two locally built placeholders
 #      (ravel-server, ravel-operator); pinning the k8s manifests is a
 #      separate ticket.
+#   5. every image argument of a `docker run`, `docker pull`, or
+#      `docker create` invocation inside a `run:` block, across
+#      .github/workflows/ci.yml, metricsbench-nightly.yml, k8s-nightly.yml,
+#      and publish-images.yml -- a backslash line continuation is joined
+#      before matching, since the image commonly sits on a line after the
+#      `docker run` token (ci.yml's MinIO and floci starts), and a line
+#      inside a here-doc body (publish-images.yml's release-notes template,
+#      which contains a literal `docker pull ...` example for humans, not an
+#      invocation this job runs) is skipped -- excluding `"$RAVEL_SERVER_IMAGE"`,
+#      `"$RAVEL_OPERATOR_IMAGE"`, and `"$ref"` by exact match: each is a shell
+#      variable holding an image this same workflow just built or resolved
+#      (a locally assembled tag being smoke-tested, or `$image@$digest` from
+#      a platform loop that already pins by digest one line above), not a
+#      third-party image reference this scan can check statically. Scoped to
+#      these four files: quickstart-published.yml carries two more unpinned
+#      `docker run` telemetrygen invocations, identical to ci.yml's; pinning
+#      that file is a separate ticket.
 #
-# Every category requires an `@sha256:<64 hex>` digest (categories 1, 2, and
-# 4) or a full 40-character commit SHA (category 3): a tag alone, a branch, or
-# a short SHA is a moving or ambiguous reference and fails the same as a bare
-# tag. Exit 0 only when every category is fully pinned and every category's
-# reference count equals its expected total.
+# Every category requires an `@sha256:<64 hex>` digest (categories 1, 2, 4,
+# and 5) or a full 40-character commit SHA (category 3): a tag alone, a
+# branch, or a short SHA is a moving or ambiguous reference and fails the
+# same as a bare tag. Exit 0 only when every category is fully pinned and
+# every category's reference count equals its expected total.
 #
 # POSIX sh, no external dependencies beyond grep/sed. Fails closed.
 
@@ -119,6 +138,53 @@ QUICKSTART_EXPECTED_PINNED_COUNT=6
 # slip through as "exempt".
 RAVEL_IMAGE_VAR_REF='${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.15.0}'
 
+# The four workflow files category 5 scans for `docker run`/`docker
+# pull`/`docker create` image arguments. Fixed list, not a glob over
+# .github/workflows/*.yml like category 3: quickstart-published.yml also
+# carries `docker run` invocations (two unpinned telemetrygen calls,
+# identical to ci.yml's) but pinning it is a separate ticket, and scanning it
+# here would make this category permanently red with no file in this check's
+# scope able to fix it.
+CI_WORKFLOW_FILE="$REPO_ROOT/.github/workflows/ci.yml"
+METRICSBENCH_NIGHTLY_WORKFLOW_FILE="$REPO_ROOT/.github/workflows/metricsbench-nightly.yml"
+K8S_NIGHTLY_WORKFLOW_FILE="$REPO_ROOT/.github/workflows/k8s-nightly.yml"
+PUBLISH_IMAGES_WORKFLOW_FILE="$REPO_ROOT/.github/workflows/publish-images.yml"
+
+# Exact number of `docker run`/`docker pull`/`docker create` image arguments
+# across the four files above. Update deliberately if a `docker run`,
+# `docker pull`, or `docker create` invocation is added, removed, or
+# repointed at a different image inside one of their `run:` blocks.
+RUN_IMAGE_EXPECTED_COUNT=15
+
+# Of those, the number that must carry a digest pin: every reference except
+# the three shell-variable exemptions below. Update deliberately alongside
+# RUN_IMAGE_EXPECTED_COUNT.
+RUN_IMAGE_EXPECTED_PINNED_COUNT=9
+
+# The exact text of an extracted image argument (same stripping as the
+# extraction below: the whitespace-delimited token itself, quotes included
+# where the shell command quoted it) that is a shell variable rather than a
+# literal third-party image reference, excluded from category 5 by exact
+# string match, not by pattern, so a typo'd variable reference does not
+# silently slip through as "exempt" -- same rationale as RAVEL_IMAGE_VAR_REF
+# above.
+#
+#   "$RAVEL_SERVER_IMAGE" (ci.yml:1597, k8s-nightly.yml:85) and
+#   "$RAVEL_OPERATOR_IMAGE" (ci.yml:1598, k8s-nightly.yml:86): both jobs
+#   `docker build` these images from source earlier in the same job and
+#   `docker run --help` them as a smoke test before the cluster is ever
+#   involved; the variable holds the just-built local tag, not a pulled
+#   third-party image.
+#
+#   "$ref" (publish-images.yml:744-745): set one line above each use to
+#   `$image@$digest` from a loop over the platform digests a prior step in
+#   the same job already resolved from the published manifest list -- it is
+#   already pinned by digest, just not as a literal `@sha256:` token this
+#   scan's static extraction can see.
+RUN_IMAGE_VAR_REF_SERVER='"$RAVEL_SERVER_IMAGE"'
+RUN_IMAGE_VAR_REF_OPERATOR='"$RAVEL_OPERATOR_IMAGE"'
+RUN_IMAGE_VAR_REF_RESOLVED='"$ref"'
+
 # A pinned image reference ends in `@sha256:` followed by exactly 64 hex
 # digits. Matching the bare substring `@sha256:` is not enough: `repo:tag@sha256:`
 # with an empty or truncated digest would satisfy it while pinning nothing,
@@ -136,7 +202,9 @@ DOCKERFILE_REFS_FILE=$(mktemp)
 WORKFLOW_REFS_FILE=$(mktemp)
 QUICKSTART_REFS_FILE=$(mktemp)
 QUICKSTART_REQUIRED_FILE=$(mktemp)
-trap 'rm -f "$DOCKERFILE_REFS_FILE" "$WORKFLOW_REFS_FILE" "$QUICKSTART_REFS_FILE" "$QUICKSTART_REQUIRED_FILE"' EXIT
+RUN_IMAGE_REFS_FILE=$(mktemp)
+RUN_IMAGE_REQUIRED_FILE=$(mktemp)
+trap 'rm -f "$DOCKERFILE_REFS_FILE" "$WORKFLOW_REFS_FILE" "$QUICKSTART_REFS_FILE" "$QUICKSTART_REQUIRED_FILE" "$RUN_IMAGE_REFS_FILE" "$RUN_IMAGE_REQUIRED_FILE"' EXIT
 
 echo "Repo-wide pin check (issue #1310)"
 
@@ -398,6 +466,179 @@ else
   fi
 fi
 
+# --- 5. docker run/pull/create image pins in workflow run: blocks -----------
+
+echo
+echo "== docker run/pull/create image pins (ci.yml, metricsbench-nightly.yml, k8s-nightly.yml, publish-images.yml, issue #1338) =="
+
+for f in "$CI_WORKFLOW_FILE" "$METRICSBENCH_NIGHTLY_WORKFLOW_FILE" \
+         "$K8S_NIGHTLY_WORKFLOW_FILE" "$PUBLISH_IMAGES_WORKFLOW_FILE"; do
+  if [ ! -f "$f" ]; then
+    echo "FAIL: workflow file not found at $f"
+    fail=1
+  fi
+done
+
+if [ -f "$CI_WORKFLOW_FILE" ] && [ -f "$METRICSBENCH_NIGHTLY_WORKFLOW_FILE" ] \
+  && [ -f "$K8S_NIGHTLY_WORKFLOW_FILE" ] && [ -f "$PUBLISH_IMAGES_WORKFLOW_FILE" ]; then
+  # A run: block is shell, not YAML, so a `docker run ...` line is scanned by
+  # joining a trailing backslash continuation onto the next physical line
+  # before matching (the image commonly lands on a later line than the
+  # `docker run` token itself: ci.yml's MinIO and floci starts). A line
+  # inside a here-doc body is skipped outright: publish-images.yml writes a
+  # `docker pull ...` example into release notes for a human to read, which
+  # is data this job emits, not a command this job runs. A `<<<` here-string
+  # (three angle brackets, used elsewhere in publish-images.yml to feed a
+  # variable to `read`) must not be mistaken for a here-doc start (two angle
+  # brackets): the heredoc-start pattern requires a non-`<` character
+  # immediately before the `<<`, which a third leading `<` fails.
+  #
+  # Once past `docker run`/`docker pull`/`docker create`, flags that consume
+  # a following argument (`-p`, `-e`, `--name`, `--network`, `--entrypoint`,
+  # and a handful of others no invocation here uses yet) are skipped along
+  # with their value; the first remaining token that is not itself a flag is
+  # the image argument.
+  awk '
+    BEGIN {
+      n = split("-p -e --name --network --entrypoint -v --volume -u --user -w --workdir -h --hostname --env --add-host --link --label -l --platform", vf, " ")
+      for (i = 1; i <= n; i++) VALUE_FLAGS[vf[i]] = 1
+    }
+    FNR == 1 {
+      in_heredoc = 0
+      heredoc_delim = ""
+      buf = ""
+      bufstart = 0
+    }
+    {
+      line = $0
+
+      if (in_heredoc) {
+        trimmed = line
+        sub(/^[ \t]+/, "", trimmed)
+        if (trimmed == heredoc_delim) in_heredoc = 0
+        next
+      }
+
+      if (match(line, /[^<]<<-?[ \t]*['"'"'"]?[A-Za-z_][A-Za-z0-9_]*['"'"'"]?[ \t]*$/)) {
+        seg = substr(line, RSTART, RLENGTH)
+        sub(/^.*<<-?[ \t]*/, "", seg)
+        sub(/[ \t]*$/, "", seg)
+        delim = seg
+        sub(/^[^A-Za-z0-9_]*/, "", delim)
+        sub(/[^A-Za-z0-9_]*$/, "", delim)
+        if (delim != "") { heredoc_delim = delim; in_heredoc = 1 }
+      }
+
+      cont = 0
+      work = line
+      if (match(work, /\\[ \t]*$/)) {
+        cont = 1
+        sub(/\\[ \t]*$/, "", work)
+      }
+
+      if (buf == "") {
+        bufstart = FNR
+        t = line
+        sub(/^[ \t]+/, "", t)
+        buf_is_comment = (substr(t, 1, 1) == "#")
+        if (buf_is_comment) cont = 0
+      }
+
+      buf = (buf == "" ? work : buf " " work)
+
+      if (cont) next
+
+      logical = buf
+      buf = ""
+      was_comment = buf_is_comment
+
+      if (was_comment) next
+      if (!match(logical, /docker[ \t]+(run|pull|create)([ \t]|$)/)) next
+      rest = substr(logical, RSTART + RLENGTH)
+      sub(/^[ \t]+/, "", rest)
+      image = ""
+      while (rest != "") {
+        if (!match(rest, /^[^ \t]+/)) break
+        tok = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RSTART + RLENGTH)
+        sub(/^[ \t]+/, "", rest)
+        if (substr(tok, 1, 1) == "-") {
+          if (index(tok, "=") > 0) continue
+          if (tok in VALUE_FLAGS) {
+            if (match(rest, /^[^ \t]+/)) {
+              rest = substr(rest, RSTART + RLENGTH)
+              sub(/^[ \t]+/, "", rest)
+            }
+          }
+          continue
+        } else {
+          image = tok
+          break
+        }
+      }
+      if (image != "") {
+        print FILENAME ":" bufstart ":" image
+      }
+    }
+  ' "$CI_WORKFLOW_FILE" "$METRICSBENCH_NIGHTLY_WORKFLOW_FILE" \
+    "$K8S_NIGHTLY_WORKFLOW_FILE" "$PUBLISH_IMAGES_WORKFLOW_FILE" \
+    >"$RUN_IMAGE_REFS_FILE"
+fi
+
+run_image_count=$(wc -l <"$RUN_IMAGE_REFS_FILE" | tr -d '[:space:]')
+echo "  docker run/pull/create image references found: $run_image_count (expected $RUN_IMAGE_EXPECTED_COUNT)"
+
+if [ "$run_image_count" -eq 0 ]; then
+  echo "FAIL: no docker run/pull/create image references found; the check must never scan zero images"
+  fail=1
+else
+  echo "  references:"
+  while IFS=: read -r file lineno image; do
+    if [ "$image" = "$RUN_IMAGE_VAR_REF_SERVER" ] || [ "$image" = "$RUN_IMAGE_VAR_REF_OPERATOR" ] \
+      || [ "$image" = "$RUN_IMAGE_VAR_REF_RESOLVED" ]; then
+      echo "    [variable ref, exempt] $file:$lineno: $image"
+    elif printf '%s\n' "$image" | grep -q "$IMAGE_DIGEST_RE"; then
+      echo "    [pinned]   $file:$lineno: $image"
+    else
+      echo "    [UNPINNED] $file:$lineno: $image"
+    fi
+  done <"$RUN_IMAGE_REFS_FILE"
+
+  # Exclude the three shell-variable exemptions by exact match before
+  # counting and pin-checking what remains, same shape as the quickstart
+  # category's RAVEL_IMAGE_VAR_REF exclusion above.
+  while IFS=: read -r file lineno image; do
+    if [ "$image" != "$RUN_IMAGE_VAR_REF_SERVER" ] && [ "$image" != "$RUN_IMAGE_VAR_REF_OPERATOR" ] \
+      && [ "$image" != "$RUN_IMAGE_VAR_REF_RESOLVED" ]; then
+      echo "$file:$lineno:$image" >>"$RUN_IMAGE_REQUIRED_FILE"
+    fi
+  done <"$RUN_IMAGE_REFS_FILE"
+
+  run_image_required_count=$(wc -l <"$RUN_IMAGE_REQUIRED_FILE" | tr -d '[:space:]')
+
+  if [ "$run_image_required_count" -eq 0 ]; then
+    echo "FAIL: no pin-required docker run/pull/create image references found; the check must never scan zero images"
+    fail=1
+  else
+    run_image_unpinned=$(grep -vc "$IMAGE_DIGEST_RE" "$RUN_IMAGE_REQUIRED_FILE")
+
+    if [ "$run_image_unpinned" -ne 0 ]; then
+      echo "FAIL: $run_image_unpinned docker run/pull/create image reference(s) lack an @sha256: digest"
+      fail=1
+    fi
+
+    if [ "$run_image_required_count" -ne "$RUN_IMAGE_EXPECTED_PINNED_COUNT" ]; then
+      echo "FAIL: found $run_image_required_count pin-required docker run/pull/create image references, expected exactly $RUN_IMAGE_EXPECTED_PINNED_COUNT"
+      fail=1
+    fi
+  fi
+
+  if [ "$run_image_count" -ne "$RUN_IMAGE_EXPECTED_COUNT" ]; then
+    echo "FAIL: found $run_image_count docker run/pull/create image references, expected exactly $RUN_IMAGE_EXPECTED_COUNT"
+    fail=1
+  fi
+fi
+
 # --- Result -------------------------------------------------------------
 
 echo
@@ -406,5 +647,5 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, $quickstart_count quickstart compose images, all pinned; comparators: $REQUIRED_COMPARATORS)"
+echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, $quickstart_count quickstart compose images, $run_image_count docker run/pull/create images, all pinned; comparators: $REQUIRED_COMPARATORS)"
 exit 0
