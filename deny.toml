@@ -32,19 +32,45 @@ ignore = [
   # the three depends on either); revisit if they drop paste upstream.
   "RUSTSEC-2024-0436",
   # RUSTSEC-2026-0194 and RUSTSEC-2026-0195: quick-xml 0.26.0 and 0.39.4
-  # (two versions, both affected) enter only through inferno's SVG
-  # rendering (inferno <- pprof, `flamegraph` feature), which both
-  # ravel-bench and services/ravel-cli pull behind their own
-  # off-by-default `profiling` feature (see the matching `inferno`
-  # CDDL-1.0 license exception below). Both advisories describe CPU/memory
-  # exhaustion from parsing attacker-controlled, untrusted XML with many
-  # attributes or namespace declarations on a single start tag. inferno's
-  # quick-xml usage here only parses and writes flamegraph SVG built from
-  # locally generated pprof sample data (symbol names and stack frames
-  # from the same process), never externally supplied or untrusted XML,
-  # so the reachable input is not attacker-controlled even when the
-  # feature is enabled. No fixed inferno release pins quick-xml
-  # >=0.41.0 yet; revisit when it does.
+  # (two versions, both affected; quick-xml 0.41.0 fixes both) enter
+  # through two separate direct parents, checked mechanically by
+  # scripts/guards/check-quick-xml-entry-points.sh:
+  #
+  # - quick-xml 0.26.0 enters through inferno's SVG rendering (inferno <-
+  #   pprof, `flamegraph` feature), which both ravel-bench and
+  #   services/ravel-cli pull behind their own off-by-default `profiling`
+  #   feature (see the matching `inferno` CDDL-1.0 license exception
+  #   below).
+  # - quick-xml 0.39.4 enters through object_store 0.13.2 (object_store <-
+  #   parquet's `object_store` feature <- ravel-bench's `object_store`
+  #   dependency), which ravel-bench pulls behind its own off-by-default
+  #   `parquet-baseline` feature. Not through inferno: pprof/inferno never
+  #   links this copy of object_store.
+  #
+  # Both advisories describe CPU/memory exhaustion from parsing
+  # attacker-controlled, untrusted XML with many attributes or namespace
+  # declarations on a single start tag. Neither reachable input is
+  # attacker-controlled here: inferno's quick-xml usage only parses and
+  # writes flamegraph SVG built from locally generated pprof sample data
+  # (symbol names and stack frames from the same process), and
+  # object_store's quick-xml usage only parses S3-compatible XML
+  # responses this bench-only reader issues to endpoints it configured
+  # itself, over the read-side Parquet accounting harness's own requests,
+  # never externally supplied or untrusted XML.
+  #
+  # The ignore rests on ravel-bench being `publish = false` with no
+  # production caller, and on no shipped binary's feature set turning on
+  # `object_store`/`cloud` for this DataFusion-side 0.13 copy: the root
+  # Dockerfile's four release builds (ravel-server --features
+  # sql,flight-sql,otap; ravel-cli; ravel-operator;
+  # ravel-ingest-router) never pass `profiling` or `parquet-baseline`.
+  # ravel-object-store's own object_store dependency is 0.14.1, which
+  # resolves quick-xml 0.41.0 and is unaffected.
+  #
+  # No fixed inferno release pins quick-xml >=0.41.0 yet, and no
+  # object_store 0.13.x release beyond 0.13.2 exists yet either (parquet's
+  # dependency is a caret range, so a patch bump would resolve
+  # automatically); revisit when either happens.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
 ]
