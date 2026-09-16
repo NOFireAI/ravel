@@ -18,8 +18,9 @@
 # it has to be the whole body -- the bot parses whatever follows `review` as
 # arguments and answers an unrecognized word with a confused reaction and no
 # review. Then wait for the `claude-fleet[bot]` review, fix or explicitly
-# answer every actionable finding (a review with zero findings counts as
-# clean), and merge by hand once CI is green:
+# answer every finding not marked nit (a review with only nits
+# counts as clean; stop after 3 rounds and hand the PR to a person), and
+# merge by hand once CI is green:
 #   gh pr merge <n> --rebase
 # `scripts/pr-review-status.sh <n>` prints CI + review status in one line.
 # FLEET_MERGE_AUTO=1 restores the old behavior (`gh pr merge --auto --rebase`)

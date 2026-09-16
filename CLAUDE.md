@@ -280,9 +280,12 @@ connection, a pushed-but-broken main).
   that review landed (#749/#750 shipped with 6 real findings unaddressed
   this way). After opening the PR it posts `@claude-fleet review` on it,
   which is the trigger for the fleet review (ADR-1586). Wait for the
-  `claude-fleet[bot]` review, fix or answer every actionable finding (a
-  review with zero findings counts as clean; check with
-  `scripts/pr-review-status.sh <pr-number>`), then run the exact merge
+  `claude-fleet[bot]` review and fix or answer every finding not marked
+  `nit`. A review whose findings are all nits is clean: do not push for
+  the nits and do not ask for another round, since a push moves the head
+  and needs a fresh review. After 3 review rounds on
+  one PR, stop and hand it to a person. Check with
+  `scripts/pr-review-status.sh <pr-number>`, then run the exact merge
   command it prints once clean (it pins `--match-head-commit` to the SHA
   it just checked, so a stale check can't land unreviewed code).
   `FLEET_MERGE_AUTO=1` restores the old auto-merge behavior for the rare
