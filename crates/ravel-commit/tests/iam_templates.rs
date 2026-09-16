@@ -5980,62 +5980,100 @@ fn commit_prefix_is_deletable_and_the_contract_bounds_its_retention() {
     );
 }
 
-/// The three operator-facing docs that restate the compliance-mode claim must
-/// restate the *qualified* form. The contract scopes "never a target" to three
-/// named mechanisms (supersession GC, retention deletion, subject erasure);
-/// each guide previously widened that into a universal ("never sweep
-/// targets", "never deleted by a maintenance sweep", "nothing ever deletes
-/// them"), which is false: `sweep_unreferenced_catalog_objects` deletes every
-/// catalog snapshot and index object the current HEAD no longer names, and
-/// those keys are inside the locked `t/*/catalog/*/*` family.
+/// Every doc that restates the compliance-mode claim must restate the
+/// *qualified* form, on two axes.
 ///
-/// The test above reverts to green if any of these three files is reverted,
-/// because it reads only the contract page. This one is the per-file pin: each
-/// row names the phrase only the corrected text carries and the universal the
-/// correction retired, so reverting one file fails one named assertion.
-const CATALOG_SWEEP_DOC_CLAIMS: &[(&str, &str, &[&str])] = &[
+/// First, "never a target" is scoped to three named mechanisms (supersession
+/// GC, retention deletion, subject erasure). Each guide once widened that into
+/// a universal ("never sweep targets", "never deleted by a maintenance sweep",
+/// "nothing ever deletes them"), which is false:
+/// `sweep_unreferenced_catalog_objects` deletes every catalog snapshot and
+/// index object the current HEAD no longer names, and those keys are inside
+/// the locked `t/*/catalog/*/*` family.
+///
+/// Second, the correction to that first error carried its own false claim:
+/// that a locked catalog object costs storage rather than erasure latency,
+/// because no catalog object can hold a subject value. Per-part `.cstat`
+/// column-statistics objects do hold one. `ColumnStat` carries a `ColumnValue`
+/// min and max and a repeated `DictEntry` dictionary
+/// (proto/ravel/catalog.proto), `ColumnValue` admits `str_utf8` and
+/// `bytes_val`, the fold tallies a declared `Str` or `Bytes` column's exact
+/// min, max and distinct-value dictionary
+/// (crates/ravel-catalog/src/column_stats_build.rs), a tenant may declare any
+/// attribute key as a `STR` typed attribute column (proto/ravel/sys.proto),
+/// and the object lands under the swept `idx/` prefix
+/// (crates/ravel-catalog/src/fold.rs).
+///
+/// `commit_prefix_is_deletable_and_the_contract_bounds_its_retention` reads
+/// only the contract page, so reverting any other file left it green. This is
+/// the per-file pin: each row names the phrases only the corrected text
+/// carries and every phrase the two corrections retired, so reverting one file
+/// fails one named assertion.
+const CATALOG_SWEEP_DOC_CLAIMS: &[(&str, &[&str], &[&str])] = &[
+    (
+        "docs/object-store-contract.md",
+        &["unreferenced-catalog sweep", "distinct-value dictionary"],
+        CATALOG_SUBJECT_VALUE_RETIRED,
+    ),
     (
         "docs/deletion-and-gc.md",
-        "unreferenced-catalog sweep",
-        &["are never sweep targets"],
+        &["unreferenced-catalog sweep", "distinct-value dictionary"],
+        CATALOG_SUBJECT_VALUE_RETIRED,
     ),
     (
         "docs/guides/disaster-recovery.md",
-        "unreferenced-catalog sweep",
-        &[
-            "never targets of the sweeps",
-            "nothing ever deletes",
-            "locking those three is free",
-        ],
+        &["unreferenced-catalog sweep", "distinct-value dictionary"],
+        CATALOG_SUBJECT_VALUE_RETIRED,
     ),
     (
         "docs/guides/operations/deployment.md",
-        "unreferenced-catalog sweep",
-        &[
-            "never deleted by a maintenance sweep",
-            "costs nothing beyond the mechanism itself",
-        ],
+        &["unreferenced-catalog sweep", "distinct-value dictionary"],
+        CATALOG_SUBJECT_VALUE_RETIRED,
     ),
 ];
 
+/// Phrases no doc may carry again. The first group is the "a maintenance sweep
+/// never touches the catalog family" universal in each spelling a doc used;
+/// the second is the "and so a lock there cannot delay an erasure" claim that
+/// replaced it, in each spelling. `never a sweep target` is listed because its
+/// absence from an earlier list is exactly why one summary-table row kept the
+/// universal after the prose above it had been corrected.
+const CATALOG_SUBJECT_VALUE_RETIRED: &[&str] = &[
+    "are never sweep targets",
+    "never a sweep target",
+    "never targets of the sweeps",
+    "nothing ever deletes",
+    "locking those three is free",
+    "never deleted by a maintenance sweep",
+    "costs nothing beyond the mechanism itself",
+    "cannot hold a subject value",
+    "no catalog object can hold a subject value",
+    "No subject value can live in a catalog object",
+];
+
 #[test]
-fn guides_qualify_the_catalog_family_sweep_claim() {
+fn every_doc_qualifies_the_catalog_family_sweep_and_erasure_claim() {
     for (rel, required, retired) in CATALOG_SWEEP_DOC_CLAIMS {
         let path = format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"));
         let doc = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert!(
-            doc.contains(required),
-            "{rel} must name the {required:?} as a deleter of objects under \
-             t/*/catalog/*/*, or it is back to claiming that locking the \
-             catalog family costs nothing"
-        );
+        for anchor in *required {
+            assert!(
+                doc.contains(anchor),
+                "{rel} must contain {anchor:?}. The unreferenced-catalog sweep \
+                 deletes objects under t/*/catalog/*/*, and a per-part \
+                 column-statistics object among them stores a declared Str or \
+                 Bytes column's exact min, max and distinct-value dictionary, \
+                 so a lock on that family both delays collection and extends \
+                 the erasure bound"
+            );
+        }
         for phrase in *retired {
             assert!(
                 !doc.contains(phrase),
-                "{rel} still carries the retired universal {phrase:?}; \
+                "{rel} still carries the retired claim {phrase:?}; \
                  sweep_unreferenced_catalog_objects deletes catalog snapshot \
-                 and index objects, so no doc may say a maintenance sweep \
-                 never touches that family"
+                 and index objects, and a .cstat among them can hold an erased \
+                 subject's own column value verbatim"
             );
         }
     }

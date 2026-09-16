@@ -40,34 +40,49 @@ paired with versioning:
 
 Versioning is what makes the last of those work: a HEAD compare-and-swap
 creates a new locked version rather than overwriting one. None of those four
-prefix families holds an erasable subject value, deliberately, so locking any
-of them never exposes a subject to Object Lock's own reach. That is not the
-same as carrying no erasure cost at all: the deployment records, the
-provisioning records, and the catalog keyspace are never targets of the three
-mechanisms that physically remove tenant data (supersession GC, retention
-deletion, and subject erasure), so locking those three costs nothing against
-those three mechanisms. The commit records
-are not exempt even that far: they are physically deleted, once
+prefix families spells a subject identifier into an object *key*, so naming
+them in the lock never exposes a subject through the key pattern itself. What
+those objects contain is a separate question, and it is where the erasure cost
+lives. The deployment records, the provisioning records, and the catalog
+keyspace are never targets of the three mechanisms that physically remove
+tenant data (supersession GC, retention deletion, and subject erasure), so
+locking those three costs nothing against those three mechanisms. The commit
+records are not exempt even that far: they are physically deleted, once
 superseded, by the same sweeps, so a still-locked commit record delays that
 delete until its retention period elapses, and the sweep pass touching it
 pauses for the difference. Keep that retention period short enough for the
 sweeps to keep making progress; see the object store contract's "Required
 bucket configuration" for the bound.
 
-The catalog keyspace carries a cost of its own, from a different mechanism.
-The unreferenced-catalog sweep deletes the snapshot and index objects under
+The catalog keyspace carries a cost of its own, from a fourth mechanism. The
+unreferenced-catalog sweep deletes the snapshot and index objects under
 `t/*/catalog/*/snap/` and `t/*/catalog/*/idx/` that the current HEAD no longer
 names, once they are older than the protection horizon. A retention covering
 the whole keyspace refuses those deletes until it elapses, and the sweep's
 delete loop stops at the first refusal, so the rest of that tenant and
 signal's unreferenced catalog objects are left behind as well and the next
-maintenance tick retries. This delays reclamation, never erasure: a catalog
-object cannot hold a subject value, so nothing erasable is being held. Keep
-that retention period inside the same window, or scope the mechanism to the
-HEAD pointer alone. The scoped posture is therefore still
-not a disaster-recovery choice; it is the baseline the commit and catalog
-layers already assume, with the commit-record family carrying the sweep-delay
-cost above and the catalog family the reclamation delay here.
+maintenance tick retries.
+
+For the HEAD pointer, the snapshot entries and the name postings, that is a
+reclamation delay: they hold identities, hashes, counts, timestamps and metric
+names, no label or attribute value. The per-part column-statistics objects
+under `idx/` are different. When a tenant declares an attribute key such as
+`user.id` as a typed string or bytes column, the fold records that column's
+exact minimum, exact maximum and exact distinct-value dictionary into the
+column-statistics object for each part, so the subject's own value is stored
+verbatim. Erasure never rewrites that object: it writes new catalog objects
+and swaps HEAD, which leaves the stale one unreferenced, and this sweep is the
+only thing that removes it. So for any tenant with a typed string or bytes
+attribute column, a retention covering the whole catalog keyspace holds an
+erased subject's value for the full retention period. That is a real addition
+to the erasure bound, not a storage cost. Keep that retention period inside
+the same window as for commit records, and if the erasure bound is
+unacceptable, scope the mechanism to `catalog/<signal>/HEAD` alone, which is
+the object the immutability argument actually rests on. The scoped posture is
+therefore still not a disaster-recovery choice; it is the baseline the commit
+and catalog layers already assume, with the commit-record family carrying the
+sweep-delay cost above and the catalog family the sweep delay and, for those
+tenants, the erasure bound here.
 
 Scoping the lock takes an operator-run mechanism, and it is a requirement of
 levels 0 and 1, not an optional extra. Level 2 replaces it with a bucket
@@ -89,15 +104,18 @@ these:
 The retention period is unconstrained for the deployment records and the
 provisioning records: no sweep deletes either of them, so no choice of period
 delays anything. For the commit records the period is not free to pick
-arbitrarily long: it delays the maintenance
-sweeps that physically remove a superseded commit record, so choose a
-period the object store contract's "Required bucket configuration" bounds
-against the sweeps' own default window, or accept those sweeps pausing on
-a commit record until the period elapses. For the catalog keyspace the same
-window applies for a different reason: the unreferenced-catalog sweep deletes
-the snapshot and index objects the current HEAD no longer names, and a
-retention covering them pauses that sweep for the tenant and signal it fires
-on. Neither delay is an erasure delay; both are reclamation delays.
+arbitrarily long: it delays the maintenance sweeps that physically remove a
+superseded commit record, so choose a period the object store contract's
+"Required bucket configuration" bounds against the sweeps' own default window,
+or accept those sweeps pausing on a commit record until the period elapses.
+For the catalog keyspace the same window applies for a different reason: the
+unreferenced-catalog sweep deletes the snapshot and index objects the current
+HEAD no longer names, and a retention covering them pauses that sweep for the
+tenant and signal it fires on. Both delays extend the erasure bound rather
+than only deferring reclamation: a locked commit record holds the superseded
+data behind it, and a locked column-statistics object holds an erased
+subject's own column value for any tenant with a typed string or bytes
+attribute column.
 
 | Mechanism | What it does | Coverage window |
 |---|---|---|
@@ -455,7 +473,7 @@ record: a real end-to-end run against MinIO is what fills a row.
 
 | Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
-| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and catalog HEAD history (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None for `sys/`, provisioning records and catalog HEAD history (no erasable subject value, and never a sweep target); for commit records, `max(bound, R)` where `R` is the chosen retention period, until it elapses | Not a recovery control |
+| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound, R)` where `R` is the chosen retention period, until it elapses. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and a retention over the whole keyspace holds a stale per-part column-statistics object: `max(bound, R)` as well for any tenant with a typed string or bytes attribute column, whose erased value that object stores verbatim. Scope the mechanism to `catalog/<signal>/HEAD` alone to keep the lock without that bound | Not a recovery control |
 | **level 0** (default) | Versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup; no replica | Primary `+E_v` | None; bucket loss is total loss |
 | **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended; the replica versioned with `NoncurrentDays = E_v_r` and expired-delete-marker cleanup | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound, D)`; query-time exclusion still immediate | As level 1 |

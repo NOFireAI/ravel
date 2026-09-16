@@ -306,8 +306,14 @@ async fn row8_records_deleted_data_not_orphan_gc_converges() {
 /// configuration"), and the record loop covers every cleared group in the
 /// pass before the data loop runs at all, so a record that never stops
 /// faulting aborts the pass at the record loop and the data loop never runs
-/// for any chain in it. The pass must therefore leave both counts exactly as
-/// they were: no commit record deleted, and no L0 data object either.
+/// for any chain in it, so the L0 data is still there afterwards.
+///
+/// This row pins the whole-pass abort only. It deliberately asserts nothing
+/// about the commit-record count: the rule fires on every `/c/` delete and
+/// `FaultStore::delete` returns the error without calling the inner store, so
+/// "no commit record was deleted" is a restatement of the fixture and no
+/// production mutation can falsify it. Row 8c below is the row that reads the
+/// record loop's own behaviour, by letting the first delete through.
 #[tokio::test]
 async fn row8b_locked_commit_record_delete_blocks_before_data_loop() {
     async fn run(sig: Sig) {
@@ -349,15 +355,149 @@ async fn row8b_locked_commit_record_delete_blocks_before_data_loop() {
             "the record-delete fault must have fired"
         );
         assert_eq!(
-            l0_commit_count(&store, &bucket).await,
-            before_records,
-            "a refused record delete must leave every commit record in place: \
-             the pass deleted nothing, not merely nothing of the data"
+            l0_data_count(&store, &bucket).await,
+            before_data,
+            "the data loop must never run while the record loop is still failing"
+        );
+    }
+    run(Sig::Metrics).await;
+    run(Sig::Logs).await;
+    run(Sig::Spans).await;
+}
+
+// --- Row 8c: the record loop stops at the first refusal --------------------
+
+/// Seed three compactable L0 inputs for `sig`, one more than [`seed_two`], so
+/// a fault on the second commit-record delete still leaves a third record
+/// behind it for the loop to reach if it wrongly carried on.
+async fn seed_three(store: &dyn ObjectStoreBackend, sig: Sig) -> Bucket {
+    match sig {
+        Sig::Metrics => {
+            for s in metrics_specs() {
+                seed_input(store, &s).await;
+            }
+            seed_input(
+                store,
+                &InputSpec::new(
+                    Uuid::from_u128(3),
+                    10,
+                    3,
+                    vec![raw_series("m", &[("k", "c")], &[(4_000, 4.0)])],
+                ),
+            )
+            .await;
+            bucket()
+        }
+        Sig::Logs => {
+            let b = seed_rlog_two_inputs(store).await;
+            seed_rlog_input(
+                store,
+                Uuid::from_u128(3),
+                10,
+                3,
+                &[log_record(0, 25, "echo"), log_record(3, 30, "foxtrot")],
+            )
+            .await;
+            b
+        }
+        Sig::Spans => {
+            let b = seed_rspan_two_inputs(store).await;
+            seed_rspan_input(
+                store,
+                Uuid::from_u128(3),
+                10,
+                3,
+                &[span_record(0, 2, 25, 30), span_record(3, 0, 2, 4)],
+            )
+            .await;
+            b
+        }
+    }
+}
+
+/// Row 8c: the record-delete loop must propagate the first refusal, not
+/// accumulate errors and keep deleting. The fixture has three superseded L0
+/// commit records and the fault fires on the *second* `/c/` delete, so the
+/// first delete really lands in the store and a third record sits behind the
+/// refusal. A correct pass deletes exactly one record and then returns the
+/// error, leaving the second record, the third record, and all the L0 data
+/// untouched.
+///
+/// This is the row row 8b cannot be. There the fault is always-on and
+/// `FaultStore::delete` returns before touching the inner store, so a record
+/// count that never moves restates the fixture. Here, a record loop rewritten
+/// to collect the error and continue deletes the third record too, and the
+/// `before - after == 1` assertion fails whether or not that rewrite still
+/// stops short of the data loop.
+#[tokio::test]
+async fn row8c_record_loop_stops_at_the_first_refused_delete() {
+    async fn run(sig: Sig) {
+        let inner = MemoryStore::new();
+        // Nth(2): the first commit-record delete succeeds, the second refuses,
+        // modeling one locked record among several in the same pass.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Delete, ScriptedFault::Timeout)
+                .with_key_contains("/c/")
+                .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = FaultStore::new(inner, plan);
+        let created = sealed_now_ns();
+        let clock = FixedClock::new(created);
+        let bucket = seed_three(&store, sig).await;
+        let outcome = compact_bucket(&store, &clock, &cfg(), &bucket)
+            .await
+            .expect("compact");
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { .. }),
+            "expected Compacted, got {outcome:?}"
+        );
+
+        clock.set(past_horizon(created, &cfg()));
+        let before_data = l0_data_count(&store, &bucket).await;
+        assert!(before_data > 0, "L0 data exists before the sweep");
+        let before_records = l0_commit_count(&store, &bucket).await;
+        assert_eq!(
+            before_records, 3,
+            "the fixture must hold three superseded L0 commit records: the \
+             Nth(2) fault has to land inside the record loop with a record \
+             still behind it, or a loop that carried on past the refusal would \
+             have nothing left to delete and this row would restate row 8b"
+        );
+
+        let err = sweep_superseded(
+            &store,
+            &clock,
+            &cfg(),
+            &NoLeases,
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+        )
+        .await;
+        assert!(
+            err.is_err(),
+            "a refused record delete must abort the pass, not be collected and \
+             skipped"
+        );
+        assert_eq!(
+            store.fault_count(Op::Delete, FaultKind::Timeout),
+            1,
+            "the Nth(2) record-delete fault must have fired exactly once; a \
+             higher count means the loop kept issuing deletes after the refusal"
+        );
+
+        let after_records = l0_commit_count(&store, &bucket).await;
+        assert_eq!(
+            before_records - after_records,
+            1,
+            "exactly the one record before the refusal may be gone: the loop \
+             must return the error rather than carry on through the rest \
+             (before {before_records}, after {after_records})"
         );
         assert_eq!(
             l0_data_count(&store, &bucket).await,
             before_data,
-            "the data loop must never run while the record loop is still failing"
+            "the data loop must not run after the record loop refused"
         );
     }
     run(Sig::Metrics).await;

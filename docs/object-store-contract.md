@@ -718,10 +718,12 @@ adapter contract:
    deletion or overwrite for the configured retention period, with no
    principal (including the bucket owner) able to shorten or remove it.
    Subject identifiers that must remain erasable under ADR-0064 live in
-   *values*, never in *object keys or names*, so locking these prefixes
-   never exposes a subject value to Object Lock's own reach. That keeps
-   confidentiality out of the conflict; it does not keep the prefixes out
-   of it. `sys/*`, `t/*/*/prov`, and `t/*/catalog/*/*` are never targets
+   *values*, never in *object keys or names*, so naming a prefix in the
+   lock never exposes a subject value through the pattern itself. What a
+   locked object *contains* is a separate question, and for one member of
+   the catalog family the answer is not "nothing erasable"; see "A lock
+   on the catalog family" below. `sys/*`, `t/*/*/prov`, and
+   `t/*/catalog/*/*` are never targets
    of supersession GC, ADR-0019 retention deletion, or ADR-0064 erasure,
    so a lock on those three costs nothing *against those three
    mechanisms*. That is the whole of the exemption, and it does not
@@ -759,27 +761,54 @@ adapter contract:
    `services/ravel-server/src/maintain.rs`'s maintenance tick) deletes
    every object under those two prefixes that the current HEAD no longer
    names, once it is older than `protection_horizon`. A compliance-mode
-   retention on the family therefore has a cost, but a different one from
-   the commit records above. It is **not** an erasure cost: catalog
-   snapshot entries, name postings, and column statistics carry
-   identities, hashes, counts, timestamps, and metric names only, never a
-   label or attribute value (ADR-0064 Context and its §7 requirement), so
-   no catalog object can hold a subject value, erasure never rewrites or
-   deletes one, and the `+R` erasure bound the commit records carry does
-   not extend here. The cost is storage: an unreferenced catalog object
-   under a retention `R` lingers for `R` past the horizon instead of
-   being reclaimed. It is not confined to the locked object either. The
-   sweep's delete loop propagates the first refusal, so one locked object
-   aborts that `(tenant, signal)` pass and the unreferenced objects
-   behind it in the same pass are left in place too. The production
-   driver logs the failed pass and retries on the next maintenance tick,
-   where the same object refuses again, so collection of that
-   `(tenant, signal)`'s catalog garbage resumes only once `R` elapses.
-   Operators who apply the scoped posture to the whole catalog keyspace
-   should keep `R` inside `protection_horizon` here for the same reason
-   as for commit records, or scope the mechanism to `catalog/<signal>/HEAD`
-   alone, which is the object the immutability argument above actually
-   rests on.
+   retention on the family therefore has a cost, and for some tenants
+   part of that cost is a genuine erasure bound.
+
+   Not every catalog object is alike here. The HEAD pointer, the snapshot
+   entries inside a snapshot part, and the name postings carry identities,
+   hashes, counts, timestamps, and metric names only, never a label or
+   attribute value: that is what ADR-0064's Context establishes, and it
+   enumerates exactly `SnapshotEntry`, `SnapshotPartHeader`, and name
+   postings (ADR-0064 Context, plus its §7 requirement that subject
+   identifiers never appear inside metric names). The per-part
+   column-statistics objects post-date that ADR and were never analysed
+   there, and they do hold values. A `ColumnStat` carries a `ColumnValue`
+   min, a `ColumnValue` max, and a repeated `DictEntry` dictionary, and a
+   `ColumnValue` admits `str_utf8` and `bytes_val`
+   (proto/ravel/catalog.proto). The fold tallies a declared `Str` or
+   `Bytes` column exactly: its min, its max, and its
+   distinct-value dictionary
+   (`crates/ravel-catalog/src/column_stats_build.rs`). A tenant may
+   declare any attribute key, `user.id` among them, as a `STR` typed
+   attribute column whose key is the SQL column name verbatim
+   (proto/ravel/sys.proto, `TypedAttrColumn`). Those objects are written
+   as `t/<hash>/catalog/<signal>/idx/*.cstat`
+   (`crates/ravel-catalog/src/fold.rs`), inside the `idx/` prefix this
+   sweep lists.
+
+   So for any tenant with a `STR` or `BYTES` typed attribute column, an
+   erased subject's own value can sit verbatim in a `.cstat`. Erasure
+   does not rewrite that object in place; the rewrite pass and the fold
+   that follows it write new catalog objects and swap HEAD, which leaves
+   the stale `.cstat` unreferenced, and the unreferenced-catalog sweep is
+   the only mechanism that then removes it. A retention `R` on
+   `t/*/catalog/*/*` refuses that delete, so the physical-removal bound
+   for that value becomes `max(bound, R)`: a real `+R` erasure bound of
+   the same shape the commit records carry. An operator who wants the
+   immutability guarantee without that bound scopes the mechanism to
+   `catalog/<signal>/HEAD` alone, which is the object the immutability
+   argument above actually rests on.
+
+   The refusal is not confined to the locked object either. The sweep's
+   delete loop propagates the first refusal, so one locked object aborts
+   that `(tenant, signal)` pass and the unreferenced objects behind it in
+   the same pass are left in place too. The production driver logs the
+   failed pass and retries on the next maintenance tick, where the same
+   object refuses again, so collection of that `(tenant, signal)`'s
+   catalog garbage resumes only once `R` elapses. An operator who applies
+   the scoped posture to the whole catalog keyspace should therefore keep
+   `R` inside `protection_horizon` here for the same reason as for commit
+   records.
 
    **How the prefix scoping is achieved.** Object Lock has no prefix
    scope of its own. It is enabled once per bucket, at bucket creation,
