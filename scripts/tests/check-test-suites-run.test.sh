@@ -38,6 +38,20 @@ check_contains() {
   fi
 }
 
+# An unknown helper is a silent pass here: this file runs under `set -uo
+# pipefail` without `-e`, so a call to a function that does not exist prints
+# "command not found", increments nothing, and leaves the summary reading
+# green. That happened to `check_true`, copied in from a sibling suite that
+# defines it -- the assertion it guarded never ran at all.
+check_true() {
+  local label="$1" cond="$2"
+  if [[ "${cond}" == "1" ]]; then
+    pass=$((pass + 1)); printf 'ok    %s\n' "${label}"
+  else
+    fail=$((fail + 1)); printf 'FAIL  %s\n' "${label}"
+  fi
+}
+
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
@@ -92,7 +106,12 @@ commit_all "${d}"
 out="$(run_guard "${d}")"; rc=$?
 check_eq "an orphan suite fails (1)" "1" "${rc}"
 check_contains "and names it" "beta.test.sh" "${out}"
-check_contains "and does not name the wired one as an orphan" "ORPHAN    scripts/tests/beta.test.sh" "${out}"
+# Asserts the WIRED suite is absent from the output. The previous version
+# asserted the ORPHAN line for beta -- the orphan -- which is line above's
+# assertion with a prefix, and never mentioned alpha at all. A guard patched
+# to libel every wired suite as an orphan passed the whole file unchanged.
+check_true "and does not name the wired one as an orphan" \
+  "$([[ "${out}" != *"alpha.test.sh"* ]] && echo 1 || echo 0)"
 
 # --- a suite wired in a NON-ci workflow still counts --------------------
 # A nightly is a workflow. Requiring ci.yml specifically would push slow
@@ -142,6 +161,63 @@ commit_all "${d}"
 out="$( cd "${d}" && ./scripts/guards/check-test-suites-run.sh --list 2>&1 )"; rc=$?
 check_eq "--list exits 0 on a clean tree" "0" "${rc}"
 check_contains "--list names the wired suite" "run       scripts/tests/alpha.test.sh" "${out}"
+
+# --- a suite named only in a YAML comment is NOT run --------------------
+# A comment is not something running a suite. Matching the raw files made the
+# guard report a suite as covered when a workflow merely talked about it, and
+# the change that added this guard put two real suites into that state.
+# Mutation: match the files directly instead of the comment-stripped text.
+d="$(new_repo commentonly)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+add_suite "${d}" "scripts/tests/beta.test.sh"
+printf '      # we used to run scripts/tests/beta.test.sh here; removed for speed\n' \
+  >>"${d}/.github/workflows/ci.yml"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a suite named only in a comment is an orphan (1)" "1" "${rc}"
+check_contains "and is named as one" "ORPHAN    scripts/tests/beta.test.sh" "${out}"
+
+# A trailing comment on a real step does not disqualify that step.
+d="$(new_repo trailingcomment)"
+add_suite "${d}" "scripts/tests/alpha.test.sh"
+printf '      - run: bash scripts/tests/alpha.test.sh  # the important one\n' \
+  >>"${d}/.github/workflows/ci.yml"
+commit_all "${d}"
+out="$(run_guard "${d}")"; rc=$?
+check_eq "a step with a trailing comment still counts (0)" "0" "${rc}"
+
+# --- the exception branch ----------------------------------------------
+# Reachable only because the guard reads extra entries from the environment.
+# With the array literal as the only source, is_excepted and excepted_reason
+# were unreachable from here and a typo in the field split would ship green.
+# Mutation: change `${entry%%|*}` to `${entry%|*}` and the reason leaks into
+# the path comparison, failing the first case below.
+d="$(new_repo excepted)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+add_suite "${d}" "scripts/tests/slow.test.sh"
+commit_all "${d}"
+# The reason carries its own `|`, which is what makes the field split
+# observable: with a single separator `${entry%%|*}` and `${entry%|*}` return
+# the same string, so a case using a pipe-free reason cannot tell a greedy
+# split from a lazy one.
+out="$( cd "${d}" && CHECK_TEST_SUITES_EXCEPTED='scripts/tests/slow.test.sh|needs a GPU | see #1234' \
+        ./scripts/guards/check-test-suites-run.sh 2>&1 )"; rc=$?
+check_eq "an excepted suite does not fail the guard (0)" "0" "${rc}"
+check_contains "and its whole reason is printed" "needs a GPU | see #1234" "${out}"
+# An exception must be visible without --list: the summary line is what a
+# reader uses to decide nothing is excluded.
+check_contains "and the summary says how many were excepted" "1 excepted above" "${out}"
+check_true "and the summary does not claim all are run" \
+  "$([[ "${out}" != *"all run by a workflow"* ]] && echo 1 || echo 0)"
+
+# An exception for a DIFFERENT suite does not cover this one.
+d="$(new_repo excepted_other)"
+add_suite "${d}" "scripts/tests/alpha.test.sh" wired
+add_suite "${d}" "scripts/tests/slow.test.sh"
+commit_all "${d}"
+out="$( cd "${d}" && CHECK_TEST_SUITES_EXCEPTED='scripts/tests/other.test.sh|unrelated' \
+        ./scripts/guards/check-test-suites-run.sh 2>&1 )"; rc=$?
+check_eq "an unrelated exception leaves the orphan failing (1)" "1" "${rc}"
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [[ ${fail} -eq 0 ]]
