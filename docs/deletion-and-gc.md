@@ -217,8 +217,23 @@ window would still call a Hit.
   selection entirely: no LIST of the `l0/` data prefix, and that pass's
   orphan and breaker figures (deleted, quarantined, quarantine-refused, and
   the breaker fields) are reported as zero rather than a value carried over
-  from the last tick that did run it. The L0 listing cost that used to be
-  paid every 300 s is now paid once per full-sweep interval instead. The
+  from the last tick that did run it. Those zeros mean "the rule did not
+  run", not "the rule looked and found nothing", and the two are
+  indistinguishable from the counts alone, so the report records which pass
+  it was and a consumer that keeps a last-observed-value gauge must not
+  publish the skipped kind. The `ravel_maintain_orphans_present` and
+  `ravel_maintain_orphans_withheld` gauges are therefore written only by a
+  pass that ran the rule: they report the last completed orphan pass and are
+  refreshed once per full-sweep interval rather than reset to zero by every
+  tick in between. Publishing the zeros would silently disable the
+  `orphans_present > 0 for 12h` alert
+  (`docs/guides/operations/troubleshooting.md`), since on the defaults 71 of
+  every 72 ticks skip the rule. The per-pass counters
+  (`orphans_quarantined`, `orphans_quarantine_refused`, `quarantine_reaped`,
+  and the breaker-trip counter) are unaffected: a skipped pass adds zero,
+  which is the truth about the events it performed. The L0 listing cost that
+  used to be paid every 300 s is now paid once per full-sweep interval
+  instead. The
   quarantine reaper (a different rule, over the separate `quarantine/`
   prefix) is unaffected and still runs every tick, so objects already
   quarantined keep aging out on schedule. The key layout of `l0/` and

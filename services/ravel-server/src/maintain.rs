@@ -5542,6 +5542,229 @@ mod tests {
         assert_eq!(safety.quarantine_reaped(Signal::Logs), 0);
     }
 
+    /// The `/metrics` body one scrape would return with `safety` as its only
+    /// populated family. Asserting on this rather than on the accessors is
+    /// what makes a gauge test speak about the sample an operator's alert
+    /// rule reads.
+    fn rendered_metrics(safety: &MaintenanceSafetyMetrics) -> String {
+        let snapshot = crate::metrics::MaintenanceSafetySnapshot::from_metrics(safety);
+        crate::metrics::render(
+            crate::config::Mode::Maintain,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &crate::metrics::CatalogCountersSnapshot::default(),
+            None,
+            Some(&snapshot),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::metrics::AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            crate::metrics::IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::metrics::MemoryBudgetSnapshot::default(),
+        )
+    }
+
+    /// An `OrphanPass::Skip` pass never ran rule 1, so its zero orphan figures
+    /// are structural, not a measurement: they must not reach the
+    /// `ravel_maintain_orphans_present` gauge. Since the orphan-cadence split
+    /// (issue #1734) that is 71 of every 72 ticks on the defaults (300 s tick,
+    /// 6 h `interior_reverify_ns`), so a `Skip` pass that stores its zeros
+    /// resets the gauge within one tick of every nonzero sample and the
+    /// `> 0 for 12h` alert in `docs/guides/operations/troubleshooting.md` can
+    /// never fire.
+    ///
+    /// The `Skip` reports come from `sweep_shard_zoned_with_holds`, the same
+    /// call `run_tick_with_clock` makes on a non-due tick, so a change to what
+    /// a skipped pass reports is exercised here rather than frozen into a
+    /// hand-built literal.
+    ///
+    /// Flip to watch it fail: drop the `report.orphan_pass == OrphanPass::Run`
+    /// guard in `record_sweep` (i.e. store both gauges unconditionally, as
+    /// this branch did before the fix). The rendered gauge reads 0 after the
+    /// first skipped pass instead of 7.
+    #[tokio::test]
+    async fn skip_pass_does_not_clear_the_orphans_present_gauge() {
+        let store = MemoryStore::new();
+        let clock = ravel_maintain::FixedClock::new(1_000);
+        let compactor = CompactorConfig::default();
+        let tenant = TenantId::new("acme").hash();
+        let safety = MaintenanceSafetyMetrics::default();
+
+        // One pass that really ran rule 1 and found seven candidates present.
+        safety.record_sweep(Signal::Metrics, &sweep_report(false, 0, 7));
+        assert!(
+            rendered_metrics(&safety)
+                .contains("ravel_maintain_orphans_present{mode=\"maintain\",signal=\"metrics\"} 7"),
+            "the measuring pass publishes its count"
+        );
+
+        // Several ticks' worth of skipped passes over an empty shard.
+        for _ in 0..5 {
+            let (skipped, _holds) = ravel_maintain::sweep_shard_zoned_with_holds(
+                &store,
+                &clock,
+                &compactor,
+                &ravel_maintain::NoLeases,
+                &tenant,
+                Signal::Metrics,
+                0,
+                &[],
+                OrphanPass::Skip,
+            )
+            .await
+            .expect("zoned sweep with rule 1 skipped");
+            assert_eq!(
+                orphans_present_total(&skipped),
+                0,
+                "a skipped pass reports structural zeros; that is the input this test is about"
+            );
+            safety.record_sweep(Signal::Metrics, &skipped);
+        }
+
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains("ravel_maintain_orphans_present{mode=\"maintain\",signal=\"metrics\"} 7"),
+            "five skipped passes must leave the last measured count of 7 standing:\n{body}"
+        );
+
+        // The withheld gauge is written by the same two lines and carries the
+        // same defect, so it is pinned the same way: a tripped measuring pass,
+        // then skipped passes that must not erase it.
+        safety.record_sweep(Signal::Metrics, &sweep_report(true, 55, 0));
+        for _ in 0..5 {
+            let (skipped, _holds) = ravel_maintain::sweep_shard_zoned_with_holds(
+                &store,
+                &clock,
+                &compactor,
+                &ravel_maintain::NoLeases,
+                &tenant,
+                Signal::Metrics,
+                0,
+                &[],
+                OrphanPass::Skip,
+            )
+            .await
+            .expect("zoned sweep with rule 1 skipped");
+            safety.record_sweep(Signal::Metrics, &skipped);
+        }
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains(
+                "ravel_maintain_orphans_withheld{mode=\"maintain\",signal=\"metrics\"} 55"
+            ),
+            "skipped passes must not erase the withheld count either:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_orphans_present{mode=\"maintain\",signal=\"metrics\"} 55"
+            ),
+            "and the tripped pass's present total stands too:\n{body}"
+        );
+    }
+
+    /// The gauges are per signal while `record_sweep` runs once per shard, so
+    /// the rule above has to hold across the units of a single tick as well:
+    /// a unit that skipped rule 1 must not clear what a unit that ran it just
+    /// measured, whichever order the unit loop visits them in.
+    ///
+    /// Drives the real `run_tick_with_clock` over two shards of one signal.
+    /// Shard 0 has one record-less L0 data object past the orphan age gate and
+    /// a cold memo, so it takes the full-sweep branch and measures one orphan
+    /// present. Shard 1's memo is primed with a full sweep at this tick's own
+    /// `now`, so it takes the zoned `OrphanPass::Skip` branch. `run_bounded`
+    /// preserves ascending shard order in its results, so the accounting loop
+    /// sees the measuring unit first and the skipping unit second: the order
+    /// in which a last-write-wins gauge loses the measurement.
+    ///
+    /// Flip to watch it fail: drop the `report.orphan_pass == OrphanPass::Run`
+    /// guard in `record_sweep`. Shard 1's structural zero lands after shard
+    /// 0's measurement and the rendered gauge reads 0 instead of 1.
+    #[tokio::test]
+    async fn a_skip_unit_does_not_clear_a_run_unit_in_the_same_tick() {
+        const SHARDS: u32 = 2;
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let store = MemoryStore::new();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+
+        // One L0 data object in shard 0 with no commit record anywhere: an
+        // orphan candidate, as soon as the clock puts it past the age gate.
+        let orphan_key = keys::data_key(
+            &tenant,
+            Signal::Metrics,
+            0,
+            Uuid::from_u128(7),
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .expect("orphan data key");
+        store
+            .put(
+                &orphan_key,
+                bytes::Bytes::from_static(b"orphaned flush"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed the orphan");
+
+        // `MemoryStore` stamps `last_modified` from its own clock, which
+        // starts at 0, so one nanosecond past the gate is past it.
+        let now = compactor.orphan_age_gate_ns() + 1;
+        let clock = ravel_maintain::FixedClock::new(now);
+
+        let mut memo = MaintainMemo::with_default_interval();
+        // Shard 1 swept fully at this same instant: not due again this tick.
+        memo.record_full_sweep(tenant, Signal::Metrics, 1, now);
+
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains("ravel_maintain_orphans_present{mode=\"maintain\",signal=\"metrics\"} 1"),
+            "shard 0 measured one orphan present; shard 1's skipped pass in the same tick \
+             must not clear it:\n{body}"
+        );
+        assert_eq!(
+            safety.orphans_quarantined(Signal::Metrics),
+            1,
+            "the measuring unit really did run rule 1 and quarantine the orphan"
+        );
+    }
+
     /// A store wrapper that instruments `list_delimited` -- the call
     /// `scan_and_maintain_with_memo` makes first, via `list_shard_hours`,
     /// before touching anything else for a unit -- with a run of
