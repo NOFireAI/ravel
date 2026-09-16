@@ -4478,4 +4478,82 @@ mod tick_tests {
             "a standby replica is alive; its liveness gauge must keep advancing"
         );
     }
+
+    /// A store that fails the lease write is a failure, not the healthy standby
+    /// state the test above pins: it must count under its own outcome and leave
+    /// the liveness gauge where the last completed tick left it, because the
+    /// recommended operator alert keys on exactly this series. The fault is
+    /// `Transient`, which reaches `acquire_lease`'s catch-all `Err` arm; a
+    /// `FailedConditionalWrite` would surface as `AlreadyExists` and be
+    /// swallowed into the lease-not-held path instead. Both ticks fold into one
+    /// handle, as every tenant's evaluator does in a real process.
+    #[tokio::test]
+    async fn a_lease_unavailable_tick_records_the_store_failure() {
+        let metrics = Arc::new(AlertMetrics::default());
+        let tenant = TenantId::new(TENANT).hash();
+
+        let mut healthy = evaluator_with(
+            seeded_store().await,
+            TestClock::at(NOW_NS),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+        assert!(
+            !healthy.run_tick().await.lease_unavailable,
+            "the first tick holds the lease on a healthy store"
+        );
+
+        // Scoped to the lease key, so the state memo (`t/<hex>/a/state/latest`)
+        // and every commit-record put still succeed and only the lease write
+        // fails.
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::Put,
+                ScriptedFault::Transient("alert lease write unavailable".into()),
+            )
+            .with_key_contains(alert_lease_key(&tenant))
+            .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(seeded_store().await, plan));
+        let broken: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let mut dead = evaluator_with(
+            broken,
+            TestClock::at(NOW_NS + 3_600 * NS_PER_SEC),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+
+        let report = dead.run_tick().await;
+        // Whole-struct, not an `assert!` on the flag: `outcome` tests
+        // `lease_unavailable` before `lease_not_held`, so a build that set both
+        // would still count `LeaseUnavailable` and only this compare catches it.
+        assert_eq!(
+            report,
+            AlertEvalReport {
+                lease_unavailable: true,
+                ..Default::default()
+            },
+            "a failed lease write is a store failure and nothing else: no rule \
+             ran, and the tick is not the healthy lease-not-held state"
+        );
+
+        assert!(
+            fault.fault_count(Op::Put, FaultKind::Transient) >= 1,
+            "the injected lease-write fault actually fired"
+        );
+        assert_eq!(metrics.ticks(AlertTickOutcome::LeaseUnavailable), 1);
+        assert_eq!(metrics.ticks(AlertTickOutcome::Evaluated), 1);
+        assert_eq!(
+            metrics.ticks(AlertTickOutcome::LeaseNotHeld),
+            0,
+            "a store failure is not a peer holding the lease"
+        );
+        assert_eq!(metrics.ticks(AlertTickOutcome::HistoryUnavailable), 0);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "the gauge still carries the first tick's reading: a tick that could \
+             not reach the store must not look alive"
+        );
+    }
 }
