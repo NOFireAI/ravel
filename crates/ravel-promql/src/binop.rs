@@ -34,7 +34,8 @@
 //! `h + h` and `h - h` align their operands first, as every other combining
 //! caller in [`crate::histogram`] does: an exponential/custom-buckets mix, or
 //! two custom-buckets histograms with different bounds, cannot be combined at
-//! all and drops with an info annotation; two exponential histograms at
+//! all and drops with a warning annotation (the incompatible-bucket-layout
+//! warning, one text for both shapes); two exponential histograms at
 //! different scales are both down-converted to the coarser scale before the
 //! buckets are merged. Stored data really does mix scales within one series
 //! (RSEG down-converts a flush whose bucket count exceeds its limit), so this
@@ -181,21 +182,27 @@ fn incompatible_types_info(op: TokenId, lhs_is_histogram: bool, rhs_is_histogram
     )
 }
 
-/// Prometheus' `histogram.ErrHistogramsIncompatibleSchema` text: `+`/`-`
-/// between an exponential-schema histogram and a custom-buckets one has no
-/// defined result, so the sample drops and this is raised.
-const MIXED_SCHEMAS_INFO: &str = "cannot apply this operation on histograms with a mix of \
-                                  exponential and custom bucket schemas";
-
-/// Prometheus' `histogram.ErrHistogramsIncompatibleBounds` text: two
-/// custom-bucket histograms whose boundaries differ have no common bucket
-/// layout to merge into, so the sample drops and this is raised.
-const INCOMPATIBLE_BOUNDS_INFO: &str = "cannot apply this operation on custom buckets histograms \
-                                        with different custom bounds";
+/// Prometheus' `IncompatibleBucketLayoutInBinOpWarning` message: `+`/`-`
+/// between two histograms with no common bucket layout has no defined result,
+/// so the sample drops and this is raised.
+///
+/// Prometheus raises one annotation for both unalignable shapes. Its
+/// `VectorBinop` catches `ErrHistogramsIncompatibleSchema` and
+/// `ErrHistogramsIncompatibleBounds` from `FloatHistogram.Add`/`Sub` and calls
+/// `NewIncompatibleBucketLayoutInBinOpWarning(op)` for either, on the warnings
+/// channel rather than the infos one. Rendered in the same convention as
+/// [`incompatible_types_info`]: Prometheus' channel prefix and position suffix
+/// are dropped, the operator symbol is kept.
+fn incompatible_bucket_layout_warning(op: TokenId) -> String {
+    format!(
+        "incompatible bucket layout encountered for binary operator {}",
+        op_symbol(op)
+    )
+}
 
 /// Establish [`FloatHistogram::add_assign`]/[`FloatHistogram::sub_assign`]'s
 /// precondition for a `h + h` / `h - h` pair, returning the two operands to
-/// combine or the info text for a pair that cannot be combined at all.
+/// combine or `None` for a pair that cannot be combined at all.
 ///
 /// `combine` merges by absolute bucket index and keeps the receiver's scale,
 /// so two operands at different scales would otherwise add bucket `i` to
@@ -204,26 +211,30 @@ const INCOMPATIBLE_BOUNDS_INFO: &str = "cannot apply this operation on custom bu
 /// exactly as [`crate::histogram::sum_histograms`] and
 /// [`crate::histogram::histogram_rate`] do. Custom-bucket histograms cannot be
 /// rescaled, so the two unalignable shapes Prometheus rejects outright (a mix
-/// of the two schema families, and differing custom bounds) drop instead.
+/// of the two schema families, and differing custom bounds) drop instead. The
+/// caller raises one [`incompatible_bucket_layout_warning`] for either, which
+/// is the single annotation Prometheus raises for both.
 ///
 /// A differing `zero_threshold` is NOT reconciled here: no caller in this
-/// crate does, and doing so is Prometheus' separate `reconcileZeroBuckets`
-/// pass rather than part of schema alignment.
+/// crate does. Prometheus reconciles one inside `FloatHistogram.Add`/`Sub`
+/// themselves (`reconcileZeroBuckets`, called before the buckets are merged),
+/// not as a caller-side alignment step, so two operands with different zero
+/// thresholds combine their zero counts here as if the thresholds matched.
 fn align_histogram_operands(
     lhs: &FloatHistogram,
     rhs: &FloatHistogram,
-) -> Result<(FloatHistogram, FloatHistogram), &'static str> {
+) -> Option<(FloatHistogram, FloatHistogram)> {
     if lhs.uses_custom_buckets() != rhs.uses_custom_buckets() {
-        return Err(MIXED_SCHEMAS_INFO);
+        return None;
     }
     if lhs.uses_custom_buckets() {
         if !lhs.custom_bounds_match(rhs) {
-            return Err(INCOMPATIBLE_BOUNDS_INFO);
+            return None;
         }
-        return Ok((lhs.clone(), rhs.clone()));
+        return Some((lhs.clone(), rhs.clone()));
     }
     let scale = lhs.scale.min(rhs.scale);
-    Ok((lhs.copy_to_scale(scale), rhs.copy_to_scale(scale)))
+    Some((lhs.copy_to_scale(scale), rhs.copy_to_scale(scale)))
 }
 
 /// The outcome of combining one matched (or scalar-paired) sample: a plain
@@ -322,8 +333,8 @@ fn eval_scalar_scalar(op: TokenId, l: f64, r: f64) -> f64 {
 /// pairing that carries a histogram drops the sample and raises an info
 /// annotation. A filter-mode comparison that does not hold drops without an
 /// annotation, exactly as for floats. The two combining arms (`+`, `-`) run
-/// [`align_histogram_operands`] first, which is where a pair that shares no
-/// bucket layout drops with its own annotation.
+/// [`align_histogram_operands`] first; a pair that shares no bucket layout
+/// drops there with its own warning annotation instead.
 fn combine_value(
     op: TokenId,
     lhs: (f64, Option<&FloatHistogram>),
@@ -375,7 +386,7 @@ fn combine_value(
         match (op, lh, rh) {
             (_, None, None) => Combined::Value(apply_arith(op, lv, rv)),
             (T_ADD | T_SUB, Some(a), Some(b)) => match align_histogram_operands(a, b) {
-                Ok((mut out, other)) => {
+                Some((mut out, other)) => {
                     if op == T_ADD {
                         out.add_assign(&other);
                     } else {
@@ -383,8 +394,8 @@ fn combine_value(
                     }
                     Combined::Histogram(out)
                 }
-                Err(message) => {
-                    ctx.info(message);
+                None => {
+                    ctx.warn(incompatible_bucket_layout_warning(op));
                     Combined::Drop
                 }
             },
@@ -1402,8 +1413,10 @@ mod tests {
 
     /// Issue #1700 fix round: a custom-buckets histogram and an
     /// exponential-schema one have no common bucket layout, so `h + h` drops
-    /// the sample and raises exactly one info, matching Prometheus'
-    /// `ErrHistogramsIncompatibleSchema` drop-and-annotate.
+    /// the sample and raises exactly one warning. Prometheus' `VectorBinop`
+    /// catches `ErrHistogramsIncompatibleSchema` from `FloatHistogram.Add` and
+    /// answers with the incompatible-bucket-layout warning, on the warnings
+    /// channel, so nothing lands on the infos channel here.
     #[test]
     fn addition_of_a_custom_buckets_and_exponential_pair_drops_and_annotates() {
         let src = TestSource::new()
@@ -1428,22 +1441,22 @@ mod tests {
             "a custom-buckets and exponential pair cannot be combined"
         );
         assert_eq!(
-            annotations.infos(),
-            [
-                "cannot apply this operation on histograms with a mix of exponential \
-                 and custom bucket schemas"
-            ],
-            "exactly one info, carrying Prometheus' incompatible-schema wording"
+            annotations.warnings(),
+            ["incompatible bucket layout encountered for binary operator +"],
+            "exactly one warning, carrying Prometheus' \
+             IncompatibleBucketLayoutInBinOpWarning wording"
         );
         assert!(
-            annotations.warnings().is_empty(),
-            "the drop is an info, not a warning"
+            annotations.infos().is_empty(),
+            "the drop is a warning, not an info"
         );
     }
 
     /// Issue #1700 fix round: two custom-buckets histograms whose boundaries
     /// differ have no shared layout either, and `-` drops them the same way
-    /// `+` does (Prometheus' `ErrHistogramsIncompatibleBounds`).
+    /// `+` does. Prometheus answers `ErrHistogramsIncompatibleBounds` with the
+    /// same one warning it uses for the incompatible-schema case, so only the
+    /// operator symbol differs from the `+` test above.
     #[test]
     fn subtraction_of_custom_buckets_with_different_bounds_drops_and_annotates() {
         let src = TestSource::new()
@@ -1465,12 +1478,61 @@ mod tests {
         };
         assert!(v.is_empty(), "different custom bounds cannot be combined");
         assert_eq!(
-            annotations.infos(),
-            [
-                "cannot apply this operation on custom buckets histograms with \
-                 different custom bounds"
-            ],
-            "exactly one info, carrying Prometheus' incompatible-bounds wording"
+            annotations.warnings(),
+            ["incompatible bucket layout encountered for binary operator -"],
+            "exactly one warning, carrying Prometheus' \
+             IncompatibleBucketLayoutInBinOpWarning wording"
+        );
+        assert!(
+            annotations.infos().is_empty(),
+            "the drop is a warning, not an info"
+        );
+    }
+
+    /// Issue #1700 second fix round: `h - h` subtracts zero counts like any
+    /// other population, so a right operand with the larger zero count leaves
+    /// the result's `zero_count` negative. `all_buckets` gates the zero bucket
+    /// on a strictly positive count, as Prometheus' `allFloatBucketIterator`
+    /// does, so the negative zero bucket is not rendered at all. No corpus cell
+    /// can express this: both difftest histogram fixtures carry a constant
+    /// `zero_count` of 1, so every corpus `h - h` cancels to exactly zero.
+    #[test]
+    fn subtraction_leaving_a_negative_zero_count_renders_no_zero_bucket() {
+        let mut small = nh_at_scale(0, &[1.0]);
+        small.zero_threshold = 0.5;
+        small.zero_count = 1.0;
+        small.count += 1.0;
+        let mut large = nh_at_scale(0, &[1.0]);
+        large.zero_threshold = 0.5;
+        large.zero_count = 4.0;
+        large.count += 4.0;
+        let src = TestSource::new()
+            .with_histogram_series(&[("__name__", "hs"), ("job", "x")], &[(0, small)])
+            .expect("valid histogram series")
+            .with_histogram_series(&[("__name__", "hl"), ("job", "x")], &[(0, large)])
+            .expect("valid histogram series");
+        let (value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&src, "hs - hl", 0)
+            .expect("two aligned exponential histograms must subtract");
+        let Value::Vector(v) = value else {
+            panic!("expected a vector result");
+        };
+        assert_eq!(v.len(), 1);
+        assert!(
+            annotations.is_empty(),
+            "an alignable pair raises no annotation"
+        );
+        let h = v[0]
+            .histogram
+            .as_ref()
+            .expect("the result element must carry a histogram");
+        assert_eq!(h.zero_count, -3.0, "1 - 4, subtracted like any population");
+        assert!(
+            h.all_buckets()
+                .iter()
+                .all(|b| !(b.lower == -0.5 && b.upper == 0.5)),
+            "a non-positive zero count renders no zero bucket, got {:?}",
+            h.all_buckets()
         );
     }
 

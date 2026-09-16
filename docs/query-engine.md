@@ -2526,8 +2526,12 @@ histograms unchanged and are outside this split.
 `h + h` and `h - h` align their two operands before merging buckets. An
 exponential-schema histogram paired with a custom-buckets (NHCB) one, or two
 custom-buckets histograms with different bounds, have no common bucket layout:
-the sample drops with an info annotation, which is what Prometheus does with
-`ErrHistogramsIncompatibleSchema` and `ErrHistogramsIncompatibleBounds`. Two
+the sample drops with one warning annotation on the response's `warnings`
+channel, reading `incompatible bucket layout encountered for binary operator
+<op>`. Prometheus raises that same single warning for both shapes, catching
+`ErrHistogramsIncompatibleSchema` and `ErrHistogramsIncompatibleBounds` from
+`FloatHistogram.Add`/`Sub` and answering either with
+`NewIncompatibleBucketLayoutInBinOpWarning`. Two
 exponential histograms at different schemas are both down-converted to the
 coarser one first, so each bucket index means the same value range on both
 sides; the result carries the coarser schema. That is not a corner case:

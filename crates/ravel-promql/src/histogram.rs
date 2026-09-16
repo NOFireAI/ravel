@@ -13,25 +13,31 @@
 //! ## Exactness status (read this before trusting the numbers)
 //!
 //! ADR-0021 requires mirroring Prometheus' float algorithms operation-for-
-//! operation, verified by the differential gate. That differential gate
-//! cannot run yet: no native-histogram sample can reach Ravel's evaluator,
-//! because the query read path and the ingest path are still f64-only (see
-//! the `histogram_native` corpus header). Every
-//! algorithm here is therefore a structural port of Prometheus'
-//! `model/histogram` and `promql/quantile.go`/`functions.go`, checked
-//! against hand-computed fixtures rather than a live Prometheus. Two known
-//! residues, to be resolved to ADR-0025 allowlist entries or exact ports once
-//! the gate exists:
+//! operation, verified by the differential gate. That gate now runs: native
+//! histograms flow ingest -> storage -> query -> evaluator, and the
+//! `histogram_native` corpus diffs 33 native-histogram cells against the
+//! pinned Prometheus binary, with the `binop.txt` histogram cells covering the
+//! binary operators on top. Algorithms without a corpus cell to cover them are
+//! still structural ports of Prometheus' `model/histogram` and
+//! `promql/quantile.go`/`functions.go` checked against hand-computed fixtures.
+//! Two known residues, to be resolved to ADR-0025 allowlist entries or exact
+//! ports:
 //!
 //! * `bucket_bound` computes `2^(idx * 2^-scale)` arithmetically. Prometheus
 //!   uses hard-coded `exponentialBounds` tables for `scale > 0` for bit-exact
 //!   bounds; the arithmetic form may differ by a ULP for fractional
-//!   exponents. `scale <= 0` bounds are exact powers of two and match.
+//!   exponents. `scale <= 0` bounds are exact powers of two and match. The
+//!   corpus dataset is schema 0 throughout, so no cell exercises this.
 //! * Differing zero-thresholds between two operands of `add`/`sub` are not
-//!   reconciled (Prometheus' `reconcileZeroBuckets`); operands are required to
-//!   share a zero-threshold. Every native-histogram code path that combines histograms
-//!   (rate windows, aggregation groups) operates on one producer's series, so
-//!   this holds in practice, but it is not the general Prometheus behavior.
+//!   reconciled. Prometheus reconciles them inside `FloatHistogram.Add`/`Sub`
+//!   themselves (`reconcileZeroBuckets`, which widens the zero bucket to the
+//!   larger threshold and folds the buckets it swallows into it); Ravel's
+//!   `FloatHistogram::combine` adds the two zero counts as they stand, as if
+//!   the thresholds matched. `h + h` and `h - h` over two independently
+//!   produced series reach this, so the "one producer, one threshold" argument
+//!   that used to cover the rate-window and aggregation-group callers no
+//!   longer holds for the crate as a whole. The corpus does not catch it: the
+//!   dataset's histogram series carry a uniform zero bucket.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
