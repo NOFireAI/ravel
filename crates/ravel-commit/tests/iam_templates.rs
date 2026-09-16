@@ -6025,24 +6025,35 @@ const CATALOG_SWEEP_DOC_CLAIMS: &[(&str, &[&str], &[&str])] = &[
     ),
     (
         "docs/deletion-and-gc.md",
-        &["unreferenced-catalog sweep", "distinct-value dictionary"],
+        CATALOG_CONSEQUENCE_AND_POINTER,
         CATALOG_SUBJECT_VALUE_RETIRED,
     ),
     (
         "docs/guides/disaster-recovery.md",
-        &["unreferenced-catalog sweep", "distinct-value dictionary"],
+        CATALOG_CONSEQUENCE_AND_POINTER,
         CATALOG_SUBJECT_VALUE_RETIRED,
     ),
     (
         "docs/guides/operations/deployment.md",
-        &["unreferenced-catalog sweep", "distinct-value dictionary"],
+        CATALOG_CONSEQUENCE_AND_POINTER,
         CATALOG_SUBJECT_VALUE_RETIRED,
     ),
     (
         "docs/consistency-model.md",
-        &["unreferenced-catalog sweep", "distinct-value dictionary"],
+        CATALOG_CONSEQUENCE_AND_POINTER,
         CATALOG_SUBJECT_VALUE_RETIRED,
     ),
+];
+
+/// The four non-normative restatements now carry only the operator-facing
+/// consequence of a lock on the catalog family and a pointer, by heading, to
+/// the object store contract that owns the full mechanism. Requiring both
+/// anchors keeps each file from silently dropping the erasure-cost consequence
+/// or the pointer: removing the pointer from any one file fails the presence
+/// assertion for that row.
+const CATALOG_CONSEQUENCE_AND_POINTER: &[&str] = &[
+    "costs an erasure obligation",
+    "A lock on the catalog family",
 ];
 
 /// Phrases no doc may carry again. The first group is the "a maintenance sweep

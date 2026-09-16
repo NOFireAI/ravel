@@ -54,50 +54,22 @@ pauses for the difference. Keep that retention period short enough for the
 sweeps to keep making progress; see the object store contract's "Required
 bucket configuration" for the bound.
 
-The catalog keyspace carries a cost of its own, from a fourth mechanism. The
-unreferenced-catalog sweep deletes the snapshot and index objects under
-`t/*/catalog/*/snap/` and `t/*/catalog/*/idx/` that the current HEAD no longer
-names, once they are older than the protection horizon. A retention covering
-the whole keyspace refuses those deletes until it elapses, and the sweep's
-delete loop stops at the first refusal, so the rest of that tenant and
-signal's unreferenced catalog objects are left behind as well and the next
-maintenance tick retries.
-
-For the HEAD pointer, the snapshot entries and the name postings, that is a
-reclamation delay: they hold identities, hashes, counts, timestamps and metric
-names, no label or attribute value. The per-part column-statistics objects
-under `idx/` are different. When a tenant declares an attribute key such as
-`user.id` as a typed string or bytes column, the fold records that column's
-exact minimum, exact maximum and exact distinct-value dictionary into the
-column-statistics object for each part (the dictionary only up to a fixed
-entry cap; the minimum and maximum always), so the subject's own value is
-stored verbatim.
-
-Erasure never rewrites that object, and it does not refresh the catalog
-either. The erasure rewrite publishes new data objects and a rewrite record;
-nothing in it folds the tenant catalog. The catalog picks the rewrite up only
-when the fold reconciles that hour, through its fixed window or the
-retention-frontier band, or when an operator rebuilds HEAD. Until one of those
-runs, the live HEAD still names the pre-rewrite part, so that part's
-column-statistics object is still referenced, is not a sweep candidate at all,
-and holds the erased value with no retention involved. Only after the
-reconcile or the rebuild does that object become unreferenced, and only then
-does the retention period start to matter. So for a tenant with a typed string
-or bytes attribute column the erasure bound is "until the fold reconciles that
-hour, then plus the retention period", not the retention period alone.
-
-Under the maintenance IAM policy Ravel ships, it is longer still. That policy
-denies the maintenance role every delete under the catalog keyspace, so the
-unreferenced column-statistics object is not deletable at all today, whatever
-retention period is chosen, and the bound stays open-ended until that policy
-changes. Scoping the mechanism to `catalog/<signal>/HEAD` alone, which is the
-object the immutability argument actually rests on, is necessary to remove the
-retention half of this but is not sufficient on its own. Keep the retention
-period inside the same window as for commit records. The scoped posture is
+The catalog keyspace carries a cost of its own, from a fourth mechanism. A
+compliance lock on `t/*/catalog/*/*` costs an erasure obligation, not only a
+reclamation delay. The unreferenced-catalog sweep deletes the snapshot and
+index objects the current HEAD no longer names, and for a tenant that declares
+a typed string or bytes attribute column a per-part column-statistics object
+among them holds that subject's own column value; a lock over the keyspace
+delays that delete, and the value persists until the fold reconciles that hour
+and then a further retention period. Under the maintenance IAM policy Ravel
+ships the delete is denied outright, so the bound stays open-ended until that
+policy changes. The four-step mechanism, the exact bound, the IAM ceiling and
+the HEAD-scoping advice are in the object store contract's "Required bucket
+configuration" section, "A lock on the catalog family". The scoped posture is
 therefore still not a disaster-recovery choice; it is the baseline the commit
 and catalog layers already assume, with the commit-record family carrying the
 sweep-delay cost above and the catalog family the sweep delay and, for those
-tenants, the erasure bound here.
+tenants, the erasure bound.
 
 Scoping the lock takes an operator-run mechanism, and it is a requirement of
 levels 0 and 1, not an optional extra. Level 2 replaces it with a bucket
@@ -126,17 +98,20 @@ or accept those sweeps pausing on a commit record until the period elapses.
 For the catalog keyspace the same window applies for a different reason: the
 unreferenced-catalog sweep deletes the snapshot and index objects the current
 HEAD no longer names, and a retention covering them pauses that sweep for the
-tenant and signal it fires on. The commit-record delay extends the erasure
-bound rather than only deferring reclamation: a locked commit record holds the
-superseded data behind it. The catalog delay does the same for a tenant with a
-typed string or bytes attribute column, and only for such a tenant: a locked
-column-statistics object holds that subject's own column value. For that
-tenant the catalog half is not bounded by the retention period alone. The
-stale object stays referenced, and so not a sweep candidate, until the fold
-reconciles that hour or an operator rebuilds HEAD, and the maintenance IAM
-policy Ravel ships denies the maintenance role every delete under the catalog
-keyspace, so the object is not deletable at all today and that half of the
-bound is open-ended until the policy changes.
+tenant and signal it fires on. A lock on a superseded *input* commit
+record extends the erasure bound rather than only deferring reclamation: the
+sweep deletes a chain's input commit records before the data they supersede,
+so a refusal there aborts the pass before the data-delete step and that data
+stays behind the locked record. A lock on a chain's own compaction or rewrite
+record does not hold data that way: by the time the sweep reaches those
+records it has already deleted the chain's inputs and their data, so the
+refusal only leaves the chain's own record in place until its retention
+elapses, and the crash-ordering guarantee that a rewrite record outlives its
+inputs is preserved. The catalog delay extends the bound too, for a tenant
+with a typed string or bytes attribute column and only for such a tenant; that
+cost, its exact bound and the shipped-IAM ceiling are in the object store
+contract's "Required bucket configuration" section, "A lock on the catalog
+family".
 
 | Mechanism | What it does | Coverage window |
 |---|---|---|

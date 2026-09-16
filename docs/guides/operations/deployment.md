@@ -86,45 +86,17 @@ contract page's "Required bucket configuration" names the default window to
 keep it inside.
 
 One of the other three families does carry a further cost, from a fourth
-mechanism. The catalog keyspace is swept: the unreferenced-catalog sweep
-deletes the snapshot and index objects under `t/*/catalog/*/snap/` and
-`t/*/catalog/*/idx/` that the current HEAD no longer names. A retention
-applied to the whole keyspace refuses those deletes until it elapses, and one
-refused delete aborts that pass for the tenant and signal it was running on,
-so the rest of that pass's garbage is left behind too and the next tick
-retries.
-
-Whether that is only a maintenance cost depends on the tenant. The catalog
-HEAD, the snapshot entries and the name postings hold identities, hashes,
-counts, timestamps and metric names, so for them the retention delays
-reclamation. The per-part column-statistics objects under `idx/` are the
-exception: when a tenant declares an attribute key such as `user.id` as a
-typed string or bytes column, the fold stores that column's exact minimum,
-exact maximum and exact distinct-value dictionary (the dictionary only up to
-a fixed entry cap; the minimum and maximum always), so a subject's own value
-is held verbatim.
-
-Erasure does not rewrite that object, and it does not refresh the catalog
-either. The erasure rewrite publishes new data objects and a rewrite record;
-nothing in it folds the tenant catalog. The catalog picks the rewrite up only
-when the fold reconciles that hour, through its fixed window or the
-retention-frontier band, or when an operator rebuilds HEAD. Until one of those
-runs, the live HEAD still names the pre-rewrite part, so that part's
-column-statistics object is still referenced, is not a sweep candidate, and
-holds the erased value with no retention involved. Only afterwards does the
-object become unreferenced and the retention period start to matter. So for a
-tenant with a typed string or bytes attribute column the erasure bound is
-"until the fold reconciles that hour, then plus the retention period", not the
-retention period alone.
-
-Today it is open-ended instead. The maintenance IAM policy Ravel ships denies
-the maintenance role every delete under the catalog keyspace, so even the
-unreferenced column-statistics object cannot be deleted, whatever retention
-period is chosen, until that policy changes. Keep the retention period inside
-the same window as for commit records, and scope the mechanism to
-`catalog/<signal>/HEAD` alone if the retention half of that bound is
-unacceptable; that scoping is necessary but not sufficient while the policy
-denies the delete.
+mechanism: a compliance lock on `t/*/catalog/*/*` there
+costs an erasure obligation, not only a reclamation delay. The unreferenced-catalog sweep
+deletes the snapshot and index objects the current HEAD no longer names, and
+for a tenant that declares a typed string or bytes attribute column a per-part
+column-statistics object among them holds that subject's own column value; a
+lock over the keyspace delays that delete, and the value persists until the
+fold reconciles that hour and then a further retention period. The maintenance
+IAM policy Ravel ships denies that delete outright, so the bound is open-ended
+until the policy changes. The four-step mechanism, the exact bound, the IAM
+ceiling and the HEAD-scoping advice are in the contract page's "Required
+bucket configuration" section, "A lock on the catalog family".
 
 **One lifecycle rule is not optional for any bucket Ravel writes to.**
 Configure `AbortIncompleteMultipartUpload` with a cleanup period of seven days
