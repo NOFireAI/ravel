@@ -589,18 +589,6 @@ pub static REGISTRY: &[Construct] = &[
          200; distinct from the subquery-over-histograms refusal, which \
          triggers inside `eval_subquery_matrix`",
     ),
-    rejected_modifier(
-        "binary operator over native histograms",
-        "Unsupported: binary operator over native histograms (422 execution)",
-        "the binop evaluator (`combine_value` and its callers) only ever \
-         reads a sample's plain float `value`, which is a meaningless 0.0 \
-         placeholder for a histogram element (issue #524); guarded before \
-         any value combination so the fabricated-zero result is never \
-         produced. `corpus/binop.txt`'s `error_*_over_histogram` entries \
-         (mode: ravel_error_prom_success) additionally pin that Prometheus \
-         itself succeeds here, so this is a real capability gap, not a \
-         shared limitation",
-    ),
     // ---- Binary operators ----
     binop("+", corpus("corpus/binop.txt")),
     binop("-", corpus("corpus/binop.txt")),
@@ -805,13 +793,6 @@ pub static REJECTION_CASES: &[RejectionCase] = &[
         eval: RejectionEval::Instant,
         time_offset_ms: 600_000,
         message_contains: "subquery over native histograms",
-    },
-    RejectionCase {
-        construct: "binary operator over native histograms",
-        query: "diff_native_hist * 2",
-        eval: RejectionEval::Instant,
-        time_offset_ms: 0,
-        message_contains: "binary operator over native histograms",
     },
     RejectionCase {
         // +600s so the instant query's window matches the generated histogram
