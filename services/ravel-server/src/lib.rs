@@ -262,12 +262,12 @@ fn multi_tenant_resolver_reason(
         let alert_only = all.len() - from_tokens.len();
         return Some(if alert_only == 0 {
             format!(
-                "{} distinct --tenant-token tenants are configured",
+                "{} distinct static bearer tenants are configured",
                 from_tokens.len()
             )
         } else {
             format!(
-                "{} distinct local tenants are configured: {} from --tenant-token and \
+                "{} distinct local tenants are configured: {} from the static bearer map and \
                  {alert_only} named only in --alert-rules-file",
                 all.len(),
                 from_tokens.len()

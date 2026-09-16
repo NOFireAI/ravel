@@ -84,7 +84,7 @@ fn refusing_unmapped_remote_clusters_when_multiple_tenants_resolve() {
         "error must name the multi-tenant exposure, got: {msg:?}"
     );
     assert!(
-        msg.contains("2 distinct --tenant-token tenants are configured"),
+        msg.contains("2 distinct static bearer tenants are configured"),
         "error must name the resolver reason (two distinct tenants), got: {msg:?}"
     );
     assert!(

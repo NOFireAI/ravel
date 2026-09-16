@@ -33,7 +33,8 @@ It needs a backend that reports the `multipart` capability, and it serves no
 ingest or query routes. It still binds `--listen-http` for liveness.
 
 `--maintain-tenant <name>`, repeatable, names a tenant this process maintains in
-addition to every tenant named by `--tenant-token`. It is required for a
+addition to every tenant named by `--tenant-token` or `--tenant-token-file`.
+It is required for a
 deployment that authenticates through OIDC or mTLS, because those tenants are
 only known once a request arrives and maintenance has no other way to learn
 about them.

@@ -369,16 +369,18 @@ local tenant refuses to start with an unmapped remote cluster**, naming every
 spec that needs a `tenant`. A coordinator runs queries for more than one local
 tenant when:
 
-- two or more `--tenant-token` values name different tenants, or
-- `--alert-rules-file` names a tenant that the `--tenant-token` values do not,
+- two or more `--tenant-token` values or `--tenant-token-file` lines name
+  different tenants, or
+- `--alert-rules-file` names a tenant that no `--tenant-token` value or
+  `--tenant-token-file` line does,
   since one alert evaluator runs per tenant in that file and its queries go
   through the same engine, or
 - any dynamic resolver is enabled: `--dev-insecure-tenant-header`,
   `--oidc-issuer`, or `--mtls-enabled`, each of which derives the tenant from a
   request header or a token claim.
 
-Startup also refuses a `tenant` that neither `--tenant-token` nor
-`--alert-rules-file` names, where the tenant set is fully known (static
+Startup also refuses a `tenant` that no `--tenant-token`, `--tenant-token-file`,
+or `--alert-rules-file` names, where the tenant set is fully known (static
 configuration, no dynamic resolver). Such a mapping can never fire, and its only
 symptom would be a remote that quietly answers nobody. Under a dynamic resolver
 the static configuration is not the tenant set, so the check does not apply

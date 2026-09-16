@@ -666,11 +666,10 @@ first `=` the same way `--tenant-token` is. A leading UTF-8 byte order mark is
 stripped before parsing. `--tenant-token` and `--tenant-token-file` are
 mutually exclusive; startup refuses if both are set. An empty or
 comment-only file parses to an empty map, the same as passing no
-`--tenant-token` at all: that authenticates nothing, and because it also
-leaves no `--maintain-tenant`-equivalent restriction, background fold,
-compaction and retention widen to every tenant storage discovers rather than
-refusing startup. A Secret mount that failed to populate produces exactly
-this, with no error at startup.
+`--tenant-token` at all: that authenticates nothing, and unless
+`--maintain-tenant` names tenants, background fold, compaction and retention
+widen to every tenant storage discovers rather than refusing startup. A Secret
+mount that failed to populate produces exactly this, with no error at startup.
 
 Tenant identity affects only key prefixing and authorization. It carries no
 other per-tenant configuration.
