@@ -32,14 +32,18 @@
 //! part of this split.
 //!
 //! `h + h` and `h - h` align their operands first, as every other combining
-//! caller in [`crate::histogram`] does: an exponential/custom-buckets mix, or
-//! two custom-buckets histograms with different bounds, cannot be combined at
-//! all and drops with a warning annotation (the incompatible-bucket-layout
-//! warning, one text for both shapes); two exponential histograms at
-//! different scales are both down-converted to the coarser scale before the
-//! buckets are merged. Stored data really does mix scales within one series
-//! (RSEG down-converts a flush whose bucket count exceeds its limit), so this
-//! is a normal input shape, not a corner case.
+//! caller in [`crate::histogram`] does. An exponential/custom-buckets mix has
+//! no common bucket layout and cannot be combined at all: the sample drops
+//! with the incompatible-bucket-layout warning. Two custom-buckets histograms
+//! with different bounds do reconcile, as Prometheus reconciles them: both are
+//! re-bucketed onto the intersection of their boundary sets and merged, and the
+//! result carries an info annotation noting the reconciliation. Two exponential
+//! histograms at different scales are both down-converted to the coarser scale
+//! before the buckets are merged, and two with different zero thresholds have
+//! the narrower widened to the larger (folding the buckets it swallows into the
+//! zero count) before merging. Stored data really does mix scales within one
+//! series (RSEG down-converts a flush whose bucket count exceeds its limit), so
+//! this is a normal input shape, not a corner case.
 
 use std::collections::{HashMap, HashSet};
 
@@ -187,13 +191,16 @@ fn incompatible_types_info(op: TokenId, lhs_is_histogram: bool, rhs_is_histogram
 /// between two histograms with no common bucket layout has no defined result,
 /// so the sample drops and this is raised.
 ///
-/// Prometheus raises one annotation for both unalignable shapes. Its
-/// `VectorBinop` catches `ErrHistogramsIncompatibleSchema` and
-/// `ErrHistogramsIncompatibleBounds` from `FloatHistogram.Add`/`Sub` and calls
-/// `NewIncompatibleBucketLayoutInBinOpWarning(op)` for either, on the warnings
-/// channel rather than the infos one. Rendered in the same convention as
-/// [`incompatible_types_info`]: Prometheus' channel prefix and position suffix
-/// are dropped, the operator symbol is kept.
+/// The one shape that reaches this in v3.13.1 is a mix of the two schema
+/// families (one exponential operand, one custom-buckets operand). Its
+/// `VectorBinop` catches `ErrHistogramsIncompatibleSchema` from
+/// `FloatHistogram.Add`/`Sub` and calls
+/// `NewIncompatibleBucketLayoutInBinOpWarning(op)` on the warnings channel.
+/// Differing custom bounds are NOT this case: v3.13.1 reconciles them rather
+/// than erroring (there is no `ErrHistogramsIncompatibleBounds`), so they take
+/// [`mismatched_custom_buckets_info`] instead. Rendered in the same convention
+/// as [`incompatible_types_info`]: Prometheus' channel prefix and position
+/// suffix are dropped, the operator symbol is kept.
 fn incompatible_bucket_layout_warning(op: TokenId) -> String {
     format!(
         "incompatible bucket layout encountered for binary operator {}",
@@ -201,58 +208,114 @@ fn incompatible_bucket_layout_warning(op: TokenId) -> String {
     )
 }
 
-/// Establish [`FloatHistogram::add_assign`]/[`FloatHistogram::sub_assign`]'s
-/// precondition for a `h + h` / `h - h` pair, returning the two operands to
-/// combine or `None` for a pair that cannot be combined at all.
+/// The info Prometheus attaches when a `h + h`/`h - h` combines two
+/// custom-bucket histograms whose boundaries differ: both were re-bucketed onto
+/// the intersection of their boundary sets before merging. One text per
+/// operation direction (addition/subtraction).
+fn mismatched_custom_buckets_info(op: TokenId) -> String {
+    format!(
+        "mismatched custom buckets were reconciled during {}",
+        hist_op_word(op)
+    )
+}
+
+/// Prometheus' `NewHistogramCounterResetCollisionWarning` message: a `h + h`/
+/// `h - h` whose operands carry conflicting counter-reset hints (one
+/// `CounterReset`, one `NotCounterReset`) has an ambiguous reset semantics for
+/// its result. Raised on the warnings channel; the operation direction word
+/// matches Prometheus' text.
+fn counter_reset_collision_warning(op: TokenId) -> String {
+    format!(
+        "conflicting counter resets during histogram {}",
+        hist_op_word(op)
+    )
+}
+
+/// "subtraction" for `-`, "addition" otherwise. The two `h + h`/`h - h`
+/// annotations name the operation this way.
+fn hist_op_word(op: TokenId) -> &'static str {
+    if op == T_SUB {
+        "subtraction"
+    } else {
+        "addition"
+    }
+}
+
+/// How a `h + h` / `h - h` pair should be combined once its operands are
+/// classified: a schema-aligned in-place merge, a custom-bounds reconciliation
+/// (both re-bucketed onto the intersection of their bounds), or an outright drop
+/// for a pair with no common bucket layout.
+enum HistogramAlignment {
+    /// Combine `lhs + sign*rhs` directly (schema/scale already reconciled, or
+    /// two custom-bucket histograms whose bounds already match).
+    Combine(FloatHistogram, FloatHistogram),
+    /// Two custom-bucket histograms with differing bounds: reconcile onto the
+    /// intersection and raise [`mismatched_custom_buckets_info`].
+    ReconcileCustomBounds(FloatHistogram, FloatHistogram),
+    /// No common bucket layout (an exponential/custom mix): drop and raise
+    /// [`incompatible_bucket_layout_warning`].
+    Incompatible,
+}
+
+/// Classify a `h + h` / `h - h` pair and prepare its operands, mirroring what
+/// Prometheus' `FloatHistogram.Add`/`Sub` accept.
 ///
 /// `combine` merges by absolute bucket index and keeps the receiver's scale,
-/// so two operands at different scales would otherwise add bucket `i` to
-/// bucket `i` across two different value ranges and label the result with the
-/// receiver's scale. Both sides are down-converted to the coarser scale first,
-/// exactly as [`crate::histogram::sum_histograms`] and
-/// [`crate::histogram::histogram_rate`] do. Custom-bucket histograms cannot be
-/// rescaled, so the two unalignable shapes Prometheus rejects outright (a mix
-/// of the two schema families, and differing custom bounds) drop instead. The
-/// caller raises one [`incompatible_bucket_layout_warning`] for either, which
-/// is the single annotation Prometheus raises for both.
+/// so two exponential operands at different scales would otherwise add bucket
+/// `i` to bucket `i` across two different value ranges and label the result
+/// with the receiver's scale. Both sides are down-converted to the coarser
+/// scale first, exactly as [`crate::histogram::sum_histograms`] and
+/// [`crate::histogram::histogram_rate`] do. A differing zero threshold between
+/// two exponential operands is reconciled inside `combine` itself
+/// (`reconcileZeroBuckets`), matching where Prometheus does it, not here.
 ///
-/// A differing `zero_threshold` is NOT reconciled here: no caller in this
-/// crate does. Prometheus reconciles one inside `FloatHistogram.Add`/`Sub`
-/// themselves (`reconcileZeroBuckets`, called before the buckets are merged),
-/// not as a caller-side alignment step, so two operands with different zero
-/// thresholds combine their zero counts here as if the thresholds matched.
-fn align_histogram_operands(
-    lhs: &FloatHistogram,
-    rhs: &FloatHistogram,
-) -> Option<(FloatHistogram, FloatHistogram)> {
+/// Custom-bucket histograms cannot be rescaled. Two of them with identical
+/// bounds combine directly; with differing bounds they reconcile onto the
+/// intersection of their bounds (Prometheus' `addCustomBucketsWithMismatches`).
+/// Only a mix of the two schema families has no common layout and drops.
+fn align_histogram_operands(lhs: &FloatHistogram, rhs: &FloatHistogram) -> HistogramAlignment {
     if lhs.uses_custom_buckets() != rhs.uses_custom_buckets() {
-        return None;
+        return HistogramAlignment::Incompatible;
     }
     if lhs.uses_custom_buckets() {
-        if !lhs.custom_bounds_match(rhs) {
-            return None;
+        if lhs.custom_bounds_match(rhs) {
+            return HistogramAlignment::Combine(lhs.clone(), rhs.clone());
         }
-        return Some((lhs.clone(), rhs.clone()));
+        return HistogramAlignment::ReconcileCustomBounds(lhs.clone(), rhs.clone());
     }
     let scale = lhs.scale.min(rhs.scale);
-    Some((lhs.copy_to_scale(scale), rhs.copy_to_scale(scale)))
+    HistogramAlignment::Combine(lhs.copy_to_scale(scale), rhs.copy_to_scale(scale))
 }
 
 /// The outcome of combining one matched (or scalar-paired) sample: a plain
-/// float, a native histogram, or a drop. A drop is either a filter-mode
-/// comparison that did not hold (no annotation) or a histogram/float pairing
-/// the operator does not define (annotated through [`QueryWindow::info`] by
-/// [`combine_value`] before returning).
+/// float, a native histogram, or a drop.
+///
+/// The two drop variants mirror the two ways Prometheus' `vectorElemBinop`
+/// declines to produce a sample, which its `VectorBinop` loop treats
+/// differently:
+///
+/// - [`Combined::Drop`] is `keep == false, err == nil`: a filter-mode
+///   comparison that did not hold. No annotation. Prometheus reaches the
+///   many-to-one duplicate-signature check for it, so [`one_to_one`] runs that
+///   check for this variant too.
+/// - [`Combined::DropIncompatible`] is the `err != nil` path: a pairing the
+///   operator does not define (a histogram/float arithmetic pairing, an
+///   ordering comparison on a histogram, annotated through
+///   [`QueryWindow::info`]) or a `h + h`/`h - h` between two histograms with no
+///   common bucket layout (annotated through [`QueryWindow::warn`]). Prometheus
+///   `continue`s on this error before the duplicate-signature check, so
+///   [`one_to_one`] skips that check for this variant.
 enum Combined {
     Value(f64),
     Histogram(FloatHistogram),
     Drop,
+    DropIncompatible,
 }
 
 /// Build the output sample for a combined pair, or `None` when it was dropped.
 fn output_sample(combined: Combined, labels: LabelSet, ts_ns: i64) -> Option<InstantSample> {
     match combined {
-        Combined::Drop => None,
+        Combined::Drop | Combined::DropIncompatible => None,
         Combined::Value(value) => Some(InstantSample::scalar(labels, ts_ns, ts_ns, value)),
         Combined::Histogram(h) => Some(InstantSample::histogram(labels, ts_ns, ts_ns, h)),
     }
@@ -348,7 +411,7 @@ fn combine_value(
     let (rv, rh) = rhs;
     let unsupported = |ctx: &QueryWindow| {
         ctx.info(incompatible_types_info(op, lh.is_some(), rh.is_some()));
-        Combined::Drop
+        Combined::DropIncompatible
     };
 
     if is_comparison(op) {
@@ -387,17 +450,38 @@ fn combine_value(
         match (op, lh, rh) {
             (_, None, None) => Combined::Value(apply_arith(op, lv, rv)),
             (T_ADD | T_SUB, Some(a), Some(b)) => match align_histogram_operands(a, b) {
-                Some((mut out, other)) => {
-                    if op == T_ADD {
-                        out.add_assign(&other);
+                HistogramAlignment::Combine(mut out, other) => {
+                    // `add_assign`/`sub_assign` return whether the operands
+                    // carried conflicting counter-reset hints. Prometheus marks
+                    // the result gauge and raises a warning on a collision. The
+                    // result histogram is the value of a binary expression, and
+                    // nothing downstream of a binop in this crate reads the
+                    // hint (a binop output is never fed to counter-reset
+                    // detection or `rate`/`increase`, the only readers), so the
+                    // gauge marking is a no-op we skip; the warning is still
+                    // user-visible, so it is raised.
+                    let collision = if op == T_ADD {
+                        out.add_assign(&other)
                     } else {
-                        out.sub_assign(&other);
+                        out.sub_assign(&other)
+                    };
+                    if collision {
+                        ctx.warn(counter_reset_collision_warning(op));
                     }
                     Combined::Histogram(out)
                 }
-                None => {
+                HistogramAlignment::ReconcileCustomBounds(mut out, other) => {
+                    let sign = if op == T_ADD { 1.0 } else { -1.0 };
+                    let collision = out.combine_custom_reconciled(&other, sign);
+                    ctx.info(mismatched_custom_buckets_info(op));
+                    if collision {
+                        ctx.warn(counter_reset_collision_warning(op));
+                    }
+                    Combined::Histogram(out)
+                }
+                HistogramAlignment::Incompatible => {
                     ctx.warn(incompatible_bucket_layout_warning(op));
-                    Combined::Drop
+                    Combined::DropIncompatible
                 }
             },
             (T_MUL, Some(a), None) => {
@@ -443,9 +527,6 @@ fn eval_scalar_vector(
         // value/histogram, regardless of the scalar's position.
         let filter = (s.value, s.histogram.as_ref());
         let combined = combine_value(op, lhs, rhs, modifier.return_bool, filter, ctx);
-        if matches!(combined, Combined::Drop) {
-            continue;
-        }
         let labels = if drop_name {
             crate::eval::drop_metric_name(s.labels)
         } else {
@@ -604,9 +685,6 @@ fn one_to_one(
         let Some(r) = rhs_map.get(&key) else {
             continue;
         };
-        if !matched_sigs.insert(key.clone()) {
-            return Err(ambiguous_match_error(&key));
-        }
         // The surviving value/histogram of a filter-mode comparison is the
         // literal left operand's own.
         let combined = combine_value(
@@ -617,6 +695,19 @@ fn one_to_one(
             (l.value, l.histogram.as_ref()),
             ctx,
         );
+        // Prometheus computes the element binop before the many-to-one
+        // duplicate-signature check and `continue`s on its error path (an
+        // undefined pairing, an incompatible bucket layout) before ever
+        // reaching that check. Match it for the error case only: a
+        // `DropIncompatible` skips the check, every other outcome (including a
+        // filter comparison that merely did not hold) still runs it, so a
+        // genuine many-to-one on computable samples is still rejected.
+        if matches!(combined, Combined::DropIncompatible) {
+            continue;
+        }
+        if !matched_sigs.insert(key.clone()) {
+            return Err(ambiguous_match_error(&key));
+        }
         let labels = one_to_one_output_labels(&l.labels, matching, drop_name);
         if let Some(sample) = output_sample(combined, labels, l.ts_ns) {
             out.push(sample);
@@ -1453,13 +1544,23 @@ mod tests {
         );
     }
 
-    /// Issue #1700 fix round: two custom-buckets histograms whose boundaries
-    /// differ have no shared layout either, and `-` drops them the same way
-    /// `+` does. Prometheus answers `ErrHistogramsIncompatibleBounds` with the
-    /// same one warning it uses for the incompatible-schema case, so only the
-    /// operator symbol differs from the `+` test above.
+    /// Issue #1700 third fix round: two custom-buckets histograms whose
+    /// boundaries differ DO combine in Prometheus v3.13.1. There is no
+    /// `ErrHistogramsIncompatibleBounds`; `FloatHistogram.Add` re-buckets both
+    /// operands onto the intersection of their boundary sets
+    /// (`addCustomBucketsWithMismatches`) and merges, raising one info that the
+    /// buckets were reconciled. Before this round the pair dropped with a
+    /// warning; this test therefore fails on pre-fix code, where
+    /// `align_histogram_operands` returned `None` for it.
+    ///
+    /// Hand computation for `[1,2,4] counts [1,2,3]` + `[1,3,5] counts [1,2,3]`:
+    /// only boundary `1` is shared, so the intersected bounds are `[1]` plus the
+    /// implicit `+Inf` overflow. Left folds to `{bound 1: 1, +Inf: 2+3 = 5}`,
+    /// right to `{bound 1: 1, +Inf: 2+3 = 5}`; the sum is `{bound 1: 2, +Inf:
+    /// 10}`, i.e. Ravel indexes 1 and 2 holding 2 and 10. Counts sum 6+6 = 12,
+    /// sums 12+12 = 24 (the `nh_at_scale` fixture sets sum to twice the count).
     #[test]
-    fn subtraction_of_custom_buckets_with_different_bounds_drops_and_annotates() {
+    fn addition_of_custom_buckets_with_different_bounds_reconciles_and_annotates() {
         let src = TestSource::new()
             .with_histogram_series(
                 &[("__name__", "ha"), ("job", "x")],
@@ -1472,21 +1573,44 @@ mod tests {
             )
             .expect("valid histogram series");
         let (value, annotations) = Evaluator::new()
-            .eval_instant_annotated(&src, "ha - hb", 0)
-            .expect("an unalignable pair must drop, not error");
+            .eval_instant_annotated(&src, "ha + hb", 0)
+            .expect("differing custom bounds must reconcile, not error");
         let Value::Vector(v) = value else {
             panic!("expected a vector result");
         };
-        assert!(v.is_empty(), "different custom bounds cannot be combined");
+        assert_eq!(v.len(), 1, "the reconciled pair produces one sample");
+        let h = v[0]
+            .histogram
+            .as_ref()
+            .expect("the result element must carry a histogram");
         assert_eq!(
-            annotations.warnings(),
-            ["incompatible bucket layout encountered for binary operator -"],
-            "exactly one warning, carrying Prometheus' \
-             IncompatibleBucketLayoutInBinOpWarning wording"
+            h.custom_values,
+            vec![1.0],
+            "the result carries the intersected boundary set"
+        );
+        assert_eq!(
+            h.positive_spans,
+            vec![crate::histogram::Span {
+                offset: 1,
+                length: 2
+            }],
+            "the reconciled bucket at bound 1 and the +Inf overflow bucket"
+        );
+        assert_eq!(
+            h.positive_buckets,
+            vec![2.0, 10.0],
+            "bound 1 holds 1+1, the +Inf overflow holds (2+3)+(2+3)"
+        );
+        assert_eq!(h.observation_count(), 12.0, "6 + 6");
+        assert_eq!(h.observation_sum(), 24.0, "12 + 12");
+        assert_eq!(
+            annotations.infos(),
+            ["mismatched custom buckets were reconciled during addition"],
+            "exactly one info naming the reconciliation"
         );
         assert!(
-            annotations.infos().is_empty(),
-            "the drop is a warning, not an info"
+            annotations.warnings().is_empty(),
+            "reconciliation is an info, not a warning"
         );
     }
 
@@ -1534,6 +1658,84 @@ mod tests {
                 .all(|b| !(b.lower == -0.5 && b.upper == 0.5)),
             "a non-positive zero count renders no zero bucket, got {:?}",
             h.all_buckets()
+        );
+    }
+
+    /// Issue #1700 third fix round: `h + h` over two histograms with
+    /// conflicting counter-reset hints (one `CounterReset`, one
+    /// `NotCounterReset`) still combines the buckets, but raises Prometheus'
+    /// counter-reset collision warning. The result is one sample and one
+    /// warning, nothing on the infos channel.
+    #[test]
+    fn addition_with_conflicting_counter_reset_hints_warns() {
+        let mut reset = nh(6.0, 42.0);
+        reset.counter_reset_hint = crate::histogram::ResetHint::Yes;
+        let mut not_reset = nh(6.0, 42.0);
+        not_reset.counter_reset_hint = crate::histogram::ResetHint::No;
+        let src = TestSource::new()
+            .with_histogram_series(&[("__name__", "hr"), ("job", "x")], &[(0, reset)])
+            .expect("valid histogram series")
+            .with_histogram_series(&[("__name__", "hn"), ("job", "x")], &[(0, not_reset)])
+            .expect("valid histogram series");
+        let (value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&src, "hr + hn", 0)
+            .expect("conflicting hints still combine, not error");
+        let Value::Vector(v) = value else {
+            panic!("expected a vector result");
+        };
+        assert_eq!(v.len(), 1, "the sample still combines");
+        assert_eq!(
+            annotations.warnings(),
+            ["conflicting counter resets during histogram addition"],
+            "exactly one counter-reset collision warning"
+        );
+        assert!(
+            annotations.infos().is_empty(),
+            "the collision is a warning, not an info"
+        );
+    }
+
+    /// Issue #1700 third fix round: Prometheus computes the element binop before
+    /// the many-to-one duplicate-signature check and returns on its error path
+    /// before that check. `h + on(job) f` matches two histogram series against
+    /// one float on `job`; every pairing is an undefined histogram/float
+    /// arithmetic that drops. Because that drop precedes the duplicate check,
+    /// the two matches on `job="x"` do NOT raise the ambiguous-match error; the
+    /// result is an empty vector and the single (deduplicated) incompatible-types
+    /// info. Pre-fix, the duplicate check ran first and this errored.
+    #[test]
+    fn histogram_float_arithmetic_drops_before_the_duplicate_match_check() {
+        let src = TestSource::new()
+            .with_histogram_series(
+                &[("__name__", "h"), ("job", "x"), ("inst", "a")],
+                &[(0, nh(6.0, 42.0))],
+            )
+            .expect("valid histogram series")
+            .with_histogram_series(
+                &[("__name__", "h"), ("job", "x"), ("inst", "b")],
+                &[(0, nh(6.0, 42.0))],
+            )
+            .expect("valid histogram series")
+            .with_series(&[("__name__", "f"), ("job", "x")], &[(0, 5.0)])
+            .expect("valid float series");
+        let (value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&src, "h + on(job) f", 0)
+            .expect("the drop precedes the duplicate check, so no ambiguous-match error");
+        let Value::Vector(v) = value else {
+            panic!("expected a vector result");
+        };
+        assert!(v.is_empty(), "every histogram/float pairing drops");
+        assert_eq!(
+            annotations.infos(),
+            [
+                "incompatible sample types encountered for binary operator \"+\": \
+                 histogram + float"
+            ],
+            "the two identical drops deduplicate to one info"
+        );
+        assert!(
+            annotations.warnings().is_empty(),
+            "an undefined arithmetic pairing is an info, not a warning"
         );
     }
 
