@@ -155,6 +155,7 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_grace_extended_stale_flushes_total` | Flushes routed on a last-known-good provisioning view inside the bounded grace window. A rising figure means the store is slow to serve the provisioning re-read and this router is running degraded-but-available. |
 | `ravel_ingest_flushes_by_age_adaptive_total` | Flushes opened on the adaptive-delay corridor age trigger rather than the fixed max_flush_delay. A rising figure means the adaptive corridor, not the fixed delay, is driving age flushes. |
 | `ravel_ingest_in_flight_flushes` | Flush tasks spawned but not yet acked, summed across shards (a gauge). A sustained high value means flushes are not keeping up with the load. |
+| `ravel_ingest_flush_permit_wait_seconds_total` | Total seconds every flush has spent waiting for a `max_inflight_flushes` permit, summed across shards. Zero unless a shard is actually asked for a second concurrent flush; a rising figure means `max_inflight_flushes` is the binding window. |
 
 The collisions family carries no `signal="spans"` series. Spans derive no
 identity that can collide, so that sample is structurally absent, not zero.
@@ -163,12 +164,15 @@ The two exemplar families carry only the `signal="metrics"` series. Exemplars
 ride on metric points, so those samples are structurally absent for logs and
 spans, not zero.
 
-The `ravel_ingest_flushes_by_age_adaptive_total` and
-`ravel_ingest_in_flight_flushes` families likewise carry only the
-`signal="metrics"` series: the adaptive-delay corridor and flush pipelining are
-metrics-pipeline features, so those samples are structurally absent for logs and
-spans, not zero. `ravel_ingest_grace_extended_stale_flushes_total` is carried
-for every signal.
+The `ravel_ingest_flushes_by_age_adaptive_total` family likewise carries only
+the `signal="metrics"` series: the adaptive-delay corridor is a
+metrics-pipeline feature, so that sample is structurally absent for logs and
+spans, not zero. `ravel_ingest_in_flight_flushes`,
+`ravel_ingest_flush_permit_wait_seconds_total`, and
+`ravel_ingest_grace_extended_stale_flushes_total` are carried for every
+signal: the `max_inflight_flushes` permit acquire runs off-actor for all three
+ingest pipelines, so a logs- or spans-only process still renders a real
+(possibly zero) sample for both.
 
 #### Per-tenant PUT attribution (`ravel_ingest_attribution_puts_total`)
 
