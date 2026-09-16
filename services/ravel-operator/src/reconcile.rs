@@ -111,10 +111,17 @@ pub const GRPC_PORT: i32 = 4317;
 /// load-balancer drain under load.
 pub const PRE_STOP_DRAIN_DELAY_SECONDS: i64 = 10;
 
-/// Minimum Kubernetes minor version (1.x) the operator supports, because the
-/// `preStop` `SleepAction` above ([`pre_stop_lifecycle`]) only became GA in
-/// 1.32.
-pub const MIN_KUBERNETES_MINOR_VERSION: u32 = 32;
+/// Minimum Kubernetes minor version (1.x) the operator supports.
+///
+/// What this asserts: the `preStop` `SleepAction` above
+/// ([`pre_stop_lifecycle`]) is `PodLifecycleSleepAction` (KEP-3960), beta and
+/// **enabled by default** from 1.30 onward, so a cluster at or above this
+/// floor honours the hook under its default feature gates. It does not
+/// assert more than that: below 1.34 (where the gate goes stable and
+/// locked on) an operator of the control plane can still have disabled the
+/// gate manually, and this check -- which only reads the apiserver version
+/// -- cannot detect that.
+pub const MIN_KUBERNETES_MINOR_VERSION: u32 = 30;
 
 /// `terminationGracePeriodSeconds` on every ravel-server pod.
 ///
@@ -650,8 +657,9 @@ fn container_security_context() -> SecurityContext {
 /// [`PRE_STOP_DRAIN_DELAY_SECONDS`] before SIGTERM so Service endpoint removal
 /// has time to propagate (see that constant).
 ///
-/// Uses the native `sleep` lifecycle action (`SleepAction`, GA since Kubernetes
-/// 1.32; the operator pins `k8s-openapi` at `v1_34`) rather than an
+/// Uses the native `sleep` lifecycle action (`SleepAction`, beta and on by
+/// default from Kubernetes 1.30, stable in 1.34; the operator pins
+/// `k8s-openapi` at `v1_34`) rather than an
 /// `exec: ["/bin/sleep", ...]`: the rendered container runs with a read-only
 /// root filesystem, non-root, and every Linux capability dropped
 /// ([`container_security_context`]), so an image without a `sleep` binary must

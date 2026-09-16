@@ -1210,14 +1210,11 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
     // #1714) rides the same mechanism rather than `Degraded`: a version
     // warning must never displace the pass's single `Degraded` entry (see
     // `reconcile_inner`) for a real bootstrap or qualification degradation.
-    let mut extra_conditions = spec_conditions(&obj.spec, obj.metadata.generation);
-    if let Some(cond) = ctx
-        .kubernetes_version
-        .as_ref()
-        .and_then(|info| kubernetes_version_condition(info, obj.metadata.generation))
-    {
-        extra_conditions.push(cond);
-    }
+    let extra_conditions = pass_conditions(
+        &obj.spec,
+        obj.metadata.generation,
+        ctx.kubernetes_version.as_ref(),
+    );
 
     // Set by `reconcile_inner` to the fresh qualified-input hash once a pass
     // reaches `QualificationDecision::Proceed`, so the degraded error path below
@@ -2209,13 +2206,17 @@ fn leading_digits(s: &str) -> Option<u32> {
 /// `minor` is nominally a bare integer string, but managed control planes
 /// commonly append a suffix (EKS/GKE report forms like `"32+"`); take its
 /// leading digits and ignore the rest. Falls back to `git_version` (e.g.
-/// `v1.32.2-gke.1234`) when `minor` carries no leading digit at all, so an
-/// unusual but still-parseable response is not treated as unsupported.
-/// Returns `None` when neither field yields a version, so callers fail open
-/// rather than false-flagging a cluster this cannot read.
+/// `v1.32.2-gke.1234`, or the unprefixed `1.32.2-gke.1234`) when `minor`
+/// carries no leading digit at all, so an unusual but still-parseable
+/// response is not treated as unsupported. Returns `None` when neither field
+/// yields a version, so callers fail open rather than false-flagging a
+/// cluster this cannot read.
 fn kubernetes_minor_version(info: &Info) -> Option<u32> {
     leading_digits(&info.minor).or_else(|| {
-        let rest = info.git_version.strip_prefix('v')?;
+        let rest = info
+            .git_version
+            .strip_prefix('v')
+            .unwrap_or(&info.git_version);
         leading_digits(rest.split('.').nth(1)?)
     })
 }
@@ -2241,11 +2242,35 @@ fn kubernetes_version_condition(
         "BelowMinimumKubernetesVersion",
         &format!(
             "cluster reports Kubernetes apiserver {} (minor {minor}), below \
-             the minimum supported version 1.{MIN_KUBERNETES_MINOR_VERSION} \
-             the operator's preStop SleepAction requires",
+             the minimum supported version 1.{MIN_KUBERNETES_MINOR_VERSION}: \
+             the PodLifecycleSleepAction gate the operator's preStop \
+             SleepAction needs is not on by default below that version, so \
+             pods here run without the preStop drain hook and a rolling \
+             update can drop in-flight ingest across the endpoint-\
+             propagation window",
             info.git_version,
         ),
     ))
+}
+
+/// Every condition [`reconcile`] owns beyond `Available`/`Degraded` (issue
+/// #1714): the spec-derived conditions plus, when the operator was able to
+/// read the cluster's Kubernetes version at startup, the
+/// `KubernetesVersionUnsupported` warning for a cluster below
+/// [`MIN_KUBERNETES_MINOR_VERSION`]. Pulled out of `reconcile` as a pure
+/// function so it can be unit-tested without a `Client`.
+fn pass_conditions(
+    spec: &RavelClusterSpec,
+    generation: Option<i64>,
+    kubernetes_version: Option<&Info>,
+) -> Vec<Condition> {
+    let mut conditions = spec_conditions(spec, generation);
+    if let Some(cond) =
+        kubernetes_version.and_then(|info| kubernetes_version_condition(info, generation))
+    {
+        conditions.push(cond);
+    }
+    conditions
 }
 
 /// The two durable status fields that outlive a single reconcile pass and ride
@@ -3031,28 +3056,31 @@ mod tests {
     /// condition-only table missed: replacing
     /// [`kubernetes_minor_version`]'s body with a bare
     /// `info.minor.parse::<u32>().ok()` (dropping the `git_version`
-    /// fallback) still produces no condition for `"32+"` -- `"32+".parse()`
+    /// fallback) still produces no condition for `"30+"` -- `"30+".parse()`
     /// fails on the trailing `+`, so the mutant fails open exactly where the
-    /// real parser reports `Some(32)` -- but the parsed-value assertion below
-    /// catches the mismatch directly. The `("", "v1.31.6")` row exercises the
-    /// fallback path itself: `minor` alone is unparsable, only `git_version`
-    /// recovers `31`, and that recovered value is still below the floor.
+    /// real parser reports `Some(30)` -- but the parsed-value assertion below
+    /// catches the mismatch directly. The `("", "v1.28.9")` row exercises the
+    /// `v`-prefixed fallback path: `minor` alone is unparsable, only
+    /// `git_version` recovers `28`, and that recovered value is still below
+    /// the floor. The `("", "1.31.6")` row exercises the same fallback
+    /// without the `v` prefix that managed control planes sometimes omit.
     #[test]
     fn apiserver_below_the_kubernetes_floor_sets_the_unsupported_condition() {
         // The floor is pinned as a literal here so the table's derived
-        // expectations cannot drift with the constant: raising it to 33 would
-        // otherwise turn the "32" row into an expected condition and pass.
-        assert_eq!(MIN_KUBERNETES_MINOR_VERSION, 32);
+        // expectations cannot drift with the constant: raising it would
+        // otherwise turn the at-floor row into an expected condition and
+        // pass.
+        assert_eq!(MIN_KUBERNETES_MINOR_VERSION, 30);
         let cases: &[(&str, &str, Option<u32>)] = &[
-            ("31", "v1.31.6", Some(31)),
-            ("32", "v1.32.0", Some(32)),
-            ("32+", "v1.32.2-gke.1234", Some(32)),
-            // No usable git_version: only the leading-digits parse of "32+"
-            // can produce 32, so a bare integer parse fails this row.
-            ("32+", "unknown", Some(32)),
+            ("29", "v1.29.5", Some(29)),
+            ("30", "v1.30.0", Some(30)),
+            // No usable git_version: only the leading-digits parse of "30+"
+            // can produce 30, so a bare integer parse fails this row.
+            ("30+", "unknown", Some(30)),
             ("33", "v1.33.1", Some(33)),
             ("unknown", "unknown", None),
-            ("", "v1.31.6", Some(31)),
+            ("", "v1.28.9", Some(28)),
+            ("", "1.31.6", Some(31)),
         ];
 
         for (minor, git_version, expect_detected_minor) in cases {
@@ -3101,7 +3129,7 @@ mod tests {
     /// reusing the `Degraded` type would.
     #[test]
     fn kubernetes_version_condition_survives_alongside_degraded() {
-        let info = version_info("31", "v1.31.6");
+        let info = version_info("29", "v1.29.5");
         let mut extra = spec_conditions(&spec_with_affinity(None), Some(5));
         extra.extend(kubernetes_version_condition(&info, Some(5)));
 
@@ -3121,6 +3149,30 @@ mod tests {
             find(&degraded.conditions, "KubernetesVersionUnsupported").status,
             "True"
         );
+    }
+
+    /// The only call site wiring `ctx.kubernetes_version` into a
+    /// `RavelCluster`'s conditions (issue #1714) is `pass_conditions`'s push
+    /// of `kubernetes_version_condition` onto `spec_conditions`'s result: a
+    /// below-floor `Info` must add `KubernetesVersionUnsupported`, and an
+    /// at-floor `Info` must not. Demonstrated failing (no condition added
+    /// either way) against a `pass_conditions` body with that push replaced
+    /// by `let _ = cond;`.
+    #[test]
+    fn pass_conditions_adds_the_kubernetes_version_condition_only_below_the_floor() {
+        let spec = spec_with_affinity(None);
+
+        let below_floor = version_info("29", "v1.29.5");
+        let below = pass_conditions(&spec, Some(5), Some(&below_floor));
+        assert_eq!(
+            condition_types(&below),
+            vec!["KubernetesVersionUnsupported"]
+        );
+        assert_eq!(find(&below, "KubernetesVersionUnsupported").status, "True");
+
+        let at_floor = version_info("30", "v1.30.0");
+        let at = pass_conditions(&spec, Some(5), Some(&at_floor));
+        assert_eq!(condition_types(&at), Vec::<&str>::new());
     }
 
     /// A reconcile error during a bootstrap hold must not restart the stall

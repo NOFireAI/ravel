@@ -174,13 +174,20 @@ plus `RavelCluster` and its status subresource, `get` on Secrets,
 least-privilege Role), and `get` on the non-resource URL `/version`. It
 never lists, writes, or watches Secrets.
 
-**Minimum Kubernetes version: 1.32.** Every rendered ravel-server container
-carries a `preStop` `SleepAction`, GA only since 1.32. Below that floor the
-apiserver does not reject the Pod: server-side apply runs without strict
-field validation, so it silently prunes the unrecognized `SleepAction`
-field and the Pod comes up with no error and no preStop sleep at all. That
-is invisible in isolation -- the container starts and looks healthy -- but
-it means every rolling update can drop in-flight ingest for that pod across
+**Minimum Kubernetes version: 1.30.** Every rendered ravel-server container
+carries a `preStop` `SleepAction`, gated by Kubernetes'
+`PodLifecycleSleepAction` feature (KEP-3960): alpha and off by default in
+1.29, beta and **on by default** from 1.30, stable (and no longer gateable)
+from 1.34. Below 1.30 the field is dropped, by one of two mechanisms
+depending on how far below: on 1.29 the field exists in the apiserver's
+type but the gate is off, so `dropDisabledFields` zeroes it out on
+admission and the Pod comes up with no error and no preStop sleep at all;
+on 1.28 and earlier the field is unrecognized by that apiserver's older
+type, and with the default `fieldValidation` of `Warn` the apiserver drops
+it and returns a Warning response header rather than rejecting the
+request -- not silent at the API, but nothing in the operator surfaces
+that header today. Either way the Pod looks healthy in isolation, but it
+means every rolling update can drop in-flight ingest for that pod across
 the endpoint-propagation window, since nothing holds the container open
 while its endpoint is withdrawn. The operator reads the cluster's version
 once at startup (via the `/version` grant above) so this has somewhere to
@@ -191,7 +198,10 @@ nothing) when it cannot read the version at all, so an RBAC gap or a
 `/version` blip never produces a false warning. The version is read once at
 process startup, not per reconcile, so a control-plane upgrade across the
 floor does not clear the condition on its own -- it clears only once the
-operator pod itself restarts and re-reads `/version`.
+operator pod itself restarts and re-reads `/version`. Note the floor only
+asserts the gate's default: a control-plane operator can still have
+disabled `PodLifecycleSleepAction` manually on a 1.30-1.33 cluster, and this
+check, which only reads the apiserver version, cannot detect that.
 
 ## `RavelCluster` reference
 
@@ -459,7 +469,7 @@ an apply error), the operator writes a `Degraded=True` condition with the
 reason and flips `Available` to `False`. A `kubectl wait` then fails with an
 explanation instead of timing out silently.
 
-On a cluster below the Kubernetes 1.32 floor (see "Installing the operator
+On a cluster below the Kubernetes 1.30 floor (see "Installing the operator
 yourself" above), every `RavelCluster` also carries a
 `KubernetesVersionUnsupported=True` condition naming the floor and the
 detected version, alongside `Available`/`Degraded` rather than instead of
