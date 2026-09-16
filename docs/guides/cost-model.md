@@ -35,8 +35,7 @@ PUTs/day = 2 x tenants x signals x shards x replicas x (86400 / age_threshold_s)
 ```
 
 `age_threshold_s` is decided per `(tenant, signal, shard)` buffer, per flush,
-by whichever of three bands applies (`age_threshold_ns` in
-`crates/ravel-ingest/src/shard.rs`):
+by whichever of three bands applies:
 
 - **Idle clock**: `max_flush_delay_idle` (40s default). Applies when the
   buffer has no strict-mode waiter and has not reached `min_flush_bytes`.
@@ -47,11 +46,10 @@ by whichever of three bands applies (`age_threshold_ns` in
   export is waiting on this buffer's flush, regardless of buffered bytes.
 
 The byte floor and the waiter bands share the same fixed threshold by
-default; they diverge only when `adaptive_flush_delay` widens the waiter
-band's threshold toward a per-tenant ceiling (ADR-0067 decision 3), which
-ships off. A low-volume buffer that never reaches the byte floor or gets a
-waiter flushes on the idle clock; a busy or strict-mode buffer flushes on the
-faster of the other two.
+default; they diverge only when adaptive flush delay (off by default) widens
+the waiter band's threshold toward a per-tenant ceiling. A low-volume buffer
+that never reaches the byte floor or gets a waiter flushes on the idle clock;
+a busy or strict-mode buffer flushes on the faster of the other two.
 
 Every flush is a data-object PUT and a commit-record PUT (the two-object
 commit protocol, unchanged by anything in this guide). Buffers are scoped
