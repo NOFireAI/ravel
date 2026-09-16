@@ -684,10 +684,8 @@ fn lit_trace_id(e: &Expr) -> Option<[u8; 16]> {
 
 /// Decode a `trace_id` literal that is a 32-character hex string (`Utf8`,
 /// `LargeUtf8`, or `Utf8View`) to its 16 raw bytes. A wrong length or
-/// malformed hex returns `None`. Shared with
-/// [`crate::trace_id_planner`], which rewrites this same string form into a
-/// native `FixedSizeBinary(16)` literal before DataFusion's type coercion
-/// runs, since coercion has no path between `FixedSizeBinary` and `Utf8`.
+/// malformed hex returns `None`. Shared with [`crate::trace_id_planner`];
+/// see that module's docs for why.
 pub(crate) fn hex_trace_id_literal(e: &Expr) -> Option<[u8; 16]> {
     match e {
         Expr::Literal(
