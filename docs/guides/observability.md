@@ -49,14 +49,18 @@ series colliding.
 
 The renderer can attach only these label keys: `tenant_hash`, `signal`,
 `mode`, `op`, `error_kind`, `workload_class`, `level`, `reason`, `cache`,
-`tier`, `kind`, and `class`, twelve in all. `reason` is shared by two
+`tier`, `kind`, `outcome`, `allocator`, `stat`, `component`, and `class`,
+sixteen in all. `reason` is shared by two
 families, the admission-rejection counter and the scrub seal-divergence
 counter. `cache` and `tier` split the read-cache family across its two caches
 and, when a disk tier is configured, its two tiers; the [caching
 guide](caching.md) documents both. `kind` splits the maintenance
 merge-memory gauge into its transient and total high-water marks. `class`
 splits the fragment in-flight gauge and admission-wait counter into their
-`pinned` and `resolve` ADR-0071 admission classes (issue #1722). The `level`
+`pinned` and `resolve` fragment admission classes. `outcome`
+splits the alert-tick counter by how one evaluation tick ended, `allocator`
+and `stat` carry the process allocator gauges, and `component` splits the
+memory budget's reserved-bytes gauge by which side reserved it. The `level`
 key is reserved and no family renders it.
 
 The allowlist is closed for two reasons. The first reason is cardinality. An
@@ -1198,7 +1202,7 @@ operator alerts on the increase rather than on a threshold.
 
 Labels: `mode` only, plus `le` on the histogram buckets and `class`
 (`pinned`|`resolve`) on the fragment in-flight gauge and admission-wait
-counter (ADR-0071 deliverable: admission disjointness, issue #1722). This
+counter. This
 family carries no per-shard, per-worker, or per-tenant label: a fan-out
 spanning many workers and tenants must not turn one query into a cardinality
 explosion. It renders only when the process runs with `--distributed-query`;

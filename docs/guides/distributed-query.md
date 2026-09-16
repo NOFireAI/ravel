@@ -130,8 +130,7 @@ ravel-server --mode all \
 - `--max-inflight-federated-resolves` (default 8) caps how many inbound
   `Resolve` (cross-cluster federation) slice fetches this process serves
   concurrently for peer-cluster coordinators. It admits against an
-  **independent semaphore** from `--max-inflight-fragments` (ADR-0071
-  deliverable: admission disjointness, issue #1722): a peer cluster driving
+  **independent semaphore** from `--max-inflight-fragments`: a peer cluster driving
   federation reads at this cap can never delay this cluster's own `Pinned`
   slices, because the two classes never share a permit pool. Over the cap a
   `Resolve` request queues; it is not rejected. The `/metrics` fragment
@@ -518,8 +517,8 @@ label.
 `GET /metrics` renders the `ravel_distrib_*` family on any process with
 distribution enabled, under the closed `mode` label alone (no per-shard,
 per-worker, or per-tenant label), except the fragment in-flight gauge and
-admission-wait counter, which also carry a `class` label (`pinned`|`resolve`;
-ADR-0071 deliverable: admission disjointness, issue #1722). The family is
+admission-wait counter, which also carry a `class` label (`pinned`|`resolve`).
+The family is
 absent entirely when distribution is off.
 
 | Metric | Type | What it tells you |
