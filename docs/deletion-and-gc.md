@@ -765,9 +765,9 @@ into them. An operator with erasure obligations must budget them deliberately.
     the deny list's "disjoint by construction" claim no longer holds for the
     catalog family. ADR-0064's Decision still states the wider form;
     amending it is tracked separately. The three value-free kinds are
-    value-free *only if* subject identifiers appear
-    as label/attribute values and never inside metric names (a documented
-    requirement; see docs/object-store-contract.md "Required bucket
+    value-free *only if* subject identifiers appear as label/attribute
+    values and never inside metric names (a documented requirement; see
+    docs/object-store-contract.md "Required bucket
     configuration" point 5). A snapshot entry whose object a rewrite
     superseded is refreshed only when the fold reconciles that hour, through
     the fixed window or the retention-frontier band (docs/catalog-and-mvcc.md,
@@ -781,11 +781,11 @@ into them. An operator with erasure obligations must budget them deliberately.
     still resolve one. That holds however many rewrite generations the hour has
     accumulated: each rewrite record stays in place behind the inputs it
     superseded, and each request's filter stays live behind the whole chain,
-    not just behind the one generation that applied it. The cost is the held
-    storage, not a failed query, and it ends when the fold reconciles the hour
-    or an operator rebuilds HEAD: the next sweep deletes the inputs, then the
-    records that superseded them, and the requests become removable behind
-    both.
+    not just behind the one generation that applied it. The cost of the held
+    inputs is storage, not a failed query, and it ends when the fold
+    reconciles the hour or an operator rebuilds HEAD: the next sweep deletes
+    the inputs, then the records that superseded them, and the requests
+    become removable behind both.
   - **ADR-0028 analytics/derived datasets are a pure query-time stage, not a
     persisted store.** `ravel-analytics` carries no clock, IO, object-store,
     or catalog (docs/analytics.md): every analytic runs in memory over query
@@ -799,8 +799,11 @@ into them. An operator with erasure obligations must budget them deliberately.
   So the pass's commit-record scope covers the data objects a snapshot
   resolves and the three value-free index kinds, and it covers no `.cstat`:
   a stale column-statistics object the live HEAD still names sits outside
-  everything the pass verifies. What covers that gap is the query-time
-  exclusion filter, not the pass. The filter cannot retire while the
+  everything the pass verifies. What covers that gap is not the pass and
+  not the row-level exclusion filter (no row is ever sourced from a
+  `.cstat`) but the statistics gate named below, which declines every
+  metadata-only answer while an erasure predicate is pending; the filter
+  covers the held inputs. The filter cannot retire while the
   superseded-input sweep still holds an input this request's rewrites
   superseded (`crates/ravel-maintain/src/sweep.rs`), which is the same
   condition under which the stale `.cstat` is still HEAD-referenced, and a
