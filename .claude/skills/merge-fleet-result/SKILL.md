@@ -37,9 +37,14 @@ findings unaddressed this way. The script asks for the review itself: after
 opening the PR it posts one comment whose whole body is
 `@claude-fleet review`, which is the trigger (ADR-1586; anything after
 `review` is parsed as arguments, and an unrecognized word gets a confused
-reaction and no review). Wait for the `claude-fleet[bot]` review, fix or
-explicitly answer every actionable finding (a review with zero findings
-counts as clean), then merge by hand once CI is green:
+reaction and no review). Wait for the `claude-fleet[bot]` review, then fix
+or explicitly answer every finding not marked `nit` (each inline comment
+starts with its severity; one with no severity counts as actionable). A
+review whose findings are all nits is clean: the bot runs Claude Opus 5,
+which reports nits on almost every PR, so waiting for a zero-finding review never ends. Do not push nit
+fixes and ask for another round; a push moves the head and needs a fresh
+review. After 3 review rounds on one PR, stop and hand it to a person.
+Merge by hand once the review is clean and CI is green:
 
 ```sh
 scripts/pr-review-status.sh <pr-number>   # one-line status; on clean, prints
