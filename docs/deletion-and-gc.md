@@ -357,7 +357,8 @@ would leak without the reaper, which is why the reaper is part of the
 mechanism, not a follow-up. The request cost changed shape too: orphan GC
 went from one DELETE per candidate to a full-object GET plus a full PUT per
 candidate, run serially with no cap on candidates per pass, and the reaper
-adds one unconditional LIST per swept unit per tick. The thin-spread record
+adds one LIST per swept unit per full-sweep interval: it runs on the pass
+that ran candidate selection, not on every tick. The thin-spread record
 loss this feature exists for is also the expensive case, because it moves
 those bytes twice through a single maintain tick. The per-pass
 unboundedness is an acknowledged open item, not a property anything
