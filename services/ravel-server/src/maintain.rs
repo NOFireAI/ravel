@@ -1644,6 +1644,7 @@ pub(crate) async fn run_tick_with_clock(
                         tenant = %tenant.to_hex(),
                         signal = ?signal,
                         shard,
+                        orphan_pass = ?report.orphan_pass,
                         orphans = report.orphans_deleted,
                         superseded_records = report.superseded_records_deleted,
                         superseded_data = report.superseded_data_deleted,

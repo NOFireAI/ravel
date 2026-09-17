@@ -107,7 +107,7 @@
 //! the unit scan's zone split (ADR-0065 decision 3): the caller's per-tick
 //! pass lists only its head+tail hours, and a full pass on the slow
 //! safety-net cadence still uses [`sweep_shard`] to eventually cover every
-//! hour. Rule 1 cannot be scoped this way and always lists the whole shard
+//! hour. Rule 1 cannot be scoped this way and, when it runs, lists the whole shard
 //! (L0 keys carry no ingest-hour component); see [`sweep_shard_zoned`]'s doc
 //! for that deviation.
 
