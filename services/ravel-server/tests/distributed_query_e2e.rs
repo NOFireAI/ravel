@@ -1766,7 +1766,11 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
     let admitted = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let m = scrape_metrics(&y_http).await;
-            if metric_value(&m, "ravel_distrib_fragment_inflight") >= 1.0 {
+            if metric_value(
+                &m,
+                "ravel_distrib_fragment_inflight{mode=\"query\",class=\"pinned\"}",
+            ) >= 1.0
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1787,7 +1791,11 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
     let freed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let m = scrape_metrics(&y_http).await;
-            if metric_value(&m, "ravel_distrib_fragment_inflight") == 0.0 {
+            if metric_value(
+                &m,
+                "ravel_distrib_fragment_inflight{mode=\"query\",class=\"pinned\"}",
+            ) == 0.0
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
