@@ -165,6 +165,7 @@ fn always_distribute_settings() -> DistribSettings {
     DistribSettings {
         fragment_keys: vec![FRAGMENT_KEY],
         max_inflight_fragments: 32,
+        max_inflight_federated_resolves: 8,
         thresholds: DistribThresholds {
             min_store_bytes: 0,
             min_segments: 0,
@@ -419,8 +420,10 @@ async fn distributed_query_http_equals_local_http() {
     );
 
     // Every ravel_distrib_ series carries only the allowlisted {mode} label
-    // (plus {le} on histogram buckets): ADR-0044 forbids per-shard, per-worker,
-    // or per-tenant labels on this family.
+    // (plus {le} on histogram buckets, and {class} on the fragment admission
+    // series split into Pinned/Resolve classes by ADR-0071, issue #1722):
+    // ADR-0044 forbids per-shard, per-worker, or per-tenant labels on this
+    // family.
     for line in metrics.lines() {
         if !line.starts_with("ravel_distrib_") {
             continue;
@@ -430,7 +433,7 @@ async fn distributed_query_http_equals_local_http() {
             for pair in labels.split(',').filter(|p| !p.is_empty()) {
                 let key = pair.split('=').next().unwrap_or(pair);
                 assert!(
-                    key == "mode" || key == "le",
+                    key == "mode" || key == "le" || key == "class",
                     "disallowed label `{key}` on a ravel_distrib series: {line}"
                 );
             }
@@ -571,7 +574,7 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
     use ravel_query::distrib::codec;
     use ravel_query::{EngineConfig, QueryEngine};
     use ravel_server::distrib::{
-        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+        AdmissionClasses, FragmentMetrics, FragmentService, RoutingSliceFetcher,
     };
 
     const CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -595,7 +598,7 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
     // uuid absent from the worker set, so rendezvous ownership of every unit
     // falls to A (never a self-mapped local shortcut).
     let metrics = Arc::new(FragmentMetrics::new());
-    let admission = FragmentAdmission::new(8, metrics.clone());
+    let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let local_catalog =
         ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
             .expect("catalog");
@@ -1186,7 +1189,7 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
     use ravel_query::distrib::codec;
     use ravel_query::{EngineConfig, QueryEngine};
     use ravel_server::distrib::{
-        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+        AdmissionClasses, FragmentMetrics, FragmentService, RoutingSliceFetcher,
     };
 
     const CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -1251,7 +1254,7 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
     ])));
 
     let metrics = Arc::new(FragmentMetrics::new());
-    let admission = FragmentAdmission::new(8, metrics.clone());
+    let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let local_catalog =
         ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
             .expect("catalog");
@@ -1369,7 +1372,7 @@ async fn version_mismatch_falls_back_to_local() {
     use ravel_query::distrib::codec;
     use ravel_query::{EngineConfig, QueryEngine};
     use ravel_server::distrib::{
-        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+        AdmissionClasses, FragmentMetrics, FragmentService, RoutingSliceFetcher,
     };
 
     const CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -1383,7 +1386,7 @@ async fn version_mismatch_falls_back_to_local() {
     // absent from the set, so absent the version filter every slice would map to
     // this worker and dial it.
     let metrics = Arc::new(FragmentMetrics::new());
-    let admission = FragmentAdmission::new(8, metrics.clone());
+    let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let local_catalog =
         ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
             .expect("catalog");
@@ -1511,7 +1514,7 @@ async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
     use ravel_query::distrib::client::SliceFetcher;
     use ravel_query::distrib::codec;
     use ravel_server::distrib::{
-        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+        AdmissionClasses, FragmentMetrics, FragmentService, RoutingSliceFetcher,
     };
 
     const CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -1547,7 +1550,7 @@ async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
     // The local fallback is never reached (B succeeds), so an empty store is fine.
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let metrics = Arc::new(FragmentMetrics::new());
-    let admission = FragmentAdmission::new(8, metrics.clone());
+    let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let local_catalog =
         ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
             .expect("catalog");
@@ -1646,7 +1649,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
     use ravel_query::distrib::codec;
     use ravel_query::{EngineConfig, QueryEngine};
     use ravel_server::distrib::{
-        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+        AdmissionClasses, FragmentMetrics, FragmentService, RoutingSliceFetcher,
     };
 
     const CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -1672,7 +1675,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
     publish_segment(coord_store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
 
     let metrics = Arc::new(FragmentMetrics::new());
-    let admission = FragmentAdmission::new(8, metrics.clone());
+    let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let local_catalog = ravel_server::query::build_catalog(
         coord_store.clone(),
         1,
@@ -1763,7 +1766,11 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
     let admitted = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let m = scrape_metrics(&y_http).await;
-            if metric_value(&m, "ravel_distrib_fragment_inflight") >= 1.0 {
+            if metric_value(
+                &m,
+                "ravel_distrib_fragment_inflight{mode=\"query\",class=\"pinned\"}",
+            ) >= 1.0
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1784,7 +1791,11 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
     let freed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let m = scrape_metrics(&y_http).await;
-            if metric_value(&m, "ravel_distrib_fragment_inflight") == 0.0 {
+            if metric_value(
+                &m,
+                "ravel_distrib_fragment_inflight{mode=\"query\",class=\"pinned\"}",
+            ) == 0.0
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1827,7 +1838,7 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
     use ravel_query::distrib::codec;
     use ravel_query::{EngineConfig, QueryEngine};
     use ravel_server::distrib::{
-        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+        AdmissionClasses, FragmentMetrics, FragmentService, RoutingSliceFetcher,
     };
 
     const CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -1864,7 +1875,7 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
     ])));
 
     let metrics = Arc::new(FragmentMetrics::new());
-    let admission = FragmentAdmission::new(8, metrics.clone());
+    let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let local_catalog =
         ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
             .expect("catalog");

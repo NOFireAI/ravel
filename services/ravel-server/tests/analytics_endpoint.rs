@@ -172,7 +172,7 @@ fn build_router_distributed(
     use ravel_query::distrib::Distributed;
     use ravel_query::distrib::partition::DistribThresholds;
     use ravel_server::distrib::{
-        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+        AdmissionClasses, FragmentMetrics, FragmentService, RoutingSliceFetcher,
     };
 
     let catalog =
@@ -184,7 +184,7 @@ fn build_router_distributed(
         Arc::new(StaticBearerTokenResolver::new(
             std::collections::HashMap::new(),
         )),
-        FragmentAdmission::new(8, metrics.clone()),
+        AdmissionClasses::new(8, 8, metrics.clone()),
         catalog.clone(),
         Arc::clone(&store),
         None,

@@ -1557,6 +1557,19 @@ pub struct Cli {
     #[arg(long = "max-inflight-fragments", default_value_t = 32)]
     pub max_inflight_fragments: u64,
 
+    /// The distinct internal-workload admission cap for inbound `Resolve`
+    /// (cross-cluster federation) fragment requests (issue #1722): the maximum
+    /// number of federation slice
+    /// fetches this process serves concurrently for peer-cluster
+    /// coordinators. A separate class from `--max-inflight-fragments`, which
+    /// now gates `Pinned` (intra-cluster) fragment requests only: a peer
+    /// cluster driving federation reads at this cap can never delay this
+    /// cluster's own `Pinned` slices, because the two classes admit against
+    /// independent bounds. Over the cap a `Resolve` request queues (it is not
+    /// rejected). Default 8.
+    #[arg(long = "max-inflight-federated-resolves", default_value_t = 8)]
+    pub max_inflight_federated_resolves: u64,
+
     /// The estimated-store-bytes axis of the ADR-0071 cost gate: a
     /// query whose pre-fetch cost estimate reaches this many bytes is worth
     /// distributing; a cheaper query on both axes runs fully locally. Feeds
@@ -3089,9 +3102,15 @@ pub struct DistribSettings {
     /// capabilities; all verify. Never empty when this struct exists (startup
     /// rejects an empty key file).
     pub fragment_keys: Vec<[u8; 32]>,
-    /// The fragment (`SeriesFetch`) admission cap, a distinct workload class
-    /// from client-query admission (`--max-inflight-fragments`, clamped `>= 1`).
+    /// The `Pinned` (intra-cluster) fragment (`SeriesFetch`) admission cap, a
+    /// distinct workload class from client-query admission
+    /// (`--max-inflight-fragments`, clamped `>= 1`).
     pub max_inflight_fragments: usize,
+    /// The `Resolve` (cross-cluster federation) fragment admission cap, a
+    /// distinct workload class from `max_inflight_fragments` (issue #1722), so a peer cluster's federation
+    /// reads can never starve this cluster's own `Pinned` slices
+    /// (`--max-inflight-federated-resolves`, clamped `>= 1`).
+    pub max_inflight_federated_resolves: usize,
     /// The cost gate and fan-out width (`DistribThresholds`).
     pub thresholds: ravel_query::distrib::partition::DistribThresholds,
     /// The dedicated TLS fragment listener (ADR-0071 amendment decision 1).
@@ -3981,6 +4000,7 @@ impl Cli {
         Ok(Some(DistribSettings {
             fragment_keys,
             max_inflight_fragments: self.max_inflight_fragments.max(1) as usize,
+            max_inflight_federated_resolves: self.max_inflight_federated_resolves.max(1) as usize,
             thresholds: ravel_query::distrib::partition::DistribThresholds {
                 min_store_bytes: self.distribute_bytes_threshold,
                 min_segments: self.distribute_segments_threshold,
@@ -4647,6 +4667,9 @@ impl Cli {
         }
         if self.max_parallel_slices == 0 {
             anyhow::bail!("--max-parallel-slices must be at least 1");
+        }
+        if self.max_inflight_federated_resolves == 0 {
+            anyhow::bail!("--max-inflight-federated-resolves must be at least 1");
         }
 
         // ADR-0071 cross-cluster federation: parse every
@@ -9690,6 +9713,30 @@ mod tests {
         ])
         .validate()
         .expect("--distributed-query under query mode is fine");
+    }
+
+    #[test]
+    fn max_inflight_federated_resolves_zero_fails_validate() {
+        // Mirrors the `--max-parallel-slices` positivity check: a zero
+        // Resolve-class admission cap would mean the class admits nothing
+        // (queues forever), which is never a valid configuration.
+        let err = cli(&["--max-inflight-federated-resolves", "0"])
+            .validate()
+            .expect_err("--max-inflight-federated-resolves 0 must refuse startup");
+        assert!(
+            err.to_string()
+                .contains("--max-inflight-federated-resolves"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn max_inflight_federated_resolves_positive_validates() {
+        // Positive control so the check above cannot be vacuously rejecting
+        // every value.
+        cli(&["--max-inflight-federated-resolves", "1"])
+            .validate()
+            .expect("a positive --max-inflight-federated-resolves is accepted");
     }
 
     #[test]

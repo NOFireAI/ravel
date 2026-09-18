@@ -6,8 +6,11 @@
 //! * [`FragmentService`] -- the worker side. It implements the generated
 //!   `SeriesFetch` gRPC service, guarding every `Pinned` call with a per-tenant,
 //!   per-query fragment capability (ADR-0071 amendment, decision 2) and
-//!   admitting it against a distinct
-//!   [`FragmentAdmission`] class (never the client-query cap). Per request it
+//!   admitting it against one of two independent
+//!   [`AdmissionClasses`] (`Pinned` or `Resolve`, selected by request scope;
+//!   never the client-query cap), so a federation-heavy peer cluster queuing
+//!   on the `Resolve` class can never delay this cluster's own intra-cluster
+//!   `Pinned` slices. Per request it
 //!   resolves a snapshot for the request's tenant over the request's event-time
 //!   window, builds an interim content-hash
 //!   [`SnapshotSegmentResolver`], and delegates to the in-crate
@@ -140,10 +143,49 @@ impl CapabilityReject {
     }
 }
 
+/// The two independent admission classes for inbound fragment fetches
+/// (issue #1722). `Pinned` fetches serve
+/// this cluster's own intra-cluster fan-out; `Resolve` fetches serve
+/// cross-cluster federation reads. Each class queues (never rejects) against
+/// its own cap, so a class saturated with one kind of traffic never delays
+/// the other: a peer cluster driving the `Resolve` class to its limit cannot
+/// starve this cluster's `Pinned` slices, and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionClass {
+    /// Intra-cluster fan-out: a capability-authorized fetch from this
+    /// cluster's own coordinator.
+    Pinned,
+    /// Cross-cluster federation: a fetch from a peer cluster's coordinator,
+    /// authorized by an ordinary tenant credential.
+    Resolve,
+}
+
+impl AdmissionClass {
+    /// Every class, in the fixed label order the per-class arrays are indexed
+    /// by.
+    const ALL: [AdmissionClass; 2] = [AdmissionClass::Pinned, AdmissionClass::Resolve];
+
+    /// The stable `class` metric label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            AdmissionClass::Pinned => "pinned",
+            AdmissionClass::Resolve => "resolve",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            AdmissionClass::Pinned => 0,
+            AdmissionClass::Resolve => 1,
+        }
+    }
+}
+
 /// The `ravel_distrib_*` metric family (ADR-0071). Process-global
 /// atomics, read at `/metrics` scrape time. Carries only the closed `mode`
-/// label at render time; never a per-shard, per-worker, or per-tenant label
-/// (ADR-0044 section 4).
+/// label (and, for the admission series, the closed `class` label) at render
+/// time; never a per-shard, per-worker, or per-tenant label (ADR-0044 section
+/// 4).
 #[derive(Debug)]
 pub struct FragmentMetrics {
     /// Inbound fragment requests served after passing capability auth and
@@ -156,8 +198,14 @@ pub struct FragmentMetrics {
     /// [`CapabilityReject`] (ADR-0071 amendment, decision 2). Rendered under the
     /// closed `reason` label.
     fragment_capability_rejects: [AtomicU64; 5],
-    /// Fragment requests currently holding an admission permit (gauge).
-    fragment_inflight: AtomicU64,
+    /// Fragment requests currently holding an admission permit (gauge),
+    /// indexed by [`AdmissionClass`]. Rendered under the closed `class` label.
+    fragment_inflight: [AtomicU64; 2],
+    /// Admission acquires that found their class's semaphore saturated and had
+    /// to queue, indexed by [`AdmissionClass`]. Rendered under the closed
+    /// `class` label; a class queuing does not mean it rejected anything (this
+    /// admission never rejects), only that a caller waited for a permit.
+    fragment_admission_waits_total: [AtomicU64; 2],
     /// Slices this coordinator executed locally (self-mapped, no network hop).
     slices_local_total: AtomicU64,
     /// Slices this coordinator dispatched to a remote worker successfully.
@@ -197,7 +245,8 @@ impl Default for FragmentMetrics {
             fragment_requests_total: AtomicU64::new(0),
             fragment_auth_failures_total: AtomicU64::new(0),
             fragment_capability_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
-            fragment_inflight: AtomicU64::new(0),
+            fragment_inflight: std::array::from_fn(|_| AtomicU64::new(0)),
+            fragment_admission_waits_total: std::array::from_fn(|_| AtomicU64::new(0)),
             slices_local_total: AtomicU64::new(0),
             slices_remote_total: AtomicU64::new(0),
             slices_redispatched_total: AtomicU64::new(0),
@@ -229,18 +278,24 @@ impl FragmentMetrics {
         self.fragment_capability_rejects[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
-    fn inc_inflight(&self) {
-        self.fragment_inflight.fetch_add(1, Ordering::Relaxed);
+    fn inc_inflight(&self, class: AdmissionClass) {
+        self.fragment_inflight[class.index()].fetch_add(1, Ordering::Relaxed);
     }
 
-    fn dec_inflight(&self) {
+    fn dec_inflight(&self, class: AdmissionClass) {
         // Saturating: an underflow would only happen on a double-drop, which the
         // permit guard's ownership prevents, but clamp rather than wrap.
-        let _ = self
-            .fragment_inflight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
+        let _ = self.fragment_inflight[class.index()].fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(1)),
+        );
+    }
+
+    /// Record that an admission acquire found `class`'s semaphore saturated
+    /// and had to queue.
+    fn record_admission_wait(&self, class: AdmissionClass) {
+        self.fragment_admission_waits_total[class.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_slice_local(&self) {
@@ -308,8 +363,26 @@ impl FragmentMetrics {
         CapabilityReject::ALL.map(|reason| (reason.reason(), self.capability_rejects(reason)))
     }
 
-    pub fn fragment_inflight(&self) -> u64 {
-        self.fragment_inflight.load(Ordering::Relaxed)
+    pub fn fragment_inflight(&self, class: AdmissionClass) -> u64 {
+        self.fragment_inflight[class.index()].load(Ordering::Relaxed)
+    }
+
+    /// The per-class in-flight gauge values paired with their
+    /// [`AdmissionClass`], for the `/metrics` renderer to emit one series
+    /// per class under the `class` label.
+    pub fn fragment_inflight_by_class(&self) -> [(AdmissionClass, u64); 2] {
+        AdmissionClass::ALL.map(|class| (class, self.fragment_inflight(class)))
+    }
+
+    pub fn fragment_admission_waits_total(&self, class: AdmissionClass) -> u64 {
+        self.fragment_admission_waits_total[class.index()].load(Ordering::Relaxed)
+    }
+
+    /// The per-class admission-wait counts paired with their
+    /// [`AdmissionClass`], for the `/metrics` renderer to emit one series
+    /// per class under the `class` label.
+    pub fn fragment_admission_waits_by_class(&self) -> [(AdmissionClass, u64); 2] {
+        AdmissionClass::ALL.map(|class| (class, self.fragment_admission_waits_total(class)))
     }
 
     pub fn slices_local_total(&self) -> u64 {
@@ -381,25 +454,31 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// The distinct internal-workload admission class for inbound fragment fetches
-/// (ADR-0071 deliverable 2). A plain counting semaphore, separate
-/// from the client-query admission controller: a coordinator that holds a
-/// client-query permit while it waits on its dispatched fragments can never
-/// deadlock behind client queries queued on the client cap, because the workers
+/// One internal-workload admission class for inbound fragment fetches
+/// (ADR-0071 deliverable 2). A plain counting semaphore, separate from the
+/// client-query admission controller: a coordinator that holds a client-query
+/// permit while it waits on its dispatched fragments can never deadlock
+/// behind client queries queued on the client cap, because the workers
 /// serving those fragments admit them here, against this independent bound.
+///
+/// One class alone does not protect a `Pinned` fetch from a `Resolve` fetch,
+/// or vice versa: see [`AdmissionClasses`], which pairs two of these under
+/// disjoint caps.
 #[derive(Clone)]
 pub struct FragmentAdmission {
     sem: Arc<tokio::sync::Semaphore>,
     metrics: Arc<FragmentMetrics>,
+    class: AdmissionClass,
 }
 
 impl FragmentAdmission {
     /// A fragment admission class bounded by `max` concurrent fetches (clamped
     /// to at least 1).
-    pub fn new(max: usize, metrics: Arc<FragmentMetrics>) -> Self {
+    fn new(max: usize, metrics: Arc<FragmentMetrics>, class: AdmissionClass) -> Self {
         FragmentAdmission {
             sem: Arc::new(tokio::sync::Semaphore::new(max.max(1))),
             metrics,
+            class,
         }
     }
 
@@ -407,11 +486,18 @@ impl FragmentAdmission {
     /// saturated. `None` only if the semaphore was closed, which this process
     /// never does; the caller then maps it to an `Unavailable` status.
     async fn acquire(&self) -> Option<FragmentPermit> {
-        let permit = self.sem.clone().acquire_owned().await.ok()?;
-        self.metrics.inc_inflight();
+        let permit = match self.sem.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.metrics.record_admission_wait(self.class);
+                self.sem.clone().acquire_owned().await.ok()?
+            }
+        };
+        self.metrics.inc_inflight(self.class);
         Some(FragmentPermit {
             _permit: permit,
             metrics: Arc::clone(&self.metrics),
+            class: self.class,
         })
     }
 }
@@ -421,11 +507,43 @@ impl FragmentAdmission {
 struct FragmentPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
     metrics: Arc<FragmentMetrics>,
+    class: AdmissionClass,
 }
 
 impl Drop for FragmentPermit {
     fn drop(&mut self) {
-        self.metrics.dec_inflight();
+        self.metrics.dec_inflight(self.class);
+    }
+}
+
+/// The two independent admission classes a [`FragmentService`] admits fetches
+/// against (issue #1722). `Pinned` and
+/// `Resolve` each carry their own semaphore and their own cap, so a peer
+/// cluster's federation reads queuing on `Resolve` never delays this
+/// cluster's own `Pinned` slices, and a `Pinned` backlog never delays
+/// `Resolve`. Both classes queue (never reject) when saturated, same as the
+/// single class this replaces.
+#[derive(Clone)]
+pub struct AdmissionClasses {
+    pinned: FragmentAdmission,
+    resolve: FragmentAdmission,
+}
+
+impl AdmissionClasses {
+    /// `max_pinned` and `max_resolve` are each clamped to at least 1
+    /// concurrent fetch.
+    pub fn new(max_pinned: usize, max_resolve: usize, metrics: Arc<FragmentMetrics>) -> Self {
+        AdmissionClasses {
+            pinned: FragmentAdmission::new(max_pinned, metrics.clone(), AdmissionClass::Pinned),
+            resolve: FragmentAdmission::new(max_resolve, metrics, AdmissionClass::Resolve),
+        }
+    }
+
+    fn for_class(&self, class: AdmissionClass) -> &FragmentAdmission {
+        match class {
+            AdmissionClass::Pinned => &self.pinned,
+            AdmissionClass::Resolve => &self.resolve,
+        }
     }
 }
 
@@ -488,7 +606,7 @@ struct FragmentServiceInner {
     /// is derived from it, never from the wire (ADR-0071 security). The
     /// intra-cluster pinned path never consults it.
     tenant_resolver: Arc<dyn TenantResolver>,
-    admission: FragmentAdmission,
+    admission: AdmissionClasses,
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     cache: Option<ReadCache>,
@@ -510,7 +628,7 @@ impl FragmentService {
     pub fn new(
         fragment_keys: Arc<Vec<[u8; 32]>>,
         tenant_resolver: Arc<dyn TenantResolver>,
-        admission: FragmentAdmission,
+        admission: AdmissionClasses,
         catalog: Arc<Catalog>,
         store: Arc<dyn ObjectStoreBackend>,
         cache: Option<ReadCache>,
@@ -896,7 +1014,14 @@ impl SeriesFetch for FragmentService {
                 self.verify_capability(&inner)?;
             }
         }
-        let Some(_permit) = self.inner.admission.acquire().await else {
+        // Pinned and Resolve admit against disjoint classes (issue #1722), so a peer cluster's
+        // federation reads queuing on Resolve can never delay this cluster's
+        // own Pinned slices.
+        let class = match &inner.scope {
+            Some(pb::fetch_request::Scope::Resolve(_)) => AdmissionClass::Resolve,
+            _ => AdmissionClass::Pinned,
+        };
+        let Some(_permit) = self.inner.admission.for_class(class).acquire().await else {
             return Err(tonic::Status::unavailable("fragment admission unavailable"));
         };
         self.inner.metrics.record_fragment_request();
@@ -1731,7 +1856,7 @@ mod tests {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let catalog =
             Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
-        let admission = FragmentAdmission::new(8, metrics.clone());
+        let admission = AdmissionClasses::new(8, 8, metrics.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         FragmentService::new(
             test_keys(),
@@ -1795,10 +1920,11 @@ mod tests {
     #[tokio::test]
     async fn fragment_admission_bounds_and_releases() {
         let metrics = Arc::new(FragmentMetrics::new());
-        let admission = FragmentAdmission::new(1, metrics.clone());
+        let classes = AdmissionClasses::new(1, 8, metrics.clone());
+        let admission = classes.for_class(AdmissionClass::Pinned).clone();
 
         let first = admission.acquire().await.expect("first permit");
-        assert_eq!(metrics.fragment_inflight(), 1);
+        assert_eq!(metrics.fragment_inflight(AdmissionClass::Pinned), 1);
 
         let waiter = {
             let admission = admission.clone();
@@ -1818,7 +1944,12 @@ mod tests {
             .await
             .expect("waiter task joins")
             .expect("second permit granted after release");
-        assert_eq!(metrics.fragment_inflight(), 0);
+        assert_eq!(metrics.fragment_inflight(AdmissionClass::Pinned), 0);
+        assert_eq!(
+            metrics.fragment_admission_waits_total(AdmissionClass::Pinned),
+            1,
+            "the queued waiter recorded exactly one admission wait"
+        );
     }
 
     /// A worker-side `FragmentService` with a fixed clock and the given keys, for
@@ -1835,7 +1966,7 @@ mod tests {
         FragmentService::new(
             keys,
             empty_resolver(),
-            FragmentAdmission::new(8, metrics.clone()),
+            AdmissionClasses::new(8, 8, metrics.clone()),
             catalog,
             store,
             None,
@@ -1870,6 +2001,101 @@ mod tests {
             frames.push(frame.expect("in-crate stream never errors"));
         }
         Ok(decode_slice_frames(frames).expect("frames decode"))
+    }
+
+    /// A worker-side `FragmentService` sharing the caller's `metrics` and
+    /// `admission` classes, so a test can hold a permit on one class directly
+    /// while driving `fetch` through the service.
+    fn service_with_admission(
+        metrics: Arc<FragmentMetrics>,
+        admission: AdmissionClasses,
+        resolver: Arc<dyn TenantResolver>,
+        now_ns: i64,
+    ) -> FragmentService {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        FragmentService::new(
+            test_keys(),
+            resolver,
+            admission,
+            catalog,
+            store,
+            None,
+            Arc::new(FixedClock(now_ns)),
+            metrics,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+        )
+    }
+
+    /// issue #1722. A cross-cluster
+    /// federation coordinator saturating the `Resolve` class (here bounded to
+    /// 1) must never delay this cluster's own `Pinned` fetches: the two
+    /// classes are independent semaphores, so a `Pinned` fetch is admitted
+    /// and completes well inside the bounded timeout even while a `Resolve`
+    /// permit is held forever.
+    #[tokio::test]
+    async fn pinned_fetch_admitted_while_resolve_class_is_saturated() {
+        let now = 1_000;
+        let metrics = Arc::new(FragmentMetrics::new());
+        let admission = AdmissionClasses::new(8, 1, metrics.clone());
+        let service =
+            service_with_admission(metrics.clone(), admission.clone(), empty_resolver(), now);
+
+        // Saturate and permanently hold the Resolve class: a peer cluster
+        // driving federation reads at the cap, forever.
+        let _resolve_permit = admission
+            .for_class(AdmissionClass::Resolve)
+            .acquire()
+            .await
+            .expect("resolve permit acquired");
+
+        let tenant = [3u8; 16];
+        let query = [4u8; 16];
+        let cap = mint(&TEST_KEY, tenant, metrics_signal(), query, now + 1_000);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            pinned_fetch(&service, pinned_with_cap(tenant, query, cap)),
+        )
+        .await
+        .expect("a saturated Resolve class must not starve a Pinned fetch");
+        outcome.expect("the Pinned fetch is admitted and served");
+    }
+
+    /// The inverse of the disjointness property above: a `Pinned` backlog
+    /// saturating its own class must never delay a `Resolve` (federation)
+    /// fetch.
+    #[tokio::test]
+    async fn resolve_fetch_admitted_while_pinned_class_is_saturated() {
+        let now = 1_000;
+        let metrics = Arc::new(FragmentMetrics::new());
+        let admission = AdmissionClasses::new(1, 8, metrics.clone());
+        let tokens: std::collections::HashMap<String, ravel_types::TenantId> =
+            std::collections::HashMap::from([(
+                "federation-token".to_string(),
+                ravel_types::TenantId::new("tenant-a".to_string()),
+            )]);
+        let resolver: Arc<dyn TenantResolver> =
+            Arc::new(ravel_query::http::StaticBearerTokenResolver::new(tokens));
+        let service = service_with_admission(metrics.clone(), admission.clone(), resolver, now);
+
+        // Saturate and permanently hold the Pinned class: an intra-cluster
+        // fan-out backlog at the cap, forever.
+        let _pinned_permit = admission
+            .for_class(AdmissionClass::Pinned)
+            .acquire()
+            .await
+            .expect("pinned permit acquired");
+
+        let request = resolve_request(TenantHash([9u8; 16]), now);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetch_decoded(&service, request, "federation-token"),
+        )
+        .await
+        .expect("a saturated Pinned class must not starve a Resolve fetch");
+        outcome.expect("the Resolve fetch is admitted and served");
     }
 
     /// A valid capability naming the request's own tenant, signal, and query is
@@ -3000,7 +3226,7 @@ mod tests {
         FragmentService::new(
             test_keys(),
             resolver,
-            FragmentAdmission::new(8, metrics.clone()),
+            AdmissionClasses::new(8, 8, metrics.clone()),
             catalog,
             store,
             None,
@@ -3143,7 +3369,7 @@ mod tests {
         FragmentService::new(
             test_keys(),
             empty_resolver(),
-            FragmentAdmission::new(8, metrics.clone()),
+            AdmissionClasses::new(8, 8, metrics.clone()),
             catalog,
             store,
             None,
