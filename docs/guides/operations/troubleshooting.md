@@ -32,7 +32,7 @@ record you removed as garbage to reclaim.
 
 | Symptom | Likely cause | How to confirm | Corrective action |
 |---|---|---|---|
-| `increase(ravel_maintain_orphan_breaker_tripped_total[5m]) > 0` | A sweep pass found a large set of data objects whose commit records are gone, which usually means records were deleted out of band rather than that a lot of flushes were abandoned. | The counter increment itself is the confirmation: it only increments on a real trip. `ravel_maintain_orphans_withheld` on `/metrics` gives the size of the most recent withheld set. Re-run the same evaluation without deleting anything with `ravel-cli maintain sweep --tenant <t> --signal <s> --shard <n> --dry-run`. | Restore the missing commit records before the next pass runs. Do not wait for the trip to persist; see below. |
+| `increase(ravel_maintain_orphan_breaker_tripped_total[5m]) > 0` | A sweep pass found a large set of data objects whose commit records are gone, which usually means records were deleted out of band rather than that a lot of flushes were abandoned. | The counter increment itself is the confirmation: it only increments on a real trip. A trip can only happen on a tick that ran candidate selection, which is the full-sweep cadence (`interior_reverify_ns`, 6 hours by default), not every tick. `ravel_maintain_orphans_withheld` on `/metrics` gives the size of the set withheld by the last such pass, and a tick that skipped selection leaves it unchanged. Re-run the same evaluation without deleting anything with `ravel-cli maintain sweep --tenant <t> --signal <s> --shard <n> --dry-run`. | Restore the missing commit records before the next pass runs. Do not wait for the trip to persist; see below. |
 
 Alert on the **first trip**, with `increase(...) > 0`, not on a sustained
 condition. The counter only increments, so any increase is a trip that really
@@ -95,7 +95,25 @@ breaker as an all-clear:
 
 The gauge that closes the small-scale gap is `ravel_maintain_orphans_present`,
 which carries the most recent pass's total candidate count whether or not the
-breaker tripped. Alert on it sustained:
+breaker tripped.
+
+"Most recent pass" means the most recent pass that actually ran the orphan
+rule. Orphan candidate selection runs on the full-sweep cadence
+(`interior_reverify_ns`, default 6 h), not on every maintain tick (default
+300 s); the ticks in between skip the rule entirely and report nothing about
+orphans, so they leave the gauge alone rather than resetting it to zero. The
+gauge therefore reports the last completed orphan pass and is refreshed once
+per full-sweep interval. Read a change in its value as "the last orphan pass
+found this", never as "as of this scrape"; a value can be up to one
+full-sweep interval old, and a genuine return to zero shows up on the next
+pass that runs, not on the next tick.
+
+The gauge also reports only one unit per tick: it is labelled by mode and
+signal while the sweep runs per tenant, signal and shard, so each pass
+overwrites the same series and a unit that measured zero can mask another
+unit's nonzero measurement.
+
+Alert on it sustained:
 
 | Symptom | Likely cause | How to confirm | Corrective action |
 |---|---|---|---|
@@ -103,8 +121,13 @@ breaker tripped. Alert on it sustained:
 
 Twelve hours is roughly half the grace window: long enough that one normal
 abandoned-flush cleanup between passes does not page, short enough that real
-loss alarms with hours to spare. `ravel_maintain_orphans_withheld` is not an
-alert target. It reflects only the most recent pass and drops to zero on the
+loss alarms with hours to spare. It is also comfortably longer than the
+default 6 h full-sweep interval that refreshes the gauge, so a sustained
+alert window always spans at least one orphan pass; keep that relationship
+if you raise `interior_reverify_ns`, or the window can close on a single
+stale sample. `ravel_maintain_orphans_withheld` is not an
+alert target. It reflects only the most recent pass that ran the orphan rule
+and drops to zero on the
 next non-tripping pass, including one that stopped tripping through dilution.
 
 ## Commit records were deleted out of band

@@ -204,6 +204,43 @@ window would still call a Hit.
   candidate, a move to quarantine (see "Quarantine and the second horizon"
   below), never a direct delete. The breaker is all-or-nothing: a
   tripped, non-overridden breaker quarantines zero candidates that pass.
+- **Candidate selection's initial listing runs on the full-sweep cadence, not
+  every maintain tick.** That listing is the one phase of a
+  pass that cannot be hour-scoped (L0 data keys carry no ingest-hour
+  component), so it would otherwise re-list the whole shard's `l0/`
+  data prefix on every maintain tick (default 300 s) even though rules 2 and
+  3 already list only the tick's zone-scoped hours. `ravel-maintain`'s
+  per-tick sweep now runs candidate selection only on the tick a full sweep
+  is due -- the same cadence memo (`MaintainMemo::full_sweep_due`,
+  `interior_reverify_ns`, default 6 h) that already governs when rules 2 and
+  3 fall back to their own unscoped pass. Every other tick skips candidate
+  selection entirely: no LIST of the `l0/` data prefix, and that pass's
+  orphan and breaker figures (deleted, quarantined, quarantine-refused, and
+  the breaker fields) are reported as zero rather than a value carried over
+  from the last tick that did run it. Those zeros mean "the rule did not
+  run", not "the rule looked and found nothing", and the two are
+  indistinguishable from the counts alone, so the report records which pass
+  it was and a consumer that keeps a last-observed-value gauge must not
+  publish the skipped kind. The `ravel_maintain_orphans_present` and
+  `ravel_maintain_orphans_withheld` gauges are therefore written only by a
+  pass that ran the rule: they report the last completed orphan pass and are
+  refreshed once per full-sweep interval rather than reset to zero by every
+  tick in between. Publishing the zeros would silently disable the
+  `orphans_present > 0 for 12h` alert
+  (`docs/guides/operations/troubleshooting.md`), since on the defaults 71 of
+  every 72 ticks skip the rule. The per-pass counters
+  (`orphans_quarantined`, `orphans_quarantine_refused`, `quarantine_reaped`,
+  and the breaker-trip counter) are unaffected: a skipped pass adds zero,
+  which is the truth about the events it performed. The L0 listing cost that
+  used to be paid every 300 s is now paid once per full-sweep interval
+  instead. The quarantine reaper runs on that same cadence: it is a different
+  rule over the separate `quarantine/` prefix, but it runs only on a pass that
+  ran candidate selection, so the breaker's hold on it cannot be stepped
+  around by the next tick (see "A tripped breaker holds the reaper" below).
+  Objects already quarantined keep aging out, one full-sweep interval at a
+  time rather than one tick at a time, which moves the effective second
+  horizon later by at most one full-sweep interval and never earlier. The key
+  layout of `l0/` and `quarantine/` is unchanged.
 - The mass-orphan circuit breaker (ADR-0048 decision 4) trips when a
   pass's surviving candidate count is at least `orphan_breaker_min_count`
   (default 50) AND exceeds `orphan_breaker_max_ratio` (default 0.10) of
@@ -287,15 +324,22 @@ prefix and a separate reaper deletes it only after a second horizon:
   object whose embedded timestamp is more than `quarantine_horizon_ns`
   (default 7 days) behind the clock, deletes it. A key whose `/q<ns>`
   segment cannot be parsed is skipped, never deleted (fail-closed: an
-  unreadable age is treated as not-yet-expired). It runs on the same
-  maintain tick as the sweep, whole-shard like orphan GC itself (quarantine
-  keys are not hour-bucketed), and is stateless and idempotent.
+  unreadable age is treated as not-yet-expired). It runs on the same pass as
+  orphan GC's candidate selection, so on the full-sweep cadence
+  (`interior_reverify_ns`, default 6 h) rather than on every maintain tick,
+  whole-shard like orphan GC itself (quarantine keys are not hour-bucketed),
+  and is stateless and idempotent.
 - **A tripped breaker holds the reaper.** A pass whose mass-orphan breaker
   tripped reaps nothing, whatever the quarantine ages say. A loss that grows
   over time reaches the breaker's thresholds days after it started, so
   reaping on such a pass deletes the copies taken while it was still small.
-  The two horizons are therefore chained, not independent. A
-  `force_orphan_gc` override is not a trip and still reclaims.
+  The two horizons are therefore chained, not independent, and they are
+  chained because both run on the same pass: a pass that skipped candidate
+  selection never evaluated the breaker, so it reports not-tripped
+  structurally, and reaping there would delete on the next tick exactly what
+  the trip just held. Tying the reaper to candidate selection's cadence makes
+  the hold hold by construction, with no breaker state persisted between
+  passes. A `force_orphan_gc` override is not a trip and still reclaims.
 - **The event is visible in the logs, not yet on `/metrics`.** A pass counts
   objects quarantined (equal to the retained `orphans_deleted` count of
   candidates removed from the live set), refused, and reaped, and emits a
@@ -313,7 +357,8 @@ would leak without the reaper, which is why the reaper is part of the
 mechanism, not a follow-up. The request cost changed shape too: orphan GC
 went from one DELETE per candidate to a full-object GET plus a full PUT per
 candidate, run serially with no cap on candidates per pass, and the reaper
-adds one unconditional LIST per swept unit per tick. The thin-spread record
+adds one LIST per swept unit per full-sweep interval: it runs on the pass
+that ran candidate selection, not on every tick. The thin-spread record
 loss this feature exists for is also the expensive case, because it moves
 those bytes twice through a single maintain tick. The per-pass
 unboundedness is an acknowledged open item, not a property anything
