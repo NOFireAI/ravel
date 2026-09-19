@@ -26,17 +26,58 @@
 //! - [`COMMIT_SUBSTR`] (`/c/`) -- the L0 commit records.
 //!
 //! Faults are deliberately *not* placed on GET (the query and compaction read
-//! paths do not all retry), on the `l1/` parts, or on the `catalog/` snapshot
-//! objects a fold writes: a fault there would fail a phase this ingest-only
-//! rule set has no retry hook for and turn a green invariant red for reasons
-//! unrelated to the bug classes this task hunts. The compaction and sweep
-//! phases get their own retryable faults -- including LIST and DELETE on the
-//! sweep path -- from the phase-isolated schedule in
-//! [`generate_compaction_faults`], never from the rules below.
-//! `Occurrence::Nth` (rather than `Always`) is used so each rule fires exactly
-//! once, during ingest, and is fully consumed before the compact/sweep phases,
-//! so a leftover rule can never fire on a compaction-record PUT that has no
-//! retry hook of its own.
+//! paths do not all retry) or on the `l1/` parts by the rules below: a fault
+//! there would fail a phase this ingest-only rule set has no retry hook for and
+//! turn a green invariant red for reasons unrelated to the bug classes this
+//! task hunts. The compaction, sweep, and fold phases get their own retryable
+//! faults -- including LIST and DELETE on the sweep path and PUT on the catalog
+//! snapshot prefix -- from the phase-isolated schedules in
+//! [`generate_compaction_faults`] and [`generate_fold_fault`], never from the
+//! rules below. `Occurrence::Nth` (rather than `Always`) is used so each rule
+//! fires exactly once, during ingest, and is fully consumed before the
+//! fold/compact/sweep phases, so a leftover rule can never fire on a
+//! compaction-record PUT that has no retry hook of its own.
+//!
+//! # Is `Catalog::fold` idempotent on retry after a throttled catalog PUT?
+//!
+//! Yes, and the fold-phase rule in [`generate_fold_fault`] rests on that
+//! decision: the driver retries the fold once and requires the post-fold cycle
+//! digest to equal the digest of the same seed run with no faults at all
+//! (`tests/compaction_phase_faults.rs`,
+//! `catalog_put_fault_on_fold_recovers_or_returns_typed_error`).
+//!
+//! The evidence is in `crates/ravel-catalog/src/fold.rs`, read as of this
+//! commit:
+//!
+//! - A snapshot part is PUT under a content-addressed key
+//!   (`part_object_key`, keyed on the blake3 of the part's own encoded bytes)
+//!   with `PutOptions::create_if_absent()`, and the call site treats
+//!   `StoreError::AlreadyExists` as success ("bytes are identical by
+//!   construction"). A re-run that recomputes the same part from the same
+//!   commit layout therefore converges whether or not the first attempt's
+//!   bytes landed. `docs/catalog-and-mvcc.md` states the same rule
+//!   normatively: "two folders that fold the same input independently write
+//!   the same key and `PutMode::CreateIfAbsent` `AlreadyExists` is idempotent
+//!   success".
+//! - Any other PUT error on that path returns `CatalogError::Store(e)`
+//!   immediately: `fold_inner` has no internal retry, so a throttled catalog
+//!   PUT is already a *typed* error at the `Catalog::fold` boundary, never a
+//!   panic and never a partial success.
+//! - The HEAD CAS is the fold's last write (`head_put_result`, under
+//!   `PutMode::CasVersion`/`CreateIfAbsent`), and the typed error above
+//!   returns before it. So a faulted attempt publishes nothing a reader can
+//!   reach: HEAD still names the pre-fold snapshot, and the orphaned part (if
+//!   any landed) is exactly the "orphan part" crash case
+//!   `sweep_unreferenced_catalog_objects` already collects.
+//! - Under this harness the faulted PUT does not even reach the backend:
+//!   `FaultStore::put` short-circuits a `Throttled`/`Transient` scripted fault
+//!   before calling the wrapped store (`crates/ravel-object-store/src/fault.rs`),
+//!   so the retry's PUT lands as a plain create.
+//!
+//! The retry is bounded and the non-recoverable branch is preserved: an
+//! `Occurrence::Always` fault on the same target exhausts the budget and
+//! surfaces a typed `CycleError::Fold`, which is the flip that proves the
+//! recover branch is not vacuous.
 
 use rand::RngExt;
 use ravel_object_store::fault::{
@@ -62,6 +103,19 @@ pub const COMMIT_SUBSTR: &str = "/c/";
 /// (`<writer>.<epoch>.<seq>.cmt`) never do. A `Put` rule keyed on this fires
 /// only on the compaction write path.
 pub const L1_SUBSTR: &str = "/l1";
+/// Key substring matching the catalog snapshot parts a fold publishes
+/// (`t/<tenant>/catalog/<signal>/snap/<watermark>.<hash>.csnap`, see
+/// `part_object_key` in `crates/ravel-catalog/src/fold.rs`) and nothing any
+/// other phase writes. The commit records (`.../c/<shard>/<hour>/<name>.cmt`),
+/// the L0 data objects (`.../l0/...`), and the compaction outputs (`.../l1...`)
+/// contain no `/snap/` segment, so a `Put` rule keyed on this can never reach a
+/// commit-record PUT under any seed -- the phase isolation the module docs
+/// require. It is also narrower than the whole `catalog/` prefix on purpose:
+/// the postings object (`catalog/<signal>/idx/*.npost`) has a PUT failure path
+/// that warns and folds on without the index rather than returning an error,
+/// so a fault there would exercise a different contract than the
+/// recover-or-typed-error one this rule claims.
+pub const CATALOG_SNAPSHOT_SUBSTR: &str = "/snap/";
 
 /// One hold/release gate the schedule can arm on a [`FaultStore`], holding
 /// each matching call open until released (ADR-0059 decision 5). Matching is
@@ -124,6 +178,15 @@ pub struct FaultSchedule {
     /// C (the first delete the sweep issues), so the re-run re-gathers the same
     /// cleared groups and deletes them through rule 2.
     pub sweep_plan: FaultPlan,
+    /// The scripted plan the driver wraps only around `Catalog::fold`: one
+    /// retryable PUT on the catalog snapshot prefix
+    /// ([`CATALOG_SNAPSHOT_SUBSTR`]). Isolated to the fold phase by the
+    /// dedicated [`FaultStore`] the driver builds from it, and recovered by the
+    /// driver's bounded fold re-run, which the module docs justify from the
+    /// fold's own code.
+    ///
+    /// [`FaultStore`]: ravel_object_store::fault::FaultStore
+    pub fold_plan: FaultPlan,
     /// Hold/release gates the driver may arm on the store.
     pub gates: Vec<GateScript>,
     /// The `(Op, FaultKind)` pair each emitted ingest-phase rule injects, in
@@ -140,6 +203,14 @@ pub struct FaultSchedule {
     /// [`compact_plan`]: FaultSchedule::compact_plan
     /// [`sweep_plan`]: FaultSchedule::sweep_plan
     pub expected_compaction_faults: Vec<(Op, FaultKind)>,
+    /// The `(Op, FaultKind)` the [`fold_plan`] rule injects, or `None` for a
+    /// schedule that arms no fold fault ([`FaultSchedule::none`]). The driver
+    /// merges it into [`crate::driver::CycleOutcome::expected_faults`] and
+    /// reports the exact number of times it fired in
+    /// [`crate::driver::CycleOutcome::fold_faults_fired`].
+    ///
+    /// [`fold_plan`]: FaultSchedule::fold_plan
+    pub expected_fold_fault: Option<(Op, FaultKind)>,
 }
 
 impl FaultSchedule {
@@ -149,9 +220,11 @@ impl FaultSchedule {
             plan: FaultPlan::empty(),
             compact_plan: FaultPlan::empty(),
             sweep_plan: FaultPlan::empty(),
+            fold_plan: FaultPlan::empty(),
             gates: Vec::new(),
             expected_faults: Vec::new(),
             expected_compaction_faults: Vec::new(),
+            expected_fold_fault: None,
         }
     }
 
@@ -227,14 +300,59 @@ pub fn generate(master_seed: &MasterSeed, config: &FaultScheduleConfig) -> Fault
     let (compact_plan, sweep_plan, expected_compaction_faults) =
         generate_compaction_faults(&mut rng);
 
+    // Fold-phase fault, drawn last for the same reason: appending the draw
+    // leaves every earlier phase's schedule byte-for-byte what it was.
+    let (fold_plan, expected_fold_fault) = generate_fold_fault(&mut rng);
+
     FaultSchedule {
         plan,
         compact_plan,
         sweep_plan,
+        fold_plan,
         gates,
         expected_faults,
         expected_compaction_faults,
+        expected_fold_fault: Some(expected_fold_fault),
     }
+}
+
+/// Derive the fold-phase fault plan: one retryable PUT on the catalog
+/// snapshot prefix ([`CATALOG_SNAPSHOT_SUBSTR`]), `Occurrence::Nth(1)` so it
+/// fires exactly once per cycle, on the first snapshot part the first fold
+/// publishes. Only the flavor (transient vs throttled) varies with the seed.
+///
+/// Phase isolation is by construction, as for the compaction and sweep plans:
+/// the driver builds a [`FaultStore`] from this plan and folds through it
+/// alone, so the rule cannot fire during ingest, compaction, sweep, or the
+/// query probes. It is also isolated by key: `/snap/` appears in no commit
+/// record, data object, or compaction output, so no seed can steer this rule
+/// onto a commit-record PUT.
+///
+/// The recovery contract is the one the module docs derive from the fold's own
+/// code: `Catalog::fold` publishes content-addressed parts and CAS-swaps HEAD
+/// last, so a faulted attempt publishes nothing reachable and a re-run
+/// converges on the identical snapshot. The driver retries once and asserts
+/// the post-fold digest against the fault-free run.
+///
+/// [`FaultStore`]: ravel_object_store::fault::FaultStore
+fn generate_fold_fault(rng: &mut rand::rngs::StdRng) -> (FaultPlan, (Op, FaultKind)) {
+    let (fault, kind) = if rng.random_bool(0.5) {
+        (
+            ScriptedFault::Transient("sim fault schedule: transient on catalog snapshot".to_string()),
+            FaultKind::Transient,
+        )
+    } else {
+        (
+            ScriptedFault::Throttled { retry_after_ms: 50 },
+            FaultKind::Throttled,
+        )
+    };
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, fault)
+            .with_key_contains(CATALOG_SNAPSHOT_SUBSTR)
+            .with_occurrence(Occurrence::Nth(1)),
+    );
+    (plan, (Op::Put, kind))
 }
 
 /// Derive the compaction- and sweep-phase fault plans. All four kinds are
@@ -399,6 +517,7 @@ mod tests {
         let b = generate(&MasterSeed::new(99), &cfg);
         assert_eq!(a.expected_faults, b.expected_faults);
         assert_eq!(a.expected_compaction_faults, b.expected_compaction_faults);
+        assert_eq!(a.expected_fold_fault, b.expected_fold_fault);
         assert_eq!(a.gates, b.gates);
         assert_eq!(a.plan.rules.len(), b.plan.rules.len());
         for (ra, rb) in a.plan.rules.iter().zip(b.plan.rules.iter()) {
@@ -411,6 +530,7 @@ mod tests {
         for (pa, pb) in [
             (&a.compact_plan, &b.compact_plan),
             (&a.sweep_plan, &b.sweep_plan),
+            (&a.fold_plan, &b.fold_plan),
         ] {
             assert_eq!(pa.rules.len(), pb.rules.len());
             for (ra, rb) in pa.rules.iter().zip(pb.rules.iter()) {
@@ -474,6 +594,71 @@ mod tests {
                     rule.occurrence,
                     Occurrence::Nth(1),
                     "seed {seed}: compaction/sweep rule must be Nth(1)"
+                );
+            }
+        }
+    }
+
+    /// Object keys in the shapes `docs/catalog-and-mvcc.md` fixes, one per
+    /// writer the cycle runs, so the fold rule's key filter can be checked
+    /// against the real layout rather than against its own definition.
+    const SAMPLE_KEYS: [(&str, bool); 7] = [
+        // (key, whether the fold rule's `/snap/` filter must match it)
+        ("t/aabb/catalog/m/snap/20231114T22.0123456789abcdef.csnap", true),
+        ("t/aabb/catalog/m/HEAD", false),
+        ("t/aabb/catalog/m/idx/20231114T22.0123456789abcdef.npost", false),
+        ("t/aabb/catalog/m/idx/20231114T22.0123456789abcdef.cstat", false),
+        ("t/aabb/m/c/0000/20231114T22/0123456789ab.1.7.cmt", false),
+        ("t/aabb/m/c/0000/20231114T22/l1.0123456789abcdef.cmt", false),
+        ("t/aabb/m/l0/0000/20231114T22/0123456789abcdef.rseg", false),
+    ];
+
+    #[test]
+    fn generate_arms_a_retryable_catalog_snapshot_put() {
+        let cfg = FaultScheduleConfig::default();
+        for seed in 1u64..=64 {
+            let s = generate(&MasterSeed::new(seed), &cfg);
+            assert_eq!(
+                s.fold_plan.rules.len(),
+                1,
+                "seed {seed}: the fold plan must carry exactly one rule"
+            );
+            let rule = &s.fold_plan.rules[0];
+            assert_eq!(rule.op, Op::Put, "seed {seed}: fold fault is not a PUT");
+            assert_eq!(
+                rule.key_contains.as_deref(),
+                Some(CATALOG_SNAPSHOT_SUBSTR),
+                "seed {seed}: fold fault is not keyed on the catalog snapshot prefix"
+            );
+            assert_eq!(
+                rule.occurrence,
+                Occurrence::Nth(1),
+                "seed {seed}: fold rule must be Nth(1) so it fires exactly once"
+            );
+            assert!(
+                matches!(
+                    rule.fault,
+                    ScriptedFault::Transient(_) | ScriptedFault::Throttled { .. }
+                ),
+                "seed {seed}: non-retryable fold fault {:?}",
+                rule.fault
+            );
+            assert_eq!(
+                s.expected_fold_fault,
+                Some((Op::Put, rule.fault.kind())),
+                "seed {seed}: expected fold-fault tuple does not describe the armed rule"
+            );
+
+            // The rule can never reach a commit-record PUT (nor any other
+            // phase's object) under this seed, because its key filter does not
+            // match one.
+            let key = rule.key_contains.as_deref().unwrap_or("");
+            for (sample, want_match) in SAMPLE_KEYS {
+                assert_eq!(
+                    sample.contains(key),
+                    want_match,
+                    "seed {seed}: fold rule key {key:?} matches {sample:?} = {}, want {want_match}",
+                    sample.contains(key)
                 );
             }
         }
