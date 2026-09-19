@@ -10,56 +10,86 @@
 # This file is sourced, never executed. Every entry point under scripts/dr/
 # sources it, sets `set -euo pipefail` itself, and calls `dr_init`.
 #
-# Environment (every script reads the same set; the defaults are the CI MinIO
-# values, so a CI run needs none of them):
+# NOTHING HERE HAS A GUESSABLE BUCKET NAME OR A GUESSABLE CREDENTIAL. Both
+# bucket names and both credentials are required with no default, and `dr_init`
+# refuses when any of them is unset. A default bucket name is a recursive
+# delete aimed at whatever bucket happens to bear that name in the account the
+# credentials belong to, and a default credential pair silently turns a
+# real-S3 misconfiguration into a run against someone's dev MinIO or the
+# reverse.
+#
+# Environment:
 #
 #   DR_ENDPOINT          S3 endpoint override. Default http://127.0.0.1:9000.
 #                        Set it to the EMPTY STRING for real S3: the scripts
 #                        then export no RAVEL_S3_ENDPOINT at all, which is how
 #                        the object store expresses "use AWS's regional
 #                        endpoint" (S3Config.endpoint is Option<String>).
-#   DR_REGION            S3 region. Default us-east-1.
-#   DR_BUCKET_PRIMARY    Bucket A, the primary the corpus is written into.
-#   DR_BUCKET_REPLICA    Bucket B, the empty bucket the replica is restored
-#                        into and the only bucket the restore checks read.
-#   DR_ACCESS_KEY        Access key id.
-#   DR_SECRET_KEY        Secret access key.
-#   DR_SESSION_TOKEN     Optional STS session token (real S3 only).
+#   DR_REGION            S3 region. Default us-east-1. Passed to bucket
+#                        creation too: a bucket created with no region lands
+#                        in the endpoint's default one, which is a different
+#                        bucket from the one the rest of the run addresses.
+#   DR_BUCKET_PRIMARY    REQUIRED. Bucket A, the primary the corpus is written
+#                        into.
+#   DR_BUCKET_REPLICA    REQUIRED. Bucket B, the empty bucket the replica is
+#                        restored into and the only bucket the restore checks
+#                        read. Must differ from bucket A.
+#   DR_ACCESS_KEY        REQUIRED. Access key id.
+#   DR_SECRET_KEY        REQUIRED. Secret access key.
+#   DR_SESSION_TOKEN     STS session token. Required in practice whenever the
+#                        credentials come from an instance role or any other
+#                        STS source; when it is set, every tool the harness
+#                        drives must carry it or every call 403s.
 #   DR_TENANT            Tenant name. Default dr-rehearsal-tenant.
-#   DR_TENANT_TOKEN      Ingest bearer token for that tenant.
+#   DR_TENANT_TOKEN      Ingest bearer token for that tenant. Never placed in
+#                        argv: ravel-server reads it from a
+#                        `--tenant-token-file` and curl from a `--config`
+#                        file, both written mode 600 under DR_LOG_DIR/private.
 #   DR_SHARDS            Shard count passed to the ravel-cli subcommands.
-#   DR_TENANT_HASH_MODE  unkeyed | keyed. A fresh bucket refuses to be written
-#                        until the deployment names one (ADR-0050 section 3),
-#                        and the custody manifest check asserts the choice was
-#                        made explicitly rather than defaulted into.
+#   DR_TENANT_HASH_MODE  REQUIRED. unkeyed | keyed. A fresh bucket refuses to
+#                        be written until the deployment names one (ADR-0050
+#                        section 3), and the custody manifest check asserts the
+#                        choice was made explicitly rather than defaulted into.
 #   DR_TENANT_HASH_KEY_FILE   Required when DR_TENANT_HASH_MODE=keyed.
-#   DR_TENANT_KMS_CONFIG      Per-tenant KMS configuration file, or the literal
-#                        `none` to declare the deployment uses no per-tenant
-#                        KMS. The custody manifest check refuses an unset
-#                        value: "unset" and "deliberately none" are different
-#                        answers and only one of them is a restore-ready
-#                        deployment.
-#   DR_ADMIN_CREDENTIAL_FILE  File holding the admin credential the restore
-#                        operator will use, or the literal `none` under the
-#                        same rule.
+#   DR_TENANT_KMS_CONFIG      REQUIRED. Per-tenant KMS configuration file, or
+#                        the literal `none` to declare the deployment uses no
+#                        per-tenant KMS. The custody manifest check refuses an
+#                        unset value: "unset" and "deliberately none" are
+#                        different answers and only one of them is a
+#                        restore-ready deployment. It therefore has no default:
+#                        a default of `none` would make an operator who
+#                        declared nothing pass as one who declared none.
+#   DR_ADMIN_CREDENTIAL_FILE  REQUIRED. File holding the admin credential the
+#                        restore operator will use, or the literal `none` under
+#                        the same rule and for the same reason.
+#   DR_FOLD_SEAL_MARGIN_WAITED  0 | 1, default 0. Set it to 1 only when the run
+#                        really did wait `max_flush_lifetime +
+#                        clock_skew_allowance + fold_safety_margin` out after
+#                        the last write. At 0 the catalog-fold phase reports
+#                        itself a NO-OP (see restore-check.sh); at 1 a fold
+#                        that publishes no snapshot HEAD is a failure.
 #   DR_LOG_DIR           Where logs and the pre-registered figures live.
 #                        Default <repo>/.gate-logs/dr (gitignored).
 #   DR_MC                Path to an `mc` binary. When unset the scripts run
 #                        the digest-pinned mc image under docker.
 #   DR_MC_IMAGE          The mc image reference, digest pinned.
+#   DR_MC_HOST_URL       Escape hatch: the whole MC_HOST_dr URL, built by the
+#                        caller. When DR_SESSION_TOKEN is set this URL must
+#                        carry a session-token component or startup refuses.
 #   DR_HTTP_ADDR         host:port the seeding server listens on for HTTP.
 #   DR_GRPC_ADDR         host:port the seeding server listens on for gRPC.
 #
-# A real S3 run needs, at minimum: DR_ENDPOINT set to the empty string,
-# DR_REGION, DR_BUCKET_PRIMARY, DR_BUCKET_REPLICA, DR_ACCESS_KEY,
-# DR_SECRET_KEY (plus DR_SESSION_TOKEN under STS), DR_TENANT,
+# A real S3 run needs: DR_ENDPOINT set to the empty string, DR_REGION,
+# DR_BUCKET_PRIMARY, DR_BUCKET_REPLICA, DR_ACCESS_KEY, DR_SECRET_KEY,
+# DR_SESSION_TOKEN (under STS, which an instance role always is), DR_TENANT,
 # DR_TENANT_TOKEN, DR_TENANT_HASH_MODE (with DR_TENANT_HASH_KEY_FILE when
 # keyed), DR_TENANT_KMS_CONFIG and DR_ADMIN_CREDENTIAL_FILE.
 #
 # Credentials are never placed in a command line. mc receives them through an
 # MC_HOST_<alias> variable in the environment (for the containerised mc, via a
-# bare `-e NAME` so the value never appears in argv), and ravel-cli and
-# ravel-server receive them through RAVEL_S3_ACCESS_KEY / RAVEL_S3_SECRET_KEY.
+# bare `-e NAME` so the value never appears in the container's argv), and
+# ravel-cli and ravel-server receive them through RAVEL_S3_ACCESS_KEY /
+# RAVEL_S3_SECRET_KEY / RAVEL_S3_SESSION_TOKEN.
 
 # shellcheck shell=bash
 
@@ -68,18 +98,19 @@ export DR_ROOT_DIR
 
 DR_ENDPOINT="${DR_ENDPOINT-http://127.0.0.1:9000}"
 DR_REGION="${DR_REGION:-us-east-1}"
-DR_BUCKET_PRIMARY="${DR_BUCKET_PRIMARY:-ravel-dr-primary}"
-DR_BUCKET_REPLICA="${DR_BUCKET_REPLICA:-ravel-dr-replica}"
-DR_ACCESS_KEY="${DR_ACCESS_KEY:-minioadmin}"
-DR_SECRET_KEY="${DR_SECRET_KEY:-minioadmin}"
+DR_BUCKET_PRIMARY="${DR_BUCKET_PRIMARY:-}"
+DR_BUCKET_REPLICA="${DR_BUCKET_REPLICA:-}"
+DR_ACCESS_KEY="${DR_ACCESS_KEY:-}"
+DR_SECRET_KEY="${DR_SECRET_KEY:-}"
 DR_SESSION_TOKEN="${DR_SESSION_TOKEN:-}"
 DR_TENANT="${DR_TENANT:-dr-rehearsal-tenant}"
 DR_TENANT_TOKEN="${DR_TENANT_TOKEN:-dr-rehearsal-token}"
 DR_SHARDS="${DR_SHARDS:-4}"
-DR_TENANT_HASH_MODE="${DR_TENANT_HASH_MODE:-unkeyed}"
+DR_TENANT_HASH_MODE="${DR_TENANT_HASH_MODE:-}"
 DR_TENANT_HASH_KEY_FILE="${DR_TENANT_HASH_KEY_FILE:-}"
-DR_TENANT_KMS_CONFIG="${DR_TENANT_KMS_CONFIG:-none}"
-DR_ADMIN_CREDENTIAL_FILE="${DR_ADMIN_CREDENTIAL_FILE:-none}"
+DR_TENANT_KMS_CONFIG="${DR_TENANT_KMS_CONFIG:-}"
+DR_ADMIN_CREDENTIAL_FILE="${DR_ADMIN_CREDENTIAL_FILE:-}"
+DR_FOLD_SEAL_MARGIN_WAITED="${DR_FOLD_SEAL_MARGIN_WAITED:-0}"
 DR_LOG_DIR="${DR_LOG_DIR:-${DR_ROOT_DIR}/.gate-logs/dr}"
 DR_MC="${DR_MC:-}"
 # quay.io rather than Docker Hub: Docker Hub's anonymous pull allowance is
@@ -88,10 +119,15 @@ DR_MC_IMAGE="${DR_MC_IMAGE:-quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256
 DR_HTTP_ADDR="${DR_HTTP_ADDR:-127.0.0.1:8480}"
 DR_GRPC_ADDR="${DR_GRPC_ADDR:-127.0.0.1:8481}"
 
-# The reconciled marker. Deliberately outside `t/` and `sys/`, the two key
-# families docs/catalog-and-mvcc.md freezes, so it can never collide with a
-# key Ravel itself writes.
+# The harness's own keys. All three live under `dr/`, deliberately outside
+# `t/` and `sys/`, the two key families docs/catalog-and-mvcc.md freezes, so
+# they can never collide with a key Ravel itself writes. `dr_list_keys` drops
+# the whole `dr/` prefix, so harness bookkeeping never counts as corpus and a
+# bucket holding only its own creation marker still reads as empty.
 DR_MARKER_KEY="dr/reconciled.json"
+DR_RESTORE_START_KEY="dr/restore-start.json"
+DR_BUCKET_MARKER_KEY="dr/rehearsal-bucket.json"
+DR_HARNESS_PREFIX="dr/"
 
 # The file the pre-registered figures live in. seed.sh and replicate.sh write
 # it before any fault is injected; restore-check.sh reads it and refuses to
@@ -114,10 +150,64 @@ dr_die() {
 DR_EX_USAGE=64
 DR_EX_PRECONDITION=65
 
+# A bucket name this harness is willing to address. Not a full S3 grammar:
+# enough that a truncated or interpolation-mangled variable cannot reach a
+# recursive delete.
+dr_valid_bucket_name() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]
+}
+
+# Both buckets, named explicitly and distinct. Called by dr_init, so every
+# entry point refuses the same way.
+dr_require_buckets() {
+  [[ -n "${DR_BUCKET_PRIMARY}" ]] || dr_die "${DR_EX_USAGE}" \
+    "DR_BUCKET_PRIMARY is unset and has no default; name bucket A explicitly"
+  [[ -n "${DR_BUCKET_REPLICA}" ]] || dr_die "${DR_EX_USAGE}" \
+    "DR_BUCKET_REPLICA is unset and has no default; name bucket B explicitly"
+  dr_valid_bucket_name "${DR_BUCKET_PRIMARY}" || dr_die "${DR_EX_USAGE}" \
+    "DR_BUCKET_PRIMARY is not a usable bucket name: '${DR_BUCKET_PRIMARY}'"
+  dr_valid_bucket_name "${DR_BUCKET_REPLICA}" || dr_die "${DR_EX_USAGE}" \
+    "DR_BUCKET_REPLICA is not a usable bucket name: '${DR_BUCKET_REPLICA}'"
+  [[ "${DR_BUCKET_PRIMARY}" != "${DR_BUCKET_REPLICA}" ]] || dr_die "${DR_EX_USAGE}" \
+    "DR_BUCKET_PRIMARY and DR_BUCKET_REPLICA are both '${DR_BUCKET_PRIMARY}'; the restore target must be a different bucket from the primary"
+}
+
+dr_require_credentials() {
+  [[ -n "${DR_ACCESS_KEY}" ]] || dr_die "${DR_EX_USAGE}" \
+    "DR_ACCESS_KEY is unset and has no default; there is no dev fallback credential"
+  [[ -n "${DR_SECRET_KEY}" ]] || dr_die "${DR_EX_USAGE}" \
+    "DR_SECRET_KEY is unset and has no default; there is no dev fallback credential"
+}
+
+# One custody item, declared rather than defaulted. An empty value is refused:
+# "unset" and "deliberately none" are different answers, and a default would
+# collapse them.
+dr_custody_declared() {
+  local name="$1" value="$2"
+  if [[ -z "${value}" ]]; then
+    printf 'dr: %s is unset; declare a file path or the literal "none"\n' "${name}" >&2
+    return 1
+  fi
+  if [[ "${value}" != "none" ]]; then
+    if [[ ! -r "${value}" ]]; then
+      printf 'dr: %s=%s is not readable\n' "${name}" "${value}" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
 dr_init() {
   mkdir -p "${DR_LOG_DIR}"
+  dr_require_buckets
+  dr_require_credentials
+  dr_assert_mc_can_carry_session_token
   case "${DR_TENANT_HASH_MODE}" in
     unkeyed | keyed) ;;
+    "")
+      dr_die "${DR_EX_USAGE}" \
+        "DR_TENANT_HASH_MODE is unset and has no default; declare 'unkeyed' or 'keyed' (ADR-0050 section 3)"
+      ;;
     *)
       dr_die "${DR_EX_USAGE}" \
         "DR_TENANT_HASH_MODE must be 'unkeyed' or 'keyed', got '${DR_TENANT_HASH_MODE}'"
@@ -127,42 +217,54 @@ dr_init() {
     dr_die "${DR_EX_USAGE}" \
       "DR_TENANT_HASH_MODE=keyed needs DR_TENANT_HASH_KEY_FILE"
   fi
+  case "${DR_FOLD_SEAL_MARGIN_WAITED}" in
+    0 | 1) ;;
+    *)
+      dr_die "${DR_EX_USAGE}" \
+        "DR_FOLD_SEAL_MARGIN_WAITED must be 0 or 1, got '${DR_FOLD_SEAL_MARGIN_WAITED}'"
+      ;;
+  esac
 }
 
 # The shared tail of every usage message: the variables a real S3 run needs,
 # in one place so the six scripts cannot drift apart on it.
 dr_usage_environment() {
   cat <<'USAGE'
-Environment (defaults are the CI MinIO values; a CI run needs none of them):
+Environment. The four marked REQUIRED have no default; every script refuses
+when one of them is unset.
   DR_ENDPOINT        endpoint override, default http://127.0.0.1:9000.
                      Set it to the EMPTY STRING for real S3: no endpoint
                      override is exported and the store uses AWS's regional
                      endpoint.
-  DR_REGION          default us-east-1
-  DR_BUCKET_PRIMARY  bucket A (the primary), default ravel-dr-primary
-  DR_BUCKET_REPLICA  bucket B (the empty restore target), default
-                     ravel-dr-replica
-  DR_ACCESS_KEY      access key id, default minioadmin
-  DR_SECRET_KEY      secret access key, default minioadmin
-  DR_SESSION_TOKEN   STS session token, real S3 only, default unset
+  DR_REGION          default us-east-1; also the region buckets are created in
+  DR_BUCKET_PRIMARY  REQUIRED  bucket A (the primary)
+  DR_BUCKET_REPLICA  REQUIRED  bucket B (the empty restore target), distinct
+                               from bucket A
+  DR_ACCESS_KEY      REQUIRED  access key id
+  DR_SECRET_KEY      REQUIRED  secret access key
+  DR_SESSION_TOKEN   STS session token; required whenever the credentials come
+                     from an instance role or any other STS source
   DR_TENANT          tenant name, default dr-rehearsal-tenant
-  DR_TENANT_TOKEN    ingest bearer token for that tenant
+  DR_TENANT_TOKEN    ingest bearer token for that tenant (never in argv)
   DR_SHARDS          shard count for the ravel-cli subcommands, default 4
-  DR_TENANT_HASH_MODE       unkeyed | keyed, default unkeyed
+  DR_TENANT_HASH_MODE       REQUIRED  unkeyed | keyed
   DR_TENANT_HASH_KEY_FILE   deployment key file, required when keyed
-  DR_TENANT_KMS_CONFIG      per-tenant KMS config file, or `none`
-  DR_ADMIN_CREDENTIAL_FILE  admin credential file, or `none`
+  DR_TENANT_KMS_CONFIG      REQUIRED  per-tenant KMS config file, or `none`
+  DR_ADMIN_CREDENTIAL_FILE  REQUIRED  admin credential file, or `none`
+  DR_FOLD_SEAL_MARGIN_WAITED  0 | 1, default 0; 1 only when the run waited the
+                     catalog seal margin out
   DR_LOG_DIR         logs and pre-registered figures, default
                      <repo>/.gate-logs/dr
   DR_MC / DR_MC_IMAGE       an mc binary, or the digest-pinned mc image
+  DR_MC_HOST_URL     escape hatch: the whole MC_HOST_dr URL
   DR_HTTP_ADDR / DR_GRPC_ADDR  listen addresses for the seeding server
 
 A real S3 run needs: DR_ENDPOINT="" plus DR_REGION, DR_BUCKET_PRIMARY,
-DR_BUCKET_REPLICA, DR_ACCESS_KEY, DR_SECRET_KEY (and DR_SESSION_TOKEN under
-STS), DR_TENANT, DR_TENANT_TOKEN, DR_TENANT_HASH_MODE (with
-DR_TENANT_HASH_KEY_FILE when keyed), DR_TENANT_KMS_CONFIG and
-DR_ADMIN_CREDENTIAL_FILE. Credentials are read from the environment and are
-never passed on a command line.
+DR_BUCKET_REPLICA, DR_ACCESS_KEY, DR_SECRET_KEY, DR_SESSION_TOKEN (under STS,
+which an instance role always is), DR_TENANT, DR_TENANT_TOKEN,
+DR_TENANT_HASH_MODE (with DR_TENANT_HASH_KEY_FILE when keyed),
+DR_TENANT_KMS_CONFIG and DR_ADMIN_CREDENTIAL_FILE. Credentials are read from
+the environment and are never passed on a command line.
 USAGE
 }
 
@@ -249,11 +351,73 @@ dr_expect_write() {
 }
 
 # ---------------------------------------------------------------------------
+# Nanosecond stamps.
+#
+# These are compared as equal-width zero-padded strings, never with bash
+# arithmetic: a stamp is input this harness does not always produce, and bash
+# wraps past the 64-bit range, so a twenty-digit stamp would compare as a
+# negative number and read as safely in the past.
+# ---------------------------------------------------------------------------
+
+dr_now_ns() { date -u +%s%N; }
+
+# True when `a` is not after `b`, i.e. a <= b.
+dr_ns_not_after() {
+  local a="$1" b="$2"
+  [[ "${a}" =~ ^[0-9]+$ && "${b}" =~ ^[0-9]+$ ]] || return 2
+  while [[ "${#a}" -lt "${#b}" ]]; do a="0${a}"; done
+  while [[ "${#b}" -lt "${#a}" ]]; do b="0${b}"; done
+  if [[ "${a}" > "${b}" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # mc: the one backend-agnostic S3 tool. Same invocations against MinIO and
 # against real S3; only the MC_HOST_dr URL differs.
 # ---------------------------------------------------------------------------
 
 dr_have_command() { command -v "$1" >/dev/null 2>&1; }
+
+# Percent-encode one value for the userinfo part of a URL. A secret access key
+# routinely contains `/` and `+`, and an unencoded `/` truncates the host: the
+# URL then names a different endpoint entirely, with no error to read.
+dr_urlencode() {
+  local LC_ALL=C
+  local s="$1" out="" i c
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "${c}" in
+      [a-zA-Z0-9._~-]) out+="${c}" ;;
+      *) out+="$(printf '%%%02X' "'${c}")" ;;
+    esac
+  done
+  printf '%s\n' "${out}"
+}
+
+# Refuse at startup when a session token is set and the mc credential path in
+# use cannot carry it. MC_HOST_<alias> carries temporary credentials as
+# `scheme://<key>:<secret>:<token>@host`; a caller-supplied DR_MC_HOST_URL
+# with only two components would send the STS key pair with no token, and
+# every mc call would 403 while the ravel binaries (which get the token
+# through RAVEL_S3_SESSION_TOKEN) succeeded.
+dr_assert_mc_can_carry_session_token() {
+  [[ -n "${DR_SESSION_TOKEN}" ]] || return 0
+  [[ -n "${DR_MC_HOST_URL:-}" ]] || return 0
+  local url="${DR_MC_HOST_URL}" userinfo colons
+  if [[ "${url}" != *"@"* ]]; then
+    dr_die "${DR_EX_USAGE}" \
+      "DR_SESSION_TOKEN is set but DR_MC_HOST_URL carries no credentials at all; it must be scheme://<key>:<secret>:<session-token>@host"
+  fi
+  userinfo="${url#*://}"
+  userinfo="${userinfo%%@*}"
+  colons="${userinfo//[^:]/}"
+  if [[ "${#colons}" -ne 2 ]]; then
+    dr_die "${DR_EX_USAGE}" \
+      "DR_SESSION_TOKEN is set but DR_MC_HOST_URL has no session-token component; it must be scheme://<key>:<secret>:<session-token>@host"
+  fi
+}
 
 # The alias URL. Credentials go in here and this value is never echoed.
 dr_mc_host_url() {
@@ -261,7 +425,7 @@ dr_mc_host_url() {
     printf '%s\n' "${DR_MC_HOST_URL}"
     return 0
   fi
-  local host scheme
+  local host scheme access secret token
   if [[ -n "${DR_ENDPOINT}" ]]; then
     scheme="${DR_ENDPOINT%%://*}"
     host="${DR_ENDPOINT#*://}"
@@ -269,7 +433,14 @@ dr_mc_host_url() {
     scheme="https"
     host="s3.${DR_REGION}.amazonaws.com"
   fi
-  printf '%s://%s:%s@%s\n' "${scheme}" "${DR_ACCESS_KEY}" "${DR_SECRET_KEY}" "${host}"
+  access="$(dr_urlencode "${DR_ACCESS_KEY}")"
+  secret="$(dr_urlencode "${DR_SECRET_KEY}")"
+  if [[ -n "${DR_SESSION_TOKEN}" ]]; then
+    token="$(dr_urlencode "${DR_SESSION_TOKEN}")"
+    printf '%s://%s:%s:%s@%s\n' "${scheme}" "${access}" "${secret}" "${token}" "${host}"
+  else
+    printf '%s://%s:%s@%s\n' "${scheme}" "${access}" "${secret}" "${host}"
+  fi
 }
 
 # Run one mc command against the `dr` alias. Prefers an mc on PATH, falls back
@@ -296,18 +467,123 @@ dr_mc_available() {
   dr_have_command docker
 }
 
-# Every object key in a bucket, one per line, bucket-relative. Listing always
-# starts at the bucket root so the printed keys are full keys; the callers
-# filter by prefix themselves.
+# Drop the harness's own bookkeeping keys from a listing. They are not corpus:
+# a bucket holding only its creation marker is an empty restore target, and
+# the marker must not inflate a count whose band was fixed from bucket A.
+dr_strip_harness_keys() {
+  awk -v pfx="${DR_HARNESS_PREFIX}" '
+    NF > 0 && index($0, pfx) != 1 { print }
+  ' <<<"$1"
+}
+
+# Every current object key in a bucket, one per line, bucket-relative.
+# Listing always starts at the bucket root so the printed keys are full keys;
+# the callers filter by prefix themselves.
 dr_list_keys() {
-  local bucket="$1" listing
+  local bucket="$1" listing names
   listing="$(dr_mc ls --recursive "dr/${bucket}/")" || return 1
-  awk 'NF > 0 { print $NF }' <<<"${listing}"
+  names="$(awk 'NF > 0 { print $NF }' <<<"${listing}")"
+  dr_strip_harness_keys "${names}"
+}
+
+# Every key in a bucket INCLUDING noncurrent versions and delete markers. The
+# emptiness assertions use this one: `mc rm --recursive` on a versioned bucket
+# writes delete markers and leaves every prior version in place, so a listing
+# of current versions alone reports an emptied-looking bucket that still holds
+# all of its data (and `maintain verify-custody --versioning-aware` will find
+# it). Falls back to the current-version listing when the backend rejects
+# `--versions`.
+dr_list_all_versions() {
+  local bucket="$1" listing names
+  if ! listing="$(dr_mc ls --recursive --versions "dr/${bucket}/" 2>/dev/null)"; then
+    listing="$(dr_mc ls --recursive "dr/${bucket}/")" || return 1
+  fi
+  names="$(awk 'NF > 0 { print $NF }' <<<"${listing}")"
+  dr_strip_harness_keys "${names}"
 }
 
 dr_count_lines() {
   awk 'BEGIN { n = 0 } NF > 0 { n++ } END { print n }' <<<"$1"
 }
+
+# ---------------------------------------------------------------------------
+# Bucket lifecycle. Creation stamps a rehearsal marker; a recursive delete
+# refuses on a bucket that does not carry one.
+# ---------------------------------------------------------------------------
+
+dr_bucket_exists() {
+  dr_mc ls "dr/$1/" >/dev/null 2>&1
+}
+
+dr_write_bucket_marker() {
+  local bucket="$1"
+  printf '{"rehearsal": "ravel-dr", "bucket": "%s", "created_at_unix_ns": %s}\n' \
+    "${bucket}" "$(dr_now_ns)" \
+    | dr_mc pipe "dr/${bucket}/${DR_BUCKET_MARKER_KEY}" >/dev/null
+}
+
+# True when the bucket carries a rehearsal marker this harness wrote FOR THIS
+# BUCKET. The bucket name is checked inside the body as well as in the key, so
+# a marker copied in from somewhere else does not authorise a delete here.
+dr_bucket_marker_present() {
+  local bucket="$1" body
+  body="$(dr_mc cat "dr/${bucket}/${DR_BUCKET_MARKER_KEY}" 2>/dev/null)" || return 1
+  [[ "${body}" == *'"rehearsal": "ravel-dr"'* ]] || return 1
+  [[ "${body}" == *"\"bucket\": \"${bucket}\""* ]] || return 1
+  return 0
+}
+
+# Create the bucket in DR_REGION if it is absent, and stamp it. A bucket
+# created with no region lands in the endpoint's default region, which is a
+# different bucket from the one the rest of the run addresses.
+dr_ensure_bucket() {
+  local bucket="$1"
+  if dr_bucket_exists "${bucket}"; then
+    return 0
+  fi
+  dr_log "creating bucket ${bucket} in region ${DR_REGION}"
+  dr_mc mb --region "${DR_REGION}" "dr/${bucket}" >/dev/null || return 1
+  dr_write_bucket_marker "${bucket}"
+}
+
+# Empty a bucket. Refuses unless the bucket carries this harness's creation
+# marker, or the caller passed the explicit override; prints the bucket name
+# and its object count (all versions) before deleting anything; deletes every
+# version rather than writing delete markers; and proves the result is empty.
+#
+# $1 bucket, $2 1 when --i-know-this-bucket was passed.
+dr_reset_bucket() {
+  local bucket="$1" override="$2" count after
+  if ! dr_bucket_marker_present "${bucket}"; then
+    if [[ "${override}" -ne 1 ]]; then
+      dr_die "${DR_EX_PRECONDITION}" \
+        "refusing to empty bucket '${bucket}': it carries no ${DR_BUCKET_MARKER_KEY} rehearsal marker, so this harness did not create it. Pass --i-know-this-bucket to override."
+    fi
+    dr_log "bucket ${bucket} carries no rehearsal marker; proceeding under --i-know-this-bucket"
+  fi
+  count="$(dr_count_lines "$(dr_list_all_versions "${bucket}")")" || dr_die \
+    "${DR_EX_PRECONDITION}" "could not list ${bucket} before emptying it"
+  printf 'dr-reset: bucket=%s objects_to_delete=%s (all versions)\n' "${bucket}" "${count}"
+  dr_log "emptying bucket ${bucket} (${count} object version(s))"
+  if ! dr_mc rm --recursive --force --versions "dr/${bucket}/" \
+    >"${DR_LOG_DIR}/reset-${bucket}.log" 2>&1; then
+    dr_log "versioned delete refused by the backend; retrying without --versions"
+    dr_mc rm --recursive --force "dr/${bucket}/" \
+      >>"${DR_LOG_DIR}/reset-${bucket}.log" 2>&1 \
+      || dr_die "${DR_EX_PRECONDITION}" "could not empty ${bucket}"
+  fi
+  after="$(dr_count_lines "$(dr_list_all_versions "${bucket}")")"
+  if [[ "${after}" -ne 0 ]]; then
+    dr_die "${DR_EX_PRECONDITION}" \
+      "bucket ${bucket} still holds ${after} object version(s) after the delete; on a versioned bucket a delete marker is not an empty bucket"
+  fi
+  dr_write_bucket_marker "${bucket}"
+}
+
+# ---------------------------------------------------------------------------
+# Key classifiers. All of them read the layout docs/catalog-and-mvcc.md and
+# ADR-0010 freeze, with no decode step.
+# ---------------------------------------------------------------------------
 
 # The tenant prefix hash, discovered from the bucket rather than recomputed.
 # Asserts a single-tenant universe: every figure below is a whole-bucket count,
@@ -360,11 +636,82 @@ dr_l0_identity() {
   printf '%s\n' "${base}"
 }
 
+# The `<seq>` component of an L0 identity, exactly as the key carries it:
+# twenty decimal digits, zero padded (ravel-commit/src/keys.rs formats it
+# `{seq:020}` and the parser rejects any other width).
+DR_SEQ_WIDTH=20
+# The offset the dangling-commit-record fault adds to reach a sequence number
+# no writer epoch of this rehearsal produced.
+DR_FORGED_SEQ_OFFSET=900000001
+
+# Offset a padded seq component and re-pad the result to the key's own width.
+#
+# Two things go wrong without this. A zero-padded value inside `$(( ))` is
+# parsed as OCTAL, so a seq containing an 8 or a 9 aborts the script with
+# "value too great for base", and every other seq is silently read in base 8.
+# And the sum of a padded value is unpadded, so the forged key carries a nine
+# digit seq that the key parser rejects as malformed: the fault is then caught
+# for the wrong reason, and would go on being "caught" if the corruption it
+# models stopped being detected.
+dr_forged_seq() {
+  local seq="$1" stripped value
+  if [[ ! "${seq}" =~ ^[0-9]{20}$ ]]; then
+    printf 'dr: seq component "%s" is not %s digits; the key layout is frozen at that width\n' \
+      "${seq}" "${DR_SEQ_WIDTH}" >&2
+    return 1
+  fi
+  stripped="${seq#"${seq%%[!0]*}"}"
+  [[ -n "${stripped}" ]] || stripped="0"
+  if [[ "${#stripped}" -gt 18 ]]; then
+    printf 'dr: seq component "%s" does not fit bash arithmetic; refusing to forge from it\n' \
+      "${seq}" >&2
+    return 1
+  fi
+  # 10# forces base 10 on the zero-padded value.
+  value=$((10#${seq} + DR_FORGED_SEQ_OFFSET))
+  printf '%0*d\n' "${DR_SEQ_WIDTH}" "${value}"
+}
+
 # ---------------------------------------------------------------------------
 # ravel binaries. Prefer prebuilt binaries on PATH, fall back to cargo run so
 # the same harness works on a runner with installed binaries and on a dev
 # tree.
 # ---------------------------------------------------------------------------
+
+# A private directory for the two credential-bearing files below. Mode 700,
+# and outside every path the CI artifact upload globs.
+dr_private_dir() {
+  local dir="${DR_LOG_DIR}/private"
+  mkdir -p "${dir}"
+  chmod 700 "${dir}"
+  printf '%s\n' "${dir}"
+}
+
+# `<token>=<tenant>` in a file, for ravel-server's --tenant-token-file. The
+# token is a credential and this file's own rule is that credentials never
+# appear in a command line; --tenant-token would put it in argv, where every
+# process listing on the host can read it.
+dr_tenant_token_file() {
+  local dir file
+  dir="$(dr_private_dir)"
+  file="${dir}/tenant-tokens"
+  : >"${file}"
+  chmod 600 "${file}"
+  printf '%s=%s\n' "${DR_TENANT_TOKEN}" "${DR_TENANT}" >"${file}"
+  printf '%s\n' "${file}"
+}
+
+# A curl config file carrying the tenant bearer header, for the same reason:
+# `curl -H "Authorization: Bearer ..."` puts the token in argv.
+dr_curl_auth_config() {
+  local dir file
+  dir="$(dr_private_dir)"
+  file="${dir}/curl-auth.cfg"
+  : >"${file}"
+  chmod 600 "${file}"
+  printf 'header = "Authorization: Bearer %s"\n' "${DR_TENANT_TOKEN}" >"${file}"
+  printf '%s\n' "${file}"
+}
 
 # Export the RAVEL_S3_* fallbacks for one bucket. Against real S3 no
 # RAVEL_S3_ENDPOINT is exported at all: S3Config.endpoint is Option<String>,
@@ -456,8 +803,6 @@ dr_writers_stopped() {
 # phase that silently did not run cannot pass as one that was fast.
 # ---------------------------------------------------------------------------
 
-dr_now_ns() { date -u +%s%N; }
-
 dr_emit_phase_seconds() {
   local name="$1" start_ns="$2" end_ns="$3"
   awk -v n="${name}" -v a="${start_ns}" -v b="${end_ns}" \
@@ -504,8 +849,15 @@ dr_dry_run_common() {
   printf '  tenant: %s (shards %s)\n' "${DR_TENANT}" "${DR_SHARDS}"
   printf '  tenant hash mode: %s\n' "${DR_TENANT_HASH_MODE}"
   printf '  credentials: from DR_ACCESS_KEY / DR_SECRET_KEY (not shown)\n'
+  if [[ -n "${DR_SESSION_TOKEN}" ]]; then
+    printf '  session token: set (mc receives it in the MC_HOST_dr URL)\n'
+  else
+    printf '  session token: not set\n'
+  fi
   printf '  log dir: %s\n' "${DR_LOG_DIR}"
-  printf '  marker key: %s\n' "${DR_MARKER_KEY}"
+  printf '  reconciled marker key: %s\n' "${DR_MARKER_KEY}"
+  printf '  restore-start stamp key: %s\n' "${DR_RESTORE_START_KEY}"
+  printf '  bucket creation marker key: %s\n' "${DR_BUCKET_MARKER_KEY}"
   if dr_mc_available; then
     printf '  OK    mc available (binary on PATH or docker for the pinned image)\n'
   else

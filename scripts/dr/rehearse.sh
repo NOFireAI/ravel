@@ -19,14 +19,20 @@
 # claim the checks ran first.
 #
 # With --fault the rehearsal is expected to go RED, and this script asserts it
-# went red in the right place: restore-check must fail at the phase that fault
-# targets, with that phase's exit code, every earlier phase must have passed,
-# no later phase may have run, and start.sh must still refuse afterwards.
-# Exit 0 then means "the fault was caught exactly where it should be", which
-# is the only outcome a fault injection can honestly report as success.
+# went red in the right place AND for the right reason: restore-check must fail
+# at the phase that fault targets, with that phase's exit code, every earlier
+# phase must have passed, no later phase may have run, start.sh must still
+# refuse afterwards, and the failing phase's own output must name the artefact
+# inject.sh injected (or the exact figure line that artefact puts out of band).
+# A phase name and an exit code alone would pass on any unrelated failure that
+# happened to land in the same phase, which is how a rehearsal starts proving
+# nothing while staying green.
 #
 #   --fault <name>  inject one of inject.sh's faults before the checks
 #   --exports N     corpus size passed to seed.sh
+#   --i-know-this-bucket  passed through to seed.sh and replicate.sh, letting
+#                   their --reset empty a bucket that carries no rehearsal
+#                   marker
 #   --dry-run       show the sequence and the configuration, run nothing
 #
 # Exit 0 on a clean rehearsal that ended with the server started, or on a
@@ -74,7 +80,8 @@ phase as `phase <name> seconds=<n>`.
 Clean run:  seed, replicate, start-refusal-probe, restore-check, start.
 Fault run:  seed, replicate, inject, start-refusal-probe, restore-check,
             start-refusal-after-failure. The run passes only when
-            restore-check failed at the check that fault targets:
+            restore-check failed at the check that fault targets, and that
+            check's output named the injected artefact:
 
   dangling-commit-record  ->  custody-manifest           (exit 11)
   missing-data-object     ->  commit-reconstruction      (exit 12)
@@ -83,6 +90,9 @@ Fault run:  seed, replicate, inject, start-refusal-probe, restore-check,
 Options:
   --fault <name>  inject one fault before the checks
   --exports N     corpus size passed to seed.sh
+  --i-know-this-bucket
+                  passed to seed.sh and replicate.sh, letting their --reset
+                  empty a bucket that carries no rehearsal marker
   --dry-run       show the sequence and the configuration, run nothing
   --help, -h      this message
 
@@ -92,6 +102,7 @@ USAGE
 
 FAULT=""
 EXPORTS=""
+KNOW_BUCKET=0
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -100,6 +111,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || dr_die "${DR_EX_USAGE}" "--fault needs a value"
       FAULT="$2"
       shift 2
+      ;;
+    --i-know-this-bucket)
+      KNOW_BUCKET=1
+      shift
       ;;
     --exports)
       [[ $# -ge 2 ]] || dr_die "${DR_EX_USAGE}" "--exports needs a value"
@@ -134,8 +149,13 @@ fi
 dr_init
 
 declare -a SEED_ARGS=(--reset)
+declare -a REPLICATE_ARGS=(--reset)
 if [[ -n "${EXPORTS}" ]]; then
   SEED_ARGS+=(--exports "${EXPORTS}")
+fi
+if [[ "${KNOW_BUCKET}" -eq 1 ]]; then
+  SEED_ARGS+=(--i-know-this-bucket)
+  REPLICATE_ARGS+=(--i-know-this-bucket)
 fi
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
@@ -143,13 +163,20 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   if [[ -n "${FAULT}" ]]; then
     printf '  fault: %s, expected to be caught at %s (exit %s)\n' \
       "${FAULT}" "${TARGET_PHASE}" "${TARGET_CODE}"
+    printf '         and to name the injected artefact in that check output\n'
     printf '  sequence: seed, replicate, inject, start-refusal-probe,\n'
     printf '            restore-check, start-refusal-after-failure\n'
   else
     printf '  fault: none (clean rehearsal)\n'
     printf '  sequence: seed, replicate, start-refusal-probe, restore-check, start\n'
   fi
-  printf '  each phase prints `phase <name> seconds=<n>` exactly once\n'
+  printf '  each phase prints "phase <name> seconds=<n>" exactly once\n'
+  printf '  seed.sh and replicate.sh are run with --reset, which refuses unless\n'
+  printf '    each bucket carries %s\n' "${DR_BUCKET_MARKER_KEY}"
+  if [[ "${KNOW_BUCKET}" -eq 1 ]]; then
+    printf '    --i-know-this-bucket is passed through: that marker check is waived\n'
+  fi
+  printf '  an incomplete run stops any ravel-server it started (EXIT trap)\n'
   for script in seed.sh replicate.sh inject.sh restore-check.sh start.sh; do
     if [[ -x "${DR_HERE}/${script}" ]]; then
       printf '  OK    %s is executable\n' "${script}"
@@ -166,10 +193,45 @@ fi
 rm -f \
   "${DR_LOG_DIR}/dr-failed-phase" \
   "${DR_LOG_DIR}/dr-marker-written-at" \
+  "${DR_LOG_DIR}/dr-restore-started-at" \
   "${DR_LOG_DIR}/dr-server-started-at" \
   "${DR_LOG_DIR}/dr-restore-check-exit" \
   "${DR_LOG_DIR}/dr-injected.env" \
   "${DR_LOG_DIR}/dr-server.pid"
+
+# A rehearsal that does not reach its own end must not leave ravel-server
+# serving bucket B. Three phases here can start one (both refusal probes and
+# the clean run's final start all invoke start.sh --background, which starts a
+# server the moment the marker satisfies it), and every path out of this script
+# other than a completed clean rehearsal has to take it down again. Without
+# this, a run that goes red after the start leaves a server answering on a
+# bucket the rehearsal just declared unverified.
+SERVER_LEFT_RUNNING=0
+
+stop_server() {
+  local pid_file="${DR_LOG_DIR}/dr-server.pid" pid
+  [[ -f "${pid_file}" ]] || return 0
+  pid="$(cat "${pid_file}")"
+  if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+    dr_log "stopping ravel-server (pid ${pid}) left running by an incomplete rehearsal"
+    kill "${pid}" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep 1
+    done
+    kill -9 "${pid}" 2>/dev/null || true
+  fi
+  rm -f "${pid_file}"
+}
+
+on_exit() {
+  local code=$?
+  if [[ "${code}" -ne 0 || "${SERVER_LEFT_RUNNING}" -ne 1 ]]; then
+    stop_server
+  fi
+  return "${code}"
+}
+trap on_exit EXIT
 
 TIMING=""
 EXPECTED_PHASES=()
@@ -192,7 +254,7 @@ run_phase() {
 }
 
 step_seed() { "${DR_HERE}/seed.sh" "${SEED_ARGS[@]}"; }
-step_replicate() { "${DR_HERE}/replicate.sh" --reset; }
+step_replicate() { "${DR_HERE}/replicate.sh" "${REPLICATE_ARGS[@]}"; }
 step_inject() { "${DR_HERE}/inject.sh" --fault "${FAULT}"; }
 
 RESTORE_LOG="${DR_LOG_DIR}/rehearse-restore-check.log"
@@ -262,6 +324,9 @@ if [[ -z "${FAULT}" ]]; then
       "restore-check exited 0 without reporting the ${phase} check; a check that did not run is not a check that passed"
   done
   run_phase start step_start
+  # The one path that deliberately leaves a server up: the rehearsal's stated
+  # outcome is ravel-server serving the restored bucket.
+  SERVER_LEFT_RUNNING=1
 else
   if [[ "${restore_rc}" -ne "${TARGET_CODE}" ]]; then
     dr_die 1 \
@@ -291,6 +356,30 @@ else
     fi
   done
 
+  # The failure must be about the artefact that was injected. A phase name and
+  # an exit code together say only that something went wrong in the right
+  # check; inject.sh already records what it injected, and this is what ties
+  # the two ends together. The evidence is the injected key, the forged
+  # identity, or the exact out-of-band figure line the injection produces,
+  # decided by inject.sh at injection time.
+  INJECTED_ENV="${DR_LOG_DIR}/dr-injected.env"
+  [[ -f "${INJECTED_ENV}" ]] || dr_die 1 \
+    "inject.sh left no ${INJECTED_ENV}; there is nothing to tie the failure to"
+  expected_evidence="$(awk -v k="DR_EXPECTED_EVIDENCE=" '
+    index($0, k) == 1 { print substr($0, length(k) + 1) }
+  ' "${INJECTED_ENV}")"
+  [[ -n "${expected_evidence}" ]] || dr_die 1 \
+    "inject.sh recorded no DR_EXPECTED_EVIDENCE for fault ${FAULT}"
+  evidence_hits="$(awk -v needle="${expected_evidence}" '
+    BEGIN { c = 0 } index($0, needle) > 0 { c++ } END { print c }
+  ' "${RESTORE_LOG}")"
+  if [[ "${evidence_hits}" -eq 0 ]]; then
+    dr_die 1 \
+      "check ${TARGET_PHASE} failed, but its output never names the injected artefact '${expected_evidence}'; the fault was not what made it fail"
+  fi
+  printf 'rehearse: %s named the injected artefact %s time(s): %s\n' \
+    "${TARGET_PHASE}" "${evidence_hits}" "${expected_evidence}"
+
   # A failed restore must leave the server unstartable. The marker is written
   # only on success, so this is the same refusal as the probe, now after the
   # checks have run and failed.
@@ -308,6 +397,6 @@ if [[ -z "${FAULT}" ]]; then
   printf 'rehearse: clean rehearsal complete; ravel-server started against %s after the marker\n' \
     "${DR_BUCKET_REPLICA}"
 else
-  printf 'rehearse: fault %s was caught at %s (exit %s) and the server stayed refused\n' \
+  printf 'rehearse: fault %s was caught at %s (exit %s), named in that check output, and the server stayed refused\n' \
     "${FAULT}" "${TARGET_PHASE}" "${TARGET_CODE}"
 fi

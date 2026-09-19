@@ -33,6 +33,18 @@
 #   3 catalog-fold-verification  exit 13
 #       `ravel-cli catalog fold` then `ravel-cli catalog verify`: the snapshot
 #       agrees with the sealed commit history.
+#
+#       READ THIS BEFORE TRUSTING THIS PHASE. A fold seals an ingest hour only
+#       `max_flush_lifetime + clock_skew_allowance + fold_safety_margin` after
+#       that hour ends. A rehearsal that does not wait that margin out seals
+#       nothing, publishes no snapshot HEAD, and gives catalog verify nothing
+#       to diff, so THE PHASE VERIFIES NOTHING about the folded catalog. In
+#       that case it prints `fold.verification: NO-OP ...` and makes exactly
+#       two claims, both of which can fail: the fold's own entry_count (read
+#       from the tool) is inside its band, and a fold that sealed entries
+#       while publishing no HEAD is a contradiction. Set
+#       DR_FOLD_SEAL_MARGIN_WAITED=1 on a run that really did wait the margin
+#       out, and a missing HEAD becomes a failure instead of a no-op.
 #   4 canary-query               exit 14
 #       The pre-serving read verification: `ravel-cli maintain verify-custody
 #       --versioning-aware` re-checks every live object's content against its
@@ -67,6 +79,13 @@ failure, and writes the reconciled marker only when all four pass.
   2 commit-reconstruction      exit 12
   3 catalog-fold-verification  exit 13
   4 canary-query               exit 14
+
+Phase 3 is a NO-OP on a run that did not wait the catalog seal margin out:
+no ingest hour is sealed, no snapshot HEAD is published, and catalog verify
+has nothing to diff. It prints `fold.verification: NO-OP ...` when that
+happens rather than reporting green figures it did not read from the tool.
+Set DR_FOLD_SEAL_MARGIN_WAITED=1 on a run that did wait, and a missing HEAD
+becomes a phase failure.
 
 The failing phase's name is printed as `dr-phase-fail: <name>` and written to
 <DR_LOG_DIR>/dr-failed-phase, so a caller can assert WHICH check failed rather
@@ -109,7 +128,15 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   printf '    3 catalog-fold-verification  exit 13\n'
   printf '    4 canary-query               exit 14\n'
   printf '  custody items declared: tenant-hash=%s kms=%s admin-credential=%s\n' \
-    "${DR_TENANT_HASH_MODE}" "${DR_TENANT_KMS_CONFIG}" "${DR_ADMIN_CREDENTIAL_FILE}"
+    "${DR_TENANT_HASH_MODE}" "${DR_TENANT_KMS_CONFIG:-<unset: phase 1 refuses>}" \
+    "${DR_ADMIN_CREDENTIAL_FILE:-<unset: phase 1 refuses>}"
+  printf '  would: delete %s/%s and write %s/%s before any check runs\n' \
+    "${DR_BUCKET_REPLICA}" "${DR_MARKER_KEY}" "${DR_BUCKET_REPLICA}" "${DR_RESTORE_START_KEY}"
+  if [[ "${DR_FOLD_SEAL_MARGIN_WAITED}" -eq 1 ]]; then
+    printf '  fold phase: REAL, DR_FOLD_SEAL_MARGIN_WAITED=1 requires a snapshot HEAD\n'
+  else
+    printf '  fold phase: NO-OP unless the run waited the seal margin out\n'
+  fi
   if dr_writers_stopped; then
     printf '  OK    no writer answering on %s\n' "${DR_HTTP_ADDR}"
   else
@@ -149,6 +176,14 @@ cli() {
   CLI_RC=0
   CLI_OUT="$(dr_ravel_cli "$@" 2>&1)" || CLI_RC=$?
   printf '--- ravel-cli %s (exit %s)\n%s\n' "$*" "${CLI_RC}" "${CLI_OUT}" >>"${PHASE_LOG}"
+  if [[ "${CLI_RC}" -ne 0 ]]; then
+    # The tool's own output carries the artefact it failed on (verify-custody
+    # names the mismatching data key on its `<-- ANOMALY` line, for one), and a
+    # caller asserting the failure is about the fault that was injected has to
+    # be able to read it. A pointer to the phase log is not evidence.
+    printf 'dr-cli-failed: ravel-cli %s (exit %s); its output follows\n' "$*" "${CLI_RC}" >&2
+    printf '%s\n' "${CLI_OUT}" >&2
+  fi
 }
 
 # --- preconditions -------------------------------------------------------
@@ -174,6 +209,39 @@ EXPECT_TENANT_HASH="$(dr_expect DR_EXPECT_TENANT_HASH)" \
 
 dr_export_s3_env "${DR_BUCKET_REPLICA}"
 
+# --- clear the previous marker, then stamp this restore's start -------------
+#
+# This is the FIRST thing this script does to the bucket. An earlier run's
+# reconciled marker is a live object in the restore target, and leaving it
+# there means a run that fails at phase 1 still leaves start.sh a marker to be
+# satisfied by. Deleting it locally is not enough: start.sh reads the object,
+# not the local copy.
+#
+# The restore-start stamp written in its place is what makes the ordering
+# checkable rather than merely plausible. start.sh requires the marker to
+# post-date this stamp, so a marker from any previous restore is refused on its
+# timestamp alone, without depending on the delete above having reached the
+# bucket.
+
+RESTORE_START_NS="$(dr_now_ns)"
+dr_mc rm --force "dr/${DR_BUCKET_REPLICA}/${DR_MARKER_KEY}" \
+  >"${DR_LOG_DIR}/marker-clear.log" 2>&1 || true
+if dr_mc stat "dr/${DR_BUCKET_REPLICA}/${DR_MARKER_KEY}" >/dev/null 2>&1; then
+  dr_die "${DR_EX_PHASE_PRECONDITION}" \
+    "the previous reconciled marker at ${DR_BUCKET_REPLICA}/${DR_MARKER_KEY} is still present after the delete; a restore cannot run with a stale marker in the target"
+fi
+{
+  printf '{\n'
+  printf '  "rehearsal": "ravel-dr",\n'
+  printf '  "bucket": "%s",\n' "${DR_BUCKET_REPLICA}"
+  printf '  "restore_started_at_unix_ns": %s\n' "${RESTORE_START_NS}"
+  printf '}\n'
+} | dr_mc pipe "dr/${DR_BUCKET_REPLICA}/${DR_RESTORE_START_KEY}" \
+  >"${DR_LOG_DIR}/restore-start-write.log" 2>&1
+printf '%s\n' "${RESTORE_START_NS}" >"${DR_LOG_DIR}/dr-restore-started-at"
+printf 'restore-check: restore_start_ns=%s (previous marker cleared from %s)\n' \
+  "${RESTORE_START_NS}" "${DR_BUCKET_REPLICA}"
+
 # ---------------------------------------------------------------------------
 # 1. custody-manifest
 # ---------------------------------------------------------------------------
@@ -185,18 +253,16 @@ phase_custody_manifest() {
     [[ -r "${DR_TENANT_HASH_KEY_FILE}" ]] || phase_fail "${name}" 11 \
       "DR_TENANT_HASH_MODE=keyed but the deployment key file ${DR_TENANT_HASH_KEY_FILE} is not readable"
   fi
-  [[ -n "${DR_TENANT_KMS_CONFIG}" ]] || phase_fail "${name}" 11 \
-    "DR_TENANT_KMS_CONFIG is unset; declare a file or the literal 'none'"
-  if [[ "${DR_TENANT_KMS_CONFIG}" != "none" ]]; then
-    [[ -r "${DR_TENANT_KMS_CONFIG}" ]] || phase_fail "${name}" 11 \
-      "DR_TENANT_KMS_CONFIG=${DR_TENANT_KMS_CONFIG} is not readable"
-  fi
-  [[ -n "${DR_ADMIN_CREDENTIAL_FILE}" ]] || phase_fail "${name}" 11 \
-    "DR_ADMIN_CREDENTIAL_FILE is unset; declare a file or the literal 'none'"
-  if [[ "${DR_ADMIN_CREDENTIAL_FILE}" != "none" ]]; then
-    [[ -r "${DR_ADMIN_CREDENTIAL_FILE}" ]] || phase_fail "${name}" 11 \
-      "DR_ADMIN_CREDENTIAL_FILE=${DR_ADMIN_CREDENTIAL_FILE} is not readable"
-  fi
+  # These two carry no default in lib.sh, so an operator who declared nothing
+  # reaches here with an empty value and is refused. A default of `none` would
+  # have made this check unfailable: it would report the declaration the
+  # default made on the operator's behalf.
+  dr_custody_declared DR_TENANT_KMS_CONFIG "${DR_TENANT_KMS_CONFIG}" \
+    || phase_fail "${name}" 11 \
+      "the per-tenant KMS custody item is not declared; set DR_TENANT_KMS_CONFIG to a readable file or the literal 'none'"
+  dr_custody_declared DR_ADMIN_CREDENTIAL_FILE "${DR_ADMIN_CREDENTIAL_FILE}" \
+    || phase_fail "${name}" 11 \
+      "the admin credential custody item is not declared; set DR_ADMIN_CREDENTIAL_FILE to a readable file or the literal 'none'"
   printf 'custody items: tenant-hash=%s kms=%s admin-credential=%s\n' \
     "${DR_TENANT_HASH_MODE}" "${DR_TENANT_KMS_CONFIG}" "${DR_ADMIN_CREDENTIAL_FILE}"
 
@@ -354,18 +420,31 @@ phase_catalog_fold_verification() {
   no_head="$(awk 'BEGIN { c = 0 } index($0, "no HEAD found at ") == 1 { c++ } END { print c }' \
     <<<"${CLI_OUT}")"
   if [[ "${no_head}" -eq 1 ]]; then
-    # Nothing sealed, so no snapshot was published and there is nothing to
-    # diff. That is consistent only when the fold also sealed nothing; a fold
-    # that sealed entries and left no HEAD is a real divergence.
-    dr_assert_figure "verify.snapshot_entries" 0 0 0 || failures=1
-    dr_assert_figure "verify.missing_from_snapshot" 0 0 0 || failures=1
-    dr_assert_figure "verify.content_hash_mismatches" 0 0 0 || failures=1
+    # No snapshot HEAD was published, so catalog verify diffed nothing and
+    # there is no figure to read out of it. This phase then verifies NOTHING
+    # about the fold's agreement with the commit history, and says so. It used
+    # to assert three literal zeroes here, which read as three green figure
+    # lines and could not fail: they were the script's own constants, not the
+    # tool's output.
+    #
+    # Two real assertions survive the no-op, and they are the only claims this
+    # branch makes: a fold that sealed entries and left no HEAD is a
+    # contradiction whatever the seal margin was, and a run that declares it
+    # waited the margin out (DR_FOLD_SEAL_MARGIN_WAITED=1) must have a HEAD.
+    printf 'fold.verification: NO-OP no snapshot HEAD was published, so nothing was diffed and this phase verified nothing about the folded catalog\n'
+    printf 'fold.verification: cause the fold seals an ingest hour only max_flush_lifetime + clock_skew_allowance + fold_safety_margin after that hour ends, and this run did not wait that margin out\n'
+    printf 'fold.verification: DR_FOLD_SEAL_MARGIN_WAITED=%s\n' "${DR_FOLD_SEAL_MARGIN_WAITED}"
+    if [[ "${DR_FOLD_SEAL_MARGIN_WAITED}" -eq 1 ]]; then
+      failures=1
+      printf 'dr: DR_FOLD_SEAL_MARGIN_WAITED=1 says this run waited the seal margin out, but the fold published no snapshot HEAD\n' >&2
+    fi
     if [[ "${entry_count}" -ne 0 ]]; then
       failures=1
       printf 'dr: the fold sealed %s entries but published no HEAD\n' "${entry_count}" >&2
     fi
   else
     local snapshot_entries missing mismatches
+    printf 'fold.verification: REAL a snapshot HEAD is present and the three figures below are read from catalog verify\n'
     snapshot_entries="$(dr_field_once "snapshot entries" "${CLI_OUT}")" \
       || phase_fail "${name}" 13 "catalog verify printed no single snapshot-entry count"
     missing="$(dr_field_once "missing from snapshot" "${CLI_OUT}")" \
@@ -489,9 +568,14 @@ phase_canary_query() {
   #   decoded samples   exactly the accepted exports, and exactly what the
   #                     catalog claimed: the catalog's metadata and the bytes
   #                     on the object have to agree.
+  #   segments inspected   [1, replicated L0 data objects], the same
+  #                     corpus-derived band as the segment count. It is NOT
+  #                     banded on CANARY_SEGMENTS: the listed-versus-reported
+  #                     check above already proves those two equal, and the
+  #                     loop increments this counter once per listed key, so
+  #                     that band could not fail.
   dr_assert_figure "canary.segments" "${CANARY_SEGMENTS}" 1 "${EXPECT_DATA}" || failures=1
-  dr_assert_figure "canary.segments_inspected" "${inspected}" \
-    "${CANARY_SEGMENTS}" "${CANARY_SEGMENTS}" || failures=1
+  dr_assert_figure "canary.segments_inspected" "${inspected}" 1 "${EXPECT_DATA}" || failures=1
   dr_assert_figure "canary.samples" "${CANARY_SAMPLES}" \
     "${EXPECT_SAMPLES}" "${EXPECT_SAMPLES}" || failures=1
   dr_assert_figure "canary.series" "${CANARY_SERIES}" 1 "${EXPECT_SAMPLES}" || failures=1
@@ -523,10 +607,14 @@ run_phase "canary-query" phase_canary_query
 #
 # Written only here, after all four checks have passed. It names the bucket it
 # was written for, so start.sh cannot be satisfied by a marker left over from
-# a restore into a different bucket. The key lives outside `t/` and `sys/`,
-# the two key families docs/catalog-and-mvcc.md freezes.
+# a restore into a different bucket, and it carries the restore-start stamp
+# this run wrote before phase 1, so start.sh can require it to belong to THIS
+# restore rather than to any earlier one. The key lives outside `t/` and
+# `sys/`, the two key families docs/catalog-and-mvcc.md freezes.
 
 marker_ns="$(dr_now_ns)"
+dr_ns_not_after "${RESTORE_START_NS}" "${marker_ns}" || dr_die 1 \
+  "the clock went backwards during the run: restore start ${RESTORE_START_NS} is after the marker stamp ${marker_ns}"
 checks_json=""
 for phase_name in "${DR_PHASES[@]}"; do
   if [[ -n "${checks_json}" ]]; then
@@ -540,6 +628,7 @@ marker_body="$(
   printf '  "bucket": "%s",\n' "${DR_BUCKET_REPLICA}"
   printf '  "tenant": "%s",\n' "${DR_TENANT}"
   printf '  "tenant_hash": "%s",\n' "${EXPECT_TENANT_HASH}"
+  printf '  "restore_started_at_unix_ns": %s,\n' "${RESTORE_START_NS}"
   printf '  "reconciled_at_unix_ns": %s,\n' "${marker_ns}"
   printf '  "checks": [%s],\n' "${checks_json}"
   printf '  "canary_segments": %s,\n' "${CANARY_SEGMENTS}"

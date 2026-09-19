@@ -12,6 +12,13 @@
 # it was written for, so a marker left in place by a restore into a different
 # bucket cannot satisfy a start against this one.
 #
+# A marker in the right bucket is still not enough. restore-check.sh writes a
+# restore-start stamp OBJECT into the bucket before its first check, and this
+# script requires the marker to post-date that stamp and to carry the same
+# value. A marker from an EARLIER restore of the same bucket is therefore
+# refused: "not stamped in the future" is a clock check, not an ordering one,
+# and on its own it accepts any marker old enough.
+#
 #   --background  start the server, wait for it to answer, and return, leaving
 #                 it running with its pid in <DR_LOG_DIR>/dr-server.pid. The
 #                 default runs it in the foreground.
@@ -33,12 +40,14 @@ usage() {
 Usage: scripts/dr/start.sh [--background] [--dry-run] [--help]
 
 Starts ravel-server against bucket B, and only if the reconciled marker
-written by restore-check.sh exists in B and names B.
+written by restore-check.sh exists in B, names B, and belongs to the restore
+whose restore-start stamp is currently in B.
 
 A refusal prints `dr-start-refused: <reason>` and exits 10. A start prints
-`dr-start-ok: bucket=<B> marker_ns=<n> started_ns=<n>` and records the start
-time in <DR_LOG_DIR>/dr-server-started-at, so a caller can assert the marker
-was written before the server was started rather than taking it on trust.
+`dr-start-ok: bucket=<B> restore_start_ns=<n> marker_ns=<n> started_ns=<n>`
+and records the start time in <DR_LOG_DIR>/dr-server-started-at, so a caller
+can assert the marker was written during this restore and before the server
+was started rather than taking either on trust.
 
 Options:
   --background  return once the server answers, leaving it running
@@ -76,6 +85,7 @@ done
 dr_init
 
 MARKER_FILE="${DR_LOG_DIR}/reconciled.json"
+RESTORE_START_FILE="${DR_LOG_DIR}/restore-start.json"
 
 # Fetch the marker from bucket B. Returns 1 when it is not there at all, which
 # is the ordinary "the restore checks have not passed yet" case rather than an
@@ -85,23 +95,33 @@ fetch_marker() {
     >"${MARKER_FILE}" 2>"${DR_LOG_DIR}/start-marker-fetch.log"
 }
 
-# The single value of a JSON string field in the marker, quotes and trailing
-# comma removed. The marker is written by restore-check.sh one field per line,
-# so this needs no JSON parser, and it goes through dr_field_once so a field
-# that appears twice is refused exactly as a missing one is.
-marker_field() {
-  local raw
-  raw="$(dr_field_once "  \"$1\"" "$(cat "${MARKER_FILE}")")" || return 1
+fetch_restore_start() {
+  dr_mc cat "dr/${DR_BUCKET_REPLICA}/${DR_RESTORE_START_KEY}" \
+    >"${RESTORE_START_FILE}" 2>"${DR_LOG_DIR}/start-restore-start-fetch.log"
+}
+
+# The single value of a JSON field in one of the two objects, quotes and
+# trailing comma removed. Both are written one field per line, so this needs no
+# JSON parser, and it goes through dr_field_once so a field that appears twice
+# is refused exactly as a missing one is.
+json_field() {
+  local file="$1" raw
+  raw="$(dr_field_once "  \"$2\"" "$(cat "${file}")")" || return 1
   raw="${raw%,}"
   raw="${raw#\"}"
   raw="${raw%\"}"
   printf '%s\n' "${raw}"
 }
 
+marker_field() { json_field "${MARKER_FILE}" "$1"; }
+
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   dr_dry_run_common "start.sh"
   printf '  would: refuse unless %s/%s exists and its "bucket" field is %s\n' \
     "${DR_BUCKET_REPLICA}" "${DR_MARKER_KEY}" "${DR_BUCKET_REPLICA}"
+  printf '  would: refuse unless %s/%s exists and the marker carries and\n' \
+    "${DR_BUCKET_REPLICA}" "${DR_RESTORE_START_KEY}"
+  printf '         post-dates its restore_started_at_unix_ns\n'
   if [[ "${BACKGROUND}" -eq 1 ]]; then
     printf '  would: start ravel-server in the background on %s\n' "${DR_HTTP_ADDR}"
   else
@@ -141,36 +161,52 @@ marker_ns="$(marker_field reconciled_at_unix_ns)" || refuse \
 [[ "${marker_ns}" =~ ^[0-9]+$ ]] || refuse \
   "the reconciled marker's reconciled_at_unix_ns is not an integer: ${marker_ns}"
 
-# The marker is input this script does not produce, and bash's arithmetic
-# comparison wraps past the 64-bit range, so a stamp of twenty digits would
-# compare as a negative number and read as safely in the past. Compare the two
-# as equal-width zero-padded strings instead.
-ns_not_after() {
-  local a="$1" b="$2"
-  while [[ "${#a}" -lt "${#b}" ]]; do a="0${a}"; done
-  while [[ "${#b}" -lt "${#a}" ]]; do b="0${b}"; done
-  if [[ "${a}" > "${b}" ]]; then
-    return 1
-  fi
-  return 0
-}
+# The marker must belong to the restore that is running now, not to any
+# earlier restore of the same bucket. restore-check.sh writes this stamp into
+# the bucket before its first check and copies it into the marker it writes
+# after the last one, so a marker that post-dates the stamp AND carries its
+# value can only have been written by the run that wrote the stamp.
+rm -f "${RESTORE_START_FILE}"
+fetch_restore_start || refuse \
+  "no restore-start stamp at ${DR_BUCKET_REPLICA}/${DR_RESTORE_START_KEY}; restore-check.sh has not run against this bucket"
+[[ -s "${RESTORE_START_FILE}" ]] || refuse \
+  "the restore-start stamp at ${DR_BUCKET_REPLICA}/${DR_RESTORE_START_KEY} is empty"
+
+restore_start_ns="$(json_field "${RESTORE_START_FILE}" restore_started_at_unix_ns)" || refuse \
+  "the restore-start stamp carries no single \"restore_started_at_unix_ns\" field"
+[[ "${restore_start_ns}" =~ ^[0-9]+$ ]] || refuse \
+  "the restore-start stamp's restore_started_at_unix_ns is not an integer: ${restore_start_ns}"
+
+marker_start_ns="$(marker_field restore_started_at_unix_ns)" || refuse \
+  "the reconciled marker carries no single \"restore_started_at_unix_ns\" field; it predates the restore-start stamp requirement"
+[[ "${marker_start_ns}" == "${restore_start_ns}" ]] || refuse \
+  "the reconciled marker belongs to the restore started at ${marker_start_ns}, but the bucket's restore-start stamp is ${restore_start_ns}"
+
+dr_ns_not_after "${restore_start_ns}" "${marker_ns}" || refuse \
+  "the reconciled marker is stamped ${marker_ns}, before the restore started at ${restore_start_ns}"
 
 started_ns="$(dr_now_ns)"
-ns_not_after "${marker_ns}" "${started_ns}" || refuse \
+dr_ns_not_after "${marker_ns}" "${started_ns}" || refuse \
   "the reconciled marker is stamped ${marker_ns}, after this start at ${started_ns}"
 
 printf '%s\n' "${started_ns}" >"${DR_LOG_DIR}/dr-server-started-at"
-printf 'dr-start-ok: bucket=%s marker_ns=%s started_ns=%s\n' \
-  "${DR_BUCKET_REPLICA}" "${marker_ns}" "${started_ns}"
+printf 'dr-start-ok: bucket=%s restore_start_ns=%s marker_ns=%s started_ns=%s\n' \
+  "${DR_BUCKET_REPLICA}" "${restore_start_ns}" "${marker_ns}" "${started_ns}"
 
 dr_export_s3_env "${DR_BUCKET_REPLICA}"
+
+# The tenant token reaches the server through a mode-600 file, not through
+# argv: a credential on a command line is readable by every process listing on
+# the host, and this harness's own rule forbids it.
+TOKEN_FILE="$(dr_tenant_token_file)"
+CURL_AUTH="$(dr_curl_auth_config)"
 
 declare -a SERVER_ARGV=()
 mapfile -d '' -t SERVER_ARGV < <(dr_ravel_server_argv \
   --store s3 \
   --listen-http "${DR_HTTP_ADDR}" \
   --listen-grpc "${DR_GRPC_ADDR}" \
-  --tenant-token "${DR_TENANT_TOKEN}=${DR_TENANT}")
+  --tenant-token-file "${TOKEN_FILE}")
 
 if [[ "${BACKGROUND}" -eq 0 ]]; then
   dr_log "starting ravel-server against ${DR_BUCKET_REPLICA} (foreground)"
@@ -186,7 +222,7 @@ printf '%s\n' "${server_pid}" >"${DR_LOG_DIR}/dr-server.pid"
 ready=0
 for _ in $(seq 1 60); do
   if curl --silent --fail --max-time 2 \
-    -H "Authorization: Bearer ${DR_TENANT_TOKEN}" \
+    --config "${CURL_AUTH}" \
     "http://${DR_HTTP_ADDR}/api/v1/query?query=up" >/dev/null 2>&1; then
     ready=1
     break

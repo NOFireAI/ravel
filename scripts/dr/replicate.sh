@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Usage: scripts/dr/replicate.sh [--reset] [--dry-run] [--help]
+# Usage: scripts/dr/replicate.sh [--reset] [--i-know-this-bucket] [--dry-run]
+#                                [--help]
 #
 # Step 2 of the disaster-recovery rehearsal (issue #814): mirror bucket A into
 # an EMPTY bucket B, and assert the mirror moved exactly what bucket A holds.
@@ -8,7 +9,10 @@
 # new, empty bucket rather than over a live one, so a non-empty bucket B is
 # refused here rather than merged into.
 #
-#   --reset    empty bucket B first
+#   --reset    empty bucket B first. Refuses unless DR_BUCKET_REPLICA names
+#              the bucket explicitly and it carries this harness's rehearsal
+#              marker.
+#   --i-know-this-bucket  let --reset empty a bucket with no rehearsal marker
 #   --dry-run  validate configuration and dependencies, touch nothing
 #
 # Exit 0 on success, 64 on bad usage, 65 on an unmet precondition, 1 when a
@@ -20,13 +24,18 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/dr/replicate.sh [--reset] [--dry-run] [--help]
+Usage: scripts/dr/replicate.sh [--reset] [--i-know-this-bucket] [--dry-run]
+                               [--help]
 
 Mirrors bucket A into an empty bucket B and asserts the object counts moved
 match what seed.sh pre-registered for bucket A.
 
 Options:
-  --reset      empty bucket B before mirroring
+  --reset      empty bucket B before mirroring. Refuses unless
+               DR_BUCKET_REPLICA names the bucket explicitly and it carries
+               this harness's rehearsal marker.
+  --i-know-this-bucket
+               let --reset empty a bucket with no rehearsal marker
   --dry-run    validate configuration and dependencies without touching a
                bucket or the network
   --help, -h   this message
@@ -36,12 +45,17 @@ USAGE
 }
 
 RESET=0
+KNOW_BUCKET=0
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset)
       RESET=1
+      shift
+      ;;
+    --i-know-this-bucket)
+      KNOW_BUCKET=1
       shift
       ;;
     --dry-run | --check)
@@ -63,8 +77,19 @@ dr_init
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   dr_dry_run_common "replicate.sh"
-  printf '  would: require %s to be empty, then mirror %s into it\n' \
-    "${DR_BUCKET_REPLICA}" "${DR_BUCKET_PRIMARY}"
+  printf '  would: require %s to be empty (every version, not just current),\n' \
+    "${DR_BUCKET_REPLICA}"
+  printf '         then mirror %s into it, excluding the %s harness prefix\n' \
+    "${DR_BUCKET_PRIMARY}" "${DR_HARNESS_PREFIX}"
+  if [[ "${RESET}" -eq 1 ]]; then
+    printf '  reset: yes, and it refuses unless %s carries %s\n' \
+      "${DR_BUCKET_REPLICA}" "${DR_BUCKET_MARKER_KEY}"
+    if [[ "${KNOW_BUCKET}" -eq 1 ]]; then
+      printf '         --i-know-this-bucket: the marker requirement is waived\n'
+    fi
+  else
+    printf '  reset: no, a non-empty bucket B is refused\n'
+  fi
   printf '  bands: mirrored objects == DR_EXPECT_TOTAL_OBJECTS exactly;\n'
   printf '         mirrored L0 data objects == DR_EXPECT_DATA_OBJECTS exactly;\n'
   printf '         mirrored L0 commit records == DR_EXPECT_COMMIT_RECORDS exactly\n'
@@ -83,28 +108,36 @@ expect_total="$(dr_expect DR_EXPECT_TOTAL_OBJECTS)"
 expect_data="$(dr_expect DR_EXPECT_DATA_OBJECTS)"
 expect_commits="$(dr_expect DR_EXPECT_COMMIT_RECORDS)"
 
-dr_log "ensuring bucket ${DR_BUCKET_REPLICA} exists"
-dr_mc mb -p "dr/${DR_BUCKET_REPLICA}" >/dev/null 2>&1 || true
+dr_log "ensuring bucket ${DR_BUCKET_REPLICA} exists in region ${DR_REGION}"
+dr_ensure_bucket "${DR_BUCKET_REPLICA}" || dr_die "${DR_EX_PRECONDITION}" \
+  "could not create bucket ${DR_BUCKET_REPLICA} in region ${DR_REGION}"
 
-before="$(dr_list_keys "${DR_BUCKET_REPLICA}")" || dr_die "${DR_EX_PRECONDITION}" \
+# Emptiness is asserted over ALL versions. On a versioned bucket a recursive
+# delete writes delete markers and leaves every prior version in place, so a
+# current-version listing reports an empty bucket that still holds all of its
+# data, and `maintain verify-custody --versioning-aware` reads those versions.
+before="$(dr_list_all_versions "${DR_BUCKET_REPLICA}")" || dr_die "${DR_EX_PRECONDITION}" \
   "could not list ${DR_BUCKET_REPLICA}"
 before_count="$(dr_count_lines "${before}")"
 if [[ "${before_count}" -gt 0 ]]; then
   if [[ "${RESET}" -eq 1 ]]; then
-    dr_log "emptying bucket ${DR_BUCKET_REPLICA} (${before_count} object(s))"
-    dr_mc rm --recursive --force "dr/${DR_BUCKET_REPLICA}/" >/dev/null
-    before="$(dr_list_keys "${DR_BUCKET_REPLICA}")" || dr_die "${DR_EX_PRECONDITION}" \
+    dr_reset_bucket "${DR_BUCKET_REPLICA}" "${KNOW_BUCKET}"
+    before="$(dr_list_all_versions "${DR_BUCKET_REPLICA}")" || dr_die "${DR_EX_PRECONDITION}" \
       "could not re-list ${DR_BUCKET_REPLICA}"
     before_count="$(dr_count_lines "${before}")"
   fi
 fi
 if [[ "${before_count}" -ne 0 ]]; then
   dr_die "${DR_EX_PRECONDITION}" \
-    "bucket ${DR_BUCKET_REPLICA} holds ${before_count} object(s); the restore target must be empty (pass --reset)"
+    "bucket ${DR_BUCKET_REPLICA} holds ${before_count} object version(s); the restore target must be empty (pass --reset)"
 fi
 
 dr_log "mirroring ${DR_BUCKET_PRIMARY} into ${DR_BUCKET_REPLICA}"
-dr_mc mirror --overwrite "dr/${DR_BUCKET_PRIMARY}/" "dr/${DR_BUCKET_REPLICA}/" \
+# The harness's own prefix is excluded: bucket A's creation marker is not
+# corpus, and copying it would overwrite bucket B's own marker with one naming
+# bucket A, which is exactly what dr_reset_bucket refuses to delete against.
+dr_mc mirror --overwrite --exclude "${DR_HARNESS_PREFIX}*" \
+  "dr/${DR_BUCKET_PRIMARY}/" "dr/${DR_BUCKET_REPLICA}/" \
   >"${DR_LOG_DIR}/replicate-mirror.log" 2>&1
 
 source_keys="$(dr_list_keys "${DR_BUCKET_PRIMARY}")" || dr_die "${DR_EX_PRECONDITION}" \

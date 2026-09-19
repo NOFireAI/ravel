@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Usage: scripts/dr/seed.sh [--exports N] [--reset] [--dry-run] [--help]
+# Usage: scripts/dr/seed.sh [--exports N] [--reset] [--i-know-this-bucket]
+#                           [--dry-run] [--help]
 #
 # Step 1 of the disaster-recovery rehearsal (issue #814): write a known corpus
 # through a real ravel-server into bucket A, stop the writer, and pre-register
@@ -13,7 +14,14 @@
 #
 #   --exports N   corpus size (default 12, or DR_SEED_EXPORTS)
 #   --reset       empty bucket A first (a rehearsal starts from a known
-#                 corpus, so a non-empty bucket A is refused without this)
+#                 corpus, so a non-empty bucket A is refused without this).
+#                 The bucket must be named explicitly in DR_BUCKET_PRIMARY and
+#                 must carry the rehearsal marker this harness writes when it
+#                 creates a bucket.
+#   --i-know-this-bucket  allow --reset to empty a bucket that carries no
+#                 rehearsal marker. This is a recursive delete of a bucket
+#                 this harness did not create; nothing else in the harness
+#                 sets it.
 #   --dry-run     validate configuration and dependencies, touch nothing
 #
 # Exit 0 on success, 64 on bad usage, 65 on an unmet precondition, 1 when a
@@ -25,7 +33,8 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/dr/seed.sh [--exports N] [--reset] [--dry-run] [--help]
+Usage: scripts/dr/seed.sh [--exports N] [--reset] [--i-know-this-bucket]
+                          [--dry-run] [--help]
 
 Writes a known corpus through a real ravel-server into bucket A, stops the
 writer, inventories the bucket, and pre-registers the expected figures other
@@ -33,7 +42,11 @@ phases assert against (DR_EXPECT_* in <DR_LOG_DIR>/dr-expect.env).
 
 Options:
   --exports N   corpus size in OTLP exports (default 12, or DR_SEED_EXPORTS)
-  --reset       empty bucket A before seeding
+  --reset       empty bucket A before seeding. Refuses unless DR_BUCKET_PRIMARY
+                names the bucket explicitly and the bucket carries this
+                harness's rehearsal marker.
+  --i-know-this-bucket
+                let --reset empty a bucket with no rehearsal marker
   --dry-run     validate configuration and dependencies without touching a
                 bucket, a binary or the network
   --help, -h    this message
@@ -44,6 +57,7 @@ USAGE
 
 EXPORTS="${DR_SEED_EXPORTS:-12}"
 RESET=0
+KNOW_BUCKET=0
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -55,6 +69,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --reset)
       RESET=1
+      shift
+      ;;
+    --i-know-this-bucket)
+      KNOW_BUCKET=1
       shift
       ;;
     --dry-run | --check)
@@ -81,8 +99,18 @@ dr_init
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   dr_dry_run_common "seed.sh"
   printf '  corpus: %s OTLP metric exports, 1 sample and 1 series each\n' "${EXPORTS}"
-  printf '  would: create %s, qualify the store, start ravel-server on %s,\n' \
-    "${DR_BUCKET_PRIMARY}" "${DR_HTTP_ADDR}"
+  if [[ "${RESET}" -eq 1 ]]; then
+    printf '  reset: yes, and it refuses unless %s carries %s\n' \
+      "${DR_BUCKET_PRIMARY}" "${DR_BUCKET_MARKER_KEY}"
+    if [[ "${KNOW_BUCKET}" -eq 1 ]]; then
+      printf '         --i-know-this-bucket: the marker requirement is waived\n'
+    fi
+  else
+    printf '  reset: no, a non-empty bucket A is refused\n'
+  fi
+  printf '  would: create %s in region %s, qualify the store, start\n' \
+    "${DR_BUCKET_PRIMARY}" "${DR_REGION}"
+  printf '         ravel-server on %s,\n' "${DR_HTTP_ADDR}"
   printf '         POST %s exports under strict ack, stop the writer, and\n' "${EXPORTS}"
   printf '         pre-register DR_EXPECT_* into %s\n' "$(dr_expect_file)"
   printf '  bands: accepted exports [%s,%s]; L0 data objects [2,%s];\n' \
@@ -112,19 +140,19 @@ trap cleanup EXIT
 
 dr_export_s3_env "${DR_BUCKET_PRIMARY}"
 
-dr_log "ensuring bucket ${DR_BUCKET_PRIMARY} exists"
-dr_mc mb -p "dr/${DR_BUCKET_PRIMARY}" >/dev/null 2>&1 || true
+dr_log "ensuring bucket ${DR_BUCKET_PRIMARY} exists in region ${DR_REGION}"
+dr_ensure_bucket "${DR_BUCKET_PRIMARY}" || dr_die "${DR_EX_PRECONDITION}" \
+  "could not create bucket ${DR_BUCKET_PRIMARY} in region ${DR_REGION}"
 
-existing="$(dr_list_keys "${DR_BUCKET_PRIMARY}")" || dr_die "${DR_EX_PRECONDITION}" \
+existing="$(dr_list_all_versions "${DR_BUCKET_PRIMARY}")" || dr_die "${DR_EX_PRECONDITION}" \
   "could not list ${DR_BUCKET_PRIMARY}"
 existing_count="$(dr_count_lines "${existing}")"
 if [[ "${existing_count}" -gt 0 ]]; then
   if [[ "${RESET}" -eq 1 ]]; then
-    dr_log "emptying bucket ${DR_BUCKET_PRIMARY} (${existing_count} object(s))"
-    dr_mc rm --recursive --force "dr/${DR_BUCKET_PRIMARY}/" >/dev/null
+    dr_reset_bucket "${DR_BUCKET_PRIMARY}" "${KNOW_BUCKET}"
   else
     dr_die "${DR_EX_PRECONDITION}" \
-      "bucket ${DR_BUCKET_PRIMARY} already holds ${existing_count} object(s); pass --reset to empty it"
+      "bucket ${DR_BUCKET_PRIMARY} already holds ${existing_count} object version(s); pass --reset to empty it"
   fi
 fi
 
@@ -148,18 +176,24 @@ gen_fixture() {
 gen_fixture
 
 dr_log "starting ravel-server against ${DR_BUCKET_PRIMARY}"
+# The tenant token reaches the server through a file and curl through a config
+# file. Both would otherwise sit in argv, where any process listing on the host
+# reads them, and this harness's own rule is that a credential never appears on
+# a command line.
+TOKEN_FILE="$(dr_tenant_token_file)"
+CURL_AUTH="$(dr_curl_auth_config)"
 declare -a SERVER_ARGV=()
 mapfile -d '' -t SERVER_ARGV < <(dr_ravel_server_argv \
   --store s3 \
   --listen-http "${DR_HTTP_ADDR}" \
   --listen-grpc "${DR_GRPC_ADDR}" \
-  --tenant-token "${DR_TENANT_TOKEN}=${DR_TENANT}")
+  --tenant-token-file "${TOKEN_FILE}")
 "${SERVER_ARGV[@]}" >"${SEED_LOG}" 2>&1 &
 SERVER_PID=$!
 
 server_ready() {
   curl --silent --fail --max-time 2 \
-    -H "Authorization: Bearer ${DR_TENANT_TOKEN}" \
+    --config "${CURL_AUTH}" \
     "http://${DR_HTTP_ADDR}/api/v1/query?query=up" >/dev/null 2>&1
 }
 
@@ -193,8 +227,8 @@ for _ in $(seq 1 "${EXPORTS}"); do
   curl --silent --show-error --fail \
     --dump-header "${header_file}" \
     --output /dev/null \
+    --config "${CURL_AUTH}" \
     -X POST "http://${DR_HTTP_ADDR}/v1/metrics" \
-    -H "Authorization: Bearer ${DR_TENANT_TOKEN}" \
     -H "Content-Type: application/x-protobuf" \
     --data-binary "@${FIXTURE}" || code=$?
   if [[ "${code}" -ne 0 ]]; then
@@ -202,8 +236,20 @@ for _ in $(seq 1 "${EXPORTS}"); do
     continue
   fi
   headers="$(cat "${header_file}")"
-  token="$(awk 'BEGIN { IGNORECASE = 1 } /^x-ravel-commit-token:/ { print $2 }' \
-    <<<"${headers}" | tr -d '\r')"
+  # HTTP header names are case insensitive, and the case-folding here is done
+  # by hand: gawk's IGNORECASE is a gawk extension that mawk (the default awk
+  # on Debian and Ubuntu runners) silently ignores, so every export would read
+  # as untokened and the seed would report zero accepted.
+  token="$(awk '
+    { line = $0 }
+    { name = line; sub(/:.*/, "", name) }
+    { lname = tolower(name) }
+    lname == "x-ravel-commit-token" {
+      value = line
+      sub(/^[^:]*:[ \t]*/, "", value)
+      print value
+    }
+  ' <<<"${headers}" | tr -d '\r')"
   if [[ -z "${token}" ]]; then
     dr_log "export carried no strict-ack commit token; not counted"
     continue

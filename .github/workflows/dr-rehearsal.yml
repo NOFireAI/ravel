@@ -75,9 +75,29 @@ jobs:
             expected_phase: canary-query
             expected_exit: "14"
     env:
-      # The CI MinIO values are the script defaults, so only the corpus size
-      # is set here. A real S3 run overrides DR_ENDPOINT (to the empty
-      # string), DR_REGION, the bucket names and the credentials instead.
+      # Nothing below has a script default. Both bucket names, both
+      # credentials, the tenant hash mode and the two custody declarations are
+      # required, and every script refuses when one of them is unset: a default
+      # bucket name is a recursive delete aimed at whatever bucket bears that
+      # name in the account the credentials belong to, and a default custody
+      # declaration turns the custody check into one that cannot fail.
+      #
+      # These are the values for the throwaway MinIO this job starts below. A
+      # real S3 run sets DR_ENDPOINT to the empty string and supplies its own
+      # region, buckets and STS credentials (DR_SESSION_TOKEN included).
+      DR_BUCKET_PRIMARY: ravel-dr-ci-primary
+      DR_BUCKET_REPLICA: ravel-dr-ci-replica
+      DR_ACCESS_KEY: minioadmin
+      DR_SECRET_KEY: minioadmin
+      DR_TENANT_HASH_MODE: unkeyed
+      # `none` is a declaration, not a default: this throwaway MinIO deployment
+      # has no per-tenant KMS and no separate admin credential file.
+      DR_TENANT_KMS_CONFIG: none
+      DR_ADMIN_CREDENTIAL_FILE: none
+      # This lane does not wait the catalog seal margin out, so the fold
+      # verification phase reports itself a no-op rather than asserting a
+      # snapshot HEAD it cannot have.
+      DR_FOLD_SEAL_MARGIN_WAITED: "0"
       DR_SEED_EXPORTS: "6"
       DR_LOG_DIR: ${{ github.workspace }}/.gate-logs/dr
     steps:
@@ -318,13 +338,17 @@ jobs:
         with:
           name: dr-rehearsal-${{ matrix.case }}
           # Logs and the small text records the assertions read, only. No
-          # object bodies and no fixture data leave the runner.
+          # object bodies and no fixture data leave the runner. Every entry is
+          # a file directly under .gate-logs/dr, so the credential-bearing
+          # files the harness writes into .gate-logs/dr/private (the tenant
+          # token file and the curl auth config) are not uploaded.
           path: |
             .gate-logs/dr/*.log
             .gate-logs/dr/dr-expect.env
             .gate-logs/dr/dr-failed-phase
             .gate-logs/dr/dr-restore-check-exit
             .gate-logs/dr/dr-marker-written-at
+            .gate-logs/dr/dr-restore-started-at
             .gate-logs/dr/dr-server-started-at
             .gate-logs/dr/dr-injected.env
           if-no-files-found: warn
