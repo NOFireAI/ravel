@@ -46,6 +46,36 @@ tier B runs, and the baseline is recorded, on the self-hosted reference runner.
 A baseline recorded anywhere else is a demonstration of the machinery, not a
 usable baseline, and its label must say so.
 
+A hand-recorded baseline is only usable for a comparison once five things are
+stamped into it, in the `_meta.label` text or a `_meta` field:
+
+- **Host** -- the machine class the numbers were measured on (CPU, core
+  count, whether the box is shared). A criterion number carries no meaning
+  without this; see ADR-0070 decision 3.
+- **Binary SHA** -- the commit the `cargo bench` binaries were built from.
+  Without it, a regression against the baseline cannot be attributed to a
+  code range.
+- **Corpus** -- what data the bench set ran over. For tier B specifically
+  this is n/a as a separate field: every named bench (`segment_encode`,
+  `series_id_hash`, `logseg_encode`, `logseg_scan`, `otap decode`,
+  `merge_kway_vs_materialized`, `bytes_slice_vs_copy`) generates its own
+  synthetic input in-process at a cardinality fixed by the knobs below,
+  there is no external or ingested corpus to name. A future bench added to
+  this set that reads recorded or ingested data must stamp what it read.
+- **Knobs** -- `BENCH_SAMPLE_SIZE`, `BENCH_WARMUP`, `BENCH_MEASURE`, and
+  `RAVEL_BENCH_MAX_SERIES`, exactly as described below.
+- **Flush cadence** -- n/a for tier B. Every bench in this set is pure-CPU
+  and store-independent (that is the property that makes a timing
+  comparison meaningful at all, per ADR-0070 decision 3); none of them
+  touch an ingest or flush path. A bench that did would need to stamp it.
+
+A baseline missing the fields that do apply to it (host, binary SHA, knobs)
+is not usable for a comparison, the same way `bench-tier-b.sh compare`
+already refuses a pair with no `_meta.knobs` (below). The committed
+`tier-b.json` is exactly this case: it carries a host label but no binary
+SHA, so treat it as a demonstration of the machinery only, never as a
+regression reference.
+
 The sampling knobs are load-bearing in the same way. `RAVEL_BENCH_MAX_SERIES`
 is part of the `segment_encode` bench id, so a re-record at a different
 cardinality renames that arm. The compare then reports it as MISSING on one
