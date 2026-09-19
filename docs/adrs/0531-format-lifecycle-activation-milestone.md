@@ -1,13 +1,20 @@
 # ADR-0531: What "first public release" means for the format-lifecycle policy
 
-Status: Proposed (recommendation; needs owner confirmation before the naming
-half lands)
+Status: Accepted (2026-09-19)
 
 This ADR decides nothing about any byte of any format. It settles a naming
 question the format-lifecycle ADRs left ambiguous, and records the rollback
 stance those ADRs never wrote down. It is issue #531 (documentation
 reconciliation) and the second unlanded half of issue #530 / #1775 (a
 documented rollback stance).
+
+The owner decided on 2026-09-19, on the reading recommended below (Reading B),
+and named the milestone: **the format-lifecycle activation milestone is the
+v1.0 release: until v1.0 ships, a bulk data-object format change may break
+backward compatibility outright rather than carry a reader window, so
+ADR-0066's N/N-1 window is not opened before v1.0 and the supported-version
+window stays at exactly one version.** Decision point 1 below states that in
+full; points 2 and 3 follow from it unchanged.
 
 ## Context
 
@@ -63,7 +70,9 @@ lifecycle ADRs means:
   were policy violations that shipped, and the project owes a retroactive
   correction and a migration path for any 0.9.x store that upgraded.
 - **Reading B: a distinct, not-yet-reached format-lifecycle activation
-  milestone**, separate from the software's first public release at 0.9.0. Then
+  milestone**, separate from the software's first public release at 0.9.0
+  (the owner chose this reading on 2026-09-19 and fixed the milestone at the
+  v1.0 release). Then
   the format lifecycle is still under ADR-0027's pre-release regime at HEAD,
   ADR-0066's window is staged (machinery present, exercised by tests and
   dry-runs) but not yet governing, and the 0.10.0 and 0.12.0 deletions were the
@@ -83,39 +92,43 @@ support for this recommendation. Shipping a v3+v4 reader is outside ADR-0027
 decision 7 under Reading B and outside ADR-0066's readers-before-writers
 sequencing under Reading A. It was closed in the next minor release by
 ADR-0892, which describes the window as unretired rather than as policy, so it
-does not establish that the N/N-1 window ever opened. The owner confirming
-point 2 below should know that one shipped bump deviated from the regime being
-confirmed.
+does not establish that the N/N-1 window ever opened. Point 2 below was
+confirmed in the knowledge that one shipped bump deviated from the regime it
+confirms.
 
-## Decision (recommended, pending owner confirmation)
+## Decision
 
 1. For the format-lifecycle policy only, "first public release" in ADR-0027
-   (decision 7, Status line) and ADR-0066 (decision 1) denotes a **format-
-   lifecycle activation milestone that has not yet occurred**. It is distinct
-   from the software's first public release (0.9.0, CHANGELOG.md), which is a
-   marketing/packaging fact about the binary, not a guarantee about on-object
-   format stability. The activation milestone is declared explicitly, in its own
-   reviewed change, when the project commits to carrying real dual versions.
+   (decision 7, Status line) and ADR-0066 (decision 1) denotes the **v1.0
+   release**, which has not happened. It is distinct from the software's first
+   public release (0.9.0, CHANGELOG.md), which is a marketing/packaging fact
+   about the binary, not a guarantee about on-object format stability. Until
+   v1.0 ships, Ravel may break backward compatibility: a bulk data-object
+   format change may delete the previous version's reader outright rather than
+   carry a reader window, and stored objects at the retired version become
+   unreadable. What that means for ADR-0066's N/N-1 reader window is exact: the
+   window is **not opened before v1.0**, and the supported-version window stays
+   at exactly one version (`SUPPORTED_VERSIONS` one entry wide per Class A
+   format) until the v1.0 release. Opening it is a separate reviewed change
+   made at v1.0, not an event that happens on its own.
 
-2. Until that milestone is declared, ADR-0027's pre-release regime remains in
-   force for the bulk data-object formats: exactly one supported version at a
-   time, the previous version's read and write support deleted in the same
-   change that introduces the new one, and no in-place migration across a bump.
-   ADR-0066's N/N-1 machinery stays staged and exercised by tests and dry-runs,
-   as decision 1 already says for the pre-release period.
+2. Until v1.0, ADR-0027's pre-release regime remains in force for the bulk
+   data-object formats: exactly one supported version at a time, the previous
+   version's read and write support deleted in the same change that introduces
+   the new one, and no in-place migration across a bump. ADR-0066's N/N-1
+   machinery stays staged and exercised by tests and dry-runs, as decision 1
+   already says for the pre-release period.
 
 3. This confirms, rather than reverses, ADR-0092 decision 7 and the 0.10.0 and
    0.12.0 reader deletions: they acted correctly under the pre-release regime,
-   because the activation milestone had not (and has not) occurred. It says
-   nothing about 0.11.0's two-version RLOG reader, which no reading of the
-   phrase authorises and which ADR-0892 has already closed.
+   because v1.0 had not (and has not) shipped. It says nothing about 0.11.0's
+   two-version RLOG reader, which no reading of the phrase authorises and which
+   ADR-0892 has already closed.
 
-The owner must confirm point 1 before the reconciling edits to ADR-0027,
-ADR-0066, and ADR-0092 land. If the owner instead chooses Reading A, this ADR is
-withdrawn and a separate change records the retroactive-correction obligation
-for the shipped 0.10.0/0.12.0 deletions; the operator-facing posture edits in
-the format docs (below) hold under either reading and are not gated on the
-choice.
+Reading A is therefore rejected: the shipped 0.10.0 and 0.12.0 reader deletions
+carry no retroactive-correction obligation, and no changelog history is edited.
+The operator-facing posture edits in the format docs (below) were factual at
+HEAD under either reading and are not affected by the choice.
 
 ## Rollback stance (issue #530 / #1775, the second unlanded bullet)
 
@@ -149,14 +162,14 @@ in force at HEAD (Reading B, point 2 above):
   event** under the current regime: plan it as forward-only, and for logs and
   spans treat the rollback window as bounded by the retention horizon.
 
-- **When this stance changes.** When the activation milestone (point 1) is
-  declared and the reader window moves to N/N-1, a single bump becomes rollback-
+- **When this stance changes.** At the v1.0 release (point 1), when the reader
+  window moves to N/N-1, a single bump becomes rollback-
   safe across exactly one version boundary, and the `maintain migrate` primitive
   can convert a store forward before the old reader is retired. The floor-raise
   ordering that makes that safe (a version's read support is deleted only once
   every bucket's format floor exceeds it) is exercised end to end in
   `crates/ravel-maintain/src/migrate.rs`; that machinery is ready, but it is not
-  the governing posture until the milestone is declared.
+  the governing posture until v1.0 ships.
 
 ## Consequences
 
@@ -164,17 +177,19 @@ in force at HEAD (Reading B, point 2 above):
   docs/log-segment-format.md, docs/span-segment-format.md, README.md) state the
   HEAD posture plainly: the
   reader admits exactly one version, a format bump is a non-rollbackable
-  data-migration event, and the N/N-1 window is staged but not yet in force.
-  These edits are factual at HEAD and hold under either reading of "first public
-  release."
+  data-migration event, and the N/N-1 window is staged and does not open before
+  v1.0. Those docs and docs/guides/operations/maintenance.md name v1.0 as the
+  milestone, so the rule an operator reads is a date-free but concrete one
+  rather than an undecided event.
 
-- ADR-0027, ADR-0066, ADR-0092, and ADR-0892 each gain a pointer to this ADR at
+- ADR-0027, ADR-0066, ADR-0092, and ADR-0892 each carry a pointer to this ADR at
   the "first public release" reference, so a reader meeting the ambiguous phrase
-  is sent to the decision record rather than left to guess. ADR-0892 is not a
-  passing mention of the phrase: it is the ADR that deleted a shipped reader on
-  the strength of it, and docs/log-segment-format.md sends readers there by
-  name. Their core decisions
-  are not rewritten here; that waits on owner confirmation of point 1.
+  is sent to the decision record rather than left to guess, and each pointer
+  names v1.0. ADR-0892 is not a passing mention of the phrase: it is the ADR
+  that deleted a shipped reader on the strength of it, and
+  docs/log-segment-format.md sends readers there by name. Their core decisions
+  are not rewritten: this ADR fixes what their milestone phrase denotes, nothing
+  else.
 
 - A documentation/code consistency check
   (scripts/check_format_version_docs.py, wired into scripts/gates.sh and CI)
@@ -188,3 +203,11 @@ in force at HEAD (Reading B, point 2 above):
   `SegmentVersion::WINDOW` single-source model in the issue #530 change (see the
   ADR-0066 #530 amendment); the names in ADR-0092 are stale but its decision is
   unchanged. Recorded here rather than rewritten into the historical ADR.
+
+- Two doc comments in the format crates still carry the ambiguous phrase and
+  read, after 0.9.0 shipped, as if the window were already due to open:
+  `SupportedVersions::n_and_prev` is "Reserved for first public release"
+  (`crates/ravel-logseg/src/footer.rs`), and RSEG's `SUPPORTED_VERSIONS` is
+  "ready for the first post-release bump" (`crates/ravel-segment/src/format.rs`).
+  Under this ADR both mean v1.0. No code behaviour is affected, and no code is
+  changed here; the wording is recorded as a follow-up.

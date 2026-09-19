@@ -67,7 +67,7 @@ ADR-0027's single-version policy is superseded at (and only at) first public rel
 
 Until first release, ADR-0027 stands unchanged; this ADR's machinery lands exercised by tests and dry-runs rather than by carrying real dual versions in anger.
 
-"First public release" here is disambiguated by ADR-0531 (proposed): it denotes a not-yet-reached format-lifecycle activation milestone, distinct from the software's first public release at 0.9.0. Under that reading this decision's N/N-1 window is staged but not yet in force at HEAD, which is why the reader window is still single-version and the 0.10.0 (RSEG v6) and 0.12.0 (RLOG v3) deletions acted correctly under ADR-0027's pre-release regime. 0.11.0, which introduced RLOG v4 while keeping the v3 reader, is a deviation from that regime rather than an early start of this decision's window; ADR-0892 closed it.
+"First public release" here is settled by ADR-0531 (Accepted 2026-09-19): it is the **v1.0 release**, distinct from the software's first public release at 0.9.0. This decision's N/N-1 window therefore does not open before v1.0: it is staged and not in force at HEAD, which is why the reader window is still single-version and the 0.10.0 (RSEG v6) and 0.12.0 (RLOG v3) deletions acted correctly under ADR-0027's pre-release regime, where a format change may break backward compatibility outright. 0.11.0, which introduced RLOG v4 while keeping the v3 reader, is a deviation from that regime rather than an early start of this decision's window; ADR-0892 closed it.
 
 ### 2. Fail-closed-on-newer, everywhere, typed
 
@@ -154,7 +154,7 @@ Deleting an offboarded tenant's data is selective deletion's (ADR-0064) mechanis
 
 ## Consequences
 
-- ADR-0027 is superseded at first public release on the terms its own decision 7 set; until then it stands, and this ADR's Class A machinery is exercised by tests and dry-runs.
+- ADR-0027 is superseded at first public release on the terms its own decision 7 set; until then it stands, and this ADR's Class A machinery is exercised by tests and dry-runs. ADR-0531 fixes that point at the v1.0 release, so the supersession, and with it the N/N-1 window, is dated to v1.0 and the machinery stays staged until then.
 - The format-change skill is amended: state the format's migration class (A-D) and convergence plan in every format ADR; for Class A, land the N-1 reader before any N writer ships; deleting an old version's reader requires citing every bucket's floor. The skill's "readable by every future version" sentence is corrected to state both regimes (pre-release single-version per ADR-0027; post-release N/N-1 window per this ADR) — today the carve-out lives only inside ADR-0027 and the skill contradicts it.
 - `docs/segment-format.md`, `docs/log-segment-format.md`, `docs/catalog-and-mvcc.md` each gain a normative migration paragraph; ADR-0051 §3 and `docs/guides/admission-limits.md` and `operations.md` drop "restart to change"; README/PROGRESS updated in the same commits as the code (doc-currency rule).
 - Interaction with multi-part fold (ADR-0063): it is a Class B bump — envelope version bump, fold regenerates, dual-read across the rolling window only. Decision 2's HEAD fix must land before its format change dispatches, or a lagging fold process will CAS-clobber its new-format HEAD during rollout. This ADR should sequence that task first for its benefit.

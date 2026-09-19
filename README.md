@@ -91,15 +91,19 @@ error rate against Ravel through PromQL, and filter the lines it counts by
 body text, but it cannot browse the lines themselves. Reading log lines is
 SQL's job. If you need write acknowledgement in single-digit milliseconds, strict
 mode pays an object-store round trip and buffered mode gives up the crash guarantee
-above. Ravel is pre-1.0: the persistent formats are versioned contracts, and the
+above. Ravel is pre-1.0, and until v1.0 ships it may break backward
+compatibility: the persistent formats are versioned contracts, but a version
+change before v1.0 retires the old one rather than keeping it readable, and the
 surfaces around them still move. A bulk data-object format bump (RSEG, RLOG,
-RSPAN) is currently a non-rollbackable, forward-only data-migration event: the
+RSPAN) is therefore a non-rollbackable, forward-only data-migration event: the
 reader admits one on-object version at a time, so once data is written at a new
-version, a build that predates the bump cannot read it. The other persistent
+version, a build that predates the bump cannot read it, and objects left at the
+retired version are wiped or re-ingested. The other persistent
 formats do not work this way: rebuildable fold outputs and the additive,
-field-number-frozen records evolve without a one-way step. Treat a format upgrade as one-way until a released version
-declares the format stable. See the segment, log, and span format specs for the
-exact posture.
+field-number-frozen records evolve without a one-way step. The two-version
+reader window that makes an upgrade reversible across one version boundary
+opens at v1.0, so treat a format upgrade as one-way until then. See the
+segment, log, and span format specs for the exact posture.
 
 ## What works
 

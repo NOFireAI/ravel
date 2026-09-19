@@ -1,7 +1,7 @@
 # RSEG v7: Ravel Segment Format (metrics)
 
 Persistent contract. ADR-0027 leaves exactly one supported version until the
-first public release: v7. Any change to the layout bumps the version and
+v1.0 release: v7. Any change to the layout bumps the version and
 retires the previous one in the same change (an ADR plus a version bump, never
 an in-place edit under the same number). v7 (ADR-0092) retired v6 read and
 write support in the same change that introduced it, so a stray v6 object is
@@ -15,10 +15,11 @@ fails closed with a typed `UnsupportedVersion`, and retention's version hold
 declines to delete it but cannot make it readable. The irreversible step is the
 first write at the new version; before it, a rollback to the earlier build is
 safe. The N/N-1 reader window described below is machinery the code carries for
-a future format-lifecycle activation milestone, not a posture any released build
-has had; that milestone is distinct from the software's first public release at
-0.9.0 (ADR-0531, proposed). Plan a format bump as forward-only until it is
-declared.
+the v1.0 release, not a posture any released build has had: ADR-0531 fixes the
+format-lifecycle activation milestone at v1.0, which is distinct from the
+software's first public release at 0.9.0 and has not shipped. Before v1.0 a
+format change may break backward compatibility outright, so plan every format
+bump as forward-only until v1.0 ships.
 
 **Which versions the reader admits.** The reader admits exactly the versions in
 `ravel_segment::SUPPORTED_VERSIONS`, which today is the single version 7. That
@@ -47,10 +48,11 @@ side of a rolling upgrade (or the build a rollback returns to) reads that object
 normally. A corrupt object is swept as usual.
 
 **Version lifecycle and migration (ADR-0066, normative).** RSEG is a Class A
-bulk data-object format. Until the format-lifecycle activation milestone
-(ADR-0531, proposed: distinct from the software's 0.9.0 first public release and
-not yet reached), ADR-0027's single-supported-version rule above stands and a
-bump is forward-only. From that milestone onward the supported-version window
+bulk data-object format. Until the v1.0 release (ADR-0531: the
+format-lifecycle activation milestone is v1.0, distinct from the software's
+0.9.0 first public release and not yet shipped), ADR-0027's
+single-supported-version rule above stands, a bump is forward-only, and the
+N/N-1 window is not opened. From v1.0 onward the supported-version window
 becomes N/N-1: the writer always emits the current version N, and the reader
 accepts N and N-1. The window is single-sourced as
 `ravel_segment::SUPPORTED_VERSIONS`, and the writer, reader gate,
