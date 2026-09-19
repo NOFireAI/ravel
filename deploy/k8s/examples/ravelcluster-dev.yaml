@@ -30,6 +30,16 @@ spec:
     name: ravel-audit-token-key
   gateway:
     replicas: 1
+    # Explicit block (#1726): replaces the rendered default request entirely
+    # (100m CPU / 256Mi memory, no limits) rather than merging with it. Omit
+    # this block to keep that default.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
     # Ingest affinity (ADR-0076 decision 1) is off here and in every existing
     # RavelCluster: omitting the block renders no Ingress and behaves exactly
     # as before. It also needs an ingress controller, which the kind dev

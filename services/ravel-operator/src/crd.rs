@@ -179,7 +179,11 @@ pub struct GatewaySpec {
     #[serde(default = "default_replicas")]
     pub replicas: i32,
 
-    /// Container resource requests/limits.
+    /// Container resource requests/limits. Omit to render the default request
+    /// of `100m` CPU / `256Mi` memory and no limits
+    /// ([`GATEWAY_DEFAULT_CPU_REQUEST`], [`GATEWAY_DEFAULT_MEMORY_REQUEST`]).
+    /// An explicit block here replaces the default entirely rather than
+    /// merging with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirementsSpec>,
 
@@ -550,7 +554,11 @@ pub struct QuerySpec {
     #[serde(default = "default_replicas")]
     pub replicas: i32,
 
-    /// Container resource requests/limits.
+    /// Container resource requests/limits. Omit to render the default request
+    /// of `200m` CPU / `512Mi` memory and no limits
+    /// ([`QUERY_DEFAULT_CPU_REQUEST`], [`QUERY_DEFAULT_MEMORY_REQUEST`]). An
+    /// explicit block here replaces the default entirely rather than merging
+    /// with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirementsSpec>,
 
@@ -607,7 +615,11 @@ pub struct MaintainSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_secs: Option<u64>,
 
-    /// Container resource requests/limits.
+    /// Container resource requests/limits. Omit to render the default request
+    /// of `100m` CPU / `256Mi` memory and no limits
+    /// ([`MAINTAIN_DEFAULT_CPU_REQUEST`], [`MAINTAIN_DEFAULT_MEMORY_REQUEST`]).
+    /// An explicit block here replaces the default entirely rather than
+    /// merging with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirementsSpec>,
 
@@ -727,6 +739,25 @@ pub struct ResourceRequirementsSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<BTreeMap<String, String>>,
 }
+
+/// Default gateway request when `spec.gateway.resources` is omitted (#1726).
+/// Sized to keep the `kind` dev lane -- three tiers plus MinIO and floci on
+/// one node -- schedulable without every operator having to size it by hand.
+pub const GATEWAY_DEFAULT_CPU_REQUEST: &str = "100m";
+/// Companion to [`GATEWAY_DEFAULT_CPU_REQUEST`].
+pub const GATEWAY_DEFAULT_MEMORY_REQUEST: &str = "256Mi";
+
+/// Default query request when `spec.query.resources` is omitted (#1726), sized
+/// larger than gateway/maintain for the query engine's working set.
+pub const QUERY_DEFAULT_CPU_REQUEST: &str = "200m";
+/// Companion to [`QUERY_DEFAULT_CPU_REQUEST`].
+pub const QUERY_DEFAULT_MEMORY_REQUEST: &str = "512Mi";
+
+/// Default maintain request when `spec.maintain.resources` is omitted
+/// (#1726).
+pub const MAINTAIN_DEFAULT_CPU_REQUEST: &str = "100m";
+/// Companion to [`MAINTAIN_DEFAULT_CPU_REQUEST`].
+pub const MAINTAIN_DEFAULT_MEMORY_REQUEST: &str = "256Mi";
 
 /// Observed status (ADR-0034 decision 2). Written by the operator on the status
 /// subresource.

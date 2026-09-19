@@ -34,8 +34,10 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 
 use crate::crd::{
-    AffinityBackend, AffinityKeySource, GatewayReference, IngestAffinitySpec, LocalSecretRef,
-    RavelClusterSpec, ResourceRequirementsSpec,
+    AffinityBackend, AffinityKeySource, GATEWAY_DEFAULT_CPU_REQUEST,
+    GATEWAY_DEFAULT_MEMORY_REQUEST, GatewayReference, IngestAffinitySpec, LocalSecretRef,
+    MAINTAIN_DEFAULT_CPU_REQUEST, MAINTAIN_DEFAULT_MEMORY_REQUEST, QUERY_DEFAULT_CPU_REQUEST,
+    QUERY_DEFAULT_MEMORY_REQUEST, RavelClusterSpec, ResourceRequirementsSpec,
 };
 
 /// A spec that cannot be rendered into a valid object set.
@@ -582,8 +584,17 @@ fn deployment_key_volume_mount(spec: &RavelClusterSpec) -> Option<VolumeMount> {
 }
 
 /// Convert the CRD resource spec into a Kubernetes `ResourceRequirements`.
-fn resources(spec: Option<&ResourceRequirementsSpec>) -> Option<ResourceRequirements> {
-    let spec = spec?;
+///
+/// When the spec omits `resources` entirely, renders `default_cpu`/
+/// `default_memory` as the request and no limits (#1726), so every tier
+/// schedules with a sane floor instead of Kubernetes' bare "best effort"
+/// default. An explicit spec block, even a partial one, replaces the default
+/// entirely rather than merging with it.
+fn resources(
+    spec: Option<&ResourceRequirementsSpec>,
+    default_cpu: &str,
+    default_memory: &str,
+) -> ResourceRequirements {
     let map = |m: Option<&BTreeMap<String, String>>| {
         m.map(|m| {
             m.iter()
@@ -591,11 +602,21 @@ fn resources(spec: Option<&ResourceRequirementsSpec>) -> Option<ResourceRequirem
                 .collect::<BTreeMap<_, _>>()
         })
     };
-    Some(ResourceRequirements {
-        requests: map(spec.requests.as_ref()),
-        limits: map(spec.limits.as_ref()),
-        claims: None,
-    })
+    match spec {
+        Some(spec) => ResourceRequirements {
+            requests: map(spec.requests.as_ref()),
+            limits: map(spec.limits.as_ref()),
+            claims: None,
+        },
+        None => ResourceRequirements {
+            requests: Some(BTreeMap::from([
+                ("cpu".to_string(), Quantity(default_cpu.to_string())),
+                ("memory".to_string(), Quantity(default_memory.to_string())),
+            ])),
+            limits: None,
+            claims: None,
+        },
+    }
 }
 
 /// Liveness and readiness probes pointed at `/healthz` and `/readyz` on the
@@ -739,6 +760,7 @@ fn deployment(
     ports: Vec<ContainerPort>,
     replicas: i32,
     resources_spec: Option<&ResourceRequirementsSpec>,
+    default_resources: (&str, &str),
     strategy_type: &str,
     secrets_checksum: &str,
 ) -> Deployment {
@@ -756,7 +778,11 @@ fn deployment(
         liveness_probe: Some(liveness),
         readiness_probe: Some(readiness),
         lifecycle: Some(pre_stop_lifecycle()),
-        resources: resources(resources_spec),
+        resources: Some(resources(
+            resources_spec,
+            default_resources.0,
+            default_resources.1,
+        )),
         volume_mounts: volume_mount.map(|m| vec![m]),
         security_context: Some(container_security_context()),
         ..Default::default()
@@ -863,6 +889,7 @@ pub fn desired_gateway_deployment(
         ports,
         spec.gateway.replicas,
         spec.gateway.resources.as_ref(),
+        (GATEWAY_DEFAULT_CPU_REQUEST, GATEWAY_DEFAULT_MEMORY_REQUEST),
         "RollingUpdate",
         &tier_secrets_checksum(spec, ctx, tier_override, None),
     )
@@ -906,6 +933,7 @@ pub fn desired_query_deployment(
         ports,
         spec.query.replicas,
         spec.query.resources.as_ref(),
+        (QUERY_DEFAULT_CPU_REQUEST, QUERY_DEFAULT_MEMORY_REQUEST),
         "RollingUpdate",
         &tier_secrets_checksum(
             spec,
@@ -1014,6 +1042,10 @@ pub fn desired_maintain_deployment(
         ports,
         spec.maintain.replicas,
         spec.maintain.resources.as_ref(),
+        (
+            MAINTAIN_DEFAULT_CPU_REQUEST,
+            MAINTAIN_DEFAULT_MEMORY_REQUEST,
+        ),
         "RollingUpdate",
         &tier_secrets_checksum(spec, ctx, tier_override, None),
     )))
@@ -3203,6 +3235,90 @@ mod tests {
                 "unset spec.gc must render no --gc- flag: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn omitted_resources_render_default_requests_on_every_tier() {
+        // #1726. base_spec() carries `resources: None` on all three tiers; each
+        // container must get exactly its tier's default cpu/memory request and
+        // no limits, not Kubernetes' bare "best effort" default.
+        let spec = base_spec();
+        assert_eq!(spec.gateway.resources, None);
+        assert_eq!(spec.query.resources, None);
+        assert_eq!(spec.maintain.resources, None);
+
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("maintain enabled");
+
+        for (tier, dep, cpu, memory) in [
+            (
+                "gateway",
+                &g,
+                crate::crd::GATEWAY_DEFAULT_CPU_REQUEST,
+                crate::crd::GATEWAY_DEFAULT_MEMORY_REQUEST,
+            ),
+            (
+                "query",
+                &q,
+                crate::crd::QUERY_DEFAULT_CPU_REQUEST,
+                crate::crd::QUERY_DEFAULT_MEMORY_REQUEST,
+            ),
+            (
+                "maintain",
+                &m,
+                crate::crd::MAINTAIN_DEFAULT_CPU_REQUEST,
+                crate::crd::MAINTAIN_DEFAULT_MEMORY_REQUEST,
+            ),
+        ] {
+            let resources = container_of(dep)
+                .resources
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tier} container must carry rendered resources"));
+            let requests = resources
+                .requests
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tier} must render default requests"));
+            assert_eq!(
+                requests.get("cpu").map(|q| q.0.as_str()),
+                Some(cpu),
+                "{tier} default cpu request"
+            );
+            assert_eq!(
+                requests.get("memory").map(|q| q.0.as_str()),
+                Some(memory),
+                "{tier} default memory request"
+            );
+            assert_eq!(
+                resources.limits, None,
+                "{tier} must render no default limits"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_resources_spec_passes_through_unchanged() {
+        // #1726. An operator-supplied resources block, even a partial one (here
+        // a cpu request with no memory request, and a memory limit with no cpu
+        // limit), is rendered verbatim: the default request must not be merged
+        // in alongside it.
+        let mut spec = base_spec();
+        spec.gateway.resources = Some(ResourceRequirementsSpec {
+            requests: Some(BTreeMap::from([("cpu".to_string(), "750m".to_string())])),
+            limits: Some(BTreeMap::from([("memory".to_string(), "1Gi".to_string())])),
+        });
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        let resources = container_of(&g)
+            .resources
+            .as_ref()
+            .expect("gateway container must carry resources");
+        let requests = resources.requests.as_ref().expect("explicit requests");
+        assert_eq!(requests.len(), 1, "explicit requests must not gain entries");
+        assert_eq!(requests.get("cpu").map(|q| q.0.as_str()), Some("750m"));
+        let limits = resources.limits.as_ref().expect("explicit limits");
+        assert_eq!(limits.get("memory").map(|q| q.0.as_str()), Some("1Gi"));
     }
 
     #[test]
