@@ -49,15 +49,17 @@ series colliding.
 
 The renderer can attach only these label keys: `tenant_hash`, `signal`,
 `mode`, `op`, `error_kind`, `workload_class`, `level`, `reason`, `cache`,
-`tier`, `kind`, `outcome`, `allocator`, `stat`, `component`, and `class`,
-sixteen in all. `reason` is shared by two
+`tier`, `kind`, `outcome`, `allocator`, `stat`, `component`, `class`, and
+`carrier`, seventeen in all. `reason` is shared by two
 families, the admission-rejection counter and the scrub seal-divergence
 counter. `cache` and `tier` split the read-cache family across its two caches
 and, when a disk tier is configured, its two tiers; the [caching
 guide](caching.md) documents both. `kind` splits the maintenance
 merge-memory gauge into its transient and total high-water marks. `class`
 splits the fragment in-flight gauge and admission-wait counter into their
-`pinned` and `resolve` fragment admission classes. `outcome`
+`pinned` and `resolve` fragment admission classes. `carrier` splits the
+declared-statistics drop tally across the four carriers of ADR-0873's
+statistics. `outcome`
 splits the alert-tick counter by how one evaluation tick ended, `allocator`
 and `stat` carry the process allocator gauges, and `component` splits the
 memory budget's reserved-bytes gauge by which side reserved it. The `level`
@@ -264,6 +266,11 @@ the `maintain` mode, which never spawns it, and `--disable-fold`, which
 returns no fold tasks in any mode. The on-demand fold route is mounted only
 in `all` and `query`. A `maintain` process, and any process run with
 `--disable-fold`, therefore reports zeros permanently.
+
+The `ravel_catalog_fold_stamped_*` pair shares this prefix and is not part of
+this family. It is ADR-0873 stamp coverage, documented under declared-column
+statistics below, and unlike the three liveness families it is omitted in
+`maintain` rather than rendered as zeros.
 
 The `signal` label is the family's per-signal keying, not a convenience. The
 fold runs as one independent task per signal, each with its own loop and no
@@ -488,6 +495,123 @@ count, so a stuck single tenant is found through
 `ravel_catalog_fold_failures_total` and the fold task's per-tenant logs
 instead. And a deployment that has discovered no tenants at all folds nothing
 and so trips this rule; scope the group to deployments that serve traffic.
+
+### Declared-column statistics (`ravel_declared_stats_drops_observed_total`, `ravel_catalog_fold_stamped_*`)
+
+Three families cover ADR-0873's per-declared-column min/max stamps: one defect
+tally on the read side, and one coverage pair at the fold.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `ravel_declared_stats_drops_observed_total` | `mode`, `carrier` | Declared-column statistics entries a reader dropped as defective, by the carrier it was reading. |
+| `ravel_catalog_fold_stamped_records_total` | `mode` | Commit records carrying declared-column statistics that the fold read. |
+| `ravel_catalog_fold_stamped_entries_total` | `mode` | Snapshot entries the fold wrote carrying declared-column statistics. |
+
+`carrier` is a closed set of four: `commit-record` and `compaction-part` are
+the two stamp carriers, `snapshot-entry` is the fold's copy of them, and
+`cstat` is the `.cstat` object's own `ColumnStat` entries, whose reader lives
+in `ravel-sql`. The drop tally counts OBSERVATIONS, not distinct defects: one
+defective record read by a thousand queries counts a thousand times, because
+deduplicating per entry would need unbounded state keyed by (object, column)
+on a path walked once per segment per query. So compare its rate across equal
+windows and never its magnitude across windows of different query volume. The
+[query engine guide](../query-engine.md) states the same semantics next to the
+predicate the drops come from.
+
+This family renders in every mode, including `maintain`. Its four carriers are
+read by four different subsystems, and `compaction-part` is observed by the
+compaction that only `maintain` runs, so gating the family on folding would
+hide a defect signal in exactly the mode that produces it.
+
+The two fold families are the coverage pair, and they answer a different
+question from the drop tally: not "is a stamp defective" but "is a stamp that
+was written reaching the snapshot at all". `..._stamped_records_total` counts
+commit records the fold read that carried statistics; `..._stamped_entries_total`
+counts snapshot entries the fold then wrote carrying statistics. Both are
+process-wide totals accumulated by the fold as each fold commits its `HEAD`,
+so a fold attempt that lost its compare-and-swap and retried contributes
+nothing. In the healthy state the two rise together, one entry per stamped
+record.
+
+Unlike the drop tally, the coverage pair renders only in a mode that spawns a
+fold task, which is every mode but `maintain`. On a `maintain` process both
+families are absent, not zero.
+
+#### The stamp-coverage shortfall alert
+
+```yaml
+groups:
+  - name: ravel-declared-stats
+    rules:
+      - alert: RavelFoldStampCoverageShortfall
+        expr: |
+          sum(increase(ravel_catalog_fold_stamped_records_total[1h]))
+            >
+          sum(increase(ravel_catalog_fold_stamped_entries_total[1h]))
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            The Ravel fold is reading more stamped commit records than it is
+            writing stamped snapshot entries
+          description: >-
+            Declared-column statistics are being read off commit records and
+            not carried onto the snapshot entries the query side prunes with,
+            so pruning silently degrades to a full scan on the affected
+            segments. Check ravel_declared_stats_drops_observed_total with
+            carrier="commit-record" for stamps the validity predicate is
+            rejecting, and carrier="snapshot-entry" for the fold's own copy.
+      - alert: RavelFoldStampCoverageMissing
+        expr: |
+          absent(ravel_catalog_fold_stamped_records_total)
+          and
+          (
+            sum(increase(ravel_ingest_flushes_by_size_total{signal="logs"}[1h]))
+            +
+            sum(increase(ravel_ingest_flushes_by_age_total{signal="logs"}[1h]))
+            +
+            sum(increase(ravel_ingest_flushes_manual_total{signal="logs"}[1h]))
+          ) > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Ravel is flushing log segments but no process reports fold stamp
+            coverage
+          description: >-
+            Every folding process in this deployment predates the
+            stamp-coverage counters, or the deployment folds nowhere. Either
+            way nothing can say whether the stamps the ingest side writes are
+            reaching the snapshot. Roll the fold processes, or scope this rule
+            out on a deployment that deliberately folds nowhere.
+```
+
+Why two rules rather than one. An old fold cannot emit a counter it does not
+have, so the detectable signal is a divergence between the two counters, or
+the fold-side family being absent while the ingest side rises. The first rule
+covers the divergence; the second covers the absence, and it needs the ingest
+side as its second term, because an absent fold family on its own is also what
+a `maintain`-only or an idle deployment looks like.
+
+`sum()` over both sides of the shortfall rule, not a per-instance comparison.
+The fold loop skips its tick when `HEAD` is already fresher than
+`fold_interval`, so a replica whose peers folded correctly reads zero on both
+counters and a per-instance comparison would compare two zeros forever; the
+fleet-wide sums are what "is this catalog carrying its stamps" is a question
+about. `increase(...[1h])` rather than the raw totals because both are
+monotonic process-lifetime counters: a process that carried a shortfall once
+and has been healthy since keeps the raw gap forever, and only a windowed rate
+distinguishes a live shortfall from a scar. `for: 15m` covers the one benign
+way the two can diverge briefly, a fold that reads a batch of stamped records
+in one scrape interval and writes their entries in the next.
+
+The pair cannot detect a stamp that was never written. Both counters live on
+the fold, so an ingest pipeline that stops stamping entirely drives both to
+zero together, which reads identically to an idle tenant. That case is what
+the `commit-record` drop tally is for: a stamp written and rejected shows
+there, a stamp never written shows in neither.
 
 ### Tenancy adoption (`ravel_tenancy_v1_unkeyed_adoptions_total`)
 

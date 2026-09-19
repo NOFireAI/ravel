@@ -165,6 +165,86 @@ async fn metrics_ingest_family_present_only_in_ingest_modes() {
     }
 }
 
+/// ADR-0873's three observability families on a live `/metrics` scrape.
+///
+/// The per-carrier drop tally renders in every mode: its four carriers are
+/// read by four different subsystems, and `compaction-part` is observed in
+/// exactly the mode that folds nothing, so gating it on folding would hide a
+/// defect signal where it is most likely to appear. The fold stamp-coverage
+/// pair renders only where a fold task exists, which is every mode but
+/// `Mode::Maintain`, and is omitted rather than zero-padded there.
+///
+/// Each family is counted, not merely tested for presence: a family emitted
+/// twice is a duplicate series a scrape rejects, and a duplicate reads the
+/// same as a single one to `contains`.
+#[tokio::test]
+async fn metrics_declared_stats_families_render_once_where_the_fold_runs() {
+    for (mode, mode_label, expect_fold) in [
+        (Mode::All, "all", true),
+        (Mode::Gateway, "gateway", true),
+        (Mode::Query, "query", true),
+        (Mode::Maintain, "maintain", false),
+    ] {
+        let running = start_test_server(mode, u64::MAX).await;
+        let base = format!("http://{}", running.http_addr);
+        let client = reqwest::Client::new();
+
+        let body = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request completes")
+            .text()
+            .await
+            .expect("metrics body is text");
+
+        assert_eq!(
+            body.matches("# TYPE ravel_declared_stats_drops_observed_total counter")
+                .count(),
+            1,
+            "mode {mode:?} must declare the drop tally exactly once:\n{body}"
+        );
+        for carrier in [
+            "commit-record",
+            "compaction-part",
+            "snapshot-entry",
+            "cstat",
+        ] {
+            assert_eq!(
+                body.matches(&format!(
+                    "ravel_declared_stats_drops_observed_total{{mode=\"{mode_label}\",carrier=\"{carrier}\"}} "
+                ))
+                .count(),
+                1,
+                "mode {mode:?} must render the {carrier} drop series exactly once:\n{body}"
+            );
+        }
+
+        for family in [
+            "ravel_catalog_fold_stamped_records_total",
+            "ravel_catalog_fold_stamped_entries_total",
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {family} counter")).count(),
+                usize::from(expect_fold),
+                "mode {mode:?} fold family {family} header count should be \
+                 {}:\n{body}",
+                usize::from(expect_fold)
+            );
+            assert_eq!(
+                body.matches(&format!("{family}{{mode=\"{mode_label}\"}} "))
+                    .count(),
+                usize::from(expect_fold),
+                "mode {mode:?} fold family {family} sample count should be \
+                 {}:\n{body}",
+                usize::from(expect_fold)
+            );
+        }
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
 /// ADR-1170 decision 4: the three process memory budget gauges must render
 /// with real values read from the same `MemoryBudget` the server was started
 /// with, not zeroed placeholders. `component="fetch"` reads `0` because

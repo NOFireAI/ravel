@@ -262,6 +262,19 @@ pub struct FoldReport {
     /// drains the backlog oldest-first. Nonzero here is the signal that the
     /// frontier is behind; steady state is always zero.
     pub frontier_hours_deferred: u64,
+    /// L0 commit records this fold read whose `declared_column_stats` (field
+    /// 20) was non-empty: the read half of the ADR-0873 stamp-coverage pair.
+    /// Counted off the wire before the statistics validity predicate runs, so
+    /// a record whose every entry is defective still counts here. An exact
+    /// count for this fold, not a running total.
+    pub stamped_records: u64,
+    /// Snapshot entries this fold wrote carrying at least one declared-column
+    /// stamp: the write half of the same pair. Never above `stamped_records`,
+    /// since only a stamped record can produce a stamped entry. Below it means
+    /// every entry of some stamped record was dropped on the way through,
+    /// which is the coverage shortfall ADR-0873's deployment gate is read
+    /// against.
+    pub stamped_entries: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -429,7 +442,11 @@ fn entry_identity(entry: &SnapshotEntry) -> EntryIdentity {
     )
 }
 
-fn build_snapshot_entry(key: &str, record: &CommitRecord) -> Result<SnapshotEntry, CatalogError> {
+fn build_snapshot_entry(
+    key: &str,
+    record: &CommitRecord,
+    coverage: &mut declared_stats::StampCoverage,
+) -> Result<SnapshotEntry, CatalogError> {
     let writer_id =
         Uuid::parse_str(&record.writer_id).map_err(|_| CatalogError::FieldMismatch {
             key: key.to_string(),
@@ -457,7 +474,7 @@ fn build_snapshot_entry(key: &str, record: &CommitRecord) -> Result<SnapshotEntr
         // clauses against this record's own sample_count. A defective entry is
         // dropped here rather than sealed into a part that outlives the record
         // proving it wrong.
-        declared_column_stats: declared_stats::carry_commit_record(record),
+        declared_column_stats: declared_stats::carry_commit_record(record, coverage),
     })
 }
 
@@ -1233,6 +1250,13 @@ impl Catalog {
                 .map(|(index, entry)| (entry_identity(entry), (index, true)))
                 .collect();
             let mut layout_drift_count: u64 = 0;
+            // ADR-0873 stamp coverage for this fold attempt. Threaded through
+            // the classifier like `layout_drift_count` rather than kept in a
+            // thread-local: the fold is an async fn that can migrate threads
+            // across any of its awaits, and a retried attempt must start from
+            // zero rather than double-count the records the abandoned attempt
+            // already read.
+            let mut coverage = declared_stats::StampCoverage::default();
 
             // Discover each (shard, hour) bucket's keys concurrently, bounded
             // by `fold_bucket_concurrency` (ADR-0063 section 3), mirroring the
@@ -1263,6 +1287,7 @@ impl Catalog {
                         &accounting,
                         &mut counters,
                         &mut layout_drift_count,
+                        &mut coverage,
                     )
                     .await?;
                 for (entry, is_canonical) in contribution {
@@ -1329,6 +1354,7 @@ impl Catalog {
                         &mut dirty_hours,
                         &mut counters,
                         &mut layout_drift_count,
+                        &mut coverage,
                     )
                     .await?;
                 }
@@ -1417,6 +1443,7 @@ impl Catalog {
                                 &mut dirty_hours,
                                 &mut counters,
                                 &mut layout_drift_count,
+                                &mut coverage,
                             )
                             .await?;
                         }
@@ -1512,6 +1539,7 @@ impl Catalog {
                                 &mut dirty_hours,
                                 &mut counters,
                                 &mut layout_drift_count,
+                                &mut coverage,
                             )
                             .await?;
                         }
@@ -2212,6 +2240,11 @@ impl Catalog {
             counters.put_requests += 1;
             match head_put_result {
                 Ok(_) => {
+                    // Only a fold that reached its committed HEAD contributes
+                    // to the process-global coverage totals, so an attempt
+                    // abandoned to a CAS loss and retried from zero above is
+                    // counted exactly once, by whichever attempt won.
+                    declared_stats::observe_fold_stamp_coverage(coverage);
                     return Ok(FoldReport {
                         watermark_hour: Some(watermark_hour),
                         previous_watermark_hour: head_state.watermark_hour(),
@@ -2232,6 +2265,8 @@ impl Catalog {
                         layout_drift_count,
                         frontier_hours_reconciled,
                         frontier_hours_deferred,
+                        stamped_records: coverage.records(),
+                        stamped_entries: coverage.entries(),
                     });
                 }
                 // Another folder's HEAD CAS won first. Re-GET HEAD next
@@ -2552,6 +2587,7 @@ impl Catalog {
         dirty_hours: &mut HashSet<u32>,
         counters: &mut RequestCounters,
         layout_drift_count: &mut u64,
+        coverage: &mut declared_stats::StampCoverage,
     ) -> Result<(), CatalogError> {
         // A bucket with only immutable L0 records cannot have changed since it
         // was folded (seal lemma). Skip it with no GET; only a late compaction
@@ -2570,6 +2606,7 @@ impl Catalog {
                 accounting,
                 counters,
                 layout_drift_count,
+                coverage,
             )
             .await?;
         let mut desired = dedup_contribution(contribution);
@@ -2650,6 +2687,7 @@ impl Catalog {
         accounting: &QueryAccounting,
         counters: &mut RequestCounters,
         layout_drift_count: &mut u64,
+        coverage: &mut declared_stats::StampCoverage,
     ) -> Result<BucketContribution, CatalogError> {
         let mut l0_keys: Vec<&str> = Vec::new();
         let mut compaction_keys: Vec<&str> = Vec::new();
@@ -2809,7 +2847,7 @@ impl Catalog {
             )) {
                 continue;
             }
-            let entry = build_snapshot_entry(key, &record)?;
+            let entry = build_snapshot_entry(key, &record, coverage)?;
             let is_canonical = hour == entry.ingest_hour_bucket;
             contributed.push((entry, is_canonical));
         }
@@ -2988,6 +3026,11 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         layout_drift_count: 0,
         frontier_hours_reconciled: 0,
         frontier_hours_deferred: 0,
+        // A no-op fold reads no commit record and writes no entry, so it has
+        // no coverage to report and contributes nothing to the process-global
+        // totals either.
+        stamped_records: 0,
+        stamped_entries: 0,
     }
 }
 
@@ -3067,6 +3110,65 @@ mod tests {
             ingest_hour_bucket,
         })
         .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(payload))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    fn stamp_stat(
+        name: &str,
+        min: i64,
+        max: i64,
+        null_count: u64,
+    ) -> ravel_types::declared_stats::DeclaredColumnStat {
+        ravel_types::declared_stats::DeclaredColumnStat::new(
+            name,
+            ravel_types::declared_stats::DeclaredStatType::I64,
+            Some(ravel_types::declared_stats::DeclaredStatValue::I64(min)),
+            Some(ravel_types::declared_stats::DeclaredStatValue::I64(max)),
+            null_count,
+        )
+        .expect("valid i64 stat")
+    }
+
+    /// `publish_segment` with an ADR-0873 declared-column stamp: the published
+    /// record carries `stats` in `declared_column_stats` (field 20) exactly as
+    /// the writer that computed them would have written it.
+    async fn publish_stamped_segment(
+        store: &MemoryStore,
+        seq: u64,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+        stats: &[ravel_types::declared_stats::DeclaredColumnStat],
+    ) -> CommitRecord {
+        let payload = format!("stamped-seg-{seq}").into_bytes();
+        let content_hash = *blake3::hash(&payload).as_bytes();
+        let mut record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id: Uuid::from_u128(u128::from(seq) + 1),
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: payload.len() as u64,
+            content_hash,
+            sample_count: 8,
+            series_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            min_ingest_ts_ns: created_unix_ns - 1_000,
+            max_ingest_ts_ns: created_unix_ns,
+            segment_format_version: 1,
+            created_unix_ns,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        ravel_commit::declared_stats::stamp_commit_record(&mut record, stats);
         let data_key = keys::reconstruct_data_key(&record).expect("data key");
         publish::put_data_object(store, &data_key, Bytes::from(payload))
             .await
@@ -3312,6 +3414,117 @@ mod tests {
             .await
             .expect("publish");
         record
+    }
+
+    /// ADR-0873 stamp coverage, the acceptance test for both halves of the
+    /// pair and for the shortfall between them.
+    ///
+    /// A fold over a known mix of stamped and unstamped commit records reports
+    /// exactly how many stamped records it read and exactly how many stamped
+    /// entries it wrote from them. The second half folds the same stamped
+    /// records with the test-only strip hook installed, which is the only way
+    /// to produce the state a mixed-version fleet produces in the field: new
+    /// records carrying stamps, a fold of an older shape not carrying them
+    /// through. The counts must then diverge, entries below records, which is
+    /// what the alert in docs/guides/observability.md fires on.
+    #[tokio::test]
+    async fn fold_report_counts_stamped_records_and_stamped_entries_and_flags_shortfall() {
+        const HOUR: u32 = 10;
+        let created = i64::from(HOUR) * NS_PER_HOUR + 60_000_000_000;
+        let stats = vec![stamp_stat("EventDate", -5, 19_000, 2)];
+
+        let records_before = crate::declared_stats::fold_stamped_records_total();
+        let entries_before = crate::declared_stats::fold_stamped_entries_total();
+
+        // Three stamped records and two unstamped ones, one hour, one shard.
+        let store = Arc::new(MemoryStore::new());
+        for seq in 1..=3u64 {
+            publish_stamped_segment(&store, seq, HOUR, created, &stats).await;
+        }
+        for seq in 4..=5u64 {
+            publish_segment(
+                &store,
+                0,
+                Uuid::from_u128(u128::from(seq) + 1),
+                seq,
+                HOUR,
+                created,
+            )
+            .await;
+        }
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(HOUR),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+
+        assert_eq!(
+            report.entry_count, 5,
+            "all five records fold in; only three of them are stamped"
+        );
+        assert_eq!(
+            report.stamped_records, 3,
+            "exactly the three records published with a stamp are counted as read with one"
+        );
+        assert_eq!(
+            report.stamped_entries, 3,
+            "each of those three carried its stamp onto its snapshot entry"
+        );
+
+        // The shortfall. Same three stamped records, a fold whose carriage does
+        // not survive.
+        let store = Arc::new(MemoryStore::new());
+        for seq in 1..=3u64 {
+            publish_stamped_segment(&store, seq, HOUR, created, &stats).await;
+        }
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let stripped = {
+            let _strip = crate::declared_stats::StripCarriedStampsGuard::install();
+            catalog
+                .fold(
+                    &tenant(),
+                    Signal::Metrics,
+                    Uuid::new_v4(),
+                    now_at_seal(HOUR),
+                    &[],
+                    None,
+                )
+                .await
+                .expect("fold")
+        };
+
+        assert_eq!(
+            stripped.stamped_records, 3,
+            "the records are still read with their stamps on the wire"
+        );
+        assert_eq!(
+            stripped.stamped_entries, 0,
+            "none of the stamps reached an entry, which is the shortfall itself"
+        );
+        assert!(
+            stripped.stamped_entries < stripped.stamped_records,
+            "entries below records is the state the coverage alert fires on"
+        );
+
+        // The two per-fold reports also reach the process-global totals the
+        // /metrics families render. A lower bound, not an equality: the totals
+        // are process-global and other fold tests in this binary add to them
+        // concurrently, so only this test's own contribution is pinned.
+        assert!(
+            crate::declared_stats::fold_stamped_records_total() >= records_before + 6,
+            "both folds' six stamped records must reach the process-global total"
+        );
+        assert!(
+            crate::declared_stats::fold_stamped_entries_total() >= entries_before + 3,
+            "only the first fold's three stamped entries may reach the process-global total"
+        );
     }
 
     /// Issue #850, Finding 3: an incremental fold that appends entries must

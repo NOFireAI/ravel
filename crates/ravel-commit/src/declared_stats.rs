@@ -160,6 +160,23 @@ pub fn declared_stat_drops_observed_total() -> u64 {
         .sum()
 }
 
+/// Every carrier's tally, paired with its carrier, in [`StatCarrier::ALL`]
+/// order.
+///
+/// The scrape-side accessor: a renderer that iterates this emits one series per
+/// carrier label whether or not that carrier has ever dropped an entry, so a
+/// label that stays at `0` is visibly covered rather than indistinguishable
+/// from a carrier nobody wired up. Calling [`declared_stat_drops_observed`] per
+/// carrier gives the same numbers; this exists so the renderer cannot iterate a
+/// label list out of step with the tallies it reads.
+///
+/// Same observation semantics and the same non-atomicity as
+/// [`declared_stat_drops_observed_total`]: four independent relaxed loads, a
+/// snapshot for alerting rather than a consistent cut.
+pub fn declared_stat_drops_observed_all() -> [(StatCarrier, u64); 4] {
+    StatCarrier::ALL.map(|carrier| (carrier, declared_stat_drops_observed(carrier)))
+}
+
 /// Record `count` drop observations under `carrier`.
 ///
 /// Public because one carrier of the ADR-0873 decision 4 union is read outside
@@ -1539,5 +1556,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The scrape-side accessor pairs each carrier with that carrier's own
+    /// tally, in `StatCarrier::ALL` order, so a renderer iterating it cannot
+    /// put one carrier's count under another's label.
+    ///
+    /// The delta is taken over `cstat`, the one carrier nothing in this crate
+    /// observes on its own (`ravel_sql`'s `.cstat` reader is its only
+    /// reporter). The tallies are process-global and the other tests in this
+    /// binary run beside this one, moving the three read-side carriers as they
+    /// go, so only the `cstat` delta is an exact figure here.
+    #[test]
+    fn drops_observed_all_pairs_every_carrier_with_its_own_tally() {
+        let before = declared_stat_drops_observed_all();
+        assert_eq!(
+            before.map(|(carrier, _)| carrier),
+            StatCarrier::ALL,
+            "the accessor must report carriers in StatCarrier::ALL order"
+        );
+
+        observe_declared_stat_drops(StatCarrier::Cstat, 3);
+
+        let after = declared_stat_drops_observed_all();
+        let cstat = after
+            .iter()
+            .position(|(carrier, _)| *carrier == StatCarrier::Cstat)
+            .expect("cstat is one of the four carriers");
+        assert_eq!(
+            after[cstat].1 - before[cstat].1,
+            3,
+            "three observations under cstat must land on the cstat pair exactly"
+        );
     }
 }
