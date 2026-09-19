@@ -27,6 +27,30 @@ fn same_seed_produces_identical_fault_plan() {
         );
         assert_eq!(a.gates, b.gates, "seed {seed}: gate scripts differ");
         assert_eq!(
+            a.expected_fold_fault, b.expected_fold_fault,
+            "seed {seed}: expected fold-fault tuple differs across two generations"
+        );
+        // The fold plan replays identically too: same op, key, Nth and fault
+        // flavor, so a fold fault that fired once on a failing seed fires the
+        // same way on replay.
+        assert_eq!(
+            a.fold_plan.rules.len(),
+            b.fold_plan.rules.len(),
+            "seed {seed}: fold rule count differs"
+        );
+        for (ra, rb) in a.fold_plan.rules.iter().zip(b.fold_plan.rules.iter()) {
+            assert_eq!(ra.op, rb.op, "seed {seed}: fold rule op differs");
+            assert_eq!(
+                ra.key_contains, rb.key_contains,
+                "seed {seed}: fold rule key differs"
+            );
+            assert_eq!(
+                ra.occurrence, rb.occurrence,
+                "seed {seed}: fold rule occurrence differs"
+            );
+            assert_eq!(ra.fault, rb.fault, "seed {seed}: fold rule fault differs");
+        }
+        assert_eq!(
             a.plan.rules.len(),
             b.plan.rules.len(),
             "seed {seed}: rule count differs"
@@ -86,6 +110,18 @@ fn same_seed_produces_identical_cycle_digest() {
         assert_eq!(
             a.faulted_pass_unreferenced_parts_deleted, b.faulted_pass_unreferenced_parts_deleted,
             "seed {seed}: faulted-pass unreferenced parts not deterministic"
+        );
+        // The fold fault fired the same number of times both runs, and that
+        // number is the exact one the `Nth(1)` rule allows -- a comparison of
+        // two zeroes would be equal and prove nothing.
+        assert_eq!(
+            a.fold_faults_fired, 1,
+            "seed {seed}: fold fault fired {} times in the first cycle, want exactly 1",
+            a.fold_faults_fired
+        );
+        assert_eq!(
+            a.fold_faults_fired, b.fold_faults_fired,
+            "seed {seed}: fold-fault fired count not deterministic"
         );
     }
 }
