@@ -160,6 +160,17 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   exit 0
 fi
 
+# A rehearsal starts from a clean slate. Every one of these is a record of
+# what happened in THIS run, and a leftover from an earlier one would be read
+# as this run's own evidence by both the assertions below and the workflow's.
+rm -f \
+  "${DR_LOG_DIR}/dr-failed-phase" \
+  "${DR_LOG_DIR}/dr-marker-written-at" \
+  "${DR_LOG_DIR}/dr-server-started-at" \
+  "${DR_LOG_DIR}/dr-restore-check-exit" \
+  "${DR_LOG_DIR}/dr-injected.env" \
+  "${DR_LOG_DIR}/dr-server.pid"
+
 TIMING=""
 EXPECTED_PHASES=()
 

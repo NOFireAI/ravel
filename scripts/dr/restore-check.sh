@@ -126,7 +126,9 @@ fi
 PHASE_LOG="${DR_LOG_DIR}/restore-check.log"
 FAILED_PHASE_FILE="${DR_LOG_DIR}/dr-failed-phase"
 : >"${PHASE_LOG}"
-rm -f "${FAILED_PHASE_FILE}"
+# Both records describe THIS run. A stale one would be read as this run's own
+# evidence that a check failed, or that the marker was written.
+rm -f "${FAILED_PHASE_FILE}" "${DR_LOG_DIR}/dr-marker-written-at"
 
 phase_fail() {
   local name="$1" code="$2"

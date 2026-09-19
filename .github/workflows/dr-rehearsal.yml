@@ -1,0 +1,331 @@
+name: dr-rehearsal
+
+# Disaster-recovery rehearsal against MinIO (issue #814).
+#
+# Runs scripts/dr/rehearse.sh: seed a known corpus into bucket A through a
+# real ravel-server, mirror A into an empty bucket B, and run the custody,
+# reconstruction, catalog and canary checks against B with writers stopped,
+# before ravel-server is allowed to start. One clean job proves the sequence
+# goes green and that the server started only after the reconciled marker
+# existed; three fault jobs prove it goes RED, each at the specific check its
+# fault targets rather than merely somewhere.
+#
+# This lane measures nothing publishable. MinIO removes the request fees and
+# the latency profile a real restore pays, so no RPO or RTO figure may be
+# derived from it; docs/guides/disaster-recovery.md holds both unmeasured
+# until a real rehearsal against real S3 produces them. What this lane proves
+# is the ORDERING and the DETECTION: that the checks run before anything
+# serves, that they stop at the first failure, and that each injected fault is
+# caught by the check that is supposed to catch it.
+#
+# The same scripts run against real S3: every endpoint, bucket name and
+# credential comes from a DR_* environment variable, and setting DR_ENDPOINT
+# to the empty string exports no endpoint override at all, which is how the
+# object store selects AWS's regional endpoint. `scripts/dr/rehearse.sh
+# --help` names the full set a real run needs.
+#
+# NON-BLOCKING by construction (ADR-0070, ADR-0075): this workflow triggers
+# only on a schedule and on manual dispatch, never on push/pull_request/
+# merge_group, so it can never gate a merge.
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Sunday 07:19 UTC. Off-peak, off the :00/:30 marks, and distinct
+    # from every other scheduled lane in this repo (metricsbench-nightly
+    # 02:13, k8s-nightly 03:00, sim-nightly 03:17, tla-nightly 04:37,
+    # supply-chain-nightly 05:43, bench-s3 weekly Mon 04:17,
+    # quickstart-published weekly 06:29) so the scheduled runs do not contend.
+    - cron: "19 7 * * 0"
+
+# One scheduled rehearsal at a time; a manual dispatch does not cancel one
+# already in flight.
+concurrency:
+  group: dr-rehearsal-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  rehearsal:
+    name: ${{ matrix.case }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      # Every case must report. A fault that stops being caught is exactly the
+      # finding this lane exists for, and cancelling its siblings would hide
+      # whether the others still work.
+      fail-fast: false
+      matrix:
+        include:
+          - case: clean
+            fault: ""
+            expected_phase: ""
+            expected_exit: ""
+          - case: fault-dangling-commit-record
+            fault: dangling-commit-record
+            expected_phase: custody-manifest
+            expected_exit: "11"
+          - case: fault-missing-data-object
+            fault: missing-data-object
+            expected_phase: commit-reconstruction
+            expected_exit: "12"
+          - case: fault-canary-error
+            fault: canary-error
+            expected_phase: canary-query
+            expected_exit: "14"
+    env:
+      # The CI MinIO values are the script defaults, so only the corpus size
+      # is set here. A real S3 run overrides DR_ENDPOINT (to the empty
+      # string), DR_REGION, the bucket names and the credentials instead.
+      DR_SEED_EXPORTS: "6"
+      DR_LOG_DIR: ${{ github.workspace }}/.gate-logs/dr
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing after this checkout runs git against the remote, so the
+          # workflow token has no reason to sit in .git/config where a
+          # dependency build script could read it.
+          persist-credentials: false
+      - name: Check the figure-assertion helpers
+        # Every band in the rehearsal is enforced by these helpers, so a bug in
+        # one of them shows up as a rehearsal that passes. Run their cases
+        # first, before anything expensive.
+        run: scripts/dr/lib.test.sh
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a
+          # scheduled ref is charged against the budget that holds the
+          # main-scoped entries every run restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the ravel binaries the rehearsal drives
+        run: |
+          cargo build --locked -p ravel-cli -p ravel-server
+          cargo build --locked -p ravel-server --example gen_otlp_fixture
+          echo "${GITHUB_WORKSPACE}/target/debug" >> "${GITHUB_PATH}"
+      - name: Start MinIO
+        run: |
+          # Docker Hub's anonymous pull allowance is per-IP and shared across
+          # every project on a runner, so an unauthenticated pull there fails
+          # unpredictably; quay.io does not share that allowance.
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+      - name: Wait for MinIO to be live
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live; then
+              echo "MinIO is live"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become healthy in time"
+          docker logs minio || true
+          exit 1
+
+      - name: Run the rehearsal
+        env:
+          DR_FAULT: ${{ matrix.fault }}
+        run: |
+          mkdir -p "${DR_LOG_DIR}"
+          rc=0
+          if [ -n "${DR_FAULT}" ]; then
+            scripts/dr/rehearse.sh --fault "${DR_FAULT}" \
+              > "${DR_LOG_DIR}/rehearse.log" 2>&1 || rc=$?
+          else
+            scripts/dr/rehearse.sh > "${DR_LOG_DIR}/rehearse.log" 2>&1 || rc=$?
+          fi
+          cat "${DR_LOG_DIR}/rehearse.log"
+          echo "rehearse.sh exit: ${rc}"
+          exit "${rc}"
+
+      # --- clean case -----------------------------------------------------
+
+      - name: Assert the clean rehearsal passed all four checks
+        if: matrix.fault == ''
+        run: |
+          log="${DR_LOG_DIR}/rehearse.log"
+          rc_file="${DR_LOG_DIR}/dr-restore-check-exit"
+          test -f "${rc_file}" || { echo "::error::restore-check recorded no exit code"; exit 1; }
+          restore_rc="$(cat "${rc_file}")"
+          if [ "${restore_rc}" != "0" ]; then
+            echo "::error::restore-check exited ${restore_rc} on the clean case"
+            exit 1
+          fi
+          if [ -f "${DR_LOG_DIR}/dr-failed-phase" ]; then
+            echo "::error::a check was recorded as failed on the clean case: $(cat "${DR_LOG_DIR}/dr-failed-phase")"
+            exit 1
+          fi
+          for phase in custody-manifest commit-reconstruction \
+            catalog-fold-verification canary-query; do
+            n="$(grep -c "^dr-phase-pass: ${phase}\$" "${log}")" || n=0
+            if [ "${n}" != "1" ]; then
+              echo "::error::check ${phase} reported ${n} passes, expected exactly 1"
+              exit 1
+            fi
+          done
+
+      - name: Assert start.sh started the server only after the marker existed
+        if: matrix.fault == ''
+        run: |
+          log="${DR_LOG_DIR}/rehearse.log"
+          # The probe: a start attempted after the mirror and before the
+          # checks must have been REFUSED, and that refusal must appear in the
+          # log BEFORE the successful start.
+          refused_line="$(awk '/^dr-start-refused: /{ print NR; exit }' "${log}")"
+          ok_line="$(awk '/^dr-start-ok: /{ print NR; exit }' "${log}")"
+          if [ -z "${refused_line}" ]; then
+            echo "::error::start.sh was never refused; the ordering was not exercised"
+            exit 1
+          fi
+          if [ -z "${ok_line}" ]; then
+            echo "::error::start.sh never started the server"
+            exit 1
+          fi
+          if [ "${refused_line}" -ge "${ok_line}" ]; then
+            echo "::error::the refusal at line ${refused_line} did not precede the start at line ${ok_line}"
+            exit 1
+          fi
+          ok_count="$(grep -c '^dr-start-ok: ' "${log}")" || ok_count=0
+          if [ "${ok_count}" != "1" ]; then
+            echo "::error::${ok_count} successful starts in one rehearsal, expected exactly 1"
+            exit 1
+          fi
+          # The timestamps, independently of the log order: the marker is
+          # written by restore-check only after all four checks passed, and
+          # start.sh stamps its own start after reading it.
+          marker_ns="$(cat "${DR_LOG_DIR}/dr-marker-written-at")"
+          started_ns="$(cat "${DR_LOG_DIR}/dr-server-started-at")"
+          if [ "${marker_ns}" -ge "${started_ns}" ]; then
+            echo "::error::marker stamp ${marker_ns} is not before the server start ${started_ns}"
+            exit 1
+          fi
+          # The server answered from bucket B after the start.
+          if ! grep -q '^dr-start-serving: ' "${log}"; then
+            echo "::error::the server never reported serving after the start"
+            exit 1
+          fi
+
+      # --- fault cases ----------------------------------------------------
+      #
+      # The assertion is not "restore-check exited non-zero". Each fault has
+      # exactly one check that is supposed to catch it, and the step below
+      # asserts that check by name: its exit code, its recorded name, that
+      # every EARLIER check passed, and that no LATER check reported anything
+      # at all (which is what "stop at the first failure" means).
+
+      - name: Assert restore-check failed at ${{ matrix.expected_phase }}
+        if: matrix.fault != ''
+        env:
+          EXPECTED_PHASE: ${{ matrix.expected_phase }}
+          EXPECTED_EXIT: ${{ matrix.expected_exit }}
+          DR_FAULT: ${{ matrix.fault }}
+        run: |
+          log="${DR_LOG_DIR}/rehearse.log"
+          rc_file="${DR_LOG_DIR}/dr-restore-check-exit"
+          test -f "${rc_file}" || { echo "::error::restore-check recorded no exit code"; exit 1; }
+          restore_rc="$(cat "${rc_file}")"
+          if [ "${restore_rc}" = "0" ]; then
+            echo "::error::fault ${DR_FAULT} left restore-check green"
+            exit 1
+          fi
+          if [ "${restore_rc}" != "${EXPECTED_EXIT}" ]; then
+            echo "::error::fault ${DR_FAULT} made restore-check exit ${restore_rc}, expected ${EXPECTED_EXIT} (${EXPECTED_PHASE})"
+            exit 1
+          fi
+          test -f "${DR_LOG_DIR}/dr-failed-phase" \
+            || { echo "::error::restore-check recorded no failing check name"; exit 1; }
+          failed_phase="$(cat "${DR_LOG_DIR}/dr-failed-phase")"
+          if [ "${failed_phase}" != "${EXPECTED_PHASE}" ]; then
+            echo "::error::fault ${DR_FAULT} failed at ${failed_phase}, expected ${EXPECTED_PHASE}"
+            exit 1
+          fi
+          n="$(grep -c "^dr-phase-fail: ${EXPECTED_PHASE}\$" "${log}")" || n=0
+          if [ "${n}" != "1" ]; then
+            echo "::error::${EXPECTED_PHASE} reported ${n} failures, expected exactly 1"
+            exit 1
+          fi
+          seen_target=0
+          for phase in custody-manifest commit-reconstruction \
+            catalog-fold-verification canary-query; do
+            passes="$(grep -c "^dr-phase-pass: ${phase}\$" "${log}")" || passes=0
+            if [ "${phase}" = "${EXPECTED_PHASE}" ]; then
+              seen_target=1
+              if [ "${passes}" != "0" ]; then
+                echo "::error::${phase} both failed and reported ${passes} pass(es)"
+                exit 1
+              fi
+              continue
+            fi
+            if [ "${seen_target}" = "0" ]; then
+              if [ "${passes}" != "1" ]; then
+                echo "::error::${phase} runs before ${EXPECTED_PHASE} and reported ${passes} passes, expected exactly 1"
+                exit 1
+              fi
+            else
+              fails="$(grep -c "^dr-phase-fail: ${phase}\$" "${log}")" || fails=0
+              if [ "${passes}" != "0" ] || [ "${fails}" != "0" ]; then
+                echo "::error::${phase} runs after ${EXPECTED_PHASE} and still reported a verdict; the checks did not stop at the first failure"
+                exit 1
+              fi
+            fi
+          done
+
+      - name: Assert the failed restore never became a serving server
+        if: matrix.fault != ''
+        run: |
+          log="${DR_LOG_DIR}/rehearse.log"
+          if [ -f "${DR_LOG_DIR}/dr-marker-written-at" ]; then
+            echo "::error::a reconciled marker was written despite a failed check"
+            exit 1
+          fi
+          if [ -f "${DR_LOG_DIR}/dr-server-started-at" ]; then
+            echo "::error::ravel-server was started despite a failed check"
+            exit 1
+          fi
+          if grep -q '^dr-start-ok: ' "${log}"; then
+            echo "::error::start.sh reported a successful start on a failed restore"
+            exit 1
+          fi
+          # Refused twice: once before the checks ran, once after they failed.
+          refusals="$(grep -c '^dr-start-refused: ' "${log}")" || refusals=0
+          if [ "${refusals}" != "2" ]; then
+            echo "::error::start.sh was refused ${refusals} time(s), expected 2 (before the checks and after the failure)"
+            exit 1
+          fi
+
+      # --- always ---------------------------------------------------------
+
+      - name: Stop the rehearsal server
+        if: always()
+        run: |
+          pid_file="${DR_LOG_DIR}/dr-server.pid"
+          if [ -f "${pid_file}" ]; then
+            kill "$(cat "${pid_file}")" 2>/dev/null || true
+          fi
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true
+      - name: Upload the rehearsal logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dr-rehearsal-${{ matrix.case }}
+          # Logs and the small text records the assertions read, only. No
+          # object bodies and no fixture data leave the runner.
+          path: |
+            .gate-logs/dr/*.log
+            .gate-logs/dr/dr-expect.env
+            .gate-logs/dr/dr-failed-phase
+            .gate-logs/dr/dr-restore-check-exit
+            .gate-logs/dr/dr-marker-written-at
+            .gate-logs/dr/dr-server-started-at
+            .gate-logs/dr/dr-injected.env
+          if-no-files-found: warn
+          retention-days: 14

@@ -141,8 +141,22 @@ marker_ns="$(marker_field reconciled_at_unix_ns)" || refuse \
 [[ "${marker_ns}" =~ ^[0-9]+$ ]] || refuse \
   "the reconciled marker's reconciled_at_unix_ns is not an integer: ${marker_ns}"
 
+# The marker is input this script does not produce, and bash's arithmetic
+# comparison wraps past the 64-bit range, so a stamp of twenty digits would
+# compare as a negative number and read as safely in the past. Compare the two
+# as equal-width zero-padded strings instead.
+ns_not_after() {
+  local a="$1" b="$2"
+  while [[ "${#a}" -lt "${#b}" ]]; do a="0${a}"; done
+  while [[ "${#b}" -lt "${#a}" ]]; do b="0${b}"; done
+  if [[ "${a}" > "${b}" ]]; then
+    return 1
+  fi
+  return 0
+}
+
 started_ns="$(dr_now_ns)"
-[[ "${marker_ns}" -le "${started_ns}" ]] || refuse \
+ns_not_after "${marker_ns}" "${started_ns}" || refuse \
   "the reconciled marker is stamped ${marker_ns}, after this start at ${started_ns}"
 
 printf '%s\n' "${started_ns}" >"${DR_LOG_DIR}/dr-server-started-at"

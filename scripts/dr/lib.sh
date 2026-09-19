@@ -204,6 +204,14 @@ dr_assert_figure() {
     printf 'dr: figure %s is not an integer: "%s"\n' "${label}" "${value}" >&2
     return 1
   fi
+  # Bash compares with 64-bit arithmetic and wraps silently past its range, so
+  # an absurd figure could land inside its band as a negative number. No count
+  # this harness reports can reach eighteen digits.
+  if [[ "${#value}" -gt 18 ]]; then
+    printf 'dr: figure %s has %s digits and is not a plausible count: "%s"\n' \
+      "${label}" "${#value}" "${value}" >&2
+    return 1
+  fi
   printf 'figure %s=%s band=[%s,%s]\n' "${label}" "${value}" "${lo}" "${hi}"
   if [[ "${value}" -lt "${lo}" || "${value}" -gt "${hi}" ]]; then
     printf 'dr: figure %s=%s is outside its band [%s,%s]\n' \
