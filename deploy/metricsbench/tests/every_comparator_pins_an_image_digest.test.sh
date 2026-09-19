@@ -6,11 +6,20 @@
 #
 # The script resolves every path it reads (Dockerfile, Dockerfile.prebuilt,
 # .github/workflows, .github/actions, deploy/metricsbench/docker-compose.yml,
-# and the two quickstart compose files) from its own location, two
-# directories up. To exercise the quickstart category with a mutated file
-# while the other three categories still see real, passing content, each
-# case runs against a scratch copy of that whole subtree, with only the
-# quickstart compose files mutated per case.
+# the two quickstart compose files, and deploy/k8s) from its own location, two
+# directories up. To exercise one category with a mutated file while the
+# other categories still see real, passing content, each case runs against a
+# scratch copy of that whole subtree, with only the file(s) under test
+# mutated per case.
+#
+# Issue #1720's residual round pinned three of deploy/k8s's four registry
+# images (quay.io/minio/minio and quay.io/minio/mc in minio.yaml, floci/floci
+# in floci.yaml) by mirroring the exact digest ci.yml already pins for the
+# same image; the fourth, curlimages/curl in floci.yaml, has no prior pin
+# anywhere in the repo to mirror and the executor that did this round had no
+# registry access to resolve one, so it stays unpinned. The committed tree
+# therefore fails category 6 on that one known reference until a digest is
+# added -- see the comment above that image line in deploy/k8s/floci.yaml.
 #
 # No `sed -i`: GNU sed requires a bare `-i` (in-place, no backup) while BSD
 # sed (macOS) requires `-i ''` (a mandatory backup-suffix argument), and a
@@ -46,7 +55,7 @@ mutate() {
 new_tree() {
   local dir="${TMP}/$1"
   mkdir -p "${dir}/deploy/metricsbench/tests" "${dir}/deploy/docker-compose" \
-    "${dir}/.github/workflows" "${dir}/.github/actions"
+    "${dir}/deploy/k8s" "${dir}/.github/workflows" "${dir}/.github/actions"
   cp "${REPO_ROOT}/Dockerfile" "${dir}/Dockerfile"
   cp "${REPO_ROOT}/Dockerfile.prebuilt" "${dir}/Dockerfile.prebuilt"
   cp -r "${REPO_ROOT}/.github/workflows/." "${dir}/.github/workflows/"
@@ -57,6 +66,7 @@ new_tree() {
     "${dir}/deploy/docker-compose/ravel.yml"
   cp "${REPO_ROOT}/deploy/docker-compose/minio.yml" \
     "${dir}/deploy/docker-compose/minio.yml"
+  cp -r "${REPO_ROOT}/deploy/k8s/." "${dir}/deploy/k8s/"
   cp "${SCRIPT}" \
     "${dir}/deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh"
   chmod +x "${dir}/deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh"
@@ -84,11 +94,14 @@ check() {
   passes=$((passes + 1))
 }
 
-# --- the committed files pass ------------------------------------------------
+# --- the committed files pass, except the one known-red k8s reference -------
 
+# Every category passes on the committed tree. A suite whose baseline expects
+# the repository to be red cannot tell a fixed reference from a broken scan,
+# so each case below seeds its own bad input instead.
 d="$(new_tree committed)"
-check "the committed tree passes with all five categories pinned" "${d}" 0 \
-  "RESULT: PASS"
+check "the committed tree passes with all six categories pinned" \
+  "${d}" 0 "RESULT: PASS"
 
 # --- a bare tag in ravel.yml fails naming the line --------------------------
 
@@ -179,8 +192,9 @@ check "docker_run_image_with_tag_only_fails" "${d}" 1 \
 # The three shell-variable image references this static scan cannot resolve
 # ("$RAVEL_SERVER_IMAGE"/"$RAVEL_OPERATOR_IMAGE" in ci.yml and k8s-nightly.yml,
 # "$ref" in publish-images.yml) are exempt by exact string, not flagged
-# unpinned, and the committed tree still passes despite carrying no digest on
-# any of them.
+# unpinned, and carry no digest on any of them without affecting the result:
+# The committed tree passes, so these assert exit 0 and check that the refs
+# appear under the exempt marker rather than as findings.
 d="$(new_tree docker-run-variable-ref-is-exempt)"
 check "docker_run_variable_ref_is_exempt: RAVEL_SERVER_IMAGE ref in ci.yml is not unpinned" \
   "${d}" 0 'ci.yml:1597: "$RAVEL_SERVER_IMAGE"'
@@ -243,6 +257,43 @@ mutate "${d}/.github/actions/free-disk-space/action.yml" \
   's#^      run: |#      run: |\n        docker run redis:latest true#'
 check "docker_run_in_a_composite_action_is_scanned" "${d}" 1 \
   "redis:latest"
+
+# --- sixth category: deploy/k8s manifest image pins (issue #1720 residual) --
+
+# A bare-tag image on a k8s manifest fails naming the unpinned reference.
+# This is the acceptance test for the sixth category: against the scanner as
+# it stood before this round (no k8s category at all), this mutation would
+# have gone entirely unnoticed.
+d="$(new_tree k8s_manifest_image_without_digest_fails)"
+mutate "${d}/deploy/k8s/minio.yaml" \
+  's#image: quay\.io/minio/minio:RELEASE\.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e#image: quay.io/minio/minio:latest#'
+check "k8s_manifest_image_without_digest_fails" "${d}" 1 \
+  "minio.yaml:52: quay.io/minio/minio:latest"
+
+# The two kind-loaded local tags (built and `kind load docker-image`d rather
+# than pulled from a registry) are exempt by exact string, not flagged
+# unpinned, on the unmutated committed tree. Against the scanner as it stood
+# before this round, none of these substrings appeared anywhere in the
+# output, since deploy/k8s was not scanned at all.
+d="$(new_tree kind_local_tag_is_exempt)"
+check "kind_local_tag_is_exempt: ravel-server:latest in ravelcluster-dev.yaml is not unpinned" \
+  "${d}" 0 "examples/ravelcluster-dev.yaml:15: ravel-server:latest"
+check "kind_local_tag_is_exempt: ravel-operator:latest in operator.yaml is not unpinned" \
+  "${d}" 0 "operator/operator.yaml:41: ravel-operator:latest"
+check "kind_local_tag_is_exempt: exempt marker is used, not [UNPINNED]" \
+  "${d}" 0 "[kind-local, exempt]"
+
+# Removing a k8s manifest image line must fail both the total-count and the
+# pin-required-count assertions, not silently scan fewer references. Deleting
+# minio.yaml's (pin-required) minio image line drops the total from 6 to 5
+# and the pin-required count from 4 to 3.
+d="$(new_tree k8s-wrong-count)"
+mutate "${d}/deploy/k8s/minio.yaml" \
+  '/^          image: quay\.io\/minio\/minio:RELEASE/d'
+check "removing a k8s manifest image line fails the k8s total-count assertion" \
+  "${d}" 1 "found 5 k8s manifest image references, expected exactly 6"
+check "removing a k8s manifest image line also fails the k8s pin-required-count assertion" \
+  "${d}" 1 "found 3 pin-required k8s manifest image references, expected exactly 4"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]

@@ -16,9 +16,11 @@
 # wherever it appears, not just in this one compose file. Issue #1720 added a
 # fourth category for the same reason, scoped to the quickstart compose file.
 # Issue #1338 added a fifth, scoped to the image argument of `docker run`,
-# `docker pull`, and `docker create` inside workflow `run:` blocks. It now
-# scans five categories, each with its own exact-count assertion so a scan
-# that finds nothing in a category fails rather than passing silently:
+# `docker pull`, and `docker create` inside workflow `run:` blocks. Issue
+# #1720's residual round added a sixth, scoped to the `image:` references in
+# deploy/k8s manifests that category 4's own scope note originally deferred.
+# It now scans six categories, each with its own exact-count assertion so a
+# scan that finds nothing in a category fails rather than passing silently:
 #
 #   1. every `image:` reference in deploy/metricsbench/docker-compose.yml
 #      (the original check, unchanged in behaviour);
@@ -37,11 +39,9 @@
 #      notice) -- excluding the two `${RAVEL_IMAGE:-...}` references by exact
 #      match, since their default is Ravel's own released image (pinned by
 #      release tag, ADR-0081), not a third-party image this check governs.
-#      Scoped to these two files: deploy/k8s carries four registry images
-#      that are not yet pinned (minio.yaml lines 49 and 140, floci.yaml
-#      lines 74 and 157) plus two locally built placeholders
-#      (ravel-server, ravel-operator); pinning the k8s manifests is a
-#      separate ticket.
+#      Scoped to these two files at the time: deploy/k8s's own registry
+#      images were pinned separately by category 6 below (issue #1720's
+#      residual round).
 #   5. every image argument of a `docker run`, `docker pull`, or
 #      `docker create` invocation inside a `run:` block, across every
 #      workflow under .github/workflows and every composite action under
@@ -61,9 +61,18 @@
 #      `$image@$digest` from a platform loop that already pins by digest one
 #      line above), not a third-party image reference this scan can check
 #      statically.
+#   6. every `image:` reference across every manifest under deploy/k8s (the
+#      file list is built with `find`, the same reason category 5's list is,
+#      so a pattern matching nothing cannot silently shrink the scan) --
+#      excluding the two kind-loaded local tags by exact match:
+#      `ravel-server:latest` (deploy/k8s/examples/ravelcluster-dev.yaml) and
+#      `ravel-operator:latest` (deploy/k8s/operator/operator.yaml). Neither
+#      is pulled from a registry: both are built locally and loaded into the
+#      kind cluster with `kind load docker-image`, so there is no registry
+#      manifest to pin against.
 #
 # Every category requires an `@sha256:<64 hex>` digest (categories 1, 2, 4,
-# and 5) or a full 40-character commit SHA (category 3): a tag alone, a
+# 5, and 6) or a full 40-character commit SHA (category 3): a tag alone, a
 # branch, or a short SHA is a moving or ambiguous reference and fails the
 # same as a bare tag. Exit 0 only when every category is fully pinned and
 # every category's reference count equals its expected total.
@@ -86,6 +95,7 @@ REPO_ROOT=$(CDPATH= cd -- "$DEPLOY_DIR/../.." && pwd)
 COMPOSE_FILE="$DEPLOY_DIR/docker-compose.yml"
 RAVEL_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/ravel.yml"
 MINIO_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/minio.yml"
+K8S_DIR="$REPO_ROOT/deploy/k8s"
 
 # The comparators ADR-0927 requires in the portable cross-engine lane. Each must
 # appear as a service in the compose file. Prometheus and VictoriaMetrics are
@@ -179,6 +189,30 @@ RUN_IMAGE_VAR_REF_SERVER='"$RAVEL_SERVER_IMAGE"'
 RUN_IMAGE_VAR_REF_OPERATOR='"$RAVEL_OPERATOR_IMAGE"'
 RUN_IMAGE_VAR_REF_RESOLVED='"$ref"'
 
+# Category 6 scans every manifest under deploy/k8s. A fixed file list would
+# leave a manifest added tomorrow scanned by nothing, with no count
+# assertion to notice -- same rationale as category 5's `find` call.
+
+# Exact number of `image:` lines across every deploy/k8s manifest: minio.yaml
+# (minio, mc), floci.yaml (floci, curlimages/curl), and the two kind-loaded
+# example/operator manifests below. Update deliberately if a manifest gains,
+# loses, or repoints an `image:` line.
+K8S_EXPECTED_IMAGE_COUNT=6
+
+# Of those six, the number that must carry a digest pin: every reference
+# except the two kind-loaded local-tag exemptions below. Update deliberately
+# alongside K8S_EXPECTED_IMAGE_COUNT.
+K8S_EXPECTED_PINNED_COUNT=4
+
+# The exact text of a stripped `image:` reference (same stripping as
+# IMAGE_REFS above) that is a locally built image loaded into the kind
+# cluster with `kind load docker-image` rather than pulled from a registry:
+# excluded from category 6 by exact string match, not by pattern, so a
+# typo'd tag does not silently slip through as "exempt" -- same rationale as
+# RAVEL_IMAGE_VAR_REF above.
+K8S_LOCAL_TAG_SERVER='ravel-server:latest'
+K8S_LOCAL_TAG_OPERATOR='ravel-operator:latest'
+
 # A pinned image reference ends in `@sha256:` followed by exactly 64 hex
 # digits. Matching the bare substring `@sha256:` is not enough: `repo:tag@sha256:`
 # with an empty or truncated digest would satisfy it while pinning nothing,
@@ -198,7 +232,9 @@ QUICKSTART_REFS_FILE=$(mktemp)
 QUICKSTART_REQUIRED_FILE=$(mktemp)
 RUN_IMAGE_REFS_FILE=$(mktemp)
 RUN_IMAGE_REQUIRED_FILE=$(mktemp)
-trap 'rm -f "$DOCKERFILE_REFS_FILE" "$WORKFLOW_REFS_FILE" "$QUICKSTART_REFS_FILE" "$QUICKSTART_REQUIRED_FILE" "$RUN_IMAGE_REFS_FILE" "$RUN_IMAGE_REQUIRED_FILE"' EXIT
+K8S_REFS_FILE=$(mktemp)
+K8S_REQUIRED_FILE=$(mktemp)
+trap 'rm -f "$DOCKERFILE_REFS_FILE" "$WORKFLOW_REFS_FILE" "$QUICKSTART_REFS_FILE" "$QUICKSTART_REQUIRED_FILE" "$RUN_IMAGE_REFS_FILE" "$RUN_IMAGE_REQUIRED_FILE" "$K8S_REFS_FILE" "$K8S_REQUIRED_FILE"' EXIT
 
 echo "Repo-wide pin check (issue #1310)"
 
@@ -645,6 +681,81 @@ else
   fi
 fi
 
+# --- 6. Kubernetes manifest image pins (deploy/k8s, issue #1720 residual) ---
+
+echo
+echo "== k8s manifest image pins (deploy/k8s, issue #1720) =="
+
+k8s_scan_count=$(find "$K8S_DIR" -type f \( -name '*.yml' -o -name '*.yaml' \) | wc -l | tr -d '[:space:]')
+if [ "$k8s_scan_count" -eq 0 ]; then
+  echo "FAIL: no k8s manifest files found under $K8S_DIR"
+  fail=1
+fi
+
+if [ "$k8s_scan_count" -gt 0 ]; then
+  # shellcheck disable=SC2044
+  for f in $(find "$K8S_DIR" -type f \( -name '*.yml' -o -name '*.yaml' \) | sort); do
+    grep -nE '^[[:space:]]*image:[[:space:]]*' "$f" | while IFS= read -r line; do
+      lineno=$(printf '%s\n' "$line" | cut -d: -f1)
+      content=$(printf '%s\n' "$line" | cut -d: -f2-)
+      ref=$(printf '%s\n' "$content" | sed -E 's/^[[:space:]]*image:[[:space:]]*//; s/[[:space:]]*$//')
+      echo "$f:$lineno:$ref" >>"$K8S_REFS_FILE"
+    done
+  done
+fi
+
+k8s_count=$(wc -l <"$K8S_REFS_FILE" | tr -d '[:space:]')
+echo "  image references found: $k8s_count (expected $K8S_EXPECTED_IMAGE_COUNT)"
+
+if [ "$k8s_count" -eq 0 ]; then
+  echo "FAIL: no k8s manifest image references found; the check must never scan zero images"
+  fail=1
+else
+  echo "  references:"
+  while IFS=: read -r file lineno ref; do
+    if [ "$ref" = "$K8S_LOCAL_TAG_SERVER" ] || [ "$ref" = "$K8S_LOCAL_TAG_OPERATOR" ]; then
+      echo "    [kind-local, exempt] $file:$lineno: $ref"
+    elif printf '%s\n' "$ref" | grep -q "$IMAGE_DIGEST_RE"; then
+      echo "    [pinned]   $file:$lineno: $ref"
+    else
+      echo "    [UNPINNED] $file:$lineno: $ref"
+    fi
+  done <"$K8S_REFS_FILE"
+
+  # Exclude the two kind-loaded local-tag exemptions by exact match before
+  # counting and pin-checking what remains, same shape as the quickstart
+  # category's RAVEL_IMAGE_VAR_REF exclusion above.
+  while IFS=: read -r file lineno ref; do
+    if [ "$ref" != "$K8S_LOCAL_TAG_SERVER" ] && [ "$ref" != "$K8S_LOCAL_TAG_OPERATOR" ]; then
+      echo "$file:$lineno:$ref" >>"$K8S_REQUIRED_FILE"
+    fi
+  done <"$K8S_REFS_FILE"
+
+  k8s_required_count=$(wc -l <"$K8S_REQUIRED_FILE" | tr -d '[:space:]')
+
+  if [ "$k8s_required_count" -eq 0 ]; then
+    echo "FAIL: no pin-required k8s manifest image references found; the check must never scan zero images"
+    fail=1
+  else
+    k8s_unpinned=$(grep -vc "$IMAGE_DIGEST_RE" "$K8S_REQUIRED_FILE")
+
+    if [ "$k8s_unpinned" -ne 0 ]; then
+      echo "FAIL: $k8s_unpinned k8s manifest image reference(s) lack an @sha256: digest"
+      fail=1
+    fi
+
+    if [ "$k8s_required_count" -ne "$K8S_EXPECTED_PINNED_COUNT" ]; then
+      echo "FAIL: found $k8s_required_count pin-required k8s manifest image references, expected exactly $K8S_EXPECTED_PINNED_COUNT"
+      fail=1
+    fi
+  fi
+
+  if [ "$k8s_count" -ne "$K8S_EXPECTED_IMAGE_COUNT" ]; then
+    echo "FAIL: found $k8s_count k8s manifest image references, expected exactly $K8S_EXPECTED_IMAGE_COUNT"
+    fail=1
+  fi
+fi
+
 # --- Result -------------------------------------------------------------
 
 echo
@@ -653,5 +764,5 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, $quickstart_count quickstart compose images, $run_image_count docker run/pull/create images, all pinned; comparators: $REQUIRED_COMPARATORS)"
+echo "RESULT: PASS ($image_count compose images, $dockerfile_count Dockerfile base images, $workflow_count workflow actions, $quickstart_count quickstart compose images, $run_image_count docker run/pull/create images, $k8s_count k8s manifest images, all pinned; comparators: $REQUIRED_COMPARATORS)"
 exit 0
