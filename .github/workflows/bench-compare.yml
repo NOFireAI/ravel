@@ -3,41 +3,42 @@ name: bench-compare
 # ADR-0070 tier B: a criterion smoke compare of the pure-CPU bench set against
 # the committed baseline under bench/baselines/, posting a PR comment.
 #
-# Two things about this lane, both from ADR-0070 decision 3:
+# Owner decision, 2026-09-19 (ADR-0070 amendment): this repository gets no
+# self-hosted GitHub Actions runner. It is public, and a self-hosted runner
+# executes workflow code from forked pull requests unless every entry point is
+# gated; the `ravel-reference` label this job was written against will not be
+# registered. The job below is disabled (`if: false`) rather than left
+# pointing at that label: an unregistered label does not skip a job, it queues
+# it for about 24 hours and then fails it, which on workflow_dispatch would
+# just be a slower way of doing nothing. `runs-on: ubuntu-latest` is a syntax
+# placeholder only -- the job never reaches it while `if: false` holds -- not a
+# decision to run the comparison there. A GitHub-hosted runner is not a
+# drop-in replacement: ADR-0070 decision 3 treats a criterion timing number as
+# only comparable to a baseline taken on the same, non-noisy hardware, which a
+# shared hosted runner is not.
 #
-#  - It runs ONLY on the self-hosted reference runner where the baseline was
-#    recorded (label `ravel-reference`). A criterion timing number is only
-#    comparable to a baseline taken on the same hardware; on a GitHub-hosted
-#    runner the comparison would be noise. When the runner is offline the job
-#    stays queued until a runner picks it up or GitHub times the queue out; it
-#    is not skipped.
-#  - It is ADVISORY by default: `bench-tier-b.sh compare` without `--enforce`
-#    exits 0 regardless of the result, so this lane never blocks a merge. It
-#    posts a comment and stops there.
+# The comparison logic itself (scripts/bench-tier-b.sh, scripts/bench-compare.py)
+# is unchanged and still runnable by hand or from a workstation; only this
+# workflow's ability to run it in CI is gated off. Restoring it needs an
+# owner's decision on where it runs (a re-registered self-hosted reference
+# runner, or a GitHub-hosted runner against infrastructure -- e.g. an object
+# store -- the workflow provisions itself) before `if: false` comes out.
 #
-# The machinery to BLOCK exists and is reachable: a manual dispatch with
-# `enforce=true` runs the compare with `--enforce`, which fails the job on a
-# regression past the threshold. Per ADR-0070 that enforcing mode is gated on a
-# probation window (see the ADR amendment for issue #533) and must not be wired
-# onto the pull_request trigger without an owner's decision. This file
-# deliberately keeps the automatic path advisory.
+# It is ADVISORY by default even when runnable: `bench-tier-b.sh compare`
+# without `--enforce` exits 0 regardless of the result, so this lane never
+# blocks a merge. It posts a comment and stops there. The machinery to BLOCK
+# exists and is reachable: a manual dispatch with `enforce=true` runs the
+# compare with `--enforce`, which fails the job on a regression past the
+# threshold. Per ADR-0070 that enforcing mode is gated on a probation window
+# (see the ADR amendment for issue #533) and must not be wired onto a
+# pull_request trigger without an owner's decision. This file deliberately
+# keeps the automatic path advisory, and per the 2026-09-19 amendment stays
+# workflow_dispatch-only: nothing here runs on every pull request, so nothing
+# here can gate a merge.
 #
 # CARGO_TERM_COLOR is intentionally NOT set to always here (unlike the other
 # bench lanes): the compare reads criterion JSON, and a colored terminal would
 # only risk leaking ANSI codes into logs. The compare never greps stdout.
-
-# The pull_request trigger is deliberately absent until a runner carrying the
-# ravel-reference label is registered on this repository. GitHub does not skip a
-# job whose labels match no online runner: it queues it, holds it for about 24
-# hours, and then fails it. With no such runner registered, a pull_request
-# trigger would put a permanently pending check on every pull request in the
-# repository, not only on bench changes. Restore it as
-#
-#   on:
-#     pull_request:
-#
-# in the same change that registers the runner, and the same-repository guard on
-# the job below is what makes that safe on a public repository with forks.
 on:
   workflow_dispatch:
     inputs:
@@ -55,20 +56,24 @@ concurrency:
 
 jobs:
   bench-compare:
-    # Same-repository pull requests only. This repository is public, so a fork
-    # can open a pull request, and this job checks out the head and runs cargo
-    # bench from it on a persistent self-hosted box that holds a rust toolchain,
-    # a cargo cache, and a token with pull-requests: write. Running fork code
-    # there is arbitrary code execution on that hardware. A workflow_dispatch
-    # run has no head repository to compare and is always allowed: only a
-    # collaborator can start one.
+    # Disabled: no self-hosted runner is registered on this repository (owner
+    # decision, 2026-09-19; ADR-0070 amendment). Restoring this job is an
+    # owner decision on where it runs, not a mechanical edit; see the header
+    # comment. The rest of this `if` is the pre-existing same-repository guard
+    # (this repository is public, so a fork can open a pull request, and this
+    # job checks out the head and runs cargo bench from it with a token that
+    # has pull-requests: write; running fork code is arbitrary code execution
+    # on whatever runs this job). It stays in place, dead code for now under
+    # `false &&`, so it does not need re-deriving whenever this job is
+    # re-enabled and a pull_request trigger returns.
     if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-    # Self-hosted reference runner only (ADR-0070 decision 3). With no such
-    # runner online the job stays queued until one appears or GitHub times the
-    # queue out; it is not skipped.
-    runs-on: [self-hosted, ravel-reference]
+      false &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
+    # Placeholder only: the job never reaches a runner while `if: false`
+    # holds above. Not a decision to run the comparison on a GitHub-hosted
+    # runner -- see the header comment for what restoring this needs.
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
