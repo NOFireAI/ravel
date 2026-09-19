@@ -32,20 +32,23 @@ non-rollbackable, forward-only data-migration event: the reader admits exactly
 one version, so once any object at the new version exists, a build that predates
 the bump cannot read it. The irreversible step is the first write at the new
 version; before it, a rollback to the earlier build is safe. The N/N-1 window
-described below is staged for a future format-lifecycle activation milestone,
-distinct from the software's first public release at 0.9.0 and not yet reached
-(ADR-0531, proposed), not a posture any released build has had.
+described below is staged for the v1.0 release and is not a posture any
+released build has had: ADR-0531 fixes the format-lifecycle activation
+milestone at v1.0, which is distinct from the software's first public release
+at 0.9.0 and has not shipped. Before v1.0 a trailer-version bump may break
+backward compatibility outright.
 
 **Version lifecycle and migration (ADR-0066, normative).** The pre-release
-posture above expires at the format-lifecycle activation milestone (ADR-0531,
-proposed: distinct from the software's 0.9.0 first public release and not yet
-reached). RSPAN is a Class A bulk data-object format; from that milestone onward
-the supported-version window becomes N/N-1 (single-sourced as
+posture above expires at the v1.0 release and not before (ADR-0531: the
+format-lifecycle activation milestone is v1.0, distinct from the software's
+0.9.0 first public release and not yet shipped). RSPAN is a Class A bulk
+data-object format; from v1.0 onward the supported-version window becomes
+N/N-1 (single-sourced as
 `ravel_rspan::footer::SUPPORTED_VERSIONS`, which holds exactly one version
 today; the writer, reader gate, `audit-versions`, `migrate`, and the compactor's
 output-version constant all read it), rolled out readers-before-writers: a
 release writing N+1 requires a fleet already reading N+1, so the "no dual
-reader" statement above is the pre-release state, not a standing rule. Once an
+reader" statement above is the pre-v1.0 state, not a standing rule. Once an
 N-1 reader exists, RSPAN compaction already decodes every input's span records
 and re-encodes them from scratch, so an old-version object is migrated forward
 by the normal compaction and `maintain migrate` paths with no special carve-out;

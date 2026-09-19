@@ -382,6 +382,17 @@ not a migration target:
 
 ### Rolling a format bump: readers before writers
 
+Read this section as the procedure that applies from the v1.0 release onward.
+Ravel has not reached v1.0, and before it the reader window holds exactly one
+version: a bump deletes the version-N reader in the same change that introduces
+N+1, so backward compatibility may break outright, no fleet ever reads both
+versions, and objects left at version N become unreadable rather than
+convergeable. On a pre-v1.0 build the whole sequence below collapses into one
+step, deploy the new build everywhere and re-ingest or discard whatever was
+written at version N, and a bump is a forward-only, non-rollbackable
+data-migration event. Steps 1 to 4 become live at v1.0, when the window widens
+to N/N-1.
+
 When a release bumps a bulk data-object format from version N to N+1, roll the
 fleet in this order and never the reverse:
 

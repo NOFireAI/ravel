@@ -8,11 +8,13 @@ description: Use before changing any persistent format - RSEG layout, proto sche
 Persistent formats outlive processes and deployments. Readability across
 versions follows one of two regimes, and the format's ADR must say which:
 
-- Pre-first-release (ADR-0027, and ADR-0032/0045/0054 for RLOG/RSPAN): a
-  single supported version. Old-format objects are wiped or re-ingested;
-  no dual reader is kept. This is temporary and expires at first public
-  release.
-- Post-first-release (ADR-0066 decision 1): an N/N-1 window for the bulk
+- Pre-v1.0, the regime in force today (ADR-0027, and ADR-0032/0045/0054
+  for RLOG/RSPAN): a single supported version. Backward compatibility may
+  break at a bump; old-format objects are wiped or re-ingested and no dual
+  reader is kept. This is temporary and expires at the v1.0 release, which
+  is what "first public release" denotes in the lifecycle ADRs (ADR-0531;
+  it is not the 0.9.0 release).
+- From v1.0 onward (ADR-0066 decision 1): an N/N-1 window for the bulk
   data-object formats (Class A below). Writers always emit the current
   version N; readers accept N and N-1. Data written today is readable by
   the next version, not by every future version: N-1 support is deleted
