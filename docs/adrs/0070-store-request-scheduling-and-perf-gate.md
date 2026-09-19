@@ -203,3 +203,32 @@ bench set, and the reference-runner-only constraint stay as decision 3 sets
 them. This is a policy change on a required-check surface and needs an owner's
 call, not a fleet executor's; it is filed here so the decision is made with the
 probation condition in view rather than by default.
+
+## Amendment (2026-09-19): decision 3 resolved as advisory, not blocking; no self-hosted runner
+
+The owner decided on 2026-09-19 that this repository gets no self-hosted
+GitHub Actions runner. The repository is public, and a self-hosted runner
+executes workflow code from forked pull requests unless every entry point
+is gated; the `ravel-reference` label this ADR and `bench-compare.yml`
+were written against will not be registered.
+
+This resolves the issue #533 proposal above: tier B stays advisory, not
+blocking. Nothing runs the comparison on every pull request, and a figure
+that is not measured on every change cannot gate a merge. The proposed
+amendment's promotion path -- implement the two-consecutive-runs
+condition, record a baseline on the reference runner, switch
+`pull_request` to `--enforce` -- is not adopted; it depended on a runner
+that will not exist.
+
+`bench-compare.yml` stays `workflow_dispatch`-only. Its `ravel-reference`
+runner label is removed rather than left pointing at hardware that will
+never register, which per the base decision would otherwise queue every
+dispatched run for about 24 hours and then fail it. A future gate, if
+wanted, runs on a GitHub-hosted runner against an object store the
+workflow provisions itself (for example a MinIO container service), not
+against a persistent self-hosted box holding a warm cache and a
+`pull-requests: write` token.
+
+The committed baseline under `bench/baselines/` remains a demonstration
+recorded on a fleet executor box, not a reference measurement; see its
+`_meta` block and `bench/baselines/README.md`.
