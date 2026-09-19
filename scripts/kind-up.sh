@@ -296,6 +296,15 @@ spec:
     name: ${AUDIT_TOKEN_KEY_SECRET}
   gateway:
     replicas: 1
+    # Kept identical to the example: an explicit block replaces the rendered
+    # default request rather than merging with it.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
   query:
     replicas: 1
   maintain:
