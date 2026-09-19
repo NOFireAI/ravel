@@ -595,7 +595,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::Poll;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use parking_lot::Mutex;
@@ -1382,10 +1382,20 @@ mod tests {
     /// check) that could let the probe below run concurrently for a reason
     /// unrelated to the insert.
     ///
-    /// The disk tier's injected [`Clock`] sleeps for `SLOW_INSERT_MS` the
-    /// first time it is called, which is `DiskCache::insert`'s
-    /// `written_at_ns` stamp for this fresh key (the only clock call on this
-    /// path).
+    /// This proves the claim by ordering, not by duration. The disk tier's
+    /// injected [`Clock`] -- called once, for `DiskCache::insert`'s
+    /// `written_at_ns` stamp -- signals `began_tx` and then parks on
+    /// `release_rx` instead of sleeping. If that call runs on a genuine
+    /// blocking-pool thread (the fix), parking it does not stop the async
+    /// thread from running the concurrent RAM-hit probe to completion; the
+    /// test then releases the park and joins the leader. If that call
+    /// instead runs on the runtime's sole async thread (the bug), parking it
+    /// wedges the only thread able to ever unpark it -- there is no
+    /// duration at which the probe "would" run, it structurally cannot, and
+    /// the test hangs rather than racing a clock. An outer watchdog thread
+    /// turns that hang into a deterministic failure instead of an
+    /// indefinitely stuck test binary; it bounds wall time but asserts
+    /// nothing about it.
     ///
     /// FLIP (demonstrate failing on the unmodified tree): in
     /// `TieredCache::resolve_peeked_miss`, replace the line
@@ -1393,120 +1403,153 @@ mod tests {
     /// with the direct, pre-#1702 call `self.disk.insert(key, &bytes);`. On a
     /// `current_thread` runtime, the leader's first poll then runs `fetch`
     /// (ready immediately, no `.await` inside it), the RAM insert, and the
-    /// direct disk insert all in that single poll, uninterrupted: the sleep
-    /// blocks the only thread the runtime has for the whole `SLOW_INSERT_MS`
-    /// before that poll ever returns, so the probe below -- queued behind the
-    /// leader -- cannot be polled until it does. `elapsed` then reads
-    /// roughly `SLOW_INSERT_MS`, not under `BOUND_MS`, and the assertion
-    /// fails. Confirmed failing this way (observed elapsed 300.5ms against
-    /// the 100ms bound) before this comment was written, then reverted back
-    /// to the `spawn_blocking` version below.
+    /// direct disk insert -- including the clock's `began_tx` send and its
+    /// park on `release_rx` -- all in that single, uninterrupted poll. That
+    /// poll never returns, so nothing else on this single-threaded runtime
+    /// can ever be scheduled: not the task waiting on `fetch_entered_rx`,
+    /// not the probe, and not the code that would send on `release_tx`.
+    /// Confirmed: reverting that line makes this test hang until the
+    /// watchdog's bound elapses and it panics with the "test hung" message
+    /// below, instead of passing; reverted back to the `spawn_blocking`
+    /// version afterward.
     #[test]
     fn disk_tier_get_and_insert_run_on_the_blocking_pool() {
         // `DiskCache::new_with_clock` itself calls `clock.now_ns()` once, from
-        // `scan_existing`, to timestamp the startup scan -- before this test's
-        // own timing window starts. An unconditional "sleep on the first
-        // call" clock would burn its one sleep there instead of on the
-        // insert this test means to catch, and then measure a falsely fast
-        // insert. `armed` is set only after construction returns, so the
-        // startup call is a no-op and the sleep lands on the first call
-        // after that: `resolve_peeked_miss`'s `written_at_ns` stamp.
-        struct SlowFirstCallClock {
+        // `scan_existing`, to timestamp the startup scan -- before this
+        // test's own handshake begins. An unconditional "park on the first
+        // call" clock would wedge on the startup scan instead of the insert
+        // this test means to catch. `armed` is set only after construction
+        // returns, so the startup call is a no-op and the park lands on the
+        // first call after that: `resolve_peeked_miss`'s `written_at_ns`
+        // stamp.
+        struct ParkingFirstCallClock {
             armed: AtomicBool,
-            slept: AtomicBool,
-            sleep_for: Duration,
+            parked: AtomicBool,
+            began_tx: std::sync::mpsc::SyncSender<()>,
+            release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
         }
-        impl Clock for SlowFirstCallClock {
+        impl Clock for ParkingFirstCallClock {
             fn now_ns(&self) -> u64 {
-                if self.armed.load(Ordering::SeqCst) && !self.slept.swap(true, Ordering::SeqCst) {
-                    std::thread::sleep(self.sleep_for);
+                if self.armed.load(Ordering::SeqCst) && !self.parked.swap(true, Ordering::SeqCst) {
+                    self.began_tx.send(()).unwrap();
+                    self.release_rx.lock().recv().unwrap();
                 }
                 0
             }
         }
 
-        // The sleep the leader's disk insert incurs, and the bound the
-        // concurrent probe must beat: a third of the sleep leaves ample
-        // margin for scheduling jitter on a loaded machine while staying
-        // far above the sub-millisecond a true RAM hit takes, so a pass is
-        // never a coin flip.
-        const SLOW_INSERT_MS: u64 = 300;
-        const BOUND_MS: u64 = 100;
+        // Generous bound for the watchdog only: how long the whole handshake
+        // (leader starts, insert begins, probe runs, insert releases, leader
+        // finishes) may take before the test declares a hang rather than
+        // waiting on it forever. Nothing here is compared against a
+        // *measured* duration -- this only bounds how long `recv_timeout`
+        // blocks the outer thread.
+        const WATCHDOG_BOUND: Duration = Duration::from_secs(10);
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let (began_tx, began_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
-        rt.block_on(async {
-            let tmp = TempDir::new().unwrap();
-            let clock = Arc::new(SlowFirstCallClock {
-                armed: AtomicBool::new(false),
-                slept: AtomicBool::new(false),
-                sleep_for: Duration::from_millis(SLOW_INSERT_MS),
-            });
-            let disk = DiskCache::new_with_clock(
-                tmp.path().to_path_buf(),
-                generous_limits(),
-                clock.clone(),
-            );
-            let ram: Cache<&'static str> = Cache::new(generous_limits());
-            let tiered = Arc::new(TieredCache::new(ram, disk));
-            clock.armed.store(true, Ordering::SeqCst);
+        let worker = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
 
-            let leader_key = test_key(1, 4);
-            let tiered_leader = tiered.clone();
-            let (fetch_entered_tx, fetch_entered_rx) = oneshot::channel::<()>();
-            let overall_start = Instant::now();
-            let leader = tokio::spawn(async move {
-                tiered_leader
-                    .resolve_peeked_miss(leader_key, move || async move {
-                        let _ = fetch_entered_tx.send(());
-                        Ok::<Bytes, &'static str>(Bytes::from_static(b"aaaa"))
+            rt.block_on(async {
+                let tmp = TempDir::new().unwrap();
+                let clock = Arc::new(ParkingFirstCallClock {
+                    armed: AtomicBool::new(false),
+                    parked: AtomicBool::new(false),
+                    began_tx,
+                    release_rx: Mutex::new(release_rx),
+                });
+                let disk = DiskCache::new_with_clock(
+                    tmp.path().to_path_buf(),
+                    generous_limits(),
+                    clock.clone(),
+                );
+                let ram: Cache<&'static str> = Cache::new(generous_limits());
+                let tiered = Arc::new(TieredCache::new(ram, disk));
+                clock.armed.store(true, Ordering::SeqCst);
+
+                let leader_key = test_key(1, 4);
+                let tiered_leader = tiered.clone();
+                let (fetch_entered_tx, fetch_entered_rx) = oneshot::channel::<()>();
+                let leader = tokio::spawn(async move {
+                    tiered_leader
+                        .resolve_peeked_miss(leader_key, move || async move {
+                            let _ = fetch_entered_tx.send(());
+                            Ok::<Bytes, &'static str>(Bytes::from_static(b"aaaa"))
+                        })
+                        .await
+                });
+
+                // Wait for confirmation that the leader's fetch ran, which
+                // requires the leader's first poll to have returned control
+                // to the executor (a single-threaded runtime cannot
+                // reschedule this task while the leader's poll is still on
+                // the stack). On the reverted (pre-#1702) tree, that first
+                // poll runs fetch, the RAM insert, AND the synchronous,
+                // un-instrumented disk insert (including the clock's park)
+                // before returning, so this wait never resolves and the test
+                // hangs here. On the fixed tree the poll returns as soon as
+                // the disk insert is dispatched to the blocking pool, before
+                // the clock is ever called, so this wait is near-instant. A
+                // plain `tokio::task::yield_now().await` was tried first and
+                // does not give this guarantee: it only requires the leader
+                // to be *scheduled* by the time this task resumes, not to
+                // have been *polled*, so it let the probe below run before
+                // the leader's synchronous insert ever started and passed
+                // even on the reverted tree.
+                fetch_entered_rx.await.unwrap();
+
+                // Wait for the disk tier's clock to signal that the insert
+                // has begun. On the fixed tree this call runs on a tokio
+                // blocking-pool thread, a real second OS thread, so blocking
+                // this async thread on `recv()` here does not depend on
+                // anything this thread itself would otherwise need to do.
+                began_rx.recv().unwrap();
+
+                let probe_key = test_key(2, 4);
+                tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
+                let (served, source) = tiered
+                    .get_or_fetch(probe_key, || async {
+                        unreachable!("a RAM-resident key must never fetch")
                     })
                     .await
+                    .unwrap();
+
+                assert_eq!(source, Source::Cache, "the probe key is a RAM hit");
+                assert_eq!(served, Bytes::from_static(b"bbbb"));
+
+                // The probe above only completed because the parked insert
+                // is not holding this thread. Release it now, which is the
+                // deterministic version of "the sleep finishes": the
+                // leader's disk insert can only observe the probe's result
+                // as already asserted, never race it.
+                release_tx.send(()).unwrap();
+
+                let leader_bytes = leader.await.unwrap().unwrap();
+                assert_eq!(leader_bytes, Bytes::from_static(b"aaaa"));
             });
 
-            // Wait for confirmation that the leader's fetch ran, which
-            // requires the leader's first poll to have returned control to
-            // the executor (a single-threaded runtime cannot reschedule this
-            // task while the leader's poll is still on the stack). On the
-            // reverted (pre-#1702) tree, that first poll runs fetch, the RAM
-            // insert, AND the synchronous, un-instrumented disk insert
-            // (sleep included) before returning, so this wait absorbs the
-            // whole `SLOW_INSERT_MS`. On the fixed tree the poll returns as
-            // soon as the disk insert is dispatched to the blocking pool,
-            // long before the sleep resolves, so this wait is near-instant.
-            // A plain `tokio::task::yield_now().await` was tried first and
-            // does not give this guarantee: it only requires the leader to
-            // be *scheduled* by the time this task resumes, not to have been
-            // *polled*, so it let the probe below run before the leader's
-            // synchronous insert ever started and passed even on the
-            // reverted tree.
-            fetch_entered_rx.await.unwrap();
-
-            let probe_key = test_key(2, 4);
-            tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
-            let (served, source) = tiered
-                .get_or_fetch(probe_key, || async {
-                    unreachable!("a RAM-resident key must never fetch")
-                })
-                .await
-                .unwrap();
-            let elapsed = overall_start.elapsed();
-
-            assert_eq!(source, Source::Cache, "the probe key is a RAM hit");
-            assert_eq!(served, Bytes::from_static(b"bbbb"));
-            assert!(
-                elapsed < Duration::from_millis(BOUND_MS),
-                "a concurrent RAM-hit get_or_fetch took {elapsed:?}, over the \
-                 {BOUND_MS}ms bound; the leader's disk insert (sleeping \
-                 {SLOW_INSERT_MS}ms) must be running on the blocking pool, \
-                 not stalling the runtime's sole async thread"
-            );
-
-            let leader_bytes = leader.await.unwrap().unwrap();
-            assert_eq!(leader_bytes, Bytes::from_static(b"aaaa"));
+            let _ = done_tx.send(());
         });
+
+        match done_rx.recv_timeout(WATCHDOG_BOUND) {
+            Ok(()) => worker.join().unwrap(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!(
+                    "test hung for {WATCHDOG_BOUND:?}: the leader's disk insert \
+                     likely ran on the runtime's async thread and wedged it \
+                     parked, instead of running on the blocking pool (see #1702)"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+                Ok(()) => panic!("worker thread exited without a result"),
+                Err(panic) => std::panic::resume_unwind(panic),
+            },
+        }
     }
 }
