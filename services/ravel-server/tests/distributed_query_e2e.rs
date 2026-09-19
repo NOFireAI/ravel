@@ -1768,7 +1768,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
             let m = scrape_metrics(&y_http).await;
             if metric_value(
                 &m,
-                "ravel_distrib_fragment_inflight{mode=\"query\",class=\"pinned\"}",
+                "ravel_distrib_fragment_inflight{mode=\"all\",class=\"pinned\"}",
             ) >= 1.0
             {
                 break;
@@ -1793,7 +1793,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
             let m = scrape_metrics(&y_http).await;
             if metric_value(
                 &m,
-                "ravel_distrib_fragment_inflight{mode=\"query\",class=\"pinned\"}",
+                "ravel_distrib_fragment_inflight{mode=\"all\",class=\"pinned\"}",
             ) == 0.0
             {
                 break;
