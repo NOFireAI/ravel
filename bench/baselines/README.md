@@ -91,5 +91,6 @@ checkable. `tier-b.json` as committed predates the stamping and carries no
 `_meta.knobs`: the compare reports `NOT RECORDED` for it and an enforcing run
 refuses the pair. That is deliberate. The knobs it was recorded at are not
 fully recoverable from the file, and writing values nobody observed is the
-drift this check exists to catch. Re-recording on the reference runner, which
-this baseline needs anyway, fixes it.
+drift this check exists to catch. Re-recording it through
+`bench-tier-b.sh record` on a named machine, with the host, the binary commit
+and the knobs stamped, fixes it.
