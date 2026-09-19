@@ -738,6 +738,24 @@ pub struct Cli {
     #[arg(long, value_name = "ADDR")]
     pub mtls_listener: Option<SocketAddr>,
 
+    /// Acknowledge that `--mtls-listener` may bind an address other than
+    /// loopback (issue #1703). Ravel does not terminate client mTLS: the
+    /// resolver reads a tenant identity out of a header a reverse proxy is
+    /// trusted to have set and sanitized, the same trust class as
+    /// `X-Forwarded-For` (ADR-0050 section 1). On a loopback bind the proxy is
+    /// the only thing that can reach the listener, so the trust holds by
+    /// topology. On any other address it holds only if the operator has put a
+    /// verifying proxy in front of it and kept the socket off every network a
+    /// client can reach, which is a deployment fact Ravel cannot check. Startup
+    /// refuses a non-loopback `--mtls-listener` without this flag; passing it
+    /// asserts that proxy is in place.
+    ///
+    /// This flag grants no trust the resolver did not already have and turns
+    /// nothing on. It records that the operator chose the non-loopback bind
+    /// deliberately.
+    #[arg(long = "mtls-trust-forwarded-header")]
+    pub mtls_trust_forwarded_header: bool,
+
     /// Path to a TOML admission-limits file (ADR-0051 section 3): a
     /// `[defaults]` table plus repeatable `[tenants.<id>]` override tables,
     /// deserialized into `ravel_ingest::AdmissionLimits`. Absent
@@ -4948,6 +4966,30 @@ impl Cli {
                      listener, defeating the dedicated-listener isolation (ADR-0050 section 1)."
                 );
             }
+            // Issue #1703: the resolver believes a header, not a certificate.
+            // A loopback bind makes the reverse proxy the only possible source
+            // of that header; any other bind makes the trust a property of the
+            // deployment, which this process cannot observe. Refuse until the
+            // operator states it.
+            if !mtls_listener.ip().is_loopback() && !self.mtls_trust_forwarded_header {
+                anyhow::bail!(
+                    "--mtls-listener '{mtls_listener}' does not bind a loopback address, which \
+                     requires --mtls-trust-forwarded-header. The mTLS resolver does not verify \
+                     client certificates: it reads the tenant identity out of a header a reverse \
+                     proxy is trusted to set and sanitize (ADR-0050 section 1), so anything that \
+                     can reach this listener directly can choose its own tenant. Bind it to \
+                     loopback, or pass --mtls-trust-forwarded-header to assert that a verifying \
+                     proxy fronts this address and no client can reach it."
+                );
+            }
+        }
+        if self.mtls_trust_forwarded_header && self.mtls_listener.is_none() {
+            anyhow::bail!(
+                "--mtls-trust-forwarded-header was set but --mtls-listener was not: the flag \
+                 only relaxes the loopback requirement on that listener, so without it the \
+                 value is inert. Set --mtls-listener, or drop \
+                 --mtls-trust-forwarded-header."
+            );
         }
 
         // `KmsRoutingStore`'s per-tenant builder always constructs a real
@@ -9851,6 +9893,10 @@ mod tests {
             "--mtls-enabled",
             "--mtls-listener",
             "0.0.0.0:8443",
+            // The non-loopback mTLS bind this case is about needs its own
+            // acknowledgement (issue #1703); the allowlist is what is under
+            // test here.
+            "--mtls-trust-forwarded-header",
         ])
         .validate()
         .expect("a non-empty allowlist admits public listeners");
@@ -9991,6 +10037,51 @@ mod tests {
         assert!(
             err.to_string().contains("--mtls-listener"),
             "error names the missing flag: {err}"
+        );
+    }
+
+    /// Issue #1703: the mTLS resolver trusts a proxy-forwarded header rather
+    /// than verifying a certificate, so a listener anything but a fronting
+    /// proxy can reach lets a client choose its own tenant. A non-loopback bind
+    /// refuses startup unless the operator asserts the proxy with
+    /// `--mtls-trust-forwarded-header`; loopback needs nothing.
+    #[test]
+    fn mtls_listener_non_loopback_requires_trust_forwarded_header() {
+        let err = cli(&["--mtls-enabled", "--mtls-listener", "0.0.0.0:9443"])
+            .validate()
+            .expect_err("a non-loopback --mtls-listener must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("0.0.0.0:9443"),
+            "the error names the offending address: {msg}"
+        );
+        assert!(
+            msg.contains("--mtls-trust-forwarded-header"),
+            "the error names the flag that fixes it: {msg}"
+        );
+
+        cli(&["--mtls-enabled", "--mtls-listener", "127.0.0.1:9443"])
+            .validate()
+            .expect("a loopback --mtls-listener needs no acknowledgement");
+
+        cli(&[
+            "--mtls-enabled",
+            "--mtls-listener",
+            "0.0.0.0:9443",
+            "--mtls-trust-forwarded-header",
+        ])
+        .validate()
+        .expect("the acknowledgement admits a non-loopback --mtls-listener");
+    }
+
+    #[test]
+    fn mtls_trust_forwarded_header_without_a_listener_fails_validate() {
+        let err = cli(&["--mtls-trust-forwarded-header"])
+            .validate()
+            .expect_err("an inert acknowledgement must refuse startup");
+        assert!(
+            err.to_string().contains("--mtls-listener"),
+            "the error names the flag it would apply to: {err}"
         );
     }
 
