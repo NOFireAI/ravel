@@ -193,6 +193,7 @@ fn always_distribute_settings() -> DistribSettings {
             max_parallel_slices: 8,
         },
         fragment_listener: None,
+        advertise_endpoint: None,
     }
 }
 

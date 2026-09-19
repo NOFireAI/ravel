@@ -717,10 +717,26 @@ Binding `--mtls-listener` to the same address as a `--listen-http` that has
 inherit the development bypass. Enabling mTLS logs a startup warning naming the
 trusted header.
 
+`--mtls-listener` must bind a loopback address unless
+`--mtls-trust-forwarded-header` is also passed. Loopback is the one bind where
+the topology itself proves that only a local proxy can supply the header; on any
+other address, whether the header is trustworthy depends on a proxy Ravel cannot
+see. The flag turns nothing on and grants the resolver no trust it did not
+already have. It records that the operator chose the non-loopback bind
+deliberately and has a verifying proxy in front of it.
+
+This is a behavior change for an existing deployment: a proxy-fronted mTLS
+listener bound to anything other than loopback (`0.0.0.0:9443`, a pod IP, a
+host address) now fails startup with a message naming the address and the flag.
+Add `--mtls-trust-forwarded-header` to the argument vector to keep it starting.
+Nothing else about the deployment changes. A loopback-bound mTLS listener is
+unaffected.
+
 Dependent flags fail fast: `--oidc-tenant-claim` or `--oidc-audience` without
-OIDC enabled, `--mtls-header` or `--mtls-listener` without `--mtls-enabled`, and
-`--mtls-enabled` without `--mtls-listener`, all refuse to start rather than
-quietly doing nothing.
+OIDC enabled, `--mtls-header` or `--mtls-listener` without `--mtls-enabled`,
+`--mtls-enabled` without `--mtls-listener`, and `--mtls-trust-forwarded-header`
+without `--mtls-listener`, all refuse to start rather than quietly doing
+nothing.
 
 ### The tenant hash scheme is permanent per bucket
 

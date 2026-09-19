@@ -176,6 +176,9 @@ fn always_distribute_settings() -> DistribSettings {
         // listener. Naming the new field is forced by Rust's exhaustive struct
         // literal; the value is the legacy default and changes no behavior here.
         fragment_listener: None,
+        // Loopback, ephemeral-port binds: the advertised endpoints are the
+        // bound addresses, so no `--advertise-fragment-endpoint` override.
+        advertise_endpoint: None,
     }
 }
 

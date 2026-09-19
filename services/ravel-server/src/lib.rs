@@ -2193,9 +2193,20 @@ pub async fn start(
         // fragment endpoints: pin the operator CA and verify the fixed
         // `ravel-fragment` server name. `None` under the pre-amendment layout,
         // where the dial stays plaintext against the public gRPC listener.
+        //
+        // It also presents this process's own fragment certificate as client
+        // identity (issue #1690), because the peer's listener now requires one
+        // signed by the same pinned CA. One key pair serves both directions:
+        // every fragment process is both a worker and a coordinator, and the
+        // CA membership, not the certificate's subject, is what either side
+        // reads from it.
         let fragment_client_tls = settings.fragment_listener.as_ref().map(|fl| {
             tonic::transport::ClientTlsConfig::new()
                 .ca_certificate(tonic::transport::Certificate::from_pem(&fl.tls_ca_pem))
+                .identity(tonic::transport::Identity::from_pem(
+                    &fl.tls_cert_pem,
+                    &fl.tls_key_pem,
+                ))
                 .domain_name(distrib::FRAGMENT_TLS_SERVER_NAME)
         });
         let fetcher = Arc::new(
@@ -3088,7 +3099,18 @@ pub async fn start(
     ) {
         (Some(service), Some(fl)) => {
             let identity = tonic::transport::Identity::from_pem(&fl.tls_cert_pem, &fl.tls_key_pem);
-            let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+            // Mutual TLS on this listener (issue #1690): the same pinned
+            // `--fragment-tls-ca` that coordinators verify this listener
+            // against is also the roster of clients it will complete a
+            // handshake with, so a peer holding no certificate from that CA is
+            // refused at the transport rather than reaching the capability
+            // check. The capability remains the authorization; this only
+            // narrows who may present one. Per-process certificate identity is
+            // still not required, so any certificate the dedicated CA signed
+            // means "a fragment worker of this cluster".
+            let tls = tonic::transport::ServerTlsConfig::new()
+                .identity(identity)
+                .client_ca_root(tonic::transport::Certificate::from_pem(&fl.tls_ca_pem));
             let server = tonic::transport::Server::builder()
                 .tls_config(tls)
                 .map_err(|e| anyhow::anyhow!("failed to configure fragment listener TLS: {e}"))?
@@ -3144,11 +3166,31 @@ pub async fn start(
                 // listener, so it is advertised separately: dialing the fragment
                 // endpoint for a Flight `DoGet` reaches a port with no Flight
                 // service (issue #1296).
-                let fragment_endpoint = fragment_addr.unwrap_or(addr);
-                let flight_sql_endpoint = addr;
+                //
+                // Both are the address the listener actually bound, unless
+                // `--advertise-fragment-endpoint` supplies the host peers reach
+                // this process at (issue #1724). Startup already refused a
+                // wildcard bind without that flag, so an unadvertised endpoint
+                // here is one a sibling can dial. The advertised host applies
+                // to both lanes; its optional port applies to the fragment lane
+                // only, so the Flight SQL endpoint keeps the public gRPC
+                // listener's own bound port and a host-only value keeps both
+                // bound ports (which is what makes a `:0` test bind work).
+                let fragment_bound = fragment_addr.unwrap_or(addr);
+                let advertise = config
+                    .distrib
+                    .as_ref()
+                    .and_then(|s| s.advertise_endpoint.as_ref());
+                let (fragment_endpoint, flight_sql_endpoint) = match advertise {
+                    Some(advertise) => (
+                        advertise.fragment_endpoint(fragment_bound),
+                        advertise.flight_sql_endpoint(addr),
+                    ),
+                    None => (fragment_bound.to_string(), addr.to_string()),
+                };
                 let workers = Arc::new(ravel_fleet::query_workers::QueryWorkers::with_defaults(
-                    fragment_endpoint.to_string(),
-                    flight_sql_endpoint.to_string(),
+                    fragment_endpoint,
+                    flight_sql_endpoint,
                     ravel_query::distrib::codec::PROTOCOL_VERSION,
                 ));
                 // Ignore a set() race: `start` sets this exactly once, so the

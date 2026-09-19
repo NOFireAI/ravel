@@ -481,9 +481,26 @@ impl TenantResolver for OidcResolver {
 /// metadata is copied into the same `HeaderMap` type any `TenantResolver`
 /// reads, see `services/ravel-server/src/otlp_grpc.rs`'s
 /// `metadata_to_headers` and `flight_auth`) is closed by construction, not by
-/// convention. `services/ravel-server` refuses to start rather than run with
-/// this resolver reachable from a public listener; see
-/// `ravel_server::config::Cli::validate`.
+/// convention.
+///
+/// What `ravel_server::config::Cli::validate` enforces about that listener, and
+/// nothing beyond it:
+///
+/// - `--mtls-enabled` and `--mtls-listener` must be set together; either alone
+///   fails startup.
+/// - `--mtls-listener` must not equal `--listen-http` or `--listen-grpc`, and
+///   must not equal `--fragment-listener`.
+/// - `--mtls-listener` must bind a loopback address unless
+///   `--mtls-trust-forwarded-header` is also passed (issue #1703). Loopback is
+///   the one bind where the topology itself proves only a local proxy can
+///   supply the header; on any other address the flag is the operator's
+///   assertion that a verifying proxy fronts it.
+///
+/// Those are address and flag-pairing checks. Ravel cannot verify that a
+/// verifying proxy actually exists, that it strips the client's own copy of the
+/// header, or that no route reaches this listener directly. A configuration
+/// that passes every check above and is deployed without such a proxy still
+/// hands tenant selection to the client.
 ///
 /// The header value maps straight to a [`TenantId`] with no further parsing:
 /// certificate SAN/CN extraction already happened at the proxy, and duplicating
