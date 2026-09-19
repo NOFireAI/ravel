@@ -127,8 +127,13 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # #533): it carries exactly one external `uses:`, its checkout. Raised 98->101
 # when the k8s-nightly chaos job was added (issue #534): it adds a checkout, an
 # sccache-action, and a rust-cache. That job's free-disk-space step is a local
-# `./.github/actions/...` action, which this scan does not count.
-WORKFLOW_EXPECTED_ACTION_COUNT=101
+# `./.github/actions/...` action, which this scan does not count. Raised
+# 101->104 when the dr-rehearsal workflow was added (issue #814): it adds a
+# checkout, a rust-cache, and an upload-artifact. Its free-disk-space step is
+# a local `./.github/actions/...` action, which this scan does not count, and
+# its four matrix cases are one job definition, so the three `uses:` are
+# counted once each rather than per case.
+WORKFLOW_EXPECTED_ACTION_COUNT=104
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (minio, createbucket (mc), qualify, ravel-server,
@@ -157,13 +162,18 @@ RAVEL_IMAGE_VAR_REF='${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.15.0}'
 # Exact number of `docker run`/`docker pull`/`docker create` image arguments
 # across every scanned workflow. Update deliberately if a `docker run`,
 # `docker pull`, or `docker create` invocation is added, removed, or
-# repointed at a different image inside one of their `run:` blocks.
-RUN_IMAGE_EXPECTED_COUNT=17
+# repointed at a different image inside one of their `run:` blocks. Raised
+# 17->18 when the dr-rehearsal workflow was added (issue #814): it starts one
+# MinIO container in a `run:` block. Its mc invocations live in
+# scripts/dr/lib.sh, outside this scan's scope, and are pinned by
+# DR_MC_IMAGE's own default there.
+RUN_IMAGE_EXPECTED_COUNT=18
 
 # Of those, the number that must carry a digest pin: every reference except
 # the three shell-variable exemptions below. Update deliberately alongside
-# RUN_IMAGE_EXPECTED_COUNT.
-RUN_IMAGE_EXPECTED_PINNED_COUNT=11
+# RUN_IMAGE_EXPECTED_COUNT. Raised 11->12 with the dr-rehearsal MinIO run,
+# which is digest pinned.
+RUN_IMAGE_EXPECTED_PINNED_COUNT=12
 
 # The exact text of an extracted image argument (same stripping as the
 # extraction below: the whitespace-delimited token itself, quotes included
