@@ -65,13 +65,12 @@ spec:
       enableServiceLinks: false
       containers:
         - name: floci
-          # Same image the object-store-contract CI job gates on, so the
-          # backend this environment runs is the backend the contract suite
-          # proved satisfies Capabilities::mandatory() and multipart. Left on
-          # Docker Hub deliberately: repointing only this copy would drift
-          # from the CI job's own floci/floci:latest pull, which this
-          # deploy/-scoped fix does not touch.
-          image: floci/floci:latest
+          # Same digest the object-store-contract CI job pins for its own
+          # `docker run` (issue #1720 residual round), so the backend this
+          # environment runs is the exact build the contract suite proved
+          # satisfies Capabilities::mandatory() and multipart. Left on Docker
+          # Hub deliberately: only the pin form changed, not the registry.
+          image: floci/floci@sha256:f5aa8c18302cedb4f2385f5c4e455b3efc77fee6bf7b6e5d1712b2817ba102db
           imagePullPolicy: IfNotPresent
           ports:
             - name: s3
@@ -154,7 +153,15 @@ spec:
           # curlimages/curl was found, and this Job runs once per cluster
           # bring-up rather than per CI run, so it does not share the
           # per-runner pull pressure the quickstart job hits.
-          image: curlimages/curl:8.11.1
+          #
+          # Not yet digest-pinned (issue #1720 residual round): no prior pin
+          # for this image exists anywhere in the repo to mirror, and the
+          # executor that added the sibling pins above had no registry
+          # access to resolve one. Category 6 of
+          # deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
+          # reports this line unpinned until a digest is resolved and added
+          # here.
+          image: curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69
           imagePullPolicy: IfNotPresent
           env:
             # Must match spec.storage.s3.bucket of the RavelCluster that uses
