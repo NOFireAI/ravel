@@ -94,7 +94,7 @@ pub enum Source {
 /// cross-tier single-flight, and corruption-gate behavior.
 pub struct TieredCache<E> {
     ram: Cache<E>,
-    disk: DiskCache,
+    disk: Arc<DiskCache>,
     /// Coalesces concurrent RAM misses on one key across *both* tiers. Its
     /// value is `(clean_bytes, from_cache)`: `from_cache` records whether the
     /// leader satisfied the miss from the disk tier (`true`, corruptible) or
@@ -114,7 +114,7 @@ where
     pub fn new(ram: Cache<E>, disk: DiskCache) -> Self {
         TieredCache {
             ram,
-            disk,
+            disk: Arc::new(disk),
             single_flight: SingleFlight::new(),
         }
     }
@@ -136,12 +136,14 @@ where
     /// admitted entry's real on-disk bytes via
     /// [`DiskCache::corrupt_entry_for_test`] rather than only read its
     /// counters through [`disk_metrics`](Self::disk_metrics). `TieredCache`
-    /// owns its disk tier directly rather than behind an `Arc`, so a caller
-    /// holding only an `Arc<TieredCache<_>>` (as `ravel-query`'s `ReadCache`
-    /// does) has no other way to reach it.
+    /// keeps its disk tier behind an internal `Arc` (so the async
+    /// single-flight closures below can hand a cheap clone to
+    /// `spawn_blocking`), but exposes no public way to clone it out, so a
+    /// caller holding only an `Arc<TieredCache<_>>` (as `ravel-query`'s
+    /// `ReadCache` does) has no other way to reach it.
     #[doc(hidden)]
     pub fn disk_for_test(&self) -> &DiskCache {
-        &self.disk
+        self.disk.as_ref()
     }
 
     /// Read `key` through both tiers, fetching upstream only if both miss.
@@ -204,7 +206,18 @@ where
         let (outcome, role) = self
             .single_flight
             .run(key, move || async move {
-                if let Some(bytes) = self.disk.get(&key) {
+                // `DiskCache::get` is std::fs I/O; run it on the blocking
+                // pool rather than the async worker thread (issue #1702). A
+                // `JoinError` (the blocking task panicked or was cancelled)
+                // is treated as a plain disk miss: `disk.get` never returns
+                // an error to begin with, so this preserves its existing
+                // total-miss-tolerance contract instead of adding a new
+                // failure mode.
+                let disk = self.disk.clone();
+                let disk_get = tokio::task::spawn_blocking(move || disk.get(&key))
+                    .await
+                    .unwrap_or(None);
+                if let Some(bytes) = disk_get {
                     // Read-through: repopulate RAM so the next read is a RAM
                     // hit, not another disk consult. Clean bytes are admitted;
                     // corruption, if on, is a serve-time transform below.
@@ -218,7 +231,13 @@ where
                 // `key.len`, so a well-formed funnel key admits cleanly.
                 let bytes = fetch().await?;
                 self.ram.insert(key, bytes.clone());
-                self.disk.insert(key, &bytes);
+                // Same spawn_blocking treatment for the disk write. A
+                // `JoinError` here drops the disk admission silently: the RAM
+                // tier is already populated, so a lost disk write only costs
+                // a future disk miss, never a wrong result.
+                let disk = self.disk.clone();
+                let insert_bytes = bytes.clone();
+                let _ = tokio::task::spawn_blocking(move || disk.insert(key, &insert_bytes)).await;
                 Ok((bytes, false))
             })
             .await;
@@ -307,7 +326,14 @@ where
             .run(key, move || async move {
                 let bytes = fetch().await?;
                 self.ram.insert(key, bytes.clone());
-                self.disk.insert(key, &bytes);
+                // `DiskCache::insert` is std::fs I/O; run it on the blocking
+                // pool rather than the async worker thread (issue #1702). A
+                // `JoinError` drops the disk admission silently: the RAM
+                // tier is already populated, so a lost disk write only costs
+                // a future disk miss, never a wrong result.
+                let disk = self.disk.clone();
+                let insert_bytes = bytes.clone();
+                let _ = tokio::task::spawn_blocking(move || disk.insert(key, &insert_bytes)).await;
                 Ok((bytes, false))
             })
             .await;
@@ -567,16 +593,18 @@ async fn corrupted_disk_hit_is_corrupted_through_ram_readthrough() {
 mod tests {
     use std::future::Future;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::Poll;
+    use std::time::{Duration, Instant};
 
     use bytes::Bytes;
+    use parking_lot::Mutex;
     use tempfile::TempDir;
     use tokio::sync::oneshot;
 
     use super::fixtures::{generous_limits, test_key};
     use super::*;
-    use crate::CacheLimits;
+    use crate::{CacheLimits, Clock};
 
     /// A RAM hit is the fast path: it returns the RAM bytes and never consults
     /// the disk tier at all. Proven via the disk tier's own counters -- a
@@ -1247,5 +1275,238 @@ mod tests {
         );
         assert_eq!(tiered.disk_len(), 3);
         assert_eq!(tiered.disk_total_bytes(), 300);
+    }
+
+    /// #1702: proves the disk calls made by `get_or_fetch`'s async
+    /// single-flight closure actually run on tokio's blocking pool, not the
+    /// runtime's async thread. A [`Clock`] (the crate's existing
+    /// time-injection seam -- see the [module docs](crate) note on
+    /// `DiskCache`) records the OS thread it is called from; a disk hit
+    /// reaches the age check (`read_and_verify`), and a fresh-key admission
+    /// stamps `written_at_ns`, so both fire the clock exactly once each.
+    ///
+    /// The runtime is `current_thread`: there is no separate "worker"
+    /// thread at all, only the thread that calls `block_on`, so any thread
+    /// ID recorded for the disk work that differs from that thread is
+    /// necessarily a blocking-pool thread, never a misidentified worker.
+    #[test]
+    fn disk_get_and_insert_run_on_a_blocking_thread_not_the_worker() {
+        struct ThreadProbeClock {
+            last_thread: Mutex<Option<std::thread::ThreadId>>,
+        }
+        impl Clock for ThreadProbeClock {
+            fn now_ns(&self) -> u64 {
+                *self.last_thread.lock() = Some(std::thread::current().id());
+                0
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let async_thread_id = std::thread::current().id();
+
+            let tmp = TempDir::new().unwrap();
+            let probe = Arc::new(ThreadProbeClock {
+                last_thread: Mutex::new(None),
+            });
+            let disk = DiskCache::new_with_clock(
+                tmp.path().to_path_buf(),
+                generous_limits(),
+                probe.clone(),
+            );
+
+            // Pre-populate a disk-only entry directly (setup for the case
+            // under test below, not itself under test): the age check that
+            // fires the clock only runs on a hit.
+            let hit_key = test_key(1, 4);
+            disk.insert(hit_key, b"aaaa");
+
+            let ram: Cache<&'static str> = Cache::new(generous_limits());
+            let tiered = TieredCache::new(ram, disk);
+
+            probe.last_thread.lock().take();
+            let (_bytes, source) = tiered
+                .get_or_fetch(hit_key, || async {
+                    Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+                })
+                .await
+                .unwrap();
+            assert_eq!(source, Source::Cache, "the pre-populated key is a disk hit");
+            let get_thread = probe
+                .last_thread
+                .lock()
+                .take()
+                .expect("a disk hit's age check must call the clock");
+            assert_ne!(
+                get_thread, async_thread_id,
+                "DiskCache::get must run on a blocking-pool thread, not the \
+                 current_thread runtime's sole async thread"
+            );
+
+            let miss_key = test_key(2, 4);
+            let (_bytes, source) = tiered
+                .get_or_fetch(miss_key, || async {
+                    Ok::<Bytes, &'static str>(Bytes::from_static(b"bbbb"))
+                })
+                .await
+                .unwrap();
+            assert_eq!(source, Source::Upstream, "a fresh key is an upstream fetch");
+            let insert_thread = probe
+                .last_thread
+                .lock()
+                .take()
+                .expect("a fresh-key admission must call the clock to stamp written_at_ns");
+            assert_ne!(
+                insert_thread, async_thread_id,
+                "DiskCache::insert must run on a blocking-pool thread, not the \
+                 current_thread runtime's sole async thread"
+            );
+        });
+    }
+
+    /// #1702 acceptance test. On a `current_thread` runtime (a single async
+    /// thread and nothing else), a concurrent `get_or_fetch` for an
+    /// unrelated, RAM-resident key must not be delayed by another call's
+    /// slow disk insert, because that insert now runs on tokio's blocking
+    /// pool instead of the async thread.
+    ///
+    /// The leader uses [`resolve_peeked_miss`](TieredCache::resolve_peeked_miss),
+    /// not `get_or_fetch`: its closure goes straight from `fetch` to the disk
+    /// insert with no `disk.get` in between, so the leader's first (and only,
+    /// pre-fix) suspension point is unambiguously the insert -- there is no
+    /// earlier blocking-pool dispatch (`get_or_fetch`'s own `disk.get` miss
+    /// check) that could let the probe below run concurrently for a reason
+    /// unrelated to the insert.
+    ///
+    /// The disk tier's injected [`Clock`] sleeps for `SLOW_INSERT_MS` the
+    /// first time it is called, which is `DiskCache::insert`'s
+    /// `written_at_ns` stamp for this fresh key (the only clock call on this
+    /// path).
+    ///
+    /// FLIP (demonstrate failing on the unmodified tree): in
+    /// `TieredCache::resolve_peeked_miss`, replace the line
+    /// `let _ = tokio::task::spawn_blocking(move || disk.insert(key, &insert_bytes)).await;`
+    /// with the direct, pre-#1702 call `self.disk.insert(key, &bytes);`. On a
+    /// `current_thread` runtime, the leader's first poll then runs `fetch`
+    /// (ready immediately, no `.await` inside it), the RAM insert, and the
+    /// direct disk insert all in that single poll, uninterrupted: the sleep
+    /// blocks the only thread the runtime has for the whole `SLOW_INSERT_MS`
+    /// before that poll ever returns, so the probe below -- queued behind the
+    /// leader -- cannot be polled until it does. `elapsed` then reads
+    /// roughly `SLOW_INSERT_MS`, not under `BOUND_MS`, and the assertion
+    /// fails. Confirmed failing this way (observed elapsed 300.5ms against
+    /// the 100ms bound) before this comment was written, then reverted back
+    /// to the `spawn_blocking` version below.
+    #[test]
+    fn disk_tier_get_and_insert_run_on_the_blocking_pool() {
+        // `DiskCache::new_with_clock` itself calls `clock.now_ns()` once, from
+        // `scan_existing`, to timestamp the startup scan -- before this test's
+        // own timing window starts. An unconditional "sleep on the first
+        // call" clock would burn its one sleep there instead of on the
+        // insert this test means to catch, and then measure a falsely fast
+        // insert. `armed` is set only after construction returns, so the
+        // startup call is a no-op and the sleep lands on the first call
+        // after that: `resolve_peeked_miss`'s `written_at_ns` stamp.
+        struct SlowFirstCallClock {
+            armed: AtomicBool,
+            slept: AtomicBool,
+            sleep_for: Duration,
+        }
+        impl Clock for SlowFirstCallClock {
+            fn now_ns(&self) -> u64 {
+                if self.armed.load(Ordering::SeqCst) && !self.slept.swap(true, Ordering::SeqCst) {
+                    std::thread::sleep(self.sleep_for);
+                }
+                0
+            }
+        }
+
+        // The sleep the leader's disk insert incurs, and the bound the
+        // concurrent probe must beat: a third of the sleep leaves ample
+        // margin for scheduling jitter on a loaded machine while staying
+        // far above the sub-millisecond a true RAM hit takes, so a pass is
+        // never a coin flip.
+        const SLOW_INSERT_MS: u64 = 300;
+        const BOUND_MS: u64 = 100;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let clock = Arc::new(SlowFirstCallClock {
+                armed: AtomicBool::new(false),
+                slept: AtomicBool::new(false),
+                sleep_for: Duration::from_millis(SLOW_INSERT_MS),
+            });
+            let disk = DiskCache::new_with_clock(
+                tmp.path().to_path_buf(),
+                generous_limits(),
+                clock.clone(),
+            );
+            let ram: Cache<&'static str> = Cache::new(generous_limits());
+            let tiered = Arc::new(TieredCache::new(ram, disk));
+            clock.armed.store(true, Ordering::SeqCst);
+
+            let leader_key = test_key(1, 4);
+            let tiered_leader = tiered.clone();
+            let (fetch_entered_tx, fetch_entered_rx) = oneshot::channel::<()>();
+            let overall_start = Instant::now();
+            let leader = tokio::spawn(async move {
+                tiered_leader
+                    .resolve_peeked_miss(leader_key, move || async move {
+                        let _ = fetch_entered_tx.send(());
+                        Ok::<Bytes, &'static str>(Bytes::from_static(b"aaaa"))
+                    })
+                    .await
+            });
+
+            // Wait for confirmation that the leader's fetch ran, which
+            // requires the leader's first poll to have returned control to
+            // the executor (a single-threaded runtime cannot reschedule this
+            // task while the leader's poll is still on the stack). On the
+            // reverted (pre-#1702) tree, that first poll runs fetch, the RAM
+            // insert, AND the synchronous, un-instrumented disk insert
+            // (sleep included) before returning, so this wait absorbs the
+            // whole `SLOW_INSERT_MS`. On the fixed tree the poll returns as
+            // soon as the disk insert is dispatched to the blocking pool,
+            // long before the sleep resolves, so this wait is near-instant.
+            // A plain `tokio::task::yield_now().await` was tried first and
+            // does not give this guarantee: it only requires the leader to
+            // be *scheduled* by the time this task resumes, not to have been
+            // *polled*, so it let the probe below run before the leader's
+            // synchronous insert ever started and passed even on the
+            // reverted tree.
+            fetch_entered_rx.await.unwrap();
+
+            let probe_key = test_key(2, 4);
+            tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
+            let (served, source) = tiered
+                .get_or_fetch(probe_key, || async {
+                    unreachable!("a RAM-resident key must never fetch")
+                })
+                .await
+                .unwrap();
+            let elapsed = overall_start.elapsed();
+
+            assert_eq!(source, Source::Cache, "the probe key is a RAM hit");
+            assert_eq!(served, Bytes::from_static(b"bbbb"));
+            assert!(
+                elapsed < Duration::from_millis(BOUND_MS),
+                "a concurrent RAM-hit get_or_fetch took {elapsed:?}, over the \
+                 {BOUND_MS}ms bound; the leader's disk insert (sleeping \
+                 {SLOW_INSERT_MS}ms) must be running on the blocking pool, \
+                 not stalling the runtime's sole async thread"
+            );
+
+            let leader_bytes = leader.await.unwrap().unwrap();
+            assert_eq!(leader_bytes, Bytes::from_static(b"aaaa"));
+        });
     }
 }
