@@ -1545,6 +1545,30 @@ pub struct Cli {
     #[arg(long = "fragment-tls-ca", value_name = "PATH")]
     pub fragment_tls_ca: Option<PathBuf>,
 
+    /// The host (or `host:port`) sibling coordinators reach this process at
+    /// (issue #1724). Under `--distributed-query` this process publishes two
+    /// endpoints in its `sys/query/workers` heartbeat record: the fragment
+    /// endpoint (the dedicated `--fragment-listener` when one is configured,
+    /// otherwise the public gRPC listener) and the Flight SQL endpoint (always
+    /// the public gRPC listener). Both default to the address that listener
+    /// actually bound, which is unusable to a peer when the listener binds a
+    /// wildcard: no process can dial `0.0.0.0` or `::`. Startup refuses that
+    /// combination unless this flag supplies a routable host.
+    ///
+    /// The host applies to BOTH advertised endpoints. A port, if given, applies
+    /// to the fragment endpoint only; the Flight SQL endpoint always carries the
+    /// public gRPC listener's own bound port, because the two endpoints name
+    /// different services and a single port cannot stand for both. Omit the port
+    /// unless a NAT or port mapping makes the fragment listener reachable on a
+    /// different one than it bound; a host-only value keeps the bound port,
+    /// which is what makes an ephemeral (`:0`) bind still advertise correctly.
+    ///
+    /// An IPv6 literal may be written bare (`fd00::1`) or bracketed
+    /// (`[fd00::1]:4319`); it is always advertised bracketed, so the value is a
+    /// dialable authority. Meaningful only with `--distributed-query`.
+    #[arg(long = "advertise-fragment-endpoint", value_name = "HOST[:PORT]")]
+    pub advertise_fragment_endpoint: Option<String>,
+
     /// The distinct internal-workload admission cap for inbound fragment
     /// (`SeriesFetch`) requests (ADR-0071): the maximum number of
     /// slice fetches this process serves concurrently for remote coordinators.
@@ -3118,6 +3142,140 @@ pub struct DistribSettings {
     /// and the PEM material read once at startup. When `None`, the fragment
     /// surface stays on the public gRPC listener (the pre-amendment layout).
     pub fragment_listener: Option<FragmentListenerSettings>,
+    /// The routable endpoint this process advertises to sibling coordinators
+    /// (`--advertise-fragment-endpoint`, issue #1724). `None` means advertise
+    /// the bound addresses verbatim, which `Cli::validate` has proven are not
+    /// wildcards.
+    pub advertise_endpoint: Option<AdvertisedEndpoint>,
+}
+
+/// A parsed `--advertise-fragment-endpoint` (issue #1724): the host sibling
+/// coordinators dial this process at, and an optional fragment port override.
+///
+/// The heartbeat record publishes two endpoints and they differ in one respect,
+/// which is why this is a host plus an optional port rather than a
+/// [`SocketAddr`]: the fragment lane may be port-mapped independently, while the
+/// Flight SQL lane always lives on the public gRPC listener's own bound port.
+/// Keeping the port optional is also what lets an ephemeral (`:0`) bind
+/// advertise correctly, since the real port is only known after the bind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvertisedEndpoint {
+    /// The host as the operator wrote it, unbracketed even for an IPv6 literal.
+    host: String,
+    /// The fragment-lane port override; `None` advertises the bound port.
+    port: Option<u16>,
+}
+
+impl AdvertisedEndpoint {
+    /// Parse the flag value. Accepts `host`, `host:port`, a bare IPv6 literal
+    /// (`fd00::1`), and a bracketed one with or without a port
+    /// (`[fd00::1]:4319`). Rejects an empty host, a wildcard host (`0.0.0.0`,
+    /// `::`, both of which are exactly what this flag exists to replace), a
+    /// zero port, and anything else that would not round-trip into a dialable
+    /// `host:port` authority.
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        let raw = raw.trim();
+        let (host, port) = if let Some(rest) = raw.strip_prefix('[') {
+            let (inside, after) = rest.split_once(']').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --advertise-fragment-endpoint '{raw}': a bracketed IPv6 literal \
+                     needs a closing ']'"
+                )
+            })?;
+            let port = match after {
+                "" => None,
+                other => Some(parse_advertised_port(
+                    raw,
+                    other.strip_prefix(':').ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid --advertise-fragment-endpoint '{raw}': expected ':<port>' \
+                             or nothing after ']'"
+                        )
+                    })?,
+                )?),
+            };
+            (inside.to_string(), port)
+        } else if raw.parse::<std::net::Ipv6Addr>().is_ok() {
+            // A bare IPv6 literal: every colon belongs to the address, so there
+            // is no port to split off.
+            (raw.to_string(), None)
+        } else if let Some((host, port)) = raw.rsplit_once(':') {
+            if host.contains(':') {
+                anyhow::bail!(
+                    "invalid --advertise-fragment-endpoint '{raw}': an IPv6 literal with a port \
+                     must be bracketed, as in '[fd00::1]:4319'"
+                );
+            }
+            (host.to_string(), Some(parse_advertised_port(raw, port)?))
+        } else {
+            (raw.to_string(), None)
+        };
+
+        if host.is_empty() {
+            anyhow::bail!("invalid --advertise-fragment-endpoint '{raw}': the host is empty");
+        }
+        if host.contains(char::is_whitespace) || host.contains('/') {
+            anyhow::bail!(
+                "invalid --advertise-fragment-endpoint '{raw}': expected a bare host or \
+                 host:port, not a URL"
+            );
+        }
+        if host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified())
+        {
+            anyhow::bail!(
+                "invalid --advertise-fragment-endpoint '{raw}': '{host}' is the wildcard address, \
+                 which is what this flag exists to replace. Advertise a host sibling \
+                 coordinators can dial."
+            );
+        }
+        Ok(AdvertisedEndpoint { host, port })
+    }
+
+    /// The host, bracketed when it is an IPv6 literal so the rendered value is a
+    /// dialable authority.
+    fn authority_host(&self) -> String {
+        if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        }
+    }
+
+    /// The fragment endpoint to advertise for a fragment listener bound at
+    /// `bound`: the advertised host with the flag's port override, or the port
+    /// the listener actually bound when the flag carried none.
+    pub fn fragment_endpoint(&self, bound: SocketAddr) -> String {
+        format!(
+            "{}:{}",
+            self.authority_host(),
+            self.port.unwrap_or(bound.port())
+        )
+    }
+
+    /// The Flight SQL endpoint to advertise for a public gRPC listener bound at
+    /// `bound`: the advertised host with that listener's own bound port. The
+    /// flag's optional port is deliberately not applied here; it names the
+    /// fragment lane, and the two lanes are different services.
+    pub fn flight_sql_endpoint(&self, bound: SocketAddr) -> String {
+        format!("{}:{}", self.authority_host(), bound.port())
+    }
+}
+
+/// Parse the port half of an `--advertise-fragment-endpoint` value. Port `0` is
+/// refused: it means "any port" to a bind, and nothing at all to a dial.
+fn parse_advertised_port(raw: &str, port: &str) -> anyhow::Result<u16> {
+    let parsed: u16 = port.parse().map_err(|e| {
+        anyhow::anyhow!("invalid --advertise-fragment-endpoint '{raw}': bad port '{port}': {e}")
+    })?;
+    if parsed == 0 {
+        anyhow::bail!(
+            "invalid --advertise-fragment-endpoint '{raw}': port 0 is not dialable. Omit the \
+             port to advertise the port the listener actually bound."
+        );
+    }
+    Ok(parsed)
 }
 
 /// The dedicated TLS fragment listener's resolved configuration (ADR-0071
@@ -4007,7 +4165,37 @@ impl Cli {
                 max_parallel_slices: self.max_parallel_slices.max(1),
             },
             fragment_listener,
+            advertise_endpoint: self.parse_advertise_fragment_endpoint()?,
         }))
+    }
+
+    /// Parse `--advertise-fragment-endpoint` (issue #1724), or `Ok(None)` when
+    /// the flag is unset. Called from [`Cli::validate`] as well as from the
+    /// settings build, so a malformed value fails startup at the same point
+    /// every other cross-flag invariant does.
+    pub fn parse_advertise_fragment_endpoint(&self) -> anyhow::Result<Option<AdvertisedEndpoint>> {
+        self.advertise_fragment_endpoint
+            .as_deref()
+            .map(AdvertisedEndpoint::parse)
+            .transpose()
+    }
+
+    /// The listeners whose bound address this process would publish in its
+    /// `sys/query/workers` heartbeat record under `--distributed-query`, paired
+    /// with the flag that binds each: the fragment lane (the dedicated
+    /// `--fragment-listener` when configured, otherwise the public gRPC
+    /// listener, which is where the pre-amendment combined surface lives) and
+    /// the Flight SQL lane (always the public gRPC listener).
+    ///
+    /// Derived from `lib.rs`'s advertisement site, not guessed: a lane added
+    /// there has to be added here too, or its wildcard bind stops being
+    /// refused.
+    fn advertised_listeners(&self) -> Vec<(&'static str, SocketAddr)> {
+        let mut listeners = vec![("--listen-grpc", self.listen_grpc)];
+        if let Some(fragment_listener) = self.fragment_listener {
+            listeners.push(("--fragment-listener", fragment_listener));
+        }
+        listeners
     }
 
     /// The default per-remote soft timeout for federated fetches
@@ -4659,10 +4847,55 @@ impl Cli {
                  --fragment-listener, or drop the TLS flags."
             );
         }
+        // Parsed unconditionally so a malformed value fails startup even in a
+        // configuration where it would never be read.
+        let advertise = self.parse_advertise_fragment_endpoint()?;
+        if advertise.is_some() && !self.distributed_query {
+            anyhow::bail!(
+                "--advertise-fragment-endpoint was set but --distributed-query was not: the \
+                 advertised endpoints are only published in the sys/query/workers heartbeat \
+                 record a distributed-query process writes, so without the flag this value is \
+                 inert. Set --distributed-query, or drop --advertise-fragment-endpoint."
+            );
+        }
         if self.distributed_query {
+            // Issue #1724: under `--distributed-query` this process publishes
+            // its fragment and Flight SQL endpoints for sibling coordinators to
+            // dial, and the published value defaults to the address the
+            // listener bound. A wildcard bind therefore advertises an address
+            // no peer can dial, and the failure is silent and remote: every
+            // sibling's dispatch to this worker fails at connect and falls back
+            // to coordinator-local execution, so distribution degrades to
+            // local reads with nothing failing on this process. Refuse at
+            // startup unless the operator supplies a routable host.
+            if advertise.is_none() {
+                let wildcard: Vec<(&str, SocketAddr)> = self
+                    .advertised_listeners()
+                    .into_iter()
+                    .filter(|(_, addr)| addr.ip().is_unspecified())
+                    .collect();
+                if !wildcard.is_empty() {
+                    let named = wildcard
+                        .iter()
+                        .map(|(flag, addr)| format!("{flag} {addr}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    anyhow::bail!(
+                        "--distributed-query requires --advertise-fragment-endpoint when a \
+                         published listener binds an unspecified address: {named}. This process \
+                         publishes those addresses in its sys/query/workers record for sibling \
+                         coordinators to dial, and no peer can dial a wildcard. Pass \
+                         --advertise-fragment-endpoint <host[:port]> with a host peers can \
+                         reach, or bind the listener to a specific address."
+                    );
+                }
+            }
+
             // Reading it here (not only in `parse_distrib_settings`) fails
             // startup on an unreadable, empty, or malformed key file at the same
-            // point every other credential file is validated.
+            // point every other credential file is validated. It runs after the
+            // pure flag checks above so a wildcard bind is reported as itself,
+            // not as whichever credential file happens to be unreadable too.
             self.parse_distrib_settings()?;
         }
         if self.max_parallel_slices == 0 {
@@ -10013,6 +10246,170 @@ mod tests {
             err.to_string().contains("--fragment-listener"),
             "names the required flag: {err}"
         );
+    }
+
+    /// Issue #1724 acceptance: a wildcard-bound published listener under
+    /// `--distributed-query` refuses startup unless
+    /// `--advertise-fragment-endpoint` supplies a routable host, and with the
+    /// flag the advertised host reaches BOTH published endpoints.
+    ///
+    /// Without the refusal the failure is remote and silent: every sibling
+    /// coordinator dials `0.0.0.0`, fails at connect, and falls back to
+    /// coordinator-local execution, so distribution quietly stops while this
+    /// process reports nothing.
+    #[test]
+    fn distributed_query_refuses_unspecified_listener_without_advertise_endpoint() {
+        let key = fragment_key_tmp();
+        let key_path = key.path().to_str().expect("utf8");
+
+        let err = cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            key_path,
+            "--listen-grpc",
+            "0.0.0.0:4317",
+        ])
+        .validate()
+        .expect_err("a wildcard --listen-grpc with no advertise endpoint must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("0.0.0.0:4317"),
+            "the error names the offending address: {msg}"
+        );
+        assert!(
+            msg.contains("--advertise-fragment-endpoint"),
+            "the error names the flag that fixes it: {msg}"
+        );
+
+        // With the flag the same configuration validates, and the advertised
+        // host reaches both lanes. The bound ports are what a `:0` bind
+        // resolved to, which is why a host-only value must keep them.
+        let parsed = cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            key_path,
+            "--listen-grpc",
+            "0.0.0.0:4317",
+            "--advertise-fragment-endpoint",
+            "worker-3.ravel.svc",
+        ]);
+        parsed
+            .validate()
+            .expect("a wildcard bind with an advertised host validates");
+        let settings = parsed
+            .parse_distrib_settings()
+            .expect("settings parse")
+            .expect("--distributed-query yields settings");
+        let advertise = settings
+            .advertise_endpoint
+            .expect("the advertised endpoint reaches the distrib settings");
+        let fragment_bound: SocketAddr = "0.0.0.0:35001".parse().expect("addr");
+        let grpc_bound: SocketAddr = "0.0.0.0:35002".parse().expect("addr");
+        assert_eq!(
+            advertise.fragment_endpoint(fragment_bound),
+            "worker-3.ravel.svc:35001",
+            "the fragment endpoint takes the advertised host and the bound port"
+        );
+        assert_eq!(
+            advertise.flight_sql_endpoint(grpc_bound),
+            "worker-3.ravel.svc:35002",
+            "the Flight SQL endpoint takes the same host and its own bound port"
+        );
+    }
+
+    /// The dedicated fragment listener is the other published lane, and it is
+    /// refused on the same rule. The check runs before the TLS PEM paths are
+    /// read (they do not exist here), so the wildcard is reported as itself.
+    #[test]
+    fn wildcard_fragment_listener_without_advertise_endpoint_fails_validate() {
+        let key = fragment_key_tmp();
+        let args = fragment_base_args(key.path().to_str().expect("utf8"), "0.0.0.0:4319");
+        let err = cli(&args)
+            .validate()
+            .expect_err("a wildcard --fragment-listener must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--fragment-listener 0.0.0.0:4319"),
+            "the error names the offending listener and address: {msg}"
+        );
+        assert!(
+            msg.contains("--advertise-fragment-endpoint"),
+            "the error names the flag that fixes it: {msg}"
+        );
+    }
+
+    /// Positive control: loopback binds (what every test and single-node
+    /// deployment uses) need no advertise endpoint, so the rule above is not
+    /// rejecting every distributed configuration.
+    #[test]
+    fn loopback_listeners_need_no_advertise_endpoint() {
+        let key = fragment_key_tmp();
+        cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            key.path().to_str().expect("utf8"),
+            "--listen-grpc",
+            "127.0.0.1:0",
+        ])
+        .validate()
+        .expect("a loopback bind advertises a dialable address on its own");
+    }
+
+    #[test]
+    fn advertise_fragment_endpoint_without_distributed_query_fails_validate() {
+        let err = cli(&["--advertise-fragment-endpoint", "worker-3.ravel.svc"])
+            .validate()
+            .expect_err("an inert advertise endpoint must refuse startup");
+        assert!(
+            err.to_string().contains("--distributed-query"),
+            "the error names the flag that would make it live: {err}"
+        );
+    }
+
+    /// The accepted spellings and what each renders, plus the refusals. The
+    /// port half names the fragment lane only, so it never displaces the Flight
+    /// SQL listener's own bound port.
+    #[test]
+    fn advertised_endpoint_parses_host_and_optional_port() {
+        let bound: SocketAddr = "0.0.0.0:4319".parse().expect("addr");
+        let grpc: SocketAddr = "0.0.0.0:4317".parse().expect("addr");
+
+        let host_only = AdvertisedEndpoint::parse("worker-3.ravel.svc").expect("host only");
+        assert_eq!(
+            host_only.fragment_endpoint(bound),
+            "worker-3.ravel.svc:4319"
+        );
+        assert_eq!(
+            host_only.flight_sql_endpoint(grpc),
+            "worker-3.ravel.svc:4317"
+        );
+
+        let with_port = AdvertisedEndpoint::parse("10.1.2.3:31319").expect("host:port");
+        assert_eq!(
+            with_port.fragment_endpoint(bound),
+            "10.1.2.3:31319",
+            "an explicit port overrides the fragment listener's bound port"
+        );
+        assert_eq!(
+            with_port.flight_sql_endpoint(grpc),
+            "10.1.2.3:4317",
+            "the Flight SQL lane keeps its own bound port"
+        );
+
+        let bare_v6 = AdvertisedEndpoint::parse("fd00::1").expect("bare IPv6");
+        assert_eq!(
+            bare_v6.fragment_endpoint(bound),
+            "[fd00::1]:4319",
+            "an IPv6 literal is advertised bracketed so the value is dialable"
+        );
+        let bracketed_v6 = AdvertisedEndpoint::parse("[fd00::1]:31319").expect("bracketed IPv6");
+        assert_eq!(bracketed_v6.fragment_endpoint(bound), "[fd00::1]:31319");
+
+        for bad in ["", "0.0.0.0", "::", "host:0", "host:notaport", "[fd00::1"] {
+            AdvertisedEndpoint::parse(bad)
+                .err()
+                .unwrap_or_else(|| panic!("'{bad}' must be refused"));
+        }
     }
 
     #[test]
