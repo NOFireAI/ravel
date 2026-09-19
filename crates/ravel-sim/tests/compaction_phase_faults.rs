@@ -15,6 +15,14 @@
 //!   the flip proving the recover-branch test is non-vacuous: the same fault
 //!   armed `Nth(1)` recovers, armed `Always` fails loud.
 //!
+//! - `catalog_put_fault_on_fold_recovers_or_returns_typed_error`: the same two
+//!   branches for the fold phase. `Catalog::fold` is idempotent on retry after
+//!   a throttled catalog PUT (the reasoning and the fold code it rests on are
+//!   in `ravel_sim::fault_plan`'s module docs), so the generated `Nth(1)` fault
+//!   fires exactly once, the driver's single re-run absorbs it, and the cycle
+//!   digest equals the fault-free run's digest bit for bit. Armed `Always`, the
+//!   same fault exhausts the budget and surfaces a typed `CycleError::Fold`.
+//!
 //! Replay a failing seed: `RAVEL_SIM_SEED=<seed> cargo test -p ravel-sim
 //! each_compaction_fault_kind_recovers` (the seed is also in the panic
 //! message, since the batch names each seed directly).
@@ -22,7 +30,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, ScriptedFault};
-use ravel_sim::fault_plan::{FaultSchedule, L1_SUBSTR};
+use ravel_sim::fault_plan::{CATALOG_SNAPSHOT_SUBSTR, FaultSchedule, L1_SUBSTR};
 use ravel_sim::workload::{CardinalityShape, WorkloadConfig};
 use ravel_sim::{CycleConfig, CycleError, MasterSeed, run_cycle};
 
@@ -212,6 +220,95 @@ fn each_compaction_fault_kind_recovers() {
                 outcome.fault_counters
             );
         }
+    }
+}
+
+#[test]
+fn catalog_put_fault_on_fold_recovers_or_returns_typed_error() {
+    let config = compacting_config();
+    // The fault-free baseline for the same seed and workload: the digest the
+    // recovered run must reproduce, and the zero the fired counter must differ
+    // from.
+    let clean_config = CycleConfig {
+        inject_faults: false,
+        ..compacting_config()
+    };
+
+    for seed in 1u64..=6 {
+        // Recover branch. A fold the re-run could not absorb would surface
+        // here as `CycleError::Fold`, so reaching the assertions at all is
+        // already the "must not report success on an unrecovered fault" half.
+        let outcome = run_cycle(MasterSeed::new(seed), &config).unwrap_or_else(|err| {
+            panic!("seed {seed}: fold-phase catalog PUT fault was not recovered: {err}")
+        });
+
+        // Exactly once: the rule is `Occurrence::Nth(1)` on the fold-only
+        // `FaultStore`. Zero would mean the fault never reached a catalog
+        // snapshot PUT and the recovery below was never exercised; two would
+        // mean a rule that must fire once fired twice.
+        assert_eq!(
+            outcome.fold_faults_fired, 1,
+            "seed {seed}: fold-phase catalog PUT fault fired {} times, want exactly 1 \
+             (counters: {:?})",
+            outcome.fold_faults_fired, outcome.fault_counters
+        );
+
+        let clean = run_cycle(MasterSeed::new(seed), &clean_config)
+            .unwrap_or_else(|err| panic!("seed {seed}: fault-free baseline cycle failed: {err}"));
+        assert_eq!(
+            clean.fold_faults_fired, 0,
+            "seed {seed}: the fault-free baseline fired a fold fault, so the comparison below \
+             is not against an unfaulted run"
+        );
+
+        // Idempotency, asserted rather than assumed: the snapshot the retried
+        // fold published serves query results identical to the run where no
+        // catalog PUT was ever faulted.
+        assert_eq!(
+            outcome.digest, clean.digest,
+            "seed {seed}: cycle digest after a recovered fold fault ({:#018x}) differs from the \
+             fault-free run ({:#018x}); the retried fold was not idempotent",
+            outcome.digest.0, clean.digest.0
+        );
+        assert_eq!(
+            outcome.records_conserved, clean.records_conserved,
+            "seed {seed}: record count after a recovered fold fault differs from the fault-free run"
+        );
+        assert!(
+            outcome.records_conserved > 0,
+            "seed {seed}: the digest comparison covered zero records"
+        );
+    }
+
+    // Typed-error branch: the same target armed `Always` can never be cleared,
+    // so the bounded re-run gives up and the cycle fails with a typed
+    // `CycleError::Fold` rather than reporting a successful run.
+    let stuck = CycleConfig {
+        fault_schedule_override: Some(unrecoverable_fold_schedule()),
+        ..compacting_config()
+    };
+    let err = run_cycle(MasterSeed::new(1), &stuck).expect_err(
+        "a fold fault the re-run cannot clear must surface a typed error, \
+         not recover or silently succeed",
+    );
+    assert!(
+        matches!(err, CycleError::Fold { .. }),
+        "expected a typed CycleError::Fold, got: {err}"
+    );
+}
+
+/// An `Always` throttled PUT on the catalog snapshot prefix that the bounded
+/// fold re-run can never clear, injected via `fault_schedule_override` so its
+/// reachability is exact.
+fn unrecoverable_fold_schedule() -> FaultSchedule {
+    let fold_plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::Throttled { retry_after_ms: 50 })
+            .with_key_contains(CATALOG_SNAPSHOT_SUBSTR)
+            .with_occurrence(Occurrence::Always),
+    );
+    FaultSchedule {
+        fold_plan,
+        ..FaultSchedule::none()
     }
 }
 
