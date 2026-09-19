@@ -53,7 +53,10 @@ pub use config::{
     MAX_RESOLVE_GET_CONCURRENCY,
 };
 pub use covering_postings::{LoadPostingsError, LoadedCoveringPostings, load_covering_postings};
-pub use declared_stats::{DeclaredColumnStats, read_snapshot_entry};
+pub use declared_stats::{
+    DeclaredColumnStats, fold_stamped_entries_total, fold_stamped_records_total,
+    read_snapshot_entry,
+};
 pub use error::CatalogError;
 pub use fold::{FoldReport, PostingsBuildError, RefoldRequest, Transaction, fetch_segment_names};
 pub use key_epoch::{

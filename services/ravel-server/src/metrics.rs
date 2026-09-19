@@ -289,6 +289,13 @@ pub enum Label {
     /// closed enum owned by [`crate::distrib`], since the classes are the
     /// admission layer's own, not a dimension this renderer invents.
     AdmissionClass(crate::distrib::AdmissionClass),
+    /// Which ADR-0873 declared-statistics carrier a
+    /// `ravel_declared_stats_drops_observed_total` sample counts drops under.
+    /// A closed enum owned by [`ravel_commit::declared_stats`], which is also
+    /// where the dashed label spelling lives, since "which writer do I look
+    /// at" is the question a nonzero drop tally asks and the answer has to
+    /// name the carrier the ADR names.
+    StatCarrier(ravel_commit::declared_stats::StatCarrier),
 }
 
 /// Which high-water mark a `ravel_maintain_rlog_merge_peak_bytes` sample is
@@ -419,6 +426,7 @@ impl Label {
             Label::AllocatorStat(_) => "stat",
             Label::MemoryComponent(_) => "component",
             Label::AdmissionClass(_) => "class",
+            Label::StatCarrier(_) => "carrier",
         }
     }
 
@@ -441,6 +449,7 @@ impl Label {
             Label::AllocatorStat(stat) => stat.name().to_string(),
             Label::MemoryComponent(component) => component.name().to_string(),
             Label::AdmissionClass(class) => admission_class_name(*class).to_string(),
+            Label::StatCarrier(carrier) => carrier.label().to_string(),
         }
     }
 }
@@ -1738,6 +1747,78 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
             fold.last_success_unix_ns as f64 / 1e9,
         );
     }
+}
+
+/// ADR-0873 declared-statistics observability: decision 2's per-carrier drop
+/// tally, and the fold's stamp-coverage pair.
+///
+/// `drops` renders in every mode, one sample per carrier in
+/// [`ravel_commit::declared_stats::StatCarrier::ALL`] whether or not that
+/// carrier has moved, because the four carriers are read by four different
+/// subsystems and no single mode covers them: ingest stamps commit records,
+/// maintenance stamps compaction parts, the fold copies onto snapshot
+/// entries, and ravel-sql reads `.cstat`. Gating this family on folding would
+/// hide the compaction-part drops in the one mode that compacts.
+///
+/// `coverage` is the fold's `(stamped_records, stamped_entries)` totals, and
+/// is `None` in a mode that runs no fold task ([`Mode::Maintain`]): both fold
+/// families are then omitted rather than rendered as zero, the same
+/// structural absence the ingest families use. The absence is load-bearing
+/// for the alert rules in docs/guides/observability.md. An old fold cannot
+/// emit a counter it does not have, so the detectable signal is a divergence
+/// between the two counters, or the fold-side family being absent while the
+/// ingest side rises; a family always present at zero would make those two
+/// cases read the same as a healthy idle fold.
+fn render_declared_stats_family(
+    out: &mut String,
+    mode: Mode,
+    drops: &[(ravel_commit::declared_stats::StatCarrier, u64)],
+    coverage: Option<(u64, u64)>,
+) {
+    write_header(
+        out,
+        "ravel_declared_stats_drops_observed_total",
+        "Declared-column statistics entries a reader dropped as defective, by carrier. Counts observations, not distinct defects: one bad entry read by many queries counts many times.",
+        "counter",
+    );
+    for (carrier, observed) in drops {
+        write_sample(
+            out,
+            "ravel_declared_stats_drops_observed_total",
+            &[Label::Mode(mode), Label::StatCarrier(*carrier)],
+            *observed,
+        );
+    }
+
+    let Some((stamped_records, stamped_entries)) = coverage else {
+        return;
+    };
+
+    write_header(
+        out,
+        "ravel_catalog_fold_stamped_records_total",
+        "Commit records carrying declared-column statistics that the fold read. The denominator of the fold's stamp coverage.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_fold_stamped_records_total",
+        &[Label::Mode(mode)],
+        stamped_records,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_fold_stamped_entries_total",
+        "Snapshot entries the fold wrote carrying declared-column statistics. Below the records total means stamps are being read and not carried through.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_fold_stamped_entries_total",
+        &[Label::Mode(mode)],
+        stamped_entries,
+    );
 }
 
 /// Tenancy adoption counter (ADR-0050 section 3). Counts buckets this process
@@ -4603,6 +4684,25 @@ pub fn render(
         render_logs_postings_family(&mut out, mode, ingest);
     }
     render_catalog_family(&mut out, mode, catalog);
+    // Process-global reads, like `crate::tenancy::v1_unkeyed_adoption_count`
+    // below: the drop tally is incremented by every reader in the process
+    // (ravel-commit and ravel-sql), and the fold totals are accumulated by
+    // `ravel_catalog::fold` as each fold attempt commits its HEAD, so neither
+    // has a snapshot struct the `/metrics` route is handed. The fold totals
+    // are read only in a mode that spawns the fold task, which is every mode
+    // but `Mode::Maintain` (`crate::lib`'s task wiring), so the two fold
+    // families are omitted rather than pinned at zero there.
+    render_declared_stats_family(
+        &mut out,
+        mode,
+        &ravel_commit::declared_stats::declared_stat_drops_observed_all(),
+        (!matches!(mode, Mode::Maintain)).then(|| {
+            (
+                ravel_catalog::fold_stamped_records_total(),
+                ravel_catalog::fold_stamped_entries_total(),
+            )
+        }),
+    );
     render_tenancy_family(&mut out, mode, crate::tenancy::v1_unkeyed_adoption_count());
     render_provisioning_family(
         &mut out,
@@ -5303,7 +5403,9 @@ mod tests {
         // gauge; `class` is the sixteenth, added by ADR-0071's admission
         // disjointness deliverable (issue #1722) to split the fragment
         // in-flight gauge and admission-wait counters into their `Pinned`
-        // and `Resolve` classes.
+        // and `Resolve` classes; `carrier` is the seventeenth, added by
+        // ADR-0873 decision 2 to split the declared-statistics drop tally
+        // across its four carriers.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -5322,6 +5424,7 @@ mod tests {
             Label::AllocatorStat(AllocatorStat::Allocated),
             Label::MemoryComponent(MemoryComponent::Sql),
             Label::AdmissionClass(crate::distrib::AdmissionClass::Pinned),
+            Label::StatCarrier(ravel_commit::declared_stats::StatCarrier::CommitRecord),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -5343,6 +5446,7 @@ mod tests {
                 Label::AllocatorStat(_) => "stat",
                 Label::MemoryComponent(_) => "component",
                 Label::AdmissionClass(_) => "class",
+                Label::StatCarrier(_) => "carrier",
             })
             .collect();
         assert_eq!(
@@ -5368,17 +5472,18 @@ mod tests {
                 "stat",
                 "component",
                 "class",
+                "carrier",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), the `cache` label, #97's `tier` \
              label, ADR-0065 decision 4's `kind`, #532's `outcome`, #1170's \
-             `allocator`/`stat`, ADR-1170 decision 4's `component`, and ADR-0071's `class` \
-             (issue #1722); `shard` must never appear here"
+             `allocator`/`stat`, ADR-1170 decision 4's `component`, ADR-0071's `class` \
+             (issue #1722), and ADR-0873 decision 2's `carrier`; `shard` must never appear here"
         );
         assert_eq!(
             one_of_each.len(),
-            17,
-            "exactly 17 label variants, 16 distinct keys"
+            18,
+            "exactly 18 label variants, 17 distinct keys"
         );
     }
 
@@ -6795,6 +6900,111 @@ mod tests {
                 "a zero {signal} failure counter must render, not be omitted:\n{body}"
             );
         }
+    }
+
+    /// Every carrier is driven with a DIFFERENT drop count and asserted
+    /// against its own label, so a renderer that paired the values with the
+    /// wrong carriers, or emitted one carrier four times, fails here. The
+    /// fold pair is likewise asserted at two different values, since a
+    /// renderer that read the records total for both samples matches any
+    /// assertion that only checks both names appear.
+    #[test]
+    fn declared_stats_family_renders_every_carrier_and_the_fold_coverage_pair() {
+        use ravel_commit::declared_stats::StatCarrier;
+
+        let mut out = String::new();
+        render_declared_stats_family(
+            &mut out,
+            Mode::All,
+            &[
+                (StatCarrier::CommitRecord, 11),
+                (StatCarrier::CompactionPart, 22),
+                (StatCarrier::SnapshotEntry, 33),
+                (StatCarrier::Cstat, 44),
+            ],
+            Some((907, 903)),
+        );
+
+        for (carrier, observed) in [
+            ("commit-record", 11),
+            ("compaction-part", 22),
+            ("snapshot-entry", 33),
+            ("cstat", 44),
+        ] {
+            let sample = format!(
+                "ravel_declared_stats_drops_observed_total{{mode=\"all\",carrier=\"{carrier}\"}} {observed}\n"
+            );
+            assert_eq!(
+                out.matches(&sample).count(),
+                1,
+                "the {carrier} drop tally must render exactly once at {observed}:\n{out}"
+            );
+        }
+        assert_eq!(
+            out.matches("ravel_declared_stats_drops_observed_total{")
+                .count(),
+            4,
+            "exactly the four ADR-0873 carriers may render:\n{out}"
+        );
+        assert_eq!(
+            out.matches("ravel_catalog_fold_stamped_records_total{mode=\"all\"} 907\n")
+                .count(),
+            1,
+            "the stamped-records total must render exactly once at 907:\n{out}"
+        );
+        assert_eq!(
+            out.matches("ravel_catalog_fold_stamped_entries_total{mode=\"all\"} 903\n")
+                .count(),
+            1,
+            "the stamped-entries total must render exactly once at 903:\n{out}"
+        );
+        assert!(
+            out.contains("# TYPE ravel_catalog_fold_stamped_records_total counter")
+                && out.contains("# TYPE ravel_catalog_fold_stamped_entries_total counter")
+                && out.contains("# TYPE ravel_declared_stats_drops_observed_total counter"),
+            "each family must declare its type:\n{out}"
+        );
+    }
+
+    /// A mode that runs no fold task omits the coverage pair entirely instead
+    /// of rendering it at zero, while the drop tally still renders: the
+    /// shortfall alert reads absence as "this process does not fold", which a
+    /// zero sample would make indistinguishable from an idle fold. The drop
+    /// tally is not gated the same way, because the compaction-part drops are
+    /// observed in exactly the mode that folds nothing.
+    #[test]
+    fn declared_stats_fold_coverage_is_absent_when_the_mode_runs_no_fold() {
+        use ravel_commit::declared_stats::StatCarrier;
+
+        let mut out = String::new();
+        render_declared_stats_family(
+            &mut out,
+            Mode::Maintain,
+            &[
+                (StatCarrier::CommitRecord, 0),
+                (StatCarrier::CompactionPart, 5),
+                (StatCarrier::SnapshotEntry, 0),
+                (StatCarrier::Cstat, 0),
+            ],
+            None,
+        );
+
+        assert_eq!(
+            out.matches(
+                "ravel_declared_stats_drops_observed_total{mode=\"maintain\",carrier=\"compaction-part\"} 5\n"
+            )
+            .count(),
+            1,
+            "the compaction-part drop tally must still render in maintain mode:\n{out}"
+        );
+        assert!(
+            !out.contains("ravel_catalog_fold_stamped_records_total"),
+            "a mode that runs no fold must omit the stamped-records family:\n{out}"
+        );
+        assert!(
+            !out.contains("ravel_catalog_fold_stamped_entries_total"),
+            "a mode that runs no fold must omit the stamped-entries family:\n{out}"
+        );
     }
 
     #[test]
