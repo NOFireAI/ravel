@@ -72,6 +72,16 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// loud typed error rather than an infinite loop.
 const COMPACTION_FAULT_RETRY_BUDGET: usize = 6;
 
+/// Attempts the fold recovery loop makes before surfacing the typed error:
+/// one retry after the first attempt. The generated fold-phase fault is
+/// `Occurrence::Nth(1)` on a dedicated `FaultStore`, so exactly one retry
+/// clears it, and `Catalog::fold` is idempotent on that retry (see the
+/// fold-idempotency section of [`crate::fault_plan`], which derives it from
+/// the fold's own code). A stuck fault (`Occurrence::Always`, reachable only
+/// through a test override) exhausts this budget and becomes a loud
+/// [`CycleError::Fold`] instead of an unbounded loop.
+const FOLD_FAULT_RETRY_BUDGET: usize = 2;
+
 /// A shared handle to an [`ObjectStoreBackend`] that is itself a backend, so a
 /// second [`FaultStore`] can wrap the same underlying store the ingest phase
 /// writes through. The compaction/sweep fault plans live on
@@ -375,6 +385,15 @@ pub struct CycleOutcome {
     /// The faulted pass's own [`SweepReport::unreferenced_parts_deleted`]. Zero
     /// when [`Self::faulted_sweep_pass`] is `None`.
     pub faulted_pass_unreferenced_parts_deleted: usize,
+    /// Exact number of times the fold-phase fault fired this cycle, read from
+    /// the fold-only [`FaultStore`]. The generated rule is
+    /// `Occurrence::Nth(1)` on the catalog snapshot prefix, so a cycle whose
+    /// fold published a snapshot part reports exactly 1, and a cycle with
+    /// faults disabled reports 0. A test asserts the exact figure rather than
+    /// "non-zero": 2 would mean the fold ran twice against a rule that must
+    /// fire once, and 0 would mean the fault was unreachable and the recovery
+    /// it claims to exercise never ran.
+    pub fold_faults_fired: u64,
     /// Snapshot of the [`FaultStore`] counters after the cycle: how many times
     /// each `(Op, FaultKind)` fired. Empty when `inject_faults` is false.
     pub fault_counters: HashMap<(Op, FaultKind), u64>,
@@ -603,6 +622,61 @@ async fn sweep_shard_recover(
             Err(source) => return Err(CycleError::Sweep { seed, source }),
         }
     }
+}
+
+/// Whether a [`CatalogError`] is one the driver's fold re-run can recover
+/// from: a retryable store fault (`Transient`/`Throttled`/`Timeout`). Unlike
+/// the compaction path, `NotFound` is NOT recoverable here -- the fold-phase
+/// schedule injects no not-found blip, and a genuine absence on the fold path
+/// is a definite answer about the snapshot layout. Every other `CatalogError`
+/// (an unsupported HEAD version, exhausted CAS retries, a malformed commit
+/// record) is surfaced immediately as a typed error, never retried.
+fn is_recoverable_catalog_error(e: &CatalogError) -> bool {
+    matches!(e, CatalogError::Store(se) if se.is_retryable())
+}
+
+/// Fold one tenant's catalog, absorbing a recoverable fold-phase fault with a
+/// bounded re-run. Returns on the recover branch, or a typed
+/// [`CycleError::Fold`] when the budget is exhausted or the error is not
+/// recoverable -- the typed-error branch of the recover-or-typed-error
+/// invariant, applied to the fold exactly as
+/// [`compact_bucket_recover`]/[`sweep_shard_recover`] apply it to the L1 and
+/// sweep prefixes.
+///
+/// `folder_id` is drawn once by the caller and reused across attempts: a retry
+/// is the same folder re-attempting its own fold, so the seed's fold-id draw
+/// sequence does not depend on whether a fault fired.
+async fn fold_recover(
+    catalog: &Catalog,
+    tenant_hash: &TenantHash,
+    folder_id: Uuid,
+    now_ns: i64,
+    seed: u64,
+) -> Result<(), CycleError> {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match catalog
+            .fold(tenant_hash, Signal::Metrics, folder_id, now_ns, &[], None)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < FOLD_FAULT_RETRY_BUDGET && is_recoverable_catalog_error(&e) => {
+                continue;
+            }
+            Err(source) => return Err(CycleError::Fold { seed, source }),
+        }
+    }
+}
+
+/// How many times the fold-phase fault has fired on `store` so far, summed
+/// over both retryable flavors the schedule may pick (`Transient` and
+/// `Throttled`). The rule is `Occurrence::Nth(1)` on the fold-only
+/// [`FaultStore`], so a whole cycle's figure is exactly 1 when the fault was
+/// reachable and 0 when faults were disabled.
+fn fold_faults_fired<S: ObjectStoreBackend>(store: &FaultStore<S>) -> u64 {
+    store.fault_count(Op::Put, FaultKind::Transient)
+        + store.fault_count(Op::Put, FaultKind::Throttled)
 }
 
 /// How many times the sweep-phase delete fault has fired on `store` so far,
@@ -988,6 +1062,23 @@ async fn run_cycle_async(
     let sweep_store: Arc<dyn ObjectStoreBackend> =
         Arc::clone(&sweep_fault_store) as Arc<dyn ObjectStoreBackend>;
 
+    // Fold-phase fault layer, built the same way: the fold plan's retryable PUT
+    // on the catalog snapshot prefix governs only the calls `Catalog::fold`
+    // makes through `fold_catalog`, so it can fire during neither ingest,
+    // compaction, sweep, nor the query probes. The folding catalog is a second
+    // `Catalog` over the same backing store rather than the query catalog
+    // itself: `fold` reads HEAD straight from the store and touches none of a
+    // `Catalog`'s caches, so folding through a separate handle leaves every
+    // later resolve reading exactly what it read before this layer existed.
+    let fold_fault_store = Arc::new(FaultStore::new(
+        SharedStore(Arc::clone(&store)),
+        schedule.fold_plan.clone(),
+    ));
+    let fold_store: Arc<dyn ObjectStoreBackend> =
+        Arc::clone(&fold_fault_store) as Arc<dyn ObjectStoreBackend>;
+    let fold_catalog = Catalog::new(Arc::clone(&fold_store), catalog_config)
+        .map_err(|source| CycleError::CatalogConfig { seed, source })?;
+
     let fold_now_ns = seal_now_ns(workload.end_ts_ns);
     let full_range = TimeRange {
         start_ns: workload.start_ts_ns,
@@ -1084,17 +1175,18 @@ async fn run_cycle_async(
         )
         .await?;
 
-        catalog
-            .fold(
-                &tenant_hash,
-                Signal::Metrics,
-                fold_rng.new_uuid(),
-                fold_now_ns,
-                &[],
-                None,
-            )
-            .await
-            .map_err(|source| CycleError::Fold { seed, source })?;
+        // Through the fold-only fault layer, with the bounded re-run: the
+        // retryable PUT on the catalog snapshot prefix fires once here and the
+        // re-run recovers to the identical snapshot, or an exhausted fault
+        // surfaces as a typed `CycleError::Fold`.
+        fold_recover(
+            &fold_catalog,
+            &tenant_hash,
+            fold_rng.new_uuid(),
+            fold_now_ns,
+            seed,
+        )
+        .await?;
 
         // Invariant (a of the earlier wave), strict-ack-implies-durable: after
         // the fold, the same tokens still resolve, and a query with NO
@@ -1181,17 +1273,14 @@ async fn run_cycle_async(
         // and drops the superseded L0 inputs. This must happen before the
         // sweep physically deletes those inputs, or a resolve served from the
         // old snapshot would 404.
-        catalog
-            .fold(
-                &tenant_hash,
-                Signal::Metrics,
-                fold_rng.new_uuid(),
-                compact_now_ns,
-                &[],
-                None,
-            )
-            .await
-            .map_err(|source| CycleError::Fold { seed, source })?;
+        fold_recover(
+            &fold_catalog,
+            &tenant_hash,
+            fold_rng.new_uuid(),
+            compact_now_ns,
+            seed,
+        )
+        .await?;
 
         // Every subsequent query for this tenant runs through a fresh
         // `Catalog`/`QueryEngine` built over the same store, modeling the
@@ -1417,11 +1506,13 @@ async fn run_cycle_async(
         .counters_snapshot()
         .into_iter()
         .chain(sweep_fault_store.counters_snapshot())
+        .chain(fold_fault_store.counters_snapshot())
     {
         *fault_counters.entry(key).or_insert(0) += count;
     }
     let mut expected_faults = schedule.expected_faults;
     expected_faults.extend(schedule.expected_compaction_faults);
+    expected_faults.extend(schedule.expected_fold_fault);
 
     Ok(CycleOutcome {
         master_seed,
@@ -1438,6 +1529,7 @@ async fn run_cycle_async(
         faulted_pass_superseded_records_deleted,
         faulted_pass_superseded_data_deleted,
         faulted_pass_unreferenced_parts_deleted,
+        fold_faults_fired: fold_faults_fired(fold_fault_store.as_ref()),
         fault_counters,
         expected_faults,
         gates_armed,
