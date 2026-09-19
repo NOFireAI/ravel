@@ -205,6 +205,17 @@ terminates TLS in-process and serves nothing else. When it is set:
   fragment worker of this cluster". Per-process certificate identity is
   deliberately not required: the capability, not the certificate, is the
   authorization.
+- TLS on this listener is mutual. `--fragment-tls-ca` is both the CA a
+  coordinator verifies a worker against and the CA the worker verifies its
+  callers against, so a peer holding no certificate from it is refused at the
+  handshake, before any capability is read. A coordinator presents this
+  process's own `--fragment-tls-cert` and `--fragment-tls-key` when it dials a
+  peer; one key pair serves both directions, because every fragment process is
+  both a worker and a coordinator. The certificate therefore needs the
+  `clientAuth` extended key usage as well as `serverAuth`. A certificate
+  carrying only `serverAuth` will serve fragments but cannot dial them, and the
+  dial fails at the handshake. Provision both usages, or rotate to a
+  certificate that has them, before enabling the dedicated listener.
 
 - The dedicated listener's address is what this node publishes as its
   `fragment_endpoint`, so binding it to a wildcard needs

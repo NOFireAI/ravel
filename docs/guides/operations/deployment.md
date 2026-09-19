@@ -335,12 +335,23 @@ identity is deliberately not required, so any certificate the dedicated CA
 signed means "a fragment worker of this cluster". No identity is ever parsed
 from a certificate.
 
+TLS on this listener is mutual. The same `--fragment-tls-ca` is the CA the
+listener verifies its callers against, so a peer presenting no certificate from
+it is refused at the handshake, before any capability is read. A coordinator
+presents this process's own `--fragment-tls-cert` and `--fragment-tls-key` when
+it dials a peer: one key pair in both directions, because every fragment
+process is both a worker and a coordinator. This narrows who may present a
+capability; it does not change what authorizes a fetch.
+
 **Ravel mints no certificates or keys.** The operator provisions the PEM files
 out of band. The certificate and key are read once at startup, so certificate
 rotation is a rolling restart. Requirements for the worker certificate:
 
 - A `ravel-fragment` dNSName SAN. The SAN is verified, not the CN.
-- `extendedKeyUsage = serverAuth`.
+- `extendedKeyUsage = serverAuth, clientAuth`. Both are required: the same
+  certificate serves inbound fragment fetches and is presented as client
+  identity on outbound ones. A `serverAuth`-only certificate serves fragments
+  but cannot dial them, and the dial fails at the handshake.
 - Signed by the CA distributed as `--fragment-tls-ca` to every query node.
 
 ### With cert-manager
@@ -362,6 +373,7 @@ spec:
     size: 256
   usages:
     - server auth
+    - client auth                   # coordinators present it when they dial
   dnsNames:
     - ravel-fragment                # the one fixed expected server name
   issuerRef:
@@ -378,8 +390,16 @@ ravel-server --mode all --distributed-query \
   --fragment-listener 0.0.0.0:4319 \
   --fragment-tls-cert /etc/ravel/fragment-tls/tls.crt \
   --fragment-tls-key  /etc/ravel/fragment-tls/tls.key \
-  --fragment-tls-ca   /etc/ravel/fragment-tls/ca.crt
+  --fragment-tls-ca   /etc/ravel/fragment-tls/ca.crt \
+  --advertise-fragment-endpoint "$POD_IP"
 ```
+
+The listener binds the wildcard so it answers on the pod's own address, but the
+heartbeat record must publish an address siblings can dial, so
+`--advertise-fragment-endpoint` is required here. Project the pod IP with the
+downward API (`fieldRef: status.podIP`), or pass the pod's stable DNS name from
+a headless Service. Without it, startup refuses rather than publishing
+`0.0.0.0:4319` for every peer to fail against.
 
 cert-manager rewrites the Secret on renewal, but Ravel reads the files only at
 startup, so schedule a rolling restart of the query fleet on the renewal

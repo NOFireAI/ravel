@@ -3521,40 +3521,44 @@ mod tests {
     // ---- ADR-0071 amendment decision 1: the dedicated TLS fragment listener ----
     //
     // Operator-provisioned test PEM material, generated offline (EC P-256). The
-    // server certificate carries a `ravel-fragment` dNSName SAN, the one fixed
-    // name a coordinator verifies against; `TEST_FRAGMENT_CA_PEM` signed it, and
+    // fragment certificate carries a `ravel-fragment` dNSName SAN, the one fixed
+    // name a coordinator verifies against, and both the serverAuth and clientAuth
+    // extended key usages: the listener now requires a client certificate from
+    // the same pinned CA (issue #1690), and one process is both the worker that
+    // serves fragments and the coordinator that dials them, so a single key pair
+    // has to satisfy both roles. `TEST_FRAGMENT_CA_PEM` signed it, and
     // `TEST_FRAGMENT_OTHER_CA_PEM` is an unrelated CA used to prove a cert that
     // does not chain to the pinned CA is refused at the TLS layer. Ravel mints no
     // certificates; these stand in for what an operator provisions.
     const TEST_FRAGMENT_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIBqTCCAU+gAwIBAgIUVJl8k+Zv3fZCuFxgwwDs+IDXi1YwCgYIKoZIzj0EAwIw
-ITEfMB0GA1UEAwwWcmF2ZWwtZnJhZ21lbnQtdGVzdC1jYTAgFw0yNjA4MTUwNDQz
-MDlaGA8yMTI2MDcyMjA0NDMwOVowITEfMB0GA1UEAwwWcmF2ZWwtZnJhZ21lbnQt
-dGVzdC1jYTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABHARUVbKgBCYpY/wf8zK
-+I6Ba4PD6+G+9cLPWeqvsgvY78Y2zyP7yYCLmWQ10Sit30vp0bupQbGmGuXe/iph
-doOjYzBhMB0GA1UdDgQWBBRDv2J6Cr7h+j5wtBdmBPkvMvasPzAfBgNVHSMEGDAW
-gBRDv2J6Cr7h+j5wtBdmBPkvMvasPzAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB
-/wQEAwIBBjAKBggqhkjOPQQDAgNIADBFAiBJuvZFS9FxJvCt+NchycR0qO/eh2b3
-T3iSUGCKdOHAGgIhAMz/4iLhm6S+EbNrFxoowxwEpKJvxMy4z/OmOySX49/U
+MIIBiDCCAS6gAwIBAgIURqm7z2RSSm9YMcJrjixkBTS6iSAwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWcmF2ZWwtZnJhZ21lbnQtdGVzdC1jYTAgFw0yNjA5MTkyMTIx
+MzVaGA8yMTI2MDgyNjIxMjEzNVowITEfMB0GA1UEAwwWcmF2ZWwtZnJhZ21lbnQt
+dGVzdC1jYTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABOynQpfkkGc1dJv+181e
+8I9uvBML0AvXJo95Z4dxje72IOA/Hhh4cpQ0EQfogGW4LtnbWS7NgilX1+RpC6gG
+CVajQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQW
+BBT7C6f70yaChMoXGTIBoZSw+8p3TTAKBggqhkjOPQQDAgNIADBFAiBXCp1E6E6i
+I3VH8wGfxQxywXkuQ86dVH5Z7FpTA9udVAIhAJT+wKFJo9hWpeKKbEmbtuuwfaok
+5axPjJ9kiO1C6ZIu
 -----END CERTIFICATE-----
 ";
     const TEST_FRAGMENT_SERVER_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIBzTCCAXOgAwIBAgIUGu6Gl5XZWJWXYbk8jUnm3jAoqg8wCgYIKoZIzj0EAwIw
-ITEfMB0GA1UEAwwWcmF2ZWwtZnJhZ21lbnQtdGVzdC1jYTAgFw0yNjA4MTUwNDQz
-MDlaGA8yMTI2MDcyMjA0NDMwOVowGTEXMBUGA1UEAwwOcmF2ZWwtZnJhZ21lbnQw
-WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATnxslJqa2rlRO4+IZHvSUWDtAjdBby
-pAHeZOgG859pbt5w9fhwXheNPZfapeuAkL1bv5LMpDUoWWP4gWiPKG8uo4GOMIGL
-MBkGA1UdEQQSMBCCDnJhdmVsLWZyYWdtZW50MBMGA1UdJQQMMAoGCCsGAQUFBwMB
-MAkGA1UdEwQCMAAwDgYDVR0PAQH/BAQDAgWgMB0GA1UdDgQWBBTurdD+8LWadPBh
-rTFdh/lcRqM4bDAfBgNVHSMEGDAWgBRDv2J6Cr7h+j5wtBdmBPkvMvasPzAKBggq
-hkjOPQQDAgNIADBFAiBoj7omC/MJ8TOEDDQ7aunzgyAOhlTSU4rBuf6NUBePWAIh
-AJg5IscLR29+D4diqUZFUlHNr+xfY7gbM6jiJCYMH0xx
+MIIB2jCCAYCgAwIBAgIUX3yTIiYvkWMVICeYkAoWQ/cpCEYwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWcmF2ZWwtZnJhZ21lbnQtdGVzdC1jYTAgFw0yNjA5MTkyMTIx
+MzVaGA8yMTI2MDgyNjIxMjEzNVowGTEXMBUGA1UEAwwOcmF2ZWwtZnJhZ21lbnQw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQHF0p+BdFVa6wOH4/e9vBYV2a3We8/
++XoQmKdUGN8vOrlnREuOj4pqI54CjnYZ1OLRQF3JRynJ5y/yWL+i3rFEo4GbMIGY
+MAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgWgMB0GA1UdJQQWMBQGCCsGAQUF
+BwMBBggrBgEFBQcDAjAZBgNVHREEEjAQgg5yYXZlbC1mcmFnbWVudDAdBgNVHQ4E
+FgQUfJC6GQoihnxgaXOnWiJBAfwInPwwHwYDVR0jBBgwFoAU+wun+9MmgoTKFxky
+AaGUsPvKd00wCgYIKoZIzj0EAwIDSAAwRQIgbEMg/jES94eo3dxOwEiM1FiHhY1v
+hzdk6C9qmCCckI4CIQC/2tvVzC1VvE9eO0Y9eN2GDp63hSc+5YvKnvFm8P6I6Q==
 -----END CERTIFICATE-----
 ";
     const TEST_FRAGMENT_SERVER_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgN7yMZh0X1IoHOzzB
-/g+1z36NBvVjUQVXs4PTS/QT9bShRANCAATnxslJqa2rlRO4+IZHvSUWDtAjdBby
-pAHeZOgG859pbt5w9fhwXheNPZfapeuAkL1bv5LMpDUoWWP4gWiPKG8u
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgonxTB6rEt10ZCoQ+
+L1ACQVzux8AvoQAB2A9c890hWPmhRANCAAQHF0p+BdFVa6wOH4/e9vBYV2a3We8/
++XoQmKdUGN8vOrlnREuOj4pqI54CjnYZ1OLRQF3JRynJ5y/yWL+i3rFE
 -----END PRIVATE KEY-----
 ";
     const TEST_FRAGMENT_OTHER_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
@@ -3584,7 +3588,14 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             TEST_FRAGMENT_SERVER_CERT_PEM,
             TEST_FRAGMENT_SERVER_KEY_PEM,
         );
-        let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+        // Mutual TLS, exactly as `lib.rs` configures it (issue #1690): the
+        // pinned CA is both what this listener proves itself with and the
+        // roster of clients it will complete a handshake with.
+        let tls = tonic::transport::ServerTlsConfig::new()
+            .identity(identity)
+            .client_ca_root(tonic::transport::Certificate::from_pem(
+                TEST_FRAGMENT_CA_PEM,
+            ));
         let server = tonic::transport::Server::builder()
             .tls_config(tls)
             .expect("server TLS config")
@@ -3613,6 +3624,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     }
 
     /// Dial `addr` over TLS with `ca_pem` pinned and `server_name` expected,
+    /// presenting the process's own fragment certificate as client identity,
     /// mirroring the coordinator's outbound fragment dial. Eagerly connects, so
     /// a CA or server-name mismatch surfaces here as the TLS handshake failure.
     async fn dial_fragment_tls(
@@ -3622,7 +3634,33 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     ) -> Result<Channel, tonic::transport::Error> {
         let tls = tonic::transport::ClientTlsConfig::new()
             .ca_certificate(tonic::transport::Certificate::from_pem(ca_pem))
+            .identity(tonic::transport::Identity::from_pem(
+                TEST_FRAGMENT_SERVER_CERT_PEM,
+                TEST_FRAGMENT_SERVER_KEY_PEM,
+            ))
             .domain_name(server_name);
+        dial_fragment_tls_with(addr, tls).await
+    }
+
+    /// The same dial with no client identity: the pinned CA is trusted for the
+    /// server direction, and nothing is offered in the client direction. This
+    /// is what a peer that verified the worker but holds no certificate of its
+    /// own looks like on the wire.
+    async fn dial_fragment_tls_without_client_cert(
+        addr: std::net::SocketAddr,
+        ca_pem: &str,
+        server_name: &str,
+    ) -> Result<Channel, tonic::transport::Error> {
+        let tls = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(ca_pem))
+            .domain_name(server_name);
+        dial_fragment_tls_with(addr, tls).await
+    }
+
+    async fn dial_fragment_tls_with(
+        addr: std::net::SocketAddr,
+        tls: tonic::transport::ClientTlsConfig,
+    ) -> Result<Channel, tonic::transport::Error> {
         Channel::from_shared(format!("https://{addr}"))
             .expect("valid uri")
             .connect_timeout(REMOTE_CONNECT_TIMEOUT)
@@ -3732,6 +3770,97 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         assert!(
             wrong_name.is_err(),
             "a server-name mismatch must be refused at the TLS layer"
+        );
+    }
+
+    /// Issue #1690: the dedicated fragment listener requires a client
+    /// certificate from the pinned `--fragment-tls-ca`. A peer that presents
+    /// none is refused by the transport even when it carries a REAL, currently
+    /// valid capability for the segment it asks for, and the SAME request
+    /// succeeds over a channel presenting the coordinator identity. The
+    /// capability is held constant across the two halves, so what differs is
+    /// the client certificate and nothing else.
+    ///
+    /// The refusal may land on `connect()` or on the first RPC: under TLS 1.3
+    /// the client finishes its side of the handshake before the server has
+    /// verified the certificate it did not receive, so the alert arrives on the
+    /// next flight. Either point is the transport refusing; what the assertion
+    /// pins is that the request never reaches the capability check, which the
+    /// succeeding half proves would otherwise have admitted it.
+    #[tokio::test]
+    async fn dedicated_tls_listener_refuses_a_client_with_no_certificate() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("mtls-tenant".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&store, tenant.hash(), now).await;
+        let service = pinned_service(store, now);
+        let (addr, _shutdown) = spawn_tls_fragment_listener(service).await;
+
+        let envelope = TimeRange {
+            start_ns: seg.min_event_ts_ns,
+            end_ns: seg.max_event_ts_ns,
+        };
+        let query_id = [0x7C; 16];
+        let capability = mint(
+            &TEST_KEY,
+            tenant.hash().0,
+            metrics_signal(),
+            query_id,
+            now + HOUR_NS,
+        );
+        let request = || {
+            let mut request = pinned_over_window(tenant.hash(), &seg, envelope);
+            request.query_id = query_id.to_vec();
+            request.fragment_capability = capability.clone();
+            request
+        };
+
+        let anonymous = dial_fragment_tls_without_client_cert(
+            addr,
+            TEST_FRAGMENT_CA_PEM,
+            FRAGMENT_TLS_SERVER_NAME,
+        )
+        .await;
+        match anonymous {
+            Err(_) => {}
+            Ok(channel) => {
+                let status = SeriesFetchClient::new(channel)
+                    .fetch(request())
+                    .await
+                    .expect_err(
+                        "a client presenting no certificate must not be served, even with a \
+                         valid capability",
+                    );
+                let detail = format!("{status:?}");
+                assert!(
+                    detail.contains("CertificateRequired"),
+                    "the refusal is the TLS layer's own alert for a missing client \
+                     certificate, not a capability rejection (which would be a typed \
+                     PermissionDenied status): {detail}"
+                );
+                assert_ne!(
+                    status.code(),
+                    tonic::Code::PermissionDenied,
+                    "the request must not reach the capability check at all: {detail}"
+                );
+            }
+        }
+
+        // The control: the same capability, over a channel that presents the
+        // coordinator's certificate, is served.
+        let authenticated = dial_fragment_tls(addr, TEST_FRAGMENT_CA_PEM, FRAGMENT_TLS_SERVER_NAME)
+            .await
+            .expect("a client presenting the coordinator identity completes the handshake");
+        let response = SeriesFetchClient::new(authenticated)
+            .fetch(request())
+            .await
+            .expect("the same request with a client certificate succeeds");
+        let decoded = collect_fetch(response).await;
+        assert_eq!(decoded.status, pb::status::Code::Ok);
+        assert_eq!(
+            decoded.series_returned, 1,
+            "the capability was accepted once the client certificate was present"
         );
     }
 
