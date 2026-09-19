@@ -11,11 +11,13 @@ Status: Accepted (superseded at first public release by ADR-0066)
 > primitive (ADR-0066 decision 5) replaces the wipe-or-re-ingest disposition
 > this ADR's decision 6 accepted. This historical content is left intact.
 >
-> The meaning of "first public release" for this policy is disambiguated by
-> ADR-0531 (proposed): it denotes a not-yet-reached format-lifecycle activation
-> milestone, distinct from the software's first public release at 0.9.0, so this
-> ADR's pre-release regime remains in force at HEAD. The supersession above takes
-> effect only when that milestone is declared.
+> The meaning of "first public release" for this policy is settled by ADR-0531
+> (Accepted 2026-09-19): it is the **v1.0 release**, distinct from the
+> software's first public release at 0.9.0, so this ADR's pre-release regime
+> remains in force at HEAD and until v1.0 ships. Read every "first public
+> release" and "first release" below as "v1.0". The supersession above takes
+> effect at v1.0 and not before: until then a format change may break backward
+> compatibility outright, and ADR-0066's N/N-1 reader window is not opened.
 
 This ADR changes the format lifecycle policy, not any byte of the v5
 layout, building on the RSEG v5 implementation (ADR-0026).
@@ -98,6 +100,10 @@ data nobody depends on.
    version freezes, the readers-before-writers rollout discipline and
    compatibility windows return, and removing support for a released
    version becomes a breaking change requiring its own ADR.
+   Amended by ADR-0531: that release is v1.0, which has not shipped, so this
+   policy has not expired. Before v1.0 a format change may break backward
+   compatibility, and the compatibility window this point promises does not
+   open early.
 8. Documentation follows the code: docs/segment-format.md becomes a
    self-contained specification of the current version, not a baseline
    plus an amendment chain. History lives in the ADRs. The v2 columnar
