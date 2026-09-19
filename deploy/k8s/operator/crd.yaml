@@ -249,7 +249,7 @@
                         "type": "integer"
                       },
                       "resources": {
-                        "description": "Container resource requests/limits.",
+                        "description": "Container resource requests/limits. Omit to render the default request\nof `100m` CPU / `256Mi` memory and no limits\n([`GATEWAY_DEFAULT_CPU_REQUEST`], [`GATEWAY_DEFAULT_MEMORY_REQUEST`]).\nAn explicit block here replaces the default entirely rather than\nmerging with it.",
                         "nullable": true,
                         "properties": {
                           "limits": {
@@ -351,7 +351,7 @@
                         "type": "integer"
                       },
                       "resources": {
-                        "description": "Container resource requests/limits.",
+                        "description": "Container resource requests/limits. Omit to render the default request\nof `100m` CPU / `256Mi` memory and no limits\n([`MAINTAIN_DEFAULT_CPU_REQUEST`], [`MAINTAIN_DEFAULT_MEMORY_REQUEST`]).\nAn explicit block here replaces the default entirely rather than\nmerging with it.",
                         "nullable": true,
                         "properties": {
                           "limits": {
@@ -404,7 +404,7 @@
                         "type": "integer"
                       },
                       "resources": {
-                        "description": "Container resource requests/limits.",
+                        "description": "Container resource requests/limits. Omit to render the default request\nof `200m` CPU / `512Mi` memory and no limits\n([`QUERY_DEFAULT_CPU_REQUEST`], [`QUERY_DEFAULT_MEMORY_REQUEST`]). An\nexplicit block here replaces the default entirely rather than merging\nwith it.",
                         "nullable": true,
                         "properties": {
                           "limits": {

@@ -234,7 +234,7 @@ A minimal example is in
 | `spec.deploymentKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters or 32 raw bytes): the deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
 | `spec.auditTokenKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters): the query-audit token key. Omit on a cluster with `deploymentKeySecretRef` set. See "Query-audit token key" below. |
 | `spec.gateway.replicas` | integer | `1` | |
-| `spec.gateway.resources` | object | none | `requests` / `limits` maps, as in a Pod spec. |
+| `spec.gateway.resources` | object | `requests: {cpu: 100m, memory: 256Mi}`, no limits | `requests` / `limits` maps, as in a Pod spec. An explicit block replaces the default entirely rather than merging with it. |
 | `spec.gateway.fold.disabled` | boolean | `false` | `--disable-fold`. Fold is a query-cost optimization only; disabling it never changes results. |
 | `spec.gateway.fold.intervalSecs` | integer | none | `--fold-interval-secs`. |
 | `spec.gateway.maxInflightFlushes` | integer | `1` | `--max-inflight-flushes`. Per-shard cap on concurrent flushes. This is the cross-tenant flush isolation control, not only a throughput knob: at `1` one tenant's stalled flush blocks co-resident tenants' flushes on that shard, so raise it to bound that. Gateway-only (ingest runs in no other tier). Omit to keep the server default of `1`; `0` is rejected at admission. |
@@ -251,11 +251,11 @@ A minimal example is in
 | `spec.gateway.ingestAffinity.annotations` | map | `{}` | Legacy `ingressNginx` only. Extra Ingress annotations, merged before the affinity annotations. `nginx.ingress.kubernetes.io/proxy-body-size` belongs here: the ingress-nginx default of `1m` rejects larger OTLP/HTTP exports. |
 | `spec.gateway.exposure.gatewayApi` | object | none | Gateway API exposure, independent of `ingestAffinity`. Renders `HTTPRoute`/`GRPCRoute` onto an existing `Gateway` instead of Ingress objects. Fields `gatewayRef.name`/`gatewayRef.namespace`, `hostnames`, `grpc` (default true). See [ingest-affinity.md](ingest-affinity.md). |
 | `spec.query.replicas` | integer | `1` | |
-| `spec.query.resources` | object | none | |
+| `spec.query.resources` | object | `requests: {cpu: 200m, memory: 512Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. |
 | `spec.maintain.replicas` | integer | `1` | |
 | `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. |
-| `spec.maintain.resources` | object | none | |
+| `spec.maintain.resources` | object | `requests: {cpu: 100m, memory: 256Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
 | `spec.gc.protectionHorizon` | string | none | `--gc-protection-horizon` on the maintain pods, a duration such as `25h5m`. It must equal the protection horizon stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
 | `spec.gc.grace` | string | none | `--gc-grace` on the maintain pods, a duration such as `24h`. It must equal the grace stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
 | `spec.retention.default` | string | none | Duration string, e.g. `30d`. |
