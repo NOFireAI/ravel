@@ -206,7 +206,7 @@ d="$(new_tree docker-run-wrong-count)"
 mutate "${d}/.github/workflows/metricsbench-nightly.yml" \
   '/^          docker run --rm --network host --entrypoint sh \\$/,/^            quay\.io\/minio\/mc@sha256:/d'
 check "removing a docker run line fails the docker-run-image count assertion" \
-  "${d}" 1 "found 16 docker run/pull/create image references, expected exactly 17"
+  "${d}" 1 "found 17 docker run/pull/create image references, expected exactly 18"
 
 # A second invocation on the same logical line is scanned too. Chaining with
 # && is ordinary shell, and a scanner that stops at the first `docker` on the
