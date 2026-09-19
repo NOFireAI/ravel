@@ -220,14 +220,22 @@ condition, record a baseline on the reference runner, switch
 `pull_request` to `--enforce` -- is not adopted; it depended on a runner
 that will not exist.
 
-`bench-compare.yml` stays `workflow_dispatch`-only. Its `ravel-reference`
-runner label is removed rather than left pointing at hardware that will
+`bench-compare.yml`'s job is disabled (`if: false`), not merely left
+`workflow_dispatch`-only: a manual dispatch, including one with
+`enforce=true`, runs no step and performs no comparison. Its
+`ravel-reference` runner label is removed from the job and from
+`.github/actionlint.yaml` rather than left pointing at hardware that will
 never register, which per the base decision would otherwise queue every
-dispatched run for about 24 hours and then fail it. A future gate, if
-wanted, runs on a GitHub-hosted runner against an object store the
-workflow provisions itself (for example a MinIO container service), not
-against a persistent self-hosted box holding a warm cache and a
-`pull-requests: write` token.
+dispatched run for about 24 hours and then fail it. The comparison
+machinery itself (`scripts/bench-tier-b.sh`, `scripts/bench-compare.py`) is
+unchanged and still runnable by hand or from a workstation; only the
+workflow's ability to run it in CI is gated off. Restoring the job is an
+owner's decision on where it runs -- a future gate, if wanted, runs on a
+GitHub-hosted runner against an object store the workflow provisions
+itself (for example a MinIO container service), not against a persistent
+self-hosted box holding a warm cache and a `pull-requests: write` token --
+and the committed baseline needs re-recording with knobs recorded before
+any enforcing comparison would trust it.
 
 The committed baseline under `bench/baselines/` remains a demonstration
 recorded on a fleet executor box, not a reference measurement; see its
