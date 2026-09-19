@@ -25,6 +25,7 @@
 //!   decoded entries has no route to coverage.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ravel_commit::declared_stats::{self as commit_stats, ValidatedDeclaredStats};
 use ravel_proto::catalog::v1::{
@@ -144,16 +145,143 @@ fn encode_validated(validated: &ValidatedDeclaredStats) -> Vec<DeclaredColumnMin
         .collect()
 }
 
+/// Stamp coverage across one fold pass: how many stamped commit records it
+/// read, and how many stamped snapshot entries it wrote from them.
+///
+/// The ADR-0873 deployment gate needs a coverage figure a mixed-version fleet
+/// can be read against: an ingest fleet that has started stamping while some
+/// fold still runs an older shape produces records with stamps and entries
+/// without them, and the ADR requires that state to be detected by a metric
+/// rather than found later as a query that quietly stops taking its shortcut.
+/// The two counts are what that comparison is made of, so they are exact
+/// per-fold tallies rather than sampled or rate-derived figures.
+///
+/// `entries` is never above `records` by construction: a carried list is
+/// non-empty only if the record it came from was stamped. Below it means every
+/// entry of some stamped record was dropped, which is the shortfall the alert
+/// in docs/guides/observability.md fires on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StampCoverage {
+    records: u64,
+    entries: u64,
+}
+
+impl StampCoverage {
+    /// Commit records read in this pass whose wire `declared_column_stats` was
+    /// non-empty. Counted off the wire, before the predicate runs, so a record
+    /// whose every entry is defective still counts as stamped: the shortfall
+    /// this figure is half of exists to report exactly that case.
+    pub(crate) fn records(self) -> u64 {
+        self.records
+    }
+
+    /// Snapshot entries this pass wrote carrying at least one stamp.
+    pub(crate) fn entries(self) -> u64 {
+        self.entries
+    }
+}
+
+/// Process-global totals behind [`fold_stamped_records_total`] and
+/// [`fold_stamped_entries_total`], summed from every [`StampCoverage`] a fold
+/// pass in this process completed.
+static FOLD_STAMPED_RECORDS: AtomicU64 = AtomicU64::new(0);
+static FOLD_STAMPED_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Add one completed fold pass's coverage to the process-global totals.
+///
+/// Called once per fold pass, where its `FoldReport` is built, so the totals
+/// and the report's own two fields are the same numbers: a pass that fails
+/// before producing a report contributes to neither.
+pub(crate) fn observe_fold_stamp_coverage(coverage: StampCoverage) {
+    FOLD_STAMPED_RECORDS.fetch_add(coverage.records, Ordering::Relaxed);
+    FOLD_STAMPED_ENTRIES.fetch_add(coverage.entries, Ordering::Relaxed);
+}
+
+/// Stamped commit records this process has folded since it started.
+///
+/// Monotonic and process-local, like the other in-process tallies the scrape
+/// reads: a scrape takes the delta between samples. Pair it with
+/// [`fold_stamped_entries_total`]; neither number means anything alone, since
+/// both are zero on a fleet that has not started stamping and both rise
+/// together on a healthy one.
+pub fn fold_stamped_records_total() -> u64 {
+    FOLD_STAMPED_RECORDS.load(Ordering::Relaxed)
+}
+
+/// Stamped snapshot entries this process has written since it started, the
+/// other half of the coverage pair.
+pub fn fold_stamped_entries_total() -> u64 {
+    FOLD_STAMPED_ENTRIES.load(Ordering::Relaxed)
+}
+
+// Whether this thread's folds drop the stamps they carried, after the source
+// record has been counted as stamped.
+//
+// Test-only, and `cfg(test)` rather than a feature or a runtime switch on
+// purpose: the whole hook exists only while ravel-catalog's own unit tests are
+// being compiled. Nothing in this crate's `tests/` directory, and nothing in
+// any crate that depends on it, links a build where this thread-local or its
+// guard exists, so no production configuration can reach it. It is what makes
+// the shortfall state (entries below records) constructible at all: producing
+// it otherwise needs a fold binary of an older shape.
+#[cfg(test)]
+thread_local! {
+    static STRIP_CARRIED_STAMPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Strips carried stamps on this thread until dropped.
+#[cfg(test)]
+pub(crate) struct StripCarriedStampsGuard;
+
+#[cfg(test)]
+impl StripCarriedStampsGuard {
+    pub(crate) fn install() -> Self {
+        STRIP_CARRIED_STAMPS.with(|strip| strip.set(true));
+        StripCarriedStampsGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for StripCarriedStampsGuard {
+    fn drop(&mut self) {
+        STRIP_CARRIED_STAMPS.with(|strip| strip.set(false));
+    }
+}
+
+/// The hook's one effect on a carried list. Thread-scoped, so a test that
+/// installs the guard cannot change what any other test's fold carries.
+#[cfg(test)]
+fn apply_strip_hook(carried: Vec<DeclaredColumnMinMax>) -> Vec<DeclaredColumnMinMax> {
+    if STRIP_CARRIED_STAMPS.with(|strip| strip.get()) {
+        Vec::new()
+    } else {
+        carried
+    }
+}
+
 /// The stamps a fold carries from one L0 commit record onto its
-/// [`SnapshotEntry`] (ADR-0873 decision 4).
+/// [`SnapshotEntry`] (ADR-0873 decision 4), tallying both sides of the
+/// coverage pair into `coverage`.
 ///
 /// The record is read through the wave-2 gated path, so only entries that
 /// passed the full predicate against the record's own `sample_count` (field
 /// 11) are carried; the dropped ones simply leave their column uncovered for
 /// this segment. Returns an empty list for an unstamped record, which is the
 /// permanent state of every record written before ADR-0873.
-pub(crate) fn carry_commit_record(record: &commit_pb::CommitRecord) -> Vec<DeclaredColumnMinMax> {
-    encode_validated(&commit_stats::read_commit_record(record))
+pub(crate) fn carry_commit_record(
+    record: &commit_pb::CommitRecord,
+    coverage: &mut StampCoverage,
+) -> Vec<DeclaredColumnMinMax> {
+    if !record.declared_column_stats.is_empty() {
+        coverage.records += 1;
+    }
+    let carried = encode_validated(&commit_stats::read_commit_record(record));
+    #[cfg(test)]
+    let carried = apply_strip_hook(carried);
+    if !carried.is_empty() {
+        coverage.entries += 1;
+    }
+    carried
 }
 
 /// The same carriage for one compaction or erasure-rewrite output part, whose
@@ -226,6 +354,12 @@ mod tests {
         .expect("valid bool stat")
     }
 
+    /// `carry_commit_record` with a throwaway tally, for the tests that assert
+    /// what gets carried rather than how much of it was counted.
+    fn carry(record: &commit_pb::CommitRecord) -> Vec<DeclaredColumnMinMax> {
+        carry_commit_record(record, &mut StampCoverage::default())
+    }
+
     fn entry(sample_count: u64, stats: Vec<DeclaredColumnMinMax>) -> SnapshotEntry {
         SnapshotEntry {
             level: 0,
@@ -261,7 +395,7 @@ mod tests {
             i64_stat("EventDate", -5, 19_000, 12),
             bool_stat("IsRefresh", false, true, 0),
         ];
-        let carried = carry_commit_record(&commit_record(1_000, &stats));
+        let carried = carry(&commit_record(1_000, &stats));
         let read = read_snapshot_entry(&entry(1_000, carried));
         assert!(read.dropped().is_empty());
         assert_eq!(read.covered().to_vec(), stats);
@@ -282,13 +416,83 @@ mod tests {
 
     #[test]
     fn an_unstamped_record_carries_an_empty_list_not_a_placeholder() {
-        let carried = carry_commit_record(&commit_record(1_000, &[]));
+        let carried = carry(&commit_record(1_000, &[]));
         assert_eq!(carried.len(), 0);
         let read = read_snapshot_entry(&entry(1_000, carried));
         assert_eq!(read.covered().len(), 0);
         assert_eq!(read.dropped().len(), 0);
         assert_eq!(read.column("EventDate"), None);
         assert!(DeclaredColumnStats::from_validated(&read).is_empty());
+    }
+
+    #[test]
+    fn stamp_coverage_counts_stamped_records_and_the_entries_carried_from_them() {
+        let stats = vec![i64_stat("EventDate", -5, 19_000, 12)];
+        let mut coverage = StampCoverage::default();
+        carry_commit_record(&commit_record(1_000, &stats), &mut coverage);
+        carry_commit_record(&commit_record(1_000, &[]), &mut coverage);
+        carry_commit_record(&commit_record(1_000, &stats), &mut coverage);
+
+        assert_eq!(
+            coverage.records(),
+            2,
+            "two of the three records carried stamps on the wire"
+        );
+        assert_eq!(
+            coverage.entries(),
+            2,
+            "both stamped records produced a stamped entry"
+        );
+    }
+
+    #[test]
+    fn a_record_whose_every_stamp_is_dropped_counts_as_a_record_with_no_entry() {
+        // Eight NULLs in a seven-row object (clause 4), and nothing else on
+        // the record: it is stamped on the wire and carries nothing out.
+        let mut record = commit_record(7, &[]);
+        record
+            .declared_column_stats
+            .push(commit_stats::encode(&i64_stat("Status", 200, 500, 8)));
+
+        let mut coverage = StampCoverage::default();
+        let carried = carry_commit_record(&record, &mut coverage);
+
+        assert!(carried.is_empty());
+        assert_eq!(coverage.records(), 1);
+        assert_eq!(
+            coverage.entries(),
+            0,
+            "a record whose every entry is dropped is exactly the shortfall the pair reports"
+        );
+    }
+
+    #[test]
+    fn the_test_only_strip_hook_makes_the_shortfall_reproducible_and_is_scoped_to_its_guard() {
+        let stats = vec![i64_stat("EventDate", -5, 19_000, 12)];
+        let record = commit_record(1_000, &stats);
+
+        let mut stripped = StampCoverage::default();
+        {
+            let _guard = StripCarriedStampsGuard::install();
+            let carried = carry_commit_record(&record, &mut stripped);
+            assert!(carried.is_empty(), "the hook drops the carried list");
+        }
+        assert_eq!(stripped.records(), 1);
+        assert_eq!(
+            stripped.entries(),
+            0,
+            "the record is counted before the strip, the entry after it"
+        );
+
+        let mut after = StampCoverage::default();
+        let carried = carry_commit_record(&record, &mut after);
+        assert_eq!(
+            carried.len(),
+            1,
+            "the guard's drop restored normal carriage"
+        );
+        assert_eq!(after.records(), 1);
+        assert_eq!(after.entries(), 1);
     }
 
     #[test]
@@ -301,7 +505,7 @@ mod tests {
         record
             .declared_column_stats
             .push(commit_stats::encode(&i64_stat("Status", 200, 500, 8)));
-        let carried = carry_commit_record(&record);
+        let carried = carry(&record);
         assert_eq!(carried.len(), 1);
         assert_eq!(carried[0].name, "EventDate");
         let read = read_snapshot_entry(&entry(7, carried));
@@ -418,7 +622,7 @@ mod tests {
     #[test]
     fn cloning_the_shared_list_shares_one_allocation() {
         let stats = vec![i64_stat("EventDate", 1, 2, 0)];
-        let read = read_snapshot_entry(&entry(7, carry_commit_record(&commit_record(7, &stats))));
+        let read = read_snapshot_entry(&entry(7, carry(&commit_record(7, &stats))));
         let shared = DeclaredColumnStats::from_validated(&read);
         let cloned = shared.clone();
         assert_eq!(shared, cloned);
