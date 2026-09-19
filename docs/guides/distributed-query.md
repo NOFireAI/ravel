@@ -205,6 +205,22 @@ terminates TLS in-process and serves nothing else. When it is set:
   fragment worker of this cluster". Per-process certificate identity is
   deliberately not required: the capability, not the certificate, is the
   authorization.
+- TLS on this listener is mutual. `--fragment-tls-ca` is both the CA a
+  coordinator verifies a worker against and the CA the worker verifies its
+  callers against, so a peer holding no certificate from it is refused at the
+  handshake, before any capability is read. A coordinator presents this
+  process's own `--fragment-tls-cert` and `--fragment-tls-key` when it dials a
+  peer; one key pair serves both directions, because every fragment process is
+  both a worker and a coordinator. The certificate therefore needs the
+  `clientAuth` extended key usage as well as `serverAuth`. A certificate
+  carrying only `serverAuth` will serve fragments but cannot dial them, and the
+  dial fails at the handshake. Provision both usages, or rotate to a
+  certificate that has them, before enabling the dedicated listener.
+
+- The dedicated listener's address is what this node publishes as its
+  `fragment_endpoint`, so binding it to a wildcard needs
+  `--advertise-fragment-endpoint` (see [The worker registry and
+  heartbeat](#the-worker-registry-and-heartbeat)).
 
 Without the flag the fragment surface stays on the public gRPC listener, so
 distribution keeps working through a rolling deploy that adds it.
@@ -236,6 +252,40 @@ distributed lanes dial:
   plaintext. It is separate from `fragment_endpoint` because the dedicated
   fragment listener serves only `SeriesFetch` and no Flight service, so a SQL
   slice fetch must dial the public gRPC address rather than the fragment one.
+
+Both endpoints default to the address the listener actually bound, and a
+sibling coordinator dials that string verbatim. A listener bound to a wildcard
+(`0.0.0.0` or `::`) therefore publishes an address no peer can dial, and the
+failure is silent at startup: the node registers, siblings route slices to it,
+and every dispatch fails at connect time. Startup refuses that combination
+instead. `--advertise-fragment-endpoint <host[:port]>` supplies the routable
+host to publish:
+
+```sh
+ravel-server --mode all \
+  --listen-grpc 0.0.0.0:4317 \
+  --distributed-query \
+  --fragment-key-file /etc/ravel/fragment.keys \
+  --advertise-fragment-endpoint node-11.internal
+```
+
+- The host applies to **both** advertised endpoints. A port, if given, applies
+  to the fragment endpoint only; the Flight SQL endpoint always carries the
+  public gRPC listener's own bound port, because the two endpoints name
+  different services and one port cannot stand for both.
+- Omit the port unless a NAT or port mapping makes the fragment listener
+  reachable on a port other than the one it bound. A host-only value keeps each
+  listener's own bound port.
+- An IPv6 literal may be written bare (`fd00::1`) or bracketed
+  (`[fd00::1]:4319`), and is always advertised bracketed.
+- The flag is only meaningful with `--distributed-query`; setting it without
+  that flag fails startup rather than leaving the value inert.
+
+An existing cluster whose listeners already bind specific addresses is
+unaffected. One that binds a wildcard with `--distributed-query` on was already
+publishing an undialable endpoint; it now refuses to start until the flag names
+a host, so the misconfiguration surfaces at startup rather than as fan-out that
+silently never works.
 
 The write is an unconditional overwrite: one writer per key, no compare-and-swap,
 no contention. This is the same pattern `maintain` mode processes already use for
