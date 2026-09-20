@@ -90,7 +90,7 @@ check() {
   passes=$((passes + 1))
 }
 
-# --- the committed files pass, except the one known-red k8s reference -------
+# --- the committed files pass every category ---------------------------------
 
 # Every category passes on the committed tree. A suite whose baseline expects
 # the repository to be red cannot tell a fixed reference from a broken scan,
