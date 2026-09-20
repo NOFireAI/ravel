@@ -591,6 +591,22 @@ pub struct FragmentService {
     ///
     /// [`Combined`]: FragmentListenerRole::Combined
     role: FragmentListenerRole,
+    /// This worker's own query limits, wired from the resolved process
+    /// configuration by `lib.rs` through
+    /// [`with_engine_config`](FragmentService::with_engine_config). Every
+    /// slice this service runs clamps the coordinator's wire budget to these
+    /// (issue #1687 part A), so a request from another cluster or another
+    /// coordinator can never authorize more work here than this process's
+    /// operator configured. `EngineConfig` is `Copy` and small, so it lives
+    /// beside `role` outside the `Arc` rather than in the shared inner: the
+    /// service is built before the process resolves its engine config, and a
+    /// builder that rebuilt the inner would silently unshare the admission
+    /// counters every mounted clone must agree on.
+    ///
+    /// Defaults to [`ravel_query::EngineConfig::default`], which is
+    /// `Unlimited` bytes: a directly-constructed service (tests, benches)
+    /// honours the wire budget verbatim, as before.
+    engine: ravel_query::EngineConfig,
 }
 
 struct FragmentServiceInner {
@@ -652,6 +668,22 @@ impl FragmentService {
             // both scopes. `lib.rs` sets an explicit role per listener via
             // `with_role`.
             role: FragmentListenerRole::Combined,
+            engine: ravel_query::EngineConfig::default(),
+        }
+    }
+
+    /// Return a clone of this service carrying this worker's own resolved
+    /// [`ravel_query::EngineConfig`], sharing the same `FragmentServiceInner`.
+    /// Called once by `lib.rs` on the service every listener and the
+    /// coordinator's no-hop path clone from, so every slice run in this
+    /// process clamps its wire budget to the local configuration (issue
+    /// #1687 part A).
+    #[must_use]
+    pub fn with_engine_config(&self, engine: ravel_query::EngineConfig) -> Self {
+        FragmentService {
+            inner: self.inner.clone(),
+            role: self.role,
+            engine,
         }
     }
 
@@ -667,6 +699,7 @@ impl FragmentService {
         FragmentService {
             inner: self.inner.clone(),
             role,
+            engine: self.engine,
         }
     }
 
@@ -913,6 +946,7 @@ impl FragmentService {
         // A cross-cluster resolve scope is rewritten to a pinned scope over this
         // cluster's own snapshot; a pinned scope (intra-cluster) uses the
         // full-window content-hash resolver unchanged.
+        let federated = matches!(request.scope, Some(pb::fetch_request::Scope::Resolve(_)));
         let (request, resolver) = match &request.scope {
             Some(pb::fetch_request::Scope::Resolve(_)) => self.resolve_scope(request).await,
             _ => {
@@ -925,7 +959,17 @@ impl FragmentService {
         if let Some(cache) = &self.inner.cache {
             fetcher = fetcher.with_cache(cache.clone());
         }
-        let service = SeriesFetchService::new(fetcher, resolver);
+        // The worker's own limits clamp the coordinator's wire budget on every
+        // slice (issue #1687 part A). A federated slice additionally enforces
+        // this cluster's `max_series`/`max_samples`: the rewrite above turned
+        // its scope into a pinned one over the LOCAL snapshot, so the service
+        // can no longer tell where the request came from, and the requesting
+        // coordinator folds this cluster's whole answer as one lump.
+        let mut service =
+            SeriesFetchService::new(fetcher, resolver).with_engine_config(self.engine);
+        if federated {
+            service = service.with_resolve_scope();
+        }
         match service.fetch(tonic::Request::new(request)).await {
             Ok(response) => {
                 let mut frames = Vec::new();

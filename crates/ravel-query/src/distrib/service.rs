@@ -47,7 +47,7 @@
 //! the coordinator dispatched from.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -59,7 +59,7 @@ use ravel_types::{SeriesId, Signal, TenantHash};
 
 use ravel_rspan::SpanQuery;
 
-use crate::config::ByteLimit;
+use crate::config::{ByteLimit, EngineConfig};
 use crate::distrib::codec;
 use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use crate::engine::{bytes_scanned_exceeded, merge_soa_runs};
@@ -130,6 +130,24 @@ pub struct SeriesFetchService<R: SegmentResolver + 'static> {
     /// unchanged; a worker that wants to serve spans opts in with the builder.
     span_fetcher: Option<SpanSegmentFetcher>,
     resolver: Arc<R>,
+    /// This worker's OWN limits, wired via
+    /// [`with_engine_config`](Self::with_engine_config). Every wire budget is
+    /// clamped to these (issue #1687 part A): a coordinator sends the query's
+    /// whole budget to every slice (issue #1725), and an absent or `0` wire
+    /// budget means "no cap from the coordinator", never "no cap at all". The
+    /// default is [`EngineConfig::default`], whose `max_bytes_scanned` is
+    /// `Unlimited`, so a caller that does not wire its config keeps the
+    /// pre-#1687 behavior of honouring the wire budget verbatim.
+    engine: EngineConfig,
+    /// Whether this slice arrived as a cross-cluster resolve-scope request
+    /// (federation), set via [`with_resolve_scope`](Self::with_resolve_scope).
+    /// Such a request is rewritten to a pinned scope over the LOCAL cluster's
+    /// snapshot before it reaches this service, so the scope on the request
+    /// itself no longer says where it came from, and the coordinator that sent
+    /// it folds this cluster's whole answer as one lump rather than seeing its
+    /// series and samples slice by slice. This worker therefore enforces its
+    /// own `max_series`/`max_samples` over what it is about to return.
+    resolve_scope: bool,
 }
 
 impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
@@ -139,7 +157,31 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             log_fetcher: None,
             span_fetcher: None,
             resolver,
+            engine: EngineConfig::default(),
+            resolve_scope: false,
         }
+    }
+
+    /// Wires this worker's own [`EngineConfig`] onto the service, so every
+    /// wire budget is clamped to the limits this process's operator
+    /// configured rather than taken verbatim from the coordinator (issue
+    /// #1687 part A). A builder rather than a `new` parameter for the same
+    /// reason [`with_log_fetcher`](Self::with_log_fetcher) is one: the
+    /// out-of-crate callers of `new` stay unchanged.
+    #[must_use]
+    pub fn with_engine_config(mut self, engine: EngineConfig) -> Self {
+        self.engine = engine;
+        self
+    }
+
+    /// Marks this service as serving a cross-cluster resolve-scope
+    /// (federation) request, which additionally enforces this worker's own
+    /// `max_series` and `max_samples` over the slice's result. See the
+    /// [`resolve_scope`](Self#structfield.resolve_scope) field.
+    #[must_use]
+    pub fn with_resolve_scope(mut self) -> Self {
+        self.resolve_scope = true;
+        self
     }
 
     /// Wires the RLOG-family fetch path (#284) onto this worker. Built over the
@@ -295,6 +337,80 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         }
     }
 
+    /// This worker's own `max_series`/`max_samples` over the result a
+    /// resolve-scope (federation) slice is about to return, as a terminal
+    /// `BudgetExceeded` summary frame when either is exceeded (issue #1687
+    /// part A). `None` on every other request: an intra-cluster slice is one
+    /// of several the coordinator folds itself, and it already re-checks both
+    /// caps over the folded totals as each slice lands.
+    ///
+    /// A federated slice has no such coordinator-side belt within this
+    /// cluster: the requesting cluster resolved nothing here, folds this
+    /// cluster's whole answer as one lump, and its caps are its own, so
+    /// without this a remote request could make this cluster materialize an
+    /// unbounded number of series before anything refused.
+    ///
+    /// Scalar and histogram series are counted separately against
+    /// `max_series`, mirroring the coordinator's two distinct-id sets. Samples
+    /// are the pre-merge, pre-reduction sum over what was fetched, which is
+    /// never less than what the slice returns, so this refuses a shade early
+    /// on a query whose segments carry duplicate samples of one series rather
+    /// than late.
+    fn resolve_scope_count_refusal(
+        &self,
+        scalar: &[Vec<FetchedSeriesSoa>],
+        histograms: &[FetchedHistogramSeries],
+        accounting: &QueryAccounting,
+        stats: &FetchStats,
+    ) -> Option<Vec<pb::FetchResponse>> {
+        if !self.resolve_scope {
+            return None;
+        }
+        let max_series = self.engine.max_series;
+        let mut distinct: HashSet<SeriesId> = HashSet::new();
+        let mut distinct_hist: HashSet<SeriesId> = HashSet::new();
+        let mut samples = 0usize;
+        for segment_series in scalar {
+            for fs in segment_series {
+                distinct.insert(fs.series_id);
+                samples = samples.saturating_add(fs.timestamps.len());
+            }
+        }
+        for hs in histograms {
+            distinct_hist.insert(hs.series_id);
+            samples = samples.saturating_add(hs.timestamps.len());
+        }
+        let err = if distinct.len() > max_series {
+            QueryError::TooManySeries {
+                count: distinct.len(),
+                max: max_series,
+            }
+        } else if distinct_hist.len() > max_series {
+            QueryError::TooManySeries {
+                count: distinct_hist.len(),
+                max: max_series,
+            }
+        } else if samples > self.engine.max_samples {
+            QueryError::TooManySamples {
+                count: samples,
+                max: self.engine.max_samples,
+            }
+        } else {
+            return None;
+        };
+        // Carries the accounting spent so far, like the byte-budget
+        // short-circuit: the coordinator folds a refusing slice's real cost
+        // before failing the query, never a lost double-spend.
+        Some(vec![summary_frame(
+            &accounting.snapshot(),
+            0,
+            0,
+            pb::status::Code::BudgetExceeded,
+            err.to_string(),
+            stats,
+        )])
+    }
+
     /// The Metrics slice path: resolve the pinned scope to refs, fetch each
     /// segment's scalar and histogram series, enforce the per-slice
     /// bytes-scanned budget, apply erasure, and stream one `SeriesFrame` per
@@ -344,12 +460,8 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         }
 
         // Per-slice bytes-scanned budget, enforced per completed segment
-        // exactly as the local path does (ADR-0061 decision 1): `0` is the wire
-        // sentinel for "no cap" (a real fetch never scans zero bytes).
-        let byte_limit = match budgets.as_ref().map(|b| b.max_bytes_scanned) {
-            Some(0) | None => ByteLimit::Unlimited,
-            Some(max) => ByteLimit::Bounded(max),
-        };
+        // exactly as the local path does (ADR-0061 decision 1).
+        let byte_limit = slice_byte_limit(budgets.as_ref(), self.engine.max_bytes_scanned);
 
         // One fresh accounting handle per slice: the coordinator folds the
         // returned snapshot into the query's aggregate (ADR-0071).
@@ -403,6 +515,12 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             for series in &mut scalar {
                 crate::erasure::retain_series_soa(series, &erasure);
             }
+        }
+
+        if let Some(frames) =
+            self.resolve_scope_count_refusal(&scalar, &histograms, &accounting, &stats)
+        {
+            return Ok(frames);
         }
 
         // Aggregation pushdown (ADR-0103 decision 2): this slice returns one
@@ -588,10 +706,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             }
         }
 
-        let byte_limit = match budgets.as_ref().map(|b| b.max_bytes_scanned) {
-            Some(0) | None => ByteLimit::Unlimited,
-            Some(max) => ByteLimit::Bounded(max),
-        };
+        let byte_limit = slice_byte_limit(budgets.as_ref(), self.engine.max_bytes_scanned);
 
         // The slice's event-time window is the ts range for the fetch. The
         // coordinator sets it to the envelope of this slice's pinned segments, a
@@ -724,10 +839,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             }
         }
 
-        let byte_limit = match budgets.as_ref().map(|b| b.max_bytes_scanned) {
-            Some(0) | None => ByteLimit::Unlimited,
-            Some(max) => ByteLimit::Bounded(max),
-        };
+        let byte_limit = slice_byte_limit(budgets.as_ref(), self.engine.max_bytes_scanned);
 
         // The slice's event-time window is the ts range for the scan. The
         // coordinator sets it to the envelope of this slice's pinned segments, a
@@ -819,6 +931,34 @@ impl<R: SegmentResolver + 'static> SeriesFetch for SeriesFetchService<R> {
         let frames = self.run_slice(request.into_inner()).await;
         let stream = futures::stream::iter(frames.into_iter().map(Ok));
         Ok(tonic::Response::new(Box::pin(stream)))
+    }
+}
+
+/// The bytes-scanned limit one slice runs under: the TIGHTER of the
+/// coordinator's wire budget and this worker's own configured limit (issue
+/// #1687 part A).
+///
+/// `0` and an absent `Budgets` are the wire's "no cap" sentinel (a real fetch
+/// never scans zero bytes), and they mean no cap FROM THE COORDINATOR, so
+/// they resolve to the worker's own limit rather than to
+/// [`ByteLimit::Unlimited`]. That is what makes a worker's configuration
+/// binding on a request it did not author: a coordinator in another cluster
+/// (federation) or on another version can send any budget it likes, or none,
+/// and still never authorize more scanning here than this process's operator
+/// allowed. The result is `Unlimited` only when the coordinator asked for no
+/// cap and this worker itself is configured with none.
+///
+/// Since #1725 a coordinator sends the query's whole `max_bytes_scanned` to
+/// every slice rather than a `1/slice_count` share of it, which is why this
+/// clamp is the worker's only protection against an oversized budget.
+fn slice_byte_limit(budgets: Option<&pb::Budgets>, worker: ByteLimit) -> ByteLimit {
+    let wire = match budgets.map(|b| b.max_bytes_scanned) {
+        Some(0) | None => return worker,
+        Some(max) => max,
+    };
+    match worker {
+        ByteLimit::Bounded(own) => ByteLimit::Bounded(wire.min(own)),
+        ByteLimit::Unlimited => ByteLimit::Bounded(wire),
     }
 }
 
