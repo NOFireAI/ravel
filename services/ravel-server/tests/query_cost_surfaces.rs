@@ -641,6 +641,7 @@ mod flight {
             audit_pipeline: None,
             process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
             process_memory_budget_is_fallback: false,
+            can_fold: true,
         });
         let scrape = scrape(&metrics).await;
         let expected = vec![
