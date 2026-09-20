@@ -132,8 +132,12 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # checkout, a rust-cache, and an upload-artifact. Its free-disk-space step is
 # a local `./.github/actions/...` action, which this scan does not count, and
 # its four matrix cases are one job definition, so the three `uses:` are
-# counted once each rather than per case.
-WORKFLOW_EXPECTED_ACTION_COUNT=104
+# counted once each rather than per case. Raised 104->107 when the
+# interop-nightly workflow was added (issue #1716): its `interop` job adds a
+# checkout, a nextest install (taiki-e/install-action), and a rust-cache; its
+# free-disk-space step is the same local `./.github/actions/...` action this
+# scan does not count, and its `report` job uses no action at all.
+WORKFLOW_EXPECTED_ACTION_COUNT=107
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (minio, createbucket (mc), qualify, ravel-server,
