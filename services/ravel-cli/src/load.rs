@@ -593,6 +593,13 @@ pub(crate) async fn run_warning_to(
         }
         Err(err) => {
             print_durable_tokens(&err);
+            // The report that held these figures is dropped with the error, and
+            // they are the only thing an operator can act on to resume: print
+            // them beside the error, with the settings precondition that says
+            // whether they are an offset at all.
+            if let Some(hint) = resume_hint(&err, read_cursors, pipeline_depth) {
+                let _ = writeln!(warnings, "{hint}");
+            }
             Err(anyhow::Error::new(err))
         }
     }
@@ -607,7 +614,6 @@ fn print_summary(report: &LoadReport) {
         report.rows_processed as f64
     };
     println!("bulk load complete");
-    println!("  rows processed   : {}", report.rows_processed);
     println!("  rows_skipped     : {}", report.rows_skipped);
     println!("  rows_written     : {}", report.rows_processed);
     println!("  rows/sec         : {rows_per_sec:.0}");
@@ -719,13 +725,72 @@ fn print_durable_tokens(err: &LoadError) {
         ""
     };
     println!(
-        "{} commit token(s)/segment(s) were durable before the failure (a partial load; \
-         re-running re-ingests the whole file, there is no dedup){suffix}:",
+        "{} commit token(s)/segment(s) were durable before the failure (a partial load, not a \
+         rollback; --skip-rows can resume it instead of re-ingesting the whole file, but only \
+         when this run used --read-cursors 1 --pipeline-depth 1 -- see the resume figures printed \
+         with the error. There is still no deduplication: nothing checks the offset a re-run is \
+         given){suffix}:",
         tokens.len()
     );
     for token in tokens {
         println!("  {}", token.encode());
     }
+}
+
+/// The failure-path resume block: the two figures [`ResumeFigures`] carries out
+/// of the dropped [`LoadReport`], the offset they add up to, and whether this
+/// run's settings make that offset mean anything.
+///
+/// The precondition is the whole content of the message. `--skip-rows` drops a
+/// file-absolute prefix exactly, at any cursor count, but the rows a FAILED run
+/// landed are a contiguous prefix of the file only under `--read-cursors 1
+/// --pipeline-depth 1`: K cursors read K far-apart partitions concurrently, and
+/// above depth 1 a batch submitted after the failing one can still commit, so
+/// the landed set has holes and `rows_skipped + rows_written` names a position
+/// no boundary sits at. Printing the figures without that sentence is what
+/// turns them into an offset an operator would paste into a resume that both
+/// duplicates and loses rows.
+///
+/// `None` for [`LoadError::Setup`]: it fails before the offset is applied or
+/// anything is written, so the previous run's own figures still stand.
+fn resume_hint(
+    err: &LoadError,
+    read_cursors: Option<usize>,
+    pipeline_depth: usize,
+) -> Option<String> {
+    let resume = err.resume_figures()?;
+    let sequential = read_cursors == Some(1) && pipeline_depth == 1;
+    let verdict = if sequential {
+        "this run used --read-cursors 1 --pipeline-depth 1, so the rows that landed are a \
+         contiguous prefix of the file and this offset resumes exactly where it stopped"
+            .to_string()
+    } else {
+        let cursors = match read_cursors {
+            Some(k) => format!("--read-cursors {k}"),
+            None => {
+                "--read-cursors unset (sized automatically to min(shards, row groups))".to_string()
+            }
+        };
+        format!(
+            "this run used {cursors} and --pipeline-depth {pipeline_depth}, so the rows that \
+             landed are NOT a contiguous prefix of the file: the cursors read far-apart \
+             partitions concurrently, and a batch submitted after the failing one can still have \
+             committed. Resuming at this offset would both re-ingest committed rows and skip rows \
+             that never landed. Only a load started with --read-cursors 1 --pipeline-depth 1 is \
+             resumable this way"
+        )
+    };
+    Some(format!(
+        "resume figures for this failed load:\n  \
+         rows_skipped     : {skipped}\n  \
+         rows_written     : {written}\n  \
+         next --skip-rows : {next} (rows_skipped + rows_written)\n\
+         {verdict}. There is no deduplication and no per-file idempotency marker, so nothing \
+         checks the offset a re-run is given; see docs/guides/ingest.md for the procedure.",
+        skipped = resume.rows_skipped,
+        written = resume.rows_written,
+        next = resume.next_skip_rows(),
+    ))
 }
 
 /// Result of a successful (or partially-durable) load, for the summary output.
@@ -735,9 +800,10 @@ pub struct LoadReport {
     /// `--skip-rows` (issue #1713): count of leading file rows dropped before
     /// mapping, by FILE-absolute position. `min(skip_rows, total file rows)`,
     /// computed once from Parquet footer metadata before decode starts. This
-    /// is a positional resume with no idempotency marker: nothing here
-    /// detects a wrong offset, and a re-run must pass the exact value the
-    /// prior attempt's summary reported.
+    /// is a positional offset with no idempotency marker: nothing here detects
+    /// a wrong value. `rows_skipped + rows_written` is the next run's offset
+    /// only when this run used one read cursor and a pipeline depth of 1; see
+    /// [`ResumeFigures`].
     pub rows_skipped: u64,
     /// One token per shard acked, across every batch, in submission order. At
     /// the default `--target-bytes 1` that is one token per object written; at
@@ -882,10 +948,51 @@ pub struct FlushMixReport {
     pub totals: FlushMixCounts,
 }
 
+/// The two figures a failed run has to hand back for `--skip-rows` to be
+/// usable: the offset that run started from and the rows it acked durable
+/// before it failed. Their sum is the next run's `--skip-rows` value, but only
+/// under `--read-cursors 1 --pipeline-depth 1`, where the acked rows are a
+/// contiguous prefix of the file. With K cursors the loader reads K far-apart
+/// partitions concurrently, and at a depth above 1 a batch submitted after the
+/// failing one can still commit, so what landed has holes and no single offset
+/// describes it. See [`resume_hint`], which is what states that to the
+/// operator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumeFigures {
+    /// `--skip-rows` as the failed run applied it (capped at the file's total
+    /// row count), i.e. [`LoadReport::rows_skipped`].
+    pub rows_skipped: u64,
+    /// Rows from writes that acked durable, in submission order, before the
+    /// failure, i.e. [`LoadReport::rows_processed`] at that moment. It does
+    /// not count rows a later in-flight write committed after the failure
+    /// ([`harvest_after_failure`] recovers those as tokens, not as rows),
+    /// which is one of the reasons the sum below is not an offset at a depth
+    /// above 1.
+    pub rows_written: u64,
+}
+
+impl ResumeFigures {
+    fn from_report(report: &LoadReport) -> Self {
+        ResumeFigures {
+            rows_skipped: report.rows_skipped,
+            rows_written: report.rows_processed,
+        }
+    }
+
+    /// The `--skip-rows` value a resume would use. Valid only under the two
+    /// settings named on this type.
+    pub fn next_skip_rows(&self) -> u64 {
+        self.rows_skipped + self.rows_written
+    }
+}
+
 /// A load failure. Every variant that can occur after some data is already
 /// durable carries the durable commit tokens, so the caller reports the
 /// genuine partial load rather than swallowing it into a generic error
-/// (ADR-0089: a failed flush is a partial load, not a rollback).
+/// (ADR-0089: a failed flush is a partial load, not a rollback). Those same
+/// variants carry [`ResumeFigures`], because the report holding them is
+/// dropped on this path and the operator needs them to decide the next run's
+/// `--skip-rows`.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     /// Setup failed before any record was written (mapping, provisioning, file
@@ -904,6 +1011,7 @@ pub enum LoadError {
     BatchFailed {
         reason: String,
         durable: Vec<CommitToken>,
+        resume: ResumeFigures,
     },
     /// A row failed a kept admission check (future skew, length cap, or the
     /// loader per-record attribute cap). Fail-fast: the run stops at the first
@@ -913,6 +1021,7 @@ pub enum LoadError {
         row: u64,
         reason: String,
         durable: Vec<CommitToken>,
+        resume: ResumeFigures,
     },
     /// A flush (object-store PUT) failed. The tokens are what was durable from
     /// *earlier* batches, plus any shard of the failing batch itself that acked
@@ -930,6 +1039,7 @@ pub enum LoadError {
     Flush {
         durable: Vec<CommitToken>,
         cause: String,
+        resume: ResumeFigures,
     },
 }
 
@@ -943,6 +1053,18 @@ impl LoadError {
             LoadError::BatchFailed { durable, .. }
             | LoadError::RowRejected { durable, .. }
             | LoadError::Flush { durable, .. } => durable,
+        }
+    }
+
+    /// The rows skipped and the rows acked durable when this error occurred.
+    /// `None` for [`LoadError::Setup`], which occurs before the load applies an
+    /// offset or writes anything, so it has no figures to resume from.
+    pub fn resume_figures(&self) -> Option<ResumeFigures> {
+        match self {
+            LoadError::Setup(_) => None,
+            LoadError::BatchFailed { resume, .. }
+            | LoadError::RowRejected { resume, .. }
+            | LoadError::Flush { resume, .. } => Some(*resume),
         }
     }
 
@@ -986,9 +1108,11 @@ impl LoadError {
 /// shard of the failing batch that acked durable before a sibling shard failed
 /// (recovered from the router error, issue #296), plus whatever any batch
 /// submitted after the failing one had already committed by the time its write
-/// resolved ([`harvest_after_failure`], issue #800) — a partial load, re-running
-/// re-ingests the whole file, there is no resumability or dedup in this
-/// version. On a [`LoadError::Flush`], the reported tokens are exact for a
+/// resolved ([`harvest_after_failure`], issue #800) — a partial load, not a
+/// rollback. Nothing deduplicates a re-ingest; the CLI's `--skip-rows` can
+/// resume such a load positionally, but only when it ran with one read cursor
+/// and a pipeline depth of 1, which is what makes the landed rows a contiguous
+/// prefix of the file ([`ResumeFigures`]). On a [`LoadError::Flush`], the reported tokens are exact for a
 /// partial flush where a sibling committed; they can still undercount only when
 /// the failing batch's ack round did not resolve (a timeout, or a shard dying
 /// at send time), where a commit can land with no observable ack (see the
@@ -1343,6 +1467,7 @@ async fn load_instrumented(
                 return Err(LoadError::BatchFailed {
                     reason,
                     durable: report.tokens.clone(),
+                    resume: ResumeFigures::from_report(&report),
                 });
             }
             Some(Prefetched::RowRejected { row, reason }) => {
@@ -1358,6 +1483,7 @@ async fn load_instrumented(
                     row,
                     reason,
                     durable: report.tokens.clone(),
+                    resume: ResumeFigures::from_report(&report),
                 });
             }
             Some(Prefetched::Batch(built)) => built,
@@ -1466,6 +1592,7 @@ async fn load_instrumented(
         return Err(LoadError::BatchFailed {
             reason,
             durable: report.tokens.clone(),
+            resume: ResumeFigures::from_report(&report),
         });
     }
 
@@ -1634,12 +1761,14 @@ async fn resolve_write_entry(
             return Err(LoadError::Flush {
                 durable,
                 cause: e.to_string(),
+                resume: ResumeFigures::from_report(report),
             });
         }
         Err(join_err) => {
             return Err(LoadError::Flush {
                 durable: report.tokens.clone(),
                 cause: format!("write task failed: {join_err}"),
+                resume: ResumeFigures::from_report(report),
             });
         }
     };
@@ -1833,11 +1962,11 @@ struct StrideCursors {
     deal_offset: usize,
     /// `--skip-rows`: the count of leading rows, by FILE-absolute position, to
     /// drop before mapping (issue #1713). Applied in [`collect_spans`] against
-    /// each span's own `file_base`, so it is correct regardless of how many
-    /// stride cursors are dealing rows or in what order they hand them out.
-    /// This is a positional resume with no idempotency marker: a re-run must
-    /// pass the exact offset the previous attempt's summary reported, and
-    /// nothing here can detect a wrong guess.
+    /// each span's own `file_base`, so the dropped rows are exactly the file's
+    /// first `skip_rows` rows regardless of how many stride cursors are dealing
+    /// rows or in what order they hand them out. That the DROP is cursor-count
+    /// independent does not make a resume so: what a failed run LANDED is a
+    /// prefix only at one cursor and depth 1 ([`ResumeFigures`]).
     skip_rows: u64,
 }
 
@@ -3922,6 +4051,7 @@ type = "i64"
         let err = LoadError::BatchFailed {
             reason: "failed to read Parquet batch: corrupt page".into(),
             durable: durable.clone(),
+            resume: ResumeFigures::default(),
         };
         assert_eq!(err.durable_tokens(), durable.as_slice());
         assert_ne!(
@@ -5212,7 +5342,7 @@ type = "i64"
         .expect_err("one shard's flush was abandoned, so the load fails");
 
         let durable = match &err {
-            LoadError::Flush { durable, cause } => {
+            LoadError::Flush { durable, cause, .. } => {
                 assert!(
                     cause.contains("flush abandoned"),
                     "the flush failure classifies as the underlying abandonment: {cause}"
