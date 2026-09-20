@@ -162,7 +162,11 @@ fn encode_validated(validated: &ValidatedDeclaredStats) -> Vec<DeclaredColumnMin
 ///
 /// `entries` is never above `records` by construction: a carried list is
 /// non-empty only if the carrier it came from was stamped, and both halves are
-/// tallied at the same two carriage points. Below it means every entry of some
+/// tallied at the same two carriage points. That holds for a pass's own pair
+/// and for the process-global totals at rest; a single scrape can still render
+/// entries above records, because the renderer reads the two atomics
+/// separately and a fold's two `fetch_add`s can land between the reads. The
+/// skew is one pass wide and gone by the next scrape. Below it means every entry of some
 /// stamped carrier was dropped, which is the shortfall the alert in
 /// docs/guides/observability.md fires on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -610,11 +610,17 @@ groups:
             Ravel is flushing log segments but no process reports fold stamp
             coverage
           description: >-
-            Every folding process in this deployment predates the
-            stamp-coverage counters, or the deployment folds nowhere. Either
-            way nothing can say whether the stamps the ingest side writes are
-            reaching the snapshot. Roll the fold processes, or scope this rule
-            out on a deployment that deliberately folds nowhere.
+            No process in this deployment renders the stamp-coverage families
+            at all, so nothing can say whether the stamps the ingest side
+            writes are reaching the snapshot. What it detects is the absence
+            of the families, not that folds are old: one `all` or `query`
+            process of a new enough build renders both, whether or not it ever
+            folds, and this rule goes quiet from then on even if every process
+            that actually folds is still on the old shape. Roll the fold
+            processes, and read the rest of the rollout off the per-pass
+            `ravel-cli catalog fold` figures per folding process. For a
+            deployment that deliberately folds nowhere, RavelCatalogFoldStalled
+            is the rule that covers it; scope this one out.
 ```
 
 Why two rules rather than one. An old fold cannot emit a counter it does not
@@ -624,6 +630,15 @@ covers the divergence; the second covers the absence, and it needs the ingest
 side as its second term, because an absent fold family on its own is also what
 a `maintain`-only deployment, a deployment that can fold by neither route, or
 an idle deployment looks like.
+
+Neither rule watches a mixed-version fleet past its first upgraded process.
+The families render on any `all` or `query` process of a new enough build,
+folding or not, so one such process makes `absent()` false, and the shortfall
+rule then compares that process's own healthy, equal contribution while the
+old folders it is rolling alongside emit nothing. For the remainder of a
+rollout the per-pass figures in the fold report, read against each folding
+process, are what says whether that process carries stamps; a fleet-wide sum
+cannot attribute a zero contribution to an old folder.
 
 `sum()` over both sides of the shortfall rule, not a per-instance comparison.
 The fold loop skips its tick when `HEAD` is already fresher than
@@ -670,7 +685,13 @@ other writer of a stamp, and a compactor of an older shape, sealing
 compaction parts with an empty statistics list, is invisible to every series
 in this section. The fold counts a carrier only when its list is non-empty,
 so an empty one increments neither half, and the drop tally counts entries a
-reader rejected, of which an empty list has none. A fleet whose ingest and
+reader rejected, of which an empty list has none. The stamped L0 records that
+compactor consumed disappear from the pair too: once a compaction record wins,
+the fold excludes its inputs and skips them before the tally, so the coverage
+those hours had is not preserved anywhere. The pair sees only the carriage of
+stamps that reached the fold already stamped; a carrier that arrived unstamped,
+whether ingest never stamped it or a compactor dropped it, is invisible on both
+halves. A fleet whose ingest and
 fold are upgraded while one compactor is not keeps both fold counters rising
 at the L0 rate, in step, ratio at one, while every L1 segment that compactor
 seals is uncovered for every declared-column statistic and every query over
