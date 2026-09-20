@@ -172,5 +172,36 @@ base="$(git -C "${d}" rev-parse HEAD)"
 check "a feat commit on the base branch is not this range's" \
   "${d}" "${base}" "${head}" 0 "clean"
 
+# --- a pull-request merge ref does not borrow the base branch's commits ------
+#
+# This is what CI actually hands the guard when a caller passes github.sha:
+# refs/pull/N/merge, whose FIRST parent is the base branch tip and whose second
+# is the branch under review. Everything merged into the base branch since the
+# fork point is reachable from it, so the walk reports a neighbour's feat
+# commit as this range's. Observed on this guard's own pull request, where a
+# feat commit that had just merged to main failed the check.
+d="$(new_repo merge-ref)"
+# base.sha is stamped when the pull request is opened, so it is main as it was
+# THEN, not main as it is when the check runs.
+base="$(git -C "${d}" rev-parse HEAD)"
+git -C "${d}" checkout -q -b feature
+printf 'text\n' >"${d}/README.md"
+git -C "${d}" add README.md
+git -C "${d}" commit -q -m "docs: this branch qualifies for nothing"
+feature="$(git -C "${d}" rev-parse HEAD)"
+# Main moves on: a neighbour feat commit lands after base.sha was stamped.
+git -C "${d}" checkout -q main
+mkdir -p "${d}/crates/c"
+printf 'pub fn neighbour() {}\n' >"${d}/crates/c/neighbour.rs"
+git -C "${d}" add crates/c/neighbour.rs
+git -C "${d}" commit -q -m "feat(c): a neighbour feature that merged first"
+main_tip="$(git -C "${d}" rev-parse HEAD)"
+# The merge ref GitHub rebuilds against CURRENT main: main tip first, branch
+# second. The neighbour feat is reachable from it and not from base.sha.
+merge_ref="$(git -C "${d}" commit-tree "$(git -C "${d}" rev-parse "${feature}^{tree}")" \
+  -p "${main_tip}" -p "${feature}" -m "Merge ${feature} into main")"
+check "a merge ref does not attribute the base branch's feat commit to this range" \
+  "${d}" "${base}" "${merge_ref}" 0 "clean"
+
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]

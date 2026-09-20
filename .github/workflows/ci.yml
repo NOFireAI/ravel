@@ -295,7 +295,12 @@ jobs:
         run: bash scripts/guards/check-changelog-touched.test.sh
       - name: Changelog guard (issue #1719)
         if: github.event_name == 'pull_request'
-        run: scripts/guards/check-changelog-touched.sh "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}"
+        # head.sha, NOT github.sha. On a pull_request event github.sha is the
+        # refs/pull/N/merge commit, whose first parent is the base branch tip,
+        # so every commit merged into main since this branch forked is
+        # reachable from it and the guard attributes a neighbour's feat commit
+        # to this pull request. head.sha is the branch tip itself.
+        run: scripts/guards/check-changelog-touched.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
       - name: Injected-clock helper guard cases (issue #1260)
         run: bash scripts/tests/check-injected-clock-helpers.test.sh
       - name: Injected-clock helper guard (issue #1260)
