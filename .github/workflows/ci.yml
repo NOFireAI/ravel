@@ -240,6 +240,12 @@ jobs:
         run: deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
       - name: Check derived-doc drift (docs/query-engine.md)
         run: scripts/check-doc-drift.sh
+      # The rehearsal harness's own helper suite. It runs here rather than only
+      # in dr-rehearsal.yml, which is scheduled and non-blocking, so a bug in
+      # the helpers fails a pull request instead of a weekly run nobody blocks
+      # on.
+      - name: Disaster-recovery harness helper cases (issue #814)
+        run: bash scripts/dr/lib.test.sh
       # Documentation gate (ADR-1040 D3). Run UNPIPED: a pipeline's exit code is
       # the last stage's, so a real failure piped through tail/grep would report
       # as a pass. No cargo toolchain, matching this job.
