@@ -2597,7 +2597,7 @@ Surface: 132 constructs over 265 corpus entries in 10 corpus files.
 | accepted divergence | 2 |
 | unclassified | 0 |
 | **reached** (supported + intentionally rejected + accepted divergence / total) | **132/132 = 100%** |
-| **agreed with Prometheus** (constructs whose corpus entries matched the pinned binary / total) | **not measured in this run** |
+| **agreed with Prometheus** (constructs whose corpus entries matched the pinned binary / constructs compared) | **not measured in this run** |
 
 | Construct | Category | State | Evidence |
 | --- | --- | --- | --- |
