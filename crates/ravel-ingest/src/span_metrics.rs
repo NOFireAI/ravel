@@ -142,10 +142,11 @@ pub struct SpanIngestMetrics {
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
     /// Per-shard ingest-skew accounting (issue #865), the span-pipeline
     /// counterpart of [`crate::IngestMetrics`]'s own and
-    /// [`crate::LogIngestMetrics`]'s own. Only the flush-permit-wait span is
-    /// recorded on this pipeline today, at the `max_inflight_flushes` acquire
-    /// in `span_shard.rs`; the on-actor and off-actor spans issue #865 never
-    /// wired up here.
+    /// [`crate::LogIngestMetrics`]'s own. The flush-permit-wait span is
+    /// recorded on this pipeline at the `max_inflight_flushes` acquire in
+    /// `span_shard.rs`, and the queued-flush gauge and deferred-trigger
+    /// counter at the queued-flush cap (issue #1740); the on-actor and
+    /// off-actor spans issue #865 never wired up here.
     ///
     /// Preallocated by [`SpanIngestMetrics::new`]; `default()` allocates none
     /// and therefore records nothing, exactly as [`crate::IngestMetrics`] does.
@@ -242,11 +243,27 @@ impl SpanIngestMetrics {
         self.shard_skew.record_flush_permit_wait_ns(shard, wait_ns);
     }
 
+    /// Shard `shard`'s current spawned-but-unreaped flush-task count, the
+    /// quantity `IngestConfig::max_queued_flushes` caps (issue #1740).
+    /// Published by the shard actor wherever its flush set changes length, so
+    /// the gauge reflects what the next trigger will be tested against.
+    pub(crate) fn record_shard_flushes_queued(&self, shard: u32, queued: u64) {
+        self.shard_skew.record_flushes_queued(shard, queued);
+    }
+
+    /// One size or age flush trigger refused because shard `shard` was already
+    /// at its queued-flush cap (issue #1740). The rows stay buffered for the
+    /// next tick.
+    pub(crate) fn record_shard_flush_trigger_deferred(&self, shard: u32) {
+        self.shard_skew.record_flush_trigger_deferred(shard);
+    }
+
     /// Point-in-time per-shard skew figures, sorted by shard index (issue
     /// #865), the span counterpart of
     /// [`crate::IngestMetrics::shard_skew_by_shard`]. A shard with no recorded
-    /// activity is simply absent. Only `flush_permit_wait_ns` is ever nonzero
-    /// on this pipeline today; see the field doc on `shard_skew`.
+    /// activity is simply absent. Only `flush_permit_wait_ns`,
+    /// `flushes_queued` and `flush_trigger_deferred` are ever nonzero on this
+    /// pipeline today; see the field doc on `shard_skew`.
     pub fn shard_skew_by_shard(&self) -> Vec<(u32, ShardSkewStats)> {
         self.shard_skew.by_shard()
     }

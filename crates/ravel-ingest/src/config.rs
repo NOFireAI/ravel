@@ -382,6 +382,26 @@ pub struct IngestConfig {
     /// value of 0 deadlocks every flush (`services/ravel-server`'s
     /// `Cli::validate` rejects it at the edge).
     pub max_inflight_flushes: u32,
+    /// Upper bound on flush tasks one shard may have spawned and not yet
+    /// reaped, counting both the flushes executing against the object store
+    /// and those parked waiting for a `max_inflight_flushes` permit
+    /// (ADR-1642 amendment, issue #1740). At the bound a size or age trigger
+    /// is refused: the tenant's rows stay in its buffer with their arrival
+    /// bookkeeping intact, so the next tick re-fires the same trigger once a
+    /// flush has finished. Drain triggers ([`FlushTrigger::Manual`]: an
+    /// explicit flush-all, shutdown, channel close) are never refused, since
+    /// nothing would retry them.
+    ///
+    /// This is the count bound that holds under
+    /// [`IngestByteBudgetLimit::Unlimited`], where `try_charge` never sheds
+    /// and the byte budget bounds nothing: resident flush memory per shard is
+    /// then this many flush windows plus the tenant buffers themselves.
+    ///
+    /// Read through [`IngestConfig::queued_flush_cap`], which floors it at 1;
+    /// 0 would refuse every trigger and never flush.
+    ///
+    /// [`FlushTrigger::Manual`]: crate::FlushTrigger::Manual
+    pub max_queued_flushes: usize,
     /// Enables the per-(shard, tenant) adaptive age trigger (ADR-0067
     /// decision 3): the fast age threshold moves within
     /// `[max_flush_delay, ceiling]` based on observed arrival rate and PUT
@@ -425,6 +445,13 @@ impl Default for IngestConfig {
             max_flush_lifetime: Duration::from_secs(3600),
             exemplar_cap_window_ns: ravel_types::ExemplarCap::DEFAULT_WINDOW_NS,
             max_inflight_flushes: 1,
+            // Issue #1740: eight flush windows per shard is deep enough that a
+            // healthy shard never reaches it (a flush that is not stalled is
+            // reaped within one PUT round trip, and the default single permit
+            // admits one at a time), and shallow enough that a stalled prefix
+            // holds bounded memory: at the 8 MiB `target_bytes` default it is
+            // 64 MiB per shard rather than an unbounded queue.
+            max_queued_flushes: 8,
             adaptive_flush_delay: false,
             // Must exceed max_flush_delay by STRICT_VISIBILITY_RESERVE_NS, not
             // equal it: equal leaves visibility_ceiling_ns's subtraction with
@@ -433,6 +460,21 @@ impl Default for IngestConfig {
             strict_visibility_budget_ns: max_flush_delay.as_nanos() as i64
                 + STRICT_VISIBILITY_RESERVE_NS,
         }
+    }
+}
+
+impl IngestConfig {
+    /// The per-shard queued-flush cap as the shard actors enforce it: at least
+    /// 1, whatever [`IngestConfig::max_queued_flushes`] holds. This is where
+    /// the "at least 1" rule is applied, rather than in a validator every
+    /// construction site would have to remember to call: `IngestConfig` is a
+    /// plain struct literal at a dozen call sites and its other bounds
+    /// (`max_inflight_flushes`) are checked only at the `ravel-server` CLI
+    /// edge, which leaves a library caller free to build a 0. A 0 cap refuses
+    /// every size and age trigger, so a shard would buffer forever and flush
+    /// only on a drain; flooring here makes that unreachable.
+    pub(crate) fn queued_flush_cap(&self) -> usize {
+        self.max_queued_flushes.max(1)
     }
 }
 
@@ -568,6 +610,10 @@ mod tests {
         // ADR-0067 decision 2: default reproduces today's one-flush-at-a-time
         // behavior bit for bit; the flip to 3 is a later measured decision.
         assert_eq!(cfg.max_inflight_flushes, 1);
+        // Issue #1740: the count bound on spawned-but-unreaped flush tasks per
+        // shard, the one that still holds under an Unlimited byte budget.
+        assert_eq!(cfg.max_queued_flushes, 8);
+        assert_eq!(cfg.queued_flush_cap(), 8);
         assert!(!cfg.adaptive_flush_delay);
         // ADR-0076 decision 4: must exceed the max_flush_delay default (2s)
         // by STRICT_VISIBILITY_RESERVE_NS, not equal it -- equal collapses
@@ -576,6 +622,23 @@ mod tests {
             cfg.strict_visibility_budget_ns,
             cfg.max_flush_delay.as_nanos() as i64 + STRICT_VISIBILITY_RESERVE_NS
         );
+    }
+
+    /// A 0 cap would refuse every size and age trigger, leaving a shard to
+    /// buffer until a drain. The accessor the actors read floors it at 1, so a
+    /// library caller that builds a 0 gets one queued flush, not none.
+    #[test]
+    fn queued_flush_cap_floors_at_one() {
+        let zero = IngestConfig {
+            max_queued_flushes: 0,
+            ..IngestConfig::default()
+        };
+        assert_eq!(zero.queued_flush_cap(), 1);
+        let three = IngestConfig {
+            max_queued_flushes: 3,
+            ..IngestConfig::default()
+        };
+        assert_eq!(three.queued_flush_cap(), 3);
     }
 
     #[test]
