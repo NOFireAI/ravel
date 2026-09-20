@@ -347,14 +347,12 @@ enum Command {
     /// with a window that reaches now). A per-record attribute cap of 1024
     /// applies (relaxed from OTLP's 128). A row that fails a kept check is
     /// rejected fail-fast: the run stops at the first bad row and exits
-    /// nonzero. `--skip-rows` (issue #1713) gives a manual, positional way to
-    /// resume after such a failure: pass the last reported `rows_skipped +
-    /// rows_written` figure and the run drops that many leading rows before
-    /// mapping. There is NO idempotency marker and NO automatic
-    /// deduplication behind this: the loader trusts the offset it is given
-    /// and cannot tell a correct resume from a wrong guess, so a mismatched
-    /// value silently reprocesses or silently drops rows. Retention is
-    /// measured from load time, not the records' event times.
+    /// nonzero. `--skip-rows` (issue #1713) drops that many leading rows by
+    /// file-absolute position; a failed run prints the figures a resume would
+    /// use. Resuming a failed load that way is sound only when it ran with
+    /// `--read-cursors 1 --pipeline-depth 1`, and there is no deduplication
+    /// behind it either way: see docs/guides/ingest.md for the procedure.
+    /// Retention is measured from load time, not the records' event times.
     Load {
         /// Path to the source Parquet file.
         #[arg(long, value_name = "FILE")]
@@ -379,13 +377,13 @@ enum Command {
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_BATCH_ROWS)]
         batch_rows: usize,
         /// Number of leading rows, by file-absolute position, to drop before
-        /// mapping (issue #1713). A manual resume after a mid-file failure:
-        /// pass the exact `rows_skipped + rows_written` figure the failed
-        /// attempt's summary reported. This is a positional offset only --
-        /// there is no per-file idempotency marker (that is separate,
-        /// future work), so the loader cannot detect a wrong value; it
-        /// silently trusts what it is given. Counted and reported once, as
-        /// `rows_skipped`, in the summary. Defaults to 0 (no skip).
+        /// mapping (issue #1713). Exact at any cursor count, and reported as
+        /// `rows_skipped`. Resuming a FAILED load with `rows_skipped +
+        /// rows_written` is sound only when that run used `--read-cursors 1
+        /// --pipeline-depth 1`; at any other settings the rows that landed are
+        /// not a prefix of the file and the offset both duplicates and drops
+        /// rows. There is no idempotency marker, so nothing checks the value.
+        /// See docs/guides/ingest.md. Defaults to 0 (no skip).
         #[arg(long, default_value_t = 0)]
         skip_rows: u64,
         /// Number of parallel stride read cursors over the Parquet file's row
