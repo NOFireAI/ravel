@@ -9,14 +9,22 @@
 //! The published state is not the registered state. [`ConformanceReport`]
 //! recomputes it from a run: which corpus entries actually exercise each
 //! construct ([`Probe`] against the corpus' own query text), whether those
-//! entries actually passed on the Ravel side ([`run_ravel_only`]) and against
-//! the pinned Prometheus binary ([`ConformanceReport::apply_run_report`]), and
-//! whether each intentionally-rejected construct actually rejected
+//! entries actually passed on the Ravel side ([`run_ravel_only`]), and whether
+//! each intentionally-rejected construct actually rejected
 //! ([`ConformanceReport::apply_rejection_results`]). A construct registered as
 //! supported whose evidence is missing or failing publishes as
 //! [`ConstructState::Unclassified`], so the table cannot claim coverage a run
 //! does not show. That is ADR-0035's "the score is computed, not
 //! hand-maintained".
+//!
+//! That state is one dimension, *reached*: Ravel got to the construct and
+//! answered as the corpus entry's mode requires. Agreement with Prometheus is
+//! a second, independent dimension ([`AgreedState`]), and it is populated only
+//! by [`ConformanceReport::apply_run_report`], which needs a differential run
+//! against the pinned Prometheus binary. A block generated without one
+//! publishes [`AgreedState::NotMeasured`] and the agreed score reads
+//! [`AGREED_NOT_MEASURED`], because a reached score rendered as a single
+//! headline reads as agreement it never measured.
 //!
 //! Scope of the enumerated surface: the 72 functions promql-parser 0.10 marks
 //! non-experimental, the 12 non-experimental aggregation operators, all 16
@@ -45,6 +53,33 @@ use crate::runner::{RunReport, ravel_instant_query, ravel_range_query};
 pub const BEGIN_MARKER: &str = "<!-- BEGIN GENERATED PROMQL CONFORMANCE TABLE -->";
 /// The marker closing the generated block in `docs/query-engine.md`.
 pub const END_MARKER: &str = "<!-- END GENERATED PROMQL CONFORMANCE TABLE -->";
+
+/// The run label the block carries when no [`RunReport`] was folded in: every
+/// state in it is Ravel's own, and agreement with Prometheus was not measured.
+pub const RAVEL_ONLY_RUN_LABEL: &str = concat!(
+    "Run: Ravel only. No Prometheus binary was in the loop, so the states\n",
+    "below are what Ravel reached and answered, not what Prometheus agreed\n",
+    "with."
+);
+
+/// The run label the block carries when a [`RunReport`] against the pinned
+/// Prometheus binary was folded in.
+pub const DIFFERENTIAL_RUN_LABEL: &str = concat!(
+    "Run: differential. A run report against the pinned Prometheus binary was\n",
+    "folded in, so the agreed score below counts constructs whose corpus\n",
+    "entries matched Prometheus."
+);
+
+/// The reached score row's label.
+pub const REACHED_ROW_LABEL: &str =
+    "**reached** (supported + intentionally rejected + accepted divergence / total)";
+
+/// The agreed score row's label.
+pub const AGREED_ROW_LABEL: &str = "**agreed with Prometheus** (constructs whose corpus entries matched the pinned binary / total)";
+
+/// What the agreed score row reads when no [`RunReport`] was supplied. Never a
+/// number: an unmeasured agreement is not 0 of the surface and not all of it.
+pub const AGREED_NOT_MEASURED: &str = "not measured in this run";
 
 /// Prefix of a [`ConstructState::Supported`] `test` naming a corpus file in
 /// this crate. The run must show at least one entry from that exact file
@@ -229,6 +264,45 @@ impl ConstructState {
     /// miss.
     pub fn is_conformant(&self) -> bool {
         !matches!(self, ConstructState::Unclassified)
+    }
+}
+
+/// The agreement dimension of a construct's published state: what a
+/// differential run against the pinned Prometheus binary showed.
+///
+/// Separate from [`ConstructState`] on purpose. A construct can be reached and
+/// answered by Ravel in a run that never started Prometheus, which is how the
+/// committed table is regenerated; folding the two together publishes a
+/// Ravel-only result under a headline a reader takes as agreement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgreedState {
+    /// No [`RunReport`] was folded in. Not a zero and not a pass: the question
+    /// was never asked.
+    NotMeasured,
+    /// A run report was folded in, but no corpus entry exercises this
+    /// construct, so Prometheus never ran it.
+    NotCompared,
+    /// Every exercising corpus entry matched the pinned Prometheus binary.
+    Agreed,
+    /// At least one exercising corpus entry did not match it.
+    Diverged,
+}
+
+impl AgreedState {
+    /// The slug used in the generated table.
+    pub fn slug(self) -> &'static str {
+        match self {
+            AgreedState::NotMeasured => "not measured",
+            AgreedState::NotCompared => "not compared",
+            AgreedState::Agreed => "agreed",
+            AgreedState::Diverged => "diverged",
+        }
+    }
+}
+
+impl fmt::Display for AgreedState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.slug())
     }
 }
 
@@ -1278,9 +1352,18 @@ pub struct ConstructOutcome {
     pub construct: &'static Construct,
     /// Every corpus entry whose query exercises the construct.
     pub evidence: Vec<Evidence>,
-    /// Exercising entries that did not behave as their mode requires, either
-    /// on the Ravel side alone or against the pinned Prometheus binary.
+    /// Exercising entries that did not behave as their mode requires on the
+    /// Ravel side. This is the reached dimension: a Prometheus disagreement
+    /// lands in [`Self::disagreements`] instead.
     pub failures: Vec<String>,
+    /// Exercising entries a differential run showed disagreeing with the
+    /// pinned Prometheus binary. Empty until
+    /// [`ConformanceReport::apply_run_report`] runs.
+    pub disagreements: Vec<String>,
+    /// What a differential run showed about this construct. `None` until
+    /// [`ConformanceReport::apply_run_report`] runs, and nothing else sets it,
+    /// so a run with no report publishes [`AgreedState::NotMeasured`].
+    pub agreed: Option<AgreedState>,
     /// For an [`ConstructState::IntentionallyRejected`] row: whether its
     /// rejection cases actually rejected. `None` until
     /// [`ConformanceReport::apply_rejection_results`] runs.
@@ -1320,8 +1403,16 @@ impl ConstructOutcome {
         self.is_corpus_gap() && self.unit_test_confirmed != Some(true)
     }
 
-    /// The state the table publishes, recomputed from the run rather than
-    /// taken from the registry.
+    /// What the run showed about agreement with Prometheus. `NotMeasured`
+    /// unless [`ConformanceReport::apply_run_report`] supplied a differential
+    /// run.
+    pub fn agreed_state(&self) -> AgreedState {
+        self.agreed.unwrap_or(AgreedState::NotMeasured)
+    }
+
+    /// The reached state the table publishes, recomputed from the run rather
+    /// than taken from the registry. Says nothing about Prometheus: that is
+    /// [`Self::agreed_state`].
     pub fn published_state(&self) -> ConstructState {
         match self.construct.state {
             ConstructState::Supported { test } => {
@@ -1386,14 +1477,24 @@ impl StateCounts {
 
     /// [`Self::conformant`] over [`Self::total`], as a percentage rounded to
     /// one decimal place. Zero when the surface is empty.
-    pub fn score_percent(&self) -> f64 {
-        let total = self.total();
-        if total == 0 {
-            return 0.0;
-        }
-        let raw = self.conformant() as f64 * 1000.0 / total as f64;
-        raw.round() / 10.0
+    ///
+    /// This is the *reached* score: how much of the surface Ravel reached and
+    /// answered. Agreement with Prometheus has its own score, and it exists
+    /// only when a differential run supplied one
+    /// ([`ConformanceReport::agreed_count`]).
+    pub fn reached_percent(&self) -> f64 {
+        percent(self.conformant(), self.total())
     }
+}
+
+/// `part` over `total` as a percentage rounded to one decimal place. Zero when
+/// `total` is zero.
+pub fn percent(part: usize, total: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let raw = part as f64 * 1000.0 / total as f64;
+    raw.round() / 10.0
 }
 
 /// Errors the report and the doc splice can produce.
@@ -1416,6 +1517,19 @@ pub enum ScoringError {
         path: String,
         /// The underlying I/O error.
         message: String,
+    },
+    /// A differential run report covers fewer entries than the corpus the
+    /// conformance report was built from.
+    #[error(
+        "the run report ran {ran} entries but the conformance report was built \
+         from {corpus} corpus entries; a `RunReport` carries only its failures, \
+         so the entries a shorter run never executed would publish as agreed"
+    )]
+    PartialRunReport {
+        /// How many entries the differential run executed.
+        ran: usize,
+        /// How many corpus entries the conformance report was built from.
+        corpus: usize,
     },
     /// The generated-table markers are missing or out of order.
     #[error("{0}")]
@@ -1520,6 +1634,8 @@ impl ConformanceReport {
                 construct,
                 evidence: Vec::new(),
                 failures: Vec::new(),
+                disagreements: Vec::new(),
+                agreed: None,
                 rejection_confirmed: None,
                 unit_test_confirmed: None,
             })
@@ -1560,15 +1676,68 @@ impl ConformanceReport {
         self.mark_failures(&failed);
     }
 
-    /// Folds in a full differential run against the pinned Prometheus binary.
-    /// Only the entry names are read, so an archived report is enough.
-    pub fn apply_run_report(&mut self, report: &RunReport) {
+    /// Folds in a full differential run against the pinned Prometheus binary,
+    /// which is the only thing that populates the agreed dimension. Only the
+    /// entry names are read, so an archived report is enough.
+    ///
+    /// A disagreement is not a Ravel-side failure and does not move the
+    /// reached state: it lands in [`ConstructOutcome::disagreements`] and
+    /// publishes as [`AgreedState::Diverged`].
+    ///
+    /// The report must have run at least the corpus this conformance report
+    /// was built from. A [`RunReport`] carries its failures and a total, not
+    /// the name of every entry it executed, so entries a shorter run never
+    /// reached are indistinguishable from passing ones, and folding one in
+    /// would publish agreement for constructs Prometheus never saw.
+    pub fn apply_run_report(&mut self, report: &RunReport) -> Result<(), ScoringError> {
+        if report.total < self.corpus_entries {
+            return Err(ScoringError::PartialRunReport {
+                ran: report.total,
+                corpus: self.corpus_entries,
+            });
+        }
         let failed: BTreeSet<&str> = report
             .failures
             .iter()
             .map(|f| f.entry_name.as_str())
             .collect();
-        self.mark_failures(&failed);
+        for outcome in &mut self.outcomes {
+            // One entry name can appear as evidence under two corpus files;
+            // the disagreement is the entry, counted once.
+            let disagreements: BTreeSet<&str> = outcome
+                .evidence
+                .iter()
+                .map(|e| e.entry.as_str())
+                .filter(|name| failed.contains(name))
+                .collect();
+            outcome.disagreements = disagreements.into_iter().map(str::to_string).collect();
+            outcome.agreed = Some(if outcome.evidence.is_empty() {
+                AgreedState::NotCompared
+            } else if outcome.disagreements.is_empty() {
+                AgreedState::Agreed
+            } else {
+                AgreedState::Diverged
+            });
+        }
+        Ok(())
+    }
+
+    /// How many constructs the differential run showed agreeing with the
+    /// pinned Prometheus binary, or `None` when no run report was folded in.
+    ///
+    /// `None` is the honest answer to an unmeasured question, and it is what
+    /// keeps the rendered score row from printing a number
+    /// ([`AGREED_NOT_MEASURED`]).
+    pub fn agreed_count(&self) -> Option<usize> {
+        if !self.outcomes.iter().any(|o| o.agreed.is_some()) {
+            return None;
+        }
+        Some(
+            self.outcomes
+                .iter()
+                .filter(|o| o.agreed_state() == AgreedState::Agreed)
+                .count(),
+        )
     }
 
     fn mark_failures(&mut self, failed: &BTreeSet<&str>) {
@@ -1686,6 +1855,11 @@ impl ConformanceReport {
              `RAVEL_UPDATE_CONFORMANCE_TABLE=1`. Do not edit the block between\n\
              the markers by hand.\n\n",
         );
+        out.push_str(match self.agreed_count() {
+            Some(_) => DIFFERENTIAL_RUN_LABEL,
+            None => RAVEL_ONLY_RUN_LABEL,
+        });
+        out.push_str("\n\n");
         out.push_str(&format!(
             "Surface: {} constructs over {} corpus entries in {} corpus files.\n\n",
             counts.total(),
@@ -1704,12 +1878,20 @@ impl ConformanceReport {
         ));
         out.push_str(&format!("| unclassified | {} |\n", counts.unclassified));
         out.push_str(&format!(
-            "| **score** (supported + intentionally rejected + accepted \
-             divergence / total) | **{}/{} = {}%** |\n\n",
+            "| {REACHED_ROW_LABEL} | **{}/{} = {}%** |\n",
             counts.conformant(),
             counts.total(),
-            counts.score_percent()
+            counts.reached_percent()
         ));
+        let agreed = match self.agreed_count() {
+            Some(agreed) => format!(
+                "{agreed}/{} = {}%",
+                counts.total(),
+                percent(agreed, counts.total())
+            ),
+            None => AGREED_NOT_MEASURED.to_string(),
+        };
+        out.push_str(&format!("| {AGREED_ROW_LABEL} | **{agreed}** |\n\n"));
 
         out.push_str("| Construct | Category | State | Evidence |\n| --- | --- | --- | --- |\n");
         let mut rows: Vec<&ConstructOutcome> = self.outcomes.iter().collect();
@@ -1775,6 +1957,16 @@ impl ConformanceReport {
                     parts.push("cited corpus file does not exercise it".to_string());
                 }
             }
+        }
+        // Only a measured disagreement is reported here. An unmeasured
+        // agreement says nothing per row: the block's own label and its agreed
+        // score row carry that, once, rather than repeating it on every row.
+        if outcome.agreed_state() == AgreedState::Diverged {
+            parts.push(format!(
+                "{} exercising entries diverged from Prometheus: {}",
+                outcome.disagreements.len(),
+                outcome.disagreements.join(", ")
+            ));
         }
         if !outcome.construct.note.is_empty() {
             parts.push(collapse_whitespace(outcome.construct.note));
@@ -2779,7 +2971,7 @@ fn an_attributed_helper() {}
     }
 
     #[test]
-    fn score_counts_states_one_two_and_accepted_divergence() {
+    fn reached_score_counts_states_one_two_and_accepted_divergence() {
         let counts = StateCounts {
             supported: 6,
             intentionally_rejected: 2,
@@ -2788,8 +2980,8 @@ fn an_attributed_helper() {}
         };
         assert_eq!(counts.total(), 10);
         assert_eq!(counts.conformant(), 9);
-        assert_eq!(counts.score_percent(), 90.0);
-        assert_eq!(StateCounts::default().score_percent(), 0.0);
+        assert_eq!(counts.reached_percent(), 90.0);
+        assert_eq!(StateCounts::default().reached_percent(), 0.0);
     }
 
     #[test]
@@ -2810,6 +3002,180 @@ fn an_attributed_helper() {}
         let err = splice_generated_block("no markers here", "table")
             .expect_err("must reject a document with no markers");
         assert!(matches!(err, ScoringError::Markers(_)));
+    }
+
+    /// A synthetic differential run: `total` entries executed, the named ones
+    /// mismatched. Only the entry names are read, so the bodies are inert.
+    fn run_report(total: usize, failed: &[&str]) -> RunReport {
+        RunReport {
+            total,
+            failures: failed
+                .iter()
+                .map(|name| crate::runner::Failure {
+                    entry_name: (*name).to_string(),
+                    query: "synthetic".to_string(),
+                    detail: "synthetic mismatch".to_string(),
+                    prometheus_body: Json::Null,
+                    ravel_body: Json::Null,
+                })
+                .collect(),
+        }
+    }
+
+    /// The four constructs `rate(up[5m])` exercises, which is the whole agreed
+    /// set in the two tests below.
+    const RATE_QUERY_CONSTRUCTS: &[&str] = &[
+        "function call",
+        "matrix selector",
+        "rate",
+        "vector selector",
+    ];
+
+    fn rate_corpus() -> Vec<CorpusEntry> {
+        vec![entry("rate(up[5m])")]
+    }
+
+    /// Without a run report the agreed dimension has no value at all, and the
+    /// rendered block says so rather than printing a score. A reached score
+    /// published alone reads as agreement with Prometheus, which is what the
+    /// committed table used to claim from a run Prometheus never joined.
+    #[test]
+    fn agreement_is_unmeasured_until_a_run_report_is_folded_in() {
+        let entries = rate_corpus();
+        let files = [CorpusFile {
+            path: "corpus/rate.txt",
+            entries: &entries,
+        }];
+        let report = ConformanceReport::from_corpus(&files);
+
+        assert_eq!(report.agreed_count(), None);
+        assert!(
+            report
+                .outcomes
+                .iter()
+                .all(|o| o.agreed_state() == AgreedState::NotMeasured)
+        );
+
+        let block = report.to_markdown();
+        assert!(block.contains(RAVEL_ONLY_RUN_LABEL), "block was:\n{block}");
+        assert!(!block.contains(DIFFERENTIAL_RUN_LABEL));
+        assert!(
+            block.contains(&format!(
+                "| {AGREED_ROW_LABEL} | **{AGREED_NOT_MEASURED}** |"
+            )),
+            "block was:\n{block}"
+        );
+        // The unmeasured row is never a number, in either direction.
+        assert!(!block.contains(&format!("| {AGREED_ROW_LABEL} | **0/")));
+        assert!(!block.contains(&format!("| {AGREED_ROW_LABEL} | **{}/", REGISTRY.len())));
+    }
+
+    /// A clean run report agrees exactly the constructs the corpus exercised,
+    /// and nothing else: a construct no corpus entry reaches was never put to
+    /// Prometheus, so it is `NotCompared`, not agreed.
+    #[test]
+    fn a_clean_run_report_agrees_exactly_the_exercised_constructs() {
+        let entries = rate_corpus();
+        let files = [CorpusFile {
+            path: "corpus/rate.txt",
+            entries: &entries,
+        }];
+        let mut report = ConformanceReport::from_corpus(&files);
+        report
+            .apply_run_report(&run_report(1, &[]))
+            .expect("a report covering the corpus is accepted");
+
+        assert_eq!(report.agreed_count(), Some(RATE_QUERY_CONSTRUCTS.len()));
+        let agreed: Vec<&str> = report
+            .outcomes
+            .iter()
+            .filter(|o| o.agreed_state() == AgreedState::Agreed)
+            .map(|o| o.construct.name)
+            .collect();
+        let mut sorted = agreed.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, RATE_QUERY_CONSTRUCTS);
+        assert_eq!(
+            report
+                .outcomes
+                .iter()
+                .filter(|o| o.agreed_state() == AgreedState::NotCompared)
+                .count(),
+            REGISTRY.len() - RATE_QUERY_CONSTRUCTS.len()
+        );
+
+        let block = report.to_markdown();
+        assert!(
+            block.contains(DIFFERENTIAL_RUN_LABEL),
+            "block was:\n{block}"
+        );
+        assert!(
+            block.contains(&format!(
+                "| {AGREED_ROW_LABEL} | **{}/{} = ",
+                RATE_QUERY_CONSTRUCTS.len(),
+                REGISTRY.len()
+            )),
+            "block was:\n{block}"
+        );
+    }
+
+    /// A Prometheus disagreement is not a Ravel-side failure: it moves the
+    /// agreed dimension and leaves the reached state exactly where the
+    /// Ravel-only run put it.
+    #[test]
+    fn a_disagreeing_entry_diverges_without_moving_the_reached_state() {
+        let entries = rate_corpus();
+        let files = [CorpusFile {
+            path: "corpus/rate.txt",
+            entries: &entries,
+        }];
+        let mut report = ConformanceReport::from_corpus(&files);
+        let index = report
+            .outcomes
+            .iter()
+            .position(|o| o.construct.name == "rate")
+            .expect("rate is registered");
+        let reached_before = report.counts();
+        report
+            .apply_run_report(&run_report(1, &["t"]))
+            .expect("a report covering the corpus is accepted");
+
+        assert_eq!(report.agreed_count(), Some(0));
+        assert_eq!(report.outcomes[index].agreed_state(), AgreedState::Diverged);
+        assert_eq!(report.outcomes[index].disagreements, vec!["t".to_string()]);
+        assert!(report.outcomes[index].failures.is_empty());
+        assert!(matches!(
+            report.outcomes[index].published_state(),
+            ConstructState::Supported { .. }
+        ));
+        assert_eq!(report.counts(), reached_before);
+
+        let block = report.to_markdown();
+        assert!(
+            block.contains("1 exercising entries diverged from Prometheus: t"),
+            "block was:\n{block}"
+        );
+    }
+
+    /// A run report shorter than the corpus is refused rather than folded in:
+    /// it carries failures and a total, not the name of every entry it ran, so
+    /// the entries it never reached would publish as agreed.
+    #[test]
+    fn a_run_report_that_did_not_cover_the_corpus_is_refused() {
+        let entries = vec![entry("rate(up[5m])"), entry("sum(up)")];
+        let files = [CorpusFile {
+            path: "corpus/rate.txt",
+            entries: &entries,
+        }];
+        let mut report = ConformanceReport::from_corpus(&files);
+        let err = report
+            .apply_run_report(&run_report(1, &[]))
+            .expect_err("a partial run report must be refused");
+        assert!(matches!(
+            err,
+            ScoringError::PartialRunReport { ran: 1, corpus: 2 }
+        ));
+        assert_eq!(report.agreed_count(), None);
     }
 
     #[test]
