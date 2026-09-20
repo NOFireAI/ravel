@@ -5215,6 +5215,7 @@ dependencies = [
  "datafusion",
  "futures",
  "hex",
+ "opentelemetry-proto",
  "proptest",
  "prost",
  "rand 0.10.2",

@@ -23,8 +23,9 @@ use std::fmt::Write as _;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, MapArray, StringArray,
-    StringViewArray, TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
+    Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray, MapArray,
+    StringArray, StringViewArray, StructArray, TimestampNanosecondArray, UInt8Array, UInt32Array,
+    UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Int32Type, SchemaRef, TimeUnit};
 use datafusion::arrow::ipc::writer::StreamWriter;
@@ -163,6 +164,27 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
             }?
         }
         DataType::Map(_, _) => map_to_json(array, row)?,
+        // `spans.events` is a `List(Struct{...})` (issue #1710). A list cell
+        // becomes a JSON array and a struct cell a JSON object, each element
+        // encoded by the same rules as a top-level cell, so a nested Utf8 or
+        // Map reads exactly as it would in a column of its own.
+        DataType::List(_) => {
+            let values = downcast::<ListArray>(array, "List")?.value(row);
+            let mut items = Vec::with_capacity(values.len());
+            for i in 0..values.len() {
+                items.push(cell_to_json(&values, i)?);
+            }
+            Json::Array(items)
+        }
+        DataType::Struct(fields) => {
+            let columns = downcast::<StructArray>(array, "Struct")?;
+            let mut object = JsonMap::with_capacity(fields.len());
+            for (i, field) in fields.iter().enumerate() {
+                let child = columns.column(i);
+                object.insert(field.name().to_string(), cell_to_json(child, row)?);
+            }
+            Json::Object(object)
+        }
         other => {
             return Err(SqlError::Internal(format!(
                 "no JSON encoding for arrow type {other}"

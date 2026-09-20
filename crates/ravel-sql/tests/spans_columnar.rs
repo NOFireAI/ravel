@@ -35,8 +35,8 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::erasure::snapshot_pending_erasure_predicates;
 use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanQuery, SpanRecord, StatusCode};
 use ravel_sql::{
-    SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_NAME, SPAN_COL_SERVICE_NAME, SPAN_COL_START_TS,
-    SPAN_COL_TRACE_ID, SpanSegmentFetcher, SpansScanExec, spans_schema,
+    SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_EVENTS, SPAN_COL_NAME, SPAN_COL_SERVICE_NAME,
+    SPAN_COL_START_TS, SPAN_COL_TRACE_ID, SpanSegmentFetcher, SpansScanExec, spans_schema,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -587,4 +587,162 @@ async fn eligible_scan_emits_the_projected_schema_in_order() {
         })
         .collect();
     assert_eq!(names, vec!["a0", "b1", "a2", "b3", "a4", "b5"]);
+}
+
+/// The `_events_raw` attribute value for one OTLP event named `name`, encoded
+/// exactly as `ravel_otlp::traces_normalize::encode_blob` encodes it at ingest.
+fn one_event_raw(ts_ns: u64, name: &str) -> String {
+    let event = opentelemetry_proto::tonic::trace::v1::span::Event {
+        time_unix_nano: ts_ns,
+        name: name.to_string(),
+        ..Default::default()
+    };
+    let mut raw = Vec::new();
+    prost::Message::encode_length_delimited(&event, &mut raw).expect("encode event");
+    raw.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A corpus whose spans all carry one event, so the `events` column has real
+/// content and the blocks have event pages. Kept apart from
+/// [`two_object_corpus`] so the page-count constants pinned above keep
+/// describing the corpus they were derived from.
+async fn events_corpus(store: &MemoryStore) -> Vec<SegmentRef> {
+    let records: Vec<SpanRecord> = (0u8..4)
+        .map(|i| {
+            let mut r = span(i, 0, 10 + i64::from(i) * 10, "checkout", &format!("e{i}"));
+            r.attrs.push((
+                "_events_raw".to_string(),
+                one_event_raw(1_000 + u64::from(i), "exception"),
+            ));
+            r.attrs.sort();
+            r
+        })
+        .collect();
+    vec![write_object(store, "spans/events.rspan", &records).await]
+}
+
+/// Issue #1710: adding `events` to the schema must not cost the columnar fast
+/// path anything for a query that does not ask for it, and a query that does
+/// ask for it must drain the row path.
+///
+/// Both directions are asserted over the same corpus:
+///
+/// - The events-excluding projection takes the columnar exit
+///   (`columnar_batches > 0`, `rowpath_batches == 0`) and skips pages, which is
+///   the property the new eligibility clause must not have broken.
+/// - The same projection plus `events` takes the row path
+///   (`rowpath_batches > 0`, `columnar_batches == 0`) and returns the decoded
+///   event on every row, with the shared columns byte-identical to the fast
+///   path's.
+///
+/// Flip to watch it fail: drop `&& !p.contains(&SPAN_COL_EVENTS)` from
+/// `spans_scan.rs::columnar_static_eligible`. The events-including scan then
+/// enters the columnar path, whose `columnar_column` has no arm for index 11,
+/// and this test fails at `run_scan`'s `.expect("batch")` with "spans columnar
+/// column index 11 not supported on the fast path".
+#[tokio::test]
+async fn events_projection_drains_the_row_path_and_excluding_it_keeps_the_columnar_exit() {
+    let store = MemoryStore::new();
+    let segments = events_corpus(&store).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    let without = vec![SPAN_COL_TRACE_ID, SPAN_COL_NAME];
+    let with = vec![SPAN_COL_TRACE_ID, SPAN_COL_NAME, SPAN_COL_EVENTS];
+
+    let fast = run_scan(
+        Arc::clone(&store),
+        segments.clone(),
+        Some(without.clone()),
+        Vec::new(),
+    )
+    .await;
+    assert!(
+        fast.columnar_batches > 0,
+        "a projection excluding events must still take the columnar fast path"
+    );
+    assert_eq!(fast.rowpath_batches, 0, "and must not fall back");
+    assert!(
+        fast.pages_skipped > 0,
+        "the excluded columns' pages, the event pages among them, are walked past"
+    );
+
+    let rows = run_scan(Arc::clone(&store), segments, Some(with.clone()), Vec::new()).await;
+    assert_eq!(
+        rows.columnar_batches, 0,
+        "an events-including projection must not run the columnar path"
+    );
+    assert!(
+        rows.rowpath_batches > 0,
+        "the row path must have run for the events-including projection"
+    );
+
+    // The row path emits the projected schema, events included.
+    let expected = spans_schema().project(&with).expect("project schema");
+    for b in &rows.batches {
+        assert_eq!(b.schema().as_ref(), &expected, "projected schema, in order");
+    }
+
+    // Shared columns are identical across the two paths, so adding events
+    // changed only what the extra column carries.
+    let fast_names: Vec<String> = fast.batches.iter().flat_map(string_col_1).collect();
+    let row_names: Vec<String> = rows.batches.iter().flat_map(string_col_1).collect();
+    assert_eq!(fast_names, vec!["e0", "e1", "e2", "e3"]);
+    assert_eq!(row_names, fast_names, "the two paths agree on `name`");
+
+    // Every row carries its one decoded event, with the ts and name the OTLP
+    // fixture encoded. Pinned per row, not counted in aggregate: a column that
+    // repeated one span's events on every row would still total four.
+    let events: Vec<(i64, String)> = rows
+        .batches
+        .iter()
+        .flat_map(|b| {
+            let list = b
+                .column(2)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::ListArray>()
+                .expect("events column is a ListArray");
+            (0..list.len())
+                .map(|i| {
+                    assert!(list.is_valid(i), "every fixture span has an event");
+                    let item = list.value(i);
+                    assert_eq!(item.len(), 1, "one event per fixture span");
+                    let st = item
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::StructArray>()
+                        .expect("events elements are Structs");
+                    let ts = st
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("ts_unix_nano is Int64")
+                        .value(0);
+                    let name = st
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("name is Utf8")
+                        .value(0)
+                        .to_string();
+                    (ts, name)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        events,
+        (0..4)
+            .map(|i| (1_000 + i, "exception".to_string()))
+            .collect::<Vec<_>>(),
+        "each span's own event, in (trace_id, start_ts) order"
+    );
+}
+
+/// Column 1 of `batch` as strings, for the two-path `name` comparison above.
+fn string_col_1(batch: &RecordBatch) -> Vec<String> {
+    let arr = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name column");
+    (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
 }

@@ -249,6 +249,53 @@ pub fn reconstruct_events_raw(events: &[SpanEvent]) -> String {
     hex_encode(&raw)
 }
 
+/// One protobuf field as the hand-rolled scanner below sees it. A `Fixed32`
+/// carries no payload because no field this crate reads is one; it exists so
+/// the scan can step over it rather than give up on the rest of the message.
+enum WireField<'a> {
+    Varint(u64),
+    Fixed64([u8; 8]),
+    Fixed32,
+    Len(&'a [u8]),
+}
+
+/// Reads the next `(field number, value)` from `chunk` at `*pos`, or `None` at
+/// the end of the message and on any byte sequence the wire format does not
+/// explain (a truncated varint, a length running past the end, an unknown wire
+/// type). Untrusted input: never panics, and never advances `*pos` past
+/// `chunk.len()`.
+fn next_wire_field<'a>(chunk: &'a [u8], pos: &mut usize) -> Option<(u64, WireField<'a>)> {
+    if *pos >= chunk.len() {
+        return None;
+    }
+    let tag = get_uvarint(chunk, pos).ok()?;
+    let field = tag >> 3;
+    let value = match tag & 0x7 {
+        0 => WireField::Varint(get_uvarint(chunk, pos).ok()?),
+        1 => {
+            let end = (*pos).checked_add(8).filter(|e| *e <= chunk.len())?;
+            let mut a = [0u8; 8];
+            a.copy_from_slice(chunk.get(*pos..end)?);
+            *pos = end;
+            WireField::Fixed64(a)
+        }
+        2 => {
+            let len = usize::try_from(get_uvarint(chunk, pos).ok()?).ok()?;
+            let end = (*pos).checked_add(len).filter(|e| *e <= chunk.len())?;
+            let slice = chunk.get(*pos..end)?;
+            *pos = end;
+            WireField::Len(slice)
+        }
+        5 => {
+            let end = (*pos).checked_add(4).filter(|e| *e <= chunk.len())?;
+            *pos = end;
+            WireField::Fixed32
+        }
+        _ => return None,
+    };
+    Some((field, value))
+}
+
 /// Best-effort scan of one serialized OTLP `Span.Event` for its
 /// `time_unix_nano` (field 1, wire type 1 / fixed64) and `name` (field 2, wire
 /// type 2 / length-delimited). Unknown or differently-typed fields are skipped.
@@ -258,59 +305,111 @@ fn scan_event_ts_name(chunk: &[u8]) -> (i64, String) {
     let mut ts_ns = 0i64;
     let mut name = String::new();
     let mut pos = 0usize;
-    while pos < chunk.len() {
-        let Ok(tag) = get_uvarint(chunk, &mut pos) else {
-            break;
-        };
-        let field = tag >> 3;
-        let wire = tag & 0x7;
-        match wire {
-            0 => {
-                // varint
-                if get_uvarint(chunk, &mut pos).is_err() {
-                    break;
-                }
-            }
-            1 => {
-                // fixed64
-                let end = match pos.checked_add(8) {
-                    Some(e) if e <= chunk.len() => e,
-                    _ => break,
-                };
-                if field == 1 {
-                    let mut a = [0u8; 8];
-                    a.copy_from_slice(&chunk[pos..end]);
-                    ts_ns = i64::from_le_bytes(a);
-                }
-                pos = end;
-            }
-            2 => {
-                // length-delimited
-                let Ok(len) = get_uvarint(chunk, &mut pos) else {
-                    break;
-                };
-                let end = match usize::try_from(len).ok().and_then(|l| pos.checked_add(l)) {
-                    Some(e) if e <= chunk.len() => e,
-                    _ => break,
-                };
-                if field == 2
-                    && let Ok(s) = std::str::from_utf8(&chunk[pos..end])
-                {
+    while let Some((field, value)) = next_wire_field(chunk, &mut pos) {
+        match (field, value) {
+            (EVENT_TIME_FIELD, WireField::Fixed64(a)) => ts_ns = i64::from_le_bytes(a),
+            (EVENT_NAME_FIELD, WireField::Len(b)) => {
+                if let Ok(s) = std::str::from_utf8(b) {
                     name = s.to_string();
                 }
-                pos = end;
             }
-            5 => {
-                // fixed32
-                match pos.checked_add(4) {
-                    Some(e) if e <= chunk.len() => pos = e,
-                    _ => break,
-                }
-            }
-            _ => break,
+            _ => {}
         }
     }
     (ts_ns, name)
+}
+
+/// `Span.Event.time_unix_nano`, field 1 (fixed64).
+const EVENT_TIME_FIELD: u64 = 1;
+/// `Span.Event.name`, field 2 (length-delimited).
+const EVENT_NAME_FIELD: u64 = 2;
+/// `Span.Event.attributes`, field 3 (repeated `KeyValue`).
+const EVENT_ATTRIBUTES_FIELD: u64 = 3;
+
+/// Decodes one [`SpanEvent`]'s `attrs_blob` into the event's own attribute
+/// pairs, in the order the sender encoded them.
+///
+/// The blob is a whole serialized OTLP `Span.Event`, so this reads its
+/// `attributes` field (3, repeated `KeyValue`) and stringifies each value the
+/// same way the ingest path stringifies a span attribute
+/// (`ravel_otlp::traces_normalize`): a string verbatim, a bool as
+/// `true`/`false`, an int in decimal, a double in Prometheus float spelling
+/// (`+Inf`/`-Inf` for the infinities), and a bytes value as lowercase hex. An
+/// array or kvlist value has no `Map<Utf8, Utf8>` representation and is
+/// dropped, exactly as ingest refuses one on a span attribute; nothing is lost
+/// by it, since `attrs_blob` (and the `_events_raw` attribute rebuilt from it)
+/// stays the authoritative copy.
+///
+/// Best-effort and total, like [`scan_event_ts_name`]: a blob that is not a
+/// parseable `Span.Event` yields the pairs read before the first byte the wire
+/// format could not explain, never an error and never a panic.
+pub fn event_attrs(blob: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while let Some((field, value)) = next_wire_field(blob, &mut pos) {
+        if field == EVENT_ATTRIBUTES_FIELD
+            && let WireField::Len(kv) = value
+            && let Some(pair) = decode_key_value(kv)
+        {
+            out.push(pair);
+        }
+    }
+    out
+}
+
+/// One OTLP `KeyValue`: `string key = 1`, `AnyValue value = 2`. `None` when
+/// either is absent or unrepresentable, which drops that one attribute rather
+/// than the set.
+fn decode_key_value(bytes: &[u8]) -> Option<(String, String)> {
+    let mut key: Option<String> = None;
+    let mut value: Option<String> = None;
+    let mut pos = 0usize;
+    while let Some((field, v)) = next_wire_field(bytes, &mut pos) {
+        match (field, v) {
+            (1, WireField::Len(b)) => key = std::str::from_utf8(b).ok().map(str::to_string),
+            (2, WireField::Len(b)) => value = decode_any_value(b),
+            _ => {}
+        }
+    }
+    Some((key?, value?))
+}
+
+/// One OTLP `AnyValue`, as the single string RSPAN's `Map<Utf8, Utf8>` can
+/// hold. The oneof carries exactly one variant, so the first representable
+/// field wins; `array_value` (5) and `kvlist_value` (6) are not representable
+/// and yield `None`.
+fn decode_any_value(bytes: &[u8]) -> Option<String> {
+    let mut pos = 0usize;
+    while let Some((field, v)) = next_wire_field(bytes, &mut pos) {
+        let rendered = match (field, v) {
+            (1, WireField::Len(b)) => std::str::from_utf8(b).ok().map(str::to_string),
+            (2, WireField::Varint(n)) => Some((n != 0).to_string()),
+            (3, WireField::Varint(n)) => Some((n as i64).to_string()),
+            (4, WireField::Fixed64(a)) => Some(format_double(f64::from_le_bytes(a))),
+            (7, WireField::Len(b)) => Some(hex_encode(b)),
+            _ => None,
+        };
+        if rendered.is_some() {
+            return rendered;
+        }
+    }
+    None
+}
+
+/// Renders a `double_value` exactly as `ravel_otlp::promcompat::format_float`
+/// does, so the same number reads identically whether it arrived as a span
+/// attribute or as an event attribute. Duplicated rather than imported:
+/// ravel-rspan is below ravel-otlp in the dependency graph.
+fn format_double(v: f64) -> String {
+    if v.is_infinite() {
+        if v.is_sign_negative() {
+            "-Inf".to_string()
+        } else {
+            "+Inf".to_string()
+        }
+    } else {
+        v.to_string()
+    }
 }
 
 /// Lowercase hex, matching `hex::encode` (the ingest side, so the reconstructed
@@ -644,6 +743,127 @@ mod tests {
             decode_attrs(&bad_utf8),
             Err(SpanSegError::Corrupted(_))
         ));
+    }
+
+    /// One length-delimited protobuf field: tag byte, then length, then bytes.
+    fn len_field(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        put_uvarint(&mut out, payload.len() as u64);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// An OTLP `KeyValue` whose `AnyValue` body is `value` already encoded.
+    fn key_value(key: &str, value: &[u8]) -> Vec<u8> {
+        let mut kv = len_field(0x0a, key.as_bytes());
+        kv.extend_from_slice(&len_field(0x12, value));
+        kv
+    }
+
+    #[test]
+    fn event_attrs_decodes_every_scalar_any_value_kind() {
+        let mut ev = Vec::new();
+        ev.push(0x09); // time_unix_nano
+        ev.extend_from_slice(&7i64.to_le_bytes());
+        ev.extend_from_slice(&len_field(0x12, b"exception")); // name
+        // string_value
+        ev.extend_from_slice(&len_field(
+            0x1a,
+            &key_value("exception.type", &len_field(0x0a, b"ValueError")),
+        ));
+        // bool_value = true
+        ev.extend_from_slice(&len_field(0x1a, &key_value("escaped", &[0x10, 0x01])));
+        // bool_value = false
+        ev.extend_from_slice(&len_field(0x1a, &key_value("handled", &[0x10, 0x00])));
+        // int_value = 42
+        ev.extend_from_slice(&len_field(0x1a, &key_value("retry", &[0x18, 42])));
+        // double_value
+        let mut dbl = vec![0x21];
+        dbl.extend_from_slice(&1.5f64.to_le_bytes());
+        ev.extend_from_slice(&len_field(0x1a, &key_value("ratio", &dbl)));
+        // double_value = +Inf, in Prometheus spelling
+        let mut inf = vec![0x21];
+        inf.extend_from_slice(&f64::INFINITY.to_le_bytes());
+        ev.extend_from_slice(&len_field(0x1a, &key_value("budget", &inf)));
+        // bytes_value, as lowercase hex
+        ev.extend_from_slice(&len_field(
+            0x1a,
+            &key_value("payload", &len_field(0x3a, &[0xde, 0xad, 0xbe, 0xef])),
+        ));
+
+        assert_eq!(
+            event_attrs(&ev),
+            vec![
+                ("exception.type".to_string(), "ValueError".to_string()),
+                ("escaped".to_string(), "true".to_string()),
+                ("handled".to_string(), "false".to_string()),
+                ("retry".to_string(), "42".to_string()),
+                ("ratio".to_string(), "1.5".to_string()),
+                ("budget".to_string(), "+Inf".to_string()),
+                ("payload".to_string(), "deadbeef".to_string()),
+            ],
+            "every scalar AnyValue kind decodes in encounter order"
+        );
+
+        // The same bytes are what parse_events keeps verbatim, so an event
+        // reached through the _events_raw path decodes identically.
+        let events = parse_events(&hex_encode(&frame(&ev))).expect("one event");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "exception");
+        assert_eq!(event_attrs(&events[0].attrs_blob).len(), 7);
+    }
+
+    #[test]
+    fn event_attrs_drops_unrepresentable_and_survives_garbage() {
+        // No attributes field at all.
+        let mut ev = vec![0x09];
+        ev.extend_from_slice(&0i64.to_le_bytes());
+        assert_eq!(event_attrs(&ev), Vec::new());
+
+        // array_value (field 5) has no Map<Utf8, Utf8> spelling: that one pair
+        // drops, the representable neighbours around it do not.
+        let mut mixed = Vec::new();
+        mixed.extend_from_slice(&len_field(
+            0x1a,
+            &key_value("before", &len_field(0x0a, b"a")),
+        ));
+        mixed.extend_from_slice(&len_field(0x1a, &key_value("list", &len_field(0x2a, &[]))));
+        mixed.extend_from_slice(&len_field(
+            0x1a,
+            &key_value("after", &len_field(0x0a, b"b")),
+        ));
+        assert_eq!(
+            event_attrs(&mixed),
+            vec![
+                ("before".to_string(), "a".to_string()),
+                ("after".to_string(), "b".to_string()),
+            ]
+        );
+
+        // A KeyValue missing its value, and one missing its key, each drop.
+        let mut partial = len_field(0x1a, &len_field(0x0a, b"keyonly"));
+        partial.extend_from_slice(&len_field(0x1a, &len_field(0x12, &len_field(0x0a, b"v"))));
+        assert_eq!(event_attrs(&partial), Vec::new());
+
+        // Garbage never panics: the pairs read before the unparseable byte are
+        // kept, the rest is abandoned.
+        let mut truncated = len_field(0x1a, &key_value("kept", &len_field(0x0a, b"yes")));
+        truncated.extend_from_slice(&[0x1a, 0x7f, 0x01]); // length runs past the end
+        assert_eq!(
+            event_attrs(&truncated),
+            vec![("kept".to_string(), "yes".to_string())]
+        );
+        assert_eq!(event_attrs(&[0xff, 0xff, 0xff]), Vec::new());
+        assert_eq!(event_attrs(&[]), Vec::new());
+    }
+
+    #[test]
+    fn format_double_matches_the_prometheus_float_spelling() {
+        assert_eq!(format_double(1.5), "1.5");
+        assert_eq!(format_double(-0.0), "-0");
+        assert_eq!(format_double(f64::INFINITY), "+Inf");
+        assert_eq!(format_double(f64::NEG_INFINITY), "-Inf");
+        assert_eq!(format_double(f64::NAN), "NaN");
     }
 }
 

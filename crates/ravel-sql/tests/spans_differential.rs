@@ -42,7 +42,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{Array, Int64Array, ListArray, RecordBatch, StructArray};
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::TaskContext;
@@ -55,20 +55,25 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::erasure::snapshot_pending_erasure_predicates;
 use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanQuery, SpanRecord, StatusCode};
-use ravel_sql::{SPAN_COL_ATTRS, SpanSegmentFetcher, SpansScanExec, spans_schema};
+use ravel_sql::{SPAN_COL_ATTRS, SPAN_COL_EVENTS, SpanSegmentFetcher, SpansScanExec, spans_schema};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
 
 const TENANT: TenantHash = TenantHash([1u8; 16]);
-/// The public `spans` table has eleven columns (ADR-0041); a projection is any
-/// non-empty ordered subset of these indices.
-const SPAN_COL_COUNT: usize = 11;
+/// The public `spans` table has twelve columns (ADR-0041, plus `events` from
+/// issue #1710); a projection is any non-empty ordered subset of these indices.
+const SPAN_COL_COUNT: usize = 12;
 /// The erasure target attribute. A span is erasable iff its merged attributes
 /// carry exactly this `key = value`, which `is_erased_span` matches against
 /// (ravel-query's erasure module), so the erased set is known at generation.
 const ERASE_KEY: &str = "user_id";
 const ERASE_VALUE: &str = "erase-me";
+/// Timestamp of a generated span event's first event; later events on the same
+/// span step by one nanosecond.
+const EVENT_TS_BASE: i64 = 1_700_000_000_000_000_000;
+/// The single attribute key every generated span event carries.
+const EVENT_ATTR_KEY: &str = "event.index";
 /// Proptest case count, matched to this crate's differential-suite convention
 /// (`tests/logs_differential.rs` fixes 48). Each case writes several small RSPAN
 /// objects and runs four scans (two comparisons, two paths each), so this keeps
@@ -163,7 +168,7 @@ fn arb_objects() -> impl Strategy<Value = Vec<Vec<SpanSpec>>> {
     prop::collection::vec(prop::collection::vec(arb_span(), 1..=4), 1..=3)
 }
 
-/// A projection is a non-empty ordered subset of the eleven column indices. The
+/// A projection is a non-empty ordered subset of the twelve column indices. The
 /// permutation-then-prefix shape exercises both which columns are kept and the
 /// order they appear in, so column-order and null-placement wiring is covered.
 fn arb_projection() -> impl Strategy<Value = Vec<usize>> {
@@ -195,12 +200,15 @@ fn arb_scenario() -> impl Strategy<Value = Scenario> {
 /// payload prefixed with its uvarint length, concatenated and hex-encoded. This
 /// is the exact grammar `ravel_rspan::record::parse_events` splits on, so a
 /// non-empty blob sequence is always promoted into the nested event columns.
+///
+/// Each payload is a real `opentelemetry.proto.trace.v1.Span.Event` encoding
+/// (fixed64 timestamp, name, one string-valued attribute), so the `events`
+/// column carries decoded timestamps, names, and attribute entries rather than
+/// empty structs.
 fn events_raw_value(count: usize) -> String {
     let mut raw = Vec::new();
     for i in 0..count {
-        // A small, non-empty payload per event; the bytes are kept verbatim as
-        // the event's `attrs_blob`, so any non-empty sequence parses.
-        let payload = [0x08u8, 0x02, i as u8 + 1];
+        let payload = event_payload(i);
         put_uvarint(&mut raw, payload.len() as u64);
         raw.extend_from_slice(&payload);
     }
@@ -209,6 +217,30 @@ fn events_raw_value(count: usize) -> String {
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
+}
+
+/// One `Span.Event` on the wire: `time_unix_nano` (field 1, fixed64), `name`
+/// (field 2, string), `attributes` (field 3, one `KeyValue` whose `AnyValue`
+/// carries a string).
+fn event_payload(index: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(0x09); // field 1, wire type 1 (fixed64)
+    out.extend_from_slice(&(EVENT_TS_BASE + index as i64).to_le_bytes());
+    len_field(&mut out, 2, format!("ev-{index}").as_bytes());
+
+    let mut any_value = Vec::new();
+    len_field(&mut any_value, 1, format!("{index}").as_bytes());
+    let mut key_value = Vec::new();
+    len_field(&mut key_value, 1, EVENT_ATTR_KEY.as_bytes());
+    len_field(&mut key_value, 2, &any_value);
+    len_field(&mut out, 3, &key_value);
+    out
+}
+
+fn len_field(out: &mut Vec<u8>, field: u64, payload: &[u8]) {
+    put_uvarint(out, (field << 3) | 2);
+    put_uvarint(out, payload.len() as u64);
+    out.extend_from_slice(payload);
 }
 
 fn put_uvarint(out: &mut Vec<u8>, mut n: u64) {
@@ -439,7 +471,8 @@ fn both_paths_agree_over_every_projection_subset() {
         }
 
         let projection = scn.projection.clone();
-        let excludes_attrs = !projection.contains(&SPAN_COL_ATTRS);
+        let columnar_eligible =
+            !projection.contains(&SPAN_COL_ATTRS) && !projection.contains(&SPAN_COL_EVENTS);
         let proj_schema: SchemaRef = Arc::new(
             spans_schema()
                 .project(&projection)
@@ -478,11 +511,11 @@ fn both_paths_agree_over_every_projection_subset() {
             );
 
             let rows = total_rows(&columnar);
-            if excludes_attrs {
+            if columnar_eligible {
                 if rows > 0 {
                     prop_assert!(
                         columnar.columnar_batches > 0,
-                        "an attrs-excluding projection over a non-empty corpus must take the fast path (projection {:?})",
+                        "a projection excluding attrs and events over a non-empty corpus must take the fast path (projection {:?})",
                         projection
                     );
                     prop_assert_eq!(
@@ -518,15 +551,65 @@ fn both_paths_agree_over_every_projection_subset() {
                     );
                 }
             } else {
-                // Projecting `attrs` is ineligible, so both runs take the row
-                // path; the equality above still guards row-path determinism.
+                // Projecting `attrs` or `events` is ineligible, so both runs
+                // take the row path; the equality above still guards row-path
+                // determinism.
                 if rows > 0 {
                     prop_assert!(
                         columnar.rowpath_batches > 0 && columnar.columnar_batches == 0,
-                        "an attrs-projecting query must take the row path (projection {:?})",
+                        "a query projecting attrs or events must take the row path (projection {:?})",
                         projection
                     );
                 }
+            }
+
+            // The `events` column is decoded from the corpus, not just carried:
+            // pin its null count and the exact multiset of event timestamps
+            // against what the generator wrote.
+            if let Some(position) = projection.iter().position(|c| *c == SPAN_COL_EVENTS) {
+                let batch = concat_run(&columnar, &proj_schema);
+                let events = batch
+                    .column(position)
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("events column is a list");
+                let spans_with_events = scn
+                    .objects
+                    .iter()
+                    .flatten()
+                    .filter(|s| s.events > 0)
+                    .count();
+                prop_assert_eq!(
+                    events.len() - events.null_count(),
+                    spans_with_events,
+                    "non-null event lists must match the spans the generator gave events"
+                );
+
+                let mut expected: Vec<i64> = scn
+                    .objects
+                    .iter()
+                    .flatten()
+                    .flat_map(|s| (0..s.events).map(|i| EVENT_TS_BASE + i as i64))
+                    .collect();
+                expected.sort_unstable();
+                let items = events
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("event items are structs");
+                let mut actual: Vec<i64> = items
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("event timestamps are i64")
+                    .values()
+                    .to_vec();
+                actual.sort_unstable();
+                prop_assert_eq!(
+                    actual,
+                    expected,
+                    "decoded event timestamps must match the generated corpus"
+                );
             }
 
             // --- Comparison 2: erasure fallback agrees with the survivor reference ---
