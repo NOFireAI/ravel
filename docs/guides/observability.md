@@ -58,9 +58,8 @@ guide](caching.md) documents both. `kind` splits the maintenance
 merge-memory gauge into its transient and total high-water marks. `class`
 splits the fragment in-flight gauge and admission-wait counter into their
 `pinned` and `resolve` fragment admission classes. `carrier` splits the
-declared-statistics drop tally across the four carriers of ADR-0873's
-statistics. `outcome`
-splits the alert-tick counter by how one evaluation tick ended, `allocator`
+declared-statistics drop tally across the four carriers that can drop them.
+`outcome` splits the alert-tick counter by how one evaluation tick ended, `allocator`
 and `stat` carry the process allocator gauges, and `component` splits the
 memory budget's reserved-bytes gauge by which side reserved it. The `level`
 key is reserved and no family renders it.
@@ -268,7 +267,7 @@ in `all` and `query`. A `maintain` process, and any process run with
 `--disable-fold`, therefore reports zeros permanently.
 
 The `ravel_catalog_fold_stamped_*` pair shares this prefix and is not part of
-this family. It is ADR-0873 stamp coverage, documented under declared-column
+this family. It is stamp coverage, documented under declared-column
 statistics below, and unlike the three liveness families it is omitted rather
 than rendered as zeros on any process that can fold by neither route -- a
 `maintain` process, and a `gateway` process run with `--disable-fold`.
@@ -499,7 +498,7 @@ and so trips this rule; scope the group to deployments that serve traffic.
 
 ### Declared-column statistics (`ravel_declared_stats_drops_observed_total`, `ravel_catalog_fold_stamped_*`)
 
-Three families cover ADR-0873's per-declared-column min/max stamps: one defect
+Three families cover the per-declared-column min/max stamps: one defect
 tally on the read side, and one coverage pair at the fold.
 
 | Metric | Labels | Meaning |
