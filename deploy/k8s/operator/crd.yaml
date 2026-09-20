@@ -489,6 +489,11 @@
                       "s3": {
                         "description": "S3 (or S3-compatible) backend.",
                         "properties": {
+                          "allowHttp": {
+                            "default": false,
+                            "description": "Accept a plaintext `http://` `endpoint` whose host is not loopback\n(`--s3-allow-http`). A server pod never reaches its object store over\nloopback, so an in-cluster MinIO or floci addressed by Service name\nneeds this; without it the server refuses to start rather than moving\ntelemetry and S3 credentials across the cluster network in the clear.\nLeave false (the default) for any `https://` endpoint and for real\nAWS S3.",
+                            "type": "boolean"
+                          },
                           "bucket": {
                             "description": "Bucket name (`--s3-bucket`).",
                             "type": "string"

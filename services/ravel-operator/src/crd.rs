@@ -148,9 +148,9 @@ pub struct StorageSpec {
     pub s3: S3Spec,
 }
 
-/// S3 backend configuration. `bucket`/`region`/`endpoint` render as CLI flags;
-/// credentials are injected as env vars from a Secret via `valueFrom`, never as
-/// literal flag values (ADR-0034 decision 2).
+/// S3 backend configuration. `bucket`/`region`/`endpoint`/`allowHttp` render
+/// as CLI flags; credentials are injected as env vars from a Secret via
+/// `valueFrom`, never as literal flag values (ADR-0034 decision 2).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct S3Spec {
@@ -165,6 +165,16 @@ pub struct S3Spec {
     /// MinIO or floci. Omit for real AWS S3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// Accept a plaintext `http://` `endpoint` whose host is not loopback
+    /// (`--s3-allow-http`). A server pod never reaches its object store over
+    /// loopback, so an in-cluster MinIO or floci addressed by Service name
+    /// needs this; without it the server refuses to start rather than moving
+    /// telemetry and S3 credentials across the cluster network in the clear.
+    /// Leave false (the default) for any `https://` endpoint and for real
+    /// AWS S3.
+    #[serde(default)]
+    pub allow_http: bool,
 
     /// Secret with keys `accessKeyId` and `secretAccessKey`, injected as the
     /// `RAVEL_S3_ACCESS_KEY` / `RAVEL_S3_SECRET_KEY` env vars.

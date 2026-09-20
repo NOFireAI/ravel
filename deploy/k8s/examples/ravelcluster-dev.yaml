@@ -20,6 +20,11 @@ spec:
       bucket: ravel
       region: us-east-1
       endpoint: http://minio.ravel-system.svc:9000
+      # The endpoint above is plaintext http:// to a Service name, which no
+      # pod reaches over loopback, so the server refuses to start without
+      # this. It is here because the in-cluster MinIO speaks no TLS; a
+      # cluster whose object store has an https:// endpoint omits it.
+      allowHttp: true
       credentialsSecretRef:
         name: ravel-s3-credentials
   tenantTokensSecretRef:

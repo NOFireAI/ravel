@@ -96,6 +96,11 @@ services:
       # dev bucket, so opt out explicitly. Safe on a reused minio-data/ too: an
       # existing unkeyed marker validates against this, keyed would not.
       - "--tenant-hash-unkeyed"
+      # RAVEL_S3_ENDPOINT below is plaintext http:// to the `minio` service,
+      # which is not loopback from inside this container, so startup refuses
+      # it without this flag. The traffic never leaves the compose network;
+      # a deployment reaching a real object store uses https:// instead.
+      - "--s3-allow-http"
     ports:
       - "127.0.0.1:4318:4318"
       - "127.0.0.1:4317:4317"
