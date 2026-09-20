@@ -69,6 +69,20 @@ new_tree() {
   printf '%s\n' "${dir}"
 }
 
+# line_of <tree> <relative-compose-path> <fixed-substring>
+#
+# The line number the guard reports, resolved from the fixture rather than
+# hardcoded. These expectations used to carry literal line numbers, and any
+# edit ABOVE a pinned image in deploy/docker-compose/ravel.yml broke this
+# suite even though the guard was working: adding five lines for the S3
+# plaintext flag moved grafana from 159 to 164 and failed two cases here.
+# The line is still asserted, because "names the line" is the behaviour under
+# test; it is just no longer written down in two places that drift apart.
+line_of() {
+  local dir="$1" rel="$2" needle="$3"
+  grep -n -F -- "${needle}" "${dir}/${rel}" | head -1 | cut -d: -f1
+}
+
 # check <name> <tree> <want-exit> <want-substring-or-empty>
 check() {
   local name="$1" dir="$2" want_rc="$3" want_sub="${4:-}"
@@ -105,13 +119,13 @@ d="$(new_tree bare-tag-grafana)"
 mutate "${d}/deploy/docker-compose/ravel.yml" \
   's#image: grafana/grafana:13\.2\.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0#image: grafana/grafana:latest#'
 check "a bare tag on grafana in ravel.yml fails naming the unpinned reference" \
-  "${d}" 1 "ravel.yml:159: grafana/grafana:latest"
+  "${d}" 1 "ravel.yml:$(line_of "${d}" deploy/docker-compose/ravel.yml 'image: grafana/grafana:latest'): grafana/grafana:latest"
 
 d="$(new_tree bare-tag-minio-ravel)"
 mutate "${d}/deploy/docker-compose/ravel.yml" \
   's#image: quay\.io/minio/minio:RELEASE\.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b#image: quay.io/minio/minio:latest#'
 check "a bare tag on minio in ravel.yml fails naming the unpinned reference" \
-  "${d}" 1 "ravel.yml:21: quay.io/minio/minio:latest"
+  "${d}" 1 "ravel.yml:$(line_of "${d}" deploy/docker-compose/ravel.yml 'image: quay.io/minio/minio:latest'): quay.io/minio/minio:latest"
 
 # --- a bare tag in minio.yml fails naming the line (issue #1720 fix round: --
 # --- minio.yml previously diverged from ravel.yml's pin with nothing to    --
@@ -121,13 +135,13 @@ d="$(new_tree bare-tag-minio-mirror)"
 mutate "${d}/deploy/docker-compose/minio.yml" \
   's#image: quay\.io/minio/minio:RELEASE\.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b#image: quay.io/minio/minio:latest#'
 check "a bare tag on minio in minio.yml fails naming the unpinned reference" \
-  "${d}" 1 "minio.yml:7: quay.io/minio/minio:latest"
+  "${d}" 1 "minio.yml:$(line_of "${d}" deploy/docker-compose/minio.yml 'image: quay.io/minio/minio:latest'): quay.io/minio/minio:latest"
 
 d="$(new_tree bare-tag-mc-mirror)"
 mutate "${d}/deploy/docker-compose/minio.yml" \
   's#image: quay\.io/minio/mc:RELEASE\.2025-04-08T15-39-49Z@sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952#image: quay.io/minio/mc:latest#'
 check "a bare tag on mc in minio.yml fails naming the unpinned reference" \
-  "${d}" 1 "minio.yml:18: quay.io/minio/mc:latest"
+  "${d}" 1 "minio.yml:$(line_of "${d}" deploy/docker-compose/minio.yml 'image: quay.io/minio/mc:latest'): quay.io/minio/mc:latest"
 
 # A truncated digest must fail too: the regex requires exactly 64 hex chars,
 # not just the @sha256: substring.
@@ -135,7 +149,7 @@ d="$(new_tree truncated-digest)"
 mutate "${d}/deploy/docker-compose/ravel.yml" \
   's#image: grafana/grafana:13\.2\.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0#image: grafana/grafana:13.2.2@sha256:ac461fb3#'
 check "a truncated digest on grafana in ravel.yml fails naming the unpinned reference" \
-  "${d}" 1 "ravel.yml:159: grafana/grafana:13.2.2@sha256:ac461fb3"
+  "${d}" 1 "ravel.yml:$(line_of "${d}" deploy/docker-compose/ravel.yml 'image: grafana/grafana:13.2.2@sha256:ac461fb3'): grafana/grafana:13.2.2@sha256:ac461fb3"
 
 # --- a wrong count fails, across both files ---------------------------------
 
