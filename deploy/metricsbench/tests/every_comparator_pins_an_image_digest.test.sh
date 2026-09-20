@@ -12,14 +12,10 @@
 # scratch copy of that whole subtree, with only the file(s) under test
 # mutated per case.
 #
-# Issue #1720's residual round pinned three of deploy/k8s's four registry
-# images (quay.io/minio/minio and quay.io/minio/mc in minio.yaml, floci/floci
-# in floci.yaml) by mirroring the exact digest ci.yml already pins for the
-# same image; the fourth, curlimages/curl in floci.yaml, has no prior pin
-# anywhere in the repo to mirror and the executor that did this round had no
-# registry access to resolve one, so it stays unpinned. The committed tree
-# therefore fails category 6 on that one known reference until a digest is
-# added -- see the comment above that image line in deploy/k8s/floci.yaml.
+# All four of deploy/k8s's registry images are pinned: three mirror the exact
+# digest ci.yml already pins for the same image, and curlimages/curl was
+# resolved from the registry. The committed tree passes every category, which
+# is what the cases below assert; each seeds its own bad input instead.
 #
 # No `sed -i`: GNU sed requires a bare `-i` (in-place, no backup) while BSD
 # sed (macOS) requires `-i ''` (a mandatory backup-suffix argument), and a
