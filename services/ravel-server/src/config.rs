@@ -1543,11 +1543,13 @@ pub struct Cli {
     /// (ADR-0071 amendment decision 1). Operator-provisioned; Ravel mints no
     /// certificates. The certificate must carry a `ravel-fragment` dNSName SAN,
     /// the one fixed name every coordinator verifies against, and the
-    /// `clientAuth` extended key usage alongside `serverAuth`, because this
-    /// process presents the same certificate as its client identity on every
-    /// outbound fragment dial (issue #1690); startup parses it and refuses a
-    /// certificate that cannot dial. Read once at startup; rotation is a
-    /// rolling restart. Required with `--fragment-listener`.
+    /// `serverAuth` and `clientAuth` extended key usages both, because this
+    /// process presents the same certificate in both directions of the mutual
+    /// handshake (issue #1690); `anyExtendedKeyUsage` satisfies neither, since
+    /// rustls-webpki matches the required purpose OID exactly. Startup parses
+    /// the certificate and refuses one that cannot dial or be dialled, naming
+    /// the missing usage. Read once at startup; rotation is a rolling restart.
+    /// Required with `--fragment-listener`.
     #[arg(long = "fragment-tls-cert", value_name = "PATH")]
     pub fragment_tls_cert: Option<PathBuf>,
 
@@ -4176,11 +4178,12 @@ impl Cli {
                 let cert_path =
                     require_path("--fragment-tls-cert", self.fragment_tls_cert.as_deref())?;
                 let tls_cert_pem = read_pem("--fragment-tls-cert", cert_path)?;
-                // The listener's identity is also this process's client identity
-                // on every outbound fragment dial (issue #1690), so a certificate
-                // without clientAuth serves fetches while failing every dial at
-                // the handshake. Refuse here rather than degrade silently.
-                crate::fragment_cert::ensure_client_auth_eku(cert_path, &tls_cert_pem)?;
+                // One certificate serves both halves of the mutual handshake
+                // (issue #1690): without clientAuth it serves fetches while
+                // failing every outbound dial, without serverAuth it dials
+                // while failing every inbound one. Refuse here rather than
+                // degrade silently in one direction.
+                crate::fragment_cert::ensure_mutual_auth_ekus(cert_path, &tls_cert_pem)?;
                 let key_path =
                     require_path("--fragment-tls-key", self.fragment_tls_key.as_deref())?;
                 let ca_path = require_path("--fragment-tls-ca", self.fragment_tls_ca.as_deref())?;

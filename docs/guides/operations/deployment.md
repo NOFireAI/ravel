@@ -351,12 +351,14 @@ rotation is a rolling restart. Requirements for the worker certificate:
 - `extendedKeyUsage = serverAuth, clientAuth`. Both are required: the same
   certificate serves inbound fragment fetches and is presented as client
   identity on outbound ones. A `serverAuth`-only certificate serves fragments
-  but cannot dial them, and the dial fails at the handshake. Startup reads the
-  certificate and refuses when `clientAuth` is absent, naming the file and the
-  missing usage, so an upgrade from a release that documented `serverAuth`
-  alone fails loudly instead of degrading every fan-out to coordinator-local
-  execution. A certificate carrying no `extendedKeyUsage` extension at all is
-  unconstrained and starts.
+  but cannot dial them, a `clientAuth`-only one dials them but cannot serve
+  them, and in each case the handshake in the missing direction fails.
+  `anyExtendedKeyUsage` does not stand in for either: the TLS stack matches the
+  required purpose exactly. Startup reads the certificate and refuses when
+  either usage is absent, naming the file and the missing usage, so an upgrade
+  from a release that documented `serverAuth` alone fails loudly instead of
+  degrading every fan-out to coordinator-local execution. A certificate
+  carrying no `extendedKeyUsage` extension at all is unconstrained and starts.
 - Signed by the CA distributed as `--fragment-tls-ca` to every query node.
 
 ### With cert-manager
