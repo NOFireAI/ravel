@@ -777,21 +777,57 @@ ack-deadline timeout, or a shard's channel dying at send time -- because no
 per-shard ack is observed then, and a commit can land without an observable
 ack. A failure mid-file is a genuine **partial load, not a rollback**.
 
-`--skip-rows N` (issue #1713) gives a manual, positional way to resume a
-failed load: it drops the first `N` rows of the file, by file-absolute
-position, before any row reaches mapping or admission checks, and reports how
-many it dropped as `rows_skipped` in the summary alongside `rows_written`. To
-resume after a failure, re-run with `--skip-rows` set to the failed attempt's
-`rows_skipped + rows_written`.
+#### `--skip-rows`: a positional offset, and when it resumes a failure
 
-This is **not** deduplication and carries **no idempotency marker**: the
-loader trusts the offset it is given and has no way to check it against what
-actually landed. A value that is too low re-ingests rows that already
-committed, duplicating them; a value that is too high silently drops rows
-that never landed anywhere. Getting the offset right is entirely the
-operator's responsibility. A per-file idempotency marker that would make this
-automatic and safe is separate, tracked future work under ADR-1713; this flag
-is a purely positional stopgap ahead of it.
+`--skip-rows N` drops the first `N` rows of the file, by file-absolute
+position, before any row reaches mapping or admission checks. The drop itself
+is exact at any setting: it is decided per row by that row's own position in
+the file, so it does not depend on how many read cursors are open or in what
+order they hand rows out. Every run reports how many rows it dropped as
+`rows_skipped`, alongside `rows_written`, and a run that fails mid-file prints
+both figures with the error.
+
+**`rows_skipped + rows_written` is a valid resume offset only when the failed
+run used `--read-cursors 1 --pipeline-depth 1`.** Those two settings are what
+make the rows that landed a contiguous prefix of the file:
+
+- With K read cursors the loader reads K far-apart partitions of the file
+  concurrently, so at any instant the landed rows are spread across K regions,
+  not one leading run.
+- At a pipeline depth above 1 several writes are in flight at once, and a batch
+  submitted after the failing one can still commit. The loader waits for those
+  writes and reports their commit tokens, but they sit after the gap the
+  failure left.
+
+Under either, the landed set has holes, and no single offset describes it.
+Re-running with `rows_skipped + rows_written` then does both wrong things at
+once: it re-ingests rows that already committed and skips rows that never
+landed anywhere.
+
+So a bulk load you want to be resumable must be run with
+`--read-cursors 1 --pipeline-depth 1` **from the start**. That is slower (it
+gives up the concurrent reads and the overlapped writes those flags exist for),
+and it is the price of a resumable run:
+
+```sh
+ravel-cli load --parquet hits.parquet --tenant acme --mapping hits.toml \
+  --read-cursors 1 --pipeline-depth 1
+# ... fails, printing rows_skipped 0, rows_written 4200000
+ravel-cli load --parquet hits.parquet --tenant acme --mapping hits.toml \
+  --read-cursors 1 --pipeline-depth 1 --skip-rows 4200000
+```
+
+At the default settings, treat `--skip-rows` as a deliberate positional tool
+instead: splitting one file across several runs at offsets **you** chose (rows
+`0..10000000` in one run, `--skip-rows 10000000` in the next), where the
+boundary is known up front rather than inferred from a crash.
+
+Either way this is **not** deduplication and carries **no idempotency marker**:
+the loader trusts the offset it is given and has no way to check it against
+what actually landed. A value that is too low re-ingests rows that already
+committed, duplicating them; a value that is too high silently drops rows that
+never landed anywhere. Getting the offset right is entirely the operator's
+responsibility.
 
 Retention and GC key on ingest-hour buckets, which the loader derives from
 *load* time. A bulk-loaded record with an old event timestamp is therefore
