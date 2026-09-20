@@ -2532,11 +2532,16 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// one climbing while this one stays flat is a quarantine prefix filling
     /// and never being reaped.
     pub quarantine_reaped: u64,
-    /// L0 commit records the most recent compaction scan pass found sealed
-    /// but still below `min_compaction_inputs` (issue #1729). A gauge, like
-    /// `orphans_present`: this pass's count, not a running total. A value
-    /// that keeps rising means buckets for this signal are sealing faster
-    /// than they cross the compaction threshold.
+    /// L0 commit records sitting sealed and still below
+    /// `min_compaction_inputs` (issue #1729), summed over every tenant and
+    /// shard this process maintains and republished once per maintenance
+    /// cycle. A gauge, and a per-process, per-cycle total rather than one
+    /// pass's count: a scrape mid-cycle reads the previous complete value.
+    /// A bucket the interior memo skipped contributes its last-known count,
+    /// which can be up to `interior_reverify_ns` old, so the figure is the
+    /// whole pending population rather than only what this cycle re-read. A
+    /// value that keeps rising means buckets for this signal are sealing
+    /// faster than they cross the compaction threshold.
     pub l0_records_pending: u64,
 }
 
@@ -2757,10 +2762,13 @@ fn render_maintain_safety_family(
     write_header(
         out,
         "ravel_maintain_l0_records_pending",
-        "L0 commit records the most recent compaction scan pass found sealed but still below \
-         min_compaction_inputs, by signal. A gauge: this pass's count, not a running total. A \
-         steadily rising value means buckets for that signal are sealing faster than they cross \
-         the compaction threshold; see the troubleshooting guide.",
+        "L0 commit records sitting sealed and still below min_compaction_inputs, by signal, \
+         summed over every tenant and shard this process maintains and republished once per \
+         maintenance cycle. A gauge, not a running total, and a per-process total rather than \
+         one pass or one unit: a mid-cycle scrape reads the previous cycle's complete value, and \
+         a bucket the interior memo skipped contributes its last-known count. A steadily rising \
+         value means buckets for that signal are sealing faster than they cross the compaction \
+         threshold; see the troubleshooting guide.",
         "gauge",
     );
     for signal in &snapshot.signals {
