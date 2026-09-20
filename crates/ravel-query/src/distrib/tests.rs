@@ -46,6 +46,7 @@ use ravel_types::logstream::{LogStreamId, log_stream_id};
 use crate::config::EngineConfig;
 use crate::distrib::Distributed;
 use crate::distrib::client::{DistribError, RemoteSliceFetcher, SliceFetcher, SliceResponse};
+use crate::distrib::federation::{Federation, RemoteCluster};
 use crate::distrib::partition::{DistribThresholds, partition_snapshot};
 use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use crate::distrib::{
@@ -1637,12 +1638,16 @@ impl SliceFetcher for FaithfulBudgetWorker {
 /// was under the query's cap, `budget_exceeded_error` found no bytes trip, no
 /// memory refusal, and fell through to `QueryError::Distrib`.
 ///
-/// Mutation proof, either line on its own re-breaks this test:
-/// - restoring `n / (slice_count.max(1) as u64)` in `encode_budgets`
-///   (`mod.rs`) makes the wire assertion fail with 500 and the query fail;
-/// - deleting the `parse_worker_cap_refusal` branch from
-///   `budget_exceeded_error` (`mod.rs`) makes the `Distrib` assertion fail
-///   for any worker that does refuse on a byte cap.
+/// Mutation proof: restoring `n / (slice_count.max(1) as u64)` in
+/// `encode_budgets` (`mod.rs`) makes the wire assertion fail with 500 and
+/// the query fail.
+///
+/// That is the only mutation this test catches. Under the fix no slice
+/// refuses, so the `Err` arm below is unreachable and nothing here exercises
+/// `budget_exceeded_error`'s refusal parsing: deleting the
+/// `parse_worker_cap_refusal` branch leaves this test green.
+/// `worker_local_clamp_refusal_surfaces_typed_not_distrib` is the test that
+/// mutation does break.
 #[test]
 fn skewed_slice_over_its_share_but_under_query_budget_never_returns_distrib() {
     let rt = Runtime::new().expect("runtime");
@@ -1890,6 +1895,214 @@ fn worker_cap_refusal_messages_round_trip() {
             .is_none(),
         "a non-numeric count must not parse"
     );
+}
+
+/// A federated remote whose answer is a terminal `BudgetExceeded` summary
+/// carrying `message` as its rendered refusal, plus the bytes it really spent
+/// before refusing. This is byte-for-byte what a remote's `summary_frame`
+/// puts on the wire when its wire-budget clamp trips or its
+/// `resolve_scope_count_refusal` fires (service.rs): a status code plus the
+/// `Display` text of the typed cap error it raised.
+struct RemoteCapRefusalFetcher {
+    message: String,
+    spent: u64,
+}
+
+#[async_trait::async_trait]
+impl SliceFetcher for RemoteCapRefusalFetcher {
+    async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        let acct = QueryAccounting::new();
+        acct.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, self.spent);
+        Ok(SliceResponse {
+            scalar: Vec::new(),
+            histogram: Vec::new(),
+            partials: Vec::new(),
+            accounting: acct.snapshot(),
+            stats: crate::fetcher::FetchStats::default(),
+            series_returned: 0,
+            samples_returned: 0,
+            status: pb::status::Code::BudgetExceeded,
+            status_message: self.message.clone(),
+        })
+    }
+}
+
+/// One remote cluster wired for the two federation tests below.
+fn federation_with(fetcher: Arc<dyn SliceFetcher>, skip_unavailable: bool) -> Federation {
+    Federation::new(vec![RemoteCluster {
+        name: "eu-west".to_string(),
+        fetcher,
+        tenant: None,
+        skip_unavailable,
+        soft_timeout: std::time::Duration::from_secs(5),
+    }])
+}
+
+async fn federation_fetch(fed: &Federation, config: EngineConfig) -> crate::error::QueryError {
+    fed.fetch(
+        TenantHash([1u8; 16]),
+        Signal::Metrics,
+        Vec::new(),
+        Vec::new(),
+        0,
+        1_000,
+        Vec::new(),
+        QueryAccounting::new(),
+        config,
+    )
+    .await
+    .expect_err("a remote refusal must fail the query")
+}
+
+/// Issue #1725 across the cluster boundary. A remote that answers
+/// `BudgetExceeded` REFUSED the query under its own configured caps: it
+/// clamps every wire budget to its own `EngineConfig` and, on the resolve
+/// scope, enforces its own `max_series`/`max_samples` over the result it is
+/// about to return (`resolve_scope_count_refusal`, service.rs). The
+/// coordinator is under its own budget in both cases here, so before the fix
+/// the refusal fell through to `QueryError::Federation`, which http/error.rs
+/// redacts to a retryable 503 -- telling a client to retry a query the remote
+/// will refuse identically every time. ADR-0071 decision 5 and
+/// docs/query-engine.md both reserve 503 for a fan-out that itself failed.
+///
+/// Both refusal shapes this pull request introduces are covered: the
+/// count refusal (`TooManySeries`) and the wire-budget clamp
+/// (`TooManyBytesScanned` with the REMOTE's figures, not the query's). The
+/// count case also runs with `skip_unavailable = true`, because a cap refusal
+/// is a correctness outcome and is never skippable.
+///
+/// Mutation proof: replacing the `typed_budget_refusal` call in
+/// `federation.rs`'s `BudgetExceeded` arm with the pre-fix
+/// `bytes_scanned_exceeded(...).unwrap_or_else(|| QueryError::Federation ...)`
+/// makes both `matches!` assertions below fail with `Federation { .. }` and
+/// both status assertions fail with 503.
+#[test]
+fn remote_cap_refusal_under_the_local_budget_is_a_422_not_a_503() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let config = EngineConfig {
+            max_bytes_scanned: crate::config::ByteLimit::Bounded(1_000_000),
+            ..EngineConfig::default()
+        };
+
+        // The remote enforced its own max_series over the resolve-scope
+        // result. Nothing about the coordinator's budget was reached.
+        let fed = federation_with(
+            Arc::new(RemoteCapRefusalFetcher {
+                message: crate::error::QueryError::TooManySeries {
+                    count: 50_000,
+                    max: 10_000,
+                }
+                .to_string(),
+                spent: 500,
+            }),
+            true,
+        );
+        let err = federation_fetch(&fed, config).await;
+        assert!(
+            matches!(
+                err,
+                crate::error::QueryError::TooManySeries {
+                    count: 50_000,
+                    max: 10_000
+                }
+            ),
+            "a remote count refusal keeps its type and the remote's figures, got {err:?}"
+        );
+        let rendered = crate::http::QueryErrorResponse::from_query_error(err);
+        assert_eq!(
+            rendered.status,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a cap refusal is a 422, not the 503 a Federation error renders"
+        );
+        assert_eq!(rendered.error_type, "execution");
+
+        // The remote clamped the wire budget to its own tighter
+        // `max_bytes_scanned` and refused with ITS figures (900 scanned
+        // against its own 100), while the coordinator's folded total of 900
+        // is far under the 1_000_000 it authorized.
+        let fed = federation_with(
+            Arc::new(RemoteCapRefusalFetcher {
+                message: crate::error::QueryError::TooManyBytesScanned {
+                    scanned: 900,
+                    max: 100,
+                }
+                .to_string(),
+                spent: 900,
+            }),
+            false,
+        );
+        let err = federation_fetch(&fed, config).await;
+        assert!(
+            matches!(
+                err,
+                crate::error::QueryError::TooManyBytesScanned {
+                    scanned: 900,
+                    max: 100
+                }
+            ),
+            "the remote's own clamp figures must survive the fold typed, got {err:?}"
+        );
+        let rendered = crate::http::QueryErrorResponse::from_query_error(err);
+        assert_eq!(
+            rendered.status,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a remote clamp refusal is a 422, not a 503"
+        );
+        assert_eq!(rendered.error_type, "execution");
+    });
+}
+
+/// The other side of that fix, and what stops it from swallowing a genuine
+/// fan-out failure: a remote that never answered at all is still
+/// `QueryError::Federation` and still renders as the retryable 503. The two
+/// are told apart by the wire status code -- a refusal is a `Status` a remote
+/// had to answer to send, while a transport failure produces no `Status` at
+/// all and reaches `handle_unavailable` instead. A remote therefore cannot
+/// talk its way out of 503 by putting cap-refusal text in a transport error:
+/// the text below is the exact `Display` of a `TooManyBytesScanned` that
+/// `parse_worker_cap_refusal` would happily parse, and it must change
+/// nothing.
+///
+/// Mutation proof: routing the `DistribError::Transport` arm in
+/// `Federation::fetch` through `typed_budget_refusal` on the error text (a
+/// plausible over-broad reading of the fix) makes the `Federation` assertion
+/// below fail with `TooManyBytesScanned` and the 503 assertion fail with 422.
+#[test]
+fn federated_transport_failure_still_maps_to_503() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        struct SpoofingTransportFetcher(String);
+        #[async_trait::async_trait]
+        impl SliceFetcher for SpoofingTransportFetcher {
+            async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+                Err(DistribError::Transport(self.0.clone()))
+            }
+        }
+
+        let fed = federation_with(
+            Arc::new(SpoofingTransportFetcher(
+                crate::error::QueryError::TooManyBytesScanned {
+                    scanned: 900,
+                    max: 100,
+                }
+                .to_string(),
+            )),
+            false,
+        );
+        let err = federation_fetch(&fed, EngineConfig::default()).await;
+        assert!(
+            matches!(err, crate::error::QueryError::Federation { .. }),
+            "an unreachable remote is a fan-out failure, whatever its error text says, got {err:?}"
+        );
+        let rendered = crate::http::QueryErrorResponse::from_query_error(err);
+        assert_eq!(
+            rendered.status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "a genuine transport failure keeps the retryable 503"
+        );
+        assert_eq!(rendered.error_type, "unavailable");
+    });
 }
 
 /// Issue #1687 part A: the worker's own configuration is binding on every

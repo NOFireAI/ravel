@@ -46,6 +46,15 @@
 //! remote spend and fails typed regardless of `skip_unavailable`, because a
 //! budget cap is a correctness bound, not an availability property.
 //!
+//! A remote that answers `BudgetExceeded` is refusing, not failing. It kept
+//! the query inside its own configured caps (a wire-budget clamp, or the
+//! `max_series`/`max_samples` a resolve-scope slice enforces over its own
+//! result), so the coordinator renders it as the same typed 422 refusal a
+//! local cap trip raises, never as the retryable
+//! [`QueryError::Federation`]/503 an unreachable remote raises. The two are
+//! told apart by the wire status code, which only a remote that answered can
+//! set at all, never by the text it sent.
+//!
 //! # Merge semantics and the cross-cluster tie-break limitation
 //!
 //! Federated runs join the same k-way merge the local fetch feeds, keyed by
@@ -80,7 +89,7 @@ use ravel_types::{SeriesId, Signal, TenantHash};
 
 use crate::config::EngineConfig;
 use crate::distrib::client::{DistribError, SliceFetcher, SliceResponse};
-use crate::distrib::{codec, encode_budgets};
+use crate::distrib::{codec, encode_budgets, typed_budget_refusal};
 use crate::engine::bytes_scanned_exceeded;
 use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
@@ -222,6 +231,10 @@ impl Federation {
     ///   the coordinator's `max_bytes_scanned` (never skippable).
     /// - [`QueryError::TooManySeries`] when the combined remote series overrun
     ///   the distinct-series cap.
+    /// - the typed cap error a remote reported for its OWN caps
+    ///   (`TooManyBytesScanned`/`TooManySeries`/`TooManySamples`/
+    ///   `TooManySegments`) when it refused under this coordinator's budget,
+    ///   so a remote-side refusal renders 422 rather than a retryable 503.
     ///
     /// The `accounting` handle is folded with every remote's reported cost
     /// (saturating), so the query's reported total reflects federated fetches
@@ -445,10 +458,33 @@ impl Federation {
                 pb::status::Code::BudgetExceeded => {
                     // Fold the real spend, then fail typed regardless of
                     // skip_unavailable (budget is never skippable).
+                    //
+                    // A remote that answers `BudgetExceeded` REFUSED the query;
+                    // it did not fail to answer it. The refusal therefore keeps
+                    // its type end to end and renders as the same 422 a local
+                    // cap trip does (ADR-0071 decision 5, docs/query-engine.md),
+                    // never as `Federation`, which http/error.rs redacts to a
+                    // retryable 503. That distinction matters most for this
+                    // cluster's own caps: a remote clamps every wire budget to
+                    // its own `EngineConfig` and, on the resolve scope,
+                    // enforces its own `max_series`/`max_samples` over the
+                    // result (`resolve_scope_count_refusal`, service.rs), so a
+                    // remote configured tighter than the caller refuses every
+                    // time and a 503 would invite a retry that cannot succeed.
+                    //
+                    // What separates a refusal from a transport failure is the
+                    // wire status code, not the message: a remote that never
+                    // answered (transport error or soft timeout) or reported
+                    // itself `Unavailable` took `handle_unavailable` above and
+                    // stays `Federation`/503. `status_message` only selects
+                    // WHICH cap is named, and a message matching no known cap
+                    // falls back to `Federation` rather than being labelled as
+                    // a cap that may not be the one that was hit.
                     fold_remote(&accounting, &mut running, &mut outcome.stats, &response);
-                    return Err(bytes_scanned_exceeded(
+                    return Err(typed_budget_refusal(
                         running.total_s3_bytes(),
                         config.max_bytes_scanned,
+                        &response.status_message,
                     )
                     .unwrap_or_else(|| QueryError::Federation {
                         cluster: name.clone(),

@@ -1531,6 +1531,17 @@ the federation path where the caller is another cluster.
    422 `execution` error a local query produces; 503 stays reserved for the
    cases where the fan-out itself failed.
 
+   This applies to a remote cluster's refusal exactly as it does to a
+   worker's. A remote answering `BudgetExceeded` refused the query under its
+   own caps (decisions 3 and 4), so the coordinator renders it as the same
+   typed 422 rather than as the `Federation` error it redacts to 503; only an
+   unrecognised refusal message falls through to `Federation`. Refusal and
+   fan-out failure are separated by the wire status code, not by the message:
+   a remote that was unreachable or timed out produces no status at all and
+   keeps the retryable 503, so a remote cannot move itself between the two
+   classes by choosing its error text. The one thing its text decides is which
+   cap is named.
+
 ### Consequences
 
 - A skewed shard distribution no longer fails a query that is under its budget,
