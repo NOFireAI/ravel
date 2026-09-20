@@ -154,13 +154,9 @@ spec:
           # bring-up rather than per CI run, so it does not share the
           # per-runner pull pressure the quickstart job hits.
           #
-          # Not yet digest-pinned (issue #1720 residual round): no prior pin
-          # for this image exists anywhere in the repo to mirror, and the
-          # executor that added the sibling pins above had no registry
-          # access to resolve one. Category 6 of
-          # deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
-          # reports this line unpinned until a digest is resolved and added
-          # here.
+          # Digest resolved from the registry rather than mirrored from a
+          # sibling pin, since no other reference to this image exists in the
+          # repo. Category 6 of the pin scanner holds it here.
           image: curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69
           imagePullPolicy: IfNotPresent
           env:
