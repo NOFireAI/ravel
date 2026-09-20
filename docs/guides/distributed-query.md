@@ -213,12 +213,15 @@ terminates TLS in-process and serves nothing else. When it is set:
   peer; one key pair serves both directions, because every fragment process is
   both a worker and a coordinator. The certificate therefore needs the
   `clientAuth` extended key usage as well as `serverAuth`. A certificate
-  carrying only `serverAuth` will serve fragments but cannot dial them, and the
-  dial fails at the handshake. Startup parses the certificate and refuses when
-  `clientAuth` is absent, naming the file and the missing usage, so this is an
-  upgrade that fails to start rather than one that silently stops
-  distributing. Provision both usages, or rotate to a certificate that has
-  them, before enabling the dedicated listener.
+  carrying only `serverAuth` will serve fragments but cannot dial them, one
+  carrying only `clientAuth` dials them but cannot serve them, and
+  `anyExtendedKeyUsage` satisfies neither check, because the TLS stack matches
+  the required purpose exactly rather than treating that value as a wildcard.
+  Startup parses the certificate and refuses when either usage is absent,
+  naming the file and the missing usage, so this is an upgrade that fails to
+  start rather than one that silently stops distributing in one direction.
+  Provision both usages, or rotate to a certificate that has them, before
+  enabling the dedicated listener.
 
 - The dedicated listener's address is what this node publishes as its
   `fragment_endpoint`, so binding it to a wildcard needs
