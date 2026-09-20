@@ -125,5 +125,52 @@ else
   fails=$((fails + 1))
 fi
 
+# --- a diverged base does not borrow the base branch's changelog edit --------
+#
+# The range must be taken from the merge base. With a two-dot range, a
+# CHANGELOG.md edit that landed on main AFTER the fork point reads as part of
+# this range and exempts a pull request that touched no changelog. Because this
+# guard makes nearly every merged pull request touch CHANGELOG.md, a base and
+# head that diverge over a changelog edit is the common case.
+
+d="$(new_repo diverged-base)"
+git -C "${d}" checkout -q -b feature
+mkdir -p "${d}/crates/c"
+printf 'pub fn f() {}\n' >"${d}/crates/c/feature.rs"
+git -C "${d}" add crates/c/feature.rs
+git -C "${d}" commit -q -m "feat(c): add feature with no changelog entry"
+head="$(git -C "${d}" rev-parse HEAD)"
+# Meanwhile main gains a changelog edit of its own, after the fork point.
+git -C "${d}" checkout -q main
+printf '\n- someone else\n' >>"${d}/CHANGELOG.md"
+git -C "${d}" add CHANGELOG.md
+git -C "${d}" commit -q -m "docs: unrelated changelog entry on main"
+base="$(git -C "${d}" rev-parse HEAD)"
+check "a changelog edit on the base branch does not exempt this range" \
+  "${d}" "${base}" "${head}" 1 "CHANGELOG.md"
+
+# A feat commit on the base branch must not be reported as this range's.
+#
+# Unlike the case above, this one does NOT fail under the two-dot range: the
+# review suggested the commit walk had the mirror of the diff bug, but
+# `git rev-list base..head` excludes everything reachable from base, so a
+# commit on the base branch is never walked either way. The case is kept as a
+# property worth pinning, not as a regression test for the merge-base fix; only
+# the case above discriminates, and it is the one that was silently passing.
+d="$(new_repo diverged-base-foreign-feat)"
+git -C "${d}" checkout -q -b docs-only
+printf 'text\n' >"${d}/README.md"
+git -C "${d}" add README.md
+git -C "${d}" commit -q -m "docs: touch nothing that qualifies"
+head="$(git -C "${d}" rev-parse HEAD)"
+git -C "${d}" checkout -q main
+mkdir -p "${d}/services/s"
+printf 'pub fn g() {}\n' >"${d}/services/s/other.rs"
+git -C "${d}" add services/s/other.rs
+git -C "${d}" commit -q -m "feat(s): a neighbour feature with no changelog"
+base="$(git -C "${d}" rev-parse HEAD)"
+check "a feat commit on the base branch is not this range's" \
+  "${d}" "${base}" "${head}" 0 "clean"
+
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
