@@ -347,8 +347,15 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     /// A federated slice has no such coordinator-side belt within this
     /// cluster: the requesting cluster resolved nothing here, folds this
     /// cluster's whole answer as one lump, and its caps are its own, so
-    /// without this a remote request could make this cluster materialize an
-    /// unbounded number of series before anything refused.
+    /// without this a remote request could make this cluster RETURN an
+    /// unbounded number of series.
+    ///
+    /// This bounds what the slice returns, not what it materializes. It runs
+    /// after every pinned segment has been fetched and decoded, so the series
+    /// it counts are already resident in this worker's memory when it
+    /// refuses; peak memory is bounded by the byte budget and the fetch
+    /// layer's own memory accounting, not by this. Size a worker's memory
+    /// against those, never against `max_series`.
     ///
     /// Scalar and histogram series are counted separately against
     /// `max_series`, mirroring the coordinator's two distinct-id sets. Samples

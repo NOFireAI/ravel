@@ -802,22 +802,44 @@ fn budget_exceeded_error(
     max_bytes_scanned: ByteLimit,
     status_message: &str,
 ) -> QueryError {
+    typed_budget_refusal(folded_bytes, max_bytes_scanned, status_message).unwrap_or(
+        QueryError::Distrib {
+            reason: format!("slice tripped its budget: {status_message}"),
+        },
+    )
+}
+
+/// The typed refusal behind a `BudgetExceeded` status, or `None` when the
+/// refusal's own text matches no known cap.
+///
+/// Shared by the intra-cluster slice path ([`budget_exceeded_error`]) and the
+/// cross-cluster federation path
+/// ([`Federation::fetch`](crate::distrib::federation::Federation::fetch)), which
+/// differ only in the error each renders for an unrecognised refusal: a
+/// coordinator that cannot tell which cap a peer tripped names the peer it
+/// could not understand, and the two paths have different peers.
+///
+/// The coordinator's own folded bytes are checked first, so a fan-out that
+/// really did exceed the query's budget reports the query's figures against the
+/// query's cap. Only below that does the peer's own refusal decide, and it
+/// decides only WHICH cap is reported: whether a `BudgetExceeded` arrived at
+/// all is a wire status code, never a message.
+pub(crate) fn typed_budget_refusal(
+    folded_bytes: u64,
+    max_bytes_scanned: ByteLimit,
+    status_message: &str,
+) -> Option<QueryError> {
     if let Some(err) = bytes_scanned_exceeded(folded_bytes, max_bytes_scanned) {
-        return err;
+        return Some(err);
     }
     if let Some((requested, reserved, limit)) = parse_fetch_memory_exhausted(status_message) {
-        return QueryError::Fetch(FetchError::FetchMemoryExhausted {
+        return Some(QueryError::Fetch(FetchError::FetchMemoryExhausted {
             requested,
             reserved,
             limit,
-        });
+        }));
     }
-    if let Some(err) = parse_worker_cap_refusal(status_message) {
-        return err;
-    }
-    QueryError::Distrib {
-        reason: format!("slice tripped its budget: {status_message}"),
-    }
+    parse_worker_cap_refusal(status_message)
 }
 
 /// Reconstructs the typed cap error behind a worker's rendered budget
@@ -1137,8 +1159,10 @@ pub(crate) fn span_order_key(row: &SpanRow) -> SpanOrderKey {
 /// since each is authorized for the whole budget on its own. The second
 /// half of the bound is worker-side (issue #1687 part A): a worker clamps
 /// every wire budget to its own `EngineConfig`, so an oversized or absent
-/// wire budget can never authorize more work on a worker than that worker's
-/// operator configured.
+/// wire budget can never authorize more work PER SLICE than that worker's
+/// operator configured. The clamp is per slice, not per worker: rendezvous
+/// routing can place several of one query's slices on the same worker, and
+/// each of them is authorized for the full clamped budget independently.
 ///
 /// `max_series`/`max_samples`/`max_segments` are likewise sent whole: those
 /// are count-based caps re-checked per slice as results return
