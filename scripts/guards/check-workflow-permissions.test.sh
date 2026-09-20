@@ -441,5 +441,66 @@ else
   fails=$((fails + 1))
 fi
 
+# The `- name:` step form, where `uses:` and `with:` are siblings under the
+# list item. Bounding the scan by the `uses:` line's indent stops it at `with:`
+# and never reaches `persist-credentials: false` underneath, so a correct step
+# reads as a finding. No live workflow uses this form today, which is exactly
+# why it needs a case: nothing else would catch the regression.
+d="$(new_tree named-checkout-step)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960ce8a2c0b1e8b1e5e6b0e0d4b0a0f0e0d0
+        with:
+          persist-credentials: false
+      - run: cargo build
+YML
+out="$(cd "${d}" && bash scripts/guards/check-workflow-permissions.sh 2>&1)"
+rc=$?
+if [[ "${rc}" == "0" && "${out}" != *"checkout-persists-credentials"* ]]; then
+  printf 'ok    a named step with persist-credentials under its own with: is clean\n'
+  passes=$((passes + 1))
+else
+  printf 'FAIL  a named step with persist-credentials under its own with: is clean: got %s / %s\n' "${rc}" "${out}"
+  fails=$((fails + 1))
+fi
+
+# The same shape WITHOUT the setting must still be reported, so the fix above
+# cannot be "stop scanning named steps".
+d="$(new_tree named-checkout-step-bare)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960ce8a2c0b1e8b1e5e6b0e0d4b0a0f0e0d0
+        with:
+          fetch-depth: 0
+      - run: cargo build
+YML
+out="$(cd "${d}" && bash scripts/guards/check-workflow-permissions.sh 2>&1)"
+rc=$?
+if [[ "${rc}" == "1" && "${out}" == *"checkout-persists-credentials"* ]]; then
+  printf 'ok    a named step without persist-credentials is still reported\n'
+  passes=$((passes + 1))
+else
+  printf 'FAIL  a named step without persist-credentials is still reported: got %s / %s\n' "${rc}" "${out}"
+  fails=$((fails + 1))
+fi
+
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]

@@ -32,7 +32,7 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "${repo_root}" || exit 2
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  sed -n '2,29p' "$0"
+  sed -n '2,28p' "$0"
   exit 0
 fi
 
@@ -53,7 +53,23 @@ head_sha="$(git rev-parse --verify "${head_ref}^{commit}" 2>/dev/null)" || {
   exit 2
 }
 
-range="${base_sha}..${head_sha}"
+# The range is taken from the MERGE BASE, not from the base ref directly.
+# With a two-dot range against a base that is not an ancestor of head, every
+# commit that landed on the base branch after the fork point reads as part of
+# this range: a changelog edit someone else pushed to main exempts a pull
+# request that touched no changelog, and a neighbour's feat commit is reported
+# as this one's. Since this guard makes nearly every merged pull request touch
+# CHANGELOG.md, base and head diverging over a changelog edit is the common
+# case rather than a rare one.
+merge_base="$(git merge-base "${base_sha}" "${head_sha}" 2>/dev/null)" || {
+  echo "check-changelog-touched.sh: no merge base for ${base_sha} and ${head_sha}" >&2
+  exit 2
+}
+if [[ -z "${merge_base}" ]]; then
+  echo "check-changelog-touched.sh: empty merge base for ${base_sha} and ${head_sha}" >&2
+  exit 2
+fi
+range="${merge_base}..${head_sha}"
 
 commits="$(git rev-list "${range}" 2>/dev/null)" || {
   echo "check-changelog-touched.sh: git rev-list failed for ${range}" >&2

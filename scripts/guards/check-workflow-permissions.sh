@@ -128,6 +128,10 @@ function report(rule, line, why) {
   printf "%s:%d: %s: %s\n", curfile, line, rule, why
 }
 function is_checkout_uses(line) {
+  # A commented-out line is not a step. Without this the guard reports a
+  # finding on prose or on a disabled step, and the fix an author would
+  # apply (adding the setting to a comment) changes nothing.
+  if (line ~ /^[ \t]*#/) return 0
   return line ~ /uses:[ \t]*actions\/checkout@/
 }
 function indent_of(line) {
@@ -159,14 +163,30 @@ function persist_allowed(line,   i) {
   }
   return 0
 }
+# The indent that bounds a step is the indent of its LIST ITEM, not of the
+# uses: line. In the common form where "- name:" opens the step, uses: and
+# with: are siblings at the same indent, so bounding the scan by the uses:
+# line ends it at with: and never reaches persist-credentials: false
+# underneath. That reported a correct step as a finding, and the only escape
+# was an allow marker carrying a reason that was not true.
+function step_indent_of(line,   i) {
+  if (raw[line] ~ /^[ \t]*-/) return indent_of(raw[line])
+  for (i = line - 1; i >= 1; i--) {
+    if (raw[i] ~ /^[ \t]*$/) continue
+    if (raw[i] ~ /^[ \t]*-/) return indent_of(raw[i])
+    if (indent_of(raw[i]) < indent_of(raw[line])) return indent_of(raw[i])
+  }
+  return indent_of(raw[line])
+}
 function scan_checkouts(   i, j, step_indent, satisfied) {
   for (i = 1; i <= nlines; i++) {
     if (!is_checkout_uses(raw[i])) continue
-    step_indent = indent_of(raw[i])
+    step_indent = step_indent_of(i)
     satisfied = 0
     for (j = i + 1; j <= nlines; j++) {
       if (raw[j] ~ /^[ \t]*$/) continue
-      if (indent_of(raw[j]) <= step_indent) break
+      if (indent_of(raw[j]) < step_indent) break
+      if (indent_of(raw[j]) == step_indent && raw[j] ~ /^[ \t]*-/) break
       if (persist_false(raw[j])) satisfied = 1
     }
     if (!satisfied && !persist_allowed(i)) {

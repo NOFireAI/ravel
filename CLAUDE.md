@@ -670,6 +670,21 @@ than passing for "no pull request open".
   directory cannot turn the guard into a no-op. Wired into `gates.sh` and
   ci.yml's `doc-scripts` job, cases first. Cases in
   `scripts/guards/check-workflow-permissions.test.sh`.
+- `scripts/guards/check-changelog-touched.sh <base-ref> [head-ref]`: exits 1
+  when a `feat`/`fix` commit in the range touches `crates/` or `services/`
+  while `CHANGELOG.md` goes untouched across it, and no commit carries a
+  `Changelog: none` trailer (that exact spelling, on its own line). Exit 2 is
+  could-not-answer (missing argument, an unresolvable ref, a git failure), which
+  is never a pass. The range is taken from the MERGE BASE of the two refs, not
+  from the base ref directly: with a two-dot range a `CHANGELOG.md` edit that
+  landed on the base branch after the fork point reads as this range's and
+  exempts a pull request that touched no changelog. Since the guard makes
+  nearly every merged pull request touch `CHANGELOG.md`, that divergence is the
+  common case, not a rare one. The two exemptions are the trailer and a
+  changelog edit genuinely inside the range; there is no grace period and no
+  branch allowlist, because a guard with a cutoff stops being one. Wired into
+  ci.yml's `doc-scripts` job with the pull request's base SHA. Cases in
+  `scripts/guards/check-changelog-touched.test.sh`.
 - `scripts/check-injected-clock-helpers.sh [file]`: exits non-zero when an
   injected-clock test helper contains `thread::sleep`, `tokio::time::sleep`,
   a bare or aliased `sleep()` call, `tokio::time::timeout`, `Instant::`,
