@@ -1380,4 +1380,29 @@ mod tests {
         let p = extract_spans(&[Expr::BinaryExpr(be)]);
         assert_eq!(p, SpansPushdown::default());
     }
+
+    /// The `events` list (issue #1710) has no skip-index axis: every shape here
+    /// matches on the column name, so a filter over `events` must extract
+    /// nothing and must not disturb a bound a sibling conjunct proved.
+    #[test]
+    fn events_filters_contribute_nothing() {
+        let events_only = extract_spans(&[
+            col("events").is_not_null(),
+            col("events").is_null(),
+            col("events").eq(lit("anything")),
+        ]);
+        assert_eq!(events_only, SpansPushdown::default());
+
+        let beside_a_bound = extract_spans(&[
+            col("start_ts").gt_eq(ts_lit(100)),
+            col("events").is_not_null(),
+        ]);
+        assert_eq!(
+            beside_a_bound,
+            SpansPushdown {
+                ts_lo: Some(100),
+                ..SpansPushdown::default()
+            }
+        );
+    }
 }

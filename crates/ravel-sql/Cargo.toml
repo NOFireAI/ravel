@@ -230,6 +230,15 @@ crc32c = { workspace = true }
 # heuristic fails the dict-page tests loudly instead of silently. Already a
 # workspace pin (ravel-logseg depends on it); no new supply-chain surface.
 ravel-codec = { workspace = true }
+# Dev-only: the `spans.events` acceptance test (tests/spans_provider.rs) builds
+# its `_events_raw` fixture out of real `opentelemetry.proto.trace.v1.Span.Event`
+# messages, encoded exactly the way `ravel_otlp::traces_normalize::encode_blob`
+# encodes them at ingest, rather than hand-assembling protobuf bytes that only
+# resemble what a sender sends. A drift between Ravel's event decoder and the
+# actual OTLP wire shape then fails here instead of on real traffic. Both are
+# workspace pins already in the lockfile through ravel-otlp.
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
 # Dev-only: the spill tests (tests/spill.rs, crate::spill's own unit tests)
 # need a real, writable directory to configure as the spill root and a
 # read-only one to prove the `spill_unavailable` refusal. Already a workspace

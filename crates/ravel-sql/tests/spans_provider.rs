@@ -36,6 +36,10 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::{col, lit};
 use datafusion::scalar::ScalarValue;
+use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::trace::v1::span::Event as SpanEventProto;
+use prost::Message as _;
 use ravel_catalog::{Catalog, CatalogConfig, SegmentLevel, SegmentRef, Snapshot};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -43,6 +47,7 @@ use ravel_commit::{keys, publish, record};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_rspan::record::EVENTS_RAW_KEY;
 use ravel_rspan::{
     ObjectIdentity, RspanConfig, RspanWriter, ScanStats, SpanQuery, SpanRecord, StatusCode,
 };
@@ -972,6 +977,301 @@ async fn trace_id_literal_non_hex_character_is_a_plan_error() {
     );
 }
 
+/// One `opentelemetry.proto.trace.v1.Span.Event` with string-valued
+/// attributes, the shape an OTel SDK sends for a recorded exception.
+fn otlp_event(ts_ns: u64, name: &str, attrs: &[(&str, &str)]) -> SpanEventProto {
+    SpanEventProto {
+        time_unix_nano: ts_ns,
+        name: name.to_string(),
+        attributes: attrs
+            .iter()
+            .map(|(k, v)| KeyValue {
+                key: (*k).to_string(),
+                value: Some(AnyValue {
+                    value: Some(AnyValueVariant::StringValue((*v).to_string())),
+                }),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// The `_events_raw` attribute value for `events`, built exactly as
+/// `ravel_otlp::traces_normalize::encode_blob` builds it at ingest:
+/// length-delimited protobuf messages concatenated, then hex-encoded.
+fn events_raw(events: &[SpanEventProto]) -> String {
+    let mut raw = Vec::new();
+    for e in events {
+        e.encode_length_delimited(&mut raw).expect("encode event");
+    }
+    raw.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A span carrying `events` as its `_events_raw` attribute. Attribute keys stay
+/// strictly ascending (`_events_raw` < `svc`), which is what the RSPAN attrs
+/// codec requires.
+fn span_with_events(
+    trace: [u8; 16],
+    span_id: u8,
+    start: i64,
+    name: &str,
+    events: &[SpanEventProto],
+) -> SpanRecord {
+    let mut record = span(trace, span_id, start, start + 10, name);
+    let mut attrs = vec![("svc".to_string(), "api".to_string())];
+    if !events.is_empty() {
+        attrs.insert(0, (EVENTS_RAW_KEY.to_string(), events_raw(events)));
+    }
+    record.attrs = attrs;
+    record
+}
+
+/// Issue #1710 part A acceptance test: the `spans` table exposes span events as
+/// a structured `events` column, and a query can filter on an event's own
+/// attributes.
+///
+/// Both halves matter and are asserted separately:
+///
+/// - `SELECT events FROM spans` returns the decoded structure, not a hex blob:
+///   two events on the first span (an exception with two attributes and a log
+///   with one), one on the second, and NULL (not an empty list) on the third,
+///   which carried no events at all. The assertion goes through
+///   `QueryOutput::to_json`, the encoder the HTTP `POST /api/v1/sql` surface
+///   uses, so it proves the nested `List(Struct{..., Map})` type serializes
+///   there rather than only inside arrow.
+/// - `unnest(events)` plus a `WHERE` over an event attribute filters exactly.
+///   Three event rows exist in total; the exception filter keeps two, and the
+///   `exception.type = 'ValueError'` filter keeps exactly one. Counting rows
+///   rather than asserting non-emptiness is the point: an `unnest` that
+///   silently produced one row per span, or a subscript that matched every
+///   event, would still be "> 0".
+///
+/// The fixture's `_events_raw` value is built from real
+/// `opentelemetry.proto.trace.v1.Span.Event` messages encoded the way ingest
+/// encodes them, and is then written and read back through the real RSPAN v4
+/// writer, commit record, and `SqlExecutor`, so the column is proven against
+/// the v4 event columns rather than against an in-memory fixture.
+///
+/// Against the pre-fix code this test cannot even plan: `spans` had no `events`
+/// column. Against the post-fix code, flipping
+/// `spans_scan.rs::columnar_static_eligible`'s new `!p.contains(&SPAN_COL_EVENTS)`
+/// clause back off sends a `SELECT events` projection down the columnar fast
+/// path, where `columnar_column` has no arm for it, and the query fails with
+/// "spans columnar column index 11 not supported on the fast path".
+#[tokio::test]
+async fn events_column_returns_structured_exception_event_and_filters_on_its_attrs() {
+    let t1 = [0x11u8; 16];
+    let t2 = [0x22u8; 16];
+    let records = vec![
+        span_with_events(
+            t1,
+            0,
+            100,
+            "root",
+            &[
+                otlp_event(
+                    150,
+                    "exception",
+                    &[
+                        ("exception.message", "boom"),
+                        ("exception.type", "ValueError"),
+                    ],
+                ),
+                otlp_event(160, "log", &[("level", "warn")]),
+            ],
+        ),
+        span_with_events(
+            t1,
+            1,
+            200,
+            "child",
+            &[otlp_event(
+                210,
+                "exception",
+                &[("exception.type", "KeyError")],
+            )],
+        ),
+        span_with_events(t2, 0, 300, "unrelated", &[]),
+    ];
+    let executor = executor_with_spans(&records).await;
+
+    // Half one: the structured column itself, through the JSON encoder the
+    // HTTP surface uses. Ordering is the scan's advertised (trace_id, start_ts).
+    let sql = "SELECT name, events FROM spans ORDER BY name";
+    let outcome = executor
+        .execute(tenant().hash(), &sql_request(sql))
+        .await
+        .expect("SELECT events executes");
+
+    let batches = outcome.output.batches();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "three spans, three rows");
+
+    // The column's arrow type is the declared one, not something a builder
+    // improvised: List(Struct{ts_unix_nano, name, attrs}) with the shared
+    // label map type for event attributes.
+    let events_field = batches[0].schema().field(1).clone();
+    assert_eq!(events_field.name(), "events");
+    assert_eq!(
+        events_field.data_type(),
+        ravel_sql::spans_schema()
+            .field(ravel_sql::SPAN_COL_EVENTS)
+            .data_type(),
+        "the projected events column keeps the declared table type"
+    );
+
+    let json = outcome.output.to_json().expect("events encode to JSON");
+    assert_eq!(
+        json["columns"],
+        serde_json::json!([
+            {"name": "name", "type": "Utf8"},
+            {"name": "events", "type": events_field.data_type().to_string()},
+        ])
+    );
+    assert_eq!(
+        json["rows"],
+        serde_json::json!([
+            [
+                "child",
+                [{
+                    "ts_unix_nano": 210,
+                    "name": "exception",
+                    "attrs": {"exception.type": "KeyError"},
+                }],
+            ],
+            [
+                "root",
+                [
+                    {
+                        "ts_unix_nano": 150,
+                        "name": "exception",
+                        "attrs": {
+                            "exception.message": "boom",
+                            "exception.type": "ValueError",
+                        },
+                    },
+                    {
+                        "ts_unix_nano": 160,
+                        "name": "log",
+                        "attrs": {"level": "warn"},
+                    },
+                ],
+            ],
+            ["unrelated", serde_json::Value::Null],
+        ]),
+        "events must decode into ts/name/attrs structs, and a span with no \
+         events must be NULL rather than an empty list"
+    );
+
+    // The raw attribute is still there: this column is a lossy projection of
+    // it, never a replacement (spans_schema.rs module doc).
+    let raw = executor
+        .execute(
+            tenant().hash(),
+            &sql_request("SELECT count(*) FROM spans WHERE attrs['_events_raw'] IS NOT NULL"),
+        )
+        .await
+        .expect("attrs['_events_raw'] still queryable");
+    assert_eq!(scalar_count(raw.output.batches()), 2);
+
+    // Half two: unnest plus a predicate over an event attribute.
+    for (sql, want, what) in [
+        (
+            "SELECT count(*) FROM (SELECT unnest(events) AS e FROM spans)",
+            3i64,
+            "three events across all spans",
+        ),
+        (
+            "SELECT count(*) FROM (SELECT unnest(events) AS e FROM spans) \
+             WHERE e['name'] = 'exception'",
+            2,
+            "two of the three events are exceptions",
+        ),
+        (
+            "SELECT count(*) FROM (SELECT unnest(events) AS e FROM spans) \
+             WHERE e['attrs']['exception.type'] = 'ValueError'",
+            1,
+            "exactly one event carries exception.type = ValueError",
+        ),
+        (
+            "SELECT count(*) FROM (SELECT unnest(events) AS e FROM spans) \
+             WHERE e['attrs']['exception.type'] = 'NoSuchError'",
+            0,
+            "a non-matching event attribute value keeps nothing",
+        ),
+    ] {
+        let outcome = executor
+            .execute(tenant().hash(), &sql_request(sql))
+            .await
+            .unwrap_or_else(|e| panic!("{sql} must execute: {e:?}"));
+        assert_eq!(
+            scalar_count(outcome.output.batches()),
+            want,
+            "{what} ({sql})"
+        );
+    }
+
+    // The shape docs/guides/traces.md shows: unnest beside ordinary columns,
+    // projecting a struct field and a nested map key.
+    let documented = "SELECT trace_id, span_id, e['name'] AS event_name, \
+                      e['attrs']['exception.type'] AS exception_type \
+                      FROM (SELECT trace_id, span_id, unnest(events) AS e FROM spans) \
+                      WHERE e['name'] = 'exception'";
+    let outcome = executor
+        .execute(tenant().hash(), &sql_request(documented))
+        .await
+        .unwrap_or_else(|e| panic!("the documented unnest query must execute: {e:?}"));
+    let json = outcome
+        .output
+        .to_json()
+        .expect("the documented query encodes to JSON");
+    assert_eq!(
+        json["columns"],
+        serde_json::json!([
+            {"name": "trace_id", "type": "FixedSizeBinary(16)"},
+            {"name": "span_id", "type": "FixedSizeBinary(8)"},
+            {"name": "event_name", "type": "Utf8"},
+            {"name": "exception_type", "type": "Utf8"},
+        ]),
+        "the documented query names its projected columns"
+    );
+    assert_eq!(
+        json["rows"],
+        serde_json::json!([
+            [
+                "11111111111111111111111111111111",
+                "0000000000000000",
+                "exception",
+                "ValueError"
+            ],
+            [
+                "11111111111111111111111111111111",
+                "0101010101010101",
+                "exception",
+                "KeyError"
+            ],
+        ]),
+        "one row per exception event, with the span it came from"
+    );
+}
+
+/// The single `count(*)` value in `batches`, which must hold exactly one row.
+fn scalar_count(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i64 {
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 1, "a count(*) query returns exactly one row");
+    let batch = batches
+        .iter()
+        .find(|b| b.num_rows() == 1)
+        .expect("the one non-empty batch");
+    batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .expect("count(*) is Int64")
+        .value(0)
+}
+
 /// Reachability (ADR-0110 decisions 3-5): a `SELECT` over the `spans` table,
 /// driven through the real Flight SQL surface end to end (`GetFlightInfo` then
 /// `DoGet`), takes the columnar fast path.
@@ -996,7 +1296,9 @@ async fn trace_id_literal_non_hex_character_is_a_plan_error() {
 mod flight_reachability {
     use std::sync::{Arc, Mutex};
 
-    use datafusion::arrow::array::{Array, FixedSizeBinaryArray, Int64Array, StringArray};
+    use datafusion::arrow::array::{
+        Array, FixedSizeBinaryArray, Int64Array, ListArray, MapArray, StringArray, StructArray,
+    };
     use ravel_commit::keys;
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
@@ -1218,6 +1520,125 @@ mod flight_reachability {
             "the columnar fast path must skip pages: decoded {} of {} fetched",
             execution.page_bytes_decoded,
             execution.page_bytes_fetched,
+        );
+    }
+
+    /// The Flight encoder carries the nested `events` type end to end. Arrow IPC
+    /// encodes a `List(Struct{..., Map})` with no per-type handling in Ravel, so
+    /// this pins that claim on the shipping surface rather than assuming it: the
+    /// batch that comes back over `DoGet` must carry the declared column type
+    /// and the decoded event, and a span with no events must arrive null.
+    #[tokio::test]
+    async fn flight_sql_serializes_the_nested_events_column() {
+        let tenant = tenant_id("acme");
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let no_specs: &[SegSpec] = &[];
+        let harness = Harness::build(Arc::clone(&store), &[(&tenant, no_specs)]).await;
+
+        let with_event = super::span_with_events(
+            [0u8; 16],
+            0,
+            100,
+            "a-root",
+            &[super::otlp_event(
+                1_700_000_000_000_000_000,
+                "exception",
+                &[("exception.type", "ValueError")],
+            )],
+        );
+        let without_event = super::span_with_events([1u8; 16], 0, 200, "b-root", &[]);
+        publish_spans_segment(
+            harness.store.as_ref(),
+            &tenant,
+            &[with_event, without_event],
+        )
+        .await;
+
+        let ticket = harness
+            .get_flight_info(
+                "acme",
+                "SELECT trace_id, events FROM spans ORDER BY trace_id",
+            )
+            .await
+            .expect("flight info");
+        let batches = harness.do_get("acme", &ticket).await.expect("do get");
+
+        /// One row's decoded `events` value: null, or the single event's
+        /// timestamp, name, and attribute pairs.
+        type DecodedEvent = Option<(i64, String, Vec<(String, String)>)>;
+
+        let mut rows: Vec<DecodedEvent> = Vec::new();
+        for batch in &batches {
+            assert_eq!(
+                batch.schema().field(1).data_type(),
+                ravel_sql::spans_schema()
+                    .field(ravel_sql::SPAN_COL_EVENTS)
+                    .data_type(),
+                "the Flight stream carries the declared events type"
+            );
+            let events = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("events column is a list");
+            for i in 0..batch.num_rows() {
+                if events.is_null(i) {
+                    rows.push(None);
+                    continue;
+                }
+                let items = events.value(i);
+                let items = items
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("event items are structs");
+                assert_eq!(items.len(), 1, "the fixture span carries one event");
+                let ts = items
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("event ts is i64")
+                    .value(0);
+                let name = items
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("event name is Utf8")
+                    .value(0)
+                    .to_string();
+                let attrs = items
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<MapArray>()
+                    .expect("event attrs is a map");
+                let entries = attrs.value(0);
+                let keys = entries
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("map keys are Utf8");
+                let values = entries
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("map values are Utf8");
+                let pairs = (0..entries.len())
+                    .map(|k| (keys.value(k).to_string(), values.value(k).to_string()))
+                    .collect();
+                rows.push(Some((ts, name, pairs)));
+            }
+        }
+
+        assert_eq!(
+            rows,
+            vec![
+                Some((
+                    1_700_000_000_000_000_000,
+                    "exception".to_string(),
+                    vec![("exception.type".to_string(), "ValueError".to_string())],
+                )),
+                None,
+            ],
+            "the decoded event survives the Flight round trip, and an event-free span is null"
         );
     }
 }

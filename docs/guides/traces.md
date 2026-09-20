@@ -65,6 +65,7 @@ The `spans` table has these columns:
 | `attrs`          | `Map(Utf8, Utf8)`             | merged resource, scope, and span attributes  |
 | `service_name`   | `Utf8`                        | from `attrs["service.name"]`, null when absent |
 | `duration_ns`    | `Int64`                       | computed `end_ts - start_ts`, never stored   |
+| `events`         | `List(Struct{ts_unix_nano Int64, name Utf8, attrs Map(Utf8, Utf8)})` | span events, null when the span carried none |
 
 `status_code` is the stored OTLP byte. To read it as text, map the three values
 in SQL, for example `CASE status_code WHEN 0 THEN 'Unset' WHEN 1 THEN 'Ok' WHEN
@@ -75,6 +76,37 @@ start_ts`, and both endpoints are already stored, so Ravel exposes the
 difference as a column rather than writing it to every row. You query it like
 any other column (`WHERE duration_ns > 5e8`); the reader answers it from each
 block's stored duration range.
+
+### Span events
+
+`events` is a list of structs, one element per OTLP span event, in the order the
+span recorded them. Each element carries the event's `ts_unix_nano` (the raw
+OTLP `time_unix_nano`, not a `Timestamp` column), its `name`, and its `attrs` as
+a `Map(Utf8, Utf8)` in the same shape as the span's own `attrs`. The column is
+null, not an empty list, on a span that carried no events.
+
+Event attribute values are stringified the same way span attributes are: a
+string stays as it is, an integer or a boolean is spelled as in Prometheus text
+(`42`, `true`, `+Inf`), and a byte value becomes lowercase hex. An array or
+key-value-list attribute value has no `Map(Utf8, Utf8)` spelling and is dropped
+from `attrs`. Because of that the column is a lossy projection, so the raw
+bytes stay available as `attrs['_events_raw']` for anything the column cannot
+represent.
+
+Expand the list with `unnest` to filter on an individual event:
+
+```sql
+SELECT trace_id, span_id, e['name'] AS event_name,
+       e['attrs']['exception.type'] AS exception_type
+FROM (SELECT trace_id, span_id, unnest(events) AS e FROM spans
+      WHERE start_ts >= TIMESTAMP '2026-08-19T00:00:00')
+WHERE e['name'] = 'exception';
+```
+
+`unnest` drops a span whose `events` is null, so the result holds one row per
+event, not per span. Both subscripts above are `get_field` lookups: `e['name']`
+reads a struct field, and `e['attrs']['exception.type']` reads a map key that
+evaluates to null when the event did not set it.
 
 ### Which predicates prune
 
@@ -117,6 +149,10 @@ blocks but still filters rows exactly. Notes on the shapes above:
   as a residual, because a bloom is a false-positive filter.
 - Attribute equality on the `attrs` map (`attrs['k'] = 'v'`) does not prune. It
   is evaluated exactly over the merged map.
+- A predicate over `events` does not prune either, and selecting the column
+  turns off the columnar fast path for that query: the events are rebuilt from
+  the span's attribute pages, the same as `attrs`. A query that does not select
+  `events` pays nothing for it.
 
 ### Worked queries
 
@@ -202,4 +238,9 @@ Span links are not decoded into columns. A link points from one span to
 another span in a different trace; RSPAN has no field for it, so the raw link
 bytes ride along as one opaque hex attribute, `attrs['_links_raw']`. A query
 over the `spans` table can return that blob and cannot filter on a link's
-fields. Span events take the same route, as `attrs['_events_raw']`.
+fields. A `links` column is planned; until it lands, links arrive only as that
+hex attribute.
+
+Span events used to take the same route. They are now decoded into the `events`
+column described above, with `attrs['_events_raw']` kept beside it as the
+lossless form for the attribute value kinds the column cannot spell.

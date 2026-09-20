@@ -20,6 +20,7 @@
 //! | attrs          | Map(Utf8, Utf8)               | `attrs` (already-merged map)         |
 //! | service_name   | Utf8, nullable                | `attrs["service.name"]`              |
 //! | duration_ns    | Int64                         | computed: `end_ts - start_ts`        |
+//! | events         | List(Struct), nullable        | `attrs["_events_raw"]` (RSPAN v4 event columns) |
 //!
 //! `status_code` is a small integer (`0=Unset`, `1=Ok`, `2=Error`), the exact
 //! byte [`ravel_rspan::StatusCode::to_u8`] emits, chosen over a
@@ -42,10 +43,28 @@
 //! free. Exposing it as a SQL column (rather than requiring every caller to
 //! write `end_ts - start_ts` by hand) is what makes `WHERE duration_ns >
 //! 5e8` pushdown-eligible in `spans_pushdown.rs`.
+//!
+//! `events` (issue #1710) exposes RSPAN v4's nested event columns
+//! ([`ravel_rspan::SpanEvent`], docs/span-segment-format.md "BLOCKS") as a
+//! `List` of `Struct{ts_unix_nano, name, attrs}`, one struct per span event in
+//! the order the sender sent them. Each event's own attributes use
+//! [`label_map_type`], the same `Map(Utf8, Utf8)` the span-level `attrs`
+//! column uses, so `unnest(events)` then `e['attrs']['k']` reads an event
+//! attribute with the subscript syntax a span attribute already uses. The
+//! column is nullable and is NULL (not an empty list) for a span that carried
+//! no events, which distinguishes "no events" from a hypothetical empty list
+//! without a second sentinel.
+//!
+//! The events data does not replace `attrs['_events_raw']`: that attribute
+//! stays in the `attrs` map exactly as before, because it is the byte-exact
+//! round-trip of the v4 event columns and this column is a lossy projection of
+//! it (an event attribute whose OTLP `AnyValue` is an array or a kvlist has no
+//! `Map(Utf8, Utf8)` spelling and does not appear here). A caller that needs
+//! the unabridged bytes still reads the hex attribute.
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 
 use crate::schema::label_map_type;
 
@@ -60,6 +79,7 @@ pub const SPAN_COL_STATUS_MESSAGE: usize = 7;
 pub const SPAN_COL_ATTRS: usize = 8;
 pub const SPAN_COL_SERVICE_NAME: usize = 9;
 pub const SPAN_COL_DURATION_NS: usize = 10;
+pub const SPAN_COL_EVENTS: usize = 11;
 
 /// Byte width of a trace id (`ravel_rspan::record::TRACE_ID_WIDTH`).
 pub const TRACE_ID_WIDTH: i32 = 16;
@@ -105,7 +125,40 @@ fn spans_fields() -> Vec<Field> {
         Field::new("service_name", DataType::Utf8, true),
         // Computed end_ts - start_ts (ADR-0045 decision 5), never stored.
         Field::new("duration_ns", DataType::Int64, false),
+        // RSPAN v4's nested event columns (issue #1710). NULL, not an empty
+        // list, when the span carried no events.
+        Field::new("events", span_events_type(), true),
     ]
+}
+
+/// The three fields of one `events` element. `ts_unix_nano` is the event's
+/// OTLP `time_unix_nano` as a plain `Int64` rather than a `Timestamp`, matching
+/// how RSPAN stores it and how the field is named on the wire; `name` is the
+/// event name, empty (never NULL) when the stored blob carried none; `attrs`
+/// is the event's own attributes in the same map type the span-level `attrs`
+/// column uses.
+pub fn span_event_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("ts_unix_nano", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("attrs", label_map_type(), false),
+    ])
+}
+
+/// The `events` list element field. Named `item` and non-nullable: a list slot
+/// always holds a real event struct, and the list itself is NULL when a span
+/// has none.
+pub fn span_events_item_field() -> Arc<Field> {
+    Arc::new(Field::new(
+        "item",
+        DataType::Struct(span_event_fields()),
+        false,
+    ))
+}
+
+/// The `events` column type: `List(Struct{ts_unix_nano, name, attrs})`.
+pub fn span_events_type() -> DataType {
+    DataType::List(span_events_item_field())
 }
 
 /// The public `spans` table schema.
@@ -121,7 +174,7 @@ mod tests {
     #[test]
     fn schema_columns_are_in_the_documented_order_and_type() {
         let s = spans_schema();
-        assert_eq!(s.fields().len(), 11);
+        assert_eq!(s.fields().len(), 12);
 
         assert_eq!(s.field(SPAN_COL_TRACE_ID).name(), "trace_id");
         assert_eq!(
@@ -176,5 +229,43 @@ mod tests {
         assert_eq!(s.field(SPAN_COL_DURATION_NS).name(), "duration_ns");
         assert_eq!(s.field(SPAN_COL_DURATION_NS).data_type(), &DataType::Int64);
         assert!(!s.field(SPAN_COL_DURATION_NS).is_nullable());
+
+        assert_eq!(s.field(SPAN_COL_EVENTS).name(), "events");
+        assert!(s.field(SPAN_COL_EVENTS).is_nullable());
+        let DataType::List(item) = s.field(SPAN_COL_EVENTS).data_type() else {
+            panic!(
+                "events must be a List, got {}",
+                s.field(SPAN_COL_EVENTS).data_type()
+            );
+        };
+        assert_eq!(item.name(), "item");
+        assert!(!item.is_nullable());
+        let DataType::Struct(fields) = item.data_type() else {
+            panic!("events elements must be Structs, got {}", item.data_type());
+        };
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name(), "ts_unix_nano");
+        assert_eq!(fields[0].data_type(), &DataType::Int64);
+        assert!(!fields[0].is_nullable());
+        assert_eq!(fields[1].name(), "name");
+        assert_eq!(fields[1].data_type(), &DataType::Utf8);
+        assert!(!fields[1].is_nullable());
+        assert_eq!(fields[2].name(), "attrs");
+        assert_eq!(
+            fields[2].data_type(),
+            &label_map_type(),
+            "event attrs use the same map type as the span-level attrs column"
+        );
+        assert!(!fields[2].is_nullable());
+    }
+
+    #[test]
+    fn events_is_appended_after_duration_ns_so_earlier_indices_are_stable() {
+        // The column ids are a public contract (`lib.rs` re-exports them and
+        // pushdown/columnar code indexes by them), so a new column appends.
+        let s = spans_schema();
+        assert_eq!(SPAN_COL_EVENTS, 11);
+        assert_eq!(SPAN_COL_EVENTS, SPAN_COL_DURATION_NS + 1);
+        assert_eq!(SPAN_COL_EVENTS, s.fields().len() - 1);
     }
 }

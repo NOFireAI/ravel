@@ -197,9 +197,10 @@ pub use spans_provider::SpansTableProvider;
 pub use spans_pushdown::{SpansPushdown, extract_spans};
 pub use spans_scan::SpansScanExec;
 pub use spans_schema::{
-    SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_END_TS, SPAN_COL_NAME, SPAN_COL_PARENT_SPAN_ID,
-    SPAN_COL_SERVICE_NAME, SPAN_COL_SPAN_ID, SPAN_COL_START_TS, SPAN_COL_STATUS_CODE,
-    SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID, spans_schema,
+    SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_END_TS, SPAN_COL_EVENTS, SPAN_COL_NAME,
+    SPAN_COL_PARENT_SPAN_ID, SPAN_COL_SERVICE_NAME, SPAN_COL_SPAN_ID, SPAN_COL_START_TS,
+    SPAN_COL_STATUS_CODE, SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID, span_event_fields,
+    span_events_item_field, span_events_type, spans_schema,
 };
 pub use spill::{OperatorSpill, SpillCounts, SpillScratch};
 pub use udf::{label_match_udf, label_udf};
