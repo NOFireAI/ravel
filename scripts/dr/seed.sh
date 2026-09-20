@@ -55,6 +55,38 @@ USAGE
   dr_usage_environment
 }
 
+# The non-corpus objects a seeded bucket carries beside its L0 data/commit
+# pairs, counted after dr_list_keys has dropped the `dr/` and `sys/qualify/`
+# prefixes. Every one of them is written at most once per run, and none scales
+# with the corpus size or with DR_SHARDS, which is what makes the total-object
+# band derivable at all.
+#
+# Named, for the configuration this harness runs (mode `all`, one tenant, the
+# metrics signal only): `sys/qualification` (the qualify step), `sys/tenancy`
+# (bucket birth, ADR-0050 section 3), `sys/gc` (bootstrapped at server startup),
+# `t/<hash>/metrics/prov` (first write for the signal), `t/<hash>/m/meta`, and
+# the seeding process's own `sys/maintain/workers/<pid>` and
+# `sys/maintain/memo/<pid>`. Present only under a configuration this harness can
+# be pointed at but CI does not use: `sys/t/<hash>` (keyed buckets), `sys/auth`
+# (durably provisioned tokens rather than a token file), `t/<hash>/config`,
+# `t/<hash>/enc` (per-tenant KMS), and `admission/query/<pid>.snapshot` (only
+# under a bounded query-concurrency cap). Twelve named, plus four of headroom.
+#
+# The per-shard `t/<hash>/m/maint/<shard>/cursor` is deliberately NOT in the
+# allowance: maintenance advances that cursor only after processing a SEALED
+# ingest hour, and the seed never waits the seal margin out
+# (DR_FOLD_SEAL_MARGIN_WAITED=0), so a cursor appearing here means the run's
+# state is not the state the figures were registered against and the band
+# should fail.
+#
+# The floor is 2, not the seven the list above expects in this configuration:
+# `sys/qualification` and `sys/tenancy` are the two the seed's own steps
+# guarantee, the rest belong to processes whose exact set moves with the
+# server's configuration, and every stronger claim about the corpus is already
+# asserted by the accepted-exports and L0 bands below.
+DR_SEED_CONTROL_OBJECTS_MIN=2
+DR_SEED_CONTROL_OBJECTS_MAX=16
+
 EXPORTS="${DR_SEED_EXPORTS:-12}"
 RESET=0
 KNOW_BUCKET=0
@@ -117,7 +149,22 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
     "${EXPORTS}" "${EXPORTS}" "${EXPORTS}"
   printf '         L0 commit records == L0 data objects; samples [%s,%s];\n' \
     "${EXPORTS}" "${EXPORTS}"
-  printf '         total objects [3,%s]\n' "$((2 * EXPORTS + 16))"
+  printf '         control objects [%s,%s], counted with the %s and %s\n' \
+    "${DR_SEED_CONTROL_OBJECTS_MIN}" "${DR_SEED_CONTROL_OBJECTS_MAX}" \
+    "${DR_HARNESS_PREFIX}" "${DR_QUALIFY_SCRATCH_PREFIX}"
+  printf '         prefixes excluded from every count;\n'
+  printf '         total objects [L0 data + L0 commits + %s,\n' \
+    "${DR_SEED_CONTROL_OBJECTS_MIN}"
+  printf '         L0 data + L0 commits + %s], which is [%s,%s] when each of\n' \
+    "${DR_SEED_CONTROL_OBJECTS_MAX}" \
+    "$((2 * EXPORTS + DR_SEED_CONTROL_OBJECTS_MIN))" \
+    "$((2 * EXPORTS + DR_SEED_CONTROL_OBJECTS_MAX))"
+  printf '         the %s exports flushes on its own and [%s,%s] when they\n' \
+    "${EXPORTS}" "$((4 + DR_SEED_CONTROL_OBJECTS_MIN))" \
+    "$((4 + DR_SEED_CONTROL_OBJECTS_MAX))"
+  printf '         share flushes down to the L0 floor of 2 pairs\n'
+  printf '  qualify: store qualify --list-page-size %s\n' \
+    "${DR_QUALIFY_LIST_PAGE_SIZE}"
   exit 0
 fi
 
@@ -162,8 +209,17 @@ fi
 
 # ADR-0050 EC7: a non-Memory store refuses to serve until `sys/qualification`
 # exists, and there is no bootstrap-and-continue path.
+#
+# The page size is declared rather than defaulted. The suite's two listing
+# probes each write `max(page_size + 2, 5)` scratch keys under
+# `sys/qualify/<run-id>/` and delete none of them, so the default of 1000
+# leaves about 2004 objects in bucket A before the first export is posted. See
+# DR_QUALIFY_LIST_PAGE_SIZE in lib.sh for why 2, and what a small declared page
+# size does and does not prove. The scratch prefix is excluded from every count
+# as well: the two halves are independent, and a bucket holding ten uncounted
+# probe objects is still a bucket whose inventory nobody can derive.
 dr_log "qualifying the store backend"
-dr_ravel_cli --store s3 store qualify
+dr_ravel_cli --store s3 store qualify --list-page-size "${DR_QUALIFY_LIST_PAGE_SIZE}"
 
 dr_log "generating the OTLP fixture generator (first build may be slow)"
 gen_fixture() {
@@ -279,6 +335,7 @@ commit_keys="$(dr_l0_commit_keys "${keys}")"
 total_objects="$(dr_count_lines "${keys}")"
 data_objects="$(dr_count_lines "${data_keys}")"
 commit_records="$(dr_count_lines "${commit_keys}")"
+control_objects=$((total_objects - data_objects - commit_records))
 
 # Bands, all derived from the corpus:
 #   accepted exports        exactly the number requested. An export that was
@@ -301,17 +358,33 @@ commit_records="$(dr_count_lines "${commit_keys}")"
 #                           export carries the SAME labels, so the series
 #                           count is per segment rather than per export and
 #                           gets a [1, exports] band at the canary instead.
-#   total objects           [3, 2 * exports + 16]. Two objects per flush plus
-#                           the bounded control set (sys/qualification,
-#                           sys/tenancy, sys/t/<hash>, t/<hash>/config,
-#                           t/<hash>/m/meta, t/<hash>/enc,
-#                           t/<hash>/metrics/prov and room to spare).
+#   control objects         [DR_SEED_CONTROL_OBJECTS_MIN,
+#                           DR_SEED_CONTROL_OBJECTS_MAX] = [2, 16]. Everything
+#                           the listing holds that is neither an L0 data object
+#                           nor an L0 commit record, after dr_list_keys has
+#                           dropped the harness and qualification-scratch
+#                           prefixes. The set is enumerated where those two
+#                           constants are defined; none of it scales with the
+#                           corpus.
+#   total objects           the two measured L0 counts plus that same
+#                           allowance, so the band is derived from what this
+#                           run actually wrote rather than from the worst case
+#                           the export count permits. For the CI corpus
+#                           (DR_SEED_EXPORTS=6, one flush per export) that is
+#                           [6 + 6 + 2, 6 + 6 + 16] = [14, 28]; a run whose
+#                           exports share flushes lands lower, down to
+#                           [2 + 2 + 2, 2 + 2 + 16] = [6, 20] at the floor of
+#                           the L0 band.
 failures=0
 dr_assert_figure "seed.accepted_exports" "${accepted}" "${EXPORTS}" "${EXPORTS}" || failures=1
 dr_assert_figure "seed.l0_data_objects" "${data_objects}" 2 "${EXPORTS}" || failures=1
 dr_assert_figure "seed.l0_commit_records" "${commit_records}" \
   "${data_objects}" "${data_objects}" || failures=1
-dr_assert_figure "seed.total_objects" "${total_objects}" 3 "$((2 * EXPORTS + 16))" || failures=1
+dr_assert_figure "seed.control_objects" "${control_objects}" \
+  "${DR_SEED_CONTROL_OBJECTS_MIN}" "${DR_SEED_CONTROL_OBJECTS_MAX}" || failures=1
+dr_assert_figure "seed.total_objects" "${total_objects}" \
+  "$((data_objects + commit_records + DR_SEED_CONTROL_OBJECTS_MIN))" \
+  "$((data_objects + commit_records + DR_SEED_CONTROL_OBJECTS_MAX))" || failures=1
 if [[ "${failures}" -ne 0 ]]; then
   dr_die 1 "seeded figures outside their bands; bucket A is not a known corpus"
 fi
@@ -326,6 +399,6 @@ fi
 } >>"$(dr_expect_file)"
 
 dr_log "seeded ${accepted} export(s) into ${DR_BUCKET_PRIMARY}; figures pre-registered"
-printf 'seed: bucket=%s tenant_hash=%s exports=%s data_objects=%s commit_records=%s total_objects=%s\n' \
+printf 'seed: bucket=%s tenant_hash=%s exports=%s data_objects=%s commit_records=%s control_objects=%s total_objects=%s\n' \
   "${DR_BUCKET_PRIMARY}" "${tenant_hash}" "${accepted}" "${data_objects}" \
-  "${commit_records}" "${total_objects}"
+  "${commit_records}" "${control_objects}" "${total_objects}"

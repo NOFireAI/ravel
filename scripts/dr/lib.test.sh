@@ -169,9 +169,37 @@ dr/reconciled.json
 dr/restore-start.json
 ${KEYS}"
 check "keys: the dr/ harness prefix is dropped from a listing" \
-  "10" "$(dr_count_lines "$(dr_strip_harness_keys "${HARNESS_KEYS}")")"
+  "10" "$(dr_count_lines "$(dr_strip_noncorpus_keys "${HARNESS_KEYS}")")"
 check "keys: a dr/ key is not counted as an L0 data object" \
-  "2" "$(dr_count_lines "$(dr_l0_data_keys "$(dr_strip_harness_keys "${HARNESS_KEYS}")")")"
+  "2" "$(dr_count_lines "$(dr_l0_data_keys "$(dr_strip_noncorpus_keys "${HARNESS_KEYS}")")")"
+
+# `ravel-cli store qualify` writes scratch fixtures under sys/qualify/<run-id>/
+# and deletes none of them, so they sit in bucket A for the rest of the
+# rehearsal. They are tooling output, not corpus: counting them puts every band
+# derived from the export count off by however many keys the listing probes
+# happened to write.
+QUALIFY_KEYS="sys/qualify/019265f4-0000-7000-8000-000000000001/list/key-0000
+sys/qualify/019265f4-0000-7000-8000-000000000001/list/key-0001
+sys/qualify/019265f4-0000-7000-8000-000000000001/order/a
+${KEYS}"
+check "keys: the sys/qualify/ probe prefix is dropped from a listing" \
+  "10" "$(dr_count_lines "$(dr_strip_noncorpus_keys "${QUALIFY_KEYS}")")"
+check "keys: a listing of only probe keys counts zero" \
+  "0" "$(dr_count_lines "$(dr_strip_noncorpus_keys \
+    "sys/qualify/019265f4-0000-7000-8000-000000000001/list/key-0000
+sys/qualify/019265f4-0000-7000-8000-000000000001/order/a")")"
+# sys/qualification is the DURABLE qualification record a non-Memory store
+# refuses to serve without (ADR-0050 EC7), not scratch. The two names share ten
+# characters and diverge at the eleventh, so a prefix test written against
+# `sys/qualif` would swallow the control object the seed's own band counts on.
+check "keys: sys/qualification survives the sys/qualify/ exclusion" \
+  "1" "$(dr_count_lines "$(dr_strip_noncorpus_keys 'sys/qualification')")"
+# Both families at once, since both reach a listing on bucket A at the same
+# time once the seed has qualified the store.
+check "keys: the dr/ and sys/qualify/ prefixes are dropped together" \
+  "10" "$(dr_count_lines "$(dr_strip_noncorpus_keys "dr/rehearsal-bucket.json
+sys/qualify/019265f4-0000-7000-8000-000000000001/list/key-0000
+${KEYS}")")"
 
 # --- finding 3: the forged sequence number ---------------------------------
 #
@@ -442,12 +470,61 @@ reset_probe() {
 }
 
 # A listing that fails before the delete must refuse AND issue no delete.
+# shellcheck disable=SC2031  # read in the parent; the probe's subshell only stubs
 check "reset: a failed listing before the delete refuses and deletes nothing" \
   "${DR_EX_PRECONDITION}:0" "$(reset_probe before)"
 # A listing that fails after the delete must refuse rather than report the
 # bucket proven empty. One delete has already run by then.
+# shellcheck disable=SC2031
 check "reset: a failed listing after the delete refuses rather than proving empty" \
   "${DR_EX_PRECONDITION}:1" "$(reset_probe after)"
+
+# --- dr_reset_bucket emptiness proof over non-corpus keys -------------------
+#
+# The reset's before and after counts go through the same exclusion as every
+# other count, so a bucket whose only remaining keys are the harness marker and
+# a qualification run's probe fixtures is PROVEN EMPTY rather than reported as
+# still holding objects. Both stubs below leave the real dr_list_all_versions
+# and dr_strip_noncorpus_keys in the path and stub only the mc call under them,
+# which is what makes this a test of the proof and not of a fake listing.
+
+# Runs dr_reset_bucket against a bucket whose every listing returns $1 (one key
+# per line, as `mc ls` prints them) and prints "<exit code>:<delete commands>".
+reset_residue_probe() {
+  local residue="$1" delete_log
+  delete_log="$(mktemp)"
+  local code=0
+  (
+    DR_LOG_DIR="$(mktemp -d)"
+    dr_bucket_marker_present() { return 0; }
+    dr_write_bucket_marker() { return 0; }
+    dr_mc() {
+      case "${1:-}" in
+        rm) printf 'rm\n' >>"${delete_log}" ;;
+        ls) printf '%s\n' "${residue}" ;;
+      esac
+      return 0
+    }
+    dr_reset_bucket b 0
+  ) >/dev/null 2>&1 || code=$?
+  printf '%s:%s\n' "${code}" "$(wc -l <"${delete_log}" | tr -d ' ')"
+  rm -f "${delete_log}"
+}
+
+# shellcheck disable=SC2031  # read in the parent; the probe's subshell only stubs
+check "reset: a bucket holding only qualification probe keys is proven empty" \
+  "0:1" "$(reset_residue_probe \
+    "sys/qualify/019265f4-0000-7000-8000-000000000001/list/key-0000
+sys/qualify/019265f4-0000-7000-8000-000000000001/order/a
+${DR_BUCKET_MARKER_KEY}")"
+# The other side of the same proof: a corpus key that survived the delete still
+# refuses, so the case above is passing because the probe keys are excluded and
+# not because the emptiness check stopped looking.
+# shellcheck disable=SC2031
+check "reset: a corpus key surviving the delete still refuses" \
+  "${DR_EX_PRECONDITION}:1" "$(reset_residue_probe \
+    "sys/qualify/019265f4-0000-7000-8000-000000000001/list/key-0000
+t/${TH}/m/l0/0000/${W}.7.00000000000000000001.aaaaaaaaaaaaaaaa.rseg")"
 
 # --- result ----------------------------------------------------------------
 
@@ -455,7 +532,7 @@ printf '\nlib.test.sh: %s passed, %s failed\n' "${PASSED}" "${FAILED}"
 if [[ "${FAILED}" -ne 0 ]]; then
   exit 1
 fi
-if [[ "${PASSED}" -lt 60 ]]; then
+if [[ "${PASSED}" -lt 74 ]]; then
   printf 'lib.test.sh: only %s cases ran; a suite that shrank silently is not a pass\n' \
     "${PASSED}" >&2
   exit 1
