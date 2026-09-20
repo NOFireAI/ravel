@@ -639,16 +639,16 @@ else. A fold pass publishes both halves at the moment it commits its `HEAD`,
 as two adjacent increments inside one call, so the totals move together:
 there is no state where a pass's carriers are counted for minutes before its
 entries are, and no benign reading in which a divergence is waiting to close
-on its own. What the hold covers is a scrape that lands between those two
-increments. The renderer loads the records total first and the entries total
-second, and the fold adds records first and entries second, so the only skew
-this can produce is an exposition whose entries total already includes a pass
-whose records total it read a moment earlier: entries can appear above
-records, never below. A records total above entries is therefore never this
-artifact, and every such sample is a real shortfall. The reversed sample
-skews the windowed increase for as long as it is the newest point in the
-window, which is one scrape interval, and a few intervals of agreement rule
-it out. Past the hold, the gap is a carrier every one of whose
+on its own. What the hold covers is a scrape that interleaves with those two
+increments. The fold adds records then entries, and the renderer loads
+records then entries, and both orders can be caught mid-flight: if both loads
+land between the two adds the exposition carries the pass's records without
+its entries, and if the pass completes between the two loads it carries the
+entries without the records. So a single scrape can show either total ahead
+of the other, and neither direction is by itself evidence of anything. Such a
+sample skews the windowed increase for as long as it is the newest point in
+the window, which is one scrape interval, and a few intervals of agreement
+rule it out. Past the hold, the gap is a carrier every one of whose
 stamps was dropped, so treat a shortfall that survives the hold as live and
 work it through the drop tally; it will not clear by waiting.
 
