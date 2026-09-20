@@ -288,17 +288,19 @@ impl TableProvider for SpansTableProvider {
         let pushdown = extract_spans(filters);
 
         // Eligible fast path (ADR-0110 decision 4): the projection excludes the
-        // `attrs` map and no pending erasure predicate applies. Push the
+        // `attrs` map and the `events` list, and no pending erasure predicate
+        // applies. Push the
         // projection into the scan, which emits the projected schema directly
         // and decodes only the pages that schema needs; add NO `ProjectionExec`.
         if columnar_static_eligible(projection, &self.erasure) {
             return self.build_scan(target_partitions, &pushdown, projection.cloned());
         }
 
-        // Ineligible path, unchanged: the scan emits the full eleven-column
+        // Ineligible path, unchanged: the scan emits the full twelve-column
         // schema and, for column selection, this `ProjectionExec` drops the
-        // rest. The fetch reads the whole object regardless (an `attrs`
-        // projection or a pending erasure predicate forces the row path, which
+        // rest. The fetch reads the whole object regardless (an `attrs` or
+        // `events` projection, or a pending erasure predicate, forces the row
+        // path, which
         // has no per-column page toggle), matching the logs/metrics providers.
         let plan = self.build_scan(target_partitions, &pushdown, None)?;
         match projection {

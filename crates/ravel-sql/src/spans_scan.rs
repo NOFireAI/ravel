@@ -46,9 +46,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, Int64Array, MapBuilder, StringArray, StringBuilder,
-    TimestampNanosecondArray, UInt8Array,
+    Array, ArrayRef, FixedSizeBinaryBuilder, Int64Array, ListArray, MapBuilder, StringArray,
+    StringBuilder, StructArray, TimestampNanosecondArray, UInt8Array,
 };
+use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -71,7 +72,7 @@ use ravel_query::erasure::{ErasurePredicate, is_erased_span};
 use ravel_rspan::block::DecodedBlock;
 use ravel_rspan::record::{
     COL_END_TS, COL_PARENT_SPAN_ID, COL_SPAN_ID, COL_START_TS, COL_STATUS_CODE, COL_STATUS_MESSAGE,
-    COL_TRACE_ID,
+    COL_TRACE_ID, EVENTS_RAW_KEY, event_attrs, parse_events,
 };
 use ravel_rspan::{BloomPredicate, COL_NAME, COL_SERVICE_NAME, SpanQuery};
 use ravel_types::TenantHash;
@@ -80,9 +81,10 @@ use ravel_types::accounting::QueryAccounting;
 use crate::error::SqlError;
 use crate::spans_fetcher::{SpanRow, SpanSegmentFetcher};
 use crate::spans_schema::{
-    SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_END_TS, SPAN_COL_NAME, SPAN_COL_PARENT_SPAN_ID,
-    SPAN_COL_SERVICE_NAME, SPAN_COL_SPAN_ID, SPAN_COL_START_TS, SPAN_COL_STATUS_CODE,
-    SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID, SPAN_ID_WIDTH, TRACE_ID_WIDTH, spans_schema,
+    SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_END_TS, SPAN_COL_EVENTS, SPAN_COL_NAME,
+    SPAN_COL_PARENT_SPAN_ID, SPAN_COL_SERVICE_NAME, SPAN_COL_SPAN_ID, SPAN_COL_START_TS,
+    SPAN_COL_STATUS_CODE, SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID, SPAN_ID_WIDTH,
+    TRACE_ID_WIDTH, span_event_fields, span_events_item_field, spans_schema,
 };
 
 /// Rows accumulated into one output batch before it is emitted.
@@ -107,11 +109,14 @@ const METRIC_PAGES_SKIPPED: &str = "pages_skipped";
 ///
 /// Two clauses live here because they do not vary per block:
 ///
-/// - **(a) the projection does not include the `attrs` map column.** `attrs`
-///   ([`SPAN_COL_ATTRS`]) is the only column needing the dynamic per-key
+/// - **(a) the projection includes neither the `attrs` map column nor the
+///   `events` column.** `attrs` ([`SPAN_COL_ATTRS`]) needs the dynamic per-key
 ///   columns, the `attrs_raw` overflow decode, and the `_events_raw`
-///   reconstruction, which is precisely the work the fast path avoids. A
-///   `None` (all columns) projection includes `attrs`, so it is ineligible.
+///   reconstruction, which is precisely the work the fast path avoids;
+///   `events` ([`SPAN_COL_EVENTS`]) is built from that same reconstructed
+///   `_events_raw` attribute, so projecting it needs the row path for the same
+///   reason. A `None` (all columns) projection includes both, so it is
+///   ineligible.
 /// - **(b) no pending selective-erasure predicate applies.** `is_erased_span`
 ///   matches against the merged attribute map, exactly the structure the fast
 ///   path never builds, so a scan carrying an erasure predicate drains the row
@@ -123,7 +128,9 @@ pub(crate) fn columnar_static_eligible(
     projection: Option<&Vec<usize>>,
     erasure: &[ErasurePredicate],
 ) -> bool {
-    erasure.is_empty() && projection.is_some_and(|p| !p.contains(&SPAN_COL_ATTRS))
+    erasure.is_empty()
+        && projection
+            .is_some_and(|p| !p.contains(&SPAN_COL_ATTRS) && !p.contains(&SPAN_COL_EVENTS))
 }
 
 /// The RSPAN column ids a columnar decode must materialize for `projection`
@@ -153,8 +160,8 @@ fn union_projected_columns(projection: &[usize]) -> Vec<u32> {
             SPAN_COL_STATUS_MESSAGE => push(COL_STATUS_MESSAGE),
             SPAN_COL_SERVICE_NAME => push(COL_SERVICE_NAME),
             // duration_ns is computed from start_ts/end_ts, both already in the
-            // set above; the `attrs` map is ruled out by eligibility, so no
-            // other index reaches here.
+            // set above; the `attrs` map and the `events` list are ruled out by
+            // eligibility, so no other index reaches here.
             _ => {}
         }
     }
@@ -880,7 +887,7 @@ impl RecordBatchStream for SpanScanStream {
 /// Build one `spans` [`RecordBatch`] from a slice of [`SpanRow`]s, the row path
 /// (ADR-0110's fallback and the ineligible path).
 ///
-/// `projection` `None` builds the full eleven-column schema (the ineligible
+/// `projection` `None` builds the full twelve-column schema (the ineligible
 /// path, where a `ProjectionExec` above the scan does the column selection);
 /// `Some(indices)` builds exactly those schema columns in order, so an eligible
 /// query that fell back on an `attrs_raw` block still emits the projected schema
@@ -891,7 +898,7 @@ fn build_row_batch(
     schema: SchemaRef,
     projection: Option<&[usize]>,
 ) -> DFResult<RecordBatch> {
-    let all: [usize; 11] = [
+    let all: [usize; 12] = [
         SPAN_COL_TRACE_ID,
         SPAN_COL_SPAN_ID,
         SPAN_COL_PARENT_SPAN_ID,
@@ -903,6 +910,7 @@ fn build_row_batch(
         SPAN_COL_ATTRS,
         SPAN_COL_SERVICE_NAME,
         SPAN_COL_DURATION_NS,
+        SPAN_COL_EVENTS,
     ];
     let indices = projection.unwrap_or(&all);
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(indices.len());
@@ -1008,6 +1016,7 @@ fn row_column(idx: usize, rows: &[SpanRow]) -> DFResult<ArrayRef> {
                 .map(|row| row.record.end_ts_ns.saturating_sub(row.record.start_ts_ns))
                 .collect::<Vec<_>>(),
         )),
+        SPAN_COL_EVENTS => events_column(rows)?,
         other => {
             return Err(DataFusionError::Internal(format!(
                 "spans row column index {other} out of range"
@@ -1016,12 +1025,92 @@ fn row_column(idx: usize, rows: &[SpanRow]) -> DFResult<ArrayRef> {
     })
 }
 
+/// Build the `events` column (issue #1710) for the row path.
+///
+/// The source is the span's `_events_raw` attribute, which the RSPAN v4 reader
+/// rebuilds byte-for-byte from the block's nested event columns
+/// ([`ravel_rspan::SpanEvent`]), so this column carries the v4 event data and
+/// not a re-parse of some other encoding. A span with no `_events_raw`, or one
+/// whose value does not parse as an events blob, gets a NULL list rather than
+/// an empty one: the attribute is still in `attrs` for a caller that wants the
+/// unparsed bytes.
+///
+/// Per-event attributes are decoded with [`event_attrs`], which drops an OTLP
+/// value kind that has no `Map(Utf8, Utf8)` spelling (an array or a kvlist).
+/// The arrays are assembled by hand rather than through `ListBuilder` so the
+/// produced type is exactly [`crate::spans_schema::span_events_type`]: a
+/// builder picks its own child field name and nullability, and a mismatch
+/// there fails at `RecordBatch::try_new` rather than at compile time.
+fn events_column(rows: &[SpanRow]) -> DFResult<ArrayRef> {
+    let mut offsets: Vec<i32> = Vec::with_capacity(rows.len() + 1);
+    offsets.push(0);
+    let mut present: Vec<bool> = Vec::with_capacity(rows.len());
+    let mut ts: Vec<i64> = Vec::new();
+    let mut names = StringBuilder::new();
+    let mut attrs = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    let mut total: i32 = 0;
+
+    for row in rows {
+        let events = row
+            .record
+            .attrs
+            .iter()
+            .find(|(k, _)| k.as_str() == EVENTS_RAW_KEY)
+            .and_then(|(_, v)| parse_events(v));
+        match events {
+            Some(events) => {
+                for ev in &events {
+                    ts.push(ev.ts_ns);
+                    names.append_value(&ev.name);
+                    for (k, v) in event_attrs(&ev.attrs_blob) {
+                        attrs.keys().append_value(k);
+                        attrs.values().append_value(v);
+                    }
+                    attrs
+                        .append(true)
+                        .map_err(|e| SqlError::Internal(format!("event attrs map build: {e}")))?;
+                }
+                let len = i32::try_from(events.len()).map_err(|_| {
+                    SqlError::Internal(format!("span carries {} events, too many", events.len()))
+                })?;
+                total = total.checked_add(len).ok_or_else(|| {
+                    SqlError::Internal("events column offsets overflowed i32".to_string())
+                })?;
+                present.push(true);
+            }
+            None => present.push(false),
+        }
+        offsets.push(total);
+    }
+
+    let values = StructArray::try_new(
+        span_event_fields(),
+        vec![
+            Arc::new(Int64Array::from(ts)) as ArrayRef,
+            Arc::new(names.finish()) as ArrayRef,
+            Arc::new(attrs.finish()) as ArrayRef,
+        ],
+        None,
+    )
+    .map_err(|e| SqlError::Internal(format!("event struct array build: {e}")))?;
+    let nulls = NullBuffer::from(present);
+    let list = ListArray::try_new(
+        span_events_item_field(),
+        OffsetBuffer::new(offsets.into()),
+        Arc::new(values),
+        Some(nulls),
+    )
+    .map_err(|e| SqlError::Internal(format!("events list array build: {e}")))?;
+    Ok(Arc::new(list))
+}
+
 /// Build one `spans` [`RecordBatch`] straight from the columnar view (ADR-0110
 /// decision 3), gathering each projected column out of the referenced block's
 /// view over `order` (`(block index, block row)` pairs in output order). No
-/// `SpanRecord` and no `SpanRow`. `attrs` is never among `projection` here (the
-/// fast path is not eligible when it is), so the dynamic attribute pages, the
-/// `attrs_raw` page, and the event pages are never touched.
+/// `SpanRecord` and no `SpanRow`. Neither `attrs` nor `events` is ever among
+/// `projection` here (the fast path is not eligible when either is), so the
+/// dynamic attribute pages, the `attrs_raw` page, and the event pages are
+/// never touched.
 fn build_columnar_batch(
     blocks: &[HeldBlock],
     order: &[(usize, usize)],
@@ -1162,8 +1251,9 @@ fn columnar_column(
             Arc::new(Int64Array::from(out))
         }
         other => {
-            // `attrs` (SPAN_COL_ATTRS) never reaches here: the fast path is
-            // ineligible when it is projected.
+            // `attrs` (SPAN_COL_ATTRS) and `events` (SPAN_COL_EVENTS) never
+            // reach here: the fast path is ineligible when either is
+            // projected, because both need the row path's decode.
             return Err(DataFusionError::Internal(format!(
                 "spans columnar column index {other} not supported on the fast path"
             )));
