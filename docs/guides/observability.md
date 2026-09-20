@@ -269,8 +269,9 @@ in `all` and `query`. A `maintain` process, and any process run with
 
 The `ravel_catalog_fold_stamped_*` pair shares this prefix and is not part of
 this family. It is ADR-0873 stamp coverage, documented under declared-column
-statistics below, and unlike the three liveness families it is omitted in
-`maintain` rather than rendered as zeros.
+statistics below, and unlike the three liveness families it is omitted rather
+than rendered as zeros on any process that spawns no fold task -- `maintain`,
+or any other mode run with `--disable-fold`.
 
 The `signal` label is the family's per-signal keying, not a convenience. The
 fold runs as one independent task per signal, each with its own loop and no
@@ -533,9 +534,14 @@ so a fold attempt that lost its compare-and-swap and retried contributes
 nothing. In the healthy state the two rise together, one entry per stamped
 record.
 
-Unlike the drop tally, the coverage pair renders only in a mode that spawns a
-fold task, which is every mode but `maintain`. On a `maintain` process both
-families are absent, not zero.
+Unlike the drop tally, the coverage pair renders only when this process
+actually spawned a fold task. `maintain` never spawns one; every other mode
+does, UNLESS the process also runs `--disable-fold`, in which case it spawns
+none either. Both are absent, not zero, on a `maintain` process and on any
+`--disable-fold` process regardless of mode: an operator scraping `--mode all
+--disable-fold` sees `ravel_declared_stats_drops_observed_total` present as
+usual and both `ravel_catalog_fold_stamped_*` series simply missing from the
+exposition, the same shape a `maintain` process shows.
 
 #### The stamp-coverage shortfall alert
 
@@ -593,7 +599,8 @@ have, so the detectable signal is a divergence between the two counters, or
 the fold-side family being absent while the ingest side rises. The first rule
 covers the divergence; the second covers the absence, and it needs the ingest
 side as its second term, because an absent fold family on its own is also what
-a `maintain`-only or an idle deployment looks like.
+a `maintain`-only deployment, a `--disable-fold` deployment, or an idle
+deployment looks like.
 
 `sum()` over both sides of the shortfall rule, not a per-instance comparison.
 The fold loop skips its tick when `HEAD` is already fresher than

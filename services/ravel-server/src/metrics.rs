@@ -1761,14 +1761,18 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
 /// hide the compaction-part drops in the one mode that compacts.
 ///
 /// `coverage` is the fold's `(stamped_records, stamped_entries)` totals, and
-/// is `None` in a mode that runs no fold task ([`Mode::Maintain`]): both fold
-/// families are then omitted rather than rendered as zero, the same
-/// structural absence the ingest families use. The absence is load-bearing
-/// for the alert rules in docs/guides/observability.md. An old fold cannot
-/// emit a counter it does not have, so the detectable signal is a divergence
-/// between the two counters, or the fold-side family being absent while the
-/// ingest side rises; a family always present at zero would make those two
-/// cases read the same as a healthy idle fold.
+/// is `None` when this process spawned no fold task (`Mode::Maintain`, or
+/// any other mode run with `--disable-fold`; see
+/// [`MetricsState::fold_enabled`]): both fold families are then omitted
+/// rather than rendered as zero, the same structural absence the ingest
+/// families use. The absence is load-bearing for the alert rules in
+/// docs/guides/observability.md. An old fold cannot emit a counter it does
+/// not have, so the detectable signal is a divergence between the two
+/// counters, or the fold-side family being absent while the ingest side
+/// rises; a family always present at zero would make those two cases read
+/// the same as a healthy idle fold -- exactly the false all-clear
+/// `--mode all --disable-fold` produced when this family was gated on mode
+/// alone.
 fn render_declared_stats_family(
     out: &mut String,
     mode: Mode,
@@ -4675,6 +4679,7 @@ pub fn render(
     catalog_cache_max_bytes: Option<u64>,
     audit_write_failures: Option<u64>,
     memory_budget: MemoryBudgetSnapshot,
+    fold_enabled: bool,
 ) -> String {
     let mut out = String::new();
     render_allocator_family(&mut out, mode, allocator);
@@ -4689,14 +4694,16 @@ pub fn render(
     // (ravel-commit and ravel-sql), and the fold totals are accumulated by
     // `ravel_catalog::fold` as each fold attempt commits its HEAD, so neither
     // has a snapshot struct the `/metrics` route is handed. The fold totals
-    // are read only in a mode that spawns the fold task, which is every mode
-    // but `Mode::Maintain` (`crate::lib`'s task wiring), so the two fold
-    // families are omitted rather than pinned at zero there.
+    // are read only when `fold_enabled` says this process actually spawned
+    // the fold task (`MetricsState::fold_enabled`'s doc comment has the exact
+    // gate): a mode that merely permits a fold task is not the same as one
+    // running, since `--disable-fold` spawns none in any mode, so the two
+    // fold families are omitted rather than pinned at zero there.
     render_declared_stats_family(
         &mut out,
         mode,
         &ravel_commit::declared_stats::declared_stat_drops_observed_all(),
-        (!matches!(mode, Mode::Maintain)).then(|| {
+        fold_enabled.then(|| {
             (
                 ravel_catalog::fold_stamped_records_total(),
                 ravel_catalog::fold_stamped_entries_total(),
@@ -5005,6 +5012,20 @@ pub struct MetricsState {
     /// rather than the raw near-miss remainder. See
     /// [`exposed_memory_budget_limit`].
     pub process_memory_budget_is_fallback: bool,
+    /// Whether this process actually spawned the background catalog fold
+    /// task, mirroring `crate::start`'s own gate
+    /// (`!matches!(config.mode, Mode::Maintain) && config.fold.enabled`)
+    /// rather than re-deriving it from `mode` here: `Mode::Maintain` never
+    /// calls [`crate::fold::spawn`] regardless of `--disable-fold`, and
+    /// every other mode calls it but [`crate::fold::spawn`] itself returns
+    /// [`crate::fold::FoldTasks::none`] when `--disable-fold` is set. Gates
+    /// the `ravel_catalog_fold_stamped_records_total` /
+    /// `ravel_catalog_fold_stamped_entries_total` pair: rendering them
+    /// whenever the mode merely permits a fold task, rather than when one is
+    /// actually running, left `--mode all --disable-fold` rendering both at
+    /// a zero that never moves, reading as steady coverage instead of the
+    /// fold never running.
+    pub fold_enabled: bool,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -5243,6 +5264,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         catalog_cache_max_bytes,
         audit_write_failures,
         memory_budget_snapshot,
+        state.fold_enabled,
     );
     (
         StatusCode::OK,
@@ -5350,6 +5372,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert!(
@@ -5537,6 +5560,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         let postings_lines: Vec<&str> = body
@@ -5623,6 +5647,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         let lines: Vec<&str> = body
@@ -5765,6 +5790,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         let mut declared_types: HashSet<String> = HashSet::new();
@@ -5946,6 +5972,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert!(body.contains(
@@ -6026,6 +6053,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert!(
@@ -6094,6 +6122,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         let written = "ravel_ingest_exemplars_written_total{mode=\"gateway\",signal=\"metrics\"} 7";
@@ -6169,6 +6198,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert!(
@@ -6235,6 +6265,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         let adaptive =
@@ -6353,6 +6384,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert!(
@@ -6456,6 +6488,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert!(
@@ -6515,6 +6548,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert!(
@@ -6595,6 +6629,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert!(
@@ -6878,6 +6913,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         for signal in ["metrics", "logs", "spans"] {
@@ -7007,6 +7043,95 @@ mod tests {
         );
     }
 
+    /// Drives the real [`render`] entry point (not [`render_declared_stats_family`]
+    /// directly) with a mode that PERMITS a fold task
+    /// (`Mode::All`) but `fold_enabled: false`, the shape of
+    /// `--mode all --disable-fold`: `crate::fold::spawn` never runs in
+    /// `Mode::Maintain` and itself spawns nothing when disabled, so a mode
+    /// check alone cannot tell the two apart. Before `fold_enabled` was
+    /// threaded through, `render` derived this pair from `!matches!(mode,
+    /// Mode::Maintain)` alone and rendered both families at zero forever
+    /// under exactly this combination, a false all-clear no alert on the
+    /// shortfall would ever catch.
+    #[test]
+    fn fold_disabled_in_a_fold_capable_mode_renders_neither_stamp_coverage_family() {
+        let body = render_with_fold_enabled(Mode::All, false);
+        assert!(
+            !body.contains("ravel_catalog_fold_stamped_records_total"),
+            "--disable-fold in a mode that otherwise permits folding must omit \
+             the stamped-records family, not render it at zero:\n{body}"
+        );
+        assert!(
+            !body.contains("ravel_catalog_fold_stamped_entries_total"),
+            "--disable-fold in a mode that otherwise permits folding must omit \
+             the stamped-entries family, not render it at zero:\n{body}"
+        );
+    }
+
+    /// The counterpart to the test above: a mode that actually spawns the
+    /// fold task renders both families exactly once, not omitted and not
+    /// duplicated. The sample values themselves are read from the real
+    /// process-global counters (shared with every other test in this
+    /// binary), so this asserts presence and cardinality, not a value.
+    #[test]
+    fn fold_enabled_renders_both_stamp_coverage_families_exactly_once() {
+        let body = render_with_fold_enabled(Mode::All, true);
+        assert_eq!(
+            body.matches("ravel_catalog_fold_stamped_records_total{mode=\"all\"} ")
+                .count(),
+            1,
+            "an active fold task must render the stamped-records sample exactly once:\n{body}"
+        );
+        assert_eq!(
+            body.matches("ravel_catalog_fold_stamped_entries_total{mode=\"all\"} ")
+                .count(),
+            1,
+            "an active fold task must render the stamped-entries sample exactly once:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_catalog_fold_stamped_records_total counter")
+                && body.contains("# TYPE ravel_catalog_fold_stamped_entries_total counter"),
+            "both fold-coverage families must declare their type:\n{body}"
+        );
+    }
+
+    /// Shared arg list for the two `fold_enabled` tests above: every other
+    /// source left at its "not built in this mode" `None`/empty value, since
+    /// only the fold-coverage pair is under test.
+    fn render_with_fold_enabled(mode: Mode, fold_enabled: bool) -> String {
+        render(
+            mode,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+            fold_enabled,
+        )
+    }
+
     #[test]
     fn zero_valued_snapshot_renders_valid_output_not_omitted() {
         let body = render(
@@ -7038,6 +7163,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            false,
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -7109,6 +7235,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            false,
         );
 
         assert!(
@@ -7166,6 +7293,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert!(
@@ -7215,6 +7343,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
         // Default reachability is healthy (1); the process runs no probe here.
         assert!(
@@ -7322,6 +7451,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         // All three counters appear, mode-labeled, carrying the driven value.
@@ -7378,6 +7508,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            false,
         );
         assert!(
             !body.contains("ravel_durable_auth_"),
@@ -7444,6 +7575,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            false,
         );
 
         assert!(
@@ -7548,6 +7680,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         for expected in [
@@ -7637,6 +7770,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
         assert!(
             !off.contains("ravel_distrib_"),
@@ -7695,6 +7829,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            false,
         );
 
         assert!(
@@ -7785,6 +7920,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
         assert!(
             !body.contains("ravel_scrub_"),
@@ -7876,6 +8012,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert_eq!(
@@ -7942,6 +8079,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         for (header, sample) in [
@@ -8018,6 +8156,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            false,
         );
         for (header, sample) in [
             (
@@ -8103,6 +8242,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            false,
         );
 
         for line in body.lines() {
@@ -8191,6 +8331,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         // Fetcher cache, labeled cache="fetch".
@@ -8422,6 +8563,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
         assert!(
             body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
@@ -8466,6 +8608,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert!(
@@ -8665,6 +8808,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         assert_eq!(
@@ -8751,6 +8895,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
 
         let rendered = admission_tenant_hashes(&body);
@@ -8836,6 +8981,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
         assert!(
             body.contains(&format!(
@@ -8896,6 +9042,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         );
         let hash = hash.to_hex();
         assert!(
@@ -8970,6 +9117,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            true,
         )
     }
 
@@ -9193,6 +9341,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             MemoryBudgetSnapshot::default(),
+            !matches!(mode, Mode::Maintain),
         )
     }
 
