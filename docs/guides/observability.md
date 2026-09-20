@@ -540,7 +540,7 @@ does, UNLESS the process also runs `--disable-fold`, in which case it spawns
 none either. Both are absent, not zero, on a `maintain` process and on any
 `--disable-fold` process regardless of mode: an operator scraping `--mode all
 --disable-fold` sees `ravel_declared_stats_drops_observed_total` present as
-usual and both `ravel_catalog_fold_stamped_*` series simply missing from the
+usual and both `ravel_catalog_fold_stamped_*` series missing from the
 exposition, the same shape a `maintain` process shows.
 
 #### The stamp-coverage shortfall alert
