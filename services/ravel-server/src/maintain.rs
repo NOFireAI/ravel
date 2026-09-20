@@ -170,6 +170,11 @@ pub struct MaintenanceSafetyMetrics {
     orphans_quarantined: [AtomicU64; MAINTAINED_SIGNALS.len()],
     orphans_quarantine_refused: [AtomicU64; MAINTAINED_SIGNALS.len()],
     quarantine_reaped: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    l0_records_pending: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    objects_deleted_quarantine_reaped: AtomicU64,
+    objects_deleted_superseded_records_deleted: AtomicU64,
+    objects_deleted_superseded_data_deleted: AtomicU64,
+    objects_deleted_unreferenced_parts_deleted: AtomicU64,
 }
 
 impl MaintenanceSafetyMetrics {
@@ -277,6 +282,55 @@ impl MaintenanceSafetyMetrics {
         self.quarantine_reaped[signal_index(signal)].load(Ordering::Relaxed)
     }
 
+    /// L0 commit records the most recent compaction scan pass for `signal`
+    /// found sealed but still below `min_compaction_inputs`
+    /// ([`MaintainReport::l0_records_pending`]). A gauge like
+    /// [`orphans_present`], not a counter: it reflects only the most recent
+    /// pass, overwritten (`store`) each time, since a record leaves this
+    /// count the moment its bucket compacts or expires, not on a later
+    /// event this process needs to remember happened.
+    ///
+    /// [`orphans_present`]: Self::orphans_present
+    pub fn l0_records_pending(&self, signal: Signal) -> u64 {
+        self.l0_records_pending[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Objects physically deleted from `quarantine/` past the quarantine
+    /// horizon, summed over every sweep pass of every signal since process
+    /// start ([`ravel_maintain::SweepReport::quarantine_reaped`]). Not
+    /// signal-scoped, unlike [`quarantine_reaped`](Self::quarantine_reaped):
+    /// this is the `kind`-labeled series behind
+    /// `ravel_maintain_objects_deleted_total{kind="quarantine_reaped"}`
+    /// (issue #1729), the other is the pre-existing `signal`-labeled one.
+    pub fn objects_deleted_quarantine_reaped(&self) -> u64 {
+        self.objects_deleted_quarantine_reaped
+            .load(Ordering::Relaxed)
+    }
+
+    /// Superseded L0 commit records rule 2 physically deleted, summed over
+    /// every sweep pass since process start
+    /// ([`ravel_maintain::SweepReport::superseded_records_deleted`]).
+    pub fn objects_deleted_superseded_records_deleted(&self) -> u64 {
+        self.objects_deleted_superseded_records_deleted
+            .load(Ordering::Relaxed)
+    }
+
+    /// Superseded L0 data objects rule 2 physically deleted, summed over
+    /// every sweep pass since process start
+    /// ([`ravel_maintain::SweepReport::superseded_data_deleted`]).
+    pub fn objects_deleted_superseded_data_deleted(&self) -> u64 {
+        self.objects_deleted_superseded_data_deleted
+            .load(Ordering::Relaxed)
+    }
+
+    /// Unreferenced L1 parts rule 3 physically deleted, summed over every
+    /// sweep pass since process start
+    /// ([`ravel_maintain::SweepReport::unreferenced_parts_deleted`]).
+    pub fn objects_deleted_unreferenced_parts_deleted(&self) -> u64 {
+        self.objects_deleted_unreferenced_parts_deleted
+            .load(Ordering::Relaxed)
+    }
+
     pub fn record_legal_hold_refresh_failure(&self) {
         self.legal_hold_refresh_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -331,6 +385,31 @@ impl MaintenanceSafetyMetrics {
         self.orphans_quarantine_refused[index]
             .fetch_add(report.orphans_quarantine_refused as u64, Ordering::Relaxed);
         self.quarantine_reaped[index].fetch_add(report.quarantine_reaped as u64, Ordering::Relaxed);
+
+        // The `kind`-labeled deleted-objects family (issue #1729): the four
+        // `SweepReport` fields that represent an actual physical delete, not
+        // a move to quarantine (`orphans_deleted`/`orphans_quarantined`) or a
+        // withheld/refused candidate. Unconditional, unlike the orphan gauges
+        // above: every one of these four counts an event this pass actually
+        // performed, `Skip` or `Run` alike, so there is no zeroing case to
+        // guard against.
+        self.objects_deleted_quarantine_reaped
+            .fetch_add(report.quarantine_reaped as u64, Ordering::Relaxed);
+        self.objects_deleted_superseded_records_deleted
+            .fetch_add(report.superseded_records_deleted as u64, Ordering::Relaxed);
+        self.objects_deleted_superseded_data_deleted
+            .fetch_add(report.superseded_data_deleted as u64, Ordering::Relaxed);
+        self.objects_deleted_unreferenced_parts_deleted
+            .fetch_add(report.unreferenced_parts_deleted as u64, Ordering::Relaxed);
+    }
+
+    /// One [`scan_and_maintain_with_memo`] result for `signal`, feeding the
+    /// L0-pending gauge. A gauge, not a counter, for the same reason as
+    /// [`orphans_present`](Self::orphans_present): this pass's count,
+    /// overwritten (`store`) each time.
+    pub fn record_scan(&self, signal: Signal, report: &MaintainReport) {
+        self.l0_records_pending[signal_index(signal)]
+            .store(report.l0_records_pending as u64, Ordering::Relaxed);
     }
 }
 
@@ -1602,6 +1681,7 @@ pub(crate) async fn run_tick_with_clock(
                         skipped_terminal = report.skipped_terminal,
                         "maintenance: retention + compaction pass complete"
                     );
+                    safety.record_scan(signal, &report);
                     total.retired += report.retired;
                     total.compacted += report.compacted;
                     total.already_done += report.already_done;
