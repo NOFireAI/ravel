@@ -749,7 +749,12 @@ fn print_durable_tokens(err: &LoadError) {
 /// --pipeline-depth 1`: K cursors read K far-apart partitions concurrently, and
 /// above depth 1 a batch submitted after the failing one can still commit, so
 /// the landed set has holes and `rows_skipped + rows_written` names a position
-/// no boundary sits at. Printing the figures without that sentence is what
+/// no boundary sits at. Even under those settings the offset is a floor rather
+/// than an exact boundary: a batch spans every shard its rows hash to, and the
+/// failing batch can have committed on some of them, which puts those rows in
+/// the durable token list and not in `rows_written`. A resume then re-ingests
+/// them. The error is one-sided, and that is the direction to be wrong in:
+/// duplicated rows are visible in the data, dropped rows are not. Printing the figures without that sentence is what
 /// turns them into an offset an operator would paste into a resume that both
 /// duplicates and loses rows.
 ///
@@ -764,7 +769,10 @@ fn resume_hint(
     let sequential = read_cursors == Some(1) && pipeline_depth == 1;
     let verdict = if sequential {
         "this run used --read-cursors 1 --pipeline-depth 1, so the rows that landed are a \
-         contiguous prefix of the file and this offset resumes exactly where it stopped"
+         contiguous prefix of the file and this offset loses nothing. One batch straddles \
+         every shard it touches, though, and the failing batch can have committed on some \
+         shards and not others; those rows are in the durable token list above and are not \
+         counted in rows_written, so resuming here re-ingests them"
             .to_string()
     } else {
         let cursors = match read_cursors {
