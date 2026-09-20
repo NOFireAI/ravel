@@ -1145,6 +1145,8 @@ mod tests {
                         on_actor_ns: 300,
                         flush_permit_wait_ns: 700,
                         off_actor_ns: 9_000,
+                        flushes_queued: 0,
+                        flush_trigger_deferred: 0,
                     }
                 ),
                 (
@@ -1156,6 +1158,8 @@ mod tests {
                         on_actor_ns: 50,
                         flush_permit_wait_ns: 0,
                         off_actor_ns: 0,
+                        flushes_queued: 0,
+                        flush_trigger_deferred: 0,
                     }
                 ),
             ]
@@ -1186,6 +1190,40 @@ mod tests {
                     on_actor_ns: 40,
                     flush_permit_wait_ns: 150,
                     off_actor_ns: 500,
+                    flushes_queued: 0,
+                    flush_trigger_deferred: 0,
+                }
+            )]
+        );
+    }
+
+    /// The queued-flush cap's two figures have different shapes and the
+    /// accumulator must keep them apart: `flushes_queued` is a gauge the actor
+    /// republishes at its current depth (a later smaller value wins), while
+    /// `flush_trigger_deferred` counts refusals and only ever rises. A shard
+    /// that has done nothing but refuse a trigger must still appear in the
+    /// report, or the one shard at its cap is the one the reader cannot see.
+    #[test]
+    fn queued_flush_gauge_replaces_while_the_deferred_counter_accumulates() {
+        let metrics = IngestMetrics::new(2);
+        metrics.record_shard_flushes_queued(1, 3);
+        metrics.record_shard_flushes_queued(1, 1);
+        metrics.record_shard_flush_trigger_deferred(1);
+        metrics.record_shard_flush_trigger_deferred(1);
+
+        assert_eq!(
+            metrics.shard_skew_by_shard(),
+            vec![(
+                1,
+                ShardSkewStats {
+                    messages_enqueued: 0,
+                    messages_processed: 0,
+                    queue_depth: 0,
+                    on_actor_ns: 0,
+                    flush_permit_wait_ns: 0,
+                    off_actor_ns: 0,
+                    flushes_queued: 1,
+                    flush_trigger_deferred: 2,
                 }
             )]
         );
@@ -1211,6 +1249,8 @@ mod tests {
                     on_actor_ns: 0,
                     flush_permit_wait_ns: 0,
                     off_actor_ns: 0,
+                    flushes_queued: 0,
+                    flush_trigger_deferred: 0,
                 }
             )]
         );
@@ -1344,6 +1384,8 @@ mod tests {
                     on_actor_ns: 7_000,
                     flush_permit_wait_ns: 11,
                     off_actor_ns: 13,
+                    flushes_queued: 0,
+                    flush_trigger_deferred: 0,
                 }
             )]
         );
@@ -1372,6 +1414,8 @@ mod tests {
                     on_actor_ns: 42,
                     flush_permit_wait_ns: 0,
                     off_actor_ns: 0,
+                    flushes_queued: 0,
+                    flush_trigger_deferred: 0,
                 }
             )]
         );
