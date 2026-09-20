@@ -775,9 +775,23 @@ printed list is **exact** for that partial-flush case. It remains a lower bound
 only when the failing batch's ack round did not resolve at all -- an
 ack-deadline timeout, or a shard's channel dying at send time -- because no
 per-shard ack is observed then, and a commit can land without an observable
-ack. A failure mid-file is a genuine **partial load, not a rollback**. There is
-**no resumability or deduplication**: re-running after any failure re-ingests
-the whole file from the start.
+ack. A failure mid-file is a genuine **partial load, not a rollback**.
+
+`--skip-rows N` (issue #1713) gives a manual, positional way to resume a
+failed load: it drops the first `N` rows of the file, by file-absolute
+position, before any row reaches mapping or admission checks, and reports how
+many it dropped as `rows_skipped` in the summary alongside `rows_written`. To
+resume after a failure, re-run with `--skip-rows` set to the failed attempt's
+`rows_skipped + rows_written`.
+
+This is **not** deduplication and carries **no idempotency marker**: the
+loader trusts the offset it is given and has no way to check it against what
+actually landed. A value that is too low re-ingests rows that already
+committed, duplicating them; a value that is too high silently drops rows
+that never landed anywhere. Getting the offset right is entirely the
+operator's responsibility. A per-file idempotency marker that would make this
+automatic and safe is separate, tracked future work under ADR-1713; this flag
+is a purely positional stopgap ahead of it.
 
 Retention and GC key on ingest-hour buckets, which the loader derives from
 *load* time. A bulk-loaded record with an old event timestamp is therefore
