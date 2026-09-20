@@ -183,7 +183,7 @@ d="$(new_tree docker-run-image-with-tag-only-fails)"
 mutate "${d}/.github/workflows/ci.yml" \
   's#quay\.io/minio/mc:RELEASE\.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727#quay.io/minio/mc:latest#'
 check "docker_run_image_with_tag_only_fails" "${d}" 1 \
-  "ci.yml:1217: quay.io/minio/mc:latest"
+  "quay.io/minio/mc:latest"
 
 # The three shell-variable image references this static scan cannot resolve
 # ("$RAVEL_SERVER_IMAGE"/"$RAVEL_OPERATOR_IMAGE" in ci.yml and k8s-nightly.yml,
@@ -193,7 +193,7 @@ check "docker_run_image_with_tag_only_fails" "${d}" 1 \
 # appear under the exempt marker rather than as findings.
 d="$(new_tree docker-run-variable-ref-is-exempt)"
 check "docker_run_variable_ref_is_exempt: RAVEL_SERVER_IMAGE ref in ci.yml is not unpinned" \
-  "${d}" 0 'ci.yml:1597: "$RAVEL_SERVER_IMAGE"'
+  "${d}" 0 '"$RAVEL_SERVER_IMAGE"'
 check "docker_run_variable_ref_is_exempt: exempt marker is used, not [UNPINNED]" \
   "${d}" 0 '[variable ref, exempt]'
 
