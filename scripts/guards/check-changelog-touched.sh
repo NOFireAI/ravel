@@ -61,6 +61,25 @@ head_sha="$(git rev-parse --verify "${head_ref}^{commit}" 2>/dev/null)" || {
 # as this one's. Since this guard makes nearly every merged pull request touch
 # CHANGELOG.md, base and head diverging over a changelog edit is the common
 # case rather than a rare one.
+# A pull-request merge ref (refs/pull/N/merge) has the base branch tip as its
+# FIRST parent and the branch under review as its second, so everything merged
+# into the base branch since the fork point is reachable from it. Walking that
+# range reports a neighbour's commit as this one. When head is a two-parent
+# merge whose first parent is an ancestor of the base ref, take the second
+# parent as the effective head. Callers should pass the branch tip directly
+# (ci.yml passes github.event.pull_request.head.sha); this is the backstop for
+# the ones that do not.
+head_parents="$(git rev-list --parents -n 1 "${head_sha}" 2>/dev/null)" || head_parents=""
+read -r -a head_parts <<<"${head_parents}"
+if [[ "${#head_parts[@]}" -eq 3 ]]; then
+  # The base ref descends to the first parent, i.e. that parent is the base
+  # branch tip and this is a merge ref rather than an ordinary merge commit
+  # authored on the branch.
+  if git merge-base --is-ancestor "${base_sha}" "${head_parts[1]}" 2>/dev/null; then
+    head_sha="${head_parts[2]}"
+  fi
+fi
+
 merge_base="$(git merge-base "${base_sha}" "${head_sha}" 2>/dev/null)" || {
   echo "check-changelog-touched.sh: no merge base for ${base_sha} and ${head_sha}" >&2
   exit 2
