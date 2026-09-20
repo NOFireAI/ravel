@@ -270,8 +270,8 @@ in `all` and `query`. A `maintain` process, and any process run with
 The `ravel_catalog_fold_stamped_*` pair shares this prefix and is not part of
 this family. It is ADR-0873 stamp coverage, documented under declared-column
 statistics below, and unlike the three liveness families it is omitted rather
-than rendered as zeros on any process that spawns no fold task -- `maintain`,
-or any other mode run with `--disable-fold`.
+than rendered as zeros on any process that can fold by neither route -- a
+`maintain` process, and a `gateway` process run with `--disable-fold`.
 
 The `signal` label is the family's per-signal keying, not a convenience. The
 fold runs as one independent task per signal, each with its own loop and no
@@ -534,14 +534,18 @@ so a fold attempt that lost its compare-and-swap and retried contributes
 nothing. In the healthy state the two rise together, one entry per stamped
 record.
 
-Unlike the drop tally, the coverage pair renders only when this process
-actually spawned a fold task. `maintain` never spawns one; every other mode
-does, UNLESS the process also runs `--disable-fold`, in which case it spawns
-none either. Both are absent, not zero, on a `maintain` process and on any
-`--disable-fold` process regardless of mode: an operator scraping `--mode all
---disable-fold` sees `ravel_declared_stats_drops_observed_total` present as
-usual and both `ravel_catalog_fold_stamped_*` series missing from the
-exposition, the same shape a `maintain` process shows.
+Unlike the drop tally, the coverage pair renders only when a fold can run in
+this process at all, by either route. Two routes fold, and both accumulate
+these totals: the background fold task, which `maintain` never spawns and
+which `--disable-fold` disables in every other mode, and the on-demand
+`POST /api/v1/admin/fold` route, mounted in `all` and `query` whatever
+`--disable-fold` says. So a `--mode all --disable-fold` process DOES render
+the pair: an operator can still fold it by hand, and that fold moves these
+counters. Both series are absent, not zero, exactly where neither route
+exists: every `maintain` process, and a `gateway` process run with
+`--disable-fold`. An operator scraping one of those sees
+`ravel_declared_stats_drops_observed_total` present as usual and both
+`ravel_catalog_fold_stamped_*` series missing from the exposition.
 
 #### The stamp-coverage shortfall alert
 
@@ -599,8 +603,8 @@ have, so the detectable signal is a divergence between the two counters, or
 the fold-side family being absent while the ingest side rises. The first rule
 covers the divergence; the second covers the absence, and it needs the ingest
 side as its second term, because an absent fold family on its own is also what
-a `maintain`-only deployment, a `--disable-fold` deployment, or an idle
-deployment looks like.
+a `maintain`-only deployment, a deployment that can fold by neither route, or
+an idle deployment looks like.
 
 `sum()` over both sides of the shortfall rule, not a per-instance comparison.
 The fold loop skips its tick when `HEAD` is already fresher than

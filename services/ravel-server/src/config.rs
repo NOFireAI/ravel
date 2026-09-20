@@ -39,6 +39,23 @@ impl Mode {
     pub fn installs_query_audit_pipeline(self) -> bool {
         matches!(self, Mode::All | Mode::Query)
     }
+
+    /// Whether [`crate::start`] mounts the on-demand fold route
+    /// (`POST /api/v1/admin/fold`, issue #785) for this mode. The mount sits
+    /// inside the query-surface block, which is why this delegates to
+    /// [`Mode::installs_query_audit_pipeline`] rather than restating the mode
+    /// list: the route cannot be mounted in a mode that block skips. The mount
+    /// site guards on this method so the answer here and the router's contents
+    /// are one fact rather than two.
+    ///
+    /// Read by [`crate::ServerConfig::folds_in_process`], because an on-demand
+    /// fold runs the same `Catalog::fold` the background task runs and
+    /// accumulates the same process-global stamp-coverage totals. A process
+    /// that mounts this route can fold whatever `--disable-fold` says about
+    /// the background task.
+    pub fn mounts_on_demand_fold(self) -> bool {
+        self.installs_query_audit_pipeline()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

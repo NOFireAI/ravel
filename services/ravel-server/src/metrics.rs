@@ -1761,9 +1761,9 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
 /// hide the compaction-part drops in the one mode that compacts.
 ///
 /// `coverage` is the fold's `(stamped_records, stamped_entries)` totals, and
-/// is `None` when this process spawned no fold task (`Mode::Maintain`, or
-/// any other mode run with `--disable-fold`; see
-/// [`MetricsState::fold_enabled`]): both fold families are then omitted
+/// is `None` when no fold can run in this process by either route -- neither
+/// the background task nor `POST /api/v1/admin/fold` (see
+/// [`MetricsState::can_fold`]): both fold families are then omitted
 /// rather than rendered as zero, the same structural absence the ingest
 /// families use. The absence is load-bearing for the alert rules in
 /// docs/guides/observability.md. An old fold cannot emit a counter it does
@@ -4679,7 +4679,7 @@ pub fn render(
     catalog_cache_max_bytes: Option<u64>,
     audit_write_failures: Option<u64>,
     memory_budget: MemoryBudgetSnapshot,
-    fold_enabled: bool,
+    can_fold: bool,
 ) -> String {
     let mut out = String::new();
     render_allocator_family(&mut out, mode, allocator);
@@ -4694,16 +4694,16 @@ pub fn render(
     // (ravel-commit and ravel-sql), and the fold totals are accumulated by
     // `ravel_catalog::fold` as each fold attempt commits its HEAD, so neither
     // has a snapshot struct the `/metrics` route is handed. The fold totals
-    // are read only when `fold_enabled` says this process actually spawned
-    // the fold task (`MetricsState::fold_enabled`'s doc comment has the exact
-    // gate): a mode that merely permits a fold task is not the same as one
-    // running, since `--disable-fold` spawns none in any mode, so the two
-    // fold families are omitted rather than pinned at zero there.
+    // are read only when `can_fold` says a fold can run in this process by
+    // either route (`MetricsState::can_fold`'s doc comment has the exact
+    // gate): a mode that merely permits a fold is not the same as a process
+    // that can run one, so the two fold families are omitted rather than
+    // pinned at zero on a process that can fold by neither route.
     render_declared_stats_family(
         &mut out,
         mode,
         &ravel_commit::declared_stats::declared_stat_drops_observed_all(),
-        fold_enabled.then(|| {
+        can_fold.then(|| {
             (
                 ravel_catalog::fold_stamped_records_total(),
                 ravel_catalog::fold_stamped_entries_total(),
@@ -5012,20 +5012,22 @@ pub struct MetricsState {
     /// rather than the raw near-miss remainder. See
     /// [`exposed_memory_budget_limit`].
     pub process_memory_budget_is_fallback: bool,
-    /// Whether this process actually spawned the background catalog fold
-    /// task, mirroring `crate::start`'s own gate
-    /// (`!matches!(config.mode, Mode::Maintain) && config.fold.enabled`)
-    /// rather than re-deriving it from `mode` here: `Mode::Maintain` never
-    /// calls [`crate::fold::spawn`] regardless of `--disable-fold`, and
-    /// every other mode calls it but [`crate::fold::spawn`] itself returns
-    /// [`crate::fold::FoldTasks::none`] when `--disable-fold` is set. Gates
-    /// the `ravel_catalog_fold_stamped_records_total` /
-    /// `ravel_catalog_fold_stamped_entries_total` pair: rendering them
-    /// whenever the mode merely permits a fold task, rather than when one is
-    /// actually running, left `--mode all --disable-fold` rendering both at
-    /// a zero that never moves, reading as steady coverage instead of the
-    /// fold never running.
-    pub fold_enabled: bool,
+    /// Whether a catalog fold can run in this process at all, by either
+    /// route: the background fold task, or the on-demand
+    /// `POST /api/v1/admin/fold` route. Computed by
+    /// [`crate::ServerConfig::folds_in_process`], which is where the two
+    /// spawn/mount gates are stated, rather than re-derived from `mode`
+    /// here.
+    ///
+    /// Gates the `ravel_catalog_fold_stamped_records_total` /
+    /// `ravel_catalog_fold_stamped_entries_total` pair. Both routes fold
+    /// into the same process-global totals, so both must open the gate.
+    /// Following the mode alone left `--mode all --disable-fold` rendering
+    /// both at a zero that never moves, reading as steady coverage instead
+    /// of the fold never running; following the background task alone left
+    /// the same process rendering no family at all while an operator drove
+    /// real coverage through the route.
+    pub can_fold: bool,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -5264,7 +5266,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         catalog_cache_max_bytes,
         audit_write_failures,
         memory_budget_snapshot,
-        state.fold_enabled,
+        state.can_fold,
     );
     (
         StatusCode::OK,
@@ -7044,49 +7046,48 @@ mod tests {
     }
 
     /// Drives the real [`render`] entry point (not [`render_declared_stats_family`]
-    /// directly) with a mode that PERMITS a fold task
-    /// (`Mode::All`) but `fold_enabled: false`, the shape of
-    /// `--mode all --disable-fold`: `crate::fold::spawn` never runs in
-    /// `Mode::Maintain` and itself spawns nothing when disabled, so a mode
-    /// check alone cannot tell the two apart. Before `fold_enabled` was
-    /// threaded through, `render` derived this pair from `!matches!(mode,
-    /// Mode::Maintain)` alone and rendered both families at zero forever
-    /// under exactly this combination, a false all-clear no alert on the
-    /// shortfall would ever catch.
+    /// directly) with a mode that PERMITS folding (`Mode::All`) but
+    /// `can_fold: false`: a mode check alone cannot tell a folding process
+    /// from a non-folding one, so before this flag was threaded through,
+    /// `render` derived the pair from `!matches!(mode, Mode::Maintain)` alone
+    /// and rendered both families at zero forever, a false all-clear no alert
+    /// on the shortfall would ever catch. Which configurations set the flag
+    /// is [`crate::ServerConfig::folds_in_process`]'s question, pinned by its
+    /// own tests; this one pins what the renderer does with the answer.
     #[test]
-    fn fold_disabled_in_a_fold_capable_mode_renders_neither_stamp_coverage_family() {
-        let body = render_with_fold_enabled(Mode::All, false);
+    fn a_process_that_cannot_fold_renders_neither_stamp_coverage_family() {
+        let body = render_with_can_fold(Mode::All, false);
         assert!(
             !body.contains("ravel_catalog_fold_stamped_records_total"),
-            "--disable-fold in a mode that otherwise permits folding must omit \
-             the stamped-records family, not render it at zero:\n{body}"
+            "a process that can fold by neither route must omit the \
+             stamped-records family, not render it at zero:\n{body}"
         );
         assert!(
             !body.contains("ravel_catalog_fold_stamped_entries_total"),
-            "--disable-fold in a mode that otherwise permits folding must omit \
-             the stamped-entries family, not render it at zero:\n{body}"
+            "a process that can fold by neither route must omit the \
+             stamped-entries family, not render it at zero:\n{body}"
         );
     }
 
-    /// The counterpart to the test above: a mode that actually spawns the
-    /// fold task renders both families exactly once, not omitted and not
-    /// duplicated. The sample values themselves are read from the real
-    /// process-global counters (shared with every other test in this
-    /// binary), so this asserts presence and cardinality, not a value.
+    /// The counterpart to the test above: a process that can fold renders
+    /// both families exactly once, not omitted and not duplicated. The sample
+    /// values themselves are read from the real process-global counters
+    /// (shared with every other test in this binary), so this asserts
+    /// presence and cardinality, not a value.
     #[test]
-    fn fold_enabled_renders_both_stamp_coverage_families_exactly_once() {
-        let body = render_with_fold_enabled(Mode::All, true);
+    fn a_process_that_can_fold_renders_both_stamp_coverage_families_exactly_once() {
+        let body = render_with_can_fold(Mode::All, true);
         assert_eq!(
             body.matches("ravel_catalog_fold_stamped_records_total{mode=\"all\"} ")
                 .count(),
             1,
-            "an active fold task must render the stamped-records sample exactly once:\n{body}"
+            "a folding process must render the stamped-records sample exactly once:\n{body}"
         );
         assert_eq!(
             body.matches("ravel_catalog_fold_stamped_entries_total{mode=\"all\"} ")
                 .count(),
             1,
-            "an active fold task must render the stamped-entries sample exactly once:\n{body}"
+            "a folding process must render the stamped-entries sample exactly once:\n{body}"
         );
         assert!(
             body.contains("# TYPE ravel_catalog_fold_stamped_records_total counter")
@@ -7095,10 +7096,10 @@ mod tests {
         );
     }
 
-    /// Shared arg list for the two `fold_enabled` tests above: every other
+    /// Shared arg list for the two `can_fold` tests above: every other
     /// source left at its "not built in this mode" `None`/empty value, since
     /// only the fold-coverage pair is under test.
-    fn render_with_fold_enabled(mode: Mode, fold_enabled: bool) -> String {
+    fn render_with_can_fold(mode: Mode, can_fold: bool) -> String {
         render(
             mode,
             &StoreMetricsSnapshot::default(),
@@ -7128,7 +7129,7 @@ mod tests {
             None,
             None,
             MemoryBudgetSnapshot::default(),
-            fold_enabled,
+            can_fold,
         )
     }
 

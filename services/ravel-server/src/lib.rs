@@ -748,6 +748,27 @@ pub struct ServerConfig {
     pub max_ingest_lag: Duration,
 }
 
+impl ServerConfig {
+    /// Whether a catalog fold can run in this process at all, by EITHER route:
+    /// the background fold task ([`fold::spawn`], which [`start`] skips in
+    /// [`Mode::Maintain`] and which returns [`fold::FoldTasks::none`] under
+    /// `--disable-fold`), or the on-demand route
+    /// ([`Mode::mounts_on_demand_fold`], mounted regardless of
+    /// `--disable-fold`).
+    ///
+    /// Gates the `ravel_catalog_fold_stamped_records_total` /
+    /// `ravel_catalog_fold_stamped_entries_total` pair
+    /// ([`metrics::MetricsState::can_fold`]). The totals those families render
+    /// are process-global and both routes add to them, so a gate that followed
+    /// only the background task hid real coverage from an operator who drives
+    /// folds through the route: `--mode all --disable-fold` accumulated
+    /// coverage while rendering no family at all.
+    pub fn folds_in_process(&self) -> bool {
+        let background_task = !matches!(self.mode, Mode::Maintain) && self.fold.enabled;
+        background_task || self.mode.mounts_on_demand_fold()
+    }
+}
+
 /// Default `--shutdown-timeout`: the ceiling on the graceful-shutdown drain.
 /// Kept below [`K8S_DEFAULT_GRACE_PERIOD`] so the process finishes draining and
 /// exits on its own before Kubernetes escalates SIGTERM to SIGKILL, leaving
@@ -2267,12 +2288,13 @@ pub async fn start(
         audit_pipeline: None,
         process_memory_budget: process_memory_budget.clone(),
         process_memory_budget_is_fallback: config.process_memory_budget_is_fallback,
-        // Mirrors the fold-spawn gate below exactly (`Mode::Maintain` never
-        // calls `fold::spawn`, and `fold::spawn` itself returns
-        // `FoldTasks::none()` when `!config.fold.enabled`), computed here
-        // rather than in the renderer so the mode-vs-reality distinction
-        // lives in one place.
-        fold_enabled: !matches!(config.mode, Mode::Maintain) && config.fold.enabled,
+        // Both fold routes, not just the background task: the on-demand route
+        // mounted below runs the same `Catalog::fold` into the same
+        // process-global totals, and it is mounted whatever `--disable-fold`
+        // says. Computed by `ServerConfig::folds_in_process` rather than here
+        // or in the renderer, so the spawn gate below, the route's mount gate
+        // below, and this one read one predicate.
+        can_fold: config.folds_in_process(),
     };
 
     // Held past the HTTP wiring so the Flight SQL service can register
@@ -2569,45 +2591,54 @@ pub async fn start(
         }
 
         // POST /api/v1/admin/fold (issue #785): the on-demand form of the
-        // background fold below, for one tenant and one signal. Mounted in
-        // exactly the modes that run the scheduled fold task and serve a
-        // query surface, sharing the same `Catalog`, the same CLI-derived
-        // retention config, and one `folder_id` per process, so an operator
-        // call and a scheduled tick are the same operation with different
-        // triggers. Authorization is the deployment's tenant resolver, the
-        // same credential the query routes above require.
-        let on_demand_fold_retention = Arc::new(config.maintain.retention.clone());
-        // One coalescing gate for the process, shared by both listeners: a
-        // fold triggered on the mTLS listener and one triggered on
-        // `--listen-http` for the same (tenant, signal) run once, not twice.
-        let on_demand_fold_in_flight = Arc::new(fold_on_demand::FoldInFlight::new());
-        let on_demand_fold_state = fold_on_demand::OnDemandFoldState {
-            catalog: catalog.clone(),
-            // Background class (ADR-0070), matching the scheduled fold below:
-            // an on-demand fold runs the identical LIST/GET/PUT sequence over
-            // the same objects, so it is the same deferred maintenance
-            // traffic and must not share the query hot path's bounds.
-            store: store_background.clone(),
-            tenant_resolver: config.tenant_resolver.clone(),
-            clock: Arc::new(SystemClock),
-            folder_id: on_demand_folder_id,
-            retention: on_demand_fold_retention.clone(),
-            in_flight: on_demand_fold_in_flight.clone(),
-            fold_interval: config.fold.fold_interval,
-        };
-        http_router = http_router.merge(fold_on_demand::router(on_demand_fold_state));
-        if let Some(mtls) = &config.mtls_listener {
-            let mtls_fold_state = fold_on_demand::OnDemandFoldState {
+        // background fold below, for one tenant and one signal. Sharing the
+        // same `Catalog`, the same CLI-derived retention config, and one
+        // `folder_id` per process, so an operator call and a scheduled tick
+        // are the same operation with different triggers. Authorization is
+        // the deployment's tenant resolver, the same credential the query
+        // routes above require.
+        //
+        // The guard is `Mode::mounts_on_demand_fold`, which is what the
+        // metrics gate (`ServerConfig::folds_in_process`) also reads. It is
+        // implied by the enclosing query-surface block, and it is written out
+        // anyway so the predicate is load-bearing here rather than a comment
+        // asserting a coupling: narrow it and the route and the metric gate
+        // move together. `--disable-fold` does NOT gate it -- the route is
+        // how an operator folds a process whose background task is off.
+        if config.mode.mounts_on_demand_fold() {
+            let on_demand_fold_retention = Arc::new(config.maintain.retention.clone());
+            // One coalescing gate for the process, shared by both listeners: a
+            // fold triggered on the mTLS listener and one triggered on
+            // `--listen-http` for the same (tenant, signal) run once, not twice.
+            let on_demand_fold_in_flight = Arc::new(fold_on_demand::FoldInFlight::new());
+            let on_demand_fold_state = fold_on_demand::OnDemandFoldState {
                 catalog: catalog.clone(),
+                // Background class (ADR-0070), matching the scheduled fold below:
+                // an on-demand fold runs the identical LIST/GET/PUT sequence over
+                // the same objects, so it is the same deferred maintenance
+                // traffic and must not share the query hot path's bounds.
                 store: store_background.clone(),
-                tenant_resolver: mtls.resolver.clone(),
+                tenant_resolver: config.tenant_resolver.clone(),
                 clock: Arc::new(SystemClock),
                 folder_id: on_demand_folder_id,
-                retention: on_demand_fold_retention,
-                in_flight: on_demand_fold_in_flight,
+                retention: on_demand_fold_retention.clone(),
+                in_flight: on_demand_fold_in_flight.clone(),
                 fold_interval: config.fold.fold_interval,
             };
-            mtls_router = mtls_router.merge(fold_on_demand::router(mtls_fold_state));
+            http_router = http_router.merge(fold_on_demand::router(on_demand_fold_state));
+            if let Some(mtls) = &config.mtls_listener {
+                let mtls_fold_state = fold_on_demand::OnDemandFoldState {
+                    catalog: catalog.clone(),
+                    store: store_background.clone(),
+                    tenant_resolver: mtls.resolver.clone(),
+                    clock: Arc::new(SystemClock),
+                    folder_id: on_demand_folder_id,
+                    retention: on_demand_fold_retention,
+                    in_flight: on_demand_fold_in_flight,
+                    fold_interval: config.fold.fold_interval,
+                };
+                mtls_router = mtls_router.merge(fold_on_demand::router(mtls_fold_state));
+            }
         }
 
         // GET/POST /api/v1/query_exemplars (ADR-0047 decision 4):
