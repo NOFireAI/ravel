@@ -399,6 +399,56 @@ check "endpoint: a set DR_ENDPOINT is exported unchanged" "0" "$?"
 )
 check "endpoint: a session token reaches the ravel binaries too" "0" "$?"
 
+# --- dr_reset_bucket listing status ----------------------------------------
+
+# The emptiness checks around the recursive delete must read the LISTING's
+# status, not the line counter's. Nesting one inside the other reports the
+# counter, which always exits 0 and prints 0 for empty input, so a listing
+# that failed would read as an empty bucket. The assertion is on ORDER, not
+# only the exit code: a failed listing must stop the pass before any delete
+# command is issued, which is the property that matters when the next step is
+# a recursive delete.
+
+# Runs dr_reset_bucket with the listing failing at the given stage and prints
+# "<exit code>:<delete commands issued>".
+reset_probe() {
+  local fail_stage="$1" state delete_log
+  state="$(mktemp)"
+  delete_log="$(mktemp)"
+  local code=0
+  (
+    DR_LOG_DIR="$(mktemp -d)"
+    dr_bucket_marker_present() { return 0; }
+    dr_write_bucket_marker() { return 0; }
+    # Records every delete the pass issues, so a case can assert none ran.
+    dr_mc() {
+      if [[ "${1:-}" == "rm" ]]; then printf 'rm\n' >>"${delete_log}"; fi
+      return 0
+    }
+    # Each command substitution is its own subshell, so the call count lives
+    # in a file; a variable would reset on every call.
+    dr_list_all_versions() {
+      local nth
+      nth="$(wc -l <"${state}" | tr -d ' ')"
+      printf 'call\n' >>"${state}"
+      if [[ "${fail_stage}" == "before" && "${nth}" -eq 0 ]]; then return 1; fi
+      if [[ "${fail_stage}" == "after" && "${nth}" -ge 1 ]]; then return 1; fi
+      return 0
+    }
+    dr_reset_bucket b 0
+  ) >/dev/null 2>&1 || code=$?
+  printf '%s:%s\n' "${code}" "$(wc -l <"${delete_log}" | tr -d ' ')"
+  rm -f "${state}" "${delete_log}"
+}
+
+# A listing that fails before the delete must refuse AND issue no delete.
+check "reset: a failed listing before the delete refuses and deletes nothing" \
+  "${DR_EX_PRECONDITION}:0" "$(reset_probe before)"
+# A listing that fails after the delete must refuse rather than report the
+# bucket proven empty. One delete has already run by then.
+check "reset: a failed listing after the delete refuses rather than proving empty" \
+  "${DR_EX_PRECONDITION}:1" "$(reset_probe after)"
+
 # --- result ----------------------------------------------------------------
 
 printf '\nlib.test.sh: %s passed, %s failed\n' "${PASSED}" "${FAILED}"
