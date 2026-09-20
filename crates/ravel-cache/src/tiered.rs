@@ -403,6 +403,14 @@ where
     /// view. Without this, ADR-0046 decision 4's "correctness never depends on
     /// cached state" gate would stop covering a disk-served hit read through
     /// this new access path.
+    /// # Blocking
+    ///
+    /// This is synchronous: a RAM miss reads the disk tier on the calling
+    /// thread. `get_or_fetch` runs its disk calls under `spawn_blocking`, this
+    /// path does not, so an async caller parks a runtime worker for the length
+    /// of a file read. `BlockRangeFetcher` calls it per extent from an async
+    /// function today. Call it from `spawn_blocking` in async context until
+    /// that is resolved; issue #1891 tracks it.
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
         // Fast path: a RAM hit is served verbatim (already corrupted, in
         // corruption mode, by `Cache::get`) and never consults disk, exactly
@@ -430,6 +438,12 @@ where
     /// touches no single-flight. `DiskCache::insert` silently declines bytes
     /// whose length disagrees with `key.len`, so a well-formed funnel key
     /// admits to both tiers cleanly.
+    /// # Blocking
+    ///
+    /// Synchronous, like [`TieredCache::get`]: the disk admission runs on the
+    /// calling thread rather than under `spawn_blocking`, so an async caller
+    /// parks a runtime worker for the length of a file write. Issue #1891
+    /// tracks moving this path off the worker.
     pub fn insert(&self, key: CacheKey, value: Bytes) {
         self.ram.insert(key, value.clone());
         self.disk.insert(key, &value);
