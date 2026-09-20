@@ -5025,12 +5025,14 @@ pub struct MetricsState {
     ///
     /// Gates the `ravel_catalog_fold_stamped_records_total` /
     /// `ravel_catalog_fold_stamped_entries_total` pair. Both routes fold
-    /// into the same process-global totals, so both must open the gate.
-    /// Following the mode alone left `--mode all --disable-fold` rendering
-    /// both at a zero that never moves, reading as steady coverage instead
-    /// of the fold never running; following the background task alone left
-    /// the same process rendering no family at all while an operator drove
-    /// real coverage through the route.
+    /// into the same process-global totals, so either one opens the gate and
+    /// only a process with neither omits the pair. Each single-route gate
+    /// gets a different config wrong: following the mode alone leaves
+    /// `--mode gateway --disable-fold`, which can fold by neither route,
+    /// rendering both at a zero that never moves, reading as steady coverage
+    /// instead of no fold at all; following the background task alone leaves
+    /// `--mode all --disable-fold` rendering no family while an operator
+    /// drives real coverage through the route it still mounts.
     pub can_fold: bool,
 }
 

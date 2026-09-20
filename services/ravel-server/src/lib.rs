@@ -2304,8 +2304,9 @@ pub async fn start(
         // mounted below runs the same `Catalog::fold` into the same
         // process-global totals, and it is mounted whatever `--disable-fold`
         // says. Computed by `ServerConfig::folds_in_process` rather than here
-        // or in the renderer, so the spawn gate below, the route's mount gate
-        // below, and this one read one predicate.
+        // or in the renderer, and built from the same two facts the gates
+        // below read: `fold.enabled` plus the mode for the spawn gate, and
+        // `Mode::mounts_on_demand_fold` for the route's mount gate.
         can_fold: config.folds_in_process(),
     };
 
