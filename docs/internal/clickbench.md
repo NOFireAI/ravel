@@ -217,10 +217,15 @@ before the failure, then any submitted after it whose own write landed anyway
 outcome instead of guessing). The list neither omits a batch that committed nor
 names one that did not.
 
-That is a statement about the report, not a resume mechanism. The loader has no
-resume mode: re-running re-ingests the whole file and there is no dedup, so a
-re-run duplicates every row the failed attempt did commit. The list tells an
-operator which rows are already durable; acting on it is their decision.
+That is a statement about the report, not a resume mechanism. Re-running from
+the start re-ingests the whole file and there is no dedup, so it duplicates
+every row the failed attempt did commit. `--skip-rows` is the positional resume,
+and it only means anything for a load that was started with `--read-cursors 1
+--pipeline-depth 1`; at the settings this runbook otherwise recommends, the
+rows that landed are not a contiguous prefix and no single offset describes
+them. A failed load prints the figures and says which case it is. See the
+`--skip-rows` section of docs/guides/ingest.md before resuming a ClickBench
+load.
 
 `--decode-queue-batches` is the decode/encode overlap lever (issue #680). A
 bounded channel sits between the Parquet reader plus `build_columnar_batch`

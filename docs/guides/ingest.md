@@ -817,6 +817,14 @@ ravel-cli load --parquet hits.parquet --tenant acme --mapping hits.toml \
   --read-cursors 1 --pipeline-depth 1 --skip-rows 4200000
 ```
 
+Even at those two settings the offset is a floor, not an exact boundary. One
+batch spans every shard its rows hash to, and the batch that failed can have
+committed on some of those shards and not others. Those rows are in the
+printed durable token list and are not counted in `rows_written`, so a resume
+at `rows_skipped + rows_written` re-ingests them. The error is one-sided by
+construction: the offset never skips a row that landed, it can only repeat
+one, and a duplicate is visible in the data where a gap is not.
+
 At the default settings, treat `--skip-rows` as a deliberate positional tool
 instead: splitting one file across several runs at offsets **you** chose (rows
 `0..10000000` in one run, `--skip-rows 10000000` in the next), where the
