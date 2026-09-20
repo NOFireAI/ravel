@@ -259,9 +259,10 @@ default of `4` raises the in-flight batches 4x, which takes that anchor's live
 working set from 3 to 6 batches, roughly `2x` on the same geometry. That is the
 memory the default spends.
 
-The loader prints a completion summary to stdout — `rows processed`,
-`objects written`, `elapsed` (the load wall-time ClickBench reports), and a
-`flush triggers` breakdown. It also
+The loader prints a completion summary to stdout — `rows_written`
+(`rows processed` before the resume work), `rows_skipped`, `objects written`,
+`elapsed` (the load wall-time ClickBench reports), and a `flush triggers`
+breakdown. It also
 prints a stderr warning if any object crossed, or came within 90% of, the
 per-object dynamic-column budget of 1000.
 
