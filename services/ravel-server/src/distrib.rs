@@ -3402,6 +3402,151 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
+    /// A worker clamps the wire budget to its own `EngineConfig` on the resolve
+    /// path: the wire sends `max_bytes_scanned: 0`, the "no cap" sentinel, and
+    /// the worker still refuses at its own 1-byte limit. The refusal is the
+    /// same typed `TooManyBytesScanned` string the local path renders, and the
+    /// summary carries the bytes actually spent so the coordinator folds the
+    /// real cost.
+    ///
+    /// Flip-line proof: in `slice_byte_limit` return `ByteLimit::Unlimited`
+    /// instead of `worker` for the `Some(0) | None` arm and the status is `Ok`,
+    /// not `BudgetExceeded`.
+    #[tokio::test]
+    async fn resolve_scope_clamps_wire_budget_to_local_engine_config() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("budget-tenant".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+
+        let service = federation_service(store, &[("operator-cred", "budget-tenant")], 4 * HOUR_NS)
+            .with_engine_config(ravel_query::EngineConfig {
+                max_bytes_scanned: ravel_query::ByteLimit::Bounded(1),
+                ..ravel_query::EngineConfig::default()
+            });
+
+        // The wire carries the unbounded sentinel on every cap.
+        let mut request = resolve_request(tenant.hash(), 4 * HOUR_NS);
+        request.budgets = Some(pb::Budgets {
+            max_series: 0,
+            max_samples: 0,
+            max_bytes_scanned: 0,
+            max_segments: 0,
+        });
+
+        let response = fetch_decoded(&service, request, "operator-cred")
+            .await
+            .expect("valid tenant credential is accepted");
+
+        assert_eq!(
+            response.status,
+            pb::status::Code::BudgetExceeded,
+            "the worker's own 1-byte limit refuses the slice even though the wire \
+             budget is the unbounded sentinel (got {:?}: {})",
+            response.status,
+            response.status_message
+        );
+        let spent = response.accounting.total_s3_bytes();
+        assert!(
+            spent > 1,
+            "the refusal must report the bytes actually scanned, got {spent}"
+        );
+        assert_eq!(
+            response.status_message,
+            format!("query scanned {spent} bytes, exceeding the budget of 1"),
+            "the worker renders the same typed TooManyBytesScanned string the \
+             local path does, against its OWN limit"
+        );
+        assert_eq!(response.series_returned, 0);
+    }
+
+    /// The same clamp covers the count caps on the resolve path: the worker
+    /// enforces its own `EngineConfig::max_series` over what the slice is about
+    /// to return, with the wire budget unset entirely. One published series
+    /// against a zero-series worker limit refuses with the local path's typed
+    /// `TooManySeries` string.
+    ///
+    /// Flip-line proof: delete the `resolve_scope_count_refusal` call in
+    /// `run_slice_metrics` and the status is `Ok` with one series returned.
+    #[tokio::test]
+    async fn resolve_scope_enforces_local_series_cap() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("series-cap-tenant".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+
+        let service = federation_service(
+            store,
+            &[("operator-cred", "series-cap-tenant")],
+            4 * HOUR_NS,
+        )
+        .with_engine_config(ravel_query::EngineConfig {
+            max_series: 0,
+            ..ravel_query::EngineConfig::default()
+        });
+
+        // `budgets` is None here: the worker's own config is the only cap.
+        let response = fetch_decoded(
+            &service,
+            resolve_request(tenant.hash(), 4 * HOUR_NS),
+            "operator-cred",
+        )
+        .await
+        .expect("valid tenant credential is accepted");
+
+        assert_eq!(
+            response.status,
+            pb::status::Code::BudgetExceeded,
+            "the worker's own max_series refuses the slice (got {:?}: {})",
+            response.status,
+            response.status_message
+        );
+        assert_eq!(
+            response.status_message, "query matched 1 series, exceeding the limit of 0",
+            "the exact series count and the worker's own limit are both reported"
+        );
+        assert_eq!(response.series_returned, 0);
+    }
+
+    /// The count enforcement is scoped to the resolve path only. An
+    /// intra-cluster pinned slice is one shard-major piece of a query whose
+    /// counts the coordinator folds and re-checks, so the same zero-series
+    /// worker limit must NOT refuse it: enforcing per-slice there would fail a
+    /// query that is under its own total.
+    ///
+    /// Flip-line proof: drop the `if !self.resolve_scope { return None; }` guard
+    /// at the top of `resolve_scope_count_refusal` and this pinned slice returns
+    /// `BudgetExceeded` instead of its one series.
+    #[tokio::test]
+    async fn pinned_scope_does_not_enforce_the_local_series_cap() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("pinned-cap-tenant".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&store, tenant.hash(), now).await;
+
+        let service = pinned_service(store, now).with_engine_config(ravel_query::EngineConfig {
+            max_series: 0,
+            ..ravel_query::EngineConfig::default()
+        });
+        let envelope = TimeRange {
+            start_ns: seg.min_event_ts_ns,
+            end_ns: seg.max_event_ts_ns,
+        };
+        let response = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, envelope))
+            .await
+            .expect("local run");
+
+        assert_eq!(
+            response.status,
+            pb::status::Code::Ok,
+            "a pinned slice is not a whole query: its counts fold at the \
+             coordinator (got {:?}: {})",
+            response.status,
+            response.status_message
+        );
+        assert_eq!(response.series_returned, 1);
+    }
+
     // --- Windowed fragment resolve ------------------------------------------
 
     /// A `FragmentService` over `store` on the intra-cluster pinned path: a

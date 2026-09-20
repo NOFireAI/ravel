@@ -951,7 +951,7 @@ impl<R: SegmentResolver + 'static> SeriesFetch for SeriesFetchService<R> {
 /// Since #1725 a coordinator sends the query's whole `max_bytes_scanned` to
 /// every slice rather than a `1/slice_count` share of it, which is why this
 /// clamp is the worker's only protection against an oversized budget.
-fn slice_byte_limit(budgets: Option<&pb::Budgets>, worker: ByteLimit) -> ByteLimit {
+pub(super) fn slice_byte_limit(budgets: Option<&pb::Budgets>, worker: ByteLimit) -> ByteLimit {
     let wire = match budgets.map(|b| b.max_bytes_scanned) {
         Some(0) | None => return worker,
         Some(max) => max,
