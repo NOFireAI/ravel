@@ -5624,6 +5624,10 @@ mod tests {
                 "cache",
                 "tier",
                 "kind",
+                // DeletedObjectKind (issue #1729) reuses the `kind` key, so the
+                // allowlist of distinct keys is unchanged; two variants map to
+                // it.
+                "kind",
                 "outcome",
                 "allocator",
                 "stat",
@@ -7778,8 +7782,9 @@ mod tests {
             ("superseded_data_deleted", 12),
             ("unreferenced_parts_deleted", 13),
         ] {
-            let sample =
-                format!("ravel_maintain_objects_deleted_total{{mode=\"maintain\",kind=\"{kind}\"}} {value}");
+            let sample = format!(
+                "ravel_maintain_objects_deleted_total{{mode=\"maintain\",kind=\"{kind}\"}} {value}"
+            );
             assert!(
                 body.contains(&sample),
                 "missing objects_deleted_total sample {sample}:\n{body}"

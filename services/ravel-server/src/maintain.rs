@@ -303,7 +303,8 @@ impl MaintenanceSafetyMetrics {
     /// `ravel_maintain_objects_deleted_total{kind="quarantine_reaped"}`
     /// (issue #1729), the other is the pre-existing `signal`-labeled one.
     pub fn objects_deleted_quarantine_reaped(&self) -> u64 {
-        self.objects_deleted_quarantine_reaped.load(Ordering::Relaxed)
+        self.objects_deleted_quarantine_reaped
+            .load(Ordering::Relaxed)
     }
 
     /// Superseded L0 commit records rule 2 physically deleted, summed over
@@ -394,16 +395,12 @@ impl MaintenanceSafetyMetrics {
         // guard against.
         self.objects_deleted_quarantine_reaped
             .fetch_add(report.quarantine_reaped as u64, Ordering::Relaxed);
-        self.objects_deleted_superseded_records_deleted.fetch_add(
-            report.superseded_records_deleted as u64,
-            Ordering::Relaxed,
-        );
+        self.objects_deleted_superseded_records_deleted
+            .fetch_add(report.superseded_records_deleted as u64, Ordering::Relaxed);
         self.objects_deleted_superseded_data_deleted
             .fetch_add(report.superseded_data_deleted as u64, Ordering::Relaxed);
-        self.objects_deleted_unreferenced_parts_deleted.fetch_add(
-            report.unreferenced_parts_deleted as u64,
-            Ordering::Relaxed,
-        );
+        self.objects_deleted_unreferenced_parts_deleted
+            .fetch_add(report.unreferenced_parts_deleted as u64, Ordering::Relaxed);
     }
 
     /// One [`scan_and_maintain_with_memo`] result for `signal`, feeding the
