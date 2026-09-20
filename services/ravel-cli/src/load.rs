@@ -322,9 +322,11 @@ pub fn parse_mapping(text: &str) -> Result<Mapping, LoadError> {
 /// HTTP layer and is bypassed by construction on this path (ADR-0089).
 pub const ADMISSION_BYPASS_WARNING: &str = "warning: bulk load writes directly to the log ingest router. The per-tenant \
      AdmissionController (active-stream cap, stream-creation rate, byte rate) that guards the \
-     HTTP ingest path is NOT applied to loaded data. There is no resumability or deduplication: \
-     re-running after a failure re-ingests the whole file from the start. Retention is measured \
-     from load time, not from the records' event times.";
+     HTTP ingest path is NOT applied to loaded data. There is no deduplication: re-running after \
+     a failure re-ingests every row it is given. --skip-rows can resume a failed load \
+     positionally, but only one started with --read-cursors 1 --pipeline-depth 1 (see \
+     docs/guides/ingest.md). Retention is measured from load time, not from the records' event \
+     times.";
 
 /// Near-cap warning threshold: the loader warns when the widest single object's
 /// `dynamic_columns_used` reaches this fraction of `max_dynamic_columns`,
@@ -593,6 +595,13 @@ pub(crate) async fn run_warning_to(
         }
         Err(err) => {
             print_durable_tokens(&err);
+            // The report that held these figures is dropped with the error, and
+            // they are the only thing an operator can act on to resume: print
+            // them beside the error, with the settings precondition that says
+            // whether they are an offset at all.
+            if let Some(hint) = resume_hint(&err, read_cursors, pipeline_depth) {
+                let _ = writeln!(warnings, "{hint}");
+            }
             Err(anyhow::Error::new(err))
         }
     }
@@ -607,7 +616,6 @@ fn print_summary(report: &LoadReport) {
         report.rows_processed as f64
     };
     println!("bulk load complete");
-    println!("  rows processed   : {}", report.rows_processed);
     println!("  rows_skipped     : {}", report.rows_skipped);
     println!("  rows_written     : {}", report.rows_processed);
     println!("  rows/sec         : {rows_per_sec:.0}");
@@ -719,13 +727,72 @@ fn print_durable_tokens(err: &LoadError) {
         ""
     };
     println!(
-        "{} commit token(s)/segment(s) were durable before the failure (a partial load; \
-         re-running re-ingests the whole file, there is no dedup){suffix}:",
+        "{} commit token(s)/segment(s) were durable before the failure (a partial load, not a \
+         rollback; --skip-rows can resume it instead of re-ingesting the whole file, but only \
+         when this run used --read-cursors 1 --pipeline-depth 1 -- see the resume figures printed \
+         with the error. There is still no deduplication: nothing checks the offset a re-run is \
+         given){suffix}:",
         tokens.len()
     );
     for token in tokens {
         println!("  {}", token.encode());
     }
+}
+
+/// The failure-path resume block: the two figures [`ResumeFigures`] carries out
+/// of the dropped [`LoadReport`], the offset they add up to, and whether this
+/// run's settings make that offset mean anything.
+///
+/// The precondition is the whole content of the message. `--skip-rows` drops a
+/// file-absolute prefix exactly, at any cursor count, but the rows a FAILED run
+/// landed are a contiguous prefix of the file only under `--read-cursors 1
+/// --pipeline-depth 1`: K cursors read K far-apart partitions concurrently, and
+/// above depth 1 a batch submitted after the failing one can still commit, so
+/// the landed set has holes and `rows_skipped + rows_written` names a position
+/// no boundary sits at. Printing the figures without that sentence is what
+/// turns them into an offset an operator would paste into a resume that both
+/// duplicates and loses rows.
+///
+/// `None` for [`LoadError::Setup`]: it fails before the offset is applied or
+/// anything is written, so the previous run's own figures still stand.
+fn resume_hint(
+    err: &LoadError,
+    read_cursors: Option<usize>,
+    pipeline_depth: usize,
+) -> Option<String> {
+    let resume = err.resume_figures()?;
+    let sequential = read_cursors == Some(1) && pipeline_depth == 1;
+    let verdict = if sequential {
+        "this run used --read-cursors 1 --pipeline-depth 1, so the rows that landed are a \
+         contiguous prefix of the file and this offset resumes exactly where it stopped"
+            .to_string()
+    } else {
+        let cursors = match read_cursors {
+            Some(k) => format!("--read-cursors {k}"),
+            None => {
+                "--read-cursors unset (sized automatically to min(shards, row groups))".to_string()
+            }
+        };
+        format!(
+            "this run used {cursors} and --pipeline-depth {pipeline_depth}, so the rows that \
+             landed are NOT a contiguous prefix of the file: the cursors read far-apart \
+             partitions concurrently, and a batch submitted after the failing one can still have \
+             committed. Resuming at this offset would both re-ingest committed rows and skip rows \
+             that never landed. Only a load started with --read-cursors 1 --pipeline-depth 1 is \
+             resumable this way"
+        )
+    };
+    Some(format!(
+        "resume figures for this failed load:\n  \
+         rows_skipped     : {skipped}\n  \
+         rows_written     : {written}\n  \
+         next --skip-rows : {next} (rows_skipped + rows_written)\n\
+         {verdict}. There is no deduplication and no per-file idempotency marker, so nothing \
+         checks the offset a re-run is given; see docs/guides/ingest.md for the procedure.",
+        skipped = resume.rows_skipped,
+        written = resume.rows_written,
+        next = resume.next_skip_rows(),
+    ))
 }
 
 /// Result of a successful (or partially-durable) load, for the summary output.
@@ -735,9 +802,10 @@ pub struct LoadReport {
     /// `--skip-rows` (issue #1713): count of leading file rows dropped before
     /// mapping, by FILE-absolute position. `min(skip_rows, total file rows)`,
     /// computed once from Parquet footer metadata before decode starts. This
-    /// is a positional resume with no idempotency marker: nothing here
-    /// detects a wrong offset, and a re-run must pass the exact value the
-    /// prior attempt's summary reported.
+    /// is a positional offset with no idempotency marker: nothing here detects
+    /// a wrong value. `rows_skipped + rows_written` is the next run's offset
+    /// only when this run used one read cursor and a pipeline depth of 1; see
+    /// [`ResumeFigures`].
     pub rows_skipped: u64,
     /// One token per shard acked, across every batch, in submission order. At
     /// the default `--target-bytes 1` that is one token per object written; at
@@ -882,10 +950,51 @@ pub struct FlushMixReport {
     pub totals: FlushMixCounts,
 }
 
+/// The two figures a failed run has to hand back for `--skip-rows` to be
+/// usable: the offset that run started from and the rows it acked durable
+/// before it failed. Their sum is the next run's `--skip-rows` value, but only
+/// under `--read-cursors 1 --pipeline-depth 1`, where the acked rows are a
+/// contiguous prefix of the file. With K cursors the loader reads K far-apart
+/// partitions concurrently, and at a depth above 1 a batch submitted after the
+/// failing one can still commit, so what landed has holes and no single offset
+/// describes it. See [`resume_hint`], which is what states that to the
+/// operator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumeFigures {
+    /// `--skip-rows` as the failed run applied it (capped at the file's total
+    /// row count), i.e. [`LoadReport::rows_skipped`].
+    pub rows_skipped: u64,
+    /// Rows from writes that acked durable, in submission order, before the
+    /// failure, i.e. [`LoadReport::rows_processed`] at that moment. It does
+    /// not count rows a later in-flight write committed after the failure
+    /// ([`harvest_after_failure`] recovers those as tokens, not as rows),
+    /// which is one of the reasons the sum below is not an offset at a depth
+    /// above 1.
+    pub rows_written: u64,
+}
+
+impl ResumeFigures {
+    fn from_report(report: &LoadReport) -> Self {
+        ResumeFigures {
+            rows_skipped: report.rows_skipped,
+            rows_written: report.rows_processed,
+        }
+    }
+
+    /// The `--skip-rows` value a resume would use. Valid only under the two
+    /// settings named on this type.
+    pub fn next_skip_rows(&self) -> u64 {
+        self.rows_skipped + self.rows_written
+    }
+}
+
 /// A load failure. Every variant that can occur after some data is already
 /// durable carries the durable commit tokens, so the caller reports the
 /// genuine partial load rather than swallowing it into a generic error
-/// (ADR-0089: a failed flush is a partial load, not a rollback).
+/// (ADR-0089: a failed flush is a partial load, not a rollback). Those same
+/// variants carry [`ResumeFigures`], because the report holding them is
+/// dropped on this path and the operator needs them to decide the next run's
+/// `--skip-rows`.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     /// Setup failed before any record was written (mapping, provisioning, file
@@ -904,6 +1013,7 @@ pub enum LoadError {
     BatchFailed {
         reason: String,
         durable: Vec<CommitToken>,
+        resume: ResumeFigures,
     },
     /// A row failed a kept admission check (future skew, length cap, or the
     /// loader per-record attribute cap). Fail-fast: the run stops at the first
@@ -913,6 +1023,7 @@ pub enum LoadError {
         row: u64,
         reason: String,
         durable: Vec<CommitToken>,
+        resume: ResumeFigures,
     },
     /// A flush (object-store PUT) failed. The tokens are what was durable from
     /// *earlier* batches, plus any shard of the failing batch itself that acked
@@ -930,6 +1041,7 @@ pub enum LoadError {
     Flush {
         durable: Vec<CommitToken>,
         cause: String,
+        resume: ResumeFigures,
     },
 }
 
@@ -943,6 +1055,18 @@ impl LoadError {
             LoadError::BatchFailed { durable, .. }
             | LoadError::RowRejected { durable, .. }
             | LoadError::Flush { durable, .. } => durable,
+        }
+    }
+
+    /// The rows skipped and the rows acked durable when this error occurred.
+    /// `None` for [`LoadError::Setup`], which occurs before the load applies an
+    /// offset or writes anything, so it has no figures to resume from.
+    pub fn resume_figures(&self) -> Option<ResumeFigures> {
+        match self {
+            LoadError::Setup(_) => None,
+            LoadError::BatchFailed { resume, .. }
+            | LoadError::RowRejected { resume, .. }
+            | LoadError::Flush { resume, .. } => Some(*resume),
         }
     }
 
@@ -986,9 +1110,11 @@ impl LoadError {
 /// shard of the failing batch that acked durable before a sibling shard failed
 /// (recovered from the router error, issue #296), plus whatever any batch
 /// submitted after the failing one had already committed by the time its write
-/// resolved ([`harvest_after_failure`], issue #800) — a partial load, re-running
-/// re-ingests the whole file, there is no resumability or dedup in this
-/// version. On a [`LoadError::Flush`], the reported tokens are exact for a
+/// resolved ([`harvest_after_failure`], issue #800) — a partial load, not a
+/// rollback. Nothing deduplicates a re-ingest; the CLI's `--skip-rows` can
+/// resume such a load positionally, but only when it ran with one read cursor
+/// and a pipeline depth of 1, which is what makes the landed rows a contiguous
+/// prefix of the file ([`ResumeFigures`]). On a [`LoadError::Flush`], the reported tokens are exact for a
 /// partial flush where a sibling committed; they can still undercount only when
 /// the failing batch's ack round did not resolve (a timeout, or a shard dying
 /// at send time), where a commit can land with no observable ack (see the
@@ -1343,6 +1469,7 @@ async fn load_instrumented(
                 return Err(LoadError::BatchFailed {
                     reason,
                     durable: report.tokens.clone(),
+                    resume: ResumeFigures::from_report(&report),
                 });
             }
             Some(Prefetched::RowRejected { row, reason }) => {
@@ -1358,6 +1485,7 @@ async fn load_instrumented(
                     row,
                     reason,
                     durable: report.tokens.clone(),
+                    resume: ResumeFigures::from_report(&report),
                 });
             }
             Some(Prefetched::Batch(built)) => built,
@@ -1466,6 +1594,7 @@ async fn load_instrumented(
         return Err(LoadError::BatchFailed {
             reason,
             durable: report.tokens.clone(),
+            resume: ResumeFigures::from_report(&report),
         });
     }
 
@@ -1634,12 +1763,14 @@ async fn resolve_write_entry(
             return Err(LoadError::Flush {
                 durable,
                 cause: e.to_string(),
+                resume: ResumeFigures::from_report(report),
             });
         }
         Err(join_err) => {
             return Err(LoadError::Flush {
                 durable: report.tokens.clone(),
                 cause: format!("write task failed: {join_err}"),
+                resume: ResumeFigures::from_report(report),
             });
         }
     };
@@ -1833,11 +1964,11 @@ struct StrideCursors {
     deal_offset: usize,
     /// `--skip-rows`: the count of leading rows, by FILE-absolute position, to
     /// drop before mapping (issue #1713). Applied in [`collect_spans`] against
-    /// each span's own `file_base`, so it is correct regardless of how many
-    /// stride cursors are dealing rows or in what order they hand them out.
-    /// This is a positional resume with no idempotency marker: a re-run must
-    /// pass the exact offset the previous attempt's summary reported, and
-    /// nothing here can detect a wrong guess.
+    /// each span's own `file_base`, so the dropped rows are exactly the file's
+    /// first `skip_rows` rows regardless of how many stride cursors are dealing
+    /// rows or in what order they hand them out. That the DROP is cursor-count
+    /// independent does not make a resume so: what a failed run LANDED is a
+    /// prefix only at one cursor and depth 1 ([`ResumeFigures`]).
     skip_rows: u64,
 }
 
@@ -3922,6 +4053,7 @@ type = "i64"
         let err = LoadError::BatchFailed {
             reason: "failed to read Parquet batch: corrupt page".into(),
             durable: durable.clone(),
+            resume: ResumeFigures::default(),
         };
         assert_eq!(err.durable_tokens(), durable.as_slice());
         assert_ne!(
@@ -5212,7 +5344,7 @@ type = "i64"
         .expect_err("one shard's flush was abandoned, so the load fails");
 
         let durable = match &err {
-            LoadError::Flush { durable, cause } => {
+            LoadError::Flush { durable, cause, .. } => {
                 assert!(
                     cause.contains("flush abandoned"),
                     "the flush failure classifies as the underlying abandonment: {cause}"
@@ -9232,12 +9364,68 @@ type = "i64"
             (dir, pq, m, b)
         }
 
-        #[allow(clippy::too_many_arguments)]
+        /// The same fixture written as `rows / group_rows` row groups, so a load
+        /// over it can open one stride cursor per row group. Row identity is the
+        /// same `idx` attribute, so the landed set is still checkable against
+        /// file-absolute positions.
+        fn skip_rows_row_group_fixture(
+            rows: i64,
+            group_rows: usize,
+        ) -> (tempfile::TempDir, std::path::PathBuf, Mapping, RecordBatch) {
+            use parquet::arrow::ArrowWriter;
+            use parquet::file::properties::WriterProperties;
+
+            let mut m = base_mapping();
+            m.attributes = vec![attr("idx", "idx", ColType::I64)];
+            let b = batch(vec![
+                ("ts", i64_col(vec![NOW_NS; rows as usize])),
+                ("idx", i64_col((0..rows).collect())),
+            ]);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("skip_groups.parquet");
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(group_rows))
+                .build();
+            let mut w = ArrowWriter::try_new(file, b.schema(), Some(props)).expect("arrow writer");
+            w.write(&b).expect("write batch");
+            w.close().expect("close writer");
+            (dir, pq, m, b)
+        }
+
+        /// The `idx`-attributed records for `rows` of `full`, in the form
+        /// [`decoded_records`] returns, so a landed set can be compared by
+        /// identity rather than by count.
+        fn expected_records(
+            full: &RecordBatch,
+            m: &Mapping,
+            rows: std::ops::Range<usize>,
+        ) -> Vec<String> {
+            let mut expected: Vec<String> = row_records(&full.slice(rows.start, rows.len()), m)
+                .iter()
+                .map(|r| format!("{:?}", to_logrecord(r)))
+                .collect();
+            expected.sort();
+            expected
+        }
+
         async fn run_skip_rows(
             store: Arc<dyn ObjectStoreBackend>,
             pq: &Path,
             m: &Mapping,
             skip_rows: u64,
+        ) -> LoadReport {
+            run_skip_rows_with(store, pq, m, skip_rows, 10, Some(1)).await
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn run_skip_rows_with(
+            store: Arc<dyn ObjectStoreBackend>,
+            pq: &Path,
+            m: &Mapping,
+            skip_rows: u64,
+            batch_rows: usize,
+            read_cursors: Option<usize>,
         ) -> LoadReport {
             load_instrumented(
                 store,
@@ -9245,9 +9433,9 @@ type = "i64"
                 "acme",
                 m,
                 1,
-                10,
+                batch_rows,
                 skip_rows,
-                Some(1),
+                read_cursors,
                 1,
                 DEFAULT_MAX_INFLIGHT_FLUSHES,
                 DEFAULT_DECODE_QUEUE_BATCHES,
@@ -9292,15 +9480,9 @@ type = "i64"
                 "skip_rows=7 against a 10-row file must land exactly 3 rows"
             );
 
-            let mut expected: Vec<String> = row_records(&full.slice(7, 3), &m)
-                .iter()
-                .map(|r| format!("{:?}", to_logrecord(r)))
-                .collect();
-            expected.sort();
-
             assert_eq!(
                 decoded_records(store.as_ref()).await,
-                expected,
+                expected_records(&full, &m, 7..10),
                 "the landed records must be exactly file rows 7..10, not merely 3 of them"
             );
         }
@@ -9327,6 +9509,185 @@ type = "i64"
             assert!(
                 decoded_records(store.as_ref()).await.is_empty(),
                 "no RLOG object holds any record when every row is skipped"
+            );
+        }
+
+        /// The drop `--skip-rows` performs is FILE-absolute, not per-cursor:
+        /// over a 12-row file in 4 row groups read by 4 stride cursors,
+        /// `skip_rows=5` lands exactly file rows 5..12 -- the same set a single
+        /// sequential cursor would land -- even though the cursor whose
+        /// partition straddles the offset (rows 3..6) is not the one the offset
+        /// counted through. The row-group count is asserted first: with one row
+        /// group `resolve_read_cursors` clamps the requested 4 cursors to 1 and
+        /// the test would prove nothing about cursor count.
+        ///
+        /// This is the flag's own positional guarantee. It is NOT the resume
+        /// guarantee: what a FAILED multi-cursor run left behind is a different
+        /// question, pinned by
+        /// `a_failed_load_prints_the_resume_figures_and_the_settings_precondition`.
+        ///
+        /// Non-vacuity (prove-the-test), both demonstrated failing:
+        /// drop the `*file_base +` term from `collect_spans`'s `end` (the skip
+        /// read per-span instead of file-absolute, which is what a per-cursor
+        /// offset would be) and every one-row span is dropped: `and must land
+        /// exactly the remaining 7 rows ... left: 0, right: 7`. Asserting
+        /// `4..11` instead of `5..12` keeps the count at 7 and still fails, on
+        /// `idx` 4 against 11, so the landed-set assertion is pinned by row
+        /// identity and not by how many rows arrived.
+        #[tokio::test]
+        async fn skip_rows_is_file_absolute_across_multiple_cursors_and_row_groups() {
+            let (_dir, pq, m, full) = skip_rows_row_group_fixture(12, 3);
+            let metadata = read_input_metadata(&FileInput { path: &pq }).expect("read metadata");
+            let groups = row_group_row_counts(&metadata).len();
+            assert_eq!(
+                groups, 4,
+                "the fixture must hold 4 row groups, or the 4 requested cursors clamp to the row \
+                 group count and the load is single-cursor after all"
+            );
+            assert_eq!(
+                resolve_read_cursors(Some(4), 1, groups),
+                4,
+                "and the load must therefore open 4 stride cursors, one per row group"
+            );
+
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            // 4 rows per batch over 4 live cursors: each batch takes one row
+            // from each partition, so every batch spans the whole file and the
+            // offset is crossed by a cursor that is not reading from row 0.
+            let report = run_skip_rows_with(Arc::clone(&store), &pq, &m, 5, 4, Some(4)).await;
+
+            assert_eq!(
+                report.rows_skipped, 5,
+                "skip_rows=5 against a 12-row file must report exactly 5 skipped, whatever the \
+                 cursor count"
+            );
+            assert_eq!(
+                report.rows_processed, 7,
+                "and must land exactly the remaining 7 rows"
+            );
+            assert_eq!(
+                decoded_records(store.as_ref()).await,
+                expected_records(&full, &m, 5..12),
+                "the landed records must be exactly file rows 5..12: the cursor holding rows 3..6 \
+                 keeps only row 5, and the cursors at rows 6..12 keep everything"
+            );
+        }
+
+        /// A load that fails mid-file prints the two figures a resume needs
+        /// (`rows_skipped` and `rows_written`), their sum as the next
+        /// `--skip-rows`, and whether this run's settings make that sum mean
+        /// anything -- end to end through [`run_warning_to`], the CLI's own
+        /// entry point, so the mapping file, the error path and the output
+        /// stream are the operator's.
+        ///
+        /// The run is `--read-cursors 1 --pipeline-depth 1` so the failure point
+        /// is deterministic: batches are submitted and resolved one at a time,
+        /// the first batch (file rows 2, 3) commits, and the scripted fault
+        /// fails the second batch's data-object PUT. The same error is then
+        /// asked for the multi-cursor verdict, which is the case the figures
+        /// must NOT be pasted into a resume.
+        ///
+        /// Non-vacuity (prove-the-test), both demonstrated failing: delete the
+        /// `resume_hint` emit block in `run_warning_to` and the first
+        /// assertion fails against a stream carrying only the admission-bypass
+        /// warning; force `sequential` in `resume_hint` to `true` (one verdict
+        /// for every geometry) and the multi-cursor assertion fails against the
+        /// prefix verdict.
+        #[tokio::test]
+        async fn a_failed_load_prints_the_resume_figures_and_the_settings_precondition() {
+            use ravel_object_store::fault::{
+                FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+            };
+
+            let (dir, pq, _m, _full) = skip_rows_fixture(6);
+            let mapping_path = dir.path().join("mapping.toml");
+            std::fs::write(
+                &mapping_path,
+                "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+                 [[attribute]]\nkey = \"idx\"\ncolumn = \"idx\"\ntype = \"i64\"\n",
+            )
+            .expect("write mapping");
+
+            // The second data-object PUT into shard 0 fails permanently, so the
+            // first batch is durable and the second is not.
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Put,
+                    ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+                )
+                .with_key_contains("/l0/0000/")
+                .with_occurrence(Occurrence::Nth(2)),
+            );
+            let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+
+            let mut sink: Vec<u8> = Vec::new();
+            let err = run_warning_to(
+                store.clone() as Arc<dyn ObjectStoreBackend>,
+                &pq,
+                "acme",
+                &mapping_path,
+                1,
+                2,
+                2,
+                Some(1),
+                1,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                DEFAULT_TARGET_BYTES,
+                None,
+                NOW_NS,
+                &mut sink,
+            )
+            .await
+            .expect_err("the second batch's PUT fails permanently, so the load fails");
+            assert_eq!(
+                store.fault_count(Op::Put, FaultKind::Permanent),
+                1,
+                "the scripted fault must have fired, or the failure under test never happened"
+            );
+
+            let emitted = String::from_utf8(sink).expect("warnings are utf-8");
+            assert!(
+                emitted.contains("rows_skipped     : 2"),
+                "the offset this run started from reaches the operator: {emitted}"
+            );
+            assert!(
+                emitted.contains("rows_written     : 2"),
+                "so do the rows it acked durable before failing: {emitted}"
+            );
+            assert!(
+                emitted.contains("next --skip-rows : 4 (rows_skipped + rows_written)"),
+                "and the sum, named as the flag it goes into: {emitted}"
+            );
+            assert!(
+                emitted.contains(
+                    "this run used --read-cursors 1 --pipeline-depth 1, so the rows that landed \
+                     are a contiguous prefix of the file"
+                ),
+                "with the settings precondition stated as met for this run: {emitted}"
+            );
+
+            let load_err = err
+                .downcast::<LoadError>()
+                .expect("the CLI error wraps the typed load error");
+            assert_eq!(
+                load_err.resume_figures(),
+                Some(ResumeFigures {
+                    rows_skipped: 2,
+                    rows_written: 2,
+                }),
+                "the figures are carried on the error itself, not only printed"
+            );
+
+            // The same failure under the default geometry: the figures are the
+            // same numbers and are NOT an offset.
+            let multi = resume_hint(&load_err, Some(4), 4).expect("a non-setup error has figures");
+            assert!(
+                multi.contains("next --skip-rows : 4 (rows_skipped + rows_written)")
+                    && multi.contains("NOT a contiguous prefix of the file")
+                    && multi.contains("--read-cursors 4 and --pipeline-depth 4"),
+                "a multi-cursor, pipelined run must be told the sum is not a resume offset: \
+                 {multi}"
             );
         }
     }
