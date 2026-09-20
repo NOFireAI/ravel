@@ -3,14 +3,22 @@
 //!
 //! The dedicated fragment listener is mutual TLS, and one key pair serves both
 //! directions: the same `--fragment-tls-cert` this process presents as a server
-//! is the client identity it presents when it dials a peer. A peer's rustls
-//! client verifier requires the `clientAuth` extended key usage, so a
-//! certificate provisioned against the pre-#1690 documentation (`serverAuth`
-//! only) still serves inbound fetches while failing every outbound dial at the
-//! handshake, and each such failure falls back to coordinator-local execution.
-//! Distribution stops with nothing on this process reporting it.
+//! is the client identity it presents when it dials a peer. So the certificate
+//! has to satisfy two verifiers, not one, and rustls-webpki 0.103.15 states the
+//! rule for both in `KeyUsage::validate` (verify_cert.rs): it walks the
+//! certificate's `extendedKeyUsage` OIDs and accepts only an exact match on the
+//! required one, `1.3.6.1.5.5.7.3.1` for `serverAuth` and `1.3.6.1.5.5.7.3.2`
+//! for `clientAuth`. An absent extension is accepted for either role
+//! (`RequiredIfPresent` with an empty iterator), and `anyExtendedKeyUsage` is
+//! accepted for neither: the OID is not special-cased anywhere in that crate,
+//! so it is just another non-matching purpose.
 //!
-//! [`ensure_client_auth_eku`] turns that into a startup refusal.
+//! A certificate missing one of the two therefore starts, serves the direction
+//! it does carry, and fails every handshake in the other one, and each such
+//! failure falls back to coordinator-local execution. Distribution stops with
+//! nothing on this process reporting it.
+//!
+//! [`ensure_mutual_auth_ekus`] turns that into a startup refusal.
 
 use std::path::Path;
 
@@ -21,11 +29,17 @@ use rustls_pki_types::pem::PemObject as _;
 /// certificate may be used for (RFC 5280 section 4.2.1.12).
 const EXT_KEY_USAGE_OID: &str = "2.5.29.37";
 
+/// `id-kp-serverAuth`, the usage a TLS server certificate needs.
+const SERVER_AUTH_OID: &str = "1.3.6.1.5.5.7.3.1";
+
 /// `id-kp-clientAuth`, the usage a TLS client certificate needs.
 const CLIENT_AUTH_OID: &str = "1.3.6.1.5.5.7.3.2";
 
-/// `anyExtendedKeyUsage`: a certificate listing it is usable for every purpose,
-/// so it satisfies the `clientAuth` requirement.
+/// `anyExtendedKeyUsage`. RFC 5280 leaves its handling to the application, and
+/// rustls-webpki does not special-case it: `KeyUsage::validate` compares each
+/// listed purpose to the required OID and nothing else, so a certificate
+/// carrying only this one fails both verifiers. Named here to render it in a
+/// refusal, never to satisfy one.
 const ANY_EXTENDED_KEY_USAGE_OID: &str = "2.5.29.37.0";
 
 /// DER identifier octets for the handful of types this walk names. Everything
@@ -36,14 +50,16 @@ const TAG_SEQUENCE: u8 = 0x30;
 /// `[3] EXPLICIT Extensions OPTIONAL`, the last TBSCertificate field.
 const TAG_EXTENSIONS: u8 = 0xa3;
 
-/// Refuse startup when the fragment TLS identity at `path` cannot be presented
-/// as a client certificate.
+/// Refuse startup when the fragment TLS identity at `path` cannot serve both
+/// halves of the mutual handshake it is configured for.
 ///
-/// Accepts a certificate whose `extendedKeyUsage` lists `clientAuth` or
-/// `anyExtendedKeyUsage`, and one carrying no `extendedKeyUsage` extension at
-/// all (RFC 5280: an absent extension constrains nothing, and webpki accepts
-/// it for either role). Everything else is the upgrade hazard above.
-pub fn ensure_client_auth_eku(path: &Path, cert_pem: &[u8]) -> anyhow::Result<()> {
+/// Accepts a certificate whose `extendedKeyUsage` lists both `serverAuth` and
+/// `clientAuth`, and one carrying no `extendedKeyUsage` extension at all (RFC
+/// 5280: an absent extension constrains nothing, and webpki accepts it for
+/// either role). `anyExtendedKeyUsage` stands in for neither, because the
+/// verifier does not accept it for either. Everything else is the upgrade
+/// hazard above.
+pub fn ensure_mutual_auth_ekus(path: &Path, cert_pem: &[u8]) -> anyhow::Result<()> {
     let der = CertificateDer::from_pem_slice(cert_pem).map_err(|e| {
         anyhow::anyhow!(
             "failed to read a PEM CERTIFICATE block from --fragment-tls-cert {}: {e}",
@@ -52,13 +68,13 @@ pub fn ensure_client_auth_eku(path: &Path, cert_pem: &[u8]) -> anyhow::Result<()
     })?;
     let usages = extended_key_usages(der.as_ref()).map_err(|e| {
         anyhow::anyhow!(
-            "could not determine whether --fragment-tls-cert {} carries the clientAuth extended \
-             key usage: {e}. Read it yourself with `openssl x509 -in {} -noout -ext \
-             extendedKeyUsage`: the fragment listener is mutual TLS (ADR-0071 amendment decision \
-             1) and this process presents that certificate as its client identity on every \
-             outbound fragment dial, so a certificate without clientAuth fails every dial at the \
-             handshake. Startup refuses on an unreadable certificate rather than starting on one \
-             that may not be able to dial at all.",
+            "could not determine whether --fragment-tls-cert {} carries the serverAuth and \
+             clientAuth extended key usages: {e}. Read it yourself with `openssl x509 -in {} \
+             -noout -ext extendedKeyUsage`: the fragment listener is mutual TLS (ADR-0071 \
+             amendment decision 1) and this process presents that one certificate in both \
+             directions, so a certificate missing either usage fails every handshake in that \
+             direction. Startup refuses on an unreadable certificate rather than starting on one \
+             that may not be able to dial or be dialled at all.",
             path.display(),
             path.display()
         )
@@ -67,17 +83,21 @@ pub fn ensure_client_auth_eku(path: &Path, cert_pem: &[u8]) -> anyhow::Result<()
         // No extension: unconstrained, so it can be presented as either role.
         return Ok(());
     };
-    if usages.iter().any(|usage| {
-        usage.as_str() == CLIENT_AUTH_OID || usage.as_str() == ANY_EXTENDED_KEY_USAGE_OID
-    }) {
-        return Ok(());
-    }
+    let carries = |wanted: &str| usages.iter().any(|usage| usage.as_str() == wanted);
+    let missing = match (carries(SERVER_AUTH_OID), carries(CLIENT_AUTH_OID)) {
+        (true, true) => return Ok(()),
+        (false, true) => "serverAuth extended key usage",
+        (true, false) => "clientAuth extended key usage",
+        (false, false) => "serverAuth and clientAuth extended key usages",
+    };
     anyhow::bail!(
-        "--fragment-tls-cert {} is missing the clientAuth extended key usage (it carries: {}). \
-         The dedicated fragment listener is mutual TLS (ADR-0071 amendment decision 1): this \
-         process presents that same certificate as its client identity on every outbound \
-         fragment dial, and a peer's client verifier rejects a certificate without clientAuth, \
-         so every dial would fail at the handshake and fall back to coordinator-local execution \
+        "--fragment-tls-cert {} is missing the {missing} (it carries: {}). The dedicated \
+         fragment listener is mutual TLS (ADR-0071 amendment decision 1): this process presents \
+         that one certificate in both directions, as the server identity a peer checks for \
+         serverAuth when it dials this process and as the client identity a peer checks for \
+         clientAuth when this process dials it. rustls-webpki matches the required purpose OID \
+         exactly, so anyExtendedKeyUsage does not stand in for either. Every handshake in the \
+         direction of a missing usage would fail and fall back to coordinator-local execution \
          with nothing failing here. Reissue the certificate with \
          extendedKeyUsage = serverAuth, clientAuth (cert-manager: usages: server auth, client \
          auth) and restart; see docs/guides/operations/deployment.md.",
@@ -206,9 +226,9 @@ fn extended_key_usages(der: &[u8]) -> anyhow::Result<Option<Vec<String>>> {
                 .into_iter()
                 .filter(|purpose| purpose.tag == TAG_OBJECT_IDENTIFIER)
                 // An OID this walk cannot read is reported as unreadable rather
-                // than dropped: it must not match clientAuth, and it must not
-                // vanish from the refusal that then names what the certificate
-                // carries.
+                // than dropped: it must not match either required usage, and it
+                // must not vanish from the refusal that then names what the
+                // certificate carries.
                 .map(|purpose| {
                     dotted_oid(purpose.contents).unwrap_or_else(|| "<unreadable OID>".to_string())
                 })
@@ -268,8 +288,9 @@ fn render_usages(usages: &[String]) -> String {
     usages
         .iter()
         .map(|usage| match usage.as_str() {
-            "1.3.6.1.5.5.7.3.1" => "serverAuth",
-            "1.3.6.1.5.5.7.3.2" => "clientAuth",
+            ANY_EXTENDED_KEY_USAGE_OID => "anyExtendedKeyUsage",
+            SERVER_AUTH_OID => "serverAuth",
+            CLIENT_AUTH_OID => "clientAuth",
             "1.3.6.1.5.5.7.3.3" => "codeSigning",
             "1.3.6.1.5.5.7.3.4" => "emailProtection",
             "1.3.6.1.5.5.7.3.8" => "timeStamping",
@@ -315,6 +336,42 @@ BwMBBggrBgEFBQcDAjAZBgNVHREEEjAQgg5yYXZlbC1mcmFnbWVudDAdBgNVHQ4E
 FgQUfJC6GQoihnxgaXOnWiJBAfwInPwwHwYDVR0jBBgwFoAU+wun+9MmgoTKFxky
 AaGUsPvKd00wCgYIKoZIzj0EAwIDSAAwRQIgbEMg/jES94eo3dxOwEiM1FiHhY1v
 hzdk6C9qmCCckI4CIQC/2tvVzC1VvE9eO0Y9eN2GDp63hSc+5YvKnvFm8P6I6Q==
+-----END CERTIFICATE-----
+";
+
+    /// EC P-256, `CN=ravel-fragment`, SAN `DNS:ravel-fragment`,
+    /// `extendedKeyUsage = clientAuth` only: the mirror image of
+    /// [`SERVER_AUTH_ONLY_PEM`]. It dials peers and cannot be dialled, so it
+    /// must refuse too.
+    pub(crate) const CLIENT_AUTH_ONLY_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBvDCCAWGgAwIBAgIUE130J0IY/JtvZ3xDRYvpiHgd+ogwCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOcmF2ZWwtZnJhZ21lbnQwIBcNMjYwOTIwMTAzMjI2WhgPMjEy
+NjA4MjcxMDMyMjZaMBkxFzAVBgNVBAMMDnJhdmVsLWZyYWdtZW50MFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAE9/qkHmWjvfdtsa2S4KyHk3b1+SrGhRcWoaMSk5Lj
+gTOfM5MsscGtZKTec+6rHyeYYI2P7mT/UurqGLj4Dlcyj6OBhDCBgTAPBgNVHRMB
+Af8EBTADAQH/MB0GA1UdDgQWBBSChYKjdmAa1lnoF4iQ6ypgoPpMLzAfBgNVHSME
+GDAWgBSChYKjdmAa1lnoF4iQ6ypgoPpMLzATBgNVHSUEDDAKBggrBgEFBQcDAjAZ
+BgNVHREEEjAQgg5yYXZlbC1mcmFnbWVudDAKBggqhkjOPQQDAgNJADBGAiEAtFWO
+tmmPq4H41ygQTbSUPCZMGC4bd91il0MiF0bVxX0CIQDmmLhAfGQa0ooDE2BgcxXU
+0er+9+qp3Nsh4eNE1i8dBw==
+-----END CERTIFICATE-----
+";
+
+    /// EC P-256, `CN=ravel-fragment`, SAN `DNS:ravel-fragment`,
+    /// `extendedKeyUsage = anyExtendedKeyUsage` (2.5.29.37.0) and nothing
+    /// else. It reads as permissive and is not: rustls-webpki matches the
+    /// required purpose OID exactly, so this certificate fails both verifiers.
+    pub(crate) const ANY_EXTENDED_KEY_USAGE_ONLY_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBtTCCAVugAwIBAgIUH7GjqmUMB/0aiknQ3QH0cXXUW3owCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOcmF2ZWwtZnJhZ21lbnQwIBcNMjYwOTIwMTAzMjI2WhgPMjEy
+NjA4MjcxMDMyMjZaMBkxFzAVBgNVBAMMDnJhdmVsLWZyYWdtZW50MFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAEAbrs+0F0Pu1ULVe1Fqj6mFnDrxjxIk3jwecVFyHu
+uK6NwaS+tFsv2GJJ3uNYcJozy1PN+R2sr9Id+uFeM5zA36N/MH0wDwYDVR0TAQH/
+BAUwAwEB/zAdBgNVHQ4EFgQUFlc9wG0FVA3X8WHoeGuH7xfJEYQwHwYDVR0jBBgw
+FoAUFlc9wG0FVA3X8WHoeGuH7xfJEYQwDwYDVR0lBAgwBgYEVR0lADAZBgNVHREE
+EjAQgg5yYXZlbC1mcmFnbWVudDAKBggqhkjOPQQDAgNIADBFAiAeDiX/+0uiJGY7
+wqgnDX7TeRWUOBCayVGYFyUC0VV4vwIhAPNXoWF29+tVPm8PPblW6+jaOqLLeA2l
+Zq+PFZkVGZ4M
 -----END CERTIFICATE-----
 ";
 
@@ -417,9 +474,9 @@ S38zc9lo/Ng0ve0=
 #[allow(clippy::expect_used)]
 mod tests {
     use super::test_certs::{
-        BOTH_USAGES_PEM, CRITICAL_EKU_PEM, EMPTY_SUBJECT_BOTH_USAGES_PEM,
-        EMPTY_SUBJECT_SERVER_AUTH_ONLY_PEM, NO_EKU_PEM, RSA_UTCTIME_BOTH_USAGES_PEM,
-        SERVER_AUTH_ONLY_PEM,
+        ANY_EXTENDED_KEY_USAGE_ONLY_PEM, BOTH_USAGES_PEM, CLIENT_AUTH_ONLY_PEM, CRITICAL_EKU_PEM,
+        EMPTY_SUBJECT_BOTH_USAGES_PEM, EMPTY_SUBJECT_SERVER_AUTH_ONLY_PEM, NO_EKU_PEM,
+        RSA_UTCTIME_BOTH_USAGES_PEM, SERVER_AUTH_ONLY_PEM,
     };
     use super::*;
 
@@ -429,7 +486,7 @@ mod tests {
     #[test]
     fn server_auth_only_certificate_is_refused() {
         let path = Path::new("/etc/ravel/fragment-tls/tls.crt");
-        let err = ensure_client_auth_eku(path, SERVER_AUTH_ONLY_PEM.as_bytes())
+        let err = ensure_mutual_auth_ekus(path, SERVER_AUTH_ONLY_PEM.as_bytes())
             .expect_err("a serverAuth-only fragment certificate must refuse startup");
         let msg = err.to_string();
         assert!(
@@ -450,11 +507,68 @@ mod tests {
         );
     }
 
+    /// The mirror of the hazard above, and the half the first round of this
+    /// check did not model: the same certificate is also the server identity
+    /// the peer's server-certificate verifier checks, so a `clientAuth`-only
+    /// certificate dials fine and fails every inbound handshake.
+    #[test]
+    fn client_auth_only_certificate_is_refused() {
+        let path = Path::new("/etc/ravel/fragment-tls/tls.crt");
+        let err = ensure_mutual_auth_ekus(path, CLIENT_AUTH_ONLY_PEM.as_bytes())
+            .expect_err("a clientAuth-only fragment certificate must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/etc/ravel/fragment-tls/tls.crt"),
+            "the error names the certificate path: {msg}"
+        );
+        assert!(
+            msg.contains("missing the serverAuth extended key usage"),
+            "the error names serverAuth as the missing usage: {msg}"
+        );
+        assert!(
+            !msg.contains("missing the clientAuth extended key usage"),
+            "the error does not name the usage the certificate does carry: {msg}"
+        );
+        assert!(
+            msg.contains("it carries: clientAuth"),
+            "the error names what the certificate does carry: {msg}"
+        );
+        assert!(
+            msg.contains("extendedKeyUsage = serverAuth, clientAuth"),
+            "the error names what to regenerate: {msg}"
+        );
+    }
+
+    /// `anyExtendedKeyUsage` reads as "usable for everything" and satisfies
+    /// neither verifier: rustls-webpki 0.103.15's `KeyUsage::validate` compares
+    /// each listed purpose to the required OID with no special case for
+    /// 2.5.29.37.0. A check that accepted it would start a process whose every
+    /// handshake, in both directions, fails.
+    #[test]
+    fn any_extended_key_usage_only_certificate_is_refused() {
+        let path = Path::new("/etc/ravel/fragment-tls/tls.crt");
+        let err = ensure_mutual_auth_ekus(path, ANY_EXTENDED_KEY_USAGE_ONLY_PEM.as_bytes())
+            .expect_err("anyExtendedKeyUsage satisfies neither verifier, so startup refuses");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing the serverAuth and clientAuth extended key usages"),
+            "the error names both missing usages: {msg}"
+        );
+        assert!(
+            msg.contains("it carries: anyExtendedKeyUsage"),
+            "the error names what the certificate does carry: {msg}"
+        );
+        assert!(
+            msg.contains("extendedKeyUsage = serverAuth, clientAuth"),
+            "the error names what to regenerate: {msg}"
+        );
+    }
+
     /// The positive control: a certificate with both usages is what #1690
     /// requires, and it must start normally.
     #[test]
     fn certificate_with_both_usages_is_accepted() {
-        ensure_client_auth_eku(Path::new("tls.crt"), BOTH_USAGES_PEM.as_bytes())
+        ensure_mutual_auth_ekus(Path::new("tls.crt"), BOTH_USAGES_PEM.as_bytes())
             .expect("a serverAuth+clientAuth certificate starts normally");
     }
 
@@ -462,7 +576,7 @@ mod tests {
     /// not be refused.
     #[test]
     fn certificate_without_the_extension_is_accepted() {
-        ensure_client_auth_eku(Path::new("tls.crt"), NO_EKU_PEM.as_bytes())
+        ensure_mutual_auth_ekus(Path::new("tls.crt"), NO_EKU_PEM.as_bytes())
             .expect("a certificate with no extendedKeyUsage extension is unconstrained");
     }
 
@@ -492,7 +606,7 @@ mod tests {
     /// extensions.
     #[test]
     fn certificate_with_an_empty_subject_is_accepted() {
-        ensure_client_auth_eku(
+        ensure_mutual_auth_ekus(
             Path::new("tls.crt"),
             EMPTY_SUBJECT_BOTH_USAGES_PEM.as_bytes(),
         )
@@ -504,7 +618,7 @@ mod tests {
     /// missing usage.
     #[test]
     fn empty_subject_server_auth_only_certificate_is_refused() {
-        let err = ensure_client_auth_eku(
+        let err = ensure_mutual_auth_ekus(
             Path::new("/etc/ravel/fragment-tls/tls.crt"),
             EMPTY_SUBJECT_SERVER_AUTH_ONLY_PEM.as_bytes(),
         )
@@ -524,7 +638,7 @@ mod tests {
     /// the value is not the second field of the extension SEQUENCE.
     #[test]
     fn certificate_with_a_critical_extension_is_accepted() {
-        ensure_client_auth_eku(Path::new("tls.crt"), CRITICAL_EKU_PEM.as_bytes())
+        ensure_mutual_auth_ekus(Path::new("tls.crt"), CRITICAL_EKU_PEM.as_bytes())
             .expect("a critical extendedKeyUsage listing clientAuth starts normally");
     }
 
@@ -532,7 +646,7 @@ mod tests {
     /// every TBSCertificate field the check skips changes encoding here.
     #[test]
     fn rsa_certificate_with_a_utctime_expiry_is_accepted() {
-        ensure_client_auth_eku(Path::new("tls.crt"), RSA_UTCTIME_BOTH_USAGES_PEM.as_bytes())
+        ensure_mutual_auth_ekus(Path::new("tls.crt"), RSA_UTCTIME_BOTH_USAGES_PEM.as_bytes())
             .expect("an RSA certificate carrying clientAuth starts normally");
     }
 
@@ -556,14 +670,14 @@ mod tests {
     }
 
     /// A certificate this process cannot read at all is not silently accepted:
-    /// the walk cannot tell whether it carries `clientAuth`, so startup refuses
-    /// and the message says so and how to check.
+    /// the walk cannot tell whether it carries the two usages, so startup
+    /// refuses and the message says so and how to check.
     #[test]
     fn undeterminable_certificate_is_refused_with_a_way_to_check() {
         // A CERTIFICATE block whose DER is a SEQUENCE header declaring 256
         // content octets that are not there.
         let truncated = "-----BEGIN CERTIFICATE-----\nMIIBAA==\n-----END CERTIFICATE-----\n";
-        let err = ensure_client_auth_eku(
+        let err = ensure_mutual_auth_ekus(
             Path::new("/etc/ravel/fragment-tls/tls.crt"),
             truncated.as_bytes(),
         )
@@ -572,8 +686,8 @@ mod tests {
         assert!(
             msg.contains(
                 "could not determine whether --fragment-tls-cert \
-                          /etc/ravel/fragment-tls/tls.crt carries the clientAuth extended key \
-                          usage"
+                          /etc/ravel/fragment-tls/tls.crt carries the serverAuth and clientAuth \
+                          extended key usages"
             ),
             "the error names the path and what could not be determined: {msg}"
         );
@@ -587,7 +701,7 @@ mod tests {
 
     #[test]
     fn non_pem_input_is_refused_by_path() {
-        let err = ensure_client_auth_eku(Path::new("/etc/ravel/tls.crt"), b"not a certificate")
+        let err = ensure_mutual_auth_ekus(Path::new("/etc/ravel/tls.crt"), b"not a certificate")
             .expect_err("a file with no PEM CERTIFICATE block must refuse startup");
         assert!(
             err.to_string().contains("/etc/ravel/tls.crt"),
