@@ -347,8 +347,13 @@ enum Command {
     /// with a window that reaches now). A per-record attribute cap of 1024
     /// applies (relaxed from OTLP's 128). A row that fails a kept check is
     /// rejected fail-fast: the run stops at the first bad row and exits
-    /// nonzero. There is NO resumability or deduplication: re-running after a
-    /// failure re-ingests the whole file from the start, and retention is
+    /// nonzero. `--skip-rows` (issue #1713) gives a manual, positional way to
+    /// resume after such a failure: pass the last reported `rows_skipped +
+    /// rows_written` figure and the run drops that many leading rows before
+    /// mapping. There is NO idempotency marker and NO automatic
+    /// deduplication behind this: the loader trusts the offset it is given
+    /// and cannot tell a correct resume from a wrong guess, so a mismatched
+    /// value silently reprocesses or silently drops rows. Retention is
     /// measured from load time, not the records' event times.
     Load {
         /// Path to the source Parquet file.
@@ -373,6 +378,16 @@ enum Command {
         /// `DEFAULT_BATCH_ROWS` (10000), leaving current behaviour unchanged.
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_BATCH_ROWS)]
         batch_rows: usize,
+        /// Number of leading rows, by file-absolute position, to drop before
+        /// mapping (issue #1713). A manual resume after a mid-file failure:
+        /// pass the exact `rows_skipped + rows_written` figure the failed
+        /// attempt's summary reported. This is a positional offset only --
+        /// there is no per-file idempotency marker (that is separate,
+        /// future work), so the loader cannot detect a wrong value; it
+        /// silently trusts what it is given. Counted and reported once, as
+        /// `rows_skipped`, in the summary. Defaults to 0 (no skip).
+        #[arg(long, default_value_t = 0)]
+        skip_rows: u64,
         /// Number of parallel stride read cursors over the Parquet file's row
         /// groups (issue #560). A file sorted by a resource-attribute column
         /// (e.g. ClickBench's `hits.parquet`, sorted by `CounterID`) puts one
@@ -1816,6 +1831,7 @@ async fn main() -> anyhow::Result<()> {
             mapping,
             shards,
             batch_rows,
+            skip_rows,
             read_cursors,
             pipeline_depth,
             max_inflight_flushes,
@@ -1831,6 +1847,7 @@ async fn main() -> anyhow::Result<()> {
                 &mapping,
                 shards,
                 batch_rows,
+                skip_rows,
                 read_cursors,
                 pipeline_depth,
                 max_inflight_flushes,
