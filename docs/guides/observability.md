@@ -810,9 +810,22 @@ refuses again.
 per-tenant one: one maintenance cycle (default 300 s) sums every sealed bucket
 of every `(tenant, shard)` this process currently owns, and publishes the
 result once the cycle has covered all of them. A scrape that lands mid-cycle
-reads the previous cycle's complete total, never a partial sum, and a unit
-whose pass failed contributes nothing for that cycle (that failure surfaces as
-`ravel_maintain_units_stalled`, not as a dip here). To get a deployment-wide
+reads the previous cycle's complete total, never a partial sum.
+
+A unit whose pass failed contributes nothing for that cycle, so a dip can mean
+either that pending work really fell or that a unit was not reached, and
+`ravel_maintain_units_stalled` does not separate the two on its own. It only
+moves for a per-unit failure that has repeated past the stall threshold
+(three consecutive ticks on the defaults), and several paths drop a unit's
+whole contribution before any per-unit accounting happens at all: a tenant
+whose legal-hold refresh fails is skipped for the entire tick
+(`ravel_maintain_legal_hold_refresh_failures_total` moves, `units_stalled`
+does not), and so is one skipped by the provisioning or shard-generation
+check (`ravel_provisioning_shard_count_mismatch_total`). A one- or two-cycle
+per-unit failure dips this gauge with `units_stalled` still at zero. Read a
+dip against those counters and against the age of
+`ravel_maintain_last_cycle_completed_timestamp_seconds` before concluding
+compaction caught up. To get a deployment-wide
 figure, sum the gauge across processes: with several maintain replicas each
 owns a disjoint share of the units, so no replica's value is the whole
 population and the shares do not overlap.
