@@ -765,14 +765,17 @@ Labels: `mode`.
 | `ravel_maintain_tenants_maintained` | Gauge. Discovered tenants actually maintained this cycle, after any flag restriction. |
 | `ravel_maintain_tenant_discovery_failures_total` | Maintenance cycles skipped because tenant discovery itself failed. |
 
-### Maintenance safety (`ravel_maintain_legal_hold_*`, `ravel_maintain_conservation_*`, `ravel_maintain_orphan*`)
+### Maintenance safety (`ravel_maintain_legal_hold_*`, `ravel_maintain_conservation_*`, `ravel_maintain_orphan*`, `ravel_maintain_l0_records_pending`, `ravel_maintain_objects_deleted_total`)
 
-Labels: `mode`, plus `signal` on all but the legal-hold counter. These carry no
-`tenant_hash` label.
+Labels: `mode`, plus `signal` on every series except the legal-hold counter
+(`mode` only) and `ravel_maintain_objects_deleted_total`, which carries `mode`
+and `kind` and no `signal`. These carry no `tenant_hash` label.
 
 | Metric | Meaning |
 |---|---|
 | `ravel_maintain_legal_hold_refresh_failures_total` | Legal-hold refresh failures. Each one skips that tenant's whole maintenance tick. |
+| `ravel_maintain_l0_records_pending` | Gauge. L0 commit records sitting below `min_compaction_inputs` in a sealed bucket, by signal, summed over every tenant and shard this process maintains. |
+| `ravel_maintain_objects_deleted_total` | Objects the sweep physically deleted, by `kind`: `superseded_records_deleted`, `superseded_data_deleted`, `unreferenced_parts_deleted`, `quarantine_reaped`. |
 | `ravel_maintain_conservation_aborts_total` | Compaction publishes aborted by the record-count conservation gate, by signal. |
 | `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. |
 | `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the last completed orphan pass, by signal. |
@@ -802,6 +805,26 @@ before the delete, so a refused copy leaves the object in place rather than
 deleting it uncopied. Alert on `increase(...) > 0` there, the same shape as the
 breaker-trip counter, because the next pass retries the same candidate and
 refuses again.
+
+`ravel_maintain_l0_records_pending` is a per-process total, not a per-bucket or
+per-tenant one: one maintenance cycle (default 300 s) sums every sealed bucket
+of every `(tenant, shard)` this process currently owns, and publishes the
+result once the cycle has covered all of them. A scrape that lands mid-cycle
+reads the previous cycle's complete total, never a partial sum, and a unit
+whose pass failed contributes nothing for that cycle (that failure surfaces as
+`ravel_maintain_units_stalled`, not as a dip here). To get a deployment-wide
+figure, sum the gauge across processes: with several maintain replicas each
+owns a disjoint share of the units, so no replica's value is the whole
+population and the shares do not overlap.
+
+Unlike the orphan gauges above, this one does not follow the full-sweep
+cadence. A below-threshold bucket in the interior zone is skipped on the ticks
+between re-verifies (`interior_reverify_ns`, default 6 h), but the memo carries
+its last-known L0 record count and the skipped bucket still contributes it, so
+every cycle publishes the whole pending population rather than only what that
+cycle re-read. The count a skipped bucket contributes is as old as its last
+re-verify, so a bucket that crossed the threshold since then is reflected only
+once its re-verify or its compaction runs.
 
 ### Maintenance ownership and concurrency (`ravel_maintain_workers_live`, `ravel_maintain_units_*`, `ravel_maintain_memo_warm_start_units_total`, `ravel_maintain_full_sweep_passes_total`)
 

@@ -171,6 +171,16 @@ pub struct MaintenanceSafetyMetrics {
     orphans_quarantine_refused: [AtomicU64; MAINTAINED_SIGNALS.len()],
     quarantine_reaped: [AtomicU64; MAINTAINED_SIGNALS.len()],
     l0_records_pending: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// The in-progress cycle's L0-pending accumulator, paired with
+    /// `l0_records_pending` above exactly as `owned_this_cycle` is paired with
+    /// `units_owned`: cleared by [`MaintenanceSafetyMetrics::begin_scan_cycle`],
+    /// added to by [`MaintenanceSafetyMetrics::record_scan`] for every
+    /// `(tenant, shard)` the cycle evaluates, and copied into the published
+    /// gauge by [`MaintenanceSafetyMetrics::publish_scan_cycle`] once the cycle
+    /// has covered every unit this process owns. Nothing reads it, so a scrape
+    /// landing mid-cycle sees the previous cycle's complete total rather than a
+    /// half-summed one.
+    l0_records_pending_accum: [AtomicU64; MAINTAINED_SIGNALS.len()],
     objects_deleted_quarantine_reaped: AtomicU64,
     objects_deleted_superseded_records_deleted: AtomicU64,
     objects_deleted_superseded_data_deleted: AtomicU64,
@@ -282,15 +292,27 @@ impl MaintenanceSafetyMetrics {
         self.quarantine_reaped[signal_index(signal)].load(Ordering::Relaxed)
     }
 
-    /// L0 commit records the most recent compaction scan pass for `signal`
-    /// found sealed but still below `min_compaction_inputs`
-    /// ([`MaintainReport::l0_records_pending`]). A gauge like
-    /// [`orphans_present`], not a counter: it reflects only the most recent
-    /// pass, overwritten (`store`) each time, since a record leaves this
-    /// count the moment its bucket compacts or expires, not on a later
-    /// event this process needs to remember happened.
+    /// L0 commit records this process's most recent completed maintenance
+    /// cycle found sealed but still below `min_compaction_inputs`
+    /// ([`MaintainReport::l0_records_pending`]), summed over every `(tenant,
+    /// shard)` of `signal` the cycle covered -- the whole population this
+    /// process owns, not one unit's figure.
+    ///
+    /// A gauge like [`orphans_present`], not a counter: a record leaves this
+    /// count the moment its bucket compacts or expires, not on a later event
+    /// this process needs to remember happened. Its update cadence is the
+    /// maintenance cycle, and it is only ever overwritten with a complete
+    /// cycle total ([`publish_scan_cycle`]), so a scrape that lands mid-cycle
+    /// reads the previous complete value instead of a partial sum.
+    ///
+    /// Scope is one process. A unit another replica owns is counted on that
+    /// replica, so an operator reading the whole deployment sums the series
+    /// across processes. A unit whose pass failed this cycle contributes
+    /// nothing, the same way its figures reach no other gauge here; that shows
+    /// up as `ravel_maintain_units_stalled`, not as a pending count.
     ///
     /// [`orphans_present`]: Self::orphans_present
+    /// [`publish_scan_cycle`]: Self::publish_scan_cycle
     pub fn l0_records_pending(&self, signal: Signal) -> u64 {
         self.l0_records_pending[signal_index(signal)].load(Ordering::Relaxed)
     }
@@ -403,13 +425,49 @@ impl MaintenanceSafetyMetrics {
             .fetch_add(report.unreferenced_parts_deleted as u64, Ordering::Relaxed);
     }
 
-    /// One [`scan_and_maintain_with_memo`] result for `signal`, feeding the
-    /// L0-pending gauge. A gauge, not a counter, for the same reason as
-    /// [`orphans_present`](Self::orphans_present): this pass's count,
-    /// overwritten (`store`) each time.
+    /// One [`scan_and_maintain_with_memo`] result for `signal`, added to the
+    /// current cycle's L0-pending accumulator.
+    ///
+    /// This runs once per `(tenant, shard)`, so it must accumulate rather than
+    /// overwrite: storing here published one shard of one tenant as if it were
+    /// the signal's total, and every later unit of the cycle overwrote the
+    /// one before it. The published gauge moves only in
+    /// [`publish_scan_cycle`](Self::publish_scan_cycle), after
+    /// [`begin_scan_cycle`](Self::begin_scan_cycle) cleared the accumulator at
+    /// the top of the cycle.
     pub fn record_scan(&self, signal: Signal, report: &MaintainReport) {
-        self.l0_records_pending[signal_index(signal)]
-            .store(report.l0_records_pending as u64, Ordering::Relaxed);
+        self.l0_records_pending_accum[signal_index(signal)]
+            .fetch_add(report.l0_records_pending as u64, Ordering::Relaxed);
+    }
+
+    /// Clear the L0-pending accumulator at the top of a maintenance cycle.
+    /// Pairs with [`publish_scan_cycle`](Self::publish_scan_cycle), which must
+    /// run at the end of that same cycle; between the two the published gauge
+    /// still holds the previous cycle's complete total.
+    pub fn begin_scan_cycle(&self) {
+        for accum in &self.l0_records_pending_accum {
+            accum.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Publish the finished cycle's per-signal L0-pending totals, replacing the
+    /// previous cycle's. Call once, after every `(tenant, shard)` this process
+    /// owns has had its chance to run (including the ones whose pass failed and
+    /// therefore contributed nothing).
+    ///
+    /// Each signal is its own exported series and is written with one store, so
+    /// a scrape reads a complete cycle total per series; it never sees a
+    /// partially summed one. A scrape interleaved with this call can pair a new
+    /// value for one signal with the previous value for another, which is the
+    /// ordinary cross-series skew of any multi-series scrape, not a partial sum.
+    pub fn publish_scan_cycle(&self) {
+        for (published, accum) in self
+            .l0_records_pending
+            .iter()
+            .zip(self.l0_records_pending_accum.iter())
+        {
+            published.store(accum.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
     }
 }
 
@@ -1266,10 +1324,17 @@ pub async fn run_discovery_cycle(
     // total across cycles.
     ownership.set_units_owned(0);
     ownership.begin_cycle();
+    // Same shape for the L0-pending gauge: each tenant tick below adds its
+    // `(tenant, shard)` counts into the accumulator, and `publish_scan_cycle`
+    // below moves the finished total into the exported gauge. The per-tenant
+    // call is `run_tick_with_clock` rather than `run_tick` so the begin/publish
+    // pair spans the whole cycle instead of one tenant.
+    safety.begin_scan_cycle();
 
     let mut total = MaintainReport::default();
     for tenant in &outcome.maintained {
-        let report = run_tick(
+        let report = run_tick_with_clock(
+            &WallClock,
             store,
             tenant,
             compactor,
@@ -1287,6 +1352,7 @@ pub async fn run_discovery_cycle(
         total.already_done += report.already_done;
         total.not_sealed += report.not_sealed;
         total.skipped_terminal += report.skipped_terminal;
+        total.l0_records_pending += report.l0_records_pending;
     }
 
     // Prune stall history to exactly this cycle's owned set (ADR-0065
@@ -1299,6 +1365,7 @@ pub async fn run_discovery_cycle(
     // so this prunes only genuinely-unowned units, never a still-owned one
     // whose tick a transient fault skipped.
     ownership.end_cycle();
+    safety.publish_scan_cycle();
     total
 }
 
@@ -1365,7 +1432,11 @@ pub async fn run_tick(
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> MaintainReport {
-    run_tick_with_clock(
+    // One tenant is the whole cycle on this entry point, so the L0-pending
+    // accumulator opens and publishes around it. `run_discovery_cycle` does not
+    // call through here, so the two never nest.
+    safety.begin_scan_cycle();
+    let report = run_tick_with_clock(
         &WallClock,
         store,
         tenant,
@@ -1378,7 +1449,9 @@ pub async fn run_tick(
         worker,
         live_set,
     )
-    .await
+    .await;
+    safety.publish_scan_cycle();
+    report
 }
 
 /// Records every `(signal, shard)` unit of `tenant` that the rendezvous
@@ -1687,6 +1760,7 @@ pub(crate) async fn run_tick_with_clock(
                     total.already_done += report.already_done;
                     total.not_sealed += report.not_sealed;
                     total.skipped_terminal += report.skipped_terminal;
+                    total.l0_records_pending += report.l0_records_pending;
                 }
                 Err(MaintainError::ConservationViolation {
                     input_sample_count,
@@ -5195,8 +5269,16 @@ mod tests {
     /// through real store objects. Worker A maintains a unit, memoizes its
     /// terminal bucket, and persists a durable snapshot. Worker B -- a distinct
     /// process that now owns the unit -- reads the snapshots back from the store
-    /// and seeds its cold memo from A's, then skips the bucket A already proved
-    /// terminal rather than cold-rescanning it.
+    /// and seeds its cold memo from A's, then stops cold-rescanning the bucket A
+    /// already proved terminal.
+    ///
+    /// The bucket here is below the compaction threshold, and the snapshot body
+    /// carries states and verify times but not L0 record counts, so B's first
+    /// tick re-verifies it once to learn the count its `l0_records_pending`
+    /// total must report; every tick after that skips it. Both ticks report the
+    /// bucket's one pending L0 record, which is the point of the re-verify: the
+    /// gauge is exact on the warm-start cycle too, not only once the memo has
+    /// been rebuilt locally.
     #[tokio::test]
     async fn warm_start_seeds_successor_from_predecessor_snapshot_through_store() {
         let store = InstrumentedStore::new(MemoryStore::new());
@@ -5248,8 +5330,9 @@ mod tests {
         assert_eq!(b_buckets, 1);
         assert_eq!(memo_b.len(), 1, "B's memo warm-started from the store");
 
-        // B's tick skips the seeded terminal bucket (no cold rescan).
-        let report = run_tick(
+        // B's first tick re-verifies the seeded below-threshold bucket once,
+        // because the snapshot carried no L0 record count for it.
+        let first = run_tick(
             &store,
             &tenant,
             &compactor,
@@ -5263,10 +5346,37 @@ mod tests {
         )
         .await;
         assert_eq!(
-            report.skipped_terminal, 1,
-            "B skips A's terminal bucket after a store-backed warm start"
+            first.skipped_terminal, 0,
+            "a seeded below-threshold bucket carries no count, so B's first tick re-verifies it"
         );
-        assert_eq!(report.already_done, 0, "no per-bucket work redone by B");
+        assert_eq!(
+            first.l0_records_pending, 1,
+            "that re-verify is what makes the warm-start cycle's pending total exact"
+        );
+
+        // Every tick after that skips it, which is the warm start paying off.
+        let second = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo_b,
+            &safety,
+            &ownership,
+            &worker_b,
+            &live_b,
+        )
+        .await;
+        assert_eq!(
+            second.skipped_terminal, 1,
+            "B skips A's terminal bucket once its count is known"
+        );
+        assert_eq!(second.already_done, 0, "no per-bucket work redone by B");
+        assert_eq!(
+            second.l0_records_pending, 1,
+            "the skipped bucket keeps contributing its one pending L0 record"
+        );
     }
 
     /// ADR-0065 decision 3: the reseed trigger and the ownership
@@ -5284,8 +5394,10 @@ mod tests {
     /// 2. Seeding from A's snapshot with B's *pre-handoff* view `{A,B}` seeds
     ///    nothing (B did not own the shard then) -- proving the `owns_unit`
     ///    filter is genuine, not vacuously true.
-    /// 3. Seeding with B's *post-handoff* view `{B}` seeds the shard and B's tick
-    ///    skips it rather than cold-rescanning.
+    /// 3. Seeding with B's *post-handoff* view `{B}` seeds the shard, B's first
+    ///    tick re-verifies it once to learn its L0 record count (the snapshot
+    ///    body carries no counts), and B's next tick skips it rather than
+    ///    cold-rescanning.
     #[tokio::test]
     async fn reseed_and_seeding_track_genuine_ownership_handoff() {
         const SHARDS: u32 = 8;
@@ -5408,7 +5520,11 @@ mod tests {
         assert_eq!(units, 1, "B seeds the one unit it took over");
         assert_eq!(buckets, 1);
 
-        let report = run_tick(
+        // The handed-over bucket is below the compaction threshold and the
+        // snapshot carries no count for it, so B's first tick re-verifies it
+        // once (keeping that cycle's pending total exact) and skips it from the
+        // next tick on, rather than cold-rescanning it every tick.
+        let first = run_tick(
             &store,
             &tenant,
             &compactor,
@@ -5422,8 +5538,34 @@ mod tests {
         )
         .await;
         assert_eq!(
-            report.skipped_terminal, 1,
+            first.skipped_terminal, 0,
+            "the seeded below-threshold bucket carries no count, so it is re-verified once"
+        );
+        assert_eq!(
+            first.l0_records_pending, 1,
+            "the handed-over bucket's one pending L0 record is reported on that cycle"
+        );
+
+        let second = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo_b,
+            &safety,
+            &ownership,
+            &b,
+            &live_b,
+        )
+        .await;
+        assert_eq!(
+            second.skipped_terminal, 1,
             "B skips the handed-over terminal bucket instead of cold-rescanning"
+        );
+        assert_eq!(
+            second.l0_records_pending, 1,
+            "and the skipped bucket still contributes its pending L0 record"
         );
     }
 
