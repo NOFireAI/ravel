@@ -1542,9 +1542,12 @@ pub struct Cli {
     /// PEM server certificate the dedicated fragment listener presents
     /// (ADR-0071 amendment decision 1). Operator-provisioned; Ravel mints no
     /// certificates. The certificate must carry a `ravel-fragment` dNSName SAN,
-    /// the one fixed name every coordinator verifies against. Read once at
-    /// startup; rotation is a rolling restart. Required with
-    /// `--fragment-listener`.
+    /// the one fixed name every coordinator verifies against, and the
+    /// `clientAuth` extended key usage alongside `serverAuth`, because this
+    /// process presents the same certificate as its client identity on every
+    /// outbound fragment dial (issue #1690); startup parses it and refuses a
+    /// certificate that cannot dial. Read once at startup; rotation is a
+    /// rolling restart. Required with `--fragment-listener`.
     #[arg(long = "fragment-tls-cert", value_name = "PATH")]
     pub fragment_tls_cert: Option<PathBuf>,
 
@@ -4149,26 +4152,39 @@ impl Cli {
         // blobs are read once here; rotation is a rolling restart.
         let fragment_listener = match self.fragment_listener {
             Some(addr) => {
-                let read_pem = |flag: &str, path: Option<&Path>| -> anyhow::Result<Vec<u8>> {
-                    // `validate()` already rejected `--fragment-listener` without
-                    // all three PEM paths, so a missing one here is a bug, not an
-                    // operator error; surface it as a typed error rather than
-                    // panic (no `expect` on a production path).
-                    let path = path.ok_or_else(|| {
+                // `validate()` already rejected `--fragment-listener` without all
+                // three PEM paths, so a missing one here is a bug, not an
+                // operator error; surface it as a typed error rather than panic
+                // (no `expect` on a production path).
+                fn require_path<'a>(
+                    flag: &str,
+                    path: Option<&'a Path>,
+                ) -> anyhow::Result<&'a Path> {
+                    path.ok_or_else(|| {
                         anyhow::anyhow!("{flag} is required with --fragment-listener")
-                    })?;
+                    })
+                }
+                let read_pem = |flag: &str, path: &Path| -> anyhow::Result<Vec<u8>> {
                     std::fs::read(path).map_err(|e| {
                         anyhow::anyhow!("failed to read {flag} {}: {e}", path.display())
                     })
                 };
+                let cert_path =
+                    require_path("--fragment-tls-cert", self.fragment_tls_cert.as_deref())?;
+                let tls_cert_pem = read_pem("--fragment-tls-cert", cert_path)?;
+                // The listener's identity is also this process's client identity
+                // on every outbound fragment dial (issue #1690), so a certificate
+                // without clientAuth serves fetches while failing every dial at
+                // the handshake. Refuse here rather than degrade silently.
+                crate::fragment_cert::ensure_client_auth_eku(cert_path, &tls_cert_pem)?;
+                let key_path =
+                    require_path("--fragment-tls-key", self.fragment_tls_key.as_deref())?;
+                let ca_path = require_path("--fragment-tls-ca", self.fragment_tls_ca.as_deref())?;
                 Some(FragmentListenerSettings {
                     addr,
-                    tls_cert_pem: read_pem(
-                        "--fragment-tls-cert",
-                        self.fragment_tls_cert.as_deref(),
-                    )?,
-                    tls_key_pem: read_pem("--fragment-tls-key", self.fragment_tls_key.as_deref())?,
-                    tls_ca_pem: read_pem("--fragment-tls-ca", self.fragment_tls_ca.as_deref())?,
+                    tls_cert_pem,
+                    tls_key_pem: read_pem("--fragment-tls-key", key_path)?,
+                    tls_ca_pem: read_pem("--fragment-tls-ca", ca_path)?,
                 })
             }
             None => None,
@@ -10337,6 +10353,99 @@ mod tests {
             err.to_string().contains("--fragment-listener"),
             "names the required flag: {err}"
         );
+    }
+
+    /// Issue #1690 upgrade hazard: a cluster whose fragment certificate was
+    /// provisioned against the previous documentation (`serverAuth` only) now
+    /// has to present it as a client identity too. Nothing used to parse the
+    /// certificate, so the process started, served inbound fetches, and failed
+    /// every outbound dial at the handshake, falling back to coordinator-local
+    /// execution with nothing reporting why. `validate()` refuses instead.
+    ///
+    /// The per-usage parsing lives in `crate::fragment_cert`; this pins that
+    /// the refusal reaches startup, and that a certificate carrying both usages
+    /// does not.
+    #[test]
+    fn server_auth_only_fragment_certificate_fails_validate() {
+        let key = fragment_key_tmp();
+        let material =
+            fragment_tls_material(crate::fragment_cert::test_certs::SERVER_AUTH_ONLY_PEM);
+        let err = cli(&fragment_tls_args(
+            key.path().to_str().expect("utf8"),
+            &material,
+        ))
+        .validate()
+        .expect_err("a serverAuth-only fragment certificate must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(material.cert.path().to_str().expect("utf8")),
+            "the error names the certificate path: {msg}"
+        );
+        assert!(
+            msg.contains("missing the clientAuth extended key usage"),
+            "the error names the missing usage: {msg}"
+        );
+        assert!(
+            msg.contains("extendedKeyUsage = serverAuth, clientAuth"),
+            "the error names what to regenerate: {msg}"
+        );
+    }
+
+    /// The positive control for the refusal above: the same configuration with
+    /// a `serverAuth, clientAuth` certificate starts normally, so the check is
+    /// not rejecting every dedicated fragment listener.
+    #[test]
+    fn fragment_certificate_with_client_auth_validates() {
+        let key = fragment_key_tmp();
+        let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
+        cli(&fragment_tls_args(
+            key.path().to_str().expect("utf8"),
+            &material,
+        ))
+        .validate()
+        .expect("a serverAuth+clientAuth fragment certificate starts normally");
+    }
+
+    /// The three PEM files a `--fragment-listener` configuration needs on disk,
+    /// held alive for the length of a test.
+    struct FragmentTlsMaterial {
+        cert: tempfile::NamedTempFile,
+        key: tempfile::NamedTempFile,
+        ca: tempfile::NamedTempFile,
+    }
+
+    /// Write `cert_pem` as the fragment certificate, with the test CA as both
+    /// the key and CA file: only the certificate is parsed at startup, and the
+    /// other two are read as opaque bytes.
+    fn fragment_tls_material(cert_pem: &str) -> FragmentTlsMaterial {
+        let write = |contents: &str| {
+            let file = tempfile::NamedTempFile::new().expect("temp PEM file");
+            std::fs::write(file.path(), contents).expect("write PEM");
+            file
+        };
+        FragmentTlsMaterial {
+            cert: write(cert_pem),
+            key: write(crate::fragment_cert::test_certs::NO_EKU_PEM),
+            ca: write(crate::fragment_cert::test_certs::NO_EKU_PEM),
+        }
+    }
+
+    /// A complete, otherwise-valid dedicated-fragment-listener configuration
+    /// pointing at `material`, so `validate()` reaches the certificate check.
+    fn fragment_tls_args<'a>(key_path: &'a str, material: &'a FragmentTlsMaterial) -> Vec<&'a str> {
+        vec![
+            "--distributed-query",
+            "--fragment-key-file",
+            key_path,
+            "--fragment-listener",
+            "127.0.0.1:4319",
+            "--fragment-tls-cert",
+            material.cert.path().to_str().expect("utf8"),
+            "--fragment-tls-key",
+            material.key.path().to_str().expect("utf8"),
+            "--fragment-tls-ca",
+            material.ca.path().to_str().expect("utf8"),
+        ]
     }
 
     /// Issue #1724 acceptance: a wildcard-bound published listener under

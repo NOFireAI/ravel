@@ -351,7 +351,12 @@ rotation is a rolling restart. Requirements for the worker certificate:
 - `extendedKeyUsage = serverAuth, clientAuth`. Both are required: the same
   certificate serves inbound fragment fetches and is presented as client
   identity on outbound ones. A `serverAuth`-only certificate serves fragments
-  but cannot dial them, and the dial fails at the handshake.
+  but cannot dial them, and the dial fails at the handshake. Startup reads the
+  certificate and refuses when `clientAuth` is absent, naming the file and the
+  missing usage, so an upgrade from a release that documented `serverAuth`
+  alone fails loudly instead of degrading every fan-out to coordinator-local
+  execution. A certificate carrying no `extendedKeyUsage` extension at all is
+  unconstrained and starts.
 - Signed by the CA distributed as `--fragment-tls-ca` to every query node.
 
 ### With cert-manager
@@ -419,12 +424,12 @@ openssl req -x509 -new -key fragment-ca.key -sha256 -days 3650 \
   -addext "keyUsage=critical,keyCertSign,cRLSign" \
   -out fragment-ca.crt
 
-# One worker certificate, SAN = ravel-fragment, EKU serverAuth.
+# One worker certificate, SAN = ravel-fragment, EKU serverAuth + clientAuth.
 openssl ecparam -genkey -name prime256v1 -out fragment.key
 openssl req -new -key fragment.key -subj "/CN=ravel-fragment" -out fragment.csr
 cat > fragment.ext <<'EOF'
 subjectAltName = DNS:ravel-fragment
-extendedKeyUsage = serverAuth
+extendedKeyUsage = serverAuth, clientAuth
 basicConstraints = CA:FALSE
 keyUsage = critical,digitalSignature,keyEncipherment
 EOF
@@ -436,6 +441,16 @@ Distribute `fragment-ca.crt` to every query node as `--fragment-tls-ca`, and
 `fragment.crt` with `fragment.key` as `--fragment-tls-cert` and
 `--fragment-tls-key`. Reissuing the worker certificate, or rotating the CA,
 takes effect on the next rolling restart.
+
+Check an existing certificate before the restart that turns the listener on:
+
+```sh
+openssl x509 -in fragment.crt -noout -ext extendedKeyUsage
+```
+
+It must list both `TLS Web Server Authentication` and `TLS Web Client
+Authentication`. A certificate issued against a release that documented
+`serverAuth` alone lists only the first, and startup refuses it.
 
 ### Rolling onto the dedicated listener
 
