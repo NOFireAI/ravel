@@ -505,7 +505,7 @@ tally on the read side, and one coverage pair at the fold.
 |---|---|---|
 | `ravel_declared_stats_drops_observed_total` | `mode`, `carrier` | Declared-column statistics entries a reader dropped as defective, by the carrier it was reading. |
 | `ravel_catalog_fold_stamped_records_total` | `mode` | Carriers of declared-column statistics that the fold read: L0 commit records and L1 compaction parts. |
-| `ravel_catalog_fold_stamped_entries_total` | `mode` | Snapshot entries the fold wrote carrying declared-column statistics, from either carrier. |
+| `ravel_catalog_fold_stamped_entries_total` | `mode` | Snapshot entries the fold built carrying declared-column statistics, from either carrier. |
 
 `carrier` is a closed set of four: `commit-record` and `compaction-part` are
 the two stamp carriers, `snapshot-entry` is the fold's copy of them, and
@@ -539,7 +539,8 @@ was written reaching the snapshot at all". `..._stamped_records_total` counts
 the carriers the fold read that carried statistics, which is both of the paths
 a fold builds a stamped entry from: L0 commit records (field 20) and L1
 compaction parts (field 12). `..._stamped_entries_total` counts snapshot
-entries the fold then wrote carrying statistics, from either path. Rewrite
+entries the fold then built carrying statistics, from either path, counted as
+each entry is built. Rewrite
 output parts are counted on neither side: a rewrite drops rows, so the fold
 never carries a stamp computed before the drop, and counting a carrier that can
 never carry would report a permanent shortfall. Both are process-wide totals

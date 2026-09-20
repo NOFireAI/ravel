@@ -181,7 +181,8 @@ impl StampCoverage {
         self.records
     }
 
-    /// Snapshot entries this pass wrote carrying at least one stamp.
+    /// Snapshot entries this pass built carrying at least one stamp, tallied
+    /// at the point each entry is built.
     pub(crate) fn entries(self) -> u64 {
         self.entries
     }

@@ -271,8 +271,10 @@ pub struct FoldReport {
     /// carry no stamps by decision 3, so counting them would report a
     /// permanent shortfall. An exact count for this fold, not a running total.
     pub stamped_records: u64,
-    /// Snapshot entries this fold wrote carrying at least one declared-column
-    /// stamp, from either carrier: the write half of the same pair. Never
+    /// Snapshot entries this fold built carrying at least one declared-column
+    /// stamp, from either carrier: the carry half of the same pair. Tallied
+    /// where the entry is built, so it counts what the fold carried forward
+    /// rather than what a later step wrote. Never
     /// above `stamped_records`, since only a stamped carrier can produce a
     /// stamped entry. Below it means every entry of some stamped carrier was
     /// dropped on the way through, which is the coverage shortfall ADR-0873's
