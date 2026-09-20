@@ -71,10 +71,15 @@ fn seal_margin_ns(config: &CatalogConfig) -> anyhow::Result<i64> {
 ///
 /// `json`, when `true`, prints the whole [`FoldReport`] as JSON instead of
 /// the human-readable field-by-field report. Both forms carry every field
-/// (#1598): the human-readable report used to print 10 of `FoldReport`'s 23
-/// fields and silently omit the other 13. (An earlier version of this comment
-/// said "13 of 23", counting the report's printed LINES, three of which
-/// (`store`, `signal`, `seal_margin`) are not `FoldReport` fields at all.)
+/// (#1598): the human-readable report used to print 10 of `FoldReport`'s
+/// fields and silently omit the rest. No count is given here on purpose,
+/// because the struct grows and a number in this comment goes stale without
+/// anything failing;
+/// `services/ravel-cli/tests/catalog_fold_report.rs` derives the expected key
+/// set from `FoldReport`'s own `Serialize`, so a field added and not printed
+/// fails there. (An earlier version of this comment counted the report's
+/// printed LINES, three of which (`store`, `signal`, `seal_margin`) are not
+/// `FoldReport` fields at all.)
 #[allow(clippy::too_many_arguments)]
 pub async fn fold(
     store: Arc<dyn ObjectStoreBackend>,
