@@ -795,7 +795,10 @@ from those two, because their counts fold at the coordinator.
 A worker's budget refusal keeps its type end to end: the coordinator turns it
 back into `TooManyBytesScanned`, `TooManySeries`, `TooManySamples`, or
 `TooManySegments`, so it renders as the same 422 a local budget trip does. A
-503 means the fan-out itself failed, never that a cap was hit.
+503 means the fan-out itself failed or a worker was out of fetch memory, never
+that one of the query caps (bytes, series, samples, requests) was hit. The
+memory case is backpressure: the same slice can succeed once the worker has
+room, which is why it stays retryable while a cap refusal does not.
 
 That holds on the cross-cluster path too. A remote answering `BudgetExceeded`
 refused the query under its own caps (its wire-budget clamp, or the
