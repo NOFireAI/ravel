@@ -262,18 +262,21 @@ pub struct FoldReport {
     /// drains the backlog oldest-first. Nonzero here is the signal that the
     /// frontier is behind; steady state is always zero.
     pub frontier_hours_deferred: u64,
-    /// L0 commit records this fold read whose `declared_column_stats` (field
-    /// 20) was non-empty: the read half of the ADR-0873 stamp-coverage pair.
-    /// Counted off the wire before the statistics validity predicate runs, so
-    /// a record whose every entry is defective still counts here. An exact
-    /// count for this fold, not a running total.
+    /// Stamped carriers this fold read: L0 commit records whose
+    /// `declared_column_stats` (field 20) was non-empty, plus L1 compaction
+    /// parts whose own stamps (field 12) were non-empty. The read half of the
+    /// ADR-0873 stamp-coverage pair. Counted off the wire before the
+    /// statistics validity predicate runs, so a carrier whose every entry is
+    /// defective still counts here. Rewrite output parts are excluded: they
+    /// carry no stamps by decision 3, so counting them would report a
+    /// permanent shortfall. An exact count for this fold, not a running total.
     pub stamped_records: u64,
     /// Snapshot entries this fold wrote carrying at least one declared-column
-    /// stamp: the write half of the same pair. Never above `stamped_records`,
-    /// since only a stamped record can produce a stamped entry. Below it means
-    /// every entry of some stamped record was dropped on the way through,
-    /// which is the coverage shortfall ADR-0873's deployment gate is read
-    /// against.
+    /// stamp, from either carrier: the write half of the same pair. Never
+    /// above `stamped_records`, since only a stamped carrier can produce a
+    /// stamped entry. Below it means every entry of some stamped carrier was
+    /// dropped on the way through, which is the coverage shortfall ADR-0873's
+    /// deployment gate is read against.
     pub stamped_entries: u64,
 }
 
@@ -492,6 +495,7 @@ fn build_l1_snapshot_entry(
     key: &str,
     record: &CompactionRecord,
     part: &CompactionPart,
+    coverage: &mut declared_stats::StampCoverage,
 ) -> Result<SnapshotEntry, CatalogError> {
     if record.input_set_hash.len() != 32 {
         return Err(CatalogError::FieldMismatch {
@@ -526,8 +530,10 @@ fn build_l1_snapshot_entry(
         created_unix_ns: record.created_unix_ns,
         // The part's own stamps (CompactionPart field 12), gated against the
         // part's own row count exactly as the L0 path gates a commit record's
-        // (ADR-0873 decision 4).
-        declared_column_stats: declared_stats::carry_compaction_part(part),
+        // (ADR-0873 decision 4), and tallied into the same coverage pair: a
+        // stamped entry built here counts as much as one built from an L0
+        // record.
+        declared_column_stats: declared_stats::carry_compaction_part(part, coverage),
     })
 }
 
@@ -580,7 +586,9 @@ fn build_rewrite_l1_snapshot_entry(
         // for the surviving rows. Every rewrite writer emits empty stamps
         // today; forcing empty here also refuses a stamped rewrite part from
         // a buggy or future writer until the recompute path lands with its
-        // own tests and flips this line deliberately.
+        // own tests and flips this line deliberately. Counted on neither side
+        // of the stamp-coverage pair for the same reason: a carrier that can
+        // never carry would report a permanent shortfall.
         declared_column_stats: Vec::new(),
     })
 }
@@ -2814,7 +2822,7 @@ impl Catalog {
                 continue;
             }
             for part in &record.parts {
-                let entry = build_l1_snapshot_entry(ckey, record, part)?;
+                let entry = build_l1_snapshot_entry(ckey, record, part, coverage)?;
                 contributed.push((entry, true));
             }
         }
@@ -3527,6 +3535,76 @@ mod tests {
         );
     }
 
+    /// The coverage pair counts the compaction-part carriage path, not only the
+    /// L0 one.
+    ///
+    /// A fold whose entries come entirely from compaction parts reports exactly
+    /// the stamped parts it read and exactly the stamped entries it built from
+    /// them, and both reach the process-global totals the /metrics families
+    /// render. Without the tally at `carry_compaction_part`, this fold reports
+    /// zero on both halves while writing two stamped L1 entries, which is the
+    /// state that makes the rendered entries counter mean less than it says.
+    #[tokio::test]
+    async fn fold_counts_stamp_coverage_carried_from_compaction_parts() {
+        const HOUR: u32 = 10;
+
+        let records_before = crate::declared_stats::fold_stamped_records_total();
+        let entries_before = crate::declared_stats::fold_stamped_entries_total();
+
+        // Three L1 parts of one compaction record; the first two are stamped.
+        let store = Arc::new(MemoryStore::new());
+        publish_logs_l1(
+            store.as_ref(),
+            0,
+            HOUR,
+            "stamped-compaction-parts",
+            &[
+                (&[200, 404, 200, 500], true),
+                (&[500, 500, 200], true),
+                (&[200, 200], false),
+            ],
+        )
+        .await;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(HOUR),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+
+        assert_eq!(
+            report.entry_count, 3,
+            "one L1 entry per part, and no L0 record in this fixture"
+        );
+        assert_eq!(
+            report.stamped_records, 2,
+            "exactly the two parts published with a stamp are counted as read with one"
+        );
+        assert_eq!(
+            report.stamped_entries, 2,
+            "each of those two carried its stamp onto its L1 snapshot entry"
+        );
+
+        // A lower bound on the process-global totals, as above: other fold
+        // tests in this binary add to them concurrently, so only this fold's
+        // own contribution is pinned.
+        assert!(
+            crate::declared_stats::fold_stamped_records_total() >= records_before + 2,
+            "the fold's two stamped parts must reach the process-global total"
+        );
+        assert!(
+            crate::declared_stats::fold_stamped_entries_total() >= entries_before + 2,
+            "the fold's two stamped L1 entries must reach the process-global total"
+        );
+    }
+
     /// Issue #850, Finding 3: an incremental fold that appends entries must
     /// REUSE the previous fold's column-statistics baseline for the segments it
     /// already covered, re-fetching only the genuinely new segment. The reuse
@@ -4053,18 +4131,19 @@ mod tests {
 
     /// Publish a compaction record for `(shard, ingest_hour_bucket)` whose parts
     /// are REAL L1 RLOG objects, each carrying the `status` I64 column. `parts`
-    /// gives the status values per part; part `i` becomes CompactionPart
-    /// `part_index = i`. Both the part objects (at their reconstructed L1 keys)
-    /// and the compaction record are written, so a fold over the hour produces
-    /// one L1 `SnapshotEntry` per part and ADR-0942 builds part-bound stats for
-    /// each. Returns the record (its `parts[i].content_hash` is the v2 join key
-    /// for part `i`).
+    /// gives, per part, its status values and whether the part carries an
+    /// ADR-0873 declared stamp over them (`status` min/max, no NULLs); part `i`
+    /// becomes CompactionPart `part_index = i`. Both the part objects (at their
+    /// reconstructed L1 keys) and the compaction record are written, so a fold
+    /// over the hour produces one L1 `SnapshotEntry` per part and ADR-0942
+    /// builds part-bound stats for each. Returns the record (its
+    /// `parts[i].content_hash` is the v2 join key for part `i`).
     async fn publish_logs_l1(
         store: &dyn ObjectStoreBackend,
         shard: u32,
         ingest_hour_bucket: u32,
         input_set_seed: &str,
-        parts: &[&[i64]],
+        parts: &[(&[i64], bool)],
     ) -> CompactionRecord {
         use ravel_logseg::writer::ObjectIdentity;
         use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
@@ -4080,7 +4159,7 @@ mod tests {
         let mut compaction_parts: Vec<CompactionPart> = Vec::new();
         let mut part_bytes: Vec<Vec<u8>> = Vec::new();
         let mut max_ts_all = i64::MIN;
-        for (part_index, statuses) in parts.iter().enumerate() {
+        for (part_index, (statuses, stamped)) in parts.iter().enumerate() {
             let mut w = RlogWriter::new(
                 RlogConfig::default(),
                 ObjectIdentity {
@@ -4115,7 +4194,7 @@ mod tests {
             let bytes = w.finish().expect("finish");
             let content_hash = *blake3::hash(&bytes).as_bytes();
             max_ts_all = max_ts_all.max(max_ts);
-            compaction_parts.push(CompactionPart {
+            let mut compaction_part = CompactionPart {
                 part_index: part_index as u32,
                 first_series_id: vec![0u8; 16],
                 last_series_id: vec![0xffu8; 16],
@@ -4128,7 +4207,16 @@ mod tests {
                 max_event_ts_ns: max_ts,
                 segment_format_version: 2,
                 declared_column_stats: Vec::new(),
-            });
+            };
+            if *stamped {
+                let min = *statuses.iter().min().expect("a part has rows");
+                let max = *statuses.iter().max().expect("a part has rows");
+                ravel_commit::declared_stats::stamp_compaction_part(
+                    &mut compaction_part,
+                    &[stamp_stat("status", min, max, 0)],
+                );
+            }
+            compaction_parts.push(compaction_part);
             part_bytes.push(bytes);
         }
 
@@ -4215,7 +4303,7 @@ mod tests {
             0,
             10,
             "input-set-seed",
-            &[&[200, 404, 200, 500], &[500, 500, 200]],
+            &[(&[200, 404, 200, 500], false), (&[500, 500, 200], false)],
         )
         .await;
 

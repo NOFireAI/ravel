@@ -145,8 +145,12 @@ fn encode_validated(validated: &ValidatedDeclaredStats) -> Vec<DeclaredColumnMin
         .collect()
 }
 
-/// Stamp coverage across one fold pass: how many stamped commit records it
-/// read, and how many stamped snapshot entries it wrote from them.
+/// Stamp coverage across one fold pass: how many stamped carriers it read, and
+/// how many stamped snapshot entries it wrote from them. A carrier is an L0
+/// commit record or an L1 compaction part, the two sources a fold builds a
+/// stamped entry from. Rewrite output parts are not carriers: they never carry
+/// stamps out (ADR-0873 decision 3), so counting them would report a permanent
+/// shortfall for work that is behaving as specified.
 ///
 /// The ADR-0873 deployment gate needs a coverage figure a mixed-version fleet
 /// can be read against: an ingest fleet that has started stamping while some
@@ -157,9 +161,10 @@ fn encode_validated(validated: &ValidatedDeclaredStats) -> Vec<DeclaredColumnMin
 /// per-fold tallies rather than sampled or rate-derived figures.
 ///
 /// `entries` is never above `records` by construction: a carried list is
-/// non-empty only if the record it came from was stamped. Below it means every
-/// entry of some stamped record was dropped, which is the shortfall the alert
-/// in docs/guides/observability.md fires on.
+/// non-empty only if the carrier it came from was stamped, and both halves are
+/// tallied at the same two carriage points. Below it means every entry of some
+/// stamped carrier was dropped, which is the shortfall the alert in
+/// docs/guides/observability.md fires on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct StampCoverage {
     records: u64,
@@ -167,10 +172,11 @@ pub(crate) struct StampCoverage {
 }
 
 impl StampCoverage {
-    /// Commit records read in this pass whose wire `declared_column_stats` was
-    /// non-empty. Counted off the wire, before the predicate runs, so a record
-    /// whose every entry is defective still counts as stamped: the shortfall
-    /// this figure is half of exists to report exactly that case.
+    /// Carriers read in this pass whose wire `declared_column_stats` was
+    /// non-empty: commit records (field 20) and compaction parts (field 12).
+    /// Counted off the wire, before the predicate runs, so a carrier whose
+    /// every entry is defective still counts as stamped: the shortfall this
+    /// figure is half of exists to report exactly that case.
     pub(crate) fn records(self) -> u64 {
         self.records
     }
@@ -197,7 +203,8 @@ pub(crate) fn observe_fold_stamp_coverage(coverage: StampCoverage) {
     FOLD_STAMPED_ENTRIES.fetch_add(coverage.entries, Ordering::Relaxed);
 }
 
-/// Stamped commit records this process has folded since it started.
+/// Stamped carriers this process has folded since it started: commit records
+/// and compaction parts alike.
 ///
 /// Monotonic and process-local, like the other in-process tallies the scrape
 /// reads: a scrape takes the delta between samples. Pair it with
@@ -284,10 +291,29 @@ pub(crate) fn carry_commit_record(
     carried
 }
 
-/// The same carriage for one compaction or erasure-rewrite output part, whose
-/// row count is `CompactionPart.sample_count` (field 6).
-pub(crate) fn carry_compaction_part(part: &commit_pb::CompactionPart) -> Vec<DeclaredColumnMinMax> {
-    encode_validated(&commit_stats::read_compaction_part(part))
+/// The same carriage for one compaction output part, whose row count is
+/// `CompactionPart.sample_count` (field 6), tallying both sides of the coverage
+/// pair into `coverage` exactly as the L0 path does.
+///
+/// A compaction part is the fold's second source of a stamped entry, so it is
+/// counted on both sides: an entries total that included L1 entries while the
+/// records total did not would report more entries than carriers and break the
+/// pair's one invariant. The rewrite path never reaches here (ADR-0873
+/// decision 3 forces its stamps empty), and so contributes to neither half.
+pub(crate) fn carry_compaction_part(
+    part: &commit_pb::CompactionPart,
+    coverage: &mut StampCoverage,
+) -> Vec<DeclaredColumnMinMax> {
+    if !part.declared_column_stats.is_empty() {
+        coverage.records += 1;
+    }
+    let carried = encode_validated(&commit_stats::read_compaction_part(part));
+    #[cfg(test)]
+    let carried = apply_strip_hook(carried);
+    if !carried.is_empty() {
+        coverage.entries += 1;
+    }
+    carried
 }
 
 /// Read a snapshot entry's stamps, reconciled against the entry's own row
@@ -401,17 +427,46 @@ mod tests {
         assert_eq!(read.covered().to_vec(), stats);
     }
 
+    fn compaction_part(
+        sample_count: u64,
+        stats: &[DeclaredColumnStat],
+    ) -> commit_pb::CompactionPart {
+        let mut part = commit_pb::CompactionPart {
+            sample_count,
+            ..Default::default()
+        };
+        ravel_commit::declared_stats::stamp_compaction_part(&mut part, stats);
+        part
+    }
+
     #[test]
     fn a_compaction_parts_validated_stamps_are_carried_verbatim() {
         let stats = vec![i64_stat("EventDate", 3, 4, 1)];
-        let mut part = commit_pb::CompactionPart {
-            sample_count: 10,
-            ..Default::default()
-        };
-        ravel_commit::declared_stats::stamp_compaction_part(&mut part, &stats);
-        let read = read_snapshot_entry(&entry(10, carry_compaction_part(&part)));
+        let part = compaction_part(10, &stats);
+        let carried = carry_compaction_part(&part, &mut StampCoverage::default());
+        let read = read_snapshot_entry(&entry(10, carried));
         assert!(read.dropped().is_empty());
         assert_eq!(read.covered().to_vec(), stats);
+    }
+
+    #[test]
+    fn stamp_coverage_counts_compaction_parts_on_both_sides_of_the_pair() {
+        let stats = vec![i64_stat("EventDate", 3, 4, 1)];
+        let mut coverage = StampCoverage::default();
+        carry_compaction_part(&compaction_part(10, &stats), &mut coverage);
+        carry_compaction_part(&compaction_part(10, &[]), &mut coverage);
+        carry_compaction_part(&compaction_part(10, &stats), &mut coverage);
+
+        assert_eq!(
+            coverage.records(),
+            2,
+            "a compaction part is a carrier, counted the same as a commit record"
+        );
+        assert_eq!(
+            coverage.entries(),
+            2,
+            "both stamped parts produced a stamped entry"
+        );
     }
 
     #[test]
