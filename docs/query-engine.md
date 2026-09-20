@@ -797,6 +797,17 @@ back into `TooManyBytesScanned`, `TooManySeries`, `TooManySamples`, or
 `TooManySegments`, so it renders as the same 422 a local budget trip does. A
 503 means the fan-out itself failed, never that a cap was hit.
 
+That holds on the cross-cluster path too. A remote answering `BudgetExceeded`
+refused the query under its own caps (its wire-budget clamp, or the
+`max_series`/`max_samples` a resolve-scope slice enforces over its own
+result), so the coordinator renders it as the same typed 422, not as the
+`Federation` error it redacts to 503. A refusal is told apart from a fan-out
+failure by the wire status code, which only a remote that answered can set: a
+remote that was unreachable or timed out produces no status at all and keeps
+the retryable 503. The remote's message text selects only which cap is
+reported, and a message matching no known cap falls back to 503 rather than
+naming a cap that may not be the one that was hit.
+
 ### Process-wide memory budget (ADR-1170)
 
 `ravel-server` derives one process-wide ceiling, `memory_budget_bytes`, at
