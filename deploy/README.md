@@ -44,7 +44,7 @@ the resolution recipe per registry.
 this: every `image:` line in `docker-compose/ravel.yml` and
 `docker-compose/minio.yml`, except the two `${RAVEL_IMAGE:-...}` references
 in `ravel.yml`, must carry a digest, checked in CI's `doc-scripts` job.
-`deploy/k8s` carries four registry images that are not yet pinned
-(`minio.yaml` lines 49 and 140, `floci.yaml` lines 74 and 157) plus two
-locally built placeholders (`ravel-server`, `ravel-operator`); pinning the
-k8s manifests is a separate ticket.
+`deploy/k8s`'s four registry images carry digests too, checked by the same
+job. The two locally built placeholders there (`ravel-server`,
+`ravel-operator`) are loaded into kind by tag and are exempt by exact
+string.
