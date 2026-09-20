@@ -2279,6 +2279,12 @@ pub async fn start(
         audit_pipeline: None,
         process_memory_budget: process_memory_budget.clone(),
         process_memory_budget_is_fallback: config.process_memory_budget_is_fallback,
+        // Mirrors the fold-spawn gate below exactly (`Mode::Maintain` never
+        // calls `fold::spawn`, and `fold::spawn` itself returns
+        // `FoldTasks::none()` when `!config.fold.enabled`), computed here
+        // rather than in the renderer so the mode-vs-reality distinction
+        // lives in one place.
+        fold_enabled: !matches!(config.mode, Mode::Maintain) && config.fold.enabled,
     };
 
     // Held past the HTTP wiring so the Flight SQL service can register

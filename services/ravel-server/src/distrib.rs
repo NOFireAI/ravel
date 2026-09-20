@@ -2882,6 +2882,7 @@ mod tests {
             None,
             None,
             crate::metrics::MemoryBudgetSnapshot::default(),
+            true,
         );
         assert!(
             body.contains("ravel_distrib_quarantine_marks_total{mode=\"query\"} 1"),

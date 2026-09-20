@@ -5578,6 +5578,7 @@ mod tests {
             None,
             None,
             crate::metrics::MemoryBudgetSnapshot::default(),
+            false,
         )
     }
 
