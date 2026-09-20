@@ -1296,7 +1296,9 @@ fn scalar_count(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i64
 mod flight_reachability {
     use std::sync::{Arc, Mutex};
 
-    use datafusion::arrow::array::{Array, FixedSizeBinaryArray, Int64Array, StringArray};
+    use datafusion::arrow::array::{
+        Array, FixedSizeBinaryArray, Int64Array, ListArray, MapArray, StringArray, StructArray,
+    };
     use ravel_commit::keys;
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
@@ -1518,6 +1520,125 @@ mod flight_reachability {
             "the columnar fast path must skip pages: decoded {} of {} fetched",
             execution.page_bytes_decoded,
             execution.page_bytes_fetched,
+        );
+    }
+
+    /// The Flight encoder carries the nested `events` type end to end. Arrow IPC
+    /// encodes a `List(Struct{..., Map})` with no per-type handling in Ravel, so
+    /// this pins that claim on the shipping surface rather than assuming it: the
+    /// batch that comes back over `DoGet` must carry the declared column type
+    /// and the decoded event, and a span with no events must arrive null.
+    #[tokio::test]
+    async fn flight_sql_serializes_the_nested_events_column() {
+        let tenant = tenant_id("acme");
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let no_specs: &[SegSpec] = &[];
+        let harness = Harness::build(Arc::clone(&store), &[(&tenant, no_specs)]).await;
+
+        let with_event = super::span_with_events(
+            [0u8; 16],
+            0,
+            100,
+            "a-root",
+            &[super::otlp_event(
+                1_700_000_000_000_000_000,
+                "exception",
+                &[("exception.type", "ValueError")],
+            )],
+        );
+        let without_event = super::span_with_events([1u8; 16], 0, 200, "b-root", &[]);
+        publish_spans_segment(
+            harness.store.as_ref(),
+            &tenant,
+            &[with_event, without_event],
+        )
+        .await;
+
+        let ticket = harness
+            .get_flight_info(
+                "acme",
+                "SELECT trace_id, events FROM spans ORDER BY trace_id",
+            )
+            .await
+            .expect("flight info");
+        let batches = harness.do_get("acme", &ticket).await.expect("do get");
+
+        /// One row's decoded `events` value: null, or the single event's
+        /// timestamp, name, and attribute pairs.
+        type DecodedEvent = Option<(i64, String, Vec<(String, String)>)>;
+
+        let mut rows: Vec<DecodedEvent> = Vec::new();
+        for batch in &batches {
+            assert_eq!(
+                batch.schema().field(1).data_type(),
+                ravel_sql::spans_schema()
+                    .field(ravel_sql::SPAN_COL_EVENTS)
+                    .data_type(),
+                "the Flight stream carries the declared events type"
+            );
+            let events = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("events column is a list");
+            for i in 0..batch.num_rows() {
+                if events.is_null(i) {
+                    rows.push(None);
+                    continue;
+                }
+                let items = events.value(i);
+                let items = items
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("event items are structs");
+                assert_eq!(items.len(), 1, "the fixture span carries one event");
+                let ts = items
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("event ts is i64")
+                    .value(0);
+                let name = items
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("event name is Utf8")
+                    .value(0)
+                    .to_string();
+                let attrs = items
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<MapArray>()
+                    .expect("event attrs is a map");
+                let entries = attrs.value(0);
+                let keys = entries
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("map keys are Utf8");
+                let values = entries
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("map values are Utf8");
+                let pairs = (0..entries.len())
+                    .map(|k| (keys.value(k).to_string(), values.value(k).to_string()))
+                    .collect();
+                rows.push(Some((ts, name, pairs)));
+            }
+        }
+
+        assert_eq!(
+            rows,
+            vec![
+                Some((
+                    1_700_000_000_000_000_000,
+                    "exception".to_string(),
+                    vec![("exception.type".to_string(), "ValueError".to_string())],
+                )),
+                None,
+            ],
+            "the decoded event survives the Flight round trip, and an event-free span is null"
         );
     }
 }
