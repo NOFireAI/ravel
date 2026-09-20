@@ -81,6 +81,8 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
     "${DR_BUCKET_REPLICA}"
   printf '         then mirror %s into it, excluding the %s harness prefix\n' \
     "${DR_BUCKET_PRIMARY}" "${DR_HARNESS_PREFIX}"
+  printf '         and the %s qualification scratch prefix\n' \
+    "${DR_QUALIFY_SCRATCH_PREFIX}"
   if [[ "${RESET}" -eq 1 ]]; then
     printf '  reset: yes, and it refuses unless %s carries %s\n' \
       "${DR_BUCKET_REPLICA}" "${DR_BUCKET_MARKER_KEY}"
@@ -136,7 +138,11 @@ dr_log "mirroring ${DR_BUCKET_PRIMARY} into ${DR_BUCKET_REPLICA}"
 # The harness's own prefix is excluded: bucket A's creation marker is not
 # corpus, and copying it would overwrite bucket B's own marker with one naming
 # bucket A, which is exactly what dr_reset_bucket refuses to delete against.
+# The qualification scratch prefix is excluded for the same reason it is
+# dropped from every count: a probe fixture left behind by `store qualify` is
+# tooling output, and a restore target holding it is not a copy of the corpus.
 dr_mc mirror --overwrite --exclude "${DR_HARNESS_PREFIX}*" \
+  --exclude "${DR_QUALIFY_SCRATCH_PREFIX}*" \
   "dr/${DR_BUCKET_PRIMARY}/" "dr/${DR_BUCKET_REPLICA}/" \
   >"${DR_LOG_DIR}/replicate-mirror.log" 2>&1
 

@@ -129,6 +129,39 @@ DR_RESTORE_START_KEY="dr/restore-start.json"
 DR_BUCKET_MARKER_KEY="dr/rehearsal-bucket.json"
 DR_HARNESS_PREFIX="dr/"
 
+# The scratch prefix `ravel-cli store qualify` writes under
+# (docs/catalog-and-mvcc.md: `sys/qualify/<run-id>/...`, transient probe
+# fixtures with no lifecycle guarantee beyond the run that wrote them). The
+# suite never deletes them, so they outlive the seed's own qualification step
+# and sit in bucket A for the rest of the rehearsal. They are tooling output,
+# not corpus: nothing in the seeded corpus depends on them, no restore check
+# reads them, and counting them puts every band that is derived from the export
+# count off by however many keys the probes happened to write. Dropped from
+# every listing for the same reason `dr/` is. The durable qualification RECORD
+# is `sys/qualification`, which does not carry this prefix (`sys/qualif|y/` vs
+# `sys/qualif|ication`) and is counted as the control object it is.
+DR_QUALIFY_SCRATCH_PREFIX="sys/qualify/"
+
+# The page size the seed's qualification run declares. The two listing probes
+# each write `max(page_size + 2, 5)` keys and delete none of them, so the
+# default (1000, S3Store's production page size) leaves about 2004 objects in
+# bucket A before a single export is posted. At 2 each probe writes the floor
+# of 5 keys -- the fewest the suite will write at any page size -- and still
+# drains them over three key-bearing pages, so both the first-to-second and the
+# second-to-last page transitions are crossed rather than a single boundary.
+# It is also the page size `MemoryStore::with_page_size(2)` uses as this repo's
+# pagination oracle.
+#
+# What this trades away, deliberately: `S3Store::with_page_size` re-chunks an
+# already streamed listing client side rather than setting the wire-level
+# `ListObjectsV2` page size, so a small declared page size exercises the
+# pagination seam every catalog scan consumes but does not force a real
+# continuation token out of the backend. An operator qualifying a backend for
+# production should leave the flag at its default; this rehearsal needs a
+# bucket whose object count stays derivable from the corpus it seeded.
+# shellcheck disable=SC2034  # read by seed.sh, the only step that qualifies
+DR_QUALIFY_LIST_PAGE_SIZE=2
+
 # The file the pre-registered figures live in. seed.sh and replicate.sh write
 # it before any fault is injected; restore-check.sh reads it and refuses to
 # run without it, so every figure it asserts has a band fixed before the
@@ -467,12 +500,20 @@ dr_mc_available() {
   dr_have_command docker
 }
 
-# Drop the harness's own bookkeeping keys from a listing. They are not corpus:
-# a bucket holding only its creation marker is an empty restore target, and
-# the marker must not inflate a count whose band was fixed from bucket A.
-dr_strip_harness_keys() {
-  awk -v pfx="${DR_HARNESS_PREFIX}" '
-    NF > 0 && index($0, pfx) != 1 { print }
+# Drop every key the harness or the tooling it drives wrote from a listing:
+# the `dr/` bookkeeping prefix and the `sys/qualify/` conformance scratch
+# prefix. Neither is corpus. A bucket holding only its creation marker and a
+# qualification run's probe fixtures is an empty restore target, and neither
+# family may inflate a count whose band was derived from the seeded corpus.
+#
+# Applied in exactly one place, `dr_list_keys` and `dr_list_all_versions`
+# below, so every count and every emptiness proof in the harness -- the seed's
+# non-empty refusal, the reset's before and after counts, the replica's
+# must-be-empty check, the mirror's source and target counts, inject's
+# not-empty check, and each restore check's inventory -- excludes the same set.
+dr_strip_noncorpus_keys() {
+  awk -v pfx="${DR_HARNESS_PREFIX}" -v qual="${DR_QUALIFY_SCRATCH_PREFIX}" '
+    NF > 0 && index($0, pfx) != 1 && index($0, qual) != 1 { print }
   ' <<<"$1"
 }
 
@@ -483,7 +524,7 @@ dr_list_keys() {
   local bucket="$1" listing names
   listing="$(dr_mc ls --recursive "dr/${bucket}/")" || return 1
   names="$(awk 'NF > 0 { print $NF }' <<<"${listing}")"
-  dr_strip_harness_keys "${names}"
+  dr_strip_noncorpus_keys "${names}"
 }
 
 # Every key in a bucket INCLUDING noncurrent versions and delete markers. The
@@ -499,7 +540,7 @@ dr_list_all_versions() {
     listing="$(dr_mc ls --recursive "dr/${bucket}/")" || return 1
   fi
   names="$(awk 'NF > 0 { print $NF }' <<<"${listing}")"
-  dr_strip_harness_keys "${names}"
+  dr_strip_noncorpus_keys "${names}"
 }
 
 dr_count_lines() {
