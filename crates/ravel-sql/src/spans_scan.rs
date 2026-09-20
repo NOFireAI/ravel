@@ -204,8 +204,8 @@ pub struct SpansScanExec {
     /// wrapping a `ProjectionExec` above the scan for any column selection.
     projection: Option<Arc<Vec<usize>>>,
     /// Whether this scan may attempt the columnar fast path: the query-shape
-    /// clauses of [`columnar_static_eligible`] (projection excludes `attrs`, no
-    /// pending erasure). The remaining per-block clause (no `attrs_raw` overflow
+    /// clauses of [`columnar_static_eligible`] (projection excludes `attrs`
+    /// and `events`, no pending erasure). The remaining per-block clause (no `attrs_raw` overflow
     /// page) is checked as each block is decoded, in [`prepare_partition`].
     columnar_eligible: bool,
     schema: SchemaRef,

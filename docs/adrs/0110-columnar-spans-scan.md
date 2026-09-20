@@ -150,6 +150,14 @@ existing row path runs unchanged:
   column requiring the dynamic per-key columns, the `attrs_raw` overflow decode,
   and the `_events_raw` reconstruction, which is precisely the work the fast
   path exists to avoid;
+
+  Amended when the structured `events` column was added to the `spans` table:
+  the table now has twelve columns, and the eligibility rule excludes
+  `events` as well as `attrs`, because `events` is built from the same nested
+  event columns this clause exists to skip. Every count of "eleven columns"
+  elsewhere in this ADR describes the shape at the time it was written;
+  `crates/ravel-sql/src/spans_schema.rs` is the live list.
+
 - **no pending selective-erasure predicate applies to the query.** This clause
   is load-bearing, not hygiene. `SpansScanExec` carries
   `erasure: Arc<Vec<ErasurePredicate>>` (ADR-0064 decision 2) and excludes rows
