@@ -541,7 +541,10 @@ async fn a_run_agreeing_on_every_compared_construct_publishes_full_agreement() {
     let diverged = count_agreed_state(&report, AgreedState::Diverged);
     let not_compared = count_agreed_state(&report, AgreedState::NotCompared);
     let total = report.counts().total();
-    assert_eq!(diverged, 0, "a run report with no failures diverges nowhere");
+    assert_eq!(
+        diverged, 0,
+        "a run report with no failures diverges nowhere"
+    );
     assert!(
         not_compared > 0,
         "no construct is out of the compared set, so this run cannot show the \
@@ -663,7 +666,10 @@ fn a_report_the_difftest_lane_writes_loads_back() {
         loaded.failures[0].prometheus_body,
         written.failures[0].prometheus_body
     );
-    assert_eq!(loaded.failures[0].ravel_body, written.failures[0].ravel_body);
+    assert_eq!(
+        loaded.failures[0].ravel_body,
+        written.failures[0].ravel_body
+    );
 }
 
 /// How many constructs a folded-in differential run left in one agreed state.
@@ -740,8 +746,8 @@ async fn the_supplied_run_report_publishes_the_agreed_score() {
         return;
     };
     let path = PathBuf::from(path);
-    let run = load_run_report(&path)
-        .unwrap_or_else(|e| panic!("{REPORT_ENV}={}: {e}", path.display()));
+    let run =
+        load_run_report(&path).unwrap_or_else(|e| panic!("{REPORT_ENV}={}: {e}", path.display()));
     let report = build_report_with(Some(&run)).await;
 
     let agreed = report

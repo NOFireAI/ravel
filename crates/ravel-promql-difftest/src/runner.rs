@@ -175,19 +175,21 @@ pub async fn run_corpus(
         total: entries.len(),
         failures,
     };
-    publish_report(&report);
+    publish_report(&report, std::env::var_os(REPORT_OUT_ENV).map(PathBuf::from));
     report
 }
 
-/// Archives `report` when [`REPORT_OUT_ENV`] names a path.
+/// Archives `report` at `out`, if there is one. The path is passed in rather
+/// than read here so this is reachable from a test without mutating the
+/// process environment.
 ///
-/// A failed write aborts here rather than being reported to the caller: the
-/// only callers are tests, the path was asked for explicitly, and the run that
+/// A failed write aborts rather than being reported to the caller: the only
+/// callers are tests, the path was asked for explicitly, and the run that
 /// follows this call panics on a mismatch, so a swallowed error would end as a
 /// CI step reading `RAVEL_DIFFTEST_REPORT` and finding nothing, several minutes
 /// later and with no trace of why.
-fn publish_report(report: &RunReport) {
-    let Some(path) = std::env::var_os(REPORT_OUT_ENV).map(PathBuf::from) else {
+fn publish_report(report: &RunReport, out: Option<PathBuf>) {
+    let Some(path) = out else {
         return;
     };
     match report.write_json(&path) {
@@ -278,4 +280,68 @@ fn ms_to_seconds_str(ms: i64) -> String {
     let sign = if ms < 0 { "-" } else { "" };
     let abs = ms.unsigned_abs();
     format!("{sign}{}.{:03}", abs / 1000, abs % 1000)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn report() -> RunReport {
+        RunReport {
+            total: 2,
+            failures: vec![Failure {
+                entry_name: "instant_up".to_string(),
+                query: "up".to_string(),
+                detail: "value mismatch".to_string(),
+                prometheus_body: serde_json::json!({"status": "success"}),
+                ravel_body: Json::Null,
+            }],
+        }
+    }
+
+    /// The archived report carries the exact field names the conformance
+    /// table's loader reads, including through a parent directory that does not
+    /// exist yet (a CI path under a workspace directory the job has not created).
+    #[test]
+    fn publishing_a_report_writes_the_fields_the_loader_reads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("reports").join("run.json");
+        publish_report(&report(), Some(path.clone()));
+
+        let text = std::fs::read_to_string(&path).expect("the report must exist");
+        let json: Json = serde_json::from_str(&text).expect("the report must be JSON");
+        assert_eq!(json.get("total").and_then(Json::as_u64), Some(2));
+        let failures = json
+            .get("failures")
+            .and_then(Json::as_array)
+            .expect("failures is an array");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].get("entry_name").and_then(Json::as_str),
+            Some("instant_up")
+        );
+        assert_eq!(failures[0].get("query").and_then(Json::as_str), Some("up"));
+        assert_eq!(
+            failures[0].get("detail").and_then(Json::as_str),
+            Some("value mismatch")
+        );
+        assert_eq!(
+            failures[0].get("prometheus_body"),
+            Some(&serde_json::json!({"status": "success"}))
+        );
+        assert_eq!(failures[0].get("ravel_body"), Some(&Json::Null));
+    }
+
+    /// With no path asked for, nothing is written: the differential lane is the
+    /// only run that publishes a report.
+    #[test]
+    fn publishing_without_a_path_writes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        publish_report(&report(), None);
+        let written: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("reading the temp dir")
+            .collect();
+        assert!(written.is_empty());
+    }
 }
