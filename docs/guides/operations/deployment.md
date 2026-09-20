@@ -351,7 +351,12 @@ rotation is a rolling restart. Requirements for the worker certificate:
 - `extendedKeyUsage = serverAuth, clientAuth`. Both are required: the same
   certificate serves inbound fragment fetches and is presented as client
   identity on outbound ones. A `serverAuth`-only certificate serves fragments
-  but cannot dial them, and the dial fails at the handshake.
+  but cannot dial them, and the dial fails at the handshake. Startup reads the
+  certificate and refuses when `clientAuth` is absent, naming the file and the
+  missing usage, so an upgrade from a release that documented `serverAuth`
+  alone fails loudly instead of degrading every fan-out to coordinator-local
+  execution. A certificate carrying no `extendedKeyUsage` extension at all is
+  unconstrained and starts.
 - Signed by the CA distributed as `--fragment-tls-ca` to every query node.
 
 ### With cert-manager
@@ -386,6 +391,7 @@ Mount the Secret and point the flags at the projected paths:
 
 ```sh
 ravel-server --mode all --distributed-query \
+  --listen-grpc 0.0.0.0:4317 \
   --fragment-key-file /etc/ravel/fragment-keys \
   --fragment-listener 0.0.0.0:4319 \
   --fragment-tls-cert /etc/ravel/fragment-tls/tls.crt \
@@ -394,12 +400,19 @@ ravel-server --mode all --distributed-query \
   --advertise-fragment-endpoint "$POD_IP"
 ```
 
-The listener binds the wildcard so it answers on the pod's own address, but the
-heartbeat record must publish an address siblings can dial, so
+Both listeners bind the wildcard so they answer on the pod's own address, but
+the heartbeat record must publish addresses siblings can dial, so
 `--advertise-fragment-endpoint` is required here. Project the pod IP with the
 downward API (`fieldRef: status.podIP`), or pass the pod's stable DNS name from
 a headless Service. Without it, startup refuses rather than publishing
 `0.0.0.0:4319` for every peer to fail against.
+
+`--listen-grpc` is not optional in this example. The advertised host applies to
+both published endpoints, and the Flight SQL endpoint the SQL lane dials is
+always the public gRPC listener, which defaults to `127.0.0.1:4317`. Leaving
+the default in place advertises `$POD_IP:4317` to peers while nothing outside
+the pod's own loopback answers there, so every distributed SQL slice fetch
+fails at connect.
 
 cert-manager rewrites the Secret on renewal, but Ravel reads the files only at
 startup, so schedule a rolling restart of the query fleet on the renewal
@@ -419,12 +432,12 @@ openssl req -x509 -new -key fragment-ca.key -sha256 -days 3650 \
   -addext "keyUsage=critical,keyCertSign,cRLSign" \
   -out fragment-ca.crt
 
-# One worker certificate, SAN = ravel-fragment, EKU serverAuth.
+# One worker certificate, SAN = ravel-fragment, EKU serverAuth + clientAuth.
 openssl ecparam -genkey -name prime256v1 -out fragment.key
 openssl req -new -key fragment.key -subj "/CN=ravel-fragment" -out fragment.csr
 cat > fragment.ext <<'EOF'
 subjectAltName = DNS:ravel-fragment
-extendedKeyUsage = serverAuth
+extendedKeyUsage = serverAuth, clientAuth
 basicConstraints = CA:FALSE
 keyUsage = critical,digitalSignature,keyEncipherment
 EOF
@@ -436,6 +449,16 @@ Distribute `fragment-ca.crt` to every query node as `--fragment-tls-ca`, and
 `fragment.crt` with `fragment.key` as `--fragment-tls-cert` and
 `--fragment-tls-key`. Reissuing the worker certificate, or rotating the CA,
 takes effect on the next rolling restart.
+
+Check an existing certificate before the restart that turns the listener on:
+
+```sh
+openssl x509 -in fragment.crt -noout -ext extendedKeyUsage
+```
+
+It must list both `TLS Web Server Authentication` and `TLS Web Client
+Authentication`. A certificate issued against a release that documented
+`serverAuth` alone lists only the first, and startup refuses it.
 
 ### Rolling onto the dedicated listener
 
