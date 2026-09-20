@@ -144,6 +144,14 @@ pub struct MaintainReport {
     /// call (ADR-0065 decision 3), so the sweep never issues a second LIST of
     /// the shard's hours to compute it.
     pub head_tail_hours: Vec<u32>,
+    /// L0 commit records this pass found sealed but still below
+    /// `min_compaction_inputs` ([`CompactionOutcome::BelowMinInputs`]'s own
+    /// `count`), summed over every such bucket. These records sit live and
+    /// unswept until either a later flush pushes their bucket over the
+    /// threshold or retention expires the bucket outright; this is the only
+    /// L0-record count compaction exposes without an extra listing, so it is
+    /// the figure `ravel_maintain_l0_records_pending` renders (issue #1729).
+    pub l0_records_pending: usize,
 }
 
 /// List every ingest-hour bucket present under one `(tenant, signal, shard)`,
@@ -1219,11 +1227,14 @@ pub async fn scan_and_maintain_with_memo(
             | RetentionOutcome::NotExpired => match compaction {
                 Some(CompactionOutcome::NotSealed) => report.not_sealed += 1,
                 Some(CompactionOutcome::Compacted { .. }) => report.compacted += 1,
+                Some(CompactionOutcome::BelowMinInputs { count }) => {
+                    report.already_done += 1;
+                    report.l0_records_pending += count;
+                }
                 Some(
                     CompactionOutcome::AlreadyCompacted
                     | CompactionOutcome::RewritePresent
-                    | CompactionOutcome::Tombstoned
-                    | CompactionOutcome::BelowMinInputs { .. },
+                    | CompactionOutcome::Tombstoned,
                 ) => report.already_done += 1,
                 None => {}
             },
