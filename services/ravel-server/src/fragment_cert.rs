@@ -16,24 +16,25 @@ use std::path::Path;
 
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject as _;
-use simple_asn1::{ASN1Block, ASN1Class, OID, oid};
 
 /// `id-ce-extKeyUsage`, the certificate extension listing the purposes a
 /// certificate may be used for (RFC 5280 section 4.2.1.12).
-fn ext_key_usage_oid() -> OID {
-    oid!(2, 5, 29, 37)
-}
+const EXT_KEY_USAGE_OID: &str = "2.5.29.37";
 
 /// `id-kp-clientAuth`, the usage a TLS client certificate needs.
-fn client_auth_oid() -> OID {
-    oid!(1, 3, 6, 1, 5, 5, 7, 3, 2)
-}
+const CLIENT_AUTH_OID: &str = "1.3.6.1.5.5.7.3.2";
 
 /// `anyExtendedKeyUsage`: a certificate listing it is usable for every purpose,
 /// so it satisfies the `clientAuth` requirement.
-fn any_extended_key_usage_oid() -> OID {
-    oid!(2, 5, 29, 37, 0)
-}
+const ANY_EXTENDED_KEY_USAGE_OID: &str = "2.5.29.37.0";
+
+/// DER identifier octets for the handful of types this walk names. Everything
+/// else is skipped by its length without being interpreted.
+const TAG_OCTET_STRING: u8 = 0x04;
+const TAG_OBJECT_IDENTIFIER: u8 = 0x06;
+const TAG_SEQUENCE: u8 = 0x30;
+/// `[3] EXPLICIT Extensions OPTIONAL`, the last TBSCertificate field.
+const TAG_EXTENSIONS: u8 = 0xa3;
 
 /// Refuse startup when the fragment TLS identity at `path` cannot be presented
 /// as a client certificate.
@@ -51,9 +52,14 @@ pub fn ensure_client_auth_eku(path: &Path, cert_pem: &[u8]) -> anyhow::Result<()
     })?;
     let usages = extended_key_usages(der.as_ref()).map_err(|e| {
         anyhow::anyhow!(
-            "failed to parse --fragment-tls-cert {} as an X.509 certificate: {e}. Its \
-             extendedKeyUsage is read at startup so a certificate that cannot dial a peer is \
-             refused here rather than failing every outbound fragment handshake.",
+            "could not determine whether --fragment-tls-cert {} carries the clientAuth extended \
+             key usage: {e}. Read it yourself with `openssl x509 -in {} -noout -ext \
+             extendedKeyUsage`: the fragment listener is mutual TLS (ADR-0071 amendment decision \
+             1) and this process presents that certificate as its client identity on every \
+             outbound fragment dial, so a certificate without clientAuth fails every dial at the \
+             handshake. Startup refuses on an unreadable certificate rather than starting on one \
+             that may not be able to dial at all.",
+            path.display(),
             path.display()
         )
     })?;
@@ -61,7 +67,9 @@ pub fn ensure_client_auth_eku(path: &Path, cert_pem: &[u8]) -> anyhow::Result<()
         // No extension: unconstrained, so it can be presented as either role.
         return Ok(());
     };
-    if usages.contains(&client_auth_oid()) || usages.contains(&any_extended_key_usage_oid()) {
+    if usages.iter().any(|usage| {
+        usage.as_str() == CLIENT_AUTH_OID || usage.as_str() == ANY_EXTENDED_KEY_USAGE_OID
+    }) {
         return Ok(());
     }
     anyhow::bail!(
@@ -78,57 +86,131 @@ pub fn ensure_client_auth_eku(path: &Path, cert_pem: &[u8]) -> anyhow::Result<()
     );
 }
 
-/// The `extendedKeyUsage` OIDs of a DER-encoded X.509 certificate, or `None`
-/// when it carries no such extension.
-fn extended_key_usages(der: &[u8]) -> anyhow::Result<Option<Vec<OID>>> {
-    let blocks = simple_asn1::from_der(der)?;
-    let [ASN1Block::Sequence(_, certificate)] = blocks.as_slice() else {
-        anyhow::bail!("expected one top-level SEQUENCE (Certificate)");
+/// One DER element: its identifier octet and the contents the length octets
+/// delimit.
+struct Element<'a> {
+    tag: u8,
+    contents: &'a [u8],
+}
+
+/// Split the first DER element off `bytes`, returning it and what follows.
+///
+/// Only the tag and the length are interpreted, so a value this walk does not
+/// need is stepped over whatever it holds, including nothing at all.
+fn split_element(bytes: &[u8]) -> anyhow::Result<(Element<'_>, &[u8])> {
+    let [tag, rest @ ..] = bytes else {
+        anyhow::bail!("a DER element is missing its identifier octet");
     };
-    let Some(ASN1Block::Sequence(_, tbs)) = certificate.first() else {
+    if tag & 0x1f == 0x1f {
+        anyhow::bail!("a DER element uses the high-tag-number form, which X.509 does not");
+    }
+    let (length, rest) = match rest {
+        [first @ 0x00..=0x7f, rest @ ..] => (usize::from(*first), rest),
+        [0x80, ..] => anyhow::bail!("a DER element uses indefinite-length encoding"),
+        [first, rest @ ..] => {
+            let count = usize::from(first & 0x7f);
+            let Some((octets, rest)) = rest.split_at_checked(count) else {
+                anyhow::bail!("a DER element's long-form length is truncated");
+            };
+            let mut length = 0usize;
+            for octet in octets {
+                let Some(shifted) = length.checked_mul(256) else {
+                    anyhow::bail!("a DER element declares a length this platform cannot address");
+                };
+                length = shifted + usize::from(*octet);
+            }
+            (length, rest)
+        }
+        [] => anyhow::bail!("a DER element is missing its length octets"),
+    };
+    let Some((contents, rest)) = rest.split_at_checked(length) else {
+        anyhow::bail!("a DER element declares {length} content octets that are not present");
+    };
+    Ok((
+        Element {
+            tag: *tag,
+            contents,
+        },
+        rest,
+    ))
+}
+
+/// Every DER element of a constructed value's contents, in order.
+fn elements(contents: &[u8]) -> anyhow::Result<Vec<Element<'_>>> {
+    let mut rest = contents;
+    let mut found = Vec::new();
+    while !rest.is_empty() {
+        let (element, tail) = split_element(rest)?;
+        found.push(element);
+        rest = tail;
+    }
+    Ok(found)
+}
+
+/// The `extendedKeyUsage` OIDs of a DER-encoded X.509 certificate in
+/// dotted-decimal form, or `None` when it carries no such extension.
+///
+/// The walk descends by tag and length to the extensions and decodes nothing
+/// else, so a field that is legitimately empty (the subject and issuer
+/// distinguished names of the cert-manager certificate in
+/// docs/guides/operations/deployment.md are both the empty SEQUENCE) or
+/// legitimately absent is stepped over rather than parsed.
+fn extended_key_usages(der: &[u8]) -> anyhow::Result<Option<Vec<String>>> {
+    let (certificate, _) = split_element(der)?;
+    if certificate.tag != TAG_SEQUENCE {
+        anyhow::bail!("expected a SEQUENCE (Certificate) at the top level");
+    }
+    let Some(tbs) = elements(certificate.contents)?.into_iter().next() else {
         anyhow::bail!("expected a SEQUENCE (TBSCertificate) as the first Certificate field");
     };
-    // TBSCertificate's extensions are `[3] EXPLICIT Extensions OPTIONAL`; the
-    // version is `[0]`, so the tag is what selects the right field.
-    let extensions = tbs.iter().find_map(|field| match field {
-        ASN1Block::Explicit(ASN1Class::ContextSpecific, _, tag, inner)
-            if *tag == simple_asn1::BigUint::from(3u8) =>
-        {
-            Some(inner.as_ref())
-        }
-        _ => None,
-    });
-    let Some(extensions) = extensions else {
+    if tbs.tag != TAG_SEQUENCE {
+        anyhow::bail!("expected a SEQUENCE (TBSCertificate) as the first Certificate field");
+    }
+    // The version is `[0]` and the two unique identifiers are `[1]` and `[2]`,
+    // so the tag is what selects `[3] EXPLICIT Extensions OPTIONAL`.
+    let fields = elements(tbs.contents)?;
+    let Some(extensions) = fields.iter().find(|field| field.tag == TAG_EXTENSIONS) else {
         return Ok(None);
     };
-    let ASN1Block::Sequence(_, extensions) = extensions else {
-        anyhow::bail!("expected a SEQUENCE inside the [3] extensions field");
+    let inner = elements(extensions.contents)?;
+    let [extensions] = inner.as_slice() else {
+        anyhow::bail!("expected one SEQUENCE inside the [3] extensions field");
     };
-    for extension in extensions {
-        let ASN1Block::Sequence(_, fields) = extension else {
+    if extensions.tag != TAG_SEQUENCE {
+        anyhow::bail!("expected a SEQUENCE inside the [3] extensions field");
+    }
+    for extension in elements(extensions.contents)? {
+        if extension.tag != TAG_SEQUENCE {
+            continue;
+        }
+        let fields = elements(extension.contents)?;
+        let Some(id) = fields.first() else {
             continue;
         };
-        let Some(ASN1Block::ObjectIdentifier(_, id)) = fields.first() else {
-            continue;
-        };
-        if *id != ext_key_usage_oid() {
+        if id.tag != TAG_OBJECT_IDENTIFIER
+            || dotted_oid(id.contents).as_deref() != Some(EXT_KEY_USAGE_OID)
+        {
             continue;
         }
         // Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT FALSE,
         // extnValue OCTET STRING }; the value is always last.
-        let Some(ASN1Block::OctetString(_, value)) = fields.last() else {
+        let Some(value) = fields.last().filter(|last| last.tag == TAG_OCTET_STRING) else {
             anyhow::bail!("the extendedKeyUsage extension carries no OCTET STRING value");
         };
-        let value = simple_asn1::from_der(value)?;
-        let [ASN1Block::Sequence(_, purposes)] = value.as_slice() else {
+        let (purposes, _) = split_element(value.contents)?;
+        if purposes.tag != TAG_SEQUENCE {
             anyhow::bail!("expected a SEQUENCE of key purpose OIDs in extendedKeyUsage");
-        };
+        }
         return Ok(Some(
-            purposes
-                .iter()
-                .filter_map(|purpose| match purpose {
-                    ASN1Block::ObjectIdentifier(_, id) => Some(id.clone()),
-                    _ => None,
+            elements(purposes.contents)?
+                .into_iter()
+                .filter(|purpose| purpose.tag == TAG_OBJECT_IDENTIFIER)
+                // An OID this walk cannot read is reported as unreadable rather
+                // than dropped: it must not match clientAuth, and it must not
+                // vanish from the refusal that then names what the certificate
+                // carries.
+                .map(|purpose| {
+                    dotted_oid(purpose.contents).unwrap_or_else(|| "<unreadable OID>".to_string())
                 })
                 .collect(),
         ));
@@ -136,41 +218,66 @@ fn extended_key_usages(der: &[u8]) -> anyhow::Result<Option<Vec<OID>>> {
     Ok(None)
 }
 
+/// An OID's contents in the dotted-decimal spelling an operator reads in
+/// `openssl x509` output, or `None` when they are not a readable OID.
+fn dotted_oid(contents: &[u8]) -> Option<String> {
+    let mut arcs: Vec<u128> = Vec::new();
+    let mut value: u128 = 0;
+    let mut partial = false;
+    for octet in contents {
+        value = value
+            .checked_mul(128)?
+            .checked_add(u128::from(octet & 0x7f))?;
+        if octet & 0x80 != 0 {
+            partial = true;
+            continue;
+        }
+        if arcs.is_empty() {
+            // The first subidentifier packs the first two arcs: the root arc is
+            // 0, 1 or 2, and only the first two roots bound the second arc.
+            let (root, second) = match value {
+                0..40 => (0, value),
+                40..80 => (1, value - 40),
+                _ => (2, value - 80),
+            };
+            arcs.push(root);
+            arcs.push(second);
+        } else {
+            arcs.push(value);
+        }
+        value = 0;
+        partial = false;
+    }
+    if partial || arcs.is_empty() {
+        return None;
+    }
+    Some(
+        arcs.iter()
+            .map(u128::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
 /// The usages an operator would recognise in an error, named where RFC 5280
 /// names them and dotted otherwise.
-fn render_usages(usages: &[OID]) -> String {
+fn render_usages(usages: &[String]) -> String {
     if usages.is_empty() {
         return "no key purposes".to_string();
     }
     usages
         .iter()
-        .map(|usage| {
-            let dotted = dotted(usage);
-            match dotted.as_str() {
-                "1.3.6.1.5.5.7.3.1" => "serverAuth".to_string(),
-                "1.3.6.1.5.5.7.3.2" => "clientAuth".to_string(),
-                "1.3.6.1.5.5.7.3.3" => "codeSigning".to_string(),
-                "1.3.6.1.5.5.7.3.4" => "emailProtection".to_string(),
-                "1.3.6.1.5.5.7.3.8" => "timeStamping".to_string(),
-                "1.3.6.1.5.5.7.3.9" => "OCSPSigning".to_string(),
-                _ => dotted,
-            }
+        .map(|usage| match usage.as_str() {
+            "1.3.6.1.5.5.7.3.1" => "serverAuth",
+            "1.3.6.1.5.5.7.3.2" => "clientAuth",
+            "1.3.6.1.5.5.7.3.3" => "codeSigning",
+            "1.3.6.1.5.5.7.3.4" => "emailProtection",
+            "1.3.6.1.5.5.7.3.8" => "timeStamping",
+            "1.3.6.1.5.5.7.3.9" => "OCSPSigning",
+            other => other,
         })
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// An OID in the dotted-decimal spelling an operator reads in `openssl x509`
-/// output.
-fn dotted(oid: &OID) -> String {
-    match oid.as_vec::<u64>() {
-        Ok(arcs) => arcs
-            .iter()
-            .map(|arc| arc.to_string())
-            .collect::<Vec<_>>()
-            .join("."),
-        Err(_) => "<unreadable OID>".to_string(),
-    }
 }
 
 /// Operator-provisioned PEM fixtures (EC P-256, generated offline), shared
@@ -225,12 +332,95 @@ BAMCA0gAMEUCIQCLsdlIEagLDN1CCOwcrW/74ym1Vaa/zDdjvVub1ILWvAIgB/pu
 0J/dFiX2cexyWQroOm0v47FktsJqK90Be6jo8mY=
 -----END CERTIFICATE-----
 ";
+
+    /// `extendedKeyUsage = serverAuth, clientAuth` on a certificate whose
+    /// subject and issuer distinguished names are both the empty SEQUENCE.
+    /// The cert-manager `Certificate` in docs/guides/operations/deployment.md
+    /// asks for exactly this shape (it sets neither `commonName` nor
+    /// `subject`), so a check that cannot read it refuses the deployment this
+    /// repository documents.
+    pub(crate) const EMPTY_SUBJECT_BOTH_USAGES_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBlDCCATmgAwIBAgIUF5j4iNe9M3khdz1220WLLbWfTxwwCgYIKoZIzj0EAwIw
+ADAgFw0yNjA5MjAwOTIyMDlaGA8yMTI2MDgyNzA5MjIwOVowADBZMBMGByqGSM49
+AgEGCCqGSM49AwEHA0IABFU7D6aS6J3+U3QIwbcUMW6ghlpMXsgkI1hcLwh4qWgB
+I6gXyDCgG05L/w82fjUjtAy1aDbub94z0titzlCGS5ujgY4wgYswHQYDVR0OBBYE
+FJEAogTc71kojY5gmelfxmdSfKRMMB8GA1UdIwQYMBaAFJEAogTc71kojY5gmelf
+xmdSfKRMMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0lBBYwFAYIKwYBBQUHAwEGCCsG
+AQUFBwMCMBkGA1UdEQQSMBCCDnJhdmVsLWZyYWdtZW50MAoGCCqGSM49BAMCA0kA
+MEYCIQCwbjCYe3nazTQxb4xevEU6ExCK0t5KPKMJIGmBmiruSgIhAJanbT2hfxjA
+wnccV4duK2Ul5SiGWfSweSZZ/5nPIvON
+-----END CERTIFICATE-----
+";
+
+    /// The same empty-subject shape carrying `serverAuth` alone: an empty
+    /// distinguished name is not itself a reason to accept a certificate, so
+    /// this one must still refuse.
+    pub(crate) const EMPTY_SUBJECT_SERVER_AUTH_ONLY_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBiTCCAS+gAwIBAgIURFZnfQN8mbQyVHbi1ykXgd793+kwCgYIKoZIzj0EAwIw
+ADAgFw0yNjA5MjAwOTIyMjNaGA8yMTI2MDgyNzA5MjIyM1owADBZMBMGByqGSM49
+AgEGCCqGSM49AwEHA0IABD1raXcGhZOmFCsEs+WOFDTggxuXgXmWUQKaCi+WGGKm
+L0mCDuwGy37ITNwjhpG0beD5kNuGnIYN+zCcaItsUsSjgYQwgYEwHQYDVR0OBBYE
+FLJz8FA1KYu00nomCXtU0Ay9vzoGMB8GA1UdIwQYMBaAFLJz8FA1KYu00nomCXtU
+0Ay9vzoGMA8GA1UdEwEB/wQFMAMBAf8wEwYDVR0lBAwwCgYIKwYBBQUHAwEwGQYD
+VR0RBBIwEIIOcmF2ZWwtZnJhZ21lbnQwCgYIKoZIzj0EAwIDSAAwRQIhAMb2dKje
+ROd2O6b/lRD9jFN4vypkSMPfB1OqPQHGx1dWAiAZ2PuE9cEdzXDCAyKuPq2J12tf
+bmCMSVSJlWpbCBh0hQ==
+-----END CERTIFICATE-----
+";
+
+    /// `extendedKeyUsage = critical, serverAuth, clientAuth`: the extension
+    /// SEQUENCE carries a `critical BOOLEAN` between the OID and the value,
+    /// which is the DEFAULT-FALSE field cert-manager's `isCA` issuers and
+    /// several public CAs emit.
+    pub(crate) const CRITICAL_EKU_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIByTCCAW6gAwIBAgIUVbpswwccdaiLWDHYa/7b6nBJlYwwCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOcmF2ZWwtZnJhZ21lbnQwIBcNMjYwOTIwMDkyMjIzWhgPMjEy
+NjA4MjcwOTIyMjNaMBkxFzAVBgNVBAMMDnJhdmVsLWZyYWdtZW50MFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAE6v2rlOHWH4Gv7TMnWBYPRvqidjoXYuDC54GtiuE3
+V/niPwH6hyQrGVL/ycqvd5sntpN997I9rwbIXpGTsYaNiKOBkTCBjjAdBgNVHQ4E
+FgQU4RYiX1W1E+o77rjylp4Wiy8WBSwwHwYDVR0jBBgwFoAU4RYiX1W1E+o77rjy
+lp4Wiy8WBSwwDwYDVR0TAQH/BAUwAwEB/zAgBgNVHSUBAf8EFjAUBggrBgEFBQcD
+AQYIKwYBBQUHAwIwGQYDVR0RBBIwEIIOcmF2ZWwtZnJhZ21lbnQwCgYIKoZIzj0E
+AwIDSQAwRgIhAIhdiLeqp6Bj0YXiZ+TnpSfpj3fQSk215RpqpTTWfbfkAiEAr50z
+4vfbV91O32Bg3nExwZhpELN5ZAwK0/We8vpR+vU=
+-----END CERTIFICATE-----
+";
+
+    /// RSA-2048 with a three-RDN subject and a UTCTime `notAfter`, carrying
+    /// both usages: the field encodings an EC fixture never exercises.
+    pub(crate) const RSA_UTCTIME_BOTH_USAGES_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIDlzCCAn+gAwIBAgIUVyF+9/ZKIZtZ7ZQYMaScitUnlT0wDQYJKoZIhvcNAQEL
+BQAwPTESMBAGA1UECgwJTk9GaXJlIEFJMQ4wDAYDVQQLDAVSYXZlbDEXMBUGA1UE
+AwwOcmF2ZWwtZnJhZ21lbnQwHhcNMjYwOTIwMDkyMjIzWhcNMzYwOTE3MDkyMjIz
+WjA9MRIwEAYDVQQKDAlOT0ZpcmUgQUkxDjAMBgNVBAsMBVJhdmVsMRcwFQYDVQQD
+DA5yYXZlbC1mcmFnbWVudDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
+ANX0cznimJoYj1Sf/adrbk+tvgjKgZYlKJIMVdia6u1GpXdmOWaenPWUbh+i7kTX
+GZGMOtqTANtGN1QqpHcO9A8xmCvNSBAHrlDD0sD2BFZKlXgg4LkAohJk2ijhzL8o
+bVAVyHF+Lg6O0uBsZC85Ttk5AUPc0G1tSrUTaiyTPVK5xkdNM9ooXNOUY4ntCs4q
+acgBm42XPtmjFpEfuGHO7P+XczHC1Cpev8pgX5ihLA5Oq0CTuugWk9jKcFan2h2y
+nG58PXb+1oys0C6QVCbaTsIVurU3ngqhqm/uU0XDoUsfYFDiTUYfR1u8xNIhflRG
+OXZ/HOyTUUjEblkT+/5D/q8CAwEAAaOBjjCBizAdBgNVHQ4EFgQUptxKUvvRujQq
+ajQIer6bDeUmSYswHwYDVR0jBBgwFoAUptxKUvvRujQqajQIer6bDeUmSYswDwYD
+VR0TAQH/BAUwAwEB/zAdBgNVHSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwGQYD
+VR0RBBIwEIIOcmF2ZWwtZnJhZ21lbnQwDQYJKoZIhvcNAQELBQADggEBABwBfwpM
+I1+XejMFar0OEzIcjXvQi6r3I4APt3Zd/XLQURN1XjusfB1/1SKVsmermHmo+Zn+
+jLeOLEzC3akXP0bJmuqKczkOKph8/DmArcXs71Xl0NKI4hjcxFtN/EXmgbXzsBVH
+w8rga1T2fHQCx4G43lKjMpYBw2lm0gCxmuf7uD3SlkoJfE9y0YnVEnAzh0FW8tAT
+gpGp+nEQ017SM/w4NnrNq6LEOqb2onO8A4+7G6TTyjawcm8pYSln28B0ElaUnLiW
+6xnKu6wiGld3m1BI+V+gx2Vf6c/TZtxfEZqyXsgTlIWXZNaI+fN4Ces7jPD86WoB
+S38zc9lo/Ng0ve0=
+-----END CERTIFICATE-----
+";
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::test_certs::{BOTH_USAGES_PEM, NO_EKU_PEM, SERVER_AUTH_ONLY_PEM};
+    use super::test_certs::{
+        BOTH_USAGES_PEM, CRITICAL_EKU_PEM, EMPTY_SUBJECT_BOTH_USAGES_PEM,
+        EMPTY_SUBJECT_SERVER_AUTH_ONLY_PEM, NO_EKU_PEM, RSA_UTCTIME_BOTH_USAGES_PEM,
+        SERVER_AUTH_ONLY_PEM,
+    };
     use super::*;
 
     /// The upgrade hazard: nothing used to parse the certificate, so a
@@ -294,6 +484,105 @@ mod tests {
             .expect("parses")
             .expect("carries an extendedKeyUsage extension");
         assert_eq!(render_usages(&usages), "serverAuth");
+    }
+
+    /// The cert-manager `Certificate` in docs/guides/operations/deployment.md
+    /// requests neither `commonName` nor `subject`, so its subject and issuer
+    /// are both the empty SEQUENCE. The check must read past them to the
+    /// extensions.
+    #[test]
+    fn certificate_with_an_empty_subject_is_accepted() {
+        ensure_client_auth_eku(
+            Path::new("tls.crt"),
+            EMPTY_SUBJECT_BOTH_USAGES_PEM.as_bytes(),
+        )
+        .expect("an empty-subject certificate carrying clientAuth starts normally");
+    }
+
+    /// An empty distinguished name is not a reason to accept: the same shape
+    /// without `clientAuth` still refuses, with the message that names the
+    /// missing usage.
+    #[test]
+    fn empty_subject_server_auth_only_certificate_is_refused() {
+        let err = ensure_client_auth_eku(
+            Path::new("/etc/ravel/fragment-tls/tls.crt"),
+            EMPTY_SUBJECT_SERVER_AUTH_ONLY_PEM.as_bytes(),
+        )
+        .expect_err("an empty subject does not excuse a missing clientAuth usage");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing the clientAuth extended key usage"),
+            "the error names the missing usage: {msg}"
+        );
+        assert!(
+            msg.contains("it carries: serverAuth"),
+            "the error names what the certificate does carry: {msg}"
+        );
+    }
+
+    /// A `critical` BOOLEAN sits between the extension OID and its value, so
+    /// the value is not the second field of the extension SEQUENCE.
+    #[test]
+    fn certificate_with_a_critical_extension_is_accepted() {
+        ensure_client_auth_eku(Path::new("tls.crt"), CRITICAL_EKU_PEM.as_bytes())
+            .expect("a critical extendedKeyUsage listing clientAuth starts normally");
+    }
+
+    /// A different key type, a three-RDN subject, and a UTCTime `notAfter`:
+    /// every TBSCertificate field the check skips changes encoding here.
+    #[test]
+    fn rsa_certificate_with_a_utctime_expiry_is_accepted() {
+        ensure_client_auth_eku(Path::new("tls.crt"), RSA_UTCTIME_BOTH_USAGES_PEM.as_bytes())
+            .expect("an RSA certificate carrying clientAuth starts normally");
+    }
+
+    #[test]
+    fn empty_subject_usages_are_read_from_the_extension() {
+        let der =
+            CertificateDer::from_pem_slice(EMPTY_SUBJECT_BOTH_USAGES_PEM.as_bytes()).expect("PEM");
+        let usages = extended_key_usages(der.as_ref())
+            .expect("parses")
+            .expect("carries an extendedKeyUsage extension");
+        assert_eq!(render_usages(&usages), "serverAuth, clientAuth");
+    }
+
+    #[test]
+    fn critical_extension_usages_are_read_from_the_extension() {
+        let der = CertificateDer::from_pem_slice(CRITICAL_EKU_PEM.as_bytes()).expect("PEM");
+        let usages = extended_key_usages(der.as_ref())
+            .expect("parses")
+            .expect("carries an extendedKeyUsage extension");
+        assert_eq!(render_usages(&usages), "serverAuth, clientAuth");
+    }
+
+    /// A certificate this process cannot read at all is not silently accepted:
+    /// the walk cannot tell whether it carries `clientAuth`, so startup refuses
+    /// and the message says so and how to check.
+    #[test]
+    fn undeterminable_certificate_is_refused_with_a_way_to_check() {
+        // A CERTIFICATE block whose DER is a SEQUENCE header declaring 256
+        // content octets that are not there.
+        let truncated = "-----BEGIN CERTIFICATE-----\nMIIBAA==\n-----END CERTIFICATE-----\n";
+        let err = ensure_client_auth_eku(
+            Path::new("/etc/ravel/fragment-tls/tls.crt"),
+            truncated.as_bytes(),
+        )
+        .expect_err("a certificate whose usages cannot be determined must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "could not determine whether --fragment-tls-cert \
+                          /etc/ravel/fragment-tls/tls.crt carries the clientAuth extended key \
+                          usage"
+            ),
+            "the error names the path and what could not be determined: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "openssl x509 -in /etc/ravel/fragment-tls/tls.crt -noout -ext extendedKeyUsage"
+            ),
+            "the error tells the operator how to read the extension: {msg}"
+        );
     }
 
     #[test]
