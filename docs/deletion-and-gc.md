@@ -168,6 +168,21 @@ generation would clear on a stale HEAD, which names the raw inputs rather than
 any generation's outputs, and would delete a record while the inputs it erased
 a subject out of were still resolvable.
 
+A rewrite record landing outside both the fixed reconcile window and the
+frontier band is not left to wait indefinitely for one of those two passes to
+eventually cover its hour: `Catalog::fold_with_refold_request` (issue #526,
+ADR-0063 amendment) takes a caller-supplied set of ingest hours and re-lists
+them in the same fold call, closing the gap on demand instead of on a
+schedule. A request submitted to a fold call that turns out to be a
+**no-op** (nothing newly sealed beyond the previous watermark) reconciles
+**zero hours**, whatever hours it named: the targeted pass sits inside the
+same reconcile branch as the fixed window and the frontier band, and a
+no-op fold returns before that branch ever runs. `FoldReport`'s
+`refold_hours_reconciled` field reports the count, and is `0` on that path,
+on a plain `Catalog::fold` call, and on any request naming hours the pass
+did not reach (docs/adrs/0064-selective-subject-erasure.md, the no-op
+carve-out).
+
 HEAD read failures are explicit. An **absent** HEAD is NOT a block: with no
 snapshot naming anything, the sweep proceeds (ADR-0020: the catalog index is a
 pure optimization; a missing HEAD degrades to listing). A HEAD, or a covering
