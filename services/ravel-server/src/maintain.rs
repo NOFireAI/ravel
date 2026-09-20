@@ -308,8 +308,14 @@ impl MaintenanceSafetyMetrics {
     /// Scope is one process. A unit another replica owns is counted on that
     /// replica, so an operator reading the whole deployment sums the series
     /// across processes. A unit whose pass failed this cycle contributes
-    /// nothing, the same way its figures reach no other gauge here; that shows
-    /// up as `ravel_maintain_units_stalled`, not as a pending count.
+    /// nothing, the same way its figures reach no other gauge here, so a dip
+    /// is ambiguous between "less work pending" and "a unit was not reached".
+    /// `ravel_maintain_units_stalled` does not resolve that on its own: it
+    /// moves only for a per-unit failure repeated past the stall threshold,
+    /// and a tenant skipped for the whole tick (a failed legal-hold refresh, a
+    /// provisioning or shard-generation check) never reaches per-unit
+    /// accounting at all. The guide names the counters that do move for those
+    /// paths.
     ///
     /// [`orphans_present`]: Self::orphans_present
     /// [`publish_scan_cycle`]: Self::publish_scan_cycle
