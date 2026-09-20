@@ -817,6 +817,11 @@ ravel-cli load --parquet hits.parquet --tenant acme --mapping hits.toml \
   --read-cursors 1 --pipeline-depth 1 --skip-rows 4200000
 ```
 
+A `--skip-rows` larger than the file's row count is reported rather than
+treated as a quiet success: the load exits 0 having written nothing, and says
+which offset was asked for against how many rows the file holds. A value equal
+to the row count is the completed-resume case and stays silent.
+
 Even at those two settings the offset is a floor, not an exact boundary. One
 batch spans every shard its rows hash to, and the batch that failed can have
 committed on some of those shards and not others. Those rows are in the

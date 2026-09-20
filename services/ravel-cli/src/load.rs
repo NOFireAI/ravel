@@ -570,6 +570,17 @@ pub(crate) async fn run_warning_to(
     {
         Ok(report) => {
             print_summary(&report);
+            // A requested offset past the end of the file is always an operator
+            // error: resuming an already-complete file needs
+            // `--skip-rows == total rows` exactly, and anything larger is a
+            // typo or an offset carried over from a different file. The run
+            // still succeeds (it has nothing left to do), but the clamped
+            // `rows_skipped` in the summary above cannot show that the request
+            // exceeded the file, so a resume script reading only the exit code
+            // would record the load as done.
+            if let Some(warning) = skip_rows_past_end_warning(&report) {
+                let _ = writeln!(warnings, "{warning}");
+            }
             // Early, so an operator watching a long load sees it as soon as it is
             // known, ahead of the end-of-load dynamic-column pressure warnings.
             if let Some(skew) = &report.skew_warning {
@@ -604,6 +615,27 @@ pub(crate) async fn run_warning_to(
             }
             Err(anyhow::Error::new(err))
         }
+    }
+}
+
+/// The warning for a `--skip-rows` past the end of the file, or `None` when the
+/// requested offset was within it (including the `== total_rows` case, which is
+/// the legitimate resume of an already-complete file and stays silent).
+///
+/// Named both numbers on purpose: the summary prints the CLAMPED
+/// `rows_skipped`, so without the requested value beside the file's total an
+/// operator cannot tell a completed resume from an offset that missed the file
+/// entirely.
+fn skip_rows_past_end_warning(report: &LoadReport) -> Option<String> {
+    if report.skip_rows_requested > report.file_total_rows {
+        Some(format!(
+            "warning: --skip-rows {} is past the end of this file, which holds {} rows. Nothing \
+             was loaded. Resuming an already-complete file takes --skip-rows equal to the row \
+             count, so a larger value is a typo or an offset from a different file.",
+            report.skip_rows_requested, report.file_total_rows
+        ))
+    } else {
+        None
     }
 }
 
@@ -815,6 +847,15 @@ pub struct LoadReport {
     /// only when this run used one read cursor and a pipeline depth of 1; see
     /// [`ResumeFigures`].
     pub rows_skipped: u64,
+    /// The `--skip-rows` value as the operator gave it, before the clamp to the
+    /// file's row count, and the file's own total. They differ only when the
+    /// requested offset is past the end of the file, which is always an
+    /// operator error: a resume of an already-complete file needs
+    /// `skip_rows == total_rows` exactly. `run_warning_to` reports that case,
+    /// because the clamped `rows_skipped` alone cannot show it.
+    pub skip_rows_requested: u64,
+    /// The file's total row count, read from the Parquet footer.
+    pub file_total_rows: u64,
     /// One token per shard acked, across every batch, in submission order. At
     /// the default `--target-bytes 1` that is one token per object written; at
     /// a larger target one flush answers several batches' acks with the same
@@ -1392,6 +1433,8 @@ async fn load_instrumented(
     // having written nothing (issue #1713).
     let total_rows: u64 = row_group_lens.iter().sum();
     report.rows_skipped = skip_rows.min(total_rows);
+    report.skip_rows_requested = skip_rows;
+    report.file_total_rows = total_rows;
     let mut shards_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut data_batches_flushed: u64 = 0;
 
@@ -9517,6 +9560,48 @@ type = "i64"
             assert!(
                 decoded_records(store.as_ref()).await.is_empty(),
                 "no RLOG object holds any record when every row is skipped"
+            );
+
+            // The clamped figure above cannot show that the REQUEST missed the
+            // file, so the report carries the requested value beside the
+            // file's own total and the warning is built from those two.
+            assert_eq!(
+                (report.skip_rows_requested, report.file_total_rows),
+                (1_000, 10),
+                "the unclamped request and the file's row count are both carried"
+            );
+            let warning = skip_rows_past_end_warning(&report)
+                .expect("a request past the end of the file must warn");
+            assert!(
+                warning.contains("--skip-rows 1000") && warning.contains("10 rows"),
+                "the warning names the requested offset and the file's row count: {warning}"
+            );
+        }
+
+        /// `--skip-rows` EQUAL to the file's row count is the legitimate resume
+        /// of an already-complete file, so it stays silent while a strictly
+        /// larger value warns. Without this case the warning could be written
+        /// as `>=` and nothing would fail, which would make every completed
+        /// resume print an error-shaped line.
+        ///
+        /// Non-vacuity (prove-the-test): changing the predicate in
+        /// `skip_rows_past_end_warning` from `>` to `>=` fails this test on the
+        /// `is_none` assertion while leaving the case above passing.
+        #[tokio::test]
+        async fn skip_rows_exactly_at_the_end_lands_nothing_and_stays_silent() {
+            let (_dir, pq, m, _full) = skip_rows_fixture(10);
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+            let report = run_skip_rows(Arc::clone(&store), &pq, &m, 10).await;
+
+            assert_eq!(
+                (report.rows_skipped, report.rows_processed),
+                (10, 0),
+                "a skip of exactly the row count drops every row and writes none"
+            );
+            assert!(
+                skip_rows_past_end_warning(&report).is_none(),
+                "a completed resume is not an operator error and must not warn"
             );
         }
 
