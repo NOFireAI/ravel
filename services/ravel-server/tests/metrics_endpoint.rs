@@ -15,8 +15,12 @@ use ravel_types::TenantId;
 const TOKEN: &str = "testtoken";
 
 /// Mirrors `health_endpoints.rs`'s helper: an in-process server backed by
-/// `MemoryStore`, parameterized by mode.
-async fn start_test_server(mode: Mode, process_memory_budget_bytes: u64) -> ravel_server::Running {
+/// `MemoryStore`, parameterized by mode and by whether it spawns a fold task.
+async fn start_test_server(
+    mode: Mode,
+    process_memory_budget_bytes: u64,
+    fold_enabled: bool,
+) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
@@ -38,7 +42,7 @@ async fn start_test_server(mode: Mode, process_memory_budget_bytes: u64) -> rave
         mtls_listener: None,
         fold_tenants: Vec::new(),
         fold: FoldTaskConfig {
-            enabled: false,
+            enabled: fold_enabled,
             ..FoldTaskConfig::default()
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
@@ -91,7 +95,7 @@ async fn start_test_server(mode: Mode, process_memory_budget_bytes: u64) -> rave
 #[tokio::test]
 async fn metrics_served_in_every_mode() {
     for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
-        let running = start_test_server(mode, u64::MAX).await;
+        let running = start_test_server(mode, u64::MAX, false).await;
         let base = format!("http://{}", running.http_addr);
         let client = reqwest::Client::new();
 
@@ -142,7 +146,7 @@ async fn metrics_ingest_family_present_only_in_ingest_modes() {
         (Mode::Query, false),
         (Mode::Maintain, false),
     ] {
-        let running = start_test_server(mode, u64::MAX).await;
+        let running = start_test_server(mode, u64::MAX, false).await;
         let base = format!("http://{}", running.http_addr);
         let client = reqwest::Client::new();
 
@@ -171,21 +175,26 @@ async fn metrics_ingest_family_present_only_in_ingest_modes() {
 /// read by four different subsystems, and `compaction-part` is observed in
 /// exactly the mode that folds nothing, so gating it on folding would hide a
 /// defect signal where it is most likely to appear. The fold stamp-coverage
-/// pair renders only where a fold task exists, which is every mode but
-/// `Mode::Maintain`, and is omitted rather than zero-padded there.
+/// pair renders only where a fold task is actually spawned: `Mode::Maintain`
+/// never spawns one regardless of `--disable-fold`, and every other mode
+/// spawns one only when the fold is also enabled. A process run with
+/// `--mode all --disable-fold` must therefore omit the pair the same as a
+/// `maintain` process, not render it at a zero that never moves.
 ///
 /// Each family is counted, not merely tested for presence: a family emitted
 /// twice is a duplicate series a scrape rejects, and a duplicate reads the
 /// same as a single one to `contains`.
 #[tokio::test]
 async fn metrics_declared_stats_families_render_once_where_the_fold_runs() {
-    for (mode, mode_label, expect_fold) in [
-        (Mode::All, "all", true),
-        (Mode::Gateway, "gateway", true),
-        (Mode::Query, "query", true),
-        (Mode::Maintain, "maintain", false),
+    for (mode, mode_label, fold_enabled, expect_fold) in [
+        (Mode::All, "all", true, true),
+        (Mode::All, "all", false, false),
+        (Mode::Gateway, "gateway", true, true),
+        (Mode::Query, "query", true, true),
+        (Mode::Maintain, "maintain", true, false),
+        (Mode::Maintain, "maintain", false, false),
     ] {
-        let running = start_test_server(mode, u64::MAX).await;
+        let running = start_test_server(mode, u64::MAX, fold_enabled).await;
         let base = format!("http://{}", running.http_addr);
         let client = reqwest::Client::new();
 
@@ -227,16 +236,16 @@ async fn metrics_declared_stats_families_render_once_where_the_fold_runs() {
             assert_eq!(
                 body.matches(&format!("# TYPE {family} counter")).count(),
                 usize::from(expect_fold),
-                "mode {mode:?} fold family {family} header count should be \
-                 {}:\n{body}",
+                "mode {mode:?} fold_enabled={fold_enabled} family {family} header \
+                 count should be {}:\n{body}",
                 usize::from(expect_fold)
             );
             assert_eq!(
                 body.matches(&format!("{family}{{mode=\"{mode_label}\"}} "))
                     .count(),
                 usize::from(expect_fold),
-                "mode {mode:?} fold family {family} sample count should be \
-                 {}:\n{body}",
+                "mode {mode:?} fold_enabled={fold_enabled} family {family} sample \
+                 count should be {}:\n{body}",
                 usize::from(expect_fold)
             );
         }
@@ -252,7 +261,7 @@ async fn metrics_declared_stats_families_render_once_where_the_fold_runs() {
 #[tokio::test]
 async fn metrics_memory_budget_family_reflects_configured_budget() {
     const BUDGET_BYTES: u64 = 123_456_789;
-    let running = start_test_server(Mode::All, BUDGET_BYTES).await;
+    let running = start_test_server(Mode::All, BUDGET_BYTES, false).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
