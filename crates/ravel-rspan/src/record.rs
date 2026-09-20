@@ -847,10 +847,7 @@ mod tests {
 
         // Garbage never panics: the pairs read before the unparseable byte are
         // kept, the rest is abandoned.
-        let mut truncated = len_field(
-            0x1a,
-            &key_value("kept", &len_field(0x0a, b"yes")),
-        );
+        let mut truncated = len_field(0x1a, &key_value("kept", &len_field(0x0a, b"yes")));
         truncated.extend_from_slice(&[0x1a, 0x7f, 0x01]); // length runs past the end
         assert_eq!(
             event_attrs(&truncated),

@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryBuilder, Int64Array, ListArray, MapBuilder, StringArray,
+    ArrayRef, FixedSizeBinaryBuilder, Int64Array, ListArray, MapBuilder, StringArray,
     StringBuilder, StructArray, TimestampNanosecondArray, UInt8Array,
 };
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
@@ -129,8 +129,7 @@ pub(crate) fn columnar_static_eligible(
     erasure: &[ErasurePredicate],
 ) -> bool {
     erasure.is_empty()
-        && projection
-            .is_some_and(|p| !p.contains(&SPAN_COL_ATTRS) && !p.contains(&SPAN_COL_EVENTS))
+        && projection.is_some_and(|p| !p.contains(&SPAN_COL_ATTRS) && !p.contains(&SPAN_COL_EVENTS))
 }
 
 /// The RSPAN column ids a columnar decode must materialize for `projection`
