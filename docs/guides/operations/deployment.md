@@ -391,6 +391,7 @@ Mount the Secret and point the flags at the projected paths:
 
 ```sh
 ravel-server --mode all --distributed-query \
+  --listen-grpc 0.0.0.0:4317 \
   --fragment-key-file /etc/ravel/fragment-keys \
   --fragment-listener 0.0.0.0:4319 \
   --fragment-tls-cert /etc/ravel/fragment-tls/tls.crt \
@@ -399,12 +400,19 @@ ravel-server --mode all --distributed-query \
   --advertise-fragment-endpoint "$POD_IP"
 ```
 
-The listener binds the wildcard so it answers on the pod's own address, but the
-heartbeat record must publish an address siblings can dial, so
+Both listeners bind the wildcard so they answer on the pod's own address, but
+the heartbeat record must publish addresses siblings can dial, so
 `--advertise-fragment-endpoint` is required here. Project the pod IP with the
 downward API (`fieldRef: status.podIP`), or pass the pod's stable DNS name from
 a headless Service. Without it, startup refuses rather than publishing
 `0.0.0.0:4319` for every peer to fail against.
+
+`--listen-grpc` is not optional in this example. The advertised host applies to
+both published endpoints, and the Flight SQL endpoint the SQL lane dials is
+always the public gRPC listener, which defaults to `127.0.0.1:4317`. Leaving
+the default in place advertises `$POD_IP:4317` to peers while nothing outside
+the pod's own loopback answers there, so every distributed SQL slice fetch
+fails at connect.
 
 cert-manager rewrites the Secret on renewal, but Ravel reads the files only at
 startup, so schedule a rolling restart of the query fleet on the renewal
