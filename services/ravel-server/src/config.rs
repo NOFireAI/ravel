@@ -1583,6 +1583,10 @@ pub struct Cli {
     /// unless a NAT or port mapping makes the fragment listener reachable on a
     /// different one than it bound; a host-only value keeps the bound port,
     /// which is what makes an ephemeral (`:0`) bind still advertise correctly.
+    /// A port is accepted only alongside `--fragment-listener`: without one
+    /// both endpoints are the same socket, so a port here would be applied to
+    /// the fragment endpoint and not to the Flight SQL endpoint, publishing one
+    /// correct endpoint and one wrong one. Startup refuses that combination.
     ///
     /// An IPv6 literal may be written bare (`fd00::1`) or bracketed
     /// (`[fd00::1]:4319`); it is always advertised bracketed, so the value is a
@@ -4890,6 +4894,30 @@ impl Cli {
                  advertised endpoints are only published in the sys/query/workers heartbeat \
                  record a distributed-query process writes, so without the flag this value is \
                  inert. Set --distributed-query, or drop --advertise-fragment-endpoint."
+            );
+        }
+        // Issue #1724: the port half names the fragment lane only, because the
+        // Flight SQL lane always carries the public gRPC listener's own bound
+        // port. In the combined layout there is no separate fragment lane to
+        // name: both are the one public gRPC socket, so a port override
+        // advertises a mapped port for one endpoint and the bound port for the
+        // other, and exactly one of the two published values is wrong. Refuse
+        // rather than advertise something wrong.
+        if let (Some(advertise), Some(raw)) = (
+            advertise.as_ref(),
+            self.advertise_fragment_endpoint.as_deref(),
+        ) && advertise.port.is_some()
+            && self.fragment_listener.is_none()
+        {
+            anyhow::bail!(
+                "--advertise-fragment-endpoint '{raw}' carries a port, but no --fragment-listener \
+                 is configured: in the combined layout both published lanes are served by the \
+                 public gRPC listener '{}', and the port half of this flag reaches the fragment \
+                 lane only. The Flight SQL endpoint would keep the bound port while the fragment \
+                 endpoint took the override, so one of the two endpoints published for the same \
+                 socket would be wrong. Advertise a host only, or configure --fragment-listener \
+                 so the fragment lane has its own port to map.",
+                self.listen_grpc
             );
         }
         if self.distributed_query {
@@ -10553,6 +10581,78 @@ mod tests {
         ])
         .validate()
         .expect("a loopback bind advertises a dialable address on its own");
+    }
+
+    /// Issue #1724: in the combined layout both published lanes are the one
+    /// public gRPC socket, and the port half of the flag reaches only the
+    /// fragment lane. Accepting it would publish the override for the fragment
+    /// endpoint and the bound port for the Flight SQL endpoint, so a port
+    /// mapping advertises one correct endpoint and one wrong one. Startup
+    /// refuses the combination.
+    #[test]
+    fn advertised_port_without_a_fragment_listener_fails_validate() {
+        let key = fragment_key_tmp();
+        let err = cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            key.path().to_str().expect("utf8"),
+            "--listen-grpc",
+            "0.0.0.0:4317",
+            "--advertise-fragment-endpoint",
+            "worker-3.ravel.svc:31319",
+        ])
+        .validate()
+        .expect_err("an advertised port with no dedicated fragment listener must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("worker-3.ravel.svc:31319"),
+            "the error names the value as written: {msg}"
+        );
+        assert!(
+            msg.contains("--fragment-listener"),
+            "the error names the flag whose absence makes the port meaningless: {msg}"
+        );
+        assert!(
+            msg.contains("0.0.0.0:4317"),
+            "the error names the one socket both lanes share: {msg}"
+        );
+        assert!(
+            msg.contains("Advertise a host only"),
+            "the error names the fix: {msg}"
+        );
+    }
+
+    /// The two controls for the refusal above: a host-only value in the
+    /// combined layout is the normal case and must still validate, and the
+    /// same `host:port` value is legitimate once a dedicated fragment listener
+    /// gives the fragment lane its own port to map.
+    #[test]
+    fn advertised_port_is_accepted_only_with_a_dedicated_fragment_listener() {
+        let key = fragment_key_tmp();
+        let key_path = key.path().to_str().expect("utf8");
+        cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            key_path,
+            "--listen-grpc",
+            "0.0.0.0:4317",
+            "--advertise-fragment-endpoint",
+            "worker-3.ravel.svc",
+        ])
+        .validate()
+        .expect("a host-only value in the combined layout advertises both bound ports");
+
+        let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
+        let mut args = fragment_tls_args(key_path, &material);
+        args.extend_from_slice(&[
+            "--listen-grpc",
+            "0.0.0.0:4317",
+            "--advertise-fragment-endpoint",
+            "worker-3.ravel.svc:31319",
+        ]);
+        cli(&args)
+            .validate()
+            .expect("a dedicated fragment listener gives the advertised port a lane of its own");
     }
 
     #[test]

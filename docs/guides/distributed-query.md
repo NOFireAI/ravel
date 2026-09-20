@@ -276,6 +276,13 @@ ravel-server --mode all \
   to the fragment endpoint only; the Flight SQL endpoint always carries the
   public gRPC listener's own bound port, because the two endpoints name
   different services and one port cannot stand for both.
+- A port is therefore only accepted alongside a dedicated `--fragment-listener`.
+  In the combined layout both endpoints are the one public gRPC socket, so a
+  port override would reach the fragment endpoint and leave the Flight SQL
+  endpoint on the bound port: one of the two published endpoints for the same
+  socket would be wrong. Startup refuses `host:port` there and names the
+  listener both lanes share. Advertise a host only, or give the fragment lane
+  its own listener.
 - Omit the port unless a NAT or port mapping makes the fragment listener
   reachable on a port other than the one it bound. A host-only value keeps each
   listener's own bound port.
