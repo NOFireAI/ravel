@@ -58,7 +58,7 @@ guide](caching.md) documents both. `kind` splits the maintenance
 merge-memory gauge into its transient and total high-water marks. `class`
 splits the fragment in-flight gauge and admission-wait counter into their
 `pinned` and `resolve` fragment admission classes. `carrier` splits the
-declared-statistics drop tally across the four carriers that can drop them.
+declared-statistics drop tally across its four carrier labels.
 `outcome` splits the alert-tick counter by how one evaluation tick ended, `allocator`
 and `stat` carry the process allocator gauges, and `component` splits the
 memory budget's reserved-bytes gauge by which side reserved it. The `level`
@@ -510,7 +510,17 @@ tally on the read side, and one coverage pair at the fold.
 `carrier` is a closed set of four: `commit-record` and `compaction-part` are
 the two stamp carriers, `snapshot-entry` is the fold's copy of them, and
 `cstat` is the `.cstat` object's own `ColumnStat` entries, whose reader lives
-in `ravel-sql`. The drop tally counts OBSERVATIONS, not distinct defects: one
+in `ravel-sql`.
+
+`snapshot-entry` renders in every exposition and no shipped code path
+increments it. The catalog re-validates a snapshot entry by converting it to
+its commit-record twin and reading it through the commit-record reader, so a
+drop on the fold's copy is observed under `commit-record` along with the
+fold's own reads of commit records. Read a flat `snapshot-entry` series as
+"not reported separately", never as "the fold's copies are clean", and do not
+build a remediation step on it.
+
+The drop tally counts OBSERVATIONS, not distinct defects: one
 defective record read by a thousand queries counts a thousand times, because
 deduplicating per entry would need unbounded state keyed by (object, column)
 on a path walked once per segment per query. So compare its rate across equal
@@ -561,7 +571,7 @@ groups:
           sum(increase(ravel_catalog_fold_stamped_records_total[1h]))
             >
           sum(increase(ravel_catalog_fold_stamped_entries_total[1h]))
-        for: 15m
+        for: 5m
         labels:
           severity: warning
         annotations:
@@ -572,11 +582,14 @@ groups:
             Declared-column statistics are being read off commit records or
             compaction parts and not carried onto the snapshot entries the
             query side prunes with, so pruning silently degrades to a full scan
-            on the affected segments. Check
-            ravel_declared_stats_drops_observed_total with
-            carrier="commit-record" and carrier="compaction-part" for stamps
-            the validity predicate is rejecting, and carrier="snapshot-entry"
-            for the fold's own copy.
+            on the affected segments. A shortfall means every stamp of some
+            carrier was dropped as defective, so
+            ravel_declared_stats_drops_observed_total names the writer:
+            compare its rate on carrier="commit-record" against
+            carrier="compaction-part" over the same window as the shortfall.
+            Read carrier="commit-record" as the union of two readers, the fold
+            reading commit records and the query side re-validating snapshot
+            entries, which reports under that same label.
       - alert: RavelFoldStampCoverageMissing
         expr: |
           absent(ravel_catalog_fold_stamped_records_total)
@@ -619,9 +632,21 @@ fleet-wide sums are what "is this catalog carrying its stamps" is a question
 about. `increase(...[1h])` rather than the raw totals because both are
 monotonic process-lifetime counters: a process that carried a shortfall once
 and has been healthy since keeps the raw gap forever, and only a windowed rate
-distinguishes a live shortfall from a scar. `for: 15m` covers the one benign
-way the two can diverge briefly, a fold that reads a batch of stamped records
-in one scrape interval and writes their entries in the next.
+distinguishes a live shortfall from a scar.
+
+`for: 5m` is a hold against a single anomalous sample, and against nothing
+else. A fold pass publishes both halves at the moment it commits its `HEAD`,
+as two adjacent increments inside one call, so the totals move together:
+there is no state where a pass's carriers are counted for minutes before its
+entries are, and no benign reading in which a divergence is waiting to close
+on its own. What the hold covers is a scrape that lands between those two
+increments. They are two separate counters read by two separate loads, so one
+exposition can carry the records increment without the entries increment, and
+that sample skews the windowed increase for as long as it is the newest point
+in the window, which is one scrape interval. A few scrape intervals of
+agreement rule it out. Past the hold, the gap is a carrier every one of whose
+stamps was dropped, so treat a shortfall that survives the hold as live and
+work it through the drop tally; it will not clear by waiting.
 
 The pair cannot detect a stamp that was never written. Both counters live on
 the fold, so an ingest pipeline that stops stamping entirely drives both to
@@ -634,6 +659,29 @@ What distinguishes the two is a signal that rises when data arrives: an
 ingest-side rate that is moving while both fold counters stay at zero means
 the fold is reading records that carry no stamps. That comparison is what to
 alert on for a rollout, and neither of these two counters can make it alone.
+
+That comparison covers the ingest half of a rollout only. Compaction is the
+other writer of a stamp, and a compactor of an older shape, sealing
+compaction parts with an empty statistics list, is invisible to every series
+in this section. The fold counts a carrier only when its list is non-empty,
+so an empty one increments neither half, and the drop tally counts entries a
+reader rejected, of which an empty list has none. A fleet whose ingest and
+fold are upgraded while one compactor is not keeps both fold counters rising
+at the L0 rate, in step, ratio at one, while every L1 segment that compactor
+seals is uncovered for every declared-column statistic and every query over
+it gives up the shortcut.
+
+Two things see that, and neither is in the exposition. The first is the fold
+report, which carries the same two numbers per pass instead of summed over
+the process: `ravel-cli catalog fold` prints `stamped_records` and
+`stamped_entries` for the pass it just ran, so a fold of one tenant whose
+recent hours have just been compacted reports what those parts contributed as
+carriers, and a pass that folds compaction output and counts no carriers for
+it is the signal a fleet-wide sum hides. The second is rollout order, which
+is what actually settles it: compaction runs only in `maintain`, a `maintain`
+process renders neither fold counter, and no counter on any process reports
+which shape a compactor writes. Upgrade every `maintain` process before
+reading the pair as an answer about the whole fleet.
 
 ### Tenancy adoption (`ravel_tenancy_v1_unkeyed_adoptions_total`)
 
