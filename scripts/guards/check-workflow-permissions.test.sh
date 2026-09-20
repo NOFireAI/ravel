@@ -290,6 +290,82 @@ YML
 check "an allow marker not in the block above the key does not apply" "${d}" 1 \
   "top-level-write"
 
+# --- checkout-persists-credentials ------------------------------------------
+
+d="$(new_tree checkout-no-persist)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: cargo build
+YML
+check "checkout_without_persist_credentials_false_fails" "${d}" 1 \
+  ".github/workflows/w.yml:10: checkout-persists-credentials"
+
+d="$(new_tree checkout-with-persist)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: cargo build
+YML
+check "a checkout with persist-credentials: false is clean" "${d}" 0 "clean"
+
+# The allow marker needs a reason; a bare marker does not suppress.
+d="$(new_tree checkout-allow-no-reason)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # workflow-permissions-allow: persist-credentials
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: docker push
+YML
+check "an allow marker with no reason does not suppress the checkout finding" \
+  "${d}" 1 "checkout-persists-credentials"
+
+d="$(new_tree checkout-allow-with-reason)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # workflow-permissions-allow: persist-credentials -- this job pushes
+      # tags back to the checked-out remote after the build, so the token
+      # must stay in .git/config for that push to authenticate.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: git push --tags
+YML
+check "an allow marker with a reason suppresses the checkout finding" \
+  "${d}" 0 "clean"
+
 # --- the anchor ------------------------------------------------------------
 #
 # The rule the ticket asks for by name: a scan that finds nothing must fail
