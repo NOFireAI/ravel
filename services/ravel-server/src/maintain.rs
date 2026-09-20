@@ -1352,6 +1352,7 @@ pub async fn run_discovery_cycle(
         total.already_done += report.already_done;
         total.not_sealed += report.not_sealed;
         total.skipped_terminal += report.skipped_terminal;
+        total.l0_records_pending += report.l0_records_pending;
     }
 
     // Prune stall history to exactly this cycle's owned set (ADR-0065
@@ -1759,6 +1760,7 @@ pub(crate) async fn run_tick_with_clock(
                     total.already_done += report.already_done;
                     total.not_sealed += report.not_sealed;
                     total.skipped_terminal += report.skipped_terminal;
+                    total.l0_records_pending += report.l0_records_pending;
                 }
                 Err(MaintainError::ConservationViolation {
                     input_sample_count,
@@ -5267,8 +5269,16 @@ mod tests {
     /// through real store objects. Worker A maintains a unit, memoizes its
     /// terminal bucket, and persists a durable snapshot. Worker B -- a distinct
     /// process that now owns the unit -- reads the snapshots back from the store
-    /// and seeds its cold memo from A's, then skips the bucket A already proved
-    /// terminal rather than cold-rescanning it.
+    /// and seeds its cold memo from A's, then stops cold-rescanning the bucket A
+    /// already proved terminal.
+    ///
+    /// The bucket here is below the compaction threshold, and the snapshot body
+    /// carries states and verify times but not L0 record counts, so B's first
+    /// tick re-verifies it once to learn the count its `l0_records_pending`
+    /// total must report; every tick after that skips it. Both ticks report the
+    /// bucket's one pending L0 record, which is the point of the re-verify: the
+    /// gauge is exact on the warm-start cycle too, not only once the memo has
+    /// been rebuilt locally.
     #[tokio::test]
     async fn warm_start_seeds_successor_from_predecessor_snapshot_through_store() {
         let store = InstrumentedStore::new(MemoryStore::new());
@@ -5320,8 +5330,9 @@ mod tests {
         assert_eq!(b_buckets, 1);
         assert_eq!(memo_b.len(), 1, "B's memo warm-started from the store");
 
-        // B's tick skips the seeded terminal bucket (no cold rescan).
-        let report = run_tick(
+        // B's first tick re-verifies the seeded below-threshold bucket once,
+        // because the snapshot carried no L0 record count for it.
+        let first = run_tick(
             &store,
             &tenant,
             &compactor,
@@ -5335,10 +5346,37 @@ mod tests {
         )
         .await;
         assert_eq!(
-            report.skipped_terminal, 1,
-            "B skips A's terminal bucket after a store-backed warm start"
+            first.skipped_terminal, 0,
+            "a seeded below-threshold bucket carries no count, so B's first tick re-verifies it"
         );
-        assert_eq!(report.already_done, 0, "no per-bucket work redone by B");
+        assert_eq!(
+            first.l0_records_pending, 1,
+            "that re-verify is what makes the warm-start cycle's pending total exact"
+        );
+
+        // Every tick after that skips it, which is the warm start paying off.
+        let second = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo_b,
+            &safety,
+            &ownership,
+            &worker_b,
+            &live_b,
+        )
+        .await;
+        assert_eq!(
+            second.skipped_terminal, 1,
+            "B skips A's terminal bucket once its count is known"
+        );
+        assert_eq!(second.already_done, 0, "no per-bucket work redone by B");
+        assert_eq!(
+            second.l0_records_pending, 1,
+            "the skipped bucket keeps contributing its one pending L0 record"
+        );
     }
 
     /// ADR-0065 decision 3: the reseed trigger and the ownership
@@ -5356,8 +5394,10 @@ mod tests {
     /// 2. Seeding from A's snapshot with B's *pre-handoff* view `{A,B}` seeds
     ///    nothing (B did not own the shard then) -- proving the `owns_unit`
     ///    filter is genuine, not vacuously true.
-    /// 3. Seeding with B's *post-handoff* view `{B}` seeds the shard and B's tick
-    ///    skips it rather than cold-rescanning.
+    /// 3. Seeding with B's *post-handoff* view `{B}` seeds the shard, B's first
+    ///    tick re-verifies it once to learn its L0 record count (the snapshot
+    ///    body carries no counts), and B's next tick skips it rather than
+    ///    cold-rescanning.
     #[tokio::test]
     async fn reseed_and_seeding_track_genuine_ownership_handoff() {
         const SHARDS: u32 = 8;
@@ -5480,7 +5520,11 @@ mod tests {
         assert_eq!(units, 1, "B seeds the one unit it took over");
         assert_eq!(buckets, 1);
 
-        let report = run_tick(
+        // The handed-over bucket is below the compaction threshold and the
+        // snapshot carries no count for it, so B's first tick re-verifies it
+        // once (keeping that cycle's pending total exact) and skips it from the
+        // next tick on, rather than cold-rescanning it every tick.
+        let first = run_tick(
             &store,
             &tenant,
             &compactor,
@@ -5494,8 +5538,34 @@ mod tests {
         )
         .await;
         assert_eq!(
-            report.skipped_terminal, 1,
+            first.skipped_terminal, 0,
+            "the seeded below-threshold bucket carries no count, so it is re-verified once"
+        );
+        assert_eq!(
+            first.l0_records_pending, 1,
+            "the handed-over bucket's one pending L0 record is reported on that cycle"
+        );
+
+        let second = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo_b,
+            &safety,
+            &ownership,
+            &b,
+            &live_b,
+        )
+        .await;
+        assert_eq!(
+            second.skipped_terminal, 1,
             "B skips the handed-over terminal bucket instead of cold-rescanning"
+        );
+        assert_eq!(
+            second.l0_records_pending, 1,
+            "and the skipped bucket still contributes its pending L0 record"
         );
     }
 
