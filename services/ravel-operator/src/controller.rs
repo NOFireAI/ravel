@@ -2927,6 +2927,7 @@ mod tests {
                     bucket: "ravel-data".to_string(),
                     region: "eu-west-1".to_string(),
                     endpoint: None,
+                    allow_http: false,
                     credentials_secret_ref: LocalSecretRef {
                         name: "ravel-s3".to_string(),
                     },
@@ -4766,6 +4767,7 @@ mod tests {
                         bucket: "b".to_string(),
                         region: "us-east-1".to_string(),
                         endpoint: None,
+                        allow_http: false,
                         credentials_secret_ref: LocalSecretRef {
                             name: "creds".to_string(),
                         },

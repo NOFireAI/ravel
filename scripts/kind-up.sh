@@ -288,6 +288,9 @@ spec:
       bucket: ${BUCKET}
       region: us-east-1
       endpoint: ${S3_ENDPOINT}
+      # Both backends speak plaintext http:// on a Service name, which no pod
+      # reaches over loopback; without this the server refuses to start.
+      allowHttp: true
       credentialsSecretRef:
         name: ${S3_CREDENTIALS_SECRET}
   tenantTokensSecretRef:

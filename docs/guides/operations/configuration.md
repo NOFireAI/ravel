@@ -51,11 +51,39 @@ Nothing survives process exit. `--store s3` is the only durable choice.
 
 Ravel does not use the AWS credential chain (profiles, `AWS_ACCESS_KEY_ID`,
 `~/.aws/config`). It reads the `RAVEL_S3_*` environment variables and their
-matching flags, and nothing else. `allow_http` and `force_path_style` are not
-configurable: the client enables `allow_http` when `--s3-endpoint` is set, and
-always uses path-style addressing.
+matching flags, and nothing else. `force_path_style` is not configurable: the
+client always uses path-style addressing.
 
-MinIO, for local development:
+### Plaintext endpoints
+
+The client speaks plaintext HTTP only when `--s3-endpoint` itself says
+`http://`. An `https://` endpoint, and real AWS S3 with no endpoint at all,
+never fall back to plaintext, so a redirect or a misconfigured proxy cannot
+downgrade the connection.
+
+A plaintext endpoint puts every object this process writes and reads, and the
+credentials signing those requests, on the network in the clear. Startup
+therefore refuses an `http://` endpoint whose host is not loopback unless
+`--s3-allow-http` (`RAVEL_S3_ALLOW_HTTP`) is set. The refusal names the flag.
+
+- `http://127.0.0.1:9000`, `http://localhost:9000`, `http://[::1]:9000`:
+  allowed with no flag. The traffic never leaves the host.
+- `http://minio:9000`, `http://minio.ravel-system.svc:9000`, or any other
+  name or address on the network: refused unless the flag is passed. A
+  container or a pod reaches its object store over the network, never over
+  loopback, so a plaintext in-cluster MinIO or floci needs the flag even
+  though the traffic stays inside the cluster.
+- `https://...`: unaffected, and the flag does nothing.
+
+Under the Kubernetes operator the same decision is `spec.storage.s3.allowHttp`
+on the `RavelCluster` (default `false`), which renders the flag into every
+server container's arguments.
+
+Prefer terminating TLS at the object store over setting the flag. The flag is
+for a development backend that speaks no TLS, not for a production one whose
+certificate is inconvenient.
+
+MinIO, for local development (loopback, so no flag):
 
 ```sh
 --store s3 --s3-endpoint http://127.0.0.1:9000 --s3-bucket ravel-dev \

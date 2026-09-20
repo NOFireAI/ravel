@@ -503,8 +503,8 @@ pub fn audit_token_key_missing(spec: &RavelClusterSpec) -> bool {
 }
 
 /// Args shared by every mode: store selection, shard count, and the S3
-/// bucket/region/endpoint flags. Access/secret keys are NOT here (they are env
-/// vars, see [`s3_credential_env`]).
+/// bucket/region/endpoint/allow-http flags. Access/secret keys are NOT here
+/// (they are env vars, see [`s3_credential_env`]).
 ///
 /// Also carries the tenant-hash scheme flag (ADR-0050 section 3 / ADR-0072
 /// decision 4): a fresh bucket refuses to start unless it is told a scheme.
@@ -547,6 +547,11 @@ fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
     if let Some(endpoint) = &spec.storage.s3.endpoint {
         args.push("--s3-endpoint".to_string());
         args.push(endpoint.clone());
+    }
+    // A server pod never reaches its object store over loopback, so a
+    // plaintext in-cluster endpoint refuses startup without this flag.
+    if spec.storage.s3.allow_http {
+        args.push("--s3-allow-http".to_string());
     }
     args
 }
@@ -3002,6 +3007,7 @@ mod tests {
                     bucket: "ravel-data".to_string(),
                     region: "eu-west-1".to_string(),
                     endpoint: Some("http://minio:9000".to_string()),
+                    allow_http: false,
                     credentials_secret_ref: LocalSecretRef {
                         name: "ravel-s3".to_string(),
                     },
@@ -3991,6 +3997,42 @@ mod tests {
             !env.iter()
                 .any(|e| e.name.starts_with("RAVEL_TENANT_TOKEN_"))
         );
+    }
+
+    /// Issue #1707: `ravel-server` refuses a plaintext `http://` endpoint
+    /// whose host is not loopback, and a pod's in-cluster MinIO or floci
+    /// Service is never loopback. `spec.s3.allowHttp` is what renders the
+    /// flag that accepts it, and it must render nothing at its `false`
+    /// default so an https:// or real-AWS cluster is untouched.
+    #[test]
+    fn allow_http_renders_the_flag_only_when_set() {
+        let mut spec = base_spec();
+        assert!(
+            !spec.storage.s3.allow_http,
+            "precondition: allowHttp defaults off"
+        );
+        for deployment in [
+            desired_gateway_deployment(&spec, "prod", &ctx()),
+            desired_query_deployment(&spec, "prod", &ctx()),
+        ] {
+            let args = args_of(&deployment);
+            assert!(
+                !args.iter().any(|a| a == "--s3-allow-http"),
+                "allowHttp false must render no flag, got: {args:?}"
+            );
+        }
+
+        spec.storage.s3.allow_http = true;
+        for deployment in [
+            desired_gateway_deployment(&spec, "prod", &ctx()),
+            desired_query_deployment(&spec, "prod", &ctx()),
+        ] {
+            let args = args_of(&deployment);
+            assert!(
+                args.iter().any(|a| a == "--s3-allow-http"),
+                "allowHttp true must render the flag, got: {args:?}"
+            );
+        }
     }
 
     #[test]

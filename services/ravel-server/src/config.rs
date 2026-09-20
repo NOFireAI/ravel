@@ -474,6 +474,17 @@ pub struct Cli {
     #[arg(long, env = "RAVEL_S3_ENDPOINT")]
     pub s3_endpoint: Option<String>,
 
+    /// Accept a plaintext `http://` `--s3-endpoint` whose host is not
+    /// loopback. The S3 client's `allow_http` follows the endpoint's scheme,
+    /// and a plaintext endpoint on the network carries every object this
+    /// process writes and reads, plus the credentials signing those requests,
+    /// in the clear; startup refuses that combination unless this flag says
+    /// the operator meant it. A loopback `http://` endpoint (the local MinIO
+    /// every development launcher here points at) needs no flag, and an
+    /// `https://` endpoint is unaffected.
+    #[arg(long, env = "RAVEL_S3_ALLOW_HTTP")]
+    pub s3_allow_http: bool,
+
     #[arg(long, env = "RAVEL_S3_BUCKET")]
     pub s3_bucket: Option<String>,
 
@@ -4563,6 +4574,15 @@ impl Cli {
                 "--tenant-token and --tenant-token-file are mutually exclusive: both populate \
                  the same static bearer map. Drop --tenant-token, or drop --tenant-token-file."
             );
+        }
+
+        // Plaintext object storage over the network (issue #1707). Refused
+        // here as well as in `build_store` so it fails in the same pre-flight
+        // pass as the other startup invariants; gated on `--store s3` for the
+        // same reason `build_store` is, so a stray exported
+        // `RAVEL_S3_ENDPOINT` cannot refuse a `--store memory` start.
+        if matches!(self.store, StoreKind::S3) {
+            crate::store::resolve_s3_allow_http(self.s3_endpoint.as_deref(), self.s3_allow_http)?;
         }
 
         // No value of `--max-inflight-ingest-requests` is invalid (`0` is a
@@ -10383,6 +10403,49 @@ mod tests {
             err.to_string().contains("--distributed-query"),
             "names the required flag: {err}"
         );
+    }
+
+    /// Issue #1707 at the config layer: `validate()` runs on every start, so
+    /// the plaintext-endpoint rule refuses there too rather than waiting for
+    /// the store to be built. Loopback plaintext and the flagged form both
+    /// pass, and `--store memory` never consults the endpoint at all.
+    #[test]
+    fn plaintext_non_loopback_s3_endpoint_fails_validate() {
+        let s3 = |args: &[&str]| {
+            let mut argv = vec![
+                "--store",
+                "s3",
+                "--s3-bucket",
+                "ravel-test",
+                "--s3-access-key",
+                "test",
+                "--s3-secret-key",
+                "test",
+            ];
+            argv.extend_from_slice(args);
+            cli(&argv)
+        };
+
+        let err = s3(&["--s3-endpoint", "http://minio:9000"])
+            .validate()
+            .expect_err("plaintext to a non-loopback host must refuse startup");
+        assert!(
+            err.to_string().contains("--s3-allow-http"),
+            "names the flag that accepts it: {err}"
+        );
+
+        s3(&["--s3-endpoint", "http://minio:9000", "--s3-allow-http"])
+            .validate()
+            .expect("--s3-allow-http must accept a plaintext non-loopback endpoint");
+        s3(&["--s3-endpoint", "http://127.0.0.1:9000"])
+            .validate()
+            .expect("loopback plaintext must pass unflagged");
+        s3(&["--s3-endpoint", "https://s3.us-east-1.amazonaws.com"])
+            .validate()
+            .expect("an https endpoint must pass");
+        cli(&["--s3-endpoint", "http://minio:9000"])
+            .validate()
+            .expect("--store memory must not consult the S3 endpoint");
     }
 
     #[test]
