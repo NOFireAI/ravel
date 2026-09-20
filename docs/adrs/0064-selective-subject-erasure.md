@@ -424,6 +424,29 @@ record set is rewrite-output-only" check), so the pass must not derive that
 check independently of the same exclusion logic the resolver uses, or this
 net has a hole matching the shape above.
 
+## Amendment: a targeted refold closes the out-of-window gap on demand
+
+The "out-of-window case remains open" correction above named the gap but no
+mechanism to close it on demand; `Catalog::fold_with_refold_request` (issue
+#526, ADR-0063 amendment) is that "something else." It takes a
+caller-supplied set of ingest hours and re-lists them in the same fold call
+that would otherwise only run the fixed reconcile window and the
+retention-frontier band, so a DSAR against an out-of-window hour can be
+re-folded without waiting for the horizon-gated sweep or a coincidental later
+write into that bucket.
+
+**The no-op carve-out (#1781 review item):** a request submitted to a fold
+call that turns out to be a no-op (nothing newly sealed beyond the previous
+watermark) reconciles **zero hours**, regardless of what it names. The
+targeted pass sits inside the same reconcile branch as the fixed window and
+the frontier band, and a no-op fold returns `no_op_report(...)` before that
+branch is ever reached -- the request is not evaluated and denied, it is
+never inspected at all. `FoldReport::refold_hours_reconciled` reports the
+count of hours the pass actually re-listed and is `0` on the no-op path, so a
+caller retrying a DSAR-driven refold against an unchanged watermark can tell
+"nothing sealed since last time" apart from "the request was serviced" by
+reading that field rather than assuming success from `no_op: false`.
+
 ## Amendment: completion routes through the catalog resolver, and the `.done` scope is stated to match what the pass verifies
 
 A later change closes two checkpoint findings (F1 and F3) against the

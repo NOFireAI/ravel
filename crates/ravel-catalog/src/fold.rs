@@ -262,6 +262,20 @@ pub struct FoldReport {
     /// drains the backlog oldest-first. Nonzero here is the signal that the
     /// frontier is behind; steady state is always zero.
     pub frontier_hours_deferred: u64,
+    /// Ingest hours the targeted re-fold pass reconciled this fold, from a
+    /// caller-supplied [`RefoldRequest`] (issue #526, ADR-0063 amendment).
+    /// Bounded by the same `frontier_reconcile_max_hours` cap the frontier
+    /// band uses; a request naming more hours than the cap allows carries the
+    /// remainder to whichever later fold the requester asks again, and this
+    /// field counts only the hours this call actually re-listed. `0` on a
+    /// [`Catalog::fold`] call (an empty [`RefoldRequest`]) and on a request
+    /// submitted to a fold call that turns out to be a no-op: the pass sits
+    /// inside the same reconcile branch as the fixed window and the frontier
+    /// band, which never runs when nothing new is sealed, so a request
+    /// against an unchanged watermark reconciles nothing regardless of what
+    /// it names (docs/adrs/0064-selective-subject-erasure.md, the no-op
+    /// carve-out).
+    pub refold_hours_reconciled: usize,
     /// Stamped carriers this fold read: L0 commit records whose
     /// `declared_column_stats` (field 20) was non-empty, plus L1 compaction
     /// parts whose own stamps (field 12) were non-empty. The read half of the
@@ -697,34 +711,6 @@ fn column_stats_concat_calls_for_test() -> u64 {
 #[cfg(test)]
 fn reset_column_stats_concat_calls_for_test() {
     COLUMN_STATS_CONCAT_CALLS.with(|c| c.set(0));
-}
-
-// Test-only instrumentation for issue #526: the number of hours the targeted
-// re-fold pass actually re-listed on the last fold, so a bounded-work test can
-// pin that number exactly rather than inferring it from LIST arithmetic. It is
-// not a `FoldReport` field because every field of that struct must also be
-// rendered by `ravel-cli`'s human fold report
-// (services/ravel-cli/src/catalog.rs, pinned by
-// services/ravel-cli/tests/catalog_fold_report.rs), which is outside this
-// change's scope; see the follow-up named in the issue.
-#[cfg(test)]
-thread_local! {
-    static REFOLD_HOURS_RECONCILED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn record_refold_hours_for_test(hours: u64) {
-    REFOLD_HOURS_RECONCILED.with(|c| c.set(hours));
-}
-
-#[cfg(test)]
-fn refold_hours_reconciled_for_test() -> u64 {
-    REFOLD_HOURS_RECONCILED.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-fn reset_refold_hours_for_test() {
-    REFOLD_HOURS_RECONCILED.with(|c| c.set(0));
 }
 
 /// One part's span in the fully-sorted entry set: the `[start, end)` index
@@ -1565,8 +1551,6 @@ impl Catalog {
                     "fold reconciled the ingest hours a re-fold request named"
                 );
             }
-            #[cfg(test)]
-            record_refold_hours_for_test(refold_hours_reconciled);
             // A reconcile that changed any hour invalidates the append-only,
             // stable-ordinal assumption the forward postings merge relies on
             // (a superseded or removed entry shifts every later ordinal), so
@@ -2277,6 +2261,7 @@ impl Catalog {
                         layout_drift_count,
                         frontier_hours_reconciled,
                         frontier_hours_deferred,
+                        refold_hours_reconciled: refold_hours_reconciled as usize,
                         stamped_records: coverage.records(),
                         stamped_entries: coverage.entries(),
                     });
@@ -3038,6 +3023,10 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         layout_drift_count: 0,
         frontier_hours_reconciled: 0,
         frontier_hours_deferred: 0,
+        // The carve-out this field documents: a no-op fold never reaches the
+        // reconcile branch that runs the targeted re-fold pass, so a request
+        // against it reconciles zero hours regardless of what it names.
+        refold_hours_reconciled: 0,
         // A no-op fold reads no commit record and writes no entry, so it has
         // no coverage to report and contributes nothing to the process-global
         // totals either.
@@ -6943,7 +6932,6 @@ mod tests {
 
         let compaction = publish_compaction(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
 
-        reset_refold_hours_for_test();
         let second = catalog
             .fold_with_refold_request(
                 &tenant(),
@@ -6970,7 +6958,7 @@ mod tests {
             expected,
             "hour 5 must now name the compaction output, and no longer its superseded L0 input"
         );
-        assert_eq!(refold_hours_reconciled_for_test(), 1);
+        assert_eq!(second.refold_hours_reconciled, 1);
     }
 
     /// Deliverable 1, the rewrite half: the same for a late selective-erasure
@@ -7002,7 +6990,6 @@ mod tests {
 
         let rewrite = publish_rewrite(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
 
-        reset_refold_hours_for_test();
         let second = catalog
             .fold_with_refold_request(
                 &tenant(),
@@ -7029,7 +7016,7 @@ mod tests {
             expected,
             "hour 5 must now name the rewrite output, and no longer its pre-erasure L0 input"
         );
-        assert_eq!(refold_hours_reconciled_for_test(), 1);
+        assert_eq!(second.refold_hours_reconciled, 1);
     }
 
     /// ADR-0063 section 4 carve-out 1: a FIRST fold skips the reconcile pass
@@ -7046,7 +7033,6 @@ mod tests {
         publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
         publish_compaction(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
 
-        reset_refold_hours_for_test();
         let first = catalog
             .fold_with_refold_request(
                 &tenant(),
@@ -7061,8 +7047,7 @@ mod tests {
             .expect("first fold");
         assert!(!first.no_op);
         assert_eq!(
-            refold_hours_reconciled_for_test(),
-            0,
+            first.refold_hours_reconciled, 0,
             "a first fold does no reconcile work, requested or not"
         );
         assert_eq!(
@@ -7072,6 +7057,59 @@ mod tests {
         // The first fold derives hour 5 from the commit layout, compaction
         // record included, so the request had nothing to add.
         assert_eq!(first.entry_count, 2);
+    }
+
+    /// #1763 part (a), the #1781 review item: a [`RefoldRequest`] submitted
+    /// to a fold call that turns out to be a no-op (nothing newly sealed
+    /// beyond the previous watermark) reconciles zero hours, not the count
+    /// of hours the request named. The targeted pass sits inside the same
+    /// reconcile branch as the fixed window and the frontier band, and that
+    /// branch never runs once the top-of-loop watermark check has already
+    /// returned a no-op report -- the request is never denied, it is never
+    /// reached.
+    ///
+    /// Prove-the-test: hardcode `no_op_report`'s `refold_hours_reconciled` to
+    /// `1` and the final assertion below fails.
+    #[tokio::test]
+    async fn refold_request_to_a_no_op_fold_reconciles_zero_hours_and_reports_it() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        // Same `now_ns` as the first fold: the watermark cannot advance, so
+        // this call is a no-op regardless of what the request names. Hour 5
+        // is a real, snapshot-named hour a reachable targeted pass would
+        // happily reconcile.
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+                &RefoldRequest::from_hours([5]),
+            )
+            .await
+            .expect("second fold");
+        assert!(second.no_op, "the watermark did not advance");
+        assert_eq!(
+            second.refold_hours_reconciled, 0,
+            "a request against a no-op fold reconciles nothing, however many hours it names"
+        );
     }
 
     /// ADR-0063 section 4 carve-out 2: a REBUILD skips the reconcile pass (it
@@ -7107,7 +7145,6 @@ mod tests {
             .expect("overwrite head with garbage");
         publish_compaction(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
 
-        reset_refold_hours_for_test();
         let second = catalog
             .fold_with_refold_request(
                 &tenant(),
@@ -7122,8 +7159,7 @@ mod tests {
             .expect("fold after corruption");
         assert!(second.rebuilt, "a rebuild, not an incremental fold");
         assert_eq!(
-            refold_hours_reconciled_for_test(),
-            0,
+            second.refold_hours_reconciled, 0,
             "a rebuild does no reconcile work, requested or not"
         );
         // The rebuild picks the late compaction up on its own, from the same
@@ -7213,8 +7249,7 @@ mod tests {
             .await;
         }
 
-        reset_refold_hours_for_test();
-        catalog
+        let capped = catalog
             .fold_with_refold_request(
                 &tenant(),
                 Signal::Metrics,
@@ -7227,15 +7262,13 @@ mod tests {
             .await
             .expect("capped fold");
         assert_eq!(
-            refold_hours_reconciled_for_test(),
-            2,
+            capped.refold_hours_reconciled, 2,
             "the cap of 2 bounds the pass, not the four requested hours"
         );
 
         // The remainder is not lost: requesting it again re-folds it, which is
         // the property that lets the pass defer nothing into the snapshot.
-        reset_refold_hours_for_test();
-        catalog
+        let remainder = catalog
             .fold_with_refold_request(
                 &tenant(),
                 Signal::Metrics,
@@ -7248,8 +7281,7 @@ mod tests {
             .await
             .expect("remainder fold");
         assert_eq!(
-            refold_hours_reconciled_for_test(),
-            2,
+            remainder.refold_hours_reconciled, 2,
             "the hours the cap cut out are re-foldable on the next request"
         );
     }
@@ -7291,7 +7323,6 @@ mod tests {
         // Exactly one hour receives a late record.
         publish_compaction(&store, 0, 3, &[&old_segments[2]], 4 * NS_PER_HOUR).await;
 
-        reset_refold_hours_for_test();
         let second = catalog
             .fold_with_refold_request(
                 &tenant(),
@@ -7305,8 +7336,7 @@ mod tests {
             .await
             .expect("second fold");
         assert_eq!(
-            refold_hours_reconciled_for_test(),
-            1,
+            second.refold_hours_reconciled, 1,
             "exactly the one requested hour is re-folded"
         );
         assert_eq!(
@@ -7317,7 +7347,6 @@ mod tests {
 
         // A later tick with nothing to request re-lists no extra hour at all:
         // the pass is driven by the request, never by the snapshot's size.
-        reset_refold_hours_for_test();
         let third = catalog
             .fold(
                 &tenant(),
@@ -7329,7 +7358,7 @@ mod tests {
             )
             .await
             .expect("third fold");
-        assert_eq!(refold_hours_reconciled_for_test(), 0);
+        assert_eq!(third.refold_hours_reconciled, 0);
         assert_eq!(
             third.list_requests,
             1 + 27,
@@ -7362,7 +7391,6 @@ mod tests {
             .await
             .expect("first fold");
 
-        reset_refold_hours_for_test();
         let second = catalog
             .fold_with_refold_request(
                 &tenant(),
@@ -7377,7 +7405,7 @@ mod tests {
             )
             .await
             .expect("second fold");
-        assert_eq!(refold_hours_reconciled_for_test(), 0);
+        assert_eq!(second.refold_hours_reconciled, 0);
         assert_eq!(
             second.list_requests,
             1 + 27,

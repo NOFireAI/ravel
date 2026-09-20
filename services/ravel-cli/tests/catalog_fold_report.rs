@@ -195,6 +195,7 @@ async fn fold_human_report_prints_every_fold_report_field() {
         "layout_drift_count:",
         "frontier_hours_reconciled:",
         "frontier_hours_deferred:",
+        "refold_hours_reconciled:",
     ] {
         assert!(
             printed.contains(field),
@@ -242,6 +243,16 @@ async fn fold_human_report_prints_every_fold_report_field() {
              the human report:\n{printed}"
         );
     }
+
+    // #1763 part (a): pin the exact rendered line for the new field, not just
+    // its presence as a key. The CLI has no flag yet that supplies a
+    // `RefoldRequest` (that wiring is part b / T11e), so every fold this
+    // binary runs reconciles zero requested hours.
+    assert!(
+        printed.contains("refold_hours_reconciled: 0\n"),
+        "expected the exact rendered line for a plain, RefoldRequest-less \
+         fold:\n{printed}"
+    );
 }
 
 /// Deliverable 1's `--json` flag: the whole `FoldReport` round-trips through

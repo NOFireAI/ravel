@@ -278,6 +278,10 @@ fn render_fold_report(
         "frontier_hours_deferred: {}\n",
         report.frontier_hours_deferred
     ));
+    out.push_str(&format!(
+        "refold_hours_reconciled: {}\n",
+        report.refold_hours_reconciled
+    ));
     out.push_str(&format!("stamped_records: {}\n", report.stamped_records));
     out.push_str(&format!("stamped_entries: {}\n", report.stamped_entries));
     Ok(out)
