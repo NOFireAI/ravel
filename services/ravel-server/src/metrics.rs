@@ -254,6 +254,7 @@ pub enum Label {
     Cache(CacheFamily),
     CacheTier(CacheTier),
     MergeMemoryKind(MergeMemoryKind),
+    DeletedObjectKind(DeletedObjectKind),
     /// How one alert evaluation tick ended (issue #532). A closed enum owned by
     /// [`crate::alerting`], since the outcomes are the alerting loop's own, not
     /// a dimension this renderer invents.
@@ -314,6 +315,33 @@ impl MergeMemoryKind {
         match self {
             MergeMemoryKind::Transient => "transient",
             MergeMemoryKind::Total => "total",
+        }
+    }
+}
+
+/// Which `SweepReport` field a `ravel_maintain_objects_deleted_total` sample
+/// counts (issue #1729): the four fields that represent an actual physical
+/// object delete, never a move to quarantine
+/// (`orphans_deleted`/`orphans_quarantined`, already covered by the
+/// `signal`-labeled `ravel_maintain_orphans_quarantined_total`) or a
+/// withheld/refused candidate. Named for the report field each counts,
+/// verbatim, since a downstream rule-file task keys alerts on these exact
+/// `kind=` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletedObjectKind {
+    QuarantineReaped,
+    SupersededRecordsDeleted,
+    SupersededDataDeleted,
+    UnreferencedPartsDeleted,
+}
+
+impl DeletedObjectKind {
+    fn name(self) -> &'static str {
+        match self {
+            DeletedObjectKind::QuarantineReaped => "quarantine_reaped",
+            DeletedObjectKind::SupersededRecordsDeleted => "superseded_records_deleted",
+            DeletedObjectKind::SupersededDataDeleted => "superseded_data_deleted",
+            DeletedObjectKind::UnreferencedPartsDeleted => "unreferenced_parts_deleted",
         }
     }
 }
@@ -421,6 +449,7 @@ impl Label {
             Label::Cache(_) => "cache",
             Label::CacheTier(_) => "tier",
             Label::MergeMemoryKind(_) => "kind",
+            Label::DeletedObjectKind(_) => "kind",
             Label::AlertOutcome(_) => "outcome",
             Label::Allocator(_) => "allocator",
             Label::AllocatorStat(_) => "stat",
@@ -444,6 +473,7 @@ impl Label {
             Label::Cache(family) => family.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
+            Label::DeletedObjectKind(kind) => kind.name().to_string(),
             Label::AlertOutcome(outcome) => alert_outcome_name(*outcome).to_string(),
             Label::Allocator(name) => name.to_string(),
             Label::AllocatorStat(stat) => stat.name().to_string(),
@@ -2502,6 +2532,12 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// one climbing while this one stays flat is a quarantine prefix filling
     /// and never being reaped.
     pub quarantine_reaped: u64,
+    /// L0 commit records the most recent compaction scan pass found sealed
+    /// but still below `min_compaction_inputs` (issue #1729). A gauge, like
+    /// `orphans_present`: this pass's count, not a running total. A value
+    /// that keeps rising means buckets for this signal are sealing faster
+    /// than they cross the compaction threshold.
+    pub l0_records_pending: u64,
 }
 
 /// One scrape's maintenance-safety counters (ADR-0048 decisions 1, 4, 6): the three safety controls that, before this issue, reached
@@ -2512,6 +2548,22 @@ pub struct MaintenanceSafetySnapshot {
     /// one refresh gates an entire tenant tick, so a failure skips every
     /// signal and shard of that tick at once.
     pub legal_hold_refresh_failures: u64,
+    /// Objects physically deleted from `quarantine/` past the quarantine
+    /// horizon, summed over every sweep pass of every signal since process
+    /// start. Not signal-scoped, unlike the per-signal
+    /// `quarantine_reaped` on [`MaintenanceSafetySignalSnapshot`]: this is
+    /// the `kind`-labeled `ravel_maintain_objects_deleted_total` series
+    /// (issue #1729).
+    pub objects_deleted_quarantine_reaped: u64,
+    /// Superseded L0 commit records rule 2 physically deleted, summed over
+    /// every sweep pass since process start.
+    pub objects_deleted_superseded_records_deleted: u64,
+    /// Superseded L0 data objects rule 2 physically deleted, summed over
+    /// every sweep pass since process start.
+    pub objects_deleted_superseded_data_deleted: u64,
+    /// Unreferenced L1 parts rule 3 physically deleted, summed over every
+    /// sweep pass since process start.
+    pub objects_deleted_unreferenced_parts_deleted: u64,
     pub signals: Vec<MaintenanceSafetySignalSnapshot>,
 }
 
@@ -2525,6 +2577,13 @@ impl MaintenanceSafetySnapshot {
     pub fn from_metrics(metrics: &crate::maintain::MaintenanceSafetyMetrics) -> Self {
         MaintenanceSafetySnapshot {
             legal_hold_refresh_failures: metrics.legal_hold_refresh_failures(),
+            objects_deleted_quarantine_reaped: metrics.objects_deleted_quarantine_reaped(),
+            objects_deleted_superseded_records_deleted: metrics
+                .objects_deleted_superseded_records_deleted(),
+            objects_deleted_superseded_data_deleted: metrics
+                .objects_deleted_superseded_data_deleted(),
+            objects_deleted_unreferenced_parts_deleted: metrics
+                .objects_deleted_unreferenced_parts_deleted(),
             signals: crate::maintain::MAINTAINED_SIGNALS
                 .iter()
                 .map(|&signal| MaintenanceSafetySignalSnapshot {
@@ -2536,6 +2595,7 @@ impl MaintenanceSafetySnapshot {
                     orphans_quarantined: metrics.orphans_quarantined(signal),
                     orphans_quarantine_refused: metrics.orphans_quarantine_refused(signal),
                     quarantine_reaped: metrics.quarantine_reaped(signal),
+                    l0_records_pending: metrics.l0_records_pending(signal),
                 })
                 .collect(),
         }
@@ -2691,6 +2751,67 @@ fn render_maintain_safety_family(
             "ravel_maintain_quarantine_reaped_total",
             &labels(mode, signal.signal),
             signal.quarantine_reaped,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_l0_records_pending",
+        "L0 commit records the most recent compaction scan pass found sealed but still below \
+         min_compaction_inputs, by signal. A gauge: this pass's count, not a running total. A \
+         steadily rising value means buckets for that signal are sealing faster than they cross \
+         the compaction threshold; see the troubleshooting guide.",
+        "gauge",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_l0_records_pending",
+            &labels(mode, signal.signal),
+            signal.l0_records_pending,
+        );
+    }
+
+    // The kind-labeled deleted-objects family (issue #1729): the four
+    // SweepReport fields that represent an actual physical delete, summed
+    // across every signal and shard since process start, not split by
+    // signal like the counters above.
+    fn kind_labels(mode: Mode, kind: DeletedObjectKind) -> [Label; 2] {
+        [Label::Mode(mode), Label::DeletedObjectKind(kind)]
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_objects_deleted_total",
+        "Objects physically deleted by the GC sweeper, by kind, named for the SweepReport field \
+         each counts: quarantine_reaped, superseded_records_deleted, superseded_data_deleted, or \
+         unreferenced_parts_deleted. Not signal-scoped: summed across every signal and shard \
+         this process has swept.",
+        "counter",
+    );
+    for (kind, value) in [
+        (
+            DeletedObjectKind::QuarantineReaped,
+            snapshot.objects_deleted_quarantine_reaped,
+        ),
+        (
+            DeletedObjectKind::SupersededRecordsDeleted,
+            snapshot.objects_deleted_superseded_records_deleted,
+        ),
+        (
+            DeletedObjectKind::SupersededDataDeleted,
+            snapshot.objects_deleted_superseded_data_deleted,
+        ),
+        (
+            DeletedObjectKind::UnreferencedPartsDeleted,
+            snapshot.objects_deleted_unreferenced_parts_deleted,
+        ),
+    ] {
+        write_sample(
+            out,
+            "ravel_maintain_objects_deleted_total",
+            &kind_labels(mode, kind),
+            value,
         );
     }
 }
@@ -5453,6 +5574,7 @@ mod tests {
             Label::Cache(CacheFamily::Fetch),
             Label::CacheTier(CacheTier::Ram),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
+            Label::DeletedObjectKind(DeletedObjectKind::QuarantineReaped),
             Label::AlertOutcome(crate::alerting::AlertTickOutcome::Evaluated),
             Label::Allocator("jemalloc"),
             Label::AllocatorStat(AllocatorStat::Allocated),
@@ -5475,6 +5597,7 @@ mod tests {
                 Label::Cache(_) => "cache",
                 Label::CacheTier(_) => "tier",
                 Label::MergeMemoryKind(_) => "kind",
+                Label::DeletedObjectKind(_) => "kind",
                 Label::AlertOutcome(_) => "outcome",
                 Label::Allocator(_) => "allocator",
                 Label::AllocatorStat(_) => "stat",
@@ -5510,14 +5633,15 @@ mod tests {
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), the `cache` label, #97's `tier` \
-             label, ADR-0065 decision 4's `kind`, #532's `outcome`, #1170's \
-             `allocator`/`stat`, ADR-1170 decision 4's `component`, ADR-0071's `class` \
-             (issue #1722), and ADR-0873 decision 2's `carrier`; `shard` must never appear here"
+             label, ADR-0065 decision 4's `kind` (also reused by issue #1729's deleted-objects \
+             family), #532's `outcome`, #1170's `allocator`/`stat`, ADR-1170 decision 4's \
+             `component`, ADR-0071's `class` (issue #1722), and ADR-0873 decision 2's `carrier`; \
+             `shard` must never appear here"
         );
         assert_eq!(
             one_of_each.len(),
-            18,
-            "exactly 18 label variants, 17 distinct keys"
+            19,
+            "exactly 19 label variants, 17 distinct keys"
         );
     }
 
@@ -7535,6 +7659,10 @@ mod tests {
     fn render_includes_maintain_safety_counters() {
         let snapshot = MaintenanceSafetySnapshot {
             legal_hold_refresh_failures: 3,
+            objects_deleted_quarantine_reaped: 10,
+            objects_deleted_superseded_records_deleted: 11,
+            objects_deleted_superseded_data_deleted: 12,
+            objects_deleted_unreferenced_parts_deleted: 13,
             signals: vec![
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Metrics,
@@ -7545,6 +7673,7 @@ mod tests {
                     orphans_quarantined: 4,
                     orphans_quarantine_refused: 5,
                     quarantine_reaped: 6,
+                    l0_records_pending: 8,
                 },
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Logs,
@@ -7555,6 +7684,7 @@ mod tests {
                     orphans_quarantined: 0,
                     orphans_quarantine_refused: 0,
                     quarantine_reaped: 0,
+                    l0_records_pending: 0,
                 },
             ],
         };
@@ -7628,6 +7758,33 @@ mod tests {
             ),
             "a zero-valued signal must still render:\n{body}"
         );
+        assert!(
+            body.contains(
+                "ravel_maintain_l0_records_pending{mode=\"maintain\",signal=\"metrics\"} 8"
+            ),
+            "missing l0_records_pending sample:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_maintain_l0_records_pending gauge"),
+            "l0_records_pending must carry a gauge TYPE header:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_maintain_objects_deleted_total counter"),
+            "objects_deleted_total must carry a counter TYPE header:\n{body}"
+        );
+        for (kind, value) in [
+            ("quarantine_reaped", 10),
+            ("superseded_records_deleted", 11),
+            ("superseded_data_deleted", 12),
+            ("unreferenced_parts_deleted", 13),
+        ] {
+            let sample =
+                format!("ravel_maintain_objects_deleted_total{{mode=\"maintain\",kind=\"{kind}\"}} {value}");
+            assert!(
+                body.contains(&sample),
+                "missing objects_deleted_total sample {sample}:\n{body}"
+            );
+        }
     }
 
     /// The ADR-0071 distributed read fan-out family renders under
@@ -8214,6 +8371,10 @@ mod tests {
     fn maintain_safety_family_never_renders_a_tenant_hash_label() {
         let snapshot = MaintenanceSafetySnapshot {
             legal_hold_refresh_failures: 1,
+            objects_deleted_quarantine_reaped: 1,
+            objects_deleted_superseded_records_deleted: 1,
+            objects_deleted_superseded_data_deleted: 1,
+            objects_deleted_unreferenced_parts_deleted: 1,
             signals: vec![MaintenanceSafetySignalSnapshot {
                 signal: Signal::Metrics,
                 conservation_aborts: 1,
@@ -8223,6 +8384,7 @@ mod tests {
                 orphans_quarantined: 1,
                 orphans_quarantine_refused: 1,
                 quarantine_reaped: 1,
+                l0_records_pending: 1,
             }],
         };
         let body = render(
@@ -8268,8 +8430,11 @@ mod tests {
                     || line.starts_with("ravel_maintain_orphans_quarantined_total")
                     || line.starts_with("ravel_maintain_orphans_quarantine_refused_total")
                     || line.starts_with("ravel_maintain_quarantine_reaped_total")
+                    || line.starts_with("ravel_maintain_l0_records_pending")
                 {
                     vec!["mode", "signal"]
+                } else if line.starts_with("ravel_maintain_objects_deleted_total") {
+                    vec!["mode", "kind"]
                 } else {
                     continue;
                 };
