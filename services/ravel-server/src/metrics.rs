@@ -1801,7 +1801,7 @@ fn render_declared_stats_family(
     write_header(
         out,
         "ravel_catalog_fold_stamped_records_total",
-        "Commit records carrying declared-column statistics that the fold read. The denominator of the fold's stamp coverage.",
+        "Carriers of declared-column statistics that the fold read: L0 commit records and L1 compaction parts. The denominator of the fold's stamp coverage.",
         "counter",
     );
     write_sample(
@@ -1814,7 +1814,7 @@ fn render_declared_stats_family(
     write_header(
         out,
         "ravel_catalog_fold_stamped_entries_total",
-        "Snapshot entries the fold wrote carrying declared-column statistics. Below the records total means stamps are being read and not carried through.",
+        "Snapshot entries the fold wrote carrying declared-column statistics, from either carrier. Below the records total means stamps are being read and not carried through.",
         "counter",
     );
     write_sample(
