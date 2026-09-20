@@ -1542,9 +1542,12 @@ pub struct Cli {
     /// PEM server certificate the dedicated fragment listener presents
     /// (ADR-0071 amendment decision 1). Operator-provisioned; Ravel mints no
     /// certificates. The certificate must carry a `ravel-fragment` dNSName SAN,
-    /// the one fixed name every coordinator verifies against. Read once at
-    /// startup; rotation is a rolling restart. Required with
-    /// `--fragment-listener`.
+    /// the one fixed name every coordinator verifies against, and the
+    /// `clientAuth` extended key usage alongside `serverAuth`, because this
+    /// process presents the same certificate as its client identity on every
+    /// outbound fragment dial (issue #1690); startup parses it and refuses a
+    /// certificate that cannot dial. Read once at startup; rotation is a
+    /// rolling restart. Required with `--fragment-listener`.
     #[arg(long = "fragment-tls-cert", value_name = "PATH")]
     pub fragment_tls_cert: Option<PathBuf>,
 
@@ -1580,6 +1583,10 @@ pub struct Cli {
     /// unless a NAT or port mapping makes the fragment listener reachable on a
     /// different one than it bound; a host-only value keeps the bound port,
     /// which is what makes an ephemeral (`:0`) bind still advertise correctly.
+    /// A port is accepted only alongside `--fragment-listener`: without one
+    /// both endpoints are the same socket, so a port here would be applied to
+    /// the fragment endpoint and not to the Flight SQL endpoint, publishing one
+    /// correct endpoint and one wrong one. Startup refuses that combination.
     ///
     /// An IPv6 literal may be written bare (`fd00::1`) or bracketed
     /// (`[fd00::1]:4319`); it is always advertised bracketed, so the value is a
@@ -4149,26 +4156,39 @@ impl Cli {
         // blobs are read once here; rotation is a rolling restart.
         let fragment_listener = match self.fragment_listener {
             Some(addr) => {
-                let read_pem = |flag: &str, path: Option<&Path>| -> anyhow::Result<Vec<u8>> {
-                    // `validate()` already rejected `--fragment-listener` without
-                    // all three PEM paths, so a missing one here is a bug, not an
-                    // operator error; surface it as a typed error rather than
-                    // panic (no `expect` on a production path).
-                    let path = path.ok_or_else(|| {
+                // `validate()` already rejected `--fragment-listener` without all
+                // three PEM paths, so a missing one here is a bug, not an
+                // operator error; surface it as a typed error rather than panic
+                // (no `expect` on a production path).
+                fn require_path<'a>(
+                    flag: &str,
+                    path: Option<&'a Path>,
+                ) -> anyhow::Result<&'a Path> {
+                    path.ok_or_else(|| {
                         anyhow::anyhow!("{flag} is required with --fragment-listener")
-                    })?;
+                    })
+                }
+                let read_pem = |flag: &str, path: &Path| -> anyhow::Result<Vec<u8>> {
                     std::fs::read(path).map_err(|e| {
                         anyhow::anyhow!("failed to read {flag} {}: {e}", path.display())
                     })
                 };
+                let cert_path =
+                    require_path("--fragment-tls-cert", self.fragment_tls_cert.as_deref())?;
+                let tls_cert_pem = read_pem("--fragment-tls-cert", cert_path)?;
+                // The listener's identity is also this process's client identity
+                // on every outbound fragment dial (issue #1690), so a certificate
+                // without clientAuth serves fetches while failing every dial at
+                // the handshake. Refuse here rather than degrade silently.
+                crate::fragment_cert::ensure_client_auth_eku(cert_path, &tls_cert_pem)?;
+                let key_path =
+                    require_path("--fragment-tls-key", self.fragment_tls_key.as_deref())?;
+                let ca_path = require_path("--fragment-tls-ca", self.fragment_tls_ca.as_deref())?;
                 Some(FragmentListenerSettings {
                     addr,
-                    tls_cert_pem: read_pem(
-                        "--fragment-tls-cert",
-                        self.fragment_tls_cert.as_deref(),
-                    )?,
-                    tls_key_pem: read_pem("--fragment-tls-key", self.fragment_tls_key.as_deref())?,
-                    tls_ca_pem: read_pem("--fragment-tls-ca", self.fragment_tls_ca.as_deref())?,
+                    tls_cert_pem,
+                    tls_key_pem: read_pem("--fragment-tls-key", key_path)?,
+                    tls_ca_pem: read_pem("--fragment-tls-ca", ca_path)?,
                 })
             }
             None => None,
@@ -4874,6 +4894,30 @@ impl Cli {
                  advertised endpoints are only published in the sys/query/workers heartbeat \
                  record a distributed-query process writes, so without the flag this value is \
                  inert. Set --distributed-query, or drop --advertise-fragment-endpoint."
+            );
+        }
+        // Issue #1724: the port half names the fragment lane only, because the
+        // Flight SQL lane always carries the public gRPC listener's own bound
+        // port. In the combined layout there is no separate fragment lane to
+        // name: both are the one public gRPC socket, so a port override
+        // advertises a mapped port for one endpoint and the bound port for the
+        // other, and exactly one of the two published values is wrong. Refuse
+        // rather than advertise something wrong.
+        if let (Some(advertise), Some(raw)) = (
+            advertise.as_ref(),
+            self.advertise_fragment_endpoint.as_deref(),
+        ) && advertise.port.is_some()
+            && self.fragment_listener.is_none()
+        {
+            anyhow::bail!(
+                "--advertise-fragment-endpoint '{raw}' carries a port, but no --fragment-listener \
+                 is configured: in the combined layout both published lanes are served by the \
+                 public gRPC listener '{}', and the port half of this flag reaches the fragment \
+                 lane only. The Flight SQL endpoint would keep the bound port while the fragment \
+                 endpoint took the override, so one of the two endpoints published for the same \
+                 socket would be wrong. Advertise a host only, or configure --fragment-listener \
+                 so the fragment lane has its own port to map.",
+                self.listen_grpc
             );
         }
         if self.distributed_query {
@@ -10339,6 +10383,99 @@ mod tests {
         );
     }
 
+    /// Issue #1690 upgrade hazard: a cluster whose fragment certificate was
+    /// provisioned against the previous documentation (`serverAuth` only) now
+    /// has to present it as a client identity too. Nothing used to parse the
+    /// certificate, so the process started, served inbound fetches, and failed
+    /// every outbound dial at the handshake, falling back to coordinator-local
+    /// execution with nothing reporting why. `validate()` refuses instead.
+    ///
+    /// The per-usage parsing lives in `crate::fragment_cert`; this pins that
+    /// the refusal reaches startup, and that a certificate carrying both usages
+    /// does not.
+    #[test]
+    fn server_auth_only_fragment_certificate_fails_validate() {
+        let key = fragment_key_tmp();
+        let material =
+            fragment_tls_material(crate::fragment_cert::test_certs::SERVER_AUTH_ONLY_PEM);
+        let err = cli(&fragment_tls_args(
+            key.path().to_str().expect("utf8"),
+            &material,
+        ))
+        .validate()
+        .expect_err("a serverAuth-only fragment certificate must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(material.cert.path().to_str().expect("utf8")),
+            "the error names the certificate path: {msg}"
+        );
+        assert!(
+            msg.contains("missing the clientAuth extended key usage"),
+            "the error names the missing usage: {msg}"
+        );
+        assert!(
+            msg.contains("extendedKeyUsage = serverAuth, clientAuth"),
+            "the error names what to regenerate: {msg}"
+        );
+    }
+
+    /// The positive control for the refusal above: the same configuration with
+    /// a `serverAuth, clientAuth` certificate starts normally, so the check is
+    /// not rejecting every dedicated fragment listener.
+    #[test]
+    fn fragment_certificate_with_client_auth_validates() {
+        let key = fragment_key_tmp();
+        let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
+        cli(&fragment_tls_args(
+            key.path().to_str().expect("utf8"),
+            &material,
+        ))
+        .validate()
+        .expect("a serverAuth+clientAuth fragment certificate starts normally");
+    }
+
+    /// The three PEM files a `--fragment-listener` configuration needs on disk,
+    /// held alive for the length of a test.
+    struct FragmentTlsMaterial {
+        cert: tempfile::NamedTempFile,
+        key: tempfile::NamedTempFile,
+        ca: tempfile::NamedTempFile,
+    }
+
+    /// Write `cert_pem` as the fragment certificate, with the test CA as both
+    /// the key and CA file: only the certificate is parsed at startup, and the
+    /// other two are read as opaque bytes.
+    fn fragment_tls_material(cert_pem: &str) -> FragmentTlsMaterial {
+        let write = |contents: &str| {
+            let file = tempfile::NamedTempFile::new().expect("temp PEM file");
+            std::fs::write(file.path(), contents).expect("write PEM");
+            file
+        };
+        FragmentTlsMaterial {
+            cert: write(cert_pem),
+            key: write(crate::fragment_cert::test_certs::NO_EKU_PEM),
+            ca: write(crate::fragment_cert::test_certs::NO_EKU_PEM),
+        }
+    }
+
+    /// A complete, otherwise-valid dedicated-fragment-listener configuration
+    /// pointing at `material`, so `validate()` reaches the certificate check.
+    fn fragment_tls_args<'a>(key_path: &'a str, material: &'a FragmentTlsMaterial) -> Vec<&'a str> {
+        vec![
+            "--distributed-query",
+            "--fragment-key-file",
+            key_path,
+            "--fragment-listener",
+            "127.0.0.1:4319",
+            "--fragment-tls-cert",
+            material.cert.path().to_str().expect("utf8"),
+            "--fragment-tls-key",
+            material.key.path().to_str().expect("utf8"),
+            "--fragment-tls-ca",
+            material.ca.path().to_str().expect("utf8"),
+        ]
+    }
+
     /// Issue #1724 acceptance: a wildcard-bound published listener under
     /// `--distributed-query` refuses startup unless
     /// `--advertise-fragment-endpoint` supplies a routable host, and with the
@@ -10444,6 +10581,78 @@ mod tests {
         ])
         .validate()
         .expect("a loopback bind advertises a dialable address on its own");
+    }
+
+    /// Issue #1724: in the combined layout both published lanes are the one
+    /// public gRPC socket, and the port half of the flag reaches only the
+    /// fragment lane. Accepting it would publish the override for the fragment
+    /// endpoint and the bound port for the Flight SQL endpoint, so a port
+    /// mapping advertises one correct endpoint and one wrong one. Startup
+    /// refuses the combination.
+    #[test]
+    fn advertised_port_without_a_fragment_listener_fails_validate() {
+        let key = fragment_key_tmp();
+        let err = cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            key.path().to_str().expect("utf8"),
+            "--listen-grpc",
+            "0.0.0.0:4317",
+            "--advertise-fragment-endpoint",
+            "worker-3.ravel.svc:31319",
+        ])
+        .validate()
+        .expect_err("an advertised port with no dedicated fragment listener must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("worker-3.ravel.svc:31319"),
+            "the error names the value as written: {msg}"
+        );
+        assert!(
+            msg.contains("--fragment-listener"),
+            "the error names the flag whose absence makes the port meaningless: {msg}"
+        );
+        assert!(
+            msg.contains("0.0.0.0:4317"),
+            "the error names the one socket both lanes share: {msg}"
+        );
+        assert!(
+            msg.contains("Advertise a host only"),
+            "the error names the fix: {msg}"
+        );
+    }
+
+    /// The two controls for the refusal above: a host-only value in the
+    /// combined layout is the normal case and must still validate, and the
+    /// same `host:port` value is legitimate once a dedicated fragment listener
+    /// gives the fragment lane its own port to map.
+    #[test]
+    fn advertised_port_is_accepted_only_with_a_dedicated_fragment_listener() {
+        let key = fragment_key_tmp();
+        let key_path = key.path().to_str().expect("utf8");
+        cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            key_path,
+            "--listen-grpc",
+            "0.0.0.0:4317",
+            "--advertise-fragment-endpoint",
+            "worker-3.ravel.svc",
+        ])
+        .validate()
+        .expect("a host-only value in the combined layout advertises both bound ports");
+
+        let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
+        let mut args = fragment_tls_args(key_path, &material);
+        args.extend_from_slice(&[
+            "--listen-grpc",
+            "0.0.0.0:4317",
+            "--advertise-fragment-endpoint",
+            "worker-3.ravel.svc:31319",
+        ]);
+        cli(&args)
+            .validate()
+            .expect("a dedicated fragment listener gives the advertised port a lane of its own");
     }
 
     #[test]

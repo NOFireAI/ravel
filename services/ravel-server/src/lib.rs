@@ -23,6 +23,7 @@ pub mod flight_auth;
 pub mod flight_deadline;
 pub mod fold;
 pub mod fold_on_demand;
+pub mod fragment_cert;
 pub mod gc_config;
 pub mod health;
 pub mod idle_tenant_state;

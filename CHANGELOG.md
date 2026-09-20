@@ -8,6 +8,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A distributed deployment now refuses three unsafe listener shapes at
+  startup** (issues #1724, #1703, #1690). Starting with `--distributed-query`
+  and a wildcard bind refuses unless `--advertise-fragment-endpoint` names the
+  host peers should dial, because the server previously advertised `0.0.0.0`
+  to its peers; in the combined layout, where both lanes share one socket,
+  that flag takes a host only and a `host:port` value is refused. A
+  non-loopback `--mtls-listener` refuses unless
+  `--mtls-trust-forwarded-header` says the operator meant to trust a forwarded
+  identity from anything that can reach the port. The dedicated fragment
+  listener now requires a client certificate signed by the configured CA, and
+  the coordinator presents its own identity when dialling; a certificate
+  provisioned against the previous documentation carries `serverAuth` only, so
+  startup parses it and refuses when `clientAuth` is missing rather than
+  letting every outbound dial fail at the handshake and fall back to local
+  execution. Regenerate the fragment certificate with both usages before
+  upgrading.
+
 - **The physical retention sweep is now all-or-nothing under a legal
   hold** (issue #1697). A hold on any key the pass would delete (a commit,
   compaction or rewrite record, an L0 data object, an L1 object, or the
