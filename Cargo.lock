@@ -5166,7 +5166,6 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "simple_asn1",
  "snap",
  "tempfile",
  "thiserror",

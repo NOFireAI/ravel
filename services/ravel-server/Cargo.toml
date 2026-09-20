@@ -105,15 +105,14 @@ tonic-prost = { workspace = true }
 # already resolved in the graph, not a new TLS stack.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Startup validation of the fragment TLS identity (`src/fragment_cert.rs`,
-# issue #1690): PEM-to-DER through rustls's own certificate type, then a DER
-# walk to the certificate's extendedKeyUsage, so a `serverAuth`-only identity
-# is refused at startup instead of failing every outbound fragment dial at the
-# handshake. Both are already resolved in Cargo.lock -- rustls-pki-types
-# through rustls itself, simple_asn1 through jsonwebtoken (ravel-tenant-resolve)
-# -- so neither is a new external crate; pinned directly here for the same
-# reason `ring` and `rustls` above are.
+# issue #1690): PEM-to-DER through rustls's own certificate type, then a
+# tag-and-length walk to the certificate's extendedKeyUsage written in that
+# module, so a `serverAuth`-only identity is refused at startup instead of
+# failing every outbound fragment dial at the handshake. rustls-pki-types is
+# already resolved in Cargo.lock through rustls itself, so it is not a new
+# external crate; pinned directly here for the same reason `ring` and `rustls`
+# above are.
 rustls-pki-types = "1"
-simple_asn1 = "0.6"
 # The ADR-0071 `SliceFetcher` trait (ravel_query::distrib::client) is an
 # `#[async_trait]` trait the coordinator's routing fetcher implements, so
 # async-trait is production code here, not only a test dependency.
