@@ -113,7 +113,8 @@ Protocol (new `proto/ravel/queryfrag.proto`, versioned from day 1,
 reject-unknown like commit tokens): request carries protocol version, query
 id, tenant hash, signal, scope (pinned segment identities, reconstructed and
 verified by the worker per the reconstruct-don't-trust rule, or resolve-mode
-matchers), matchers, padded window, budget shares, absolute deadline,
+matchers), matchers, padded window, the query's budgets (the whole budget,
+not a per-slice share; see the budget amendment below), absolute deadline,
 erasure predicates, and trace context. Response streams per-series frames
 (labels once, then per-run timestamp deltas and value bits, preserving NaN
 payloads, -0.0, and the staleness marker) and ends with a summary frame
@@ -131,7 +132,9 @@ stored byte changes.
   fails.
 - `Corrupt`: fail immediately, no retry, matching local semantics.
 - Budget trip on a slice or on the merged total: the same typed errors the
-  local path produces.
+  local path produces, never a transport error. A worker's own refusal is
+  parsed back into its typed form by the coordinator, so it renders as the
+  same 422 a local budget trip does.
 - Deadline: the coordinator deadline (already bounded by `sys/gc`
   `max_query_duration`, which keeps every worker inside the GC protection
   horizon) cancels the fan-out; stream teardown reaches workers and the
@@ -1472,3 +1475,67 @@ engine's own query flow still dispatches `Signal::Metrics` only today
 federation machinery for Logs/Alerts/Audit/Spans is present and tested, and the
 SQL lane that drives log and trace *search* over the wire now exists and is
 tested, but neither is reached from a live server binary yet.
+
+## Amendment: the whole budget goes to every slice, and workers clamp to their own
+
+### Context
+
+The first implementation split the query's `max_bytes_scanned` into per-slice
+shares: each slice was dispatched with `budget / slice_count`. Segment bytes
+are not distributed evenly across ingest shards, so a skewed snapshot puts one
+slice over its 1/N share while the query as a whole is far under its total. The
+worker refused, and the coordinator mapped that refusal to `QueryError::Distrib`
+because the per-slice message did not match a typed budget error it recognised.
+A query that never exceeded its own budget therefore failed as a 503, which
+reads to a client as a retryable transport fault, and retrying reproduced it.
+
+The share split also encoded the wrong trust model in the other direction. A
+worker took the wire budget as its limit, so a caller could ask a worker to
+scan more than that worker's own `EngineConfig` allows, which matters most on
+the federation path where the caller is another cluster.
+
+### Decision
+
+1. **Every slice carries the query's whole budget, verbatim.** There is no
+   per-slice share. A slice's own limit exists only to stop one runaway
+   worker, not to apportion the query.
+
+2. **The coordinator enforces the query budget over the fold.** It already
+   folds each slice's accounting snapshot as it arrives and re-checks the
+   caps incrementally, and that check, over the total, is what enforces the
+   query's budget. The worst-case over-scan before the fold trips is bounded
+   by `slice_count * budget` in wire terms, and each worker independently
+   stops at its own limit (below), so the bound is a ceiling on in-flight
+   work, not on what a query is allowed to spend.
+
+3. **A worker clamps every wire budget to its own `EngineConfig`.** The
+   effective byte limit for a slice is `min(wire, own max_bytes_scanned)`. The
+   wire value `0`, and an absent `Budgets` message, mean "the caller names no
+   cap"; both resolve to the worker's own limit, never to unlimited. A worker's
+   own configuration is always an upper bound on what any caller can make it
+   scan.
+
+4. **On the resolve scope a worker also enforces its own `max_series` and
+   `max_samples`** over the result the slice is about to return. A resolve-scope
+   request is a whole query from the remote's point of view: it resolves its own
+   snapshot and nothing downstream of it will re-check those counts on its
+   behalf. Intra-cluster pinned slices are deliberately excluded, because a
+   pinned slice is one shard-major piece of a query whose counts the coordinator
+   folds and re-checks; enforcing them per slice would reintroduce exactly the
+   failure this amendment removes.
+
+5. **A worker's budget refusal is never a transport error.** The coordinator
+   parses the worker's typed message back into `TooManyBytesScanned`,
+   `TooManySeries`, `TooManySamples`, or `TooManySegments`, and only an
+   unrecognised refusal falls through to `Distrib`. Budget trips render as the
+   422 `execution` error a local query produces; 503 stays reserved for the
+   cases where the fan-out itself failed.
+
+### Consequences
+
+- A skewed shard distribution no longer fails a query that is under its budget,
+  and a budget failure no longer looks retryable.
+- A federated request's cost ceiling rests on the remote's own configuration
+  rather than on trusting the budget the caller sent.
+- The per-segment budget check inside a slice is unchanged (ADR-0061
+  decision 1): only the limit it compares against moved.
