@@ -625,9 +625,15 @@ in one scrape interval and writes their entries in the next.
 
 The pair cannot detect a stamp that was never written. Both counters live on
 the fold, so an ingest pipeline that stops stamping entirely drives both to
-zero together, which reads identically to an idle tenant. That case is what
-the `commit-record` drop tally is for: a stamp written and rejected shows
-there, a stamp never written shows in neither.
+zero together, which reads identically to an idle tenant. The drop tally does
+not cover that case either: it counts stamps a reader rejected, so a stamp
+never written moves nothing at all, and a flat `carrier="commit-record"` line
+is not evidence that stamping is healthy.
+
+What distinguishes the two is a signal that rises when data arrives: an
+ingest-side rate that is moving while both fold counters stay at zero means
+the fold is reading records that carry no stamps. That comparison is what to
+alert on for a rollout, and neither of these two counters can make it alone.
 
 ### Tenancy adoption (`ravel_tenancy_v1_unkeyed_adoptions_total`)
 
