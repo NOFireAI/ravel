@@ -9686,6 +9686,62 @@ type = "i64"
         /// warning; force `sequential` in `resume_hint` to `true` (one verdict
         /// for every geometry) and the multi-cursor assertion fails against the
         /// prefix verdict.
+        /// The past-end warning reaches the operator, not just the function
+        /// that builds it. The two cases above call
+        /// `skip_rows_past_end_warning` directly, so deleting the `if let`
+        /// that writes it in `run_warning_to` leaves them green while the
+        /// clamped summary silently returns to reporting success. This file
+        /// already states that rule at the admission-bypass warning: with the
+        /// write inlined there, deleting the emit left every test green.
+        ///
+        /// Non-vacuity (prove-the-test), demonstrated failing: deleting the
+        /// `skip_rows_past_end_warning` emit block in `run_warning_to` fails
+        /// this test on the first assertion, against a sink carrying only the
+        /// admission-bypass warning.
+        #[tokio::test]
+        async fn a_skip_past_the_end_warns_through_the_cli_entry_point() {
+            let (dir, pq, _m, _full) = skip_rows_fixture(6);
+            let mapping_path = dir.path().join("mapping.toml");
+            std::fs::write(
+                &mapping_path,
+                "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+                 [[attribute]]\nkey = \"idx\"\ncolumn = \"idx\"\ntype = \"i64\"\n",
+            )
+            .expect("write mapping");
+
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let mut sink: Vec<u8> = Vec::new();
+            run_warning_to(
+                Arc::clone(&store),
+                &pq,
+                "acme",
+                &mapping_path,
+                1,
+                2,
+                99,
+                Some(1),
+                1,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                DEFAULT_TARGET_BYTES,
+                None,
+                NOW_NS,
+                &mut sink,
+            )
+            .await
+            .expect("a skip past the end writes nothing and still succeeds");
+
+            let emitted = String::from_utf8(sink).expect("warnings are utf-8");
+            assert!(
+                emitted.contains("--skip-rows 99") && emitted.contains("6 rows"),
+                "the operator is told the requested offset and the file's row count: {emitted}"
+            );
+            assert!(
+                decoded_records(store.as_ref()).await.is_empty(),
+                "and nothing was loaded"
+            );
+        }
+
         #[tokio::test]
         async fn a_failed_load_prints_the_resume_figures_and_the_settings_precondition() {
             use ravel_object_store::fault::{
