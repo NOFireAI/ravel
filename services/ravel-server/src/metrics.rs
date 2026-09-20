@@ -1770,9 +1770,13 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
 /// not have, so the detectable signal is a divergence between the two
 /// counters, or the fold-side family being absent while the ingest side
 /// rises; a family always present at zero would make those two cases read
-/// the same as a healthy idle fold -- exactly the false all-clear
-/// `--mode all --disable-fold` produced when this family was gated on mode
-/// alone.
+/// the same as a healthy idle fold. The gate asks whether this process can
+/// fold at all, by the background task or the on-demand route, rather than
+/// whether the mode permits one: a maintain process omits both families, and
+/// `--mode all --disable-fold` still renders them, because the admin fold
+/// route is mounted and a fold through it moves them. Those counters sit at
+/// zero until someone calls that route, which is the honest reading of a
+/// process that can fold and has not.
 fn render_declared_stats_family(
     out: &mut String,
     mode: Mode,
