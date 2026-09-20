@@ -274,9 +274,11 @@ pub struct FoldReport {
     /// Snapshot entries this fold built carrying at least one declared-column
     /// stamp, from either carrier: the carry half of the same pair. Tallied
     /// where the entry is built, so it counts what the fold carried forward
-    /// rather than what a later step wrote. Never
-    /// above `stamped_records`, since only a stamped carrier can produce a
-    /// stamped entry. Below it means every entry of some stamped carrier was
+    /// rather than what a later step wrote: a bucket the reconcile pass
+    /// re-reads and leaves unchanged, and an entry dropped as a duplicate
+    /// identity, are both counted here and on the records side alike. Never
+    /// above `stamped_records` in this report, since only a stamped carrier
+    /// can produce a stamped entry. Below it means every entry of some stamped carrier was
     /// dropped on the way through, which is the coverage shortfall ADR-0873's
     /// deployment gate is read against.
     pub stamped_entries: u64,

@@ -1756,9 +1756,12 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
 /// [`ravel_commit::declared_stats::StatCarrier::ALL`] whether or not that
 /// carrier has moved, because the four carriers are read by four different
 /// subsystems and no single mode covers them: ingest stamps commit records,
-/// maintenance stamps compaction parts, the fold copies onto snapshot
-/// entries, and ravel-sql reads `.cstat`. Gating this family on folding would
-/// hide the compaction-part drops in the one mode that compacts.
+/// maintenance stamps compaction parts, ravel-sql reads `.cstat`, and the
+/// fourth carrier, `snapshot-entry`, renders so the label set is visibly
+/// closed even though nothing in the shipped tree increments it (see the
+/// stamp-coverage section of docs/guides/observability.md). Gating this
+/// family on folding would hide the compaction-part drops in the one mode
+/// that compacts.
 ///
 /// `coverage` is the fold's `(stamped_records, stamped_entries)` totals, and
 /// is `None` when no fold can run in this process by either route -- neither
@@ -1818,7 +1821,7 @@ fn render_declared_stats_family(
     write_header(
         out,
         "ravel_catalog_fold_stamped_entries_total",
-        "Snapshot entries the fold wrote carrying declared-column statistics, from either carrier. Below the records total means stamps are being read and not carried through.",
+        "Snapshot entries the fold built carrying declared-column statistics, from either carrier. Below the records total means stamps are being read and not carried through.",
         "counter",
     );
     write_sample(
@@ -7058,8 +7061,10 @@ mod tests {
     /// `render` derived the pair from `!matches!(mode, Mode::Maintain)` alone
     /// and rendered both families at zero forever, a false all-clear no alert
     /// on the shortfall would ever catch. Which configurations set the flag
-    /// is [`crate::ServerConfig::folds_in_process`]'s question, pinned by its
-    /// own tests; this one pins what the renderer does with the answer.
+    /// is [`crate::ServerConfig::folds_in_process`]'s question, pinned by the
+    /// mode/flag table in `services/ravel-server/tests/metrics_endpoint.rs`
+    /// and by `services/ravel-server/tests/fold_on_demand_stamp_coverage.rs`;
+    /// this one pins what the renderer does with the answer.
     #[test]
     fn a_process_that_cannot_fold_renders_neither_stamp_coverage_family() {
         let body = render_with_can_fold(Mode::All, false);
