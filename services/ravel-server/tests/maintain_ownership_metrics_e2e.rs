@@ -739,9 +739,18 @@ async fn l0_pending_gauge_sums_every_owned_bucket_including_memo_skipped_ones() 
         min_compaction_inputs: MIN_COMPACTION_INPUTS,
         ..ravel_maintain::CompactorConfig::default()
     };
+    let mut config = single_worker_maintain_config(&tenant_a, 2, compactor);
+    // `fold_tenants` is what the server hands maintenance as the fallback
+    // allow-list for tenants carrying no config record, and both of the
+    // fixture's tenants are that kind. With only tenant A on the list the second
+    // tenant is never maintained and the gauge reads 6 rather than 10.
+    config.fold_tenants = tenants
+        .iter()
+        .map(|name| TenantId::new(*name).hash())
+        .collect();
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
     let server = ravel_server::start(
-        single_worker_maintain_config(&tenant_a, 2, compactor),
+        config,
         store_dyn.clone(),
         store_dyn.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
@@ -771,19 +780,30 @@ async fn l0_pending_gauge_sums_every_owned_bucket_including_memo_skipped_ones() 
     // every owned unit before the total is complete, so poll for the exact
     // figure rather than reading the first scrape.
     let mut first_complete = None;
+    // Kept for the failure message: a gauge that settles on a wrong figure says
+    // which wrong answer it is (one unit, one tenant, or a hardcoded 1), which a
+    // bare "never reached 10" does not.
+    let mut observed: Vec<Option<u64>> = Vec::new();
     for _ in 0..100 {
         let body = scrape(&client, &base).await;
-        if sample_value(&body, PENDING_LINE) == Some(expected_total) {
+        let value = sample_value(&body, PENDING_LINE);
+        if observed.last() != Some(&value) {
+            observed.push(value);
+        }
+        if value == Some(expected_total) {
             first_complete = Some(body);
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let first_complete = first_complete.expect(
-        "within the polling window one maintenance cycle must publish the whole owned \
-         population, 1+2+3+4 = 10 L0 records across two shards of two tenants, as a single \
-         ravel_maintain_l0_records_pending{signal=\"metrics\"} sample",
-    );
+    let first_complete = first_complete.unwrap_or_else(|| {
+        panic!(
+            "within the polling window one maintenance cycle must publish the whole owned \
+             population, 1+2+3+4 = 10 L0 records across two shards of two tenants, as a single \
+             ravel_maintain_l0_records_pending{{signal=\"metrics\"}} sample; \
+             observed instead: {observed:?}"
+        )
+    });
     let full_sweeps_cold = sample_value(&first_complete, FULL_SWEEP_LINE)
         .expect("full_sweep_passes_total present once maintenance has ticked");
 
