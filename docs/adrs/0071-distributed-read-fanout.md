@@ -1524,7 +1524,9 @@ the federation path where the caller is another cluster.
    folds and re-checks; enforcing them per slice would reintroduce exactly the
    failure this amendment removes.
 
-5. **A worker's budget refusal is never a transport error.** The coordinator
+5. **A worker's CAP refusal is never a transport error.** (Its fetch-memory
+   refusal is: that is backpressure, not a verdict on the query, and it stays a
+   retryable 503 for the same reason a full queue does.) The coordinator
    parses the worker's typed message back into `TooManyBytesScanned`,
    `TooManySeries`, `TooManySamples`, or `TooManySegments`, and only an
    unrecognised refusal falls through to `Distrib`. Budget trips render as the
