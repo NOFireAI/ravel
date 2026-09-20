@@ -8,7 +8,7 @@
 //! `#[ignore]`d by default because it needs a working Docker daemon (the
 //! executing user in the docker group or root, a reachable
 //! `/var/run/docker.sock`) and the ability to pull or already have
-//! `prom/prometheus:v3.0.0` cached locally. Run explicitly with:
+//! `PROMETHEUS_IMAGE` (a quay.io mirror) cached locally. Run explicitly with:
 //!
 //! ```text
 //! cargo test -p ravel-server --test remote_write_prometheus_e2e -- --ignored
@@ -37,7 +37,21 @@ use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 
 const TOKEN: &str = "testtoken";
-const PROMETHEUS_IMAGE: &str = "prom/prometheus:v3.0.0";
+// quay.io mirror of prom/prometheus:v3.0.0, digest-pinned: Docker Hub's
+// anonymous pull allowance is per-IP and shared across every project on a
+// runner (see ci.yml's MinIO/floci steps), so an unauthenticated pull there
+// fails unpredictably on a shared nightly runner; quay.io does not share that
+// allowance. The pin checker at
+// deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh only
+// scans workflow YAML for image references, not Rust string consts, so this
+// digest is not covered by that check and must be refreshed by hand.
+// Resolved with:
+//   curl -sS "https://quay.io/v2/auth?service=quay.io&scope=repository:prometheus/prometheus:pull" \
+//     | jq -r .token \
+//     | xargs -I{} curl -sS -D - -o /dev/null -H "Authorization: Bearer {}" \
+//         -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+//         https://quay.io/v2/prometheus/prometheus/manifests/v3.0.0
+const PROMETHEUS_IMAGE: &str = "quay.io/prometheus/prometheus:v3.0.0@sha256:3b9b2a15d376334da8c286d995777d3b9315aa666d2311170ada6059a517b74f";
 
 async fn start_test_server() -> ravel_server::Running {
     let mut tokens = HashMap::new();
@@ -226,13 +240,13 @@ fn tempfile_dir() -> std::path::PathBuf {
 }
 
 #[tokio::test]
-#[ignore = "requires a Docker daemon reachable by this user and the prom/prometheus:v3.0.0 image"]
+#[ignore = "requires a Docker daemon reachable by this user and the PROMETHEUS_IMAGE image"]
 async fn real_prometheus_rw1_remote_write_is_queryable() {
     run_against_real_prometheus("prometheus.WriteRequest", "up").await;
 }
 
 #[tokio::test]
-#[ignore = "requires a Docker daemon reachable by this user and the prom/prometheus:v3.0.0 image"]
+#[ignore = "requires a Docker daemon reachable by this user and the PROMETHEUS_IMAGE image"]
 async fn real_prometheus_rw2_remote_write_is_queryable() {
     run_against_real_prometheus("io.prometheus.write.v2.Request", "up").await;
 }
