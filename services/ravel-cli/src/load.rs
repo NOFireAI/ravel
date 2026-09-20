@@ -479,6 +479,7 @@ pub async fn run(
     mapping_path: &Path,
     shards: u32,
     batch_rows: usize,
+    skip_rows: u64,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     max_inflight_flushes: u32,
@@ -494,6 +495,7 @@ pub async fn run(
         mapping_path,
         shards,
         batch_rows,
+        skip_rows,
         read_cursors,
         pipeline_depth,
         max_inflight_flushes,
@@ -521,6 +523,7 @@ pub(crate) async fn run_warning_to(
     mapping_path: &Path,
     shards: u32,
     batch_rows: usize,
+    skip_rows: u64,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     max_inflight_flushes: u32,
@@ -548,6 +551,7 @@ pub(crate) async fn run_warning_to(
         &mapping,
         shards,
         batch_rows,
+        skip_rows,
         read_cursors,
         pipeline_depth,
         max_inflight_flushes,
@@ -604,6 +608,8 @@ fn print_summary(report: &LoadReport) {
     };
     println!("bulk load complete");
     println!("  rows processed   : {}", report.rows_processed);
+    println!("  rows_skipped     : {}", report.rows_skipped);
+    println!("  rows_written     : {}", report.rows_processed);
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
     println!("  elapsed          : {secs:.3}s");
@@ -726,6 +732,13 @@ fn print_durable_tokens(err: &LoadError) {
 #[derive(Debug, Clone, Default)]
 pub struct LoadReport {
     pub rows_processed: u64,
+    /// `--skip-rows` (issue #1713): count of leading file rows dropped before
+    /// mapping, by FILE-absolute position. `min(skip_rows, total file rows)`,
+    /// computed once from Parquet footer metadata before decode starts. This
+    /// is a positional resume with no idempotency marker: nothing here
+    /// detects a wrong offset, and a re-run must pass the exact value the
+    /// prior attempt's summary reported.
+    pub rows_skipped: u64,
     /// One token per shard acked, across every batch, in submission order. At
     /// the default `--target-bytes 1` that is one token per object written; at
     /// a larger target one flush answers several batches' acks with the same
@@ -1000,6 +1013,7 @@ pub async fn load(
         mapping,
         shards,
         batch_rows,
+        0,
         read_cursors,
         pipeline_depth,
         DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -1060,6 +1074,7 @@ async fn load_instrumented(
     mapping: &Mapping,
     shards: u32,
     batch_rows: usize,
+    skip_rows: u64,
     read_cursors: Option<usize>,
     pipeline_depth: usize,
     max_inflight_flushes: u32,
@@ -1236,6 +1251,13 @@ async fn load_instrumented(
 
     let started = Instant::now();
     let mut report = LoadReport::default();
+    // `--skip-rows` is a positional offset against the file's total row count,
+    // known entirely from the footer metadata already parsed above -- no need
+    // to wait for the decode pipeline to find out how many rows it dropped.
+    // Beyond the file's row count, every row is skipped and the load succeeds
+    // having written nothing (issue #1713).
+    let total_rows: u64 = row_group_lens.iter().sum();
+    report.rows_skipped = skip_rows.min(total_rows);
     let mut shards_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut data_batches_flushed: u64 = 0;
 
@@ -1273,6 +1295,7 @@ async fn load_instrumented(
     let state = StrideCursors {
         cursors,
         deal_offset: 0,
+        skip_rows,
     };
 
     let (mut rx, decode_handle) = spawn_decode_pipeline(
@@ -1808,6 +1831,14 @@ struct StrideCursors {
     /// configuration) does not starve any cursor forever: see
     /// [`decode_and_build_stride`].
     deal_offset: usize,
+    /// `--skip-rows`: the count of leading rows, by FILE-absolute position, to
+    /// drop before mapping (issue #1713). Applied in [`collect_spans`] against
+    /// each span's own `file_base`, so it is correct regardless of how many
+    /// stride cursors are dealing rows or in what order they hand them out.
+    /// This is a positional resume with no idempotency marker: a re-run must
+    /// pass the exact offset the previous attempt's summary reported, and
+    /// nothing here can detect a wrong guess.
+    skip_rows: u64,
 }
 
 /// Drain up to `want` contiguous rows from `cur`, pulling fresh Arrow batches
@@ -1917,6 +1948,27 @@ fn collect_spans(
         }
     }
     state.deal_offset = (state.deal_offset + extra) % l;
+
+    // `--skip-rows` (issue #1713): drop the leading rows of every span whose
+    // FILE-absolute position is under the skip threshold, before mapping ever
+    // sees them. Comparing against `file_base` rather than a running counter
+    // is what makes this correct independent of cursor count or dealing
+    // order: a span's own absolute position decides whether it is skipped,
+    // not the order this function happened to hand it out in.
+    if state.skip_rows > 0 {
+        spans.retain_mut(|(batch, file_base)| {
+            let end = *file_base + batch.num_rows() as u64;
+            if end <= state.skip_rows {
+                return false;
+            }
+            if *file_base < state.skip_rows {
+                let cut = (state.skip_rows - *file_base) as usize;
+                *batch = batch.slice(cut, batch.num_rows() - cut);
+                *file_base += cut as u64;
+            }
+            true
+        });
+    }
     SpanOutcome::Spans(spans)
 }
 
@@ -4046,6 +4098,7 @@ type = "i64"
             m,
             shards,
             batch_rows,
+            0,
             Some(read_cursors),
             batches + 1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -4352,6 +4405,7 @@ type = "i64"
             &mapping_path,
             4,
             10_000,
+            0,
             None,
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -4546,6 +4600,7 @@ type = "i64"
             &m,
             4,
             10,
+            0,
             None,
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -4594,6 +4649,7 @@ type = "i64"
             &m,
             4,
             10,
+            0,
             None,
             1,
             0,
@@ -4724,6 +4780,7 @@ type = "i64"
         let state = StrideCursors {
             cursors,
             deal_offset: 0,
+            skip_rows: 0,
         };
         let (mut rx, handle) = spawn_decode_pipeline(
             state,
@@ -4836,6 +4893,7 @@ type = "i64"
                     &m,
                     4,
                     2,
+                    0,
                     None,
                     2,
                     DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -5021,6 +5079,7 @@ type = "i64"
             &m,
             1,
             2,
+            0,
             None,
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -5324,6 +5383,7 @@ type = "i64"
             &m,
             1,
             2,
+            0,
             None,
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -5985,6 +6045,7 @@ type = "i64"
                     &mapping_path,
                     shards,
                     16,
+                    0,
                     Some(shards as usize),
                     4,
                     DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -6144,6 +6205,7 @@ type = "i64"
             &m,
             shards,
             rows_per_group,
+            0,
             Some(shards as usize),
             rows_per_group,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -6203,6 +6265,7 @@ type = "i64"
             &m,
             4,
             4,
+            0,
             Some(4),
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -6334,8 +6397,9 @@ type = "i64"
             pq,
             "acme",
             m,
-            1,       // one shard: both writes land in the same buffer
-            1,       // one row per batch
+            1, // one shard: both writes land in the same buffer
+            1, // one row per batch
+            0,
             Some(1), // one read cursor: batches are strictly sequential
             4,       // pipeline depth above the write count: no mid-loop ack wait
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -6534,6 +6598,7 @@ type = "i64"
             &m,
             1,
             1,
+            0,
             Some(1),
             5, // pipeline depth above the batch count: no mid-loop ack wait
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -6761,6 +6826,7 @@ type = "i64"
             &mapping_path,
             shards,
             batch_rows,
+            0,
             Some(1),
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -6791,6 +6857,7 @@ type = "i64"
             &mapping_path,
             shards,
             batch_rows,
+            0,
             Some(4),
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -6835,6 +6902,7 @@ type = "i64"
             &mapping_path,
             shards,
             batch_rows,
+            0,
             Some(1),
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -7720,6 +7788,7 @@ type = "i64"
             mapping,
             shards,
             batch_rows,
+            0,
             read_cursors,
             1,
             DEFAULT_MAX_INFLIGHT_FLUSHES,
@@ -8104,6 +8173,7 @@ type = "i64"
                 &m,
                 shards,
                 1,
+                0,
                 None,
                 PIPELINE_DEPTH,
                 flushes,
@@ -8238,6 +8308,7 @@ type = "i64"
                 &m,
                 shards,
                 1,
+                0,
                 None,
                 depth,
                 flushes,
@@ -9134,5 +9205,129 @@ type = "i64"
             "build_columnar_batch over {ROWS} rows x {COLS} columns: map build {map_elapsed:?}, \
              slot-table build {slot_elapsed:?}"
         );
+    }
+
+    /// `--skip-rows` (issue #1713): a positional resume with no idempotency
+    /// marker. These tests exercise `load_instrumented` directly (rather than
+    /// the public [`load`] wrapper, which hardcodes `skip_rows: 0` to avoid
+    /// changing its own signature) since that is the only entry point that
+    /// carries the parameter.
+    mod load_skip_rows {
+        use super::*;
+        use ravel_object_store::memory::MemoryStore;
+
+        /// A 10-row single-row-group fixture with a distinguishing `idx`
+        /// attribute (0..n), so a landed record's identity -- not just its
+        /// count -- can be checked against the source file.
+        fn skip_rows_fixture(
+            n: i64,
+        ) -> (tempfile::TempDir, std::path::PathBuf, Mapping, RecordBatch) {
+            let mut m = base_mapping();
+            m.attributes = vec![attr("idx", "idx", ColType::I64)];
+            let b = batch(vec![
+                ("ts", i64_col(vec![NOW_NS; n as usize])),
+                ("idx", i64_col((0..n).collect())),
+            ]);
+            let (dir, pq) = write_parquet(&b);
+            (dir, pq, m, b)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn run_skip_rows(
+            store: Arc<dyn ObjectStoreBackend>,
+            pq: &Path,
+            m: &Mapping,
+            skip_rows: u64,
+        ) -> LoadReport {
+            load_instrumented(
+                store,
+                pq,
+                "acme",
+                m,
+                1,
+                10,
+                skip_rows,
+                Some(1),
+                1,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                DEFAULT_TARGET_BYTES,
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+                LoadPath::Columnar,
+                None,
+                None,
+            )
+            .await
+            .expect("load succeeds")
+        }
+
+        /// A 10-row file loaded with `skip_rows=7` lands exactly the 3 rows at
+        /// file-absolute positions 7, 8, 9 -- verified by reading the RLOG
+        /// objects the router actually wrote back (via [`decoded_records`]),
+        /// not merely by a row count, against an independently computed
+        /// differential reference ([`row_records`] over the same rows sliced
+        /// straight out of the source batch).
+        ///
+        /// Non-vacuity (prove-the-test): change the `cut` computation in
+        /// `collect_spans` from `state.skip_rows - *file_base` to
+        /// `state.skip_rows - *file_base + 1` (an off-by-one that slices one
+        /// row too few off the straddling batch) and this test's exact
+        /// `rows_processed == 3` assertion fails: `left: 2, right: 3`, since
+        /// row 7 (file-absolute) is wrongly dropped along with 0..6.
+        #[tokio::test]
+        async fn skip_rows_lands_exactly_the_rows_after_the_offset() {
+            let (_dir, pq, m, full) = skip_rows_fixture(10);
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+            let report = run_skip_rows(Arc::clone(&store), &pq, &m, 7).await;
+
+            assert_eq!(
+                report.rows_skipped, 7,
+                "skip_rows=7 against a 10-row file must report exactly 7 skipped"
+            );
+            assert_eq!(
+                report.rows_processed, 3,
+                "skip_rows=7 against a 10-row file must land exactly 3 rows"
+            );
+
+            let mut expected: Vec<String> = row_records(&full.slice(7, 3), &m)
+                .iter()
+                .map(|r| format!("{:?}", to_logrecord(r)))
+                .collect();
+            expected.sort();
+
+            assert_eq!(
+                decoded_records(store.as_ref()).await,
+                expected,
+                "the landed records must be exactly file rows 7..10, not merely 3 of them"
+            );
+        }
+
+        /// A `skip_rows` at or beyond the file's total row count lands 0
+        /// records and the load still exits `Ok` -- there is no error case
+        /// for "skip past the end", since a positional resume of an
+        /// already-fully-loaded file is exactly this shape.
+        #[tokio::test]
+        async fn skip_rows_beyond_the_file_lands_nothing_and_succeeds() {
+            let (_dir, pq, m, _full) = skip_rows_fixture(10);
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+            let report = run_skip_rows(Arc::clone(&store), &pq, &m, 1_000).await;
+
+            assert_eq!(
+                report.rows_skipped, 10,
+                "rows_skipped caps at the file's total row count (10), not the requested 1000"
+            );
+            assert_eq!(
+                report.rows_processed, 0,
+                "no row survives a skip past the file's end"
+            );
+            assert!(
+                decoded_records(store.as_ref()).await.is_empty(),
+                "no RLOG object holds any record when every row is skipped"
+            );
+        }
     }
 }
