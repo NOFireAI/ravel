@@ -561,8 +561,13 @@ dr_reset_bucket() {
     fi
     dr_log "bucket ${bucket} carries no rehearsal marker; proceeding under --i-know-this-bucket"
   fi
-  count="$(dr_count_lines "$(dr_list_all_versions "${bucket}")")" || dr_die \
+  # Two statements, not one: a command substitution nested inside another
+  # reports the OUTER command's status, and dr_count_lines always exits 0, so
+  # a failed listing would have read as an empty bucket.
+  local listing
+  listing="$(dr_list_all_versions "${bucket}")" || dr_die \
     "${DR_EX_PRECONDITION}" "could not list ${bucket} before emptying it"
+  count="$(dr_count_lines "${listing}")"
   printf 'dr-reset: bucket=%s objects_to_delete=%s (all versions)\n' "${bucket}" "${count}"
   dr_log "emptying bucket ${bucket} (${count} object version(s))"
   if ! dr_mc rm --recursive --force --versions "dr/${bucket}/" \
@@ -572,7 +577,11 @@ dr_reset_bucket() {
       >>"${DR_LOG_DIR}/reset-${bucket}.log" 2>&1 \
       || dr_die "${DR_EX_PRECONDITION}" "could not empty ${bucket}"
   fi
-  after="$(dr_count_lines "$(dr_list_all_versions "${bucket}")")"
+  local after_listing
+  after_listing="$(dr_list_all_versions "${bucket}")" || dr_die \
+    "${DR_EX_PRECONDITION}" \
+    "could not list ${bucket} after emptying it, so the bucket is not proven empty"
+  after="$(dr_count_lines "${after_listing}")"
   if [[ "${after}" -ne 0 ]]; then
     dr_die "${DR_EX_PRECONDITION}" \
       "bucket ${bucket} still holds ${after} object version(s) after the delete; on a versioned bucket a delete marker is not an empty bucket"
