@@ -79,7 +79,7 @@ plus the quickstart compose files issue #1720 added: every `FROM`/`ARG` base
 image in the root `Dockerfile` and `Dockerfile.prebuilt`, every `uses:` action
 reference under `.github/workflows/` and `.github/actions/`, and every
 `image:` reference in `deploy/docker-compose/ravel.yml` and
-`deploy/docker-compose/minio.yml`. All five categories run in one invocation
+`deploy/docker-compose/minio.yml`. All six categories run in one invocation
 and each is checked against its own expected count:
 
 - **Compose images** (this directory): every image reference carries an
@@ -97,11 +97,8 @@ and each is checked against its own expected count:
   `${RAVEL_IMAGE:-...}` references in `ravel.yml` (Ravel's own released
   image, excluded by exact match) carries an `@sha256:` digest, and both the
   total image-line count (8, across both files) and the pin-required count
-  (6) equal their expected totals. Scoped to these two files: `deploy/k8s`
-  carries four registry images that are not yet pinned (`minio.yaml` lines
-  49 and 140, `floci.yaml` lines 74 and 157) plus two locally built
-  placeholders (`ravel-server`, `ravel-operator`); pinning the k8s manifests
-  is a separate ticket.
+  (6) equal their expected totals. The `deploy/k8s` manifests are covered by
+  their own category below.
 
 - **Workflow docker invocations**: every image argument of a `docker run`,
   `docker pull` or `docker create` inside a `run:` block, across every
@@ -113,7 +110,14 @@ and each is checked against its own expected count:
   continuations are joined before matching, here-doc bodies are skipped, and
   every invocation on a line is scanned, not just the first.
 
-Exit 0 means all five categories passed. Any unpinned reference, any missing
+- **Kubernetes manifest images**: every `image:` reference under
+  `deploy/k8s` carries an `@sha256:` digest, with the two locally built
+  placeholders that kind loads by tag (`ravel-server`, `ravel-operator`)
+  excluded by exact match. The total and the pin-required count each equal
+  their expected number, so an image added there without a digest fails the
+  check rather than going unnoticed.
+
+Exit 0 means all six categories passed. Any unpinned reference, any missing
 required comparator, or a reference count that drifts from any category's
 expected number fails the check with a non-zero exit. The script prints what
 it checked and how many references it found in each category.
