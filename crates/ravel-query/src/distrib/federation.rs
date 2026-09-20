@@ -263,10 +263,10 @@ impl Federation {
         let encoded_erasure = codec::encode_erasure(&erasure);
         // Not a slice fan-out: each remote cluster resolves its own snapshot
         // and enforces its own admission independently (ADR-0071), so its
-        // request carries the tenant's whole byte budget, not a scoped-down
-        // fraction of it (issue #588's fix is specific to `mod.rs`'s local
-        // slice fan-out, where every slice shares one snapshot's budget).
-        let budgets = encode_budgets(&config, 1);
+        // request carries the tenant's whole byte budget. That is the same
+        // budget a local slice now carries (issue #1725); the remote clamps
+        // it to its own `EngineConfig` on arrival, as a local worker does.
+        let budgets = encode_budgets(&config);
         let tenant_bytes = tenant_hash.0.to_vec();
         let signal_disc = codec::signal_to_u32(signal);
 

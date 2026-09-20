@@ -1336,7 +1336,7 @@ fn coordinator_reenforces_bytes_budget_over_lying_worker() {
     });
 }
 
-// --- byte budget scoped by actual slice count (issue #588) -----------------
+// --- the full byte budget goes to every slice (issue #1725) ----------------
 
 /// A [`SliceFetcher`] double that records every `request.budgets` it receives
 /// (so a test can assert what each dispatched slice was actually authorized
@@ -1389,20 +1389,20 @@ async fn sharded_snapshot(store: &MemoryStore, shard_count: u32) -> Snapshot {
     }
 }
 
-/// ADR-0071 (issue #588): every slice used to carry the tenant's FULL byte
-/// budget verbatim, so a `max_parallel_slices`-wide fan-out could authorize
-/// up to Nx the configured budget before the coordinator's post-merge
-/// re-check observed anything. Three shards at cap 3 dispatch three slices;
-/// each must be authorized for exactly a third of the query's byte budget,
-/// summing to no more than the configured total. `max_series`/
-/// `max_samples`/`max_segments` stay unscoped (deliberately, per the fix's
-/// doc comment): each slice still carries the full count-based caps.
+/// ADR-0071 (issue #1725): every slice carries the query's WHOLE byte
+/// budget, not a `1/slice_count` share of it. A share is not a budget: the
+/// slice holding the hot shard trips its share while the query as a whole
+/// sits far under the tenant's cap. Three shards at cap 3 dispatch three
+/// slices, and each must be authorized for the full 900 bytes; the
+/// coordinator's fold, not the per-slice share, is what enforces the total.
+/// `max_series`/`max_samples`/`max_segments` are sent whole for the same
+/// reason.
 ///
-/// Mutation proof: reverting `encode_budgets` in `mod.rs` to the pre-fix
-/// `max_bytes_scanned: n` (no division) makes the per-slice assertion below
-/// fail with `900`, not `300`.
+/// Mutation proof: restoring the `n / slice_count.max(1)` division in
+/// `encode_budgets` (`mod.rs`) makes the per-slice assertion below fail with
+/// `300`, not `900`.
 #[test]
-fn distrib_fetch_scopes_byte_budget_by_actual_slice_count() {
+fn distrib_fetch_sends_the_full_byte_budget_to_every_slice() {
     let rt = Runtime::new().expect("runtime");
     rt.block_on(async {
         let store = MemoryStore::new();
@@ -1445,29 +1445,23 @@ fn distrib_fetch_scopes_byte_budget_by_actual_slice_count() {
         assert_eq!(recorded.len(), 3, "all three slices dispatched once");
         for budgets in recorded.iter() {
             assert_eq!(
-                budgets.max_bytes_scanned, 300,
-                "each of 3 slices gets a third of the 900-byte budget, not the whole thing"
+                budgets.max_bytes_scanned, 900,
+                "every slice carries the query's whole 900-byte budget, not a third of it"
             );
-            assert_eq!(budgets.max_series, 42, "count-based caps stay unscoped");
-            assert_eq!(budgets.max_samples, 43, "count-based caps stay unscoped");
-            assert_eq!(budgets.max_segments, 44, "count-based caps stay unscoped");
+            assert_eq!(budgets.max_series, 42, "count-based caps are sent whole");
+            assert_eq!(budgets.max_samples, 43, "count-based caps are sent whole");
+            assert_eq!(budgets.max_segments, 44, "count-based caps are sent whole");
         }
-        let total: u64 = recorded.iter().map(|b| b.max_bytes_scanned).sum();
-        assert!(
-            total <= 900,
-            "the sum of every slice's share must never exceed the configured budget"
-        );
     });
 }
 
-/// The division must scope to how many slices `partition_snapshot` actually
-/// produced, not the configured `max_parallel_slices` cap: two shards at cap
-/// 8 dispatch only two slices, so each must get half the budget, not an
-/// eighth. Dividing by the cap instead of the real count would starve every
-/// slice with a spurious budget far below what the query is actually
-/// entitled to.
+/// The per-slice byte budget does not depend on how many slices were
+/// dispatched: two shards at cap 8 dispatch two slices, and each is
+/// authorized for the same whole 1000 bytes a single-slice query would get.
+/// That independence is the point of #1725: a query's authorization must not
+/// shrink because its data happens to span more shards.
 #[test]
-fn distrib_fetch_scopes_byte_budget_by_real_not_configured_slice_count() {
+fn distrib_fetch_byte_budget_does_not_shrink_with_slice_count() {
     let rt = Runtime::new().expect("runtime");
     rt.block_on(async {
         let store = MemoryStore::new();
@@ -1507,16 +1501,16 @@ fn distrib_fetch_scopes_byte_budget_by_real_not_configured_slice_count() {
         assert_eq!(recorded.len(), 2, "only two shards, so only two slices");
         for budgets in recorded.iter() {
             assert_eq!(
-                budgets.max_bytes_scanned, 500,
-                "two real slices split the budget in half, not by the cap of 8"
+                budgets.max_bytes_scanned, 1_000,
+                "each of two slices carries the whole budget, not half of it"
             );
         }
     });
 }
 
 /// `Unlimited` stays the wire's `0` sentinel regardless of slice count: a
-/// query with no configured byte cap must not have one manufactured by
-/// dividing `0` (or crashing on it).
+/// query with no configured byte cap must not have one manufactured on the
+/// wire, where `0` means "no cap from the coordinator".
 #[test]
 fn distrib_fetch_unlimited_byte_budget_stays_the_zero_sentinel_across_slices() {
     let rt = Runtime::new().expect("runtime");
@@ -1563,6 +1557,391 @@ fn distrib_fetch_unlimited_byte_budget_stays_the_zero_sentinel_across_slices() {
             );
         }
     });
+}
+
+/// A [`SliceFetcher`] double that behaves the way a faithful worker does: it
+/// spends a fixed number of bytes per dispatch (popped in dispatch order),
+/// reports that spend in its accounting snapshot, and refuses with
+/// `BudgetExceeded` ONLY when its own spend exceeds the wire budget it was
+/// actually given. The refusal message is the rendered
+/// `QueryError::TooManyBytesScanned` a real worker's `summary_frame` carries,
+/// so the coordinator's fold sees exactly the text the wire really delivers.
+/// `0` on the wire is the no-cap sentinel.
+struct FaithfulBudgetWorker {
+    spends: std::sync::Mutex<std::collections::VecDeque<u64>>,
+    /// The wire budget of every dispatch, in arrival order.
+    seen_wire: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl FaithfulBudgetWorker {
+    fn new(
+        spends: impl IntoIterator<Item = u64>,
+        seen_wire: Arc<std::sync::Mutex<Vec<u64>>>,
+    ) -> Self {
+        FaithfulBudgetWorker {
+            spends: std::sync::Mutex::new(spends.into_iter().collect()),
+            seen_wire,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SliceFetcher for FaithfulBudgetWorker {
+    async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        let spend = self
+            .spends
+            .lock()
+            .expect("lock")
+            .pop_front()
+            .expect("a dispatch with no configured spend");
+        let wire = request.budgets.map(|b| b.max_bytes_scanned).unwrap_or(0);
+        self.seen_wire.lock().expect("lock").push(wire);
+        let acct = QueryAccounting::new();
+        acct.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, spend);
+        let (status, status_message) = if wire != 0 && spend > wire {
+            (
+                pb::status::Code::BudgetExceeded,
+                crate::error::QueryError::TooManyBytesScanned {
+                    scanned: spend,
+                    max: wire,
+                }
+                .to_string(),
+            )
+        } else {
+            (pb::status::Code::Ok, String::new())
+        };
+        Ok(SliceResponse {
+            scalar: Vec::new(),
+            histogram: Vec::new(),
+            partials: Vec::new(),
+            accounting: acct.snapshot(),
+            stats: crate::fetcher::FetchStats::default(),
+            series_returned: 0,
+            samples_returned: 0,
+            status,
+            status_message,
+        })
+    }
+}
+
+/// The acceptance test for issue #1725. Work is skewed across shards: of two
+/// slices under a 1000-byte query budget, one scans 900 bytes and the other
+/// 50, for a folded total of 950 -- comfortably under the query's own cap.
+/// Such a query must not fail at all, and it must NEVER fail as
+/// `QueryError::Distrib`, which maps to a retryable 503 and reports a budget
+/// outcome as an outage.
+///
+/// Pre-fix both halves failed. `encode_budgets` divided the budget by the
+/// slice count, so each slice was authorized for 500: the 900-byte slice
+/// tripped and returned `BudgetExceeded`, and because the folded total (950)
+/// was under the query's cap, `budget_exceeded_error` found no bytes trip, no
+/// memory refusal, and fell through to `QueryError::Distrib`.
+///
+/// Mutation proof, either line on its own re-breaks this test:
+/// - restoring `n / (slice_count.max(1) as u64)` in `encode_budgets`
+///   (`mod.rs`) makes the wire assertion fail with 500 and the query fail;
+/// - deleting the `parse_worker_cap_refusal` branch from
+///   `budget_exceeded_error` (`mod.rs`) makes the `Distrib` assertion fail
+///   for any worker that does refuse on a byte cap.
+#[test]
+fn skewed_slice_over_its_share_but_under_query_budget_never_returns_distrib() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = MemoryStore::new();
+        let snapshot = sharded_snapshot(&store, 2).await;
+        let seen_wire = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let distributed = Distributed::new(
+            Arc::new(FaithfulBudgetWorker::new(
+                [900, 50],
+                Arc::clone(&seen_wire),
+            )),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 2,
+            },
+        );
+        let config = EngineConfig {
+            max_bytes_scanned: crate::config::ByteLimit::Bounded(1_000),
+            ..EngineConfig::default()
+        };
+        let accounting = QueryAccounting::new();
+        let result = distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &config,
+                i64::MAX,
+                None,
+            )
+            .await;
+
+        match result {
+            Ok(_) => {}
+            Err(err) => {
+                assert!(
+                    !matches!(err, crate::error::QueryError::Distrib { .. }),
+                    "a byte residual under the query's own budget must never be Distrib, got {err:?}"
+                );
+                assert!(
+                    matches!(err, crate::error::QueryError::TooManyBytesScanned { .. }),
+                    "the only acceptable failure here is a typed budget error, got {err:?}"
+                );
+            }
+        }
+
+        let wire = seen_wire.lock().expect("lock");
+        assert_eq!(wire.len(), 2, "both slices dispatched once");
+        for budget in wire.iter() {
+            assert_eq!(
+                *budget, 1_000,
+                "each slice is authorized for the query's whole budget, not a 500-byte share"
+            );
+        }
+        assert_eq!(
+            accounting.snapshot().total_s3_bytes(),
+            950,
+            "both slices' real spend is folded into the query's reported cost"
+        );
+    });
+}
+
+/// The other half of the semantics: a fan-out whose FOLDED total really is
+/// over the query's budget still fails, as the typed
+/// `TooManyBytesScanned`, and renders as 422 `execution` through the HTTP
+/// mapping -- never the 503 a `Distrib` would render. Two slices spend 900
+/// and 600 bytes; neither exceeds the 1000-byte budget each was authorized
+/// for on its own, so the refusal can only come from the coordinator's fold.
+///
+/// Mutation proof: deleting the folded `bytes_scanned_exceeded` check in
+/// `Distributed::fetch`'s `Ok` arm (`mod.rs`) lets the over-spend through and
+/// `expect_err` below fails.
+#[test]
+fn distrib_fold_over_query_budget_renders_422_not_503() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = MemoryStore::new();
+        let snapshot = sharded_snapshot(&store, 2).await;
+        let seen_wire = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let distributed = Distributed::new(
+            Arc::new(FaithfulBudgetWorker::new(
+                [900, 600],
+                Arc::clone(&seen_wire),
+            )),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 2,
+            },
+        );
+        let config = EngineConfig {
+            max_bytes_scanned: crate::config::ByteLimit::Bounded(1_000),
+            ..EngineConfig::default()
+        };
+        let accounting = QueryAccounting::new();
+        let err = distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &config,
+                i64::MAX,
+                None,
+            )
+            .await
+            .expect_err("a folded total of 1500 over a 1000-byte budget must fail");
+        assert!(
+            matches!(
+                err,
+                crate::error::QueryError::TooManyBytesScanned {
+                    scanned: 1_500,
+                    max: 1_000
+                }
+            ),
+            "the fold must report the exact folded total against the query's cap, got {err:?}"
+        );
+
+        let rendered = crate::http::QueryErrorResponse::from_query_error(err);
+        assert_eq!(
+            rendered.status,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a budget refusal is a 422, not the 503 a Distrib error renders"
+        );
+        assert_eq!(rendered.error_type, "execution");
+    });
+}
+
+/// A worker that refuses on ITS OWN tighter limit (issue #1687 part A: the
+/// worker clamps every wire budget to its local `EngineConfig`) reports a
+/// `BudgetExceeded` whose figures are the worker's, not the query's, while
+/// the coordinator's folded total stays under the query's cap. That residual
+/// is a budget outcome the caller can act on, so it surfaces as the typed
+/// `TooManyBytesScanned` carrying the WORKER's figures, never as `Distrib`.
+///
+/// Mutation proof: deleting the `parse_worker_cap_refusal` branch from
+/// `budget_exceeded_error` (`mod.rs`) makes this fall back to `Distrib` and
+/// the `matches!` below fails.
+#[test]
+fn worker_local_clamp_refusal_surfaces_typed_not_distrib() {
+    let msg = crate::error::QueryError::TooManyBytesScanned {
+        scanned: 900,
+        max: 100,
+    }
+    .to_string();
+    let err = super::budget_exceeded_error(900, crate::config::ByteLimit::Bounded(1_000), &msg);
+    assert!(
+        matches!(
+            err,
+            crate::error::QueryError::TooManyBytesScanned {
+                scanned: 900,
+                max: 100
+            }
+        ),
+        "the worker's own clamp figures must survive the fold typed, got {err:?}"
+    );
+    let rendered = crate::http::QueryErrorResponse::from_query_error(err);
+    assert_eq!(
+        rendered.status,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+/// `parse_worker_cap_refusal` inverts the `Display` of all four cap errors a
+/// worker's `summary_frame` can carry. Changing any of those `#[error(..)]`
+/// formats without updating the parser fails here rather than silently
+/// degrading the coordinator to a generic `Distrib`.
+#[test]
+fn worker_cap_refusal_messages_round_trip() {
+    let bytes = crate::error::QueryError::TooManyBytesScanned {
+        scanned: 4_194_304,
+        max: 1_048_576,
+    };
+    assert!(
+        matches!(
+            super::parse_worker_cap_refusal(&bytes.to_string()),
+            Some(crate::error::QueryError::TooManyBytesScanned {
+                scanned: 4_194_304,
+                max: 1_048_576
+            })
+        ),
+        "the bytes refusal must round-trip its exact figures"
+    );
+
+    let series = crate::error::QueryError::TooManySeries {
+        count: 10_001,
+        max: 10_000,
+    };
+    assert!(
+        matches!(
+            super::parse_worker_cap_refusal(&series.to_string()),
+            Some(crate::error::QueryError::TooManySeries {
+                count: 10_001,
+                max: 10_000
+            })
+        ),
+        "the series refusal must round-trip its exact figures"
+    );
+
+    let samples = crate::error::QueryError::TooManySamples {
+        count: 10_000_001,
+        max: 10_000_000,
+    };
+    assert!(
+        matches!(
+            super::parse_worker_cap_refusal(&samples.to_string()),
+            Some(crate::error::QueryError::TooManySamples {
+                count: 10_000_001,
+                max: 10_000_000
+            })
+        ),
+        "the samples refusal must round-trip its exact figures"
+    );
+
+    let segments = crate::error::QueryError::TooManySegments {
+        count: 1_025,
+        max: 1_024,
+    };
+    assert!(
+        matches!(
+            super::parse_worker_cap_refusal(&segments.to_string()),
+            Some(crate::error::QueryError::TooManySegments {
+                count: 1_025,
+                max: 1_024
+            })
+        ),
+        "the segments refusal must round-trip its exact figures"
+    );
+
+    // An unrelated message parses to None, so the fold still falls back to a
+    // generic Distrib rather than fabricating a budget outcome.
+    assert!(
+        super::parse_worker_cap_refusal("worker exploded").is_none(),
+        "an unrelated message must not parse as a cap refusal"
+    );
+    assert!(
+        super::parse_worker_cap_refusal("query matched some series, exceeding the limit of 3")
+            .is_none(),
+        "a non-numeric count must not parse"
+    );
+}
+
+/// Issue #1687 part A: the worker's own configuration is binding on every
+/// wire budget. `0` and an absent `Budgets` are the wire's no-cap sentinel,
+/// which means "no cap from the coordinator" and therefore resolves to the
+/// WORKER's limit, never to `Unlimited`. A coordinator asking for more than
+/// the worker allows gets the worker's number; asking for less gets its own.
+///
+/// Mutation proof: restoring the pre-fix `Some(0) | None =>
+/// ByteLimit::Unlimited` arm makes the first two cases below fail with
+/// `Unlimited`, and dropping the `wire.min(own)` to a bare `wire` makes the
+/// oversized case fail with 1_000_000.
+#[test]
+fn worker_clamps_every_wire_budget_to_its_own_engine_config() {
+    let worker = crate::config::ByteLimit::Bounded(4_096);
+    let budgets = |max_bytes_scanned| pb::Budgets {
+        max_series: u64::MAX,
+        max_samples: u64::MAX,
+        max_bytes_scanned,
+        max_segments: u64::MAX,
+    };
+
+    assert_eq!(
+        super::service::slice_byte_limit(None, worker),
+        crate::config::ByteLimit::Bounded(4_096),
+        "an absent Budgets falls back to the worker's own limit"
+    );
+    assert_eq!(
+        super::service::slice_byte_limit(Some(&budgets(0)), worker),
+        crate::config::ByteLimit::Bounded(4_096),
+        "the 0 sentinel means no cap from the coordinator, not no cap at all"
+    );
+    assert_eq!(
+        super::service::slice_byte_limit(Some(&budgets(1_000_000)), worker),
+        crate::config::ByteLimit::Bounded(4_096),
+        "an oversized wire budget is clamped down to the worker's own"
+    );
+    assert_eq!(
+        super::service::slice_byte_limit(Some(&budgets(512)), worker),
+        crate::config::ByteLimit::Bounded(512),
+        "a tighter wire budget wins: the clamp takes the minimum of the two"
+    );
+    assert_eq!(
+        super::service::slice_byte_limit(Some(&budgets(512)), crate::config::ByteLimit::Unlimited),
+        crate::config::ByteLimit::Bounded(512),
+        "an unconfigured worker still honours the coordinator's budget"
+    );
+    assert_eq!(
+        super::service::slice_byte_limit(None, crate::config::ByteLimit::Unlimited),
+        crate::config::ByteLimit::Unlimited,
+        "no cap on either side is the only way to get Unlimited"
+    );
 }
 
 // --- snapshot invalidation collapses to one retryable error ----------------

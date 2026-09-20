@@ -165,7 +165,7 @@ impl Distributed {
 
         let encoded_matchers = codec::encode_matchers(matchers);
         let encoded_erasure = codec::encode_erasure(erasure);
-        let budgets = encode_budgets(config, slices.len());
+        let budgets = encode_budgets(config);
         let tenant_bytes = tenant_hash.0.to_vec();
         let signal_disc = codec::signal_to_u32(signal);
         // One query id for the whole query (ADR-0071 amendment, decision 2): the
@@ -458,7 +458,7 @@ impl Distributed {
 
         let encoded_matchers = codec::encode_matchers(matchers);
         let encoded_erasure = codec::encode_erasure(erasure);
-        let budgets = encode_budgets(config, slices.len());
+        let budgets = encode_budgets(config);
         let tenant_bytes = tenant_hash.0.to_vec();
         let signal_disc = codec::signal_to_u32(signal);
         let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline_unix_ns, snapshot);
@@ -612,7 +612,7 @@ impl Distributed {
 
         let encoded_matchers = codec::encode_matchers(matchers);
         let encoded_erasure = codec::encode_erasure(erasure);
-        let budgets = encode_budgets(config, slices.len());
+        let budgets = encode_budgets(config);
         let tenant_bytes = tenant_hash.0.to_vec();
         let signal_disc = codec::signal_to_u32(signal);
         let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline_unix_ns, snapshot);
@@ -779,7 +779,7 @@ fn fold_span_slice(
 /// ([`FetchError::FetchMemoryExhausted`], mapped to `BudgetExceeded` by the
 /// worker's `map_*_fetch_error` in `service.rs`). Today's proto `Status`
 /// carries only a code and a message, so this disambiguates by re-checking
-/// the bytes cap over `folded_bytes` first, then parsing the memory-refusal
+/// the bytes cap over `folded_bytes` first, then parsing the refusal's own
 /// figures back out of `status_message`. A message that matches neither
 /// falls back to a generic `Distrib` rather than mislabelling the cause.
 /// Parsing rendered text back into figures is a stopgap, not the frozen
@@ -787,6 +787,16 @@ fn fold_span_slice(
 /// precedent in `proto/ravel/queryfrag.proto`) is the durable fix and would
 /// let the coordinator read the figures directly instead of round-tripping
 /// them through a `Display` string.
+///
+/// A byte residual -- a worker that refused on a bytes cap while the folded
+/// total is still under the query's own budget -- is never a `Distrib`
+/// error (issue #1725). It means the binding limit was the WORKER's, not
+/// the query's: the worker clamps every wire budget to its own
+/// `EngineConfig` (issue #1687 part A), so its refusal is a budget outcome
+/// the caller can act on (422), not an availability failure (503). It is
+/// surfaced with the worker's own figures rather than the folded ones,
+/// because the folded total is by definition under the query's cap here and
+/// rendering it against that cap would read as a contradiction.
 fn budget_exceeded_error(
     folded_bytes: u64,
     max_bytes_scanned: ByteLimit,
@@ -802,8 +812,41 @@ fn budget_exceeded_error(
             limit,
         });
     }
+    if let Some(err) = parse_worker_cap_refusal(status_message) {
+        return err;
+    }
     QueryError::Distrib {
         reason: format!("slice tripped its budget: {status_message}"),
+    }
+}
+
+/// Reconstructs the typed cap error behind a worker's rendered budget
+/// refusal: the exact inverse of the `#[error(..)]` formats on
+/// `QueryError::TooManyBytesScanned`, `TooManySeries`, `TooManySamples`, and
+/// `TooManySegments`, which is what a worker's `summary_frame` carries as
+/// its `BudgetExceeded` status message.
+///
+/// Same stopgap caveat as [`parse_fetch_memory_exhausted`]: it holds only as
+/// long as those four `Display` formats are unchanged, which
+/// `worker_cap_refusal_messages_round_trip` pins.
+fn parse_worker_cap_refusal(msg: &str) -> Option<QueryError> {
+    if let Some(rest) = msg.strip_prefix("query scanned ") {
+        let (scanned, max) = rest.split_once(" bytes, exceeding the budget of ")?;
+        return Some(QueryError::TooManyBytesScanned {
+            scanned: scanned.parse().ok()?,
+            max: max.parse().ok()?,
+        });
+    }
+    let rest = msg.strip_prefix("query matched ")?;
+    let (count, rest) = rest.split_once(' ')?;
+    let count: usize = count.parse().ok()?;
+    let (kind, max) = rest.split_once(", exceeding the limit of ")?;
+    let max: usize = max.parse().ok()?;
+    match kind {
+        "series" => Some(QueryError::TooManySeries { count, max }),
+        "samples" => Some(QueryError::TooManySamples { count, max }),
+        "segments" => Some(QueryError::TooManySegments { count, max }),
+        _ => None,
     }
 }
 
@@ -1075,36 +1118,37 @@ pub(crate) fn span_order_key(row: &SpanRow) -> SpanOrderKey {
     )
 }
 
-/// Maps a per-slice `Budgets` share from the engine config. `Unlimited`
+/// Maps the query's `Budgets` onto the wire for one slice. `Unlimited`
 /// bytes map to `0`, the wire's "no cap" sentinel (a real query never scans
 /// zero bytes, so the value is unambiguous).
 ///
-/// `max_bytes_scanned` is divided evenly across `slice_count` (issue #588):
-/// every slice used to carry the tenant's FULL byte budget verbatim, so a
-/// `max_parallel_slices`-wide fan-out (default 8) could authorize, fetch,
-/// and pay for up to 8x the configured budget before the coordinator's
-/// post-merge re-check observed anything -- final accounting and the
-/// refused outcome were correct, but the overspend already happened. Each
-/// local distrib call site passes the ACTUAL slice count `partition_snapshot`
-/// produced, not the configured cap, so the per-slice shares still sum to
-/// exactly the tenant's budget (up to floor-division slack) even when fewer
-/// slices are dispatched than `max_parallel_slices` allows. Federation's
-/// call site passes `1`: each remote cluster resolves its own snapshot and
-/// enforces its own admission independently (ADR-0071), so its request
-/// carries the tenant's whole budget by design, not a fraction of this
-/// coordinator's local fan-out.
+/// Every slice carries the query's FULL `max_bytes_scanned`, not a
+/// `1/slice_count` share of it (issue #1725). A share is not a budget: work
+/// is skewed across shards, so a slice holding the hot shard trips its
+/// share while the query as a whole sits far under the tenant's budget, and
+/// the query fails for a cap it never reached. The total is enforced where
+/// the total is known: the coordinator re-checks `max_bytes_scanned` over
+/// the folded accounting after every slice returns, so a query that really
+/// is over budget still fails with `QueryError::TooManyBytesScanned`.
 ///
-/// `max_series`/`max_samples`/`max_segments` stay unscoped: those are
-/// count-based caps already re-checked per slice as results return
-/// (`QueryError::TooManySeries` etc.), unlike bytes, which was only
-/// re-checked after every slice's work had already been paid for. Dividing
-/// them too would only tighten an already-sound cap for no reason.
-fn encode_budgets(config: &EngineConfig, slice_count: usize) -> pb::Budgets {
+/// The cost of that choice is a bounded over-scan: with `slice_count`
+/// slices in flight, the workers can collectively scan up to
+/// `slice_count * max_bytes_scanned` bytes before the folded check refuses,
+/// since each is authorized for the whole budget on its own. The second
+/// half of the bound is worker-side (issue #1687 part A): a worker clamps
+/// every wire budget to its own `EngineConfig`, so an oversized or absent
+/// wire budget can never authorize more work on a worker than that worker's
+/// operator configured.
+///
+/// `max_series`/`max_samples`/`max_segments` are likewise sent whole: those
+/// are count-based caps re-checked per slice as results return
+/// (`QueryError::TooManySeries` etc.) and folded by the coordinator.
+fn encode_budgets(config: &EngineConfig) -> pb::Budgets {
     pb::Budgets {
         max_series: config.max_series as u64,
         max_samples: config.max_samples as u64,
         max_bytes_scanned: match config.max_bytes_scanned {
-            ByteLimit::Bounded(n) => n / (slice_count.max(1) as u64),
+            ByteLimit::Bounded(n) => n,
             ByteLimit::Unlimited => 0,
         },
         max_segments: config.max_segments as u64,
