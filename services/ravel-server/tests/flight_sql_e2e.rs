@@ -75,9 +75,19 @@ const QUERY: &str = "SELECT ts, value FROM samples ORDER BY ts";
 //     | jq -r .token \
 //     | xargs -I{} curl -sS -D - -o /dev/null -H "Authorization: Bearer {}" \
 //         -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
-//         https://quay.io/v2/minio/minio/manifests/RELEASE.2025-09-07T16-13-09Z
+//         https://quay.io/v2/minio/minio/manifests/RELEASE.2025-04-08T15-41-24Z
 // (and the equivalent request against minio/mc for MC_IMAGE)
-const MINIO_IMAGE: &str = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e";
+//
+// MINIO_IMAGE is deliberately the release the compose files already run
+// (deploy/docker-compose/minio.yml, ravel.yml, deploy/metricsbench/
+// docker-compose.yml), not the newest one. This test starts the server with
+// `--console-address`, and those compose files are the only place in the tree
+// that flag is exercised, so pinning here to the same release keeps the flag
+// and the `/minio/health/ready` endpoint on a version something else already
+// runs. Moving this const forward means moving those together and checking the
+// flag still exists in the new release; a nightly lane going red on a server
+// argument is a false alarm about interop.
+const MINIO_IMAGE: &str = "quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b";
 const MC_IMAGE: &str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
 const MINIO_USER: &str = "minioadmin";
 const MINIO_PASSWORD: &str = "minioadmin";
