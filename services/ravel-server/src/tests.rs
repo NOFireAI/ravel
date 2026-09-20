@@ -218,7 +218,7 @@ fn harness(
         audit_pipeline: None,
         process_memory_budget,
         process_memory_budget_is_fallback: false,
-        fold_enabled: true,
+        can_fold: true,
     });
 
     Harness {

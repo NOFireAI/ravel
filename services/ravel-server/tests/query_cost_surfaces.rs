@@ -224,7 +224,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         audit_pipeline: None,
         process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         process_memory_budget_is_fallback: false,
-        fold_enabled: true,
+        can_fold: true,
     });
 
     Surfaces {
