@@ -1214,24 +1214,24 @@ Labels: `mode` and `signal`, plus `level` on the checksum-mismatch counter and
 `ravel_scrub_checksum_mismatch_total` is the one to alert on for any increase:
 Ravel keeps no redundant copy to repair a corrupt object from, so a nonzero
 increase is corruption an operator must investigate (with the one `level="l0"`
-caveat below). Its `level` label says which part of the commit
-lineage the corrupt object came from: `l0` an original ingested segment, `l1`
-a compaction output part, or `rewrite` a selective-erasure rewrite output
-part. The scrub corpus now covers all three: an L1 or rewrite part that a
-compaction or rewrite record still lists as live joins the same rotation an
-L0 segment does.
+caveat below). Its `level` label says which part of the commit lineage the
+corrupt object came from: `l0` an original ingested segment, `l1` a compaction
+output part, or `rewrite` a selective-erasure rewrite output part. The scrub
+corpus now covers all three: a compaction or rewrite output part that a record
+still lists as live joins the same rotation an L0 segment does.
 
-The lineage filter applies to the parts only. A compaction or rewrite record
-that a later rewrite record names in `superseded_record_key`, and one in a
-bucket a retention tombstone has retired, are both left out, because their
+The lineage filter applies to those output parts only. A compaction or rewrite
+record that a later rewrite record names in `superseded_record_key`, and one in
+a bucket a retention tombstone has retired, are both left out, because their
 parts survive until a sweep retires them and no query reads them. L0 commit
 records are scrubbed whatever their lineage: there is no supersession or
 tombstone check on that path, so an L0 segment a live compaction has already
-folded into an L1 part stays in the rotation. A `level="l0"` mismatch on an
-already-compacted hour may therefore name a redundant copy rather than data a
-query can still reach, because the catalog puts a live compaction record's
-input identities into its query-time excluded set. Check whether the hour is
-compacted before treating an `l0` mismatch as unrecoverable. The `reason` label on
+folded into a compaction output part stays in the rotation. A `level="l0"`
+mismatch on an already-compacted hour may therefore name a redundant copy
+rather than data a query can still reach, because the catalog puts a live
+compaction record's input identities into its query-time excluded set. Check
+whether the hour is compacted before treating an `l0` mismatch as
+unrecoverable. The `reason` label on
 `ravel_scrub_seal_divergence_total` carries `missing` (a sealed commit record
 absent from the snapshot, an under-count) or `mismatched` (a snapshot entry
 whose content hash disagrees with the sealed record); an orphaned entry, a
