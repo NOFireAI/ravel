@@ -665,7 +665,15 @@ than passing for "no pull request open".
   environment of every dependency build script cargo runs. A job that
   genuinely needs more declares it on itself; `# workflow-permissions-allow:
   top-level-write -- <reason>` above the key is the escape hatch for the
-  write rule only, and there is none for a missing block. A scan that finds
+  write rule only, and there is none for a missing block. A third rule,
+  `checkout-persists-credentials`, requires every `actions/checkout` step to
+  set `persist-credentials: false`: a checkout that leaves the token in
+  `.git/config` hands it to every later step in the job, including the build
+  scripts cargo runs. Its escape hatch is
+  `# workflow-permissions-allow: persist-credentials -- <reason>` on the line
+  or in the comment block above it, and the reason is required, as it is for
+  the write rule. The step bound is the enclosing list item, so the common
+  `- name:`/`uses:`/`with:` form is read correctly. A scan that finds
   no workflow file exits 64 rather than reporting clean, so a moved
   directory cannot turn the guard into a no-op. Wired into `gates.sh` and
   ci.yml's `doc-scripts` job, cases first. Cases in
