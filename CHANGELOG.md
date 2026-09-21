@@ -23,6 +23,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`--s3-endpoint` now decides whether plaintext is allowed, and a
+  non-loopback `http://` endpoint is refused at startup** (issue #1707).
+  `allow_http` was true whenever any endpoint was set, so a deployment
+  pointing at an `https` endpoint still permitted a downgrade, and an endpoint
+  that lost its scheme sent credentials and telemetry in clear with nothing
+  refusing it. The flag now follows the URL scheme. A non-loopback `http://`
+  endpoint needs `--s3-allow-http` (env `RAVEL_S3_ALLOW_HTTP`), and the
+  refusal names the flag; loopback `http` is unchanged, which is what the dev
+  compose stack, kind, and the tests use. The operator gains
+  `spec.s3.allowHttp` for an in-cluster MinIO. **On upgrade**, a deployment
+  already pointing at a plaintext non-loopback endpoint will not start until
+  the flag or the environment variable is set.
 - **`ravel-cli load` reports a `--skip-rows` value past the end of the file
   instead of succeeding quietly** (issue #1713). The value was clamped to the
   file's row count and the run exited 0 having written nothing, and the
