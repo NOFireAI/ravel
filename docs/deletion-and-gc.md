@@ -183,6 +183,46 @@ on a plain `Catalog::fold` call, and on any request naming hours the pass
 did not reach (docs/adrs/0064-selective-subject-erasure.md, the no-op
 carve-out).
 
+**The sweep is what names those hours.** The pass that had to hold an input
+already knows which hour's snapshot entry is stale, so it reports it rather
+than leaving a later fold to rediscover it. `SweepReport::blocked_named_hours`
+carries the ingest hours in which rule 2 held at least one supersession chain
+this pass *because the live HEAD snapshot named its objects*, ascending. Only
+that one block contributes: a chain held because HEAD was unreadable adds
+nothing (a fold cannot reconcile what it cannot read), a chain skipped for a
+lease or legal hold adds nothing (a fold changes nothing about the hold), and
+a chain that cleared the gate adds nothing (there is nothing left to
+reconcile). An hour appears only if at least one of its chains hit that one
+arm, so the set is a subset of the hours the pass looked at, never all of
+them.
+
+`ravel-server`'s maintain tick unions that set across the shards it swept for
+one `(tenant, signal)` and hands it to the fold loop as a
+`ravel_catalog::RefoldRequest`. The union is over the shards this process
+**owns** under ADR-0065 rendezvous ownership, and one request covers the pair
+because the catalog is per `(tenant, signal)`: a shard a peer owns contributes
+on that peer's own tick, so an hour blocked only there is reconciled a fold
+later rather than not at all. Nothing in the hand-off depends on one process
+owning every shard of a tenant.
+
+Three carve-outs apply to the hand-off itself, and none of them loses an hour
+permanently, because the next sweep re-derives the whole set from durable
+state:
+
+- **No-op fold.** A request delivered to a fold that seals nothing reconciles
+  zero hours, as above. The hour stays blocked and the next sweep sends it
+  again.
+- **Dropped request.** The queue between the sweep and the fold is bounded. A
+  send into a full queue evicts the **oldest** pending request and counts the
+  eviction, so the newest hand-off is never the one lost; the evicted tenant's
+  hour comes back on its next sweep.
+- **Process locality.** The queue is in-process. A deployment that runs the
+  maintain sweep and the fold loop in separate processes delivers no request
+  at all, and those hours are reconciled only when the fold's fixed window or
+  its retention-frontier band eventually covers them, exactly as before this
+  hand-off existed. Nothing is deleted early and nothing is lost; the gap
+  closes later.
+
 HEAD read failures are explicit. An **absent** HEAD is NOT a block: with no
 snapshot naming anything, the sweep proceeds (ADR-0020: the catalog index is a
 pure optimization; a missing HEAD degrades to listing). A HEAD, or a covering
