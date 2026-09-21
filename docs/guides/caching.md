@@ -313,6 +313,47 @@ Neither counter reaches a running server's query-facing accounting.
 the ratio is available only to a caller that reads `QueryAccounting`
 in-process, which is what the `ravel-bench` logs scan does.
 
+## The catalog record caches, which this budget does not cover
+
+Everything above is a read cache: a cache of object bytes whose ceiling is a
+share of the process memory budget. The catalog also keeps two per-tenant
+caches of decoded commit and compaction records, and they are bounded by an
+entry count rather than by a share of that budget, so their memory comes out
+of what is left after the carved shares, never out of them. Budget for them
+separately.
+
+One capacity bounds both caches independently, so the worst case is twice the
+entry count. The capacity is derived per deployment from the shard count, the
+signal count and the configured max flush delay, not from a flat constant:
+
+```text
+shards * 6 signals * ceil(3600 / max_flush_delay_seconds) * 3 unsealed hours
+```
+
+floored at 10,000 entries and capped at 30,000. At the cap that is
+`30,000 x 750 bytes per cached record x 2 caches` = 45 MB per actively-queried
+tenant, which is what the cap holds constant across every deployment shape
+(`--shards 64` derives 2,073,600 entries and 3.1 GB per tenant uncapped).
+Budget it as 45 MB times the number of tenants queried concurrently: 100 of
+them is 4.5 GB worst case, and idle tenants are reclaimed by idle-tenant
+eviction. At the shipped 2-second cadence the cap decides the value for every
+shard count, so `--shards` does not move it there.
+
+The capacity covers a tenant's unsealed tail up to the cap, not the whole
+tail. Two things put a real tail past it: the cap itself, since the estimate
+at the shipped defaults is already 129,600 entries, and the flush cadence
+term, which counts the age trigger only while a shard also flushes as soon as
+its estimated object bytes reach `target_bytes` (8 MiB by default). A tenant
+over the bound pays a per-record GET on every resolve, which is what it paid
+before the capacity was derived. The levers are a coarser `--max-flush-delay`
+or a lower shard count, both of which shrink the tail itself.
+
+`--disable-cache` does not turn these caches off, because a resolve with no
+record cache re-reads every record from the store. It does hold the capacity
+at the 10,000-entry floor rather than the derived value, so the flag costs
+about 15 MB per actively-queried tenant, the same as before the capacity was
+derived.
+
 ## What is not cached
 
 The one genuine gap is spans: RSPAN reads have no cache seam, so a repeated

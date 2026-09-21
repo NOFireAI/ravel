@@ -121,14 +121,27 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// signals * ceil(3600 / max_flush_delay_secs) * 3 unsealed hours`, clamped
 /// between the 10,000-entry floor and the cap that holds one actively-queried
 /// tenant to 45 MB across the two record caches the bound sizes. So the
-/// record caches hold a tenant's unsealed hot region, across every signal it
-/// ingests, rather than a flat cadence-blind constant, and a wide deployment
-/// still cannot make one tenant cost gigabytes. Callers must pass the
+/// record caches hold as much of a tenant's unsealed hot region, across every
+/// signal it ingests, as the cap covers, rather than a flat cadence-blind
+/// constant, and a wide deployment still cannot make one tenant cost
+/// gigabytes. It is up to 30,000 records of tail, not the whole tail: the cap
+/// binds before the estimate at the shipped defaults, and the cadence term
+/// counts the age flush trigger only, so a size-triggered tenant seals more
+/// records per shard-hour than it assumes. See
+/// [`ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT`] for both limits and
+/// the memory figures. Callers must pass the
 /// configured value, never
 /// `ravel_ingest::IngestConfig::default().max_flush_delay`, or the derived
 /// capacity stops tracking the deployment's actual flush cadence. At the
 /// shipped defaults (4 shards, 2s) the cap is what binds, so this is 30,000
-/// entries; the shard and cadence terms decide the value below it.
+/// entries, and at that cadence it binds for every shard count; the shard and
+/// cadence terms only decide the value at coarser cadences.
+///
+/// `disable_cache` skips the derivation and leaves the capacity at
+/// [`ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT`]. The flag is
+/// documented as the one for a memory-constrained container, so it must not
+/// be the path that triples record-cache memory; it does not turn the record
+/// caches off, which is why it lands on the floor and not on `0`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_catalog(
     store: Arc<dyn ObjectStoreBackend>,
@@ -144,13 +157,21 @@ pub fn build_catalog(
     // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
     // --disable-cache into a `None` fetcher cache.
     let byte_cache_max_bytes = if disable_cache { 0 } else { cache_max_bytes };
+    // `--disable-cache` is documented as the flag for a memory-constrained
+    // container, so it must not raise record-cache memory: under it the
+    // capacity stays at the flat floor the cache ran on before the derivation
+    // existed. The record caches are not ADR-0046 read caches and the flag does
+    // not turn them off; a `0` capacity would put every resolve back on a
+    // per-record GET, which is a resolve-path change the flag does not promise.
+    let cache_capacity_per_tenant = if disable_cache {
+        ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT
+    } else {
+        ravel_catalog::derive_cache_capacity_per_tenant(shard_count, max_flush_delay)
+    };
     let mut catalog_config = CatalogConfig {
         shard_count,
         byte_cache_max_bytes,
-        cache_capacity_per_tenant: ravel_catalog::derive_cache_capacity_per_tenant(
-            shard_count,
-            max_flush_delay,
-        ),
+        cache_capacity_per_tenant,
         ..CatalogConfig::default()
     };
     // The catalog listing window (ADR-0051 section 4), from `--max-ingest-lag`.
@@ -729,6 +750,42 @@ mod catalog_cache_tests {
             catalog.config().cache_capacity_per_tenant,
             expected,
             "build_catalog must pass the derived capacity through, not the flat constant"
+        );
+    }
+
+    #[test]
+    fn disable_cache_holds_the_record_cache_capacity_at_the_flat_floor() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let shard_count = 4;
+        let max_flush_delay = std::time::Duration::from_secs(2);
+        assert_eq!(
+            ravel_catalog::derive_cache_capacity_per_tenant(shard_count, max_flush_delay),
+            30_000,
+            "sanity: without the flag these arguments derive 30,000"
+        );
+
+        let catalog = build_catalog(
+            store,
+            shard_count,
+            true,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+            None,
+            None,
+            max_flush_delay,
+        )
+        .expect("catalog builds");
+
+        assert_eq!(
+            catalog.config().cache_capacity_per_tenant,
+            ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT,
+            "--disable-cache is the memory-constrained-container flag, so it must not raise \
+             record-cache memory above what the flat constant cost before the derivation"
+        );
+        assert_eq!(
+            catalog.config().byte_cache_max_bytes,
+            0,
+            "--disable-cache still turns the byte cache off"
         );
     }
 }
