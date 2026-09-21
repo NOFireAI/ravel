@@ -116,6 +116,7 @@ impl From<QueryError> for ApiError {
             // coordinator's own, so it is echoed like the other budget trips
             // rather than redacted to the retryable 503 a `Distrib` outage takes.
             | QueryError::TooManySliceFrames { .. }
+            | QueryError::TooManySliceBytes { .. }
             | QueryError::RequestBudgetExceeded { .. } => ApiError::Unsupported(e.to_string()),
             // An over-wide window refused before any LIST is a
             // resource-budget rejection, grouped with the budget classes above

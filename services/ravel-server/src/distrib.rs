@@ -89,6 +89,18 @@ use uuid::Uuid;
 /// the kernel's TCP SYN timeout (often over two minutes).
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The per-message ceiling on a fragment response frame this coordinator will
+/// decode, set on every outbound `SeriesFetchClient` (issue #1687).
+///
+/// It is the cap tonic already applies by default today, made explicit for the
+/// same reason the OTLP and OTAP services state theirs (`lib.rs`): the
+/// coordinator's own per-slice caps bound an aggregate, and the size of ONE
+/// frame is bounded only here, so leaving it to a dependency's default means a
+/// tonic release could raise it without any change in this repository. A
+/// conforming worker emits one frame per returned run, orders of magnitude
+/// below this.
+const MAX_FRAGMENT_DECODING_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
 /// The closed reason label for a rejected fragment capability (ADR-0071
 /// amendment, decision 2). Every `Pinned` fetch's capability check that fails
 /// increments exactly one of these; the set is fixed and cardinality-safe, so it
@@ -1565,7 +1577,8 @@ impl RoutingSliceFetcher {
             request.fragment_capability = capability;
         }
         let tonic_request = tonic::Request::new(request);
-        let mut client = SeriesFetchClient::new(channel);
+        let mut client = SeriesFetchClient::new(channel)
+            .max_decoding_message_size(MAX_FRAGMENT_DECODING_MESSAGE_BYTES);
         let response = client
             .fetch(tonic_request)
             .await
@@ -1906,7 +1919,8 @@ impl SliceFetcher for FederationSliceFetcher {
             DistribError::Transport("invalid federation bearer token metadata".to_string())
         })?;
         tonic_request.metadata_mut().insert("authorization", value);
-        let mut client = SeriesFetchClient::new(self.channel.clone());
+        let mut client = SeriesFetchClient::new(self.channel.clone())
+            .max_decoding_message_size(MAX_FRAGMENT_DECODING_MESSAGE_BYTES);
         let response = client.fetch(tonic_request).await.map_err(|s| {
             DistribError::Transport(format!("federated fetch to cluster {}: {s}", self.cluster))
         })?;
@@ -4451,13 +4465,16 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// frames than the coordinator's per-slice frame cap is refused AT the cap,
     /// and the coordinator never holds the slice.
     ///
-    /// The byte cap is deliberately `Unlimited` (the `EngineConfig` default), so
-    /// the frame cap is the only thing that can stop this stream. Two wrong
-    /// implementations are ruled out, each by a different assertion:
+    /// `max_bytes_scanned` is deliberately left at the `EngineConfig` default,
+    /// so the byte cap in force is the absolute 64 MiB ceiling. The frame cap
+    /// is lowered to 64 frames, about 576 wire KiB, so it is the cap this
+    /// stream reaches. Two wrong implementations are ruled out, each by a
+    /// different assertion:
     ///
-    /// * A decoder that enforces the byte cap but NOT the frame cap never
-    ///   refuses at all here: it reaches the terminal summary and returns
-    ///   `Ok`. The `expect_err` and the typed-variant assertion fail.
+    /// * A decoder that enforces the byte cap but NOT the frame cap runs on
+    ///   past 64 frames: it either reaches the terminal summary or trips the
+    ///   byte ceiling two orders of magnitude later, past 7000 frames. The
+    ///   typed-variant assertion and the produced-count assertion fail.
     /// * A decoder that enforces BOTH caps but only after draining the stream
     ///   returns the same error, so the error assertions pass, but it pulls
     ///   every message: `produced` reaches `TOTAL + 1`. The produced-count
@@ -4600,6 +4617,37 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
              produced {produced} of {} messages",
             TOTAL + 1
         );
+    }
+
+    /// The cap a STOCK process decodes under. `remote_fetch_refuses_a_slice_
+    /// past_the_byte_cap` above configures a budget; this asserts the case
+    /// nobody configures, which is where the cap has to hold on its own.
+    ///
+    /// The config is built the way `lib.rs` builds the process-wide
+    /// `EngineConfig`: `max_bytes_scanned` from `LimitsConfig`'s resolved
+    /// `query_defaults`, which with no `--limits-file` is
+    /// `shipped_query_defaults()`. That resolves to an explicit
+    /// `ByteLimit::Unlimited`, so a cap that applied only to an ABSENT setting
+    /// would be off here, on every default deployment. It resolves instead to
+    /// the absolute ceiling, and `push` refuses on `bytes > byte_cap()` (the
+    /// same field, proven firing end to end by the 32 KiB test above).
+    #[test]
+    fn a_stock_resolved_config_decodes_under_the_absolute_byte_cap() {
+        let limits = crate::config::limits::LimitsConfig::default();
+        assert_eq!(
+            limits.query_defaults.max_bytes_scanned,
+            ravel_query::ByteLimit::Unlimited,
+            "the shipped query defaults opt out of the store-bytes budget"
+        );
+        let engine = ravel_query::EngineConfig {
+            max_bytes_scanned: limits.query_defaults.max_bytes_scanned,
+            ..ravel_query::EngineConfig::default()
+        };
+        assert_eq!(
+            SliceStreamDecoder::new(&engine).byte_cap(),
+            codec::MAX_SLICE_RESPONSE_BYTES
+        );
+        assert_eq!(codec::MAX_SLICE_RESPONSE_BYTES, 67_108_864);
     }
 
     /// A slice that stays inside both caps decodes exactly as before: the caps
