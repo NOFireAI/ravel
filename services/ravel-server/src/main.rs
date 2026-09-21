@@ -468,14 +468,15 @@ async fn main() -> anyhow::Result<()> {
     let flush_cadence = cli
         .resolve_flush_cadence()
         .context("failed to resolve flush-cadence flags")?;
+    let flush_concurrency = cli.resolve_flush_concurrency();
 
     let config = ServerConfig {
         mode: cli.mode,
         listen_http: cli.listen_http,
         listen_grpc: cli.listen_grpc,
         shard_count: cli.shards,
-        max_inflight_flushes: cli.max_inflight_flushes,
-        max_queued_flushes: cli.max_queued_flushes,
+        max_inflight_flushes: flush_concurrency.max_inflight_flushes,
+        max_queued_flushes: flush_concurrency.max_queued_flushes,
         adaptive_flush_delay: cli.adaptive_flush_delay,
         max_flush_delay: flush_cadence.max_flush_delay,
         max_flush_delay_idle: flush_cadence.max_flush_delay_idle,

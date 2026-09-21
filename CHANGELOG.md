@@ -35,6 +35,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Two things to know: a
   flush that crosses the per-tenant memory backstop is **exempt** and spawns
   even at the cap, because a bounded queue of tasks is worth less than a
+  bounded buffer, so the queue can exceed the cap and under
+  `--max-ingest-buffer-bytes 0` only the length of a store stall bounds the
+  overshoot; and an `--max-inflight-flushes` above `--max-queued-flushes`
+  **raises the effective cap to match**, logging a warning that names both
+  numbers, rather than refusing to start. Only a spawned task can hold a
+  permit, so the cap has to be at least the permit count; raising it there
+  keeps a cluster running `spec.gateway.maxInflightFlushes` above 8 starting
+  on upgrade, which a refusal would have crash-looped with no field on the
+  `RavelCluster` CRD able to raise the cap in response.
   bounded buffer; and the server now **refuses to start** when
   `--max-inflight-flushes` exceeds `--max-queued-flushes`, since only a
   spawned task can hold a permit and the excess would silently reduce flush

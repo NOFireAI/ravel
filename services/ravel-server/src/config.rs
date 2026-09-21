@@ -1153,19 +1153,35 @@ pub struct Cli {
     /// local bound, never fleet-reconciled. Default 512 MiB; `0` disables the
     /// ceiling (the gauge is still tracked for `/metrics`).
     ///
-    /// What `0` leaves unbounded is narrower than it was. Under ADR-1642 a
-    /// flush task is spawned at every trigger and acquires its concurrency
-    /// permit itself, so a stalled object store used to queue spawned flushes
-    /// with only this budget's shed to stop them, and `0` removed that. Issue
-    /// #1740 caps that queue by count instead: each shard refuses a size or
-    /// age trigger once it already holds `max_queued_flushes` spawned flushes
-    /// (default 8 per shard), leaving the rows buffered for the next tick
-    /// rather than shedding them, so the queue is bounded whatever this flag
-    /// is set to. Under `0`, then, spawned flush memory is bounded per shard
-    /// and buffered rows are bounded per tenant by the per-tenant buffer caps;
-    /// what is not bounded is their sum, which is exactly what this ceiling
-    /// bounds when it is enabled. A host with many active tenants can still
-    /// exhaust memory under `0` without any single bound being crossed.
+    /// What `0` leaves unbounded is narrower than it was, but it is not
+    /// nothing. Under ADR-1642 a flush task is spawned at every trigger and
+    /// acquires its concurrency permit itself, so a stalled object store used
+    /// to queue spawned flushes with only this budget's shed to stop them,
+    /// and `0` removed that. Issue #1740 caps that queue by count: each shard
+    /// refuses a size or age trigger once it already holds
+    /// `--max-queued-flushes` spawned flushes (default 8 per shard), leaving
+    /// the rows buffered for the next tick rather than shedding them. That
+    /// cap bounds the ORDINARY triggers whatever this flag is set to. It does
+    /// not bound every spawn: a buffer that has crossed its per-(shard,
+    /// tenant) memory backstop is exempt and spawns past the cap, because
+    /// refusing there would trade a bounded queue of flush tasks for an
+    /// unbounded buffer.
+    ///
+    /// So the bound on spawned flush memory per shard depends on this flag.
+    /// When it is nonzero, a queued flush stays charged against this ceiling
+    /// until its PUTs complete, so the exempt windows push the gauge to the
+    /// ceiling, admission sheds, and the refill that would spawn the next one
+    /// stops: the ceiling bounds them. Under `0` there is no ceiling and
+    /// nothing sheds behind the backstop, so a shard holds
+    /// `--max-queued-flushes` windows PLUS one exempt window per backstop
+    /// crossing, and only the length of the stall bounds how many crossings
+    /// accumulate. That is what `0` leaves unbounded on a stalled store.
+    /// Bounded under `0` are one buffer's own resident memory (the backstop)
+    /// and the ordinary queue (the cap); unbounded are the exempt windows and
+    /// the sum across tenants, which is exactly what this ceiling bounds when
+    /// it is enabled. A host with many active tenants can exhaust memory
+    /// under `0` with the store healthy too, without any single bound being
+    /// crossed.
     #[arg(long = "max-ingest-buffer-bytes", default_value_t = 512 * 1024 * 1024)]
     pub max_ingest_buffer_bytes: u64,
 
@@ -1194,10 +1210,15 @@ pub struct Cli {
     /// [`ravel_ingest::IngestConfig::max_inflight_flushes`]'s own default of
     /// 1 (today's non-pipelined behavior). `0` is rejected by
     /// [`Cli::validate`]: it would deadlock every flush, since a shard could
-    /// never acquire a permit to run one. So is a value above
-    /// `--max-queued-flushes` (default 8): a shard refuses a trigger once
-    /// that many flush tasks are spawned and unreaped, so it never spawns
-    /// enough tasks to use the extra permits. Raise both together.
+    /// never acquire a permit to run one. A value ABOVE `--max-queued-flushes`
+    /// (default 8) is accepted and raises the effective queue cap to match,
+    /// with a warning naming both numbers: a shard refuses a trigger once the
+    /// queue cap is reached, so permits above it could never be used. This
+    /// flag is settable through the operator CRD
+    /// (`spec.gateway.maxInflightFlushes`) and the queue cap is not, so a
+    /// refusal would crash-loop an already-admitted cluster on upgrade.
+    /// Nothing lowers this flag; set `--max-queued-flushes` yourself when you
+    /// want the queue deeper than the permit count.
     #[arg(long = "max-inflight-flushes", default_value_t = 1)]
     pub max_inflight_flushes: u32,
 
@@ -1221,18 +1242,22 @@ pub struct Cli {
     /// memory, and refusing there would trade a bounded queue of flush tasks
     /// for an unbounded buffer, the worse of the two failures. Size the
     /// steady state from this cap; what bounds the overshoot is the paragraph
-    /// below. `0` is rejected, and so is a `--max-inflight-flushes`
-    /// above this value, since effective per-shard flush concurrency is the
-    /// lower of the two. Matches
+    /// below. `0` is rejected. A `--max-inflight-flushes` above this value is
+    /// accepted and raises the effective cap to match, since effective
+    /// per-shard flush concurrency is the lower of the two. Matches
     /// [`ravel_ingest::IngestConfig::max_queued_flushes`]'s own default of 8
     ///
-    /// The memory backstop has no flag of its own: it is
-    /// `max(min(--max-ingest-buffer-bytes / 8, 64 MiB), target_bytes)` per
+    /// The memory backstop has no flag of its own, and its value depends on
+    /// which arm `--max-ingest-buffer-bytes` selects. With a nonzero budget it
+    /// is `max(min(--max-ingest-buffer-bytes / 8, 64 MiB), target_bytes)` per
     /// (shard, tenant) buffer, where `target_bytes` is the ingest pipeline's
-    /// fixed 8 MiB object-size trigger and is not settable on this binary. So
-    /// 64 MiB at the default 512 MiB budget, and `--max-ingest-buffer-bytes`
-    /// is the only knob that moves it. See "Shard actor" in docs/ingest.md
-    /// for why it is a share of the budget rather than a constant.
+    /// fixed 8 MiB object-size trigger and is not settable on this binary, so
+    /// 64 MiB at the default 512 MiB budget. Under `--max-ingest-buffer-bytes
+    /// 0` there is no budget to take a share of, and the backstop is a flat
+    /// 64 MiB: NOT the 8 MiB that formula would give on that arm.
+    /// `--max-ingest-buffer-bytes` is the only knob that moves it either way.
+    /// See "Shard actor" in docs/ingest.md for why it is a share of the budget
+    /// rather than a constant.
     ///
     /// The exempt path is not bounded by a count. An exempt spawn consumes
     /// the whole buffer it fires on, so the same tenant reaches the backstop
@@ -1249,11 +1274,15 @@ pub struct Cli {
     /// bounded by the backstop either way.
     ///
     /// [`Cli::validate`] rejects `0` (it would refuse every non-drain
-    /// trigger), and rejects a `--max-inflight-flushes` above this value: a
-    /// refused trigger never spawns a task to take a permit, so permits above
-    /// this cap are unreachable, and silently truncating the permit count
-    /// would report the difference as backpressure rather than as ignored
-    /// configuration. Raise this cap alongside the permit count.
+    /// trigger). A `--max-inflight-flushes` above this value is NOT rejected:
+    /// [`Cli::resolve_flush_concurrency`] raises the effective cap to the
+    /// permit count and warns, naming both numbers. A refused trigger never
+    /// spawns a task to take a permit, so permits above the cap would be
+    /// unreachable; raising the cap keeps them reachable, where lowering the
+    /// permit count would silently discard concurrency the operator
+    /// configured, and refusing the pair would crash-loop every gateway pod
+    /// of a cluster whose CRD already sets `spec.gateway.maxInflightFlushes`
+    /// above 8 (the CRD has no field for this cap).
     #[arg(
         long = "max-queued-flushes",
         env = "RAVEL_MAX_QUEUED_FLUSHES",
@@ -3178,6 +3207,17 @@ pub struct FlushCadence {
     pub min_flush_bytes: usize,
 }
 
+/// The resolved per-shard flush concurrency pair (`--max-inflight-flushes`,
+/// `--max-queued-flushes`), after [`Cli::resolve_flush_concurrency`] has
+/// reconciled them. `max_queued_flushes` is at least `max_inflight_flushes`:
+/// a queue cap below the permit count would leave permits unreachable, since
+/// a refused trigger never spawns a task to take one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushConcurrency {
+    pub max_inflight_flushes: u32,
+    pub max_queued_flushes: u32,
+}
+
 /// Upper bound on `--max-flush-delay-idle` derived from the read-side
 /// scan-slack arithmetic `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` encodes
 /// (ADR-0076 decision 4): `FLUSH_BOUND_SLACK_HOURS` is `ceil(max_flush_delay +
@@ -4124,6 +4164,43 @@ impl Cli {
         })
     }
 
+    /// Resolve the per-shard flush concurrency pair. Effective concurrency is
+    /// the lower of the two knobs, because the queued-flush cap refuses a
+    /// trigger before any task is spawned to take a permit. When
+    /// `--max-queued-flushes` is below `--max-inflight-flushes` this raises
+    /// the queue cap to the permit count and warns, rather than refusing
+    /// startup: `--max-inflight-flushes` is settable through the operator CRD
+    /// (`spec.gateway.maxInflightFlushes`) and the queue cap is not, so a
+    /// refusal would crash-loop an already-admitted cluster on upgrade with
+    /// no custom-resource edit able to recover it. Raising the queue cap
+    /// keeps the invariant the refusal protected (the queue can hold every
+    /// permit that can be in flight) and keeps the concurrency the operator
+    /// asked for.
+    ///
+    /// This is the value `main.rs` puts on [`crate::ServerConfig`], so it is
+    /// what the shards are built with. Zero on either knob is still rejected
+    /// by [`Self::validate`]; clamping a zero would invent a configuration
+    /// nobody asked for.
+    pub fn resolve_flush_concurrency(&self) -> FlushConcurrency {
+        let max_inflight_flushes = self.max_inflight_flushes;
+        let mut max_queued_flushes = self.max_queued_flushes;
+        if max_inflight_flushes > max_queued_flushes {
+            tracing::warn!(
+                max_inflight_flushes,
+                configured_max_queued_flushes = max_queued_flushes,
+                effective_max_queued_flushes = max_inflight_flushes,
+                "--max-queued-flushes raised to match --max-inflight-flushes: a shard refuses \
+                 a trigger once the queue cap is reached, so permits above it could never be \
+                 used. --max-inflight-flushes is unchanged."
+            );
+            max_queued_flushes = max_inflight_flushes;
+        }
+        FlushConcurrency {
+            max_inflight_flushes,
+            max_queued_flushes,
+        }
+    }
+
     /// Resolve the per-query S3 request budget (ADR-0075). An explicit
     /// `--max-s3-requests` is used verbatim; otherwise the budget is DERIVED
     /// from `--shards` and the ingest pipeline's actually-configured flush
@@ -4682,24 +4759,12 @@ impl Cli {
             );
         }
 
-        // Effective per-shard flush concurrency is the lower of the two: the
-        // queued-flush cap refuses a trigger before any task is spawned to
-        // take a permit, so permits above the cap are unreachable. Refuse the
-        // pair rather than truncate, which would report the difference as
-        // deferral (backpressure) instead of as configuration that was
-        // ignored.
-        if self.max_inflight_flushes > self.max_queued_flushes {
-            anyhow::bail!(
-                "--max-inflight-flushes '{inflight}' exceeds --max-queued-flushes \
-                 '{queued}': a shard refuses a trigger once {queued} flush tasks are \
-                 spawned and unreaped, so it never spawns enough tasks to use more than \
-                 {queued} permits and the excess is counted as deferral. Raise \
-                 --max-queued-flushes to at least {inflight}, or lower \
-                 --max-inflight-flushes to at most {queued}.",
-                inflight = self.max_inflight_flushes,
-                queued = self.max_queued_flushes,
-            );
-        }
+        // A --max-inflight-flushes above --max-queued-flushes is NOT refused
+        // here: `resolve_flush_concurrency` raises the queue cap to match and
+        // warns. Refusing would crash-loop every gateway pod of a cluster
+        // whose CRD already admits `spec.gateway.maxInflightFlushes` above
+        // the queue-cap default, with no custom-resource field able to raise
+        // the cap in response.
 
         if self.max_s3_requests == Some(0) {
             anyhow::bail!(
@@ -6300,15 +6365,86 @@ mod tests {
         }
     }
 
-    /// Records every INFO event's fields as one combined string (`"
-    /// name=value"` per field), so a test can count how many times a given
-    /// `setting=` figure appears across an `emit()` call -- the emit-line
-    /// analogue of `ravel_query::http::json`'s `IoShapeJson` wire-text
-    /// "exactly once" tests, adapted from log fields instead of JSON keys.
-    #[derive(Default, Clone)]
-    struct InfoEventCapture(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+    /// `--max-queued-flushes`'s help states the per-(shard, tenant) memory
+    /// backstop for both `--max-ingest-buffer-bytes` arms, and the two arms
+    /// take different branches of
+    /// [`ravel_ingest::buffer_memory_backstop_bytes`]. Pin both figures to
+    /// what the function returns, so a prose formula cannot drift from the
+    /// branch the code takes (PR #1903 review finding 4: the help documented
+    /// `max(min(budget / 8, 64 MiB), target_bytes)` alone, which evaluates to
+    /// the 8 MiB `target_bytes` under a disabled budget while the `Unlimited`
+    /// arm returns a flat 64 MiB, an eightfold sizing error in the one
+    /// setting where nothing sheds to correct it).
+    ///
+    /// Prove-the-test: change the `Unlimited` arm to return
+    /// `config.target_bytes` and the computed needle becomes "flat 8 MiB",
+    /// which the help does not contain.
+    #[test]
+    fn max_queued_flushes_help_states_the_backstop_each_budget_arm_returns() {
+        use clap::CommandFactory;
 
-    impl<S> tracing_subscriber::Layer<S> for InfoEventCapture
+        let cmd = Cli::command();
+        let help = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "max_queued_flushes")
+            .expect("--max-queued-flushes is defined on the command")
+            .get_long_help()
+            .expect("--max-queued-flushes carries long help")
+            .to_string();
+
+        let ingest_defaults = ravel_ingest::IngestConfig::default();
+        let mib = 1024 * 1024;
+
+        let unlimited = ravel_ingest::buffer_memory_backstop_bytes(
+            &ingest_defaults,
+            ravel_ingest::IngestByteBudgetLimit::Unlimited,
+        );
+        assert_eq!(
+            unlimited % mib,
+            0,
+            "the help states the backstop in whole MiB; {unlimited} bytes is not"
+        );
+        let unlimited_needle = format!("flat {} MiB", unlimited / mib);
+        assert!(
+            help.contains(&unlimited_needle),
+            "help must state the disabled-budget backstop as \"{unlimited_needle}\": {help}"
+        );
+
+        let default_budget = cli(&[]).max_ingest_buffer_bytes;
+        let bounded = ravel_ingest::buffer_memory_backstop_bytes(
+            &ingest_defaults,
+            ravel_ingest::IngestByteBudgetLimit::Bounded(default_budget),
+        );
+        assert_eq!(
+            bounded % mib,
+            0,
+            "the help states the backstop in whole MiB; {bounded} bytes is not"
+        );
+        let bounded_needle = format!(
+            "{} MiB at the default {} MiB budget",
+            bounded / mib,
+            default_budget / mib as u64
+        );
+        assert!(
+            help.contains(&bounded_needle),
+            "help must state the budgeted backstop as \"{bounded_needle}\": {help}"
+        );
+    }
+
+    /// Records every event at `level` as one combined string (`" name=value"`
+    /// per field, with the message itself under `message=`), so a test can
+    /// count how many times a given figure appears across a call -- the
+    /// emit-line analogue of `ravel_query::http::json`'s `IoShapeJson`
+    /// wire-text "exactly once" tests, adapted from log fields instead of
+    /// JSON keys. This is the real logging surface: the events pass through a
+    /// `tracing_subscriber` registry exactly as they do in the running binary.
+    #[derive(Clone)]
+    struct LevelEventCapture {
+        level: tracing::Level,
+        lines: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for LevelEventCapture
     where
         S: tracing::Subscriber,
     {
@@ -6317,7 +6453,7 @@ mod tests {
             event: &tracing::Event<'_>,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            if *event.metadata().level() != tracing::Level::INFO {
+            if *event.metadata().level() != self.level {
                 return;
             }
             #[derive(Default)]
@@ -6344,8 +6480,28 @@ mod tests {
             }
             let mut visitor = Visitor::default();
             event.record(&mut visitor);
-            self.0.lock().push(visitor.0);
+            self.lines.lock().push(visitor.0);
         }
+    }
+
+    /// Installs a [`LevelEventCapture`] for `level` on the current thread and
+    /// returns the captured lines plus the subscriber guard. Drop the guard
+    /// before reading, or hold it: the lines are shared.
+    fn capture_events(
+        level: tracing::Level,
+    ) -> (
+        std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let lines: std::sync::Arc<parking_lot::Mutex<Vec<String>>> = Default::default();
+        let subscriber = tracing_subscriber::registry().with(LevelEventCapture {
+            level,
+            lines: lines.clone(),
+        });
+        let guard = tracing::subscriber::set_default(subscriber);
+        (lines, guard)
     }
 
     /// `RemoteClusterConfig`'s `Debug` must never print the bearer credential:
@@ -8361,12 +8517,8 @@ mod tests {
     /// `occurrences("setting=\"memory_budget_bytes\"")` reads 2, not 1.
     #[test]
     fn emit_logs_each_new_memory_figure_exactly_once() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
-        let captured: std::sync::Arc<parking_lot::Mutex<Vec<String>>> = Default::default();
-        let subscriber = tracing_subscriber::registry().with(InfoEventCapture(captured.clone()));
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
 
         resolved.emit(reference_host());
 
@@ -10865,35 +11017,99 @@ mod tests {
         );
     }
 
+    /// `spec.gateway.maxInflightFlushes: 16` is admissible on the shipped CRD
+    /// and `ravel-operator` renders `--max-inflight-flushes 16` onto the
+    /// gateway Deployment verbatim, while the CRD has no field for the queue
+    /// cap. Refusing that pair at startup would put every gateway pod of an
+    /// already-running cluster into CrashLoopBackOff on upgrade with no
+    /// custom-resource edit able to recover it, so the queue cap is raised to
+    /// the permit count instead and the raise is logged.
+    ///
+    /// Prove-the-test, against the two implementations that also "start
+    /// successfully and log a warning":
+    ///
+    /// 1. Clamp a local copy and leave the resolved value alone (return
+    ///    `self.max_queued_flushes` from `resolve_flush_concurrency` after
+    ///    warning): the `effective.max_queued_flushes` assertion reads 8, not
+    ///    16. `main.rs` fills `ServerConfig::max_queued_flushes` from this
+    ///    same resolver, so the value asserted here is the one the shards are
+    ///    built with.
+    /// 2. Clamp in the wrong direction (lower `max_inflight_flushes` to the
+    ///    queue cap): the `effective.max_inflight_flushes` assertion reads 8,
+    ///    not 16, and the operator's configured concurrency was lost.
     #[test]
-    fn inflight_flushes_above_the_queue_cap_fails_validate() {
-        // Effective per-shard flush concurrency is
-        // min(max_inflight_flushes, max_queued_flushes): the cap refuses the
-        // trigger before a task is ever spawned to take a permit. Refuse the
-        // pair rather than silently truncate the operator's setting and count
-        // the difference as deferral (PR #1903 review finding 2).
-        let err = cli(&["--max-inflight-flushes", "16"])
+    fn max_inflight_above_max_queued_clamps_the_queue_cap_instead_of_refusing() {
+        let parsed = cli(&["--max-inflight-flushes", "16"]);
+        assert_eq!(
+            parsed.max_queued_flushes, 8,
+            "the fixture is the CRD-reachable pair: 16 permits against the default queue cap"
+        );
+
+        parsed
             .validate()
-            .expect_err("16 inflight permits against the default queue cap of 8 must refuse");
-        let text = err.to_string();
+            .expect("16 inflight permits against the default queue cap must still start");
+
+        let (captured, guard) = capture_events(tracing::Level::WARN);
+        let effective = parsed.resolve_flush_concurrency();
+        drop(guard);
+
+        assert_eq!(
+            effective.max_queued_flushes, 16,
+            "the queue cap is raised to the permit count, not left at the configured 8"
+        );
+        assert_eq!(
+            effective.max_inflight_flushes, 16,
+            "the permit count the operator configured is unchanged; the clamp only raises \
+             the queue cap"
+        );
+
+        let lines = captured.lock();
+        let joined = lines.join("\n");
         for needle in [
-            "--max-inflight-flushes",
-            "--max-queued-flushes",
-            "'16'",
-            "'8'",
+            "--max-queued-flushes raised to match --max-inflight-flushes",
+            "max_inflight_flushes=16",
+            "configured_max_queued_flushes=8",
+            "effective_max_queued_flushes=16",
         ] {
             assert!(
-                text.contains(needle),
-                "refusal names both flags and both values, missing {needle}: {text}"
+                joined.contains(needle),
+                "the warning names both numbers and which one was raised, missing {needle}: \
+                 {lines:?}"
             );
         }
     }
 
+    /// The clamp is silent when it does not fire: an operator who set the
+    /// pair consistently must not read a warning about a raise that never
+    /// happened.
     #[test]
-    fn inflight_flushes_equal_to_the_queue_cap_validates() {
-        cli(&["--max-inflight-flushes", "16", "--max-queued-flushes", "16"])
+    fn inflight_flushes_equal_to_the_queue_cap_resolves_unchanged_and_silently() {
+        let parsed = cli(&["--max-inflight-flushes", "16", "--max-queued-flushes", "16"]);
+        parsed
             .validate()
             .expect("a queue cap raised to match the permit count is fine");
+
+        let (captured, guard) = capture_events(tracing::Level::WARN);
+        let effective = parsed.resolve_flush_concurrency();
+        drop(guard);
+
+        assert_eq!(effective.max_inflight_flushes, 16);
+        assert_eq!(effective.max_queued_flushes, 16);
+        let lines = captured.lock();
+        assert!(
+            !lines.iter().any(|l| l.contains("raised to match")),
+            "no raise happened, so no warning: {lines:?}"
+        );
+    }
+
+    /// The ordinary case: a queue cap above the permit count is passed
+    /// through untouched, so the clamp cannot lower either knob.
+    #[test]
+    fn queue_cap_above_the_permit_count_resolves_unchanged() {
+        let effective = cli(&["--max-inflight-flushes", "2", "--max-queued-flushes", "32"])
+            .resolve_flush_concurrency();
+        assert_eq!(effective.max_inflight_flushes, 2);
+        assert_eq!(effective.max_queued_flushes, 32);
     }
 
     #[test]
