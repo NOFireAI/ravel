@@ -1272,6 +1272,11 @@ pub struct RoutingSliceFetcher {
     /// process; only the tests lower it, so a test can drive a real stream
     /// across the cap without producing a million frames.
     max_slice_frames: usize,
+    /// The per-slice response BYTE cap this coordinator decodes under (issue
+    /// #1687 part B). Always [`codec::MAX_SLICE_RESPONSE_BYTES`] in a real
+    /// process; only the tests lower it, so a test can drive a real stream
+    /// across the cap without moving 64 MiB over the wire.
+    max_slice_bytes: u64,
     metrics: Arc<FragmentMetrics>,
 }
 
@@ -1295,6 +1300,7 @@ impl RoutingSliceFetcher {
             // `with_client_tls`.
             client_tls: None,
             max_slice_frames: codec::MAX_SLICE_RESPONSE_FRAMES,
+            max_slice_bytes: codec::MAX_SLICE_RESPONSE_BYTES,
             metrics,
         }
     }
@@ -1305,6 +1311,16 @@ impl RoutingSliceFetcher {
     #[cfg(test)]
     fn with_max_slice_frames(mut self, max_slice_frames: usize) -> Self {
         self.max_slice_frames = max_slice_frames;
+        self
+    }
+
+    /// Lower this coordinator's per-slice byte cap. Test-only, for the same
+    /// reason as [`with_max_slice_frames`](Self::with_max_slice_frames): a real
+    /// process decodes under [`codec::MAX_SLICE_RESPONSE_BYTES`], and there is
+    /// no operator flag for this.
+    #[cfg(test)]
+    fn with_max_slice_bytes(mut self, max_slice_bytes: u64) -> Self {
+        self.max_slice_bytes = max_slice_bytes;
         self
     }
 
@@ -1555,9 +1571,9 @@ impl RoutingSliceFetcher {
     ///
     /// The decode is incremental and bounded (issue #1687 part B): each frame is
     /// counted and measured before it is decoded, and the first breach of either
-    /// the frame cap or this coordinator's own `max_bytes_scanned` returns
-    /// without pulling another message. Dropping the stream at that point
-    /// cancels the RPC, so the remote stops producing too.
+    /// the frame cap or the fixed per-slice wire-byte ceiling returns without
+    /// pulling another message. Dropping the stream at that point cancels the
+    /// RPC, so the remote stops producing too.
     ///
     /// `wire_bytes` accumulates the frame bytes this attempt accepted, including
     /// the frame that tripped a cap, so a refused slice still reports what it
@@ -1583,8 +1599,9 @@ impl RoutingSliceFetcher {
             .fetch(tonic_request)
             .await
             .map_err(|s| DistribError::Transport(s.to_string()))?;
-        let mut decoder =
-            SliceStreamDecoder::new(&self.local.engine).with_max_frames(self.max_slice_frames);
+        let mut decoder = SliceStreamDecoder::new(&self.local.engine)
+            .with_max_frames(self.max_slice_frames)
+            .with_max_bytes(self.max_slice_bytes);
         let mut stream = response.into_inner();
         let outcome = loop {
             let next = stream
@@ -1845,13 +1862,18 @@ pub struct FederationSliceFetcher {
     /// The operator bearer token presented to the remote. This is the only
     /// principal the remote sees for a federated fetch.
     credential: String,
-    /// This coordinator's own query limits, the source of the decode byte cap
-    /// (issue #1687 part B). A remote cluster is outside this operator's
-    /// control, so what it streams is bounded here or nowhere. Defaults to
-    /// `EngineConfig::default`, whose `max_bytes_scanned` is `Unlimited`; the
-    /// process wires its resolved config in through
-    /// [`with_engine_config`](FederationSliceFetcher::with_engine_config).
+    /// This coordinator's own query limits, the config its slice decoder is
+    /// built from. The decoder's caps are fixed constants and do not vary with
+    /// it (issue #1687 part B); the process still wires its resolved config in
+    /// through [`with_engine_config`](FederationSliceFetcher::with_engine_config)
+    /// so a federated slice decodes under the same configuration object an
+    /// intra-cluster one does.
     engine: ravel_query::EngineConfig,
+    /// The per-slice response byte cap this coordinator decodes a federated
+    /// slice under. Always [`codec::MAX_SLICE_RESPONSE_BYTES`] in a real
+    /// process; only the tests lower it, so a test can drive a real stream
+    /// across the cap without moving 64 MiB over the wire.
+    max_slice_bytes: u64,
 }
 
 impl FederationSliceFetcher {
@@ -1893,17 +1915,26 @@ impl FederationSliceFetcher {
             channel: endpoint.connect_lazy(),
             credential: config.credential.clone(),
             engine: ravel_query::EngineConfig::default(),
+            max_slice_bytes: codec::MAX_SLICE_RESPONSE_BYTES,
         })
     }
 
     /// Wire this process's resolved query limits into the fetcher, so a
-    /// federated slice's decode byte cap is this coordinator's own
-    /// `max_bytes_scanned` rather than the `Unlimited` default (issue #1687
-    /// part B). A post-construction builder, so an existing call site that does
-    /// not set one keeps the previous behaviour on the byte cap; the frame cap
-    /// applies either way.
+    /// federated slice decodes under the same configuration an intra-cluster
+    /// slice does. A post-construction builder, so an existing call site that
+    /// does not set one keeps the `EngineConfig::default` it had. Both decode
+    /// caps are fixed constants (issue #1687 part B) and apply either way.
     pub fn with_engine_config(mut self, engine: ravel_query::EngineConfig) -> Self {
         self.engine = engine;
+        self
+    }
+
+    /// Lower the per-slice byte cap for a federated slice. Test-only: a real
+    /// process decodes under [`codec::MAX_SLICE_RESPONSE_BYTES`], and there is
+    /// no operator flag for this.
+    #[cfg(test)]
+    fn with_max_slice_bytes(mut self, max_slice_bytes: u64) -> Self {
+        self.max_slice_bytes = max_slice_bytes;
         self
     }
 }
@@ -1930,7 +1961,8 @@ impl SliceFetcher for FederationSliceFetcher {
         // the same two decode caps too (issue #1687 part B), checked before each
         // frame is decoded, and the first breach returns without pulling
         // another message.
-        let mut decoder = SliceStreamDecoder::new(&self.engine);
+        let mut decoder =
+            SliceStreamDecoder::new(&self.engine).with_max_bytes(self.max_slice_bytes);
         let mut stream = response.into_inner();
         let outcome = loop {
             let next = stream.message().await.map_err(|s| {
@@ -4576,8 +4608,16 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
 
     /// The byte cap is the other half, and it is the one that binds when a
     /// remote sends few but enormous frames: a slice whose frames outrun the
-    /// coordinator's own `max_bytes_scanned` is refused naming both byte
-    /// counts, well before the frame cap could apply.
+    /// per-slice wire ceiling is refused naming both byte counts, well before
+    /// the frame cap could apply.
+    ///
+    /// The cap is lowered through the `with_max_slice_bytes` test seam. A real
+    /// coordinator enforces [`codec::MAX_SLICE_RESPONSE_BYTES`] whatever it
+    /// configured, which the assertion below pins on a production-built
+    /// fetcher; driving 64 MiB over a loopback stream would test the same
+    /// `push` branch at a thousand times the cost, and
+    /// `ravel_query::distrib::codec::slice_cap_tests` drives the real constant
+    /// directly.
     #[tokio::test]
     async fn remote_fetch_refuses_a_slice_past_the_byte_cap() {
         const TOTAL: usize = 20_000;
@@ -4587,14 +4627,28 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
 
         let (endpoint, produced, _shutdown) = spawn_frame_flood(TOTAL).await;
         let metrics = Arc::new(FragmentMetrics::new());
+        assert_eq!(
+            fetcher_against(
+                &endpoint,
+                ravel_query::EngineConfig {
+                    // A store-byte budget far below the wire ceiling does not
+                    // become the wire cap: the two count different things.
+                    max_bytes_scanned: ravel_query::ByteLimit::Bounded(MAX_BYTES),
+                    ..ravel_query::EngineConfig::default()
+                },
+                metrics.clone(),
+            )
+            .max_slice_bytes,
+            codec::MAX_SLICE_RESPONSE_BYTES,
+            "a coordinator built the production way decodes under the constant; \
+             the lowered cap below is a test seam, not a different rule"
+        );
         let fetcher = fetcher_against(
             &endpoint,
-            ravel_query::EngineConfig {
-                max_bytes_scanned: ravel_query::ByteLimit::Bounded(MAX_BYTES),
-                ..ravel_query::EngineConfig::default()
-            },
+            ravel_query::EngineConfig::default(),
             metrics.clone(),
-        );
+        )
+        .with_max_slice_bytes(MAX_BYTES);
 
         let err = fetcher
             .fetch(pinned_request([9u8; 16], &[0]))
@@ -4602,7 +4656,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             .expect_err("a slice past the byte cap is refused");
         match err {
             DistribError::Codec(codec::CodecError::SliceByteCapExceeded { bytes, max }) => {
-                assert_eq!(max, MAX_BYTES, "the cap named is the engine's own");
+                assert_eq!(max, MAX_BYTES, "the cap named is the one in force");
                 assert!(
                     bytes > MAX_BYTES,
                     "the refusal names the bytes actually accepted ({bytes})"
@@ -4619,9 +4673,8 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         );
     }
 
-    /// The cap a STOCK process decodes under. `remote_fetch_refuses_a_slice_
-    /// past_the_byte_cap` above configures a budget; this asserts the case
-    /// nobody configures, which is where the cap has to hold on its own.
+    /// The cap a STOCK process decodes under: the case nobody configures, which
+    /// is where the cap has to hold on its own.
     ///
     /// The config is built the way `lib.rs` builds the process-wide
     /// `EngineConfig`: `max_bytes_scanned` from `LimitsConfig`'s resolved
@@ -4629,7 +4682,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// `shipped_query_defaults()`. That resolves to an explicit
     /// `ByteLimit::Unlimited`, so a cap that applied only to an ABSENT setting
     /// would be off here, on every default deployment. It resolves instead to
-    /// the absolute ceiling, and `push` refuses on `bytes > byte_cap()` (the
+    /// the fixed ceiling, and `push` refuses on `bytes > byte_cap()` (the
     /// same field, proven firing end to end by the 32 KiB test above).
     #[test]
     fn a_stock_resolved_config_decodes_under_the_absolute_byte_cap() {
@@ -4709,11 +4762,15 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             channel,
             credential: "token".to_string(),
             engine: ravel_query::EngineConfig::default(),
+            max_slice_bytes: codec::MAX_SLICE_RESPONSE_BYTES,
         }
+        // A store-byte budget far below the wire ceiling does not become the
+        // wire cap; the seam below is what lowers it for this test.
         .with_engine_config(ravel_query::EngineConfig {
             max_bytes_scanned: ravel_query::ByteLimit::Bounded(MAX_BYTES),
             ..ravel_query::EngineConfig::default()
-        });
+        })
+        .with_max_slice_bytes(MAX_BYTES);
 
         let err = fetcher
             .fetch(pinned_request([9u8; 16], &[0]))
