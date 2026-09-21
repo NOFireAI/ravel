@@ -23,11 +23,21 @@
 
 use axum::http::StatusCode;
 use ravel_query::QueryError;
+use ravel_query::distrib::codec::{MAX_SLICE_RESPONSE_BYTES, MAX_SLICE_RESPONSE_FRAMES};
 use ravel_query::http::QueryErrorResponse;
 
 fn render(err: QueryError) -> QueryErrorResponse {
     QueryErrorResponse::from_query_error(err)
 }
+
+/// The figures a real byte-cap refusal carries: the coordinator's own ceiling,
+/// and the first total that crosses it. Taken from the constant rather than
+/// written out, so raising the ceiling cannot leave this test asserting on a
+/// pair of numbers no deployment can produce.
+const OVER_BYTE_CAP: u64 = MAX_SLICE_RESPONSE_BYTES + 8_192;
+
+/// The same for the frame cap.
+const OVER_FRAME_CAP: usize = MAX_SLICE_RESPONSE_FRAMES + 1;
 
 /// The frame cap's refusal: 422, the `execution` tag every budget refusal
 /// carries, and both counts echoed so an operator can see what was asked for
@@ -35,13 +45,16 @@ fn render(err: QueryError) -> QueryErrorResponse {
 #[test]
 fn frame_cap_refusal_renders_as_422_with_both_counts() {
     let rendered = render(QueryError::TooManySliceFrames {
-        frames: 1_048_577,
-        max: 1_048_576,
+        frames: OVER_FRAME_CAP,
+        max: MAX_SLICE_RESPONSE_FRAMES,
     });
     assert_eq!(rendered.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(rendered.error_type, "execution");
     assert!(
-        rendered.message.contains("1048577") && rendered.message.contains("1048576"),
+        rendered.message.contains(&OVER_FRAME_CAP.to_string())
+            && rendered
+                .message
+                .contains(&MAX_SLICE_RESPONSE_FRAMES.to_string()),
         "both counts are echoed: {}",
         rendered.message
     );
@@ -59,13 +72,16 @@ fn frame_cap_refusal_renders_as_422_with_both_counts() {
 #[test]
 fn byte_cap_refusal_renders_as_422_naming_the_wire_bytes_and_the_cap() {
     let rendered = render(QueryError::TooManySliceBytes {
-        bytes: 67_117_056,
-        max: 67_108_864,
+        bytes: OVER_BYTE_CAP,
+        max: MAX_SLICE_RESPONSE_BYTES,
     });
     assert_eq!(rendered.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(rendered.error_type, "execution");
     assert!(
-        rendered.message.contains("67117056") && rendered.message.contains("67108864"),
+        rendered.message.contains(&OVER_BYTE_CAP.to_string())
+            && rendered
+                .message
+                .contains(&MAX_SLICE_RESPONSE_BYTES.to_string()),
         "the bytes consumed and the cap are both echoed: {}",
         rendered.message
     );
@@ -82,12 +98,12 @@ fn byte_cap_refusal_renders_as_422_naming_the_wire_bytes_and_the_cap() {
 #[test]
 fn the_two_cap_refusals_are_distinguishable_in_the_rendered_body() {
     let frames = render(QueryError::TooManySliceFrames {
-        frames: 1_048_577,
-        max: 1_048_576,
+        frames: OVER_FRAME_CAP,
+        max: MAX_SLICE_RESPONSE_FRAMES,
     });
     let bytes = render(QueryError::TooManySliceBytes {
-        bytes: 67_117_056,
-        max: 67_108_864,
+        bytes: OVER_BYTE_CAP,
+        max: MAX_SLICE_RESPONSE_BYTES,
     });
     assert_eq!(frames.status, bytes.status);
     assert_eq!(frames.error_type, bytes.error_type);

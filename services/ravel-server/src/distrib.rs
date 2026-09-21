@@ -1110,8 +1110,11 @@ pub struct FragmentStatEntry {
     /// `total_s3_bytes`); `0` when the slice ended in an error.
     pub bytes_reported: u64,
     /// Response frame bytes this coordinator accepted off the wire for the
-    /// slice, summed over its remote attempts, including the frame that tripped
-    /// a decode cap (issue #1687 part B). `0` for a slice that ran
+    /// slice, summed over its remote attempts (issue #1687 part B). A BYTE-cap
+    /// refusal includes the frame that tripped it, because
+    /// `SliceStreamDecoder::push` adds the frame's length before it compares
+    /// against the cap; a FRAME-cap refusal does not, because that check
+    /// returns before the length is measured. `0` for a slice that ran
     /// coordinator-local, which moves no frames. Distinct from
     /// `bytes_reported`, which is store bytes the worker says it read.
     pub wire_bytes_consumed: u64,
@@ -1275,7 +1278,7 @@ pub struct RoutingSliceFetcher {
     /// The per-slice response BYTE cap this coordinator decodes under (issue
     /// #1687 part B). Always [`codec::MAX_SLICE_RESPONSE_BYTES`] in a real
     /// process; only the tests lower it, so a test can drive a real stream
-    /// across the cap without moving 64 MiB over the wire.
+    /// across the cap without moving hundreds of megabytes over the wire.
     max_slice_bytes: u64,
     metrics: Arc<FragmentMetrics>,
 }
@@ -1872,7 +1875,7 @@ pub struct FederationSliceFetcher {
     /// The per-slice response byte cap this coordinator decodes a federated
     /// slice under. Always [`codec::MAX_SLICE_RESPONSE_BYTES`] in a real
     /// process; only the tests lower it, so a test can drive a real stream
-    /// across the cap without moving 64 MiB over the wire.
+    /// across the cap without moving hundreds of megabytes over the wire.
     max_slice_bytes: u64,
 }
 
@@ -4498,15 +4501,17 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// and the coordinator never holds the slice.
     ///
     /// `max_bytes_scanned` is deliberately left at the `EngineConfig` default,
-    /// so the byte cap in force is the absolute 64 MiB ceiling. The frame cap
+    /// so the byte cap in force is the absolute derived ceiling. The frame cap
     /// is lowered to 64 frames, about 576 wire KiB, so it is the cap this
     /// stream reaches. Two wrong implementations are ruled out, each by a
     /// different assertion:
     ///
     /// * A decoder that enforces the byte cap but NOT the frame cap runs on
-    ///   past 64 frames: it either reaches the terminal summary or trips the
-    ///   byte ceiling two orders of magnitude later, past 7000 frames. The
-    ///   typed-variant assertion and the produced-count assertion fail.
+    ///   past 64 frames and reaches the terminal summary: the whole flood is
+    ///   `TOTAL` frames of 1024 narrowest samples, about 185 MB of wire bytes,
+    ///   which is under [`codec::MAX_SLICE_RESPONSE_BYTES`], so the byte
+    ///   ceiling never fires on this stream at all. The typed-variant
+    ///   assertion and the produced-count assertion fail.
     /// * A decoder that enforces BOTH caps but only after draining the stream
     ///   returns the same error, so the error assertions pass, but it pulls
     ///   every message: `produced` reaches `TOTAL + 1`. The produced-count
@@ -4614,8 +4619,8 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// The cap is lowered through the `with_max_slice_bytes` test seam. A real
     /// coordinator enforces [`codec::MAX_SLICE_RESPONSE_BYTES`] whatever it
     /// configured, which the assertion below pins on a production-built
-    /// fetcher; driving 64 MiB over a loopback stream would test the same
-    /// `push` branch at a thousand times the cost, and
+    /// fetcher; driving the whole derived ceiling over a loopback stream would
+    /// test the same `push` branch at thousands of times the cost, and
     /// `ravel_query::distrib::codec::slice_cap_tests` drives the real constant
     /// directly.
     #[tokio::test]
@@ -4700,7 +4705,11 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             SliceStreamDecoder::new(&engine).byte_cap(),
             codec::MAX_SLICE_RESPONSE_BYTES
         );
-        assert_eq!(codec::MAX_SLICE_RESPONSE_BYTES, 67_108_864);
+        assert!(
+            codec::MAX_SLICE_RESPONSE_BYTES
+                >= ravel_query::DEFAULT_MAX_SAMPLES as u64 * codec::WIRE_BYTES_PER_SAMPLE_WIDEST,
+            "the stock ceiling admits a slice at the stock sample budget"
+        );
     }
 
     /// A slice that stays inside both caps decodes exactly as before: the caps
