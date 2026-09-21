@@ -35,6 +35,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A shard now refuses a flush trigger once `--max-queued-flushes` (default
+  8) flush tasks are spawned and unacked, leaving the rows buffered for the
+  next tick** (issue #1740). Before this, every trigger spawned a task, so a
+  shard whose writes were slow kept spawning while each task held its built
+  batch resident, with the worst case set by how long the object store stayed
+  slow rather than by anything configured. A per-shard `flushes_queued` gauge
+  and a `flush_trigger_deferred` counter report it. Two things to know: a
+  flush that crosses the per-tenant memory backstop is **exempt** and spawns
+  even at the cap, because a bounded queue of tasks is worth less than a
+  bounded buffer; and the server now **refuses to start** when
+  `--max-inflight-flushes` exceeds `--max-queued-flushes`, since only a
+  spawned task can hold a permit and the excess would silently reduce flush
+  concurrency.
 - **The at-rest scrub corpus now covers compaction and rewrite output parts,
   not only original L0 segments, and `ravel_scrub_checksum_mismatch_total`
   carries a new `level` label** (issue #1686). The corpus previously skipped

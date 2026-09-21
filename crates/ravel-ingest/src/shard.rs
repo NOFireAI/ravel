@@ -49,7 +49,8 @@ use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
-    SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket, size_trigger_fires,
+    SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket, memory_backstop_crossed,
+    size_trigger_fires,
 };
 use crate::error::WriteError;
 use crate::metrics::{FlushTrigger, IngestMetrics};
@@ -1438,9 +1439,30 @@ impl ShardActor {
     /// refusing there would strand acknowledged buffered-mode rows on
     /// teardown; it also needs no bound of its own, since `flush_all` awaits
     /// every spawned flush before it returns.
-    fn queued_flush_cap_reached(&self, trigger: FlushTrigger) -> bool {
-        !matches!(trigger, FlushTrigger::Manual)
-            && self.flushes.len() >= self.config.queued_flush_cap()
+    ///
+    /// A buffer that has crossed its per-(shard, tenant) memory backstop
+    /// ([`memory_backstop_crossed`]) is never refused either, whatever the
+    /// trigger: that backstop is the ONLY bound on one buffer's resident
+    /// memory, and under [`crate::IngestByteBudgetLimit::Unlimited`] nothing
+    /// sheds behind it. Refusing there would hold this many flush windows AND
+    /// let the buffer grow for as long as the store stays stalled, which is a
+    /// worse failure than the queue this cap exists to bound. So the queue may
+    /// exceed `max_queued_flushes` under memory pressure, by one window per
+    /// backstop's worth of buffered memory (PR #1903 review finding 1): a
+    /// bounded buffer plus a queue that grows only as fast as memory fills,
+    /// rather than a bounded queue plus an unbounded buffer. The exempt path is
+    /// this early return, and it is the only way past the length check below;
+    /// a refusal is always counted on `flush_trigger_deferred`, so a queue
+    /// reading above the cap with no deferral behind it is the exemption at
+    /// work.
+    fn queued_flush_cap_reached(&self, trigger: FlushTrigger, buf: &TenantBuf) -> bool {
+        if matches!(trigger, FlushTrigger::Manual) {
+            return false;
+        }
+        if memory_backstop_crossed(buf.est_bytes, &self.config, self.backstop_ceiling.get()) {
+            return false;
+        }
+        self.flushes.len() >= self.config.queued_flush_cap()
     }
 
     /// Publishes this shard's spawned-but-unreaped flush-task count (issue
@@ -1482,9 +1504,10 @@ impl ShardActor {
             debug_assert!(buf.waiters.is_empty());
             return;
         }
-        if self.queued_flush_cap_reached(trigger) {
+        if self.queued_flush_cap_reached(trigger, &buf) {
             // Issue #1740: this shard is already holding `max_queued_flushes`
-            // flush windows. Refuse the trigger rather than spawn another task
+            // flush windows, and this buffer is still under its memory
+            // backstop. Refuse the trigger rather than spawn another task
             // to park on the semaphore, and put the buffer back exactly as it
             // arrived: series, exemplars, waiters, `charges`, and the trigger
             // bookkeeping (`flush_est_bytes`, `est_bytes`, `oldest_arrival_ns`)

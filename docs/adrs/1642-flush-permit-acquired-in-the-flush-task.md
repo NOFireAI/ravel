@@ -125,9 +125,13 @@ flowchart LR
 
     Amended by issue #1740: the spawned flush queue is now bounded by
     `max_queued_flushes` under every budget setting, so "nothing bounds the
-    spawned-but-waiting flush queue except host memory" no longer holds. What
-    `Unlimited` still opts out of is the bound on buffered rows waiting in the
-    tenant map. See the amendment below.
+    spawned-but-waiting flush queue except host memory" no longer holds. The
+    bound is `max_queued_flushes` plus one window per tenant buffer over its
+    memory backstop, since a crossing is exempt from the cap. What
+    `Unlimited` still opts out of is the process-wide bound on the sum of
+    buffered rows waiting in the tenant maps; each individual buffer is still
+    bounded by that backstop, which is why the exemption exists. See the
+    amendment below.
 
   `max_inflight_flushes` keeps its other meaning unchanged: it is the
   concurrency of flushes actually executing against the object store, and so
@@ -226,6 +230,31 @@ data that never reaches the object store. Drains are also the one place the
 actor is permitted to park on in-flight flushes, so the queue they add is
 bounded by the drain itself.
 
+A trigger on a buffer that has crossed its per-(shard, tenant) memory backstop
+(`buffer_memory_backstop_bytes`: `max(target_bytes, min(64 MiB, ceiling / 8))`)
+is exempt too, whatever the trigger kind. The first cut of this cap refused
+every non-Manual trigger, including the backstop crossing, which was wrong in
+the direction that matters. That backstop is the only bound on ONE buffer's
+resident memory: `target_bytes` is an object-size estimate, not a memory one,
+and on a label-heavy series the two differ by more than an order of magnitude,
+which is why the backstop exists. Under `Unlimited` nothing sheds behind it.
+So with the store stalled and a shard at its cap, refusing the crossing left
+one tenant's buffer growing past 64 MiB with nothing to stop it: the cap
+turned a bounded queue of flush tasks into an unbounded buffer, which is a
+worse failure than the one it was added to fix. A flush window is bounded and
+drains itself; a buffer under a sustained stall is neither.
+
+The exemption is therefore deliberate, and it means the queue CAN exceed
+`max_queued_flushes`. The overshoot is one window per buffer over its
+backstop, and each of those windows costs a backstop's worth of buffered
+memory that the flush then drains, so the queue grows only as fast as memory
+fills rather than with the flush cadence, and both quantities stay bounded.
+Operators size the steady state from `max_queued_flushes` and the headroom for
+the overshoot from the backstop and the tenant count. Read the two metrics
+together to tell the cases apart: a `flushes_queued` above the cap with
+`flush_trigger_deferred` flat is the exemption (memory pressure), while
+`flush_trigger_deferred` rising is the cap (a stalled store).
+
 Two per-shard metrics make the cap observable: `flushes_queued`, a gauge of the
 spawned-but-unreaped count the cap tests, and `flush_trigger_deferred`, a
 counter of refused triggers. Both are on `ShardSkewStats`, for all three
@@ -235,8 +264,16 @@ object store, not ingest, is the thing to look at.
 
 The consequence bullets above are unchanged except in their bound. Memory per
 shard still rises by one flush window per spawned flush, and the in-flight gauge
-can still read above `max_inflight_flushes`; what is new is that the gauge
-cannot exceed `max_queued_flushes`, under any byte-budget setting. Buffered
-memory is not bounded by this cap: a shard at its cap keeps merging new writes
-into tenant buffers, which is what the byte budget bounds and what `Unlimited`
-still opts out of.
+can still read above `max_inflight_flushes`; what is new is that the gauge is
+bounded, under any byte-budget setting, by `max_queued_flushes` plus one
+window per tenant buffer over its memory backstop. Buffered memory is not
+bounded by this cap: a shard at its cap keeps merging new writes into tenant
+buffers. Per buffer that is what the memory backstop bounds, which is why the
+backstop is exempt from the cap; in sum across tenants it is what the byte
+budget bounds and what `Unlimited` still opts out of.
+
+The cap is `--max-queued-flushes` (`RAVEL_MAX_QUEUED_FLUSHES`) on
+`ravel-server`. `Cli::validate` rejects `0` and rejects a
+`--max-inflight-flushes` above it: effective per-shard flush concurrency is
+the lower of the two, because a refused trigger never spawns a task to take a
+permit, and clamping instead would report the ignored permits as deferral.
