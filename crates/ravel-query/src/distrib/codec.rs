@@ -30,6 +30,7 @@ use ravel_rspan::{SpanRecord, StatusCode};
 use ravel_segment::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 use ravel_types::logstream::{AttrValue, LogStreamId};
 
+use crate::config::{ByteLimit, EngineConfig};
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::{FetchedHistogramSeries, FetchedSeriesSoa, SamplePriority};
 use crate::span_fetcher::SpanRow;
@@ -67,9 +68,9 @@ use crate::span_fetcher::SpanRow;
 pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The ceiling on how many response frames a coordinator accepts for ONE slice
-/// before refusing it (issue #1687 part B). Paired with the byte cap the
-/// coordinator takes from its own `EngineConfig::max_bytes_scanned`, this is
-/// what bounds the memory a remote can make a coordinator hold.
+/// before refusing it (issue #1687 part B). Paired with the per-slice byte cap
+/// [`slice_byte_cap`] resolves, this is what bounds the memory a remote can
+/// make a coordinator hold.
 ///
 /// A conforming worker emits one frame per returned run (one per
 /// (series, segment) pair for scalars, one per native-histogram series, or one
@@ -83,12 +84,47 @@ pub const PROTOCOL_VERSION: u32 = 4;
 /// coordinator more memory than it can hold decoded anyway, which is the bound
 /// this exists to enforce.
 ///
-/// A count cap is needed on top of the byte cap because
-/// `EngineConfig::max_bytes_scanned` defaults to `ByteLimit::Unlimited`: on a
-/// default deployment it is the only cap that bounds anything, and an empty
-/// frame costs 2 wire bytes, so a remote streaming them forever is otherwise
-/// bounded by nothing.
+/// A count cap is needed on top of the byte cap because an empty frame costs 2
+/// wire bytes: at that size [`MAX_SLICE_RESPONSE_BYTES`] alone would admit
+/// 33554432 frames, so the byte cap does not bound a frame count at the sizes a
+/// remote chooses.
 pub const MAX_SLICE_RESPONSE_FRAMES: usize = 1 << 20;
+
+/// The absolute ceiling on the wire bytes a coordinator accepts for ONE slice
+/// (issue #1687). Not a tuning knob: no configuration raises it, and it applies
+/// on a deployment that configured nothing. [`slice_byte_cap`] combines it with
+/// `EngineConfig::max_bytes_scanned` by taking the LOWER of the two, so a
+/// configured budget can only lower the ceiling.
+///
+/// The cap is PER SLICE, and every in-flight slice decodes through its own
+/// decoder holding the full cap, so a coordinator running
+/// [`DEFAULT_MAX_PARALLEL_SLICES`](super::partition::DEFAULT_MAX_PARALLEL_SLICES)
+/// (8) slices can hold up to 8 times this figure in wire bytes at once, 512
+/// MiB, and more once those bytes are decoded into the in-memory series shapes.
+///
+/// 64 MiB is far above any legitimate slice: a conforming worker emits one
+/// frame per returned run, so a slice carrying one run for each of
+/// `EngineConfig::default`'s `max_series` of 10000 series would have to average
+/// 6711 wire bytes per frame to reach it. A slice that does reach it is refused
+/// as a budget error naming both figures, the same class of refusal as a
+/// bytes-scanned trip.
+pub const MAX_SLICE_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The per-slice wire-byte cap a coordinator running `config` applies: the
+/// lower of [`MAX_SLICE_RESPONSE_BYTES`] and the coordinator's own
+/// `max_bytes_scanned`.
+///
+/// `ByteLimit::Unlimited` is an opt-out of the store-bytes budget, not of this
+/// ceiling, so it resolves to [`MAX_SLICE_RESPONSE_BYTES`] rather than to no
+/// cap. That is the case that matters most: both `EngineConfig::default` and
+/// the server's shipped query defaults resolve to `Unlimited`, so a stock
+/// deployment reaches this function through that arm.
+pub fn slice_byte_cap(config: &EngineConfig) -> u64 {
+    match config.max_bytes_scanned {
+        ByteLimit::Bounded(max) => max.min(MAX_SLICE_RESPONSE_BYTES),
+        ByteLimit::Unlimited => MAX_SLICE_RESPONSE_BYTES,
+    }
+}
 
 /// The fragment-capability claim-set version (ADR-0071 amendment, decision 2).
 /// Distinct from [`PROTOCOL_VERSION`]: it versions the canonical claim encoding
@@ -3575,5 +3611,84 @@ mod tests {
                 "erasure window end changed"
             );
         }
+    }
+}
+
+/// Issue #1687: how the per-slice wire-byte cap resolves from a coordinator's
+/// configuration. The decoder that enforces it, and its refusal path, are
+/// covered by `super::slice_cap_tests` beside the decoder itself.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod slice_cap_tests {
+    use super::*;
+
+    /// The ceiling applies to a coordinator that configured no byte budget at
+    /// all, which is every stock deployment: both `EngineConfig::default` and
+    /// the server's shipped query defaults resolve `max_bytes_scanned` to an
+    /// explicit `ByteLimit::Unlimited`
+    /// (`services/ravel-server/src/config.rs::shipped_query_defaults`), so the
+    /// `Unlimited` arm is the one a stock process takes. Written against an
+    /// explicitly constructed `Unlimited` rather than `EngineConfig::default()`
+    /// for exactly that reason: an implementation that only capped an absent
+    /// setting would leave a stock coordinator uncapped.
+    #[test]
+    fn absolute_byte_cap_applies_when_max_bytes_scanned_is_unlimited() {
+        let config = EngineConfig {
+            max_bytes_scanned: ByteLimit::Unlimited,
+            ..EngineConfig::default()
+        };
+        assert_eq!(slice_byte_cap(&config), MAX_SLICE_RESPONSE_BYTES);
+        assert_eq!(MAX_SLICE_RESPONSE_BYTES, 67_108_864);
+
+        // The shipped default is that same `Unlimited`, so the stock path and
+        // the explicit one resolve identically.
+        assert_eq!(
+            EngineConfig::default().max_bytes_scanned,
+            ByteLimit::Unlimited
+        );
+        assert_eq!(
+            slice_byte_cap(&EngineConfig::default()),
+            MAX_SLICE_RESPONSE_BYTES
+        );
+    }
+
+    /// A configured budget below the ceiling wins: the cap is the lower of the
+    /// two, so an operator can tighten it.
+    #[test]
+    fn a_configured_budget_below_the_ceiling_wins() {
+        let config = EngineConfig {
+            max_bytes_scanned: ByteLimit::Bounded(4_096),
+            ..EngineConfig::default()
+        };
+        assert_eq!(slice_byte_cap(&config), 4_096);
+    }
+
+    /// A configured budget above the ceiling does NOT raise it. The ceiling is
+    /// absolute: `max_bytes_scanned` governs store bytes a query may scan, and
+    /// letting it raise the per-slice wire cap would make a generous budget the
+    /// way to reopen the hole this cap closes.
+    #[test]
+    fn a_configured_budget_above_the_ceiling_does_not_raise_it() {
+        let config = EngineConfig {
+            max_bytes_scanned: ByteLimit::Bounded(1u64 << 30),
+            ..EngineConfig::default()
+        };
+        assert!(1u64 << 30 > MAX_SLICE_RESPONSE_BYTES);
+        assert_eq!(slice_byte_cap(&config), MAX_SLICE_RESPONSE_BYTES);
+    }
+
+    /// The frame cap is not redundant with the byte cap: an empty frame is 2
+    /// wire bytes, so the byte ceiling alone would admit far more frames than
+    /// the frame cap does.
+    #[test]
+    fn the_byte_ceiling_alone_does_not_bound_a_frame_count() {
+        use prost::Message;
+
+        let empty = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Series(pb::SeriesFrame::default())),
+        };
+        assert_eq!(empty.encoded_len(), 2);
+        assert_eq!(MAX_SLICE_RESPONSE_BYTES / 2, 33_554_432);
+        assert!(MAX_SLICE_RESPONSE_BYTES / 2 > MAX_SLICE_RESPONSE_FRAMES as u64);
     }
 }
