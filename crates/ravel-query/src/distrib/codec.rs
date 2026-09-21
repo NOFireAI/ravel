@@ -30,7 +30,7 @@ use ravel_rspan::{SpanRecord, StatusCode};
 use ravel_segment::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 use ravel_types::logstream::{AttrValue, LogStreamId};
 
-use crate::config::EngineConfig;
+use crate::config::{DEFAULT_MAX_SAMPLES, EngineConfig};
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::{FetchedHistogramSeries, FetchedSeriesSoa, SamplePriority};
 use crate::span_fetcher::SpanRow;
@@ -86,38 +86,104 @@ pub const PROTOCOL_VERSION: u32 = 4;
 ///
 /// A count cap is needed on top of the byte cap because an empty frame costs 2
 /// wire bytes: at that size [`MAX_SLICE_RESPONSE_BYTES`] alone would admit
-/// 33554432 frames, so the byte cap does not bound a frame count at the sizes a
-/// remote chooses.
+/// 115165824 frames, so the byte cap does not bound a frame count at the sizes
+/// a remote chooses.
 pub const MAX_SLICE_RESPONSE_FRAMES: usize = 1 << 20;
+
+/// The wire cost of one scalar sample at its NARROWEST: a 1-byte zig-zag
+/// `ts_delta` plus an 8-byte `fixed64` `value_bits`, both inside packed
+/// columns, so neither carries a tag of its own.
+///
+/// A floor, not a bound. `ts_delta` is a varint, so a run whose samples sit far
+/// apart in time pays more; [`WIRE_BYTES_PER_SAMPLE_WIDEST`] is the other end.
+///
+/// Pinned by `distrib::slice_cap_tests::a_stock_config_decodes_under_the_absolute_byte_cap`,
+/// which asserts 4096 samples at this shape encode to 36_912 bytes: 4096 * 9
+/// plus [`WIRE_BYTES_PER_FRAME`].
+pub const WIRE_BYTES_PER_SAMPLE_NARROWEST: u64 = 9;
+
+/// The wire cost of one scalar sample at its WIDEST: a `ts_delta` whose zig-zag
+/// fills all 10 bytes a `sint64` varint can take, plus the fixed 8 bytes of
+/// `value_bits`. No scalar sample's own two columns can cost more than this.
+///
+/// Pinned by `slice_cap_tests::the_wire_ceiling_admits_a_slice_at_the_sample_budget`
+/// below, which encodes a run of `ts_delta: i64::MIN` (zig-zag `u64::MAX`, the
+/// widest varint there is) and asserts the per-sample figure.
+pub const WIRE_BYTES_PER_SAMPLE_WIDEST: u64 = 18;
+
+/// The wire bytes one response frame costs beside its samples, at the shape
+/// the two tests above pin: the frame, series-frame, run, `series_id` and
+/// single-`__name__`-label framing around the two packed sample columns, in a
+/// 4096-sample frame that encodes to 36_912 bytes (4096 * 9 + 48).
+///
+/// One pinned shape's framing, not an upper bound over every frame. A frame
+/// with more or longer labels spends more, and so does a larger one: each
+/// packed column carries a length-delimiter varint that widens with its own
+/// payload, which is why
+/// `slice_cap_tests::the_wire_ceiling_admits_a_slice_at_the_sample_budget`
+/// pins the per-sample figures as a marginal rate and this one at a fixed
+/// size. [`MAX_SLICE_RESPONSE_BYTES`] spends it as headroom for framing, not
+/// as an exact accounting of it.
+pub const WIRE_BYTES_PER_FRAME: u64 = 48;
 
 /// The absolute ceiling on the wire bytes a coordinator accepts for ONE slice
 /// (issue #1687). Not a tuning knob: it is fixed, no configuration raises or
 /// lowers it, and it applies on a deployment that configured nothing.
 /// [`slice_byte_cap`] returns it for every config.
 ///
-/// In particular it is independent of `EngineConfig::max_bytes_scanned`, which
-/// is a STORE-byte budget enforced on a different path (over
-/// `total_s3_bytes` as slices complete) and is not the same measure: since
-/// #1725 each slice carries the query's whole `max_bytes_scanned` as its own
-/// store-byte budget, so a slice may legitimately scan that many compressed
-/// store bytes, and a scalar sample costs at least 9 wire bytes uncompressed.
+/// # Where the number comes from
+///
+/// Derived from the sample budget rather than picked, so the two limits cannot
+/// drift apart:
+///
+/// ```text
+/// DEFAULT_MAX_SAMPLES * WIRE_BYTES_PER_SAMPLE_WIDEST   10_000_000 * 18 = 180_000_000
+/// + MAX_SLICE_RESPONSE_FRAMES * WIRE_BYTES_PER_FRAME  +  1_048_576 * 48 =  50_331_648
+///                                                      = 230_331_648 bytes
+/// ```
+///
+/// A worker is authorized to return [`DEFAULT_MAX_SAMPLES`] samples in one
+/// slice: on the federation path it enforces exactly that over what a
+/// resolve-scope slice is about to return
+/// (`distrib::service::QueryFragmentService::resolve_scope_count_refusal`), and
+/// on the intra-cluster path nothing bounds a single slice's response below it
+/// either. So a ceiling under the wire size of a slice at that budget refuses
+/// queries this deployment's own configured limits permit. The first term is
+/// that wire size at the widest a sample can encode; the second is the framing
+/// for a slice spread over as many frames as [`MAX_SLICE_RESPONSE_FRAMES`]
+/// admits, at [`WIRE_BYTES_PER_FRAME`] each.
+///
+/// It is still not a bound no slice can cross, and it is not meant to be: a run
+/// whose per-sample provenance columns are present (`Run` fields 6-9,
+/// `proto/ravel/queryfrag.proto`) carries four more packed columns per sample,
+/// and a frame with many or long labels spends more framing than the pinned
+/// figure. A slice that does cross is refused as a budget error naming both
+/// figures, the same class of refusal as a bytes-scanned trip.
+///
+/// # What it is independent of
+///
+/// `EngineConfig::max_bytes_scanned` is a STORE-byte budget enforced on a
+/// different path (over `total_s3_bytes` as slices complete) and is not the
+/// same measure: since #1725 each slice carries the query's whole
+/// `max_bytes_scanned` as its own store-byte budget, so a slice may
+/// legitimately scan that many compressed store bytes, and a scalar sample
+/// costs at least [`WIRE_BYTES_PER_SAMPLE_NARROWEST`] wire bytes uncompressed.
 /// Letting the store budget lower this cap would refuse a slice that stayed
-/// inside the budget its operator configured, quoting a wire figure nobody
-/// set.
+/// inside the budget its operator configured, quoting a wire figure nobody set.
+///
+/// # What multiplies it
 ///
 /// The cap is PER SLICE, and every in-flight slice decodes through its own
-/// decoder holding the full cap, so a coordinator running
+/// decoder holding the full cap, so what a coordinator can hold at once is this
+/// figure times the number of decoders in flight. That multiplier differs by
+/// path and neither spelling of it is
 /// [`DEFAULT_MAX_PARALLEL_SLICES`](super::partition::DEFAULT_MAX_PARALLEL_SLICES)
-/// (8) slices can hold up to 8 times this figure in wire bytes at once, 512
-/// MiB, and more once those bytes are decoded into the in-memory series shapes.
-///
-/// 64 MiB is far above any legitimate slice: a conforming worker emits one
-/// frame per returned run, so a slice carrying one run for each of
-/// `EngineConfig::default`'s `max_series` of 10000 series would have to average
-/// 6711 wire bytes per frame to reach it. A slice that does reach it is refused
-/// as a budget error naming both figures, the same class of refusal as a
-/// bytes-scanned trip.
-pub const MAX_SLICE_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+/// alone; docs/guides/distributed-query.md states both, and
+/// `the_documented_fan_out_worst_case_matches_the_constants` pins the figures
+/// it quotes.
+pub const MAX_SLICE_RESPONSE_BYTES: u64 = DEFAULT_MAX_SAMPLES as u64
+    * WIRE_BYTES_PER_SAMPLE_WIDEST
+    + MAX_SLICE_RESPONSE_FRAMES as u64 * WIRE_BYTES_PER_FRAME;
 
 /// The per-slice wire-byte cap a coordinator running `config` applies:
 /// [`MAX_SLICE_RESPONSE_BYTES`], for every config.
@@ -3632,10 +3698,12 @@ mod slice_cap_tests {
     use super::*;
     use crate::config::ByteLimit;
 
-    /// One series frame carrying `samples` samples: about 9 wire bytes each (a
-    /// 1-byte zigzag `ts_delta` plus a fixed64 `value_bits`), so a sample count
-    /// picks a wire size.
-    fn series_frame(id: u8, samples: usize) -> pb::FetchResponse {
+    /// One series frame carrying `samples` samples whose `ts_delta` is
+    /// `delta`, so a sample count and a delta together pick a wire size: a
+    /// `delta` of 1 costs [`WIRE_BYTES_PER_SAMPLE_NARROWEST`] per sample and
+    /// `i64::MIN` (zig-zag `u64::MAX`) costs
+    /// [`WIRE_BYTES_PER_SAMPLE_WIDEST`].
+    fn series_frame_with_delta(id: u8, samples: usize, delta: i64) -> pb::FetchResponse {
         pb::FetchResponse {
             frame: Some(pb::fetch_response::Frame::Series(pb::SeriesFrame {
                 series_id: vec![id; 16],
@@ -3644,12 +3712,17 @@ mod slice_cap_tests {
                     value: "x".to_string(),
                 }],
                 runs: vec![pb::Run {
-                    ts_delta: vec![1i64; samples],
+                    ts_delta: vec![delta; samples],
                     value_bits: vec![1u64; samples],
                     ..Default::default()
                 }],
             })),
         }
+    }
+
+    /// One series frame at the narrowest per-sample shape.
+    fn series_frame(id: u8, samples: usize) -> pb::FetchResponse {
+        series_frame_with_delta(id, samples, 1)
     }
 
     /// The ceiling applies to a coordinator that configured no byte budget at
@@ -3668,7 +3741,7 @@ mod slice_cap_tests {
             ..EngineConfig::default()
         };
         assert_eq!(slice_byte_cap(&config), MAX_SLICE_RESPONSE_BYTES);
-        assert_eq!(MAX_SLICE_RESPONSE_BYTES, 67_108_864);
+        assert_eq!(MAX_SLICE_RESPONSE_BYTES, 230_331_648);
 
         // The shipped default is that same `Unlimited`, so the stock path and
         // the explicit one resolve identically.
@@ -3717,7 +3790,7 @@ mod slice_cap_tests {
             ..EngineConfig::default()
         };
         assert_eq!(slice_byte_cap(&config), MAX_SLICE_RESPONSE_BYTES);
-        assert_eq!(MAX_SLICE_RESPONSE_BYTES, 67_108_864);
+        assert_eq!(MAX_SLICE_RESPONSE_BYTES, 230_331_648);
         assert_eq!(
             crate::distrib::SliceStreamDecoder::new(&config).byte_cap(),
             MAX_SLICE_RESPONSE_BYTES,
@@ -3740,11 +3813,13 @@ mod slice_cap_tests {
         // enough: `push` measures before it decodes, so nothing this large is
         // ever held decoded.
         //
-        // 7_500_000 samples at about 9 wire bytes each is about 67.5 MB, just
-        // over the ceiling; the assertion below pins that rather than trusting
-        // the arithmetic.
+        // One sample past what the ceiling's own widest-sample figure admits,
+        // so the frame crosses by that sample plus its framing; the assertion
+        // below pins that rather than trusting the arithmetic.
         let mut decoder = crate::distrib::SliceStreamDecoder::new(&config);
-        let huge = series_frame(1, 7_500_000);
+        let over_by_one_sample =
+            (MAX_SLICE_RESPONSE_BYTES / WIRE_BYTES_PER_SAMPLE_WIDEST + 1) as usize;
+        let huge = series_frame_with_delta(1, over_by_one_sample, i64::MIN);
         assert!(
             huge.encoded_len() as u64 > MAX_SLICE_RESPONSE_BYTES,
             "the frame must actually cross the ceiling, it encodes to {}",
@@ -3780,17 +3855,36 @@ mod slice_cap_tests {
         assert_eq!(slice_byte_cap(&config), MAX_SLICE_RESPONSE_BYTES);
     }
 
-    /// The fan-out figure the docs quote: a query holds up to
-    /// `DEFAULT_MAX_PARALLEL_SLICES` times the per-slice cap in wire bytes at
-    /// once, 512 MiB at the defaults.
+    /// The fan-out figures docs/guides/distributed-query.md quotes, pinned
+    /// against the constants they are computed from.
+    ///
+    /// A local fan-out's in-flight decoder count is a PRODUCT, not
+    /// `max_parallel_slices` alone: the distributed fetch runs inside the
+    /// engine's per-selector `buffer_unordered(promql_fetch_fanout)`
+    /// (`engine.rs`, `fetch_samples_and_histograms_maybe_distributed` called
+    /// from the plan fan-out), and each admitted selector then runs its own
+    /// `buffer_unordered(max_parallel_slices)` over its slices
+    /// (`distrib::DistribFetcher::fetch`). The federated path is bounded by
+    /// neither: `Federation::fetch` spawns one task per configured cluster.
     #[test]
     fn the_documented_fan_out_worst_case_matches_the_constants() {
         use super::super::partition::DEFAULT_MAX_PARALLEL_SLICES;
+        use crate::config::DEFAULT_FETCH_CONCURRENCY;
 
         assert_eq!(DEFAULT_MAX_PARALLEL_SLICES, 8);
         assert_eq!(
-            DEFAULT_MAX_PARALLEL_SLICES as u64 * MAX_SLICE_RESPONSE_BYTES,
-            512 * 1024 * 1024
+            EngineConfig::default().promql_fetch_fanout(),
+            DEFAULT_FETCH_CONCURRENCY,
+            "the per-selector fan-out defaults to the fetch concurrency"
+        );
+        assert_eq!(DEFAULT_FETCH_CONCURRENCY, 8);
+
+        let decoders = DEFAULT_FETCH_CONCURRENCY as u64 * DEFAULT_MAX_PARALLEL_SLICES as u64;
+        assert_eq!(decoders, 64);
+        assert_eq!(
+            decoders * MAX_SLICE_RESPONSE_BYTES,
+            14_741_225_472,
+            "the local fan-out worst case the guide quotes"
         );
     }
 
@@ -3805,7 +3899,131 @@ mod slice_cap_tests {
             frame: Some(pb::fetch_response::Frame::Series(pb::SeriesFrame::default())),
         };
         assert_eq!(empty.encoded_len(), 2);
-        assert_eq!(MAX_SLICE_RESPONSE_BYTES / 2, 33_554_432);
+        assert_eq!(MAX_SLICE_RESPONSE_BYTES / 2, 115_165_824);
         assert!(MAX_SLICE_RESPONSE_BYTES / 2 > MAX_SLICE_RESPONSE_FRAMES as u64);
+    }
+
+    /// The ceiling admits a slice the deployment's own sample budget permits,
+    /// and it admits it BECAUSE it is derived from that budget rather than
+    /// chosen to sit above today's value of it.
+    ///
+    /// A worker may return [`DEFAULT_MAX_SAMPLES`] samples in one slice: the
+    /// federation path enforces exactly that before returning
+    /// (`distrib::service::QueryFragmentService::resolve_scope_count_refusal`),
+    /// and the intra-cluster path bounds one slice's response by nothing
+    /// smaller. A wire ceiling under that refuses queries the operator's own
+    /// configuration allows.
+    ///
+    /// Two wrong implementations are ruled out:
+    ///
+    /// * The ceiling raised but still a literal. The equality against the
+    ///   derivation fails for any literal that is not that product, and the
+    ///   `>=` against the budget fails the next time `DEFAULT_MAX_SAMPLES`
+    ///   rises without it. "A slice at today's budget is accepted" alone would
+    ///   pass against both.
+    /// * The ceiling derived but never enforced (`push` not comparing, or
+    ///   comparing against `u64::MAX`). The refusal at the end drives a frame
+    ///   past the real constant through a real decoder and reads the rendered
+    ///   422, so a cap that stopped refusing fails here even though every
+    ///   acceptance assertion above it still passes.
+    #[test]
+    fn the_wire_ceiling_admits_a_slice_at_the_sample_budget() {
+        use crate::http::QueryErrorResponse;
+        use prost::Message;
+
+        // The per-sample and per-frame figures the derivation rests on, each
+        // measured against a real encoding rather than restated.
+        //
+        // The per-sample figures are pinned as MARGINAL cost, doubling the
+        // sample count and differencing: a packed column carries a
+        // length-delimiter varint that widens with its own payload, so the
+        // framing around the columns is not constant across sizes and only the
+        // marginal rate is. `WIRE_BYTES_PER_FRAME` is that framing at one
+        // pinned shape, which is why the ceiling spends it as headroom rather
+        // than as an exact accounting.
+        let narrow = series_frame_with_delta(0, 4096, 1);
+        assert_eq!(
+            narrow.encoded_len() as u64,
+            4096 * WIRE_BYTES_PER_SAMPLE_NARROWEST + WIRE_BYTES_PER_FRAME,
+            "the same shape `a_stock_config_decodes_under_the_absolute_byte_cap` pins"
+        );
+        assert_eq!(
+            series_frame_with_delta(0, 8192, 1).encoded_len() - narrow.encoded_len(),
+            4096 * WIRE_BYTES_PER_SAMPLE_NARROWEST as usize
+        );
+        let widest = series_frame_with_delta(0, 4096, i64::MIN);
+        assert_eq!(
+            series_frame_with_delta(0, 8192, i64::MIN).encoded_len() - widest.encoded_len(),
+            4096 * WIRE_BYTES_PER_SAMPLE_WIDEST as usize,
+            "i64::MIN zig-zags to u64::MAX, the widest a sint64 varint gets"
+        );
+
+        // The ceiling IS the derivation, not a literal that happens to clear
+        // it today.
+        assert_eq!(
+            MAX_SLICE_RESPONSE_BYTES,
+            DEFAULT_MAX_SAMPLES as u64 * WIRE_BYTES_PER_SAMPLE_WIDEST
+                + MAX_SLICE_RESPONSE_FRAMES as u64 * WIRE_BYTES_PER_FRAME
+        );
+        assert!(
+            MAX_SLICE_RESPONSE_BYTES
+                >= DEFAULT_MAX_SAMPLES as u64 * WIRE_BYTES_PER_SAMPLE_WIDEST,
+            "a slice at the sample budget must fit at any per-sample width"
+        );
+
+        // And a real decoder at the real cap accepts one. A tenth of the
+        // budget per frame, ten frames: exactly the sample budget, every
+        // sample at the widest shape, measured as encoded rather than
+        // extrapolated.
+        const FRAMES: usize = 10;
+        let per_frame = DEFAULT_MAX_SAMPLES / FRAMES;
+        assert_eq!(per_frame * FRAMES, DEFAULT_MAX_SAMPLES);
+        let frame = series_frame_with_delta(0, per_frame, i64::MIN);
+        let whole_slice = frame.encoded_len() as u64 * FRAMES as u64;
+        assert!(
+            whole_slice > DEFAULT_MAX_SAMPLES as u64 * WIRE_BYTES_PER_SAMPLE_WIDEST,
+            "the frames carry the whole budget at the widest per-sample shape, plus framing"
+        );
+        assert!(
+            whole_slice <= MAX_SLICE_RESPONSE_BYTES,
+            "a slice at the sample budget is {whole_slice} wire bytes, cap {MAX_SLICE_RESPONSE_BYTES}"
+        );
+        let mut decoder = crate::distrib::SliceStreamDecoder::new(&EngineConfig::default());
+        for _ in 0..FRAMES {
+            decoder
+                .push(frame.clone())
+                .expect("a slice at the sample budget is inside the ceiling");
+        }
+        assert_eq!(decoder.bytes_consumed(), whole_slice);
+
+        // The cap still refuses above itself, and the refusal reaches a caller
+        // as a 422 naming the observed figure and the cap.
+        let mut decoder = crate::distrib::SliceStreamDecoder::new(&EngineConfig::default());
+        let over = series_frame_with_delta(
+            1,
+            (MAX_SLICE_RESPONSE_BYTES / WIRE_BYTES_PER_SAMPLE_WIDEST + 1) as usize,
+            i64::MIN,
+        );
+        assert!(over.encoded_len() as u64 > MAX_SLICE_RESPONSE_BYTES);
+        let err = decoder
+            .push(over)
+            .expect_err("a slice past the ceiling is refused");
+        let Some(refusal @ crate::QueryError::TooManySliceBytes { bytes, max }) =
+            crate::distrib::cap_refusal_error(&err)
+        else {
+            panic!("expected a TooManySliceBytes refusal, got {err:?}");
+        };
+        assert_eq!(max, MAX_SLICE_RESPONSE_BYTES);
+        assert!(bytes > MAX_SLICE_RESPONSE_BYTES);
+        let rendered = QueryErrorResponse::from_query_error(refusal);
+        assert_eq!(rendered.status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            rendered.message.contains(&bytes.to_string())
+                && rendered
+                    .message
+                    .contains(&MAX_SLICE_RESPONSE_BYTES.to_string()),
+            "the 422 names the observed figure and the cap: {}",
+            rendered.message
+        );
     }
 }
