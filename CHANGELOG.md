@@ -35,8 +35,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bytes no query reads. L0 commit records carry no supersession or tombstone
   check and are scrubbed whatever their lineage, so a `level="l0"` mismatch on
   an hour a live compaction has already folded may name a redundant copy
-  rather than data a query can still reach.
-  `ravel_scrub_checksum_mismatch_total`
+  rather than data a query can still reach. The mismatch counter
   now carries `level="l0"`, `level="l1"`, or `level="rewrite"` instead of one
   undifferentiated series per signal; a dashboard or alert rule that sums
   over `signal` alone still sees the same total, but one that names the
@@ -46,9 +45,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with the corpus and a full rotation still completes in about the configured
   `--scrub-period`. What rises is the scrubber's steady-state read cost,
   approximately in proportion to the share of the shard's bytes that now sit
-  in compaction or rewrite parts. On a fully compacted shard, whose L1 parts
-  hold roughly as many bytes as the L0 segments they folded and which are
-  still listed alongside them, that is close to a doubling of sustained scrub
+  in compaction or rewrite parts. On a fully compacted shard, whose compaction
+  output parts hold roughly as many bytes as the L0 segments they folded and
+  which are still listed alongside them, that is close to a doubling of scrub
   GET bytes per tick. Size scrub read bandwidth against the corpus with parts
   included, not against the L0 total.
   of one. The scrub tick cadence is unchanged: an operator should expect the
