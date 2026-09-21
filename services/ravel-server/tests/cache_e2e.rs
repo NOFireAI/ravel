@@ -221,6 +221,9 @@ async fn cache_dir_attaches_disk_tier_and_a_query_is_served_from_a_disk_hit() {
         cli.cache_dir.clone(),
         cli.catalog_resolve_concurrency,
         None,
+        cli.resolve_flush_cadence()
+            .expect("flush cadence resolves")
+            .max_flush_delay,
     )
     .expect("catalog");
     let mut tokens = HashMap::new();

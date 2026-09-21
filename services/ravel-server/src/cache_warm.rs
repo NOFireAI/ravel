@@ -599,6 +599,7 @@ mod tests {
             None,
             None,
             None,
+            std::time::Duration::from_secs(2),
         )
         .expect("catalog")
     }
