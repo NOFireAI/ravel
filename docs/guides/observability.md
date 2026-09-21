@@ -1218,8 +1218,10 @@ lineage the corrupt object came from: `l0` an original ingested segment, `l1`
 a compaction output part, or `rewrite` a selective-erasure rewrite output
 part. The scrub corpus now covers all three: an L1 or rewrite part that a
 compaction or rewrite record still lists as live joins the same rotation an
-L0 segment does, and a part an input tombstone has since retired is excluded
-the same way a tombstoned L0 segment already was. The `reason` label on
+L0 segment does. Only the live generation is scrubbed. A record that a later
+rewrite record supersedes, and a record in a bucket a retention tombstone has
+retired, are both left out, because their parts survive until a sweep retires
+them and no query reads them. The `reason` label on
 `ravel_scrub_seal_divergence_total` carries `missing` (a sealed commit record
 absent from the snapshot, an under-count) or `mismatched` (a snapshot entry
 whose content hash disagrees with the sealed record); an orphaned entry, a
