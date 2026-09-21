@@ -3253,8 +3253,10 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
          or footer/section crc failure), by signal and level (ADR-0059, issue #1686): \
          level=\"l0\" is an original ingested segment, level=\"l1\" a compaction output part, \
          level=\"rewrite\" a selective-erasure rewrite output part. Alert on increase() > 0: there \
-         is no redundant copy to repair from, so any nonzero increase is corruption an operator \
-         must investigate.",
+         is no redundant copy to repair from, so a nonzero increase is corruption an operator \
+         must investigate, with one caveat on level=\"l0\" only: an L0 segment a live compaction \
+         has already folded into an l1 part is scrubbed anyway, so check whether the hour is \
+         compacted before treating an l0 mismatch as unrecoverable.",
         "counter",
     );
     for signal in &snapshot.signals {
