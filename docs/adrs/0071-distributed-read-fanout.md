@@ -1542,7 +1542,9 @@ the federation path where the caller is another cluster.
    a remote that was unreachable or timed out produces no status at all and
    keeps the retryable 503, so a remote cannot move itself between the two
    classes by choosing its error text. The one thing its text decides is which
-   cap is named.
+   cap is named. A remote out of FETCH MEMORY is the exception in the same way
+   a local worker is: it answers `BudgetExceeded` too, and it keeps the
+   retryable 503, because backpressure is not a verdict on the query.
 
 ### Consequences
 

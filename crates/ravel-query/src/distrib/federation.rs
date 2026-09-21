@@ -55,6 +55,11 @@
 //! told apart by the wire status code, which only a remote that answered can
 //! set at all, never by the text it sent.
 //!
+//! One `BudgetExceeded` is NOT a cap refusal: a remote out of fetch memory
+//! reports the same status, and it stays a retryable 503 on purpose. That is
+//! backpressure rather than a verdict on the query, so the same slice can
+//! succeed once the remote has room, exactly as on the intra-cluster path.
+//!
 //! # Merge semantics and the cross-cluster tie-break limitation
 //!
 //! Federated runs join the same k-way merge the local fetch feeds, keyed by
