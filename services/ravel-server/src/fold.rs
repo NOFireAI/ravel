@@ -41,8 +41,8 @@ use crate::tenant_discovery::discover_and_restrict_by_lifecycle;
 ///
 /// Sized against the producer, not against tenant count: one maintain tick
 /// enqueues at most one request per owned `(tenant, signal)` pair, and the
-/// fold loops drain everything for their signal at the head of every tick, so
-/// the depth only grows while a fold tick is slower than a maintain tick. 256
+/// fold loops drain everything for their signal once per tick, so the depth
+/// only grows while a fold tick is slower than a maintain tick. 256
 /// covers 85 tenants across the three [`FOLD_SIGNALS`] backing up for a whole
 /// fold interval without a single drop, and a drop costs nothing but latency:
 /// the next sweep still sees the hour blocked and re-sends it.
@@ -62,8 +62,8 @@ struct RefoldEntry {
 /// The maintain tick is the only producer: after sweeping a `(tenant, signal)`
 /// it sends the union of [`ravel_maintain::SweepReport::blocked_named_hours`]
 /// over the shards it swept. Each per-signal fold loop is the only consumer of
-/// its own signal's entries, and drains them at the head of its next tick into
-/// [`RefoldRequest`]s it passes to
+/// its own signal's entries, and drains them once per tick, just after tenant
+/// discovery, into [`RefoldRequest`]s it passes to
 /// [`Catalog::fold_with_refold_request`].
 ///
 /// Bounded with drop-oldest. `capacity` is a hard cap on queue depth; a send
@@ -280,11 +280,11 @@ pub fn spawn(
 ///
 /// `refold` is the consumer end of the queue a maintain tick in the same
 /// process sends to (issue #1763 part b). Each spawned loop drains only its
-/// own signal's requests, at the head of every tick, and passes them to
-/// [`Catalog::fold_with_refold_request`] so the targeted reconcile pass
-/// re-reads those hours even when they sit outside the fixed reconcile
-/// window. `None` (what [`spawn`] passes) folds exactly as before: an empty
-/// request on every tick.
+/// own signal's requests, once per tick just after tenant discovery, and
+/// passes them to [`Catalog::fold_with_refold_request`] so the targeted
+/// reconcile pass re-reads those hours even when they sit outside the fixed
+/// reconcile window. `None` (what [`spawn`] passes) folds exactly as before:
+/// an empty request on every tick.
 pub fn spawn_with_refold(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
