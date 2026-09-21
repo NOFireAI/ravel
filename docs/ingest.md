@@ -212,7 +212,11 @@ Loop over `select!`:
   avoid. `--max-ingest-buffer-bytes 0` (unlimited) has no ceiling to take a
   share of, so the 64 MiB cap applies alone. A ceiling under `8 *
   target_bytes` leaves `target_bytes` as the backstop, because a backstop
-  under the target would become the effective size trigger. Before merging, each point's series_id is checked against the
+  under the target would become the effective size trigger. A flush the
+  backstop fires is the one trigger the queued-flush cap never refuses
+  ("Pipelined flushes (ADR-0067)" below): the backstop is the
+  only bound on one buffer's resident memory, so it spawns even at the cap.
+  Before merging, each point's series_id is checked against the
   canonical label set that id already claims in the buffer; a mismatch
   (hash collision) rejects the point with a typed error and increments
   the series_id_collisions counter instead of silently merging
@@ -364,7 +368,8 @@ budget bounds it only when it is configured: under the default `Bounded(512
 MiB)` a sustained stall stops admitting new bytes before the queue grows
 without limit, while under `--max-ingest-buffer-bytes 0` (`Unlimited`)
 `try_charge` never sheds (ADR-1642). `max_queued_flushes`
-(`IngestConfig::max_queued_flushes`, default 8 per shard) bounds it under
+(`IngestConfig::max_queued_flushes`, `--max-queued-flushes`, default 8 per
+shard) bounds it under
 either setting: once a shard holds that many spawned-but-unreaped flushes it
 refuses its own size and age triggers rather than spawning another, and the
 refused tenant's rows stay buffered with their `oldest_arrival_ns` unreset, so
@@ -377,6 +382,23 @@ The cost is deadline, not durability: a deferred age trigger misses
 Strict-mode writers behind those
 queued flushes stay unacked for the duration; buffered-mode writers were acked
 at enqueue and their data stays invisible to queries until the flush commits.
+
+One trigger is exempt, and the queue can exceed `max_queued_flushes` because
+of it: a tenant buffer that has crossed its per-(shard, tenant) memory
+backstop (`buffer_memory_backstop_bytes`, described under "Shard actor"
+above) spawns whatever the trigger and whatever the queue depth. That backstop
+is the only bound on one buffer's resident memory, and under `Unlimited`
+nothing sheds behind it, so refusing a crossing would hold the queue at its
+cap and let the buffer grow for as long as the stall lasts: a bounded queue of
+flush tasks traded for an unbounded buffer, which is the worse of the two
+failures. The exemption keeps both bounded, at the cost of an overshoot on the
+queue. Under memory pressure the queue therefore carries one extra window per
+buffer sitting over its backstop, so it grows only as fast as memory fills,
+not with the flush cadence. Size the steady state from `max_queued_flushes`
+and the headroom for the overshoot from the backstop and the tenant count.
+`flushes_queued` reading above the cap while `flush_trigger_deferred` stays
+flat is this exemption, not a queue that lost its bound.
+
 Raising the bound gives healthy tenants a permit to flush on while one prefix
 is throttled, at the cost of more concurrent PUTs and more encode memory in
 flight. This is the lever for cross-tenant flush isolation on a shard;
@@ -845,8 +867,15 @@ terms:
    whole flush window; the ADR-1642 amendment caps that queue per shard at
    `max_queued_flushes` (default 8). At the cap a shard refuses its size and
    age triggers, leaving the rows buffered for the next tick, so flush-window
-   memory is bounded by `shard_count x max_queued_flushes x` the largest flush
-   window regardless of `--max-ingest-buffer-bytes`. Under the default
+   memory is bounded by `shard_count x (max_queued_flushes + over_backstop) x`
+   the largest flush window regardless of `--max-ingest-buffer-bytes`, where
+   `over_backstop` is the number of that shard's tenant buffers currently past
+   their memory backstop: such a buffer is exempt from the cap and spawns
+   anyway, because the backstop is the only bound on its own resident memory
+   and refusing there would make the buffer unbounded instead. Those two terms
+   trade against each other, so the sum stays bounded either way: each extra
+   flush window costs a backstop's worth of buffered memory that the flush
+   then drains. Under the default
    `Bounded` budget this count bound is the looser of the two and the byte
    ceiling is what an operator sizes to; under `0` (`Unlimited`) it is the only
    bound on flush windows, and buffered rows are then bounded per tenant by the
@@ -1001,7 +1030,7 @@ carries max token per shard).
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
 | max_inflight_flushes (per shard, all three pipelines) | 1 on `ravel-server`, 4 on `ravel-cli load` (`--max-inflight-flushes`, rejects 0) |
-| max_queued_flushes (per shard, all three pipelines) | 8 (`IngestConfig::max_queued_flushes`, no flag; floored at 1) |
+| max_queued_flushes (per shard, all three pipelines) | 8 (`--max-queued-flushes`, `RAVEL_MAX_QUEUED_FLUSHES`, rejects 0 and rejects a `max_inflight_flushes` above it; floored at 1 in `IngestConfig`; a buffer over its memory backstop spawns past the cap) |
 | adaptive_flush_delay (metrics pipeline only) | off (`--adaptive-flush-delay`) |
 | idle-tenant state TTL (process-wide) | 1 h (`--idle-tenant-state-ttl`, 0 = disabled) |
 
@@ -1136,9 +1165,16 @@ concurrently; it was the cross-batch barrier that cost the cores). Two nested co
 `--pipeline-depth` (batches the loader keeps outstanding) and
 `max_inflight_flushes` (flushes per shard, the per-shard semaphore above). The
 concurrent-write ceiling is
-`shards * min(pipeline_depth, max_inflight_flushes)`, reached only when a batch
+`shards * min(pipeline_depth, max_inflight_flushes, max_queued_flushes)`,
+reached only when a batch
 routes rows to every configured shard; with narrower fan-out the active shard
-count replaces `shards` and the real ceiling is lower.
+count replaces `shards` and the real ceiling is lower. The third term is the
+queued-flush cap (the ADR-1642 amendment): a shard stops spawning flush tasks
+at that count, so permits above it are unreachable. The loader takes the
+`IngestConfig` default of 8, above both other windows at their defaults of 4,
+so it does not bind there; `ravel-server` refuses a `--max-inflight-flushes`
+above `--max-queued-flushes` rather than let the difference read as
+backpressure.
 
 Because that term is a `min`, neither window alone changes anything, which is
 measured rather than argued: on a 16-batch single-shard fixture with a 40ms
@@ -1226,9 +1262,14 @@ Counters recorded today:
   and an ADR-0069 byte charge exactly as an executing flush does. A shard's
   reading can therefore exceed `max_inflight_flushes` (ADR-1642), and the
   excess over it, floored at zero, is the shard's queue of flushes waiting on
-  the bound. It cannot exceed `max_queued_flushes` for a shard: at that count
-  the shard refuses further size and age triggers (the ADR-1642 amendment), so
-  the sum is bounded by `shard_count x max_queued_flushes`.
+  the bound. At `max_queued_flushes` the shard refuses further size and age
+  triggers (the ADR-1642 amendment), so in steady state the sum is bounded by
+  `shard_count x max_queued_flushes`. A shard's reading can sit above that
+  cap while one of its tenant buffers is past its memory backstop: such a
+  buffer spawns whatever the queue depth, since the backstop is the only bound
+  on its resident memory. The overshoot is one window per over-backstop
+  buffer, and it costs a backstop's worth of buffered memory each, so it
+  tracks memory pressure rather than the flush cadence.
   Unlike every other counter here it is per-shard underneath
   (`IngestMetrics::in_flight_flushes_by_shard`) before being summed into this
   flat total; a shard with no flush in flight contributes 0.
@@ -1280,14 +1321,21 @@ internal, read only through `shard_skew_by_shard()`. Per shard
   the last time that set changed length. This is the quantity
   `max_queued_flushes` caps (the ADR-1642 amendment), and it is the per-shard
   version of what `in_flight_flushes_total` sums: waiting and executing flushes
-  both count, since both hold a flush window.
+  both count, since both hold a flush window. It can read above the cap, by
+  one window per tenant buffer past its memory backstop, since those spawn
+  whatever the queue depth; a reading above the cap while
+  `flush_trigger_deferred` stays flat is that exemption rather than a lost
+  bound.
 - `flush_trigger_deferred`: counter, size or age triggers the shard refused
-  because it was already at `max_queued_flushes`. A refused trigger leaves its
+  because it was already at `max_queued_flushes` and the tenant's buffer was
+  still under its memory backstop. A refused trigger leaves its
   rows buffered with their age clock unreset, so the next tick retries it; the
   counter rising means flush windows, not buffer space, are the binding
   constraint on this shard, and its tenants' `max_flush_delay` deadlines are
   slipping by however long the shard stays at the cap. `FlushTrigger::Manual`
-  is exempt from the cap and never counted here.
+  is exempt from the cap and never counted here, and so is any trigger on a
+  buffer past its memory backstop: that one spawns instead of deferring, so
+  `flushes_queued` can rise while this counter does not.
 
 #### Which shards are covered
 

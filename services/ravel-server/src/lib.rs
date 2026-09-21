@@ -409,6 +409,12 @@ pub struct ServerConfig {
     /// extended to logs and spans by ADR-0076 decision 3). See
     /// `--max-inflight-flushes`.
     pub max_inflight_flushes: u32,
+    /// Per-shard bound on spawned-but-unreaped flush tasks, forwarded to
+    /// [`ravel_ingest::IngestConfig::max_queued_flushes`] on all three ingest
+    /// pipelines (issue #1740). A buffer over its memory backstop spawns even
+    /// at the cap, so the queue can exceed this under memory pressure. See
+    /// `--max-queued-flushes`.
+    pub max_queued_flushes: u32,
     /// Enables the adaptive flush-delay corridor for the metrics ingest
     /// pipeline (ADR-0067 decision 3), forwarded to
     /// [`ravel_ingest::IngestConfig::adaptive_flush_delay`]. Does not apply
@@ -1713,6 +1719,7 @@ pub async fn start(
                 IngestConfig {
                     shard_count: config.shard_count,
                     max_inflight_flushes: config.max_inflight_flushes,
+                    max_queued_flushes: config.max_queued_flushes as usize,
                     adaptive_flush_delay: config.adaptive_flush_delay,
                     max_flush_delay: config.max_flush_delay,
                     max_flush_delay_idle: config.max_flush_delay_idle,
@@ -1799,6 +1806,7 @@ pub async fn start(
                 IngestConfig {
                     shard_count: config.shard_count,
                     max_inflight_flushes: config.max_inflight_flushes,
+                    max_queued_flushes: config.max_queued_flushes as usize,
                     max_flush_delay: config.max_flush_delay,
                     max_flush_delay_idle: config.max_flush_delay_idle,
                     min_flush_bytes: config.min_flush_bytes,
@@ -1825,6 +1833,7 @@ pub async fn start(
                 IngestConfig {
                     shard_count: config.shard_count,
                     max_inflight_flushes: config.max_inflight_flushes,
+                    max_queued_flushes: config.max_queued_flushes as usize,
                     max_flush_delay: config.max_flush_delay,
                     max_flush_delay_idle: config.max_flush_delay_idle,
                     min_flush_bytes: config.min_flush_bytes,

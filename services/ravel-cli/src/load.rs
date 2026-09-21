@@ -127,8 +127,14 @@ pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 ///
 /// Pinned to [`DEFAULT_PIPELINE_DEPTH`] by
 /// `default_max_inflight_flushes_matches_pipeline_depth`, because the two
-/// windows compose as `shards * min(pipeline_depth, max_inflight_flushes)`
-/// (ADR-0807): an inner window below the outer one re-serialises each shard's
+/// windows compose as
+/// `shards * min(pipeline_depth, max_inflight_flushes, max_queued_flushes)`
+/// (ADR-0807, third term added by the ADR-1642 amendment and issue #1740: a
+/// shard refuses a trigger once it holds `max_queued_flushes` spawned and
+/// unreaped flush tasks, so it never spawns enough to use more permits than
+/// that; the loader takes the `IngestConfig` default of 8, which is above
+/// both other windows at their defaults of 4): an inner window below the
+/// outer one re-serialises each shard's
 /// PUT round trips and makes batches queue behind a semaphore they will still
 /// have to clear before [`write_ack_deadline`] elapses, and an inner window
 /// above the outer one is unreachable, since the loader never hands any shard

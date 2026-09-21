@@ -457,7 +457,8 @@ impl ShardSkew {
     }
 
     /// One size or age flush trigger refused because shard `shard` was already
-    /// at `max_queued_flushes` (issue #1740).
+    /// at `max_queued_flushes` and the buffer was under its memory backstop
+    /// (issue #1740).
     pub(crate) fn record_flush_trigger_deferred(&self, shard: u32) {
         if let Some(s) = self.shards.get(shard as usize) {
             s.flush_trigger_deferred.fetch_add(1, Ordering::Relaxed);
@@ -600,9 +601,16 @@ pub struct ShardSkewStats {
     /// at snapshot time (issue #1740). Counts a flush parked on the
     /// `max_inflight_flushes` semaphore the same as one executing against the
     /// object store, because both hold a flush window of memory and an
-    /// ADR-0069 charge. `IngestConfig::max_queued_flushes` is its ceiling: at
-    /// the ceiling the actor refuses further size and age triggers and bumps
-    /// `flush_trigger_deferred` instead of spawning.
+    /// ADR-0069 charge. `IngestConfig::max_queued_flushes` is its ceiling in
+    /// steady state: at the ceiling the actor refuses further size and age
+    /// triggers and bumps `flush_trigger_deferred` instead of spawning.
+    ///
+    /// It can read ABOVE that ceiling, and that is not a bug. A tenant buffer
+    /// over its memory backstop spawns whatever the trigger, because the
+    /// backstop is the only bound on that buffer's resident memory; the queue
+    /// then carries one extra window per such buffer. A reading above the cap
+    /// with no matching rise in `flush_trigger_deferred` is that exemption at
+    /// work, which is memory pressure, not a queue that lost its bound.
     ///
     /// Distinct from the pipeline's in-flight-flush gauge
     /// ([`IngestMetrics::in_flight_flushes_by_shard`]) in when it stops
@@ -618,7 +626,10 @@ pub struct ShardSkewStats {
     /// and every tenant this shard refuses is missing its visibility deadline.
     ///
     /// Drain triggers ([`FlushTrigger::Manual`]: explicit flush-all, shutdown,
-    /// channel close) are never refused and never counted here.
+    /// channel close) are never refused and never counted here, and neither
+    /// is a trigger on a buffer over its memory backstop: that one spawns past
+    /// the cap rather than let a buffer grow unbounded, so `flushes_queued`
+    /// can rise while this stays flat.
     pub flush_trigger_deferred: u64,
 }
 
