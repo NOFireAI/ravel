@@ -1255,6 +1255,11 @@ pub struct RoutingSliceFetcher {
     /// pre-amendment layout, where fragment endpoints are the plaintext public
     /// gRPC listener; the dial then stays plaintext, byte-identical to before.
     client_tls: Option<tonic::transport::ClientTlsConfig>,
+    /// The per-slice response frame cap this coordinator decodes under (issue
+    /// #1687 part B). Always [`codec::MAX_SLICE_RESPONSE_FRAMES`] in a real
+    /// process; only the tests lower it, so a test can drive a real stream
+    /// across the cap without producing a million frames.
+    max_slice_frames: usize,
     metrics: Arc<FragmentMetrics>,
 }
 
@@ -1277,8 +1282,18 @@ impl RoutingSliceFetcher {
             // running a dedicated fragment listener enables TLS via
             // `with_client_tls`.
             client_tls: None,
+            max_slice_frames: codec::MAX_SLICE_RESPONSE_FRAMES,
             metrics,
         }
+    }
+
+    /// Lower this coordinator's per-slice frame cap. Test-only: a real process
+    /// decodes under [`codec::MAX_SLICE_RESPONSE_FRAMES`], and there is no
+    /// operator flag for this.
+    #[cfg(test)]
+    fn with_max_slice_frames(mut self, max_slice_frames: usize) -> Self {
+        self.max_slice_frames = max_slice_frames;
+        self
     }
 
     /// Enable TLS on this coordinator's outbound fragment dials (ADR-0071
@@ -1552,7 +1567,8 @@ impl RoutingSliceFetcher {
             .fetch(tonic_request)
             .await
             .map_err(|s| DistribError::Transport(s.to_string()))?;
-        let mut decoder = SliceStreamDecoder::new(&self.local.engine);
+        let mut decoder =
+            SliceStreamDecoder::new(&self.local.engine).with_max_frames(self.max_slice_frames);
         let mut stream = response.into_inner();
         let outcome = loop {
             let next = stream
@@ -4282,6 +4298,396 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         assert_eq!(
             on_dedicated.series_returned, on_combined.series_returned,
             "the same capability yields the same result regardless of transport"
+        );
+    }
+
+    // ---- issue #1687 part B: bounded slice decoding ------------------------
+
+    /// Roughly nine wire KiB per flooded frame: enough that a handful of them
+    /// fill the HTTP/2 stream window, so a coordinator that stops reading
+    /// stops the producer within a small, assertable overrun rather than
+    /// letting it run to completion inside the window.
+    const FLOOD_SAMPLES_PER_FRAME: usize = 1024;
+
+    /// A `SeriesFetch` server that streams `total` large series frames and then
+    /// a terminal OK summary, counting every message it actually produces.
+    ///
+    /// The count is the whole point: a coordinator that stops pulling at its cap
+    /// leaves this well below `total + 1`, and one that drains the stream before
+    /// checking anything drives it to exactly `total + 1`. The stream is built
+    /// with `unfold`, so a message is constructed only when the transport asks
+    /// for one.
+    struct FrameFlood {
+        total: usize,
+        produced: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn flood_series_frame(index: usize) -> pb::FetchResponse {
+        let mut series_id = [0u8; 16];
+        series_id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Series(pb::SeriesFrame {
+                series_id: series_id.to_vec(),
+                labels: vec![pb::Label {
+                    name: "__name__".to_string(),
+                    value: "flood".to_string(),
+                }],
+                runs: vec![pb::Run {
+                    ts_delta: vec![1i64; FLOOD_SAMPLES_PER_FRAME],
+                    value_bits: vec![1u64; FLOOD_SAMPLES_PER_FRAME],
+                    ..Default::default()
+                }],
+            })),
+        }
+    }
+
+    fn flood_summary() -> pb::FetchResponse {
+        pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
+                status: Some(pb::Status {
+                    code: pb::status::Code::Ok as i32,
+                    message: String::new(),
+                }),
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[tonic::async_trait]
+    impl SeriesFetch for FrameFlood {
+        type FetchStream = FragmentStream;
+
+        async fn fetch(
+            &self,
+            _request: tonic::Request<pb::FetchRequest>,
+        ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
+            let total = self.total;
+            let produced = Arc::clone(&self.produced);
+            let stream = futures::stream::unfold(0usize, move |i| {
+                let produced = Arc::clone(&produced);
+                async move {
+                    if i > total {
+                        return None;
+                    }
+                    produced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let frame = if i == total {
+                        flood_summary()
+                    } else {
+                        flood_series_frame(i)
+                    };
+                    Some((Ok(frame), i + 1))
+                }
+            });
+            Ok(tonic::Response::new(Box::pin(stream)))
+        }
+    }
+
+    /// Stand up a [`FrameFlood`] on an ephemeral plaintext loopback port.
+    /// Returns its `host:port`, the produced-message counter, and a shutdown
+    /// handle whose drop stops the task at test end.
+    async fn spawn_frame_flood(
+        total: usize,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let produced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = tonic::transport::Server::builder().add_service(SeriesFetchServer::new(
+            FrameFlood {
+                total,
+                produced: Arc::clone(&produced),
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = server
+                .serve_with_incoming_shutdown(
+                    tonic::transport::server::TcpIncoming::from(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await;
+        });
+        (addr.to_string(), produced, tx)
+    }
+
+    /// A coordinator whose only live worker is `endpoint`, so every slice ranks
+    /// that endpoint first and has no second remote owner to re-dispatch to: a
+    /// terminal error from the first attempt is the fetch's result.
+    fn fetcher_against(
+        endpoint: &str,
+        engine: ravel_query::EngineConfig,
+        metrics: Arc<FragmentMetrics>,
+    ) -> RoutingSliceFetcher {
+        let self_cell = Arc::new(OnceLock::new());
+        self_cell
+            .set(uuid::Uuid::from_u128(1))
+            .expect("set self id");
+        let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
+            process_id: uuid::Uuid::from_u128(2).to_string(),
+            fragment_endpoint: endpoint.to_string(),
+            flight_sql_endpoint: endpoint.to_string(),
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        }])));
+        RoutingSliceFetcher::new(
+            self_cell,
+            live,
+            test_keys(),
+            test_service(metrics.clone()).with_engine_config(engine),
+            metrics,
+        )
+    }
+
+    /// Issue #1687 part B, the acceptance test: a remote that streams far more
+    /// frames than the coordinator's per-slice frame cap is refused AT the cap,
+    /// and the coordinator never holds the slice.
+    ///
+    /// The byte cap is deliberately `Unlimited` (the `EngineConfig` default), so
+    /// the frame cap is the only thing that can stop this stream. Two wrong
+    /// implementations are ruled out, each by a different assertion:
+    ///
+    /// * A decoder that enforces the byte cap but NOT the frame cap never
+    ///   refuses at all here: it reaches the terminal summary and returns
+    ///   `Ok`. The `expect_err` and the typed-variant assertion fail.
+    /// * A decoder that enforces BOTH caps but only after draining the stream
+    ///   returns the same error, so the error assertions pass, but it pulls
+    ///   every message: `produced` reaches `TOTAL + 1`. The produced-count
+    ///   assertion fails.
+    ///
+    /// The overrun allowance is HTTP/2 flow control, not slack in the claim: a
+    /// producer may fill the stream window ahead of the reader, and the window
+    /// holds only a few frames of this size. What is asserted is that the
+    /// producer stopped near the cap, which is what "without buffering the
+    /// slice" means on a real stream.
+    #[tokio::test]
+    async fn remote_fetch_stops_pulling_at_the_frame_cap_without_buffering_the_slice() {
+        const CAP: usize = 64;
+        // Far more than the transport can buffer ahead, and 300x the cap: the
+        // produced count then distinguishes "stopped near the cap" from
+        // "stopped when the stream ended" by two orders of magnitude, not by a
+        // margin that could be flow-control luck. Frames are generated lazily,
+        // so a large TOTAL costs nothing unless something actually pulls them.
+        const TOTAL: usize = 20_000;
+        /// The measured overrun past the cap is about 170 frames (the HTTP/2
+        /// windows); this is that with room to spare, and it is a constant, not
+        /// a fraction of TOTAL.
+        const MAX_OVERRUN: usize = 1024;
+
+        assert_eq!(
+            RoutingSliceFetcher::new(
+                Arc::new(OnceLock::new()),
+                Arc::new(RwLock::new(Arc::new(Vec::new()))),
+                test_keys(),
+                test_service(Arc::new(FragmentMetrics::new())),
+                Arc::new(FragmentMetrics::new()),
+            )
+            .max_slice_frames,
+            codec::MAX_SLICE_RESPONSE_FRAMES,
+            "a coordinator built the production way decodes under the constant; \
+             the lowered cap below is a test seam, not a different rule"
+        );
+
+        let (endpoint, produced, _shutdown) = spawn_frame_flood(TOTAL).await;
+        let metrics = Arc::new(FragmentMetrics::new());
+        let fetcher = fetcher_against(
+            &endpoint,
+            ravel_query::EngineConfig::default(),
+            metrics.clone(),
+        )
+        .with_max_slice_frames(CAP);
+
+        let sink = FragmentStatsSink::new();
+        let err = with_fragment_stats(
+            sink.clone(),
+            fetcher.fetch(pinned_request([9u8; 16], &[0])),
+        )
+        .await
+        .expect_err("a slice past the frame cap is refused, not decoded");
+
+        // Rules out the byte-cap-only decoder: with an Unlimited byte cap it has
+        // nothing to trip on and returns the whole slice.
+        match err {
+            DistribError::Codec(codec::CodecError::SliceFrameCapExceeded { frames, max }) => {
+                assert_eq!(
+                    (frames, max),
+                    (CAP + 1, CAP),
+                    "the refusal names the exact counts and trips on the first \
+                     frame past the cap, not later"
+                );
+            }
+            other => panic!("expected a frame-cap refusal, got {other:?}"),
+        }
+
+        // Rules out the drain-then-check decoder: that one pulls every message.
+        let produced = produced.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            produced < TOTAL + 1,
+            "the coordinator stopped pulling: the remote produced {produced} of \
+             {} messages",
+            TOTAL + 1
+        );
+        assert!(
+            produced >= CAP + 1,
+            "the coordinator did read up to its cap before refusing, so the \
+             refusal is the cap and not an earlier transport failure \
+             (produced {produced})"
+        );
+        assert!(
+            produced <= CAP + 1 + MAX_OVERRUN,
+            "the overrun past the cap is the HTTP/2 window, a constant, not a \
+             share of the stream: produced {produced} for a cap of {CAP} out of \
+             {} available",
+            TOTAL + 1
+        );
+
+        // The bytes the refused slice made the coordinator hold are reported,
+        // not written off as zero because the slice errored.
+        let entries = sink.take();
+        assert_eq!(entries.len(), 1, "one slice, one fragment entry");
+        assert_eq!(entries[0].status, "error");
+        assert!(
+            entries[0].wire_bytes_consumed > 0,
+            "a refused slice reports the wire bytes it consumed"
+        );
+    }
+
+    /// The byte cap is the other half, and it is the one that binds when a
+    /// remote sends few but enormous frames: a slice whose frames outrun the
+    /// coordinator's own `max_bytes_scanned` is refused naming both byte
+    /// counts, well before the frame cap could apply.
+    #[tokio::test]
+    async fn remote_fetch_refuses_a_slice_past_the_byte_cap() {
+        const TOTAL: usize = 20_000;
+        // Under ~9 KiB per frame, this trips after a handful of frames, so the
+        // frame cap (left at the production constant) cannot be what fires.
+        const MAX_BYTES: u64 = 32 * 1024;
+
+        let (endpoint, produced, _shutdown) = spawn_frame_flood(TOTAL).await;
+        let metrics = Arc::new(FragmentMetrics::new());
+        let fetcher = fetcher_against(
+            &endpoint,
+            ravel_query::EngineConfig {
+                max_bytes_scanned: ravel_query::ByteLimit::Bounded(MAX_BYTES),
+                ..ravel_query::EngineConfig::default()
+            },
+            metrics.clone(),
+        );
+
+        let err = fetcher
+            .fetch(pinned_request([9u8; 16], &[0]))
+            .await
+            .expect_err("a slice past the byte cap is refused");
+        match err {
+            DistribError::Codec(codec::CodecError::SliceByteCapExceeded { bytes, max }) => {
+                assert_eq!(max, MAX_BYTES, "the cap named is the engine's own");
+                assert!(
+                    bytes > MAX_BYTES,
+                    "the refusal names the bytes actually accepted ({bytes})"
+                );
+            }
+            other => panic!("expected a byte-cap refusal, got {other:?}"),
+        }
+        let produced = produced.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            produced < TOTAL + 1,
+            "the coordinator stopped pulling at the byte cap: the remote \
+             produced {produced} of {} messages",
+            TOTAL + 1
+        );
+    }
+
+    /// A slice that stays inside both caps decodes exactly as before: the caps
+    /// refuse a flood, they do not change an ordinary slice's result.
+    #[tokio::test]
+    async fn remote_fetch_below_the_caps_decodes_the_whole_slice() {
+        const TOTAL: usize = 32;
+
+        let (endpoint, produced, _shutdown) = spawn_frame_flood(TOTAL).await;
+        let metrics = Arc::new(FragmentMetrics::new());
+        let fetcher = fetcher_against(
+            &endpoint,
+            ravel_query::EngineConfig::default(),
+            metrics.clone(),
+        )
+        .with_max_slice_frames(TOTAL + 1);
+
+        let sink = FragmentStatsSink::new();
+        let response = with_fragment_stats(
+            sink.clone(),
+            fetcher.fetch(pinned_request([9u8; 16], &[0])),
+        )
+        .await
+        .expect("a slice inside both caps decodes");
+        assert_eq!(response.status, pb::status::Code::Ok);
+        assert_eq!(
+            response.scalar.len(),
+            TOTAL,
+            "every frame below the cap is decoded and kept"
+        );
+        assert_eq!(
+            produced.load(std::sync::atomic::Ordering::Relaxed),
+            TOTAL + 1,
+            "the whole stream, summary included, was consumed"
+        );
+        let entries = sink.take();
+        assert_eq!(entries[0].status, "ok");
+        assert!(
+            entries[0].wire_bytes_consumed > 0,
+            "wire bytes are reported for a successful slice too"
+        );
+    }
+
+    /// The federation client is bounded by the same byte cap, taken from the
+    /// federating coordinator's own `EngineConfig`. A remote cluster is outside
+    /// this operator's control, so this is the only place that bound exists.
+    #[tokio::test]
+    async fn federation_fetch_refuses_a_slice_past_the_byte_cap() {
+        const TOTAL: usize = 20_000;
+        const MAX_BYTES: u64 = 32 * 1024;
+
+        let (endpoint, produced, _shutdown) = spawn_frame_flood(TOTAL).await;
+        let channel = Channel::from_shared(format!("http://{endpoint}"))
+            .expect("valid uri")
+            .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+            .connect()
+            .await
+            .expect("connect to the flood server");
+        let fetcher = FederationSliceFetcher {
+            cluster: "remote-a".to_string(),
+            channel,
+            credential: "token".to_string(),
+            engine: ravel_query::EngineConfig::default(),
+        }
+        .with_engine_config(ravel_query::EngineConfig {
+            max_bytes_scanned: ravel_query::ByteLimit::Bounded(MAX_BYTES),
+            ..ravel_query::EngineConfig::default()
+        });
+
+        let err = fetcher
+            .fetch(pinned_request([9u8; 16], &[0]))
+            .await
+            .expect_err("a federated slice past the byte cap is refused");
+        assert!(
+            matches!(
+                err,
+                DistribError::Codec(codec::CodecError::SliceByteCapExceeded { max, .. })
+                    if max == MAX_BYTES
+            ),
+            "expected a byte-cap refusal naming this coordinator's cap, got {err:?}"
+        );
+        let produced = produced.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            produced < TOTAL + 1,
+            "the federation client stopped pulling too: the remote produced \
+             {produced} of {} messages",
+            TOTAL + 1
         );
     }
 }

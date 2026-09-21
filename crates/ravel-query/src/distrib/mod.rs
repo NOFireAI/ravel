@@ -1258,6 +1258,18 @@ impl SliceStreamDecoder {
         }
     }
 
+    /// Replace the frame cap with `max_frames`.
+    ///
+    /// [`codec::MAX_SLICE_RESPONSE_FRAMES`] is sized so no ordinary slice
+    /// reaches it, which also makes it impractical to drive a test through the
+    /// real constant over a real stream. This is that seam, and it is the only
+    /// way the frame cap is varied: the default stays the constant, so a caller
+    /// that does not call this is bounded by it.
+    pub fn with_max_frames(mut self, max_frames: usize) -> Self {
+        self.max_frames = max_frames;
+        self
+    }
+
     /// Wire frame bytes accepted so far, including the frame that tripped a
     /// cap. The protobuf-encoded length of each received frame, summed.
     pub fn bytes_consumed(&self) -> u64 {
@@ -1389,5 +1401,134 @@ fn distrib_error(err: DistribError) -> QueryError {
     }
     QueryError::Distrib {
         reason: err.to_string(),
+    }
+}
+
+/// Issue #1687 part B: the private funnel every intra-cluster slice error
+/// passes through, and the decoder that feeds it.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod slice_cap_tests {
+    use super::*;
+
+    fn series_frame(id: u8, samples: usize) -> pb::FetchResponse {
+        pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Series(pb::SeriesFrame {
+                series_id: vec![id; 16],
+                labels: vec![pb::Label {
+                    name: "__name__".to_string(),
+                    value: "x".to_string(),
+                }],
+                runs: vec![pb::Run {
+                    ts_delta: vec![1i64; samples],
+                    value_bits: vec![1u64; samples],
+                    ..Default::default()
+                }],
+            })),
+        }
+    }
+
+    /// The frame cap fires on the first frame past it, and the error names the
+    /// exact counts.
+    #[test]
+    fn frame_cap_refuses_at_the_cap_with_exact_counts() {
+        let mut decoder =
+            SliceStreamDecoder::new(&EngineConfig::default()).with_max_frames(3);
+        for i in 0..3u8 {
+            decoder
+                .push(series_frame(i, 1))
+                .expect("a frame inside the cap is accepted");
+        }
+        let err = decoder
+            .push(series_frame(3, 1))
+            .expect_err("the fourth frame is past a cap of three");
+        assert!(
+            matches!(
+                err,
+                DistribError::Codec(CodecError::SliceFrameCapExceeded { frames: 4, max: 3 })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// The byte cap comes from the coordinator's own `max_bytes_scanned`, is
+    /// measured in wire frame bytes, and reports what was actually accepted.
+    #[test]
+    fn byte_cap_refuses_and_reports_bytes_consumed() {
+        let config = EngineConfig {
+            max_bytes_scanned: ByteLimit::Bounded(64),
+            ..EngineConfig::default()
+        };
+        let mut decoder = SliceStreamDecoder::new(&config);
+        let err = decoder
+            .push(series_frame(0, 64))
+            .expect_err("one frame of 64 samples is already past a 64-byte cap");
+        match err {
+            DistribError::Codec(CodecError::SliceByteCapExceeded { bytes, max }) => {
+                assert_eq!(max, 64);
+                assert_eq!(
+                    bytes,
+                    decoder.bytes_consumed(),
+                    "the error's byte count is what the decoder reports consuming"
+                );
+                assert!(bytes > 64);
+            }
+            other => panic!("expected a byte-cap refusal, got {other:?}"),
+        }
+        assert_eq!(decoder.frames_consumed(), 1);
+    }
+
+    /// `ByteLimit::Unlimited` (the `EngineConfig` default) leaves the byte cap
+    /// off, so a default deployment is bounded by the frame cap alone. This is
+    /// the reason the frame cap exists.
+    #[test]
+    fn unlimited_bytes_leaves_only_the_frame_cap() {
+        let mut decoder = SliceStreamDecoder::new(&EngineConfig::default());
+        for i in 0..8u8 {
+            decoder
+                .push(series_frame(i, 4096))
+                .expect("no byte cap applies under the default config");
+        }
+        assert!(decoder.bytes_consumed() > 100_000);
+    }
+
+    /// The funnel: a cap breach becomes a budget refusal that keeps its counts,
+    /// never the redacted `QueryError::Distrib` every other slice failure
+    /// becomes. This is what makes a cap breach a 422 and not a 503.
+    #[test]
+    fn distrib_error_keeps_a_cap_breach_in_the_budget_class() {
+        let frames = distrib_error(DistribError::Codec(CodecError::SliceFrameCapExceeded {
+            frames: 7,
+            max: 6,
+        }));
+        assert!(
+            matches!(
+                frames,
+                QueryError::TooManySliceFrames { frames: 7, max: 6 }
+            ),
+            "got {frames:?}"
+        );
+
+        let bytes = distrib_error(DistribError::Codec(CodecError::SliceByteCapExceeded {
+            bytes: 90,
+            max: 80,
+        }));
+        assert!(
+            matches!(
+                bytes,
+                QueryError::TooManyBytesScanned {
+                    scanned: 90,
+                    max: 80
+                }
+            ),
+            "got {bytes:?}"
+        );
+
+        // Anything else keeps the availability class it had.
+        let other = distrib_error(DistribError::NoSummary);
+        assert!(
+            matches!(other, QueryError::Distrib { .. }),
+            "got {other:?}"
+        );
     }
 }
