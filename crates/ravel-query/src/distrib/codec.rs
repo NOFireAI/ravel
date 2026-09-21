@@ -181,8 +181,7 @@ pub const WIRE_BYTES_PER_FRAME: u64 = 48;
 /// alone; docs/guides/distributed-query.md states both, and
 /// `the_documented_fan_out_worst_case_matches_the_constants` pins the figures
 /// it quotes.
-pub const MAX_SLICE_RESPONSE_BYTES: u64 = DEFAULT_MAX_SAMPLES as u64
-    * WIRE_BYTES_PER_SAMPLE_WIDEST
+pub const MAX_SLICE_RESPONSE_BYTES: u64 = DEFAULT_MAX_SAMPLES as u64 * WIRE_BYTES_PER_SAMPLE_WIDEST
     + MAX_SLICE_RESPONSE_FRAMES as u64 * WIRE_BYTES_PER_FRAME;
 
 /// The per-slice wire-byte cap a coordinator running `config` applies:
@@ -3966,8 +3965,7 @@ mod slice_cap_tests {
                 + MAX_SLICE_RESPONSE_FRAMES as u64 * WIRE_BYTES_PER_FRAME
         );
         assert!(
-            MAX_SLICE_RESPONSE_BYTES
-                >= DEFAULT_MAX_SAMPLES as u64 * WIRE_BYTES_PER_SAMPLE_WIDEST,
+            MAX_SLICE_RESPONSE_BYTES >= DEFAULT_MAX_SAMPLES as u64 * WIRE_BYTES_PER_SAMPLE_WIDEST,
             "a slice at the sample budget must fit at any per-sample width"
         );
 
@@ -4016,7 +4014,10 @@ mod slice_cap_tests {
         assert_eq!(max, MAX_SLICE_RESPONSE_BYTES);
         assert!(bytes > MAX_SLICE_RESPONSE_BYTES);
         let rendered = QueryErrorResponse::from_query_error(refusal);
-        assert_eq!(rendered.status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            rendered.status,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
         assert!(
             rendered.message.contains(&bytes.to_string())
                 && rendered
