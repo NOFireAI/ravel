@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
 # Workflow-permissions guard: every workflow under .github/workflows/ declares
 # a top-level `permissions:` block, and that block is a floor rather than a
-# grant.
+# grant. Also checks that every `actions/checkout` step disarms the token it
+# is handed.
 #
-#   no-permissions    a workflow with no top-level `permissions:` key. Its jobs
-#                     inherit the repository default workflow permission, which
-#                     is write here. Every job that runs cargo then puts a
-#                     read-write GITHUB_TOKEN in the environment of every
-#                     dependency build script in the graph.
-#   top-level-write   a top-level block granting a write scope. The floor is
-#                     what every job inherits, including one added later that
-#                     needs none of it. A job that genuinely needs write
-#                     declares it on itself.
+#   no-permissions              a workflow with no top-level `permissions:`
+#                                key. Its jobs inherit the repository default
+#                                workflow permission, which is write here.
+#                                Every job that runs cargo then puts a
+#                                read-write GITHUB_TOKEN in the environment of
+#                                every dependency build script in the graph.
+#   top-level-write              a top-level block granting a write scope. The
+#                                floor is what every job inherits, including
+#                                one added later that needs none of it. A job
+#                                that genuinely needs write declares it on
+#                                itself.
+#   checkout-persists-credentials
+#                                a `uses: actions/checkout@...` step with no
+#                                `persist-credentials: false` under its
+#                                `with:`. actions/checkout defaults to leaving
+#                                the token in `.git/config` after checkout, so
+#                                any build script a later `cargo` invocation
+#                                runs (a dependency's build.rs, a proc macro)
+#                                can read it and push with it. The step needs
+#                                no further `git` access against the remote to
+#                                justify keeping it.
 #
 # Usage:
 #   scripts/guards/check-workflow-permissions.sh [path ...]   # default:
@@ -20,10 +33,16 @@
 # Exit 0 clean, 1 on findings, 64 on bad usage or on a scan that found no
 # workflow to check. Findings print as `file:line: rule: explanation`.
 #
-# Escape hatch for top-level-write only, on the flagged line or anywhere in the
+# Escape hatch for top-level-write, on the flagged line or anywhere in the
 # comment block immediately above the `permissions:` key:
 #
 #   # workflow-permissions-allow: top-level-write -- <reason>
+#
+# Escape hatch for checkout-persists-credentials, on the flagged
+# `uses: actions/checkout` line or anywhere in the comment block immediately
+# above it (a reason is required; the marker alone does not suppress):
+#
+#   # workflow-permissions-allow: persist-credentials -- <reason>
 #
 # no-permissions has no escape hatch. A workflow that wants no scope at all
 # writes `permissions: {}`, which is a declaration and satisfies the rule.
@@ -36,7 +55,7 @@ roots=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help)
-      sed -n '2,30p' "$0"
+      sed -n '2,48p' "$0"
       exit 0
       ;;
     -*)
@@ -108,7 +127,75 @@ function allowed(line,   i) {
 function report(rule, line, why) {
   printf "%s:%d: %s: %s\n", curfile, line, rule, why
 }
+function is_checkout_uses(line) {
+  # A commented-out line is not a step. Without this the guard reports a
+  # finding on prose or on a disabled step, and the fix an author would
+  # apply (adding the setting to a comment) changes nothing.
+  if (line ~ /^[ \t]*#/) return 0
+  return line ~ /uses:[ \t]*actions\/checkout@/
+}
+function indent_of(line) {
+  match(line, /^[ \t]*/)
+  return RLENGTH
+}
+function persist_false(s) {
+  s = strip_comment(s)
+  gsub(/^[ \t]+|[ \t]+$/, "", s)
+  return s ~ /^persist-credentials:[ \t]*false$/
+}
+function has_reason(s,   i, rest) {
+  # A marker with no `-- reason` text, or an empty one, does not suppress: the
+  # point of the escape hatch is a reason a reviewer can read, not a bare flag.
+  i = index(s, "workflow-permissions-allow: persist-credentials")
+  if (i == 0) return 0
+  rest = substr(s, i)
+  i = index(rest, "--")
+  if (i == 0) return 0
+  rest = substr(rest, i + 2)
+  gsub(/^[ \t]+|[ \t]+$/, "", rest)
+  return length(rest) > 0
+}
+function persist_allowed(line,   i) {
+  if (has_reason(raw[line])) return 1
+  for (i = line - 1; i >= 1; i--) {
+    if (raw[i] !~ /^[ \t]*#/) return 0
+    if (has_reason(raw[i])) return 1
+  }
+  return 0
+}
+# The indent that bounds a step is the indent of its LIST ITEM, not of the
+# uses: line. In the common form where "- name:" opens the step, uses: and
+# with: are siblings at the same indent, so bounding the scan by the uses:
+# line ends it at with: and never reaches persist-credentials: false
+# underneath. That reported a correct step as a finding, and the only escape
+# was an allow marker carrying a reason that was not true.
+function step_indent_of(line,   i) {
+  if (raw[line] ~ /^[ \t]*-/) return indent_of(raw[line])
+  for (i = line - 1; i >= 1; i--) {
+    if (raw[i] ~ /^[ \t]*$/) continue
+    if (raw[i] ~ /^[ \t]*-/) return indent_of(raw[i])
+    if (indent_of(raw[i]) < indent_of(raw[line])) return indent_of(raw[i])
+  }
+  return indent_of(raw[line])
+}
+function scan_checkouts(   i, j, step_indent, satisfied) {
+  for (i = 1; i <= nlines; i++) {
+    if (!is_checkout_uses(raw[i])) continue
+    step_indent = step_indent_of(i)
+    satisfied = 0
+    for (j = i + 1; j <= nlines; j++) {
+      if (raw[j] ~ /^[ \t]*$/) continue
+      if (indent_of(raw[j]) < step_indent) break
+      if (indent_of(raw[j]) == step_indent && raw[j] ~ /^[ \t]*-/) break
+      if (persist_false(raw[j])) satisfied = 1
+    }
+    if (!satisfied && !persist_allowed(i)) {
+      report("checkout-persists-credentials", i, "actions/checkout step has no `persist-credentials: false`: the token stays in .git/config where a dependency build script can read it. Add `persist-credentials: false` under the `with:` block for this step, or a `# workflow-permissions-allow: persist-credentials -- <reason>` comment above it")
+    }
+  }
+}
 function scan(   i, body, first) {
+  scan_checkouts()
   if (perm_line == 0) {
     report("no-permissions", 1, "no top-level `permissions:` block: every job inherits the repository default, which is write. Declare the floor the jobs need, usually `contents: read`")
     return

@@ -290,6 +290,82 @@ YML
 check "an allow marker not in the block above the key does not apply" "${d}" 1 \
   "top-level-write"
 
+# --- checkout-persists-credentials ------------------------------------------
+
+d="$(new_tree checkout-no-persist)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: cargo build
+YML
+check "checkout_without_persist_credentials_false_fails" "${d}" 1 \
+  ".github/workflows/w.yml:10: checkout-persists-credentials"
+
+d="$(new_tree checkout-with-persist)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: cargo build
+YML
+check "a checkout with persist-credentials: false is clean" "${d}" 0 "clean"
+
+# The allow marker needs a reason; a bare marker does not suppress.
+d="$(new_tree checkout-allow-no-reason)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # workflow-permissions-allow: persist-credentials
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: docker push
+YML
+check "an allow marker with no reason does not suppress the checkout finding" \
+  "${d}" 1 "checkout-persists-credentials"
+
+d="$(new_tree checkout-allow-with-reason)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # workflow-permissions-allow: persist-credentials -- this job pushes
+      # tags back to the checked-out remote after the build, so the token
+      # must stay in .git/config for that push to authenticate.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: git push --tags
+YML
+check "an allow marker with a reason suppresses the checkout finding" \
+  "${d}" 0 "clean"
+
 # --- the anchor ------------------------------------------------------------
 #
 # The rule the ticket asks for by name: a scan that finds nothing must fail
@@ -362,6 +438,67 @@ if [[ "${rc}" == "1" && "${out}" == *"no-permissions"* ]]; then
   passes=$((passes + 1))
 else
   printf 'FAIL  an explicit root argument scans the same files: got %s / %s\n' "${rc}" "${out}"
+  fails=$((fails + 1))
+fi
+
+# The `- name:` step form, where `uses:` and `with:` are siblings under the
+# list item. Bounding the scan by the `uses:` line's indent stops it at `with:`
+# and never reaches `persist-credentials: false` underneath, so a correct step
+# reads as a finding. No live workflow uses this form today, which is exactly
+# why it needs a case: nothing else would catch the regression.
+d="$(new_tree named-checkout-step)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960ce8a2c0b1e8b1e5e6b0e0d4b0a0f0e0d0
+        with:
+          persist-credentials: false
+      - run: cargo build
+YML
+out="$(cd "${d}" && bash scripts/guards/check-workflow-permissions.sh 2>&1)"
+rc=$?
+if [[ "${rc}" == "0" && "${out}" != *"checkout-persists-credentials"* ]]; then
+  printf 'ok    a named step with persist-credentials under its own with: is clean\n'
+  passes=$((passes + 1))
+else
+  printf 'FAIL  a named step with persist-credentials under its own with: is clean: got %s / %s\n' "${rc}" "${out}"
+  fails=$((fails + 1))
+fi
+
+# The same shape WITHOUT the setting must still be reported, so the fix above
+# cannot be "stop scanning named steps".
+d="$(new_tree named-checkout-step-bare)"
+cat >"${d}/.github/workflows/w.yml" <<'YML'
+name: w
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960ce8a2c0b1e8b1e5e6b0e0d4b0a0f0e0d0
+        with:
+          fetch-depth: 0
+      - run: cargo build
+YML
+out="$(cd "${d}" && bash scripts/guards/check-workflow-permissions.sh 2>&1)"
+rc=$?
+if [[ "${rc}" == "1" && "${out}" == *"checkout-persists-credentials"* ]]; then
+  printf 'ok    a named step without persist-credentials is still reported\n'
+  passes=$((passes + 1))
+else
+  printf 'FAIL  a named step without persist-credentials is still reported: got %s / %s\n' "${rc}" "${out}"
   fails=$((fails + 1))
 fi
 

@@ -62,9 +62,33 @@ const NOW_NS: i64 = 4 * NS_PER_HOUR;
 
 const QUERY: &str = "SELECT ts, value FROM samples ORDER BY ts";
 
-// Pinned images so the test is reproducible across runs.
-const MINIO_IMAGE: &str = "minio/minio:RELEASE.2024-10-13T13-34-11Z";
-const MC_IMAGE: &str = "minio/mc:RELEASE.2024-10-08T09-37-31Z";
+// Pinned images so the test is reproducible across runs. quay.io mirrors
+// (same tags ci.yml already runs against for the object-store contract
+// suite), digest-pinned: Docker Hub's anonymous pull allowance is per-IP and
+// shared across every project on a runner, so an unauthenticated pull there
+// fails unpredictably; quay.io does not share that allowance. The pin
+// checker at deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
+// only scans workflow YAML for image references, not Rust string consts, so
+// these digests are not covered by that check and must be refreshed by hand.
+// Resolved with:
+//   curl -sS "https://quay.io/v2/auth?service=quay.io&scope=repository:minio/minio:pull" \
+//     | jq -r .token \
+//     | xargs -I{} curl -sS -D - -o /dev/null -H "Authorization: Bearer {}" \
+//         -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+//         https://quay.io/v2/minio/minio/manifests/RELEASE.2025-04-08T15-41-24Z
+// (and the equivalent request against minio/mc for MC_IMAGE)
+//
+// MINIO_IMAGE is deliberately the release the compose files already run
+// (deploy/docker-compose/minio.yml, ravel.yml, deploy/metricsbench/
+// docker-compose.yml), not the newest one. This test starts the server with
+// `--console-address`, and those compose files are the only place in the tree
+// that flag is exercised, so pinning here to the same release keeps the flag
+// and the `/minio/health/ready` endpoint on a version something else already
+// runs. Moving this const forward means moving those together and checking the
+// flag still exists in the new release; a nightly lane going red on a server
+// argument is a false alarm about interop.
+const MINIO_IMAGE: &str = "quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b";
+const MC_IMAGE: &str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
 const MINIO_USER: &str = "minioadmin";
 const MINIO_PASSWORD: &str = "minioadmin";
 const BUCKET: &str = "ravel-flight-e2e";
@@ -303,7 +327,7 @@ async fn client(grpc: &std::net::SocketAddr, token: &str) -> FlightSqlServiceCli
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires a Docker daemon reachable by this user and the pinned minio/minio and minio/mc images"]
+#[ignore = "requires a Docker daemon reachable by this user and the pinned MINIO_IMAGE and MC_IMAGE images"]
 async fn flight_sql_against_minio_returns_rows_and_isolates_tenants() {
     let minio = Minio::start().await;
     let store: Arc<dyn ObjectStoreBackend> =

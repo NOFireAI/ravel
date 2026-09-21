@@ -413,6 +413,16 @@ selective-erasure predicates. The budgets travel with the request and are the
 caller's carried limits, applied by the remote; the coordinator re-enforces
 them over the folded remote spend regardless.
 
+A carried budget can only lower what the remote does, never raise it. The
+remote clamps every budget on the wire to its own configuration, so the byte
+limit it applies is the smaller of the carried value and its own
+`max_bytes_scanned`, and a request that carries no cap at all gets the
+remote's own limit rather than an unlimited scan. On this resolve path the
+remote also applies its own matched-series and sample caps to the result it is
+about to return. Sizing a remote's limits is therefore a decision that binds
+every coordinator that queries it: raising a coordinator's budget does not
+raise what its remotes will scan.
+
 The credential is an **operator** secret, and the tenant the remote serves is
 derived from that credential by the remote's own resolver chain. A coordinator
 cannot name a tenant on a remote: whatever `tenant_hash` sits on the wire is
@@ -641,7 +651,8 @@ What an operator will actually observe, case by case:
 | A worker answers `Unavailable` | Same sequence as unreachable | Same |
 | A pinned segment vanished (concurrent GC or compaction) | The coordinator re-resolves the snapshot once and re-dispatches the whole query, not one slice; a second occurrence fails | The same single-retry behavior a local query already has |
 | A worker reports a corrupt segment, or a frame fails to decode | Terminal immediately: no retry, no local fallback | Typed error; a retry would mask real corruption behind a clean local read |
-| A budget trips on a slice, or on the folded total | The same typed `TooManySeries` / `TooManyBytesScanned` a local query raises | HTTP 4xx with the usual budget error |
+| A CAP trips on a slice, or on the folded total (bytes, series, samples, or the request count) | The same typed `TooManySeries` / `TooManyBytesScanned` a local query raises, never a transport error | HTTP 422 with the usual budget error |
+| A worker trips its FETCH MEMORY budget on a slice | `FetchMemoryExhausted`, which is backpressure rather than a cap on the query | HTTP 503, deliberately: the same slice may succeed when the worker has room, so a retry is the right response |
 | The query deadline is reached | The coordinator cancels the fan-out; stream teardown reaches the workers and drop-based cancellation frees their in-flight GETs and fragment permits | Normal deadline error; no leaked permits |
 | Protocol version skew during a rolling deploy | Skewed workers are dropped at routing time, so a mismatch costs no round trip; if none are eligible, the query runs fully local | `slices_local_total` rising, `slices_remote_total` flat |
 | A non-metrics signal | The worker answers `Unsupported` and the coordinator silently re-runs the whole query locally | Nothing to the client; the already-paid remote fetch is still folded into the reported cost, so such a query reports both fetches |

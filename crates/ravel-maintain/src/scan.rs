@@ -144,6 +144,14 @@ pub struct MaintainReport {
     /// call (ADR-0065 decision 3), so the sweep never issues a second LIST of
     /// the shard's hours to compute it.
     pub head_tail_hours: Vec<u32>,
+    /// L0 commit records this pass found sealed but still below
+    /// `min_compaction_inputs` ([`CompactionOutcome::BelowMinInputs`]'s own
+    /// `count`), summed over every such bucket. These records sit live and
+    /// unswept until either a later flush pushes their bucket over the
+    /// threshold or retention expires the bucket outright; this is the only
+    /// L0-record count compaction exposes without an extra listing, so it is
+    /// the figure `ravel_maintain_l0_records_pending` renders (issue #1729).
+    pub l0_records_pending: usize,
 }
 
 /// List every ingest-hour bucket present under one `(tenant, signal, shard)`,
@@ -349,12 +357,27 @@ impl TerminalState {
     }
 }
 
-/// One memo entry: the terminal classification and the injected time the bucket
-/// was last verified against object storage.
+/// One memo entry: the terminal classification, the injected time the bucket
+/// was last verified against object storage, and (for
+/// [`TerminalState::BelowThreshold`] only) how many L0 records that
+/// verification found sitting under the compaction threshold.
+///
+/// The count exists so a skipped bucket still contributes to the pass's
+/// `l0_records_pending` total: an interior bucket below the threshold is
+/// memoized terminal and skipped for every tick inside
+/// [`CompactorConfig::interior_reverify_ns`] (6 h against a 300 s tick by
+/// default), and a total built only from buckets the pass evaluated would read
+/// near zero for 71 of every 72 ticks. `None` means the entry carries no known
+/// count: either a state where the count is meaningless, or a
+/// [`TerminalState::BelowThreshold`] entry seeded from a durable snapshot,
+/// which does not encode counts. [`MaintainMemo::is_fresh_terminal`] reports
+/// that second case as not fresh, so one tick re-evaluates the bucket and the
+/// count is known from then on, rather than the total quietly reading short.
 #[derive(Debug, Clone, Copy)]
 struct MemoEntry {
     state: TerminalState,
     verified_at_ns: i64,
+    l0_records_pending: Option<usize>,
 }
 
 /// Per-worker in-memory memo of terminal bucket states.
@@ -443,25 +466,58 @@ impl MaintainMemo {
     /// Whether `key` is memoized terminal and still fresh at `now_ns` (last
     /// verified within the re-verify interval), so its bucket may be skipped
     /// this tick. A non-positive interval is never fresh.
+    ///
+    /// A [`TerminalState::BelowThreshold`] entry with no known L0 record count
+    /// is never fresh either: skipping it would drop its records out of the
+    /// pass's `l0_records_pending` total for the rest of the re-verify
+    /// interval. Only a snapshot-seeded entry is in that state (the snapshot
+    /// format carries states and verify times, not counts), so this costs one
+    /// re-evaluation per below-threshold bucket after a warm start and nothing
+    /// afterwards.
     fn is_fresh_terminal(&self, key: &BucketKey, now_ns: i64) -> bool {
         match self.entries.get(key) {
             Some(entry) => {
                 self.reverify_interval_ns > 0
                     && now_ns.saturating_sub(entry.verified_at_ns) < self.reverify_interval_ns
+                    && !(entry.state == TerminalState::BelowThreshold
+                        && entry.l0_records_pending.is_none())
             }
             None => false,
         }
     }
 
-    /// Record `key` as terminal in `state`, verified at `now_ns`.
+    /// The L0 record count `key` was last verified to hold while below the
+    /// compaction threshold, or 0 for any other entry (and for an absent one).
+    /// This is what a skipped bucket contributes to the pass's
+    /// `l0_records_pending` total.
+    fn l0_records_pending(&self, key: &BucketKey) -> usize {
+        self.entries
+            .get(key)
+            .and_then(|entry| entry.l0_records_pending)
+            .unwrap_or(0)
+    }
+
+    /// Record `key` as terminal in `state`, verified at `now_ns`, with no known
+    /// L0 record count. A below-threshold bucket's count is attached by
+    /// [`Self::set_l0_records_pending`] right after.
     fn mark_terminal(&mut self, key: BucketKey, state: TerminalState, now_ns: i64) {
         self.entries.insert(
             key,
             MemoEntry {
                 state,
                 verified_at_ns: now_ns,
+                l0_records_pending: None,
             },
         );
+    }
+
+    /// Attach the L0 record count a fresh evaluation found for `key`. No-op for
+    /// a key the memo does not hold: the memo is advisory, and a bucket that
+    /// was not memoized terminal is re-evaluated next tick anyway.
+    fn set_l0_records_pending(&mut self, key: &BucketKey, count: usize) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.l0_records_pending = Some(count);
+        }
     }
 
     /// Forget `key` (it is no longer terminal).
@@ -596,6 +652,10 @@ impl MaintainMemo {
                     MemoEntry {
                         state,
                         verified_at_ns,
+                        // The snapshot body carries states and verify times
+                        // only. A below-threshold entry therefore arrives with
+                        // no count and `is_fresh_terminal` re-verifies it once.
+                        l0_records_pending: None,
                     },
                 );
             }
@@ -1181,6 +1241,13 @@ pub async fn scan_and_maintain_with_memo(
             report.head_tail_hours.push(hour);
         } else if memo.is_fresh_terminal(&key, now) {
             report.skipped_terminal += 1;
+            // A skipped bucket still holds whatever L0 records the last
+            // evaluation found, so it keeps contributing them to this pass's
+            // total. Counting only evaluated buckets would make
+            // `l0_records_pending` a count of this tick's work rather than the
+            // pending population it is documented to be, and sawtooth it to
+            // near zero on every tick between interior re-verifies.
+            report.l0_records_pending += memo.l0_records_pending(&key);
             continue;
         }
 
@@ -1219,11 +1286,14 @@ pub async fn scan_and_maintain_with_memo(
             | RetentionOutcome::NotExpired => match compaction {
                 Some(CompactionOutcome::NotSealed) => report.not_sealed += 1,
                 Some(CompactionOutcome::Compacted { .. }) => report.compacted += 1,
+                Some(CompactionOutcome::BelowMinInputs { count }) => {
+                    report.already_done += 1;
+                    report.l0_records_pending += count;
+                }
                 Some(
                     CompactionOutcome::AlreadyCompacted
                     | CompactionOutcome::RewritePresent
-                    | CompactionOutcome::Tombstoned
-                    | CompactionOutcome::BelowMinInputs { .. },
+                    | CompactionOutcome::Tombstoned,
                 ) => report.already_done += 1,
                 None => {}
             },
@@ -1233,7 +1303,14 @@ pub async fn scan_and_maintain_with_memo(
         // newly terminal bucket, and forget one that transitioned away from a
         // terminal state (e.g. a compacted bucket that just became expired).
         match classify_terminal(&retention_outcome, &compaction) {
-            Some(state) => memo.mark_terminal(key, state, now),
+            Some(state) => {
+                memo.mark_terminal(key, state, now);
+                // Carry this evaluation's below-threshold population on the
+                // entry so the ticks that skip the bucket can still add it.
+                if let Some(CompactionOutcome::BelowMinInputs { count }) = compaction {
+                    memo.set_l0_records_pending(&key, count);
+                }
+            }
             None => memo.forget(&key),
         }
     }

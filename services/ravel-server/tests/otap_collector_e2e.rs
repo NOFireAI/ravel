@@ -68,7 +68,20 @@ use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 
 const TOKEN: &str = "testtoken";
-const COLLECTOR_IMAGE: &str = "otel/opentelemetry-collector-contrib:0.120.0";
+// ghcr.io mirror of otel/opentelemetry-collector-contrib:0.120.0,
+// digest-pinned: Docker Hub's anonymous pull allowance is per-IP and shared
+// across every project on a runner, so an unauthenticated pull there fails
+// unpredictably; ghcr.io does not share that allowance. The pin checker at
+// deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh only
+// scans workflow YAML for image references, not Rust string consts, so this
+// digest is not covered by that check and must be refreshed by hand.
+// Resolved with:
+//   curl -sS "https://ghcr.io/token?service=ghcr.io&scope=repository:open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:pull" \
+//     | jq -r .token \
+//     | xargs -I{} curl -sS -D - -o /dev/null -H "Authorization: Bearer {}" \
+//         -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+//         https://ghcr.io/v2/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib/manifests/0.120.0
+const COLLECTOR_IMAGE: &str = "ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.120.0@sha256:85ac41c2db88d0df9bd6145e608a3cb023f5d8443868adbfbbf66efb51087917";
 const METRIC_NAME: &str = "otap_collector_e2e";
 const VALUE: f64 = 42.5;
 /// The collector's OTLP/HTTP receiver port on the host (`--network host`).
@@ -250,7 +263,7 @@ async fn try_query_series(
 /// A metric sent OTLP -> collector -> `otelarrow` (real OTAP) -> `ravel-server`
 /// round-trips into a queryable series with the right value.
 #[tokio::test]
-#[ignore = "requires a Docker daemon reachable by this user and the otel/opentelemetry-collector-contrib:0.120.0 image"]
+#[ignore = "requires a Docker daemon reachable by this user and the pinned COLLECTOR_IMAGE image"]
 async fn real_collector_otelarrow_export_is_queryable() {
     let running = start_test_server().await;
     let grpc_addr = running.grpc_addr.expect("gateway binds gRPC");

@@ -8,6 +8,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A distributed query now sends each slice the full byte budget instead of
+  an even share, and a worker clamps every wire budget to its own
+  `EngineConfig`** (issues #1725 and #1687). The per-slice share failed a query
+  that was well under its total budget whenever one slice scanned more than an
+  even fraction, which is the normal shape of a skewed fan-out, and the
+  residual surfaced as a retryable 503. The coordinator still enforces the
+  total on the folded figures, so the worst case is a bounded over-scan before
+  it refuses. A cap refusal now renders as HTTP 422 wherever it comes from,
+  including across clusters; only a fan-out failure or a worker out of fetch
+  memory keeps the retryable 503. On the worker side a wire budget of `0` or
+  absent now means the worker's own limit rather than unlimited, and the
+  federation `Resolve` path enforces the worker's `max_series` and
+  `max_samples` too.
 - **`--s3-endpoint` now decides whether plaintext is allowed, and a
   non-loopback `http://` endpoint is refused at startup** (issue #1707).
   `allow_http` was true whenever any endpoint was set, so a deployment
