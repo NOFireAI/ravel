@@ -37,6 +37,13 @@ pub enum QueryError {
     TooManySamples { count: usize, max: usize },
     #[error("query scanned {scanned} bytes, exceeding the budget of {max}")]
     TooManyBytesScanned { scanned: u64, max: u64 },
+    /// A remote streamed more response frames for one slice than the
+    /// coordinator accepts (issue #1687 part B,
+    /// `distrib::codec::MAX_SLICE_RESPONSE_FRAMES`). A budget refusal like the
+    /// caps above, not an outage: the counts are the coordinator's own and
+    /// carry no server state, so they are echoed to the caller.
+    #[error("slice returned {frames} response frames, exceeding the limit of {max}")]
+    TooManySliceFrames { frames: usize, max: usize },
     #[error("query issued {requests} S3 requests, exceeding the budget of {max}")]
     RequestBudgetExceeded { requests: u64, max: u64 },
     #[error("query exceeded its deadline of {deadline:?}")]
