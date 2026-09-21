@@ -804,7 +804,10 @@ That holds on the cross-cluster path too. A remote answering `BudgetExceeded`
 refused the query under its own caps (its wire-budget clamp, or the
 `max_series`/`max_samples` a resolve-scope slice enforces over its own
 result), so the coordinator renders it as the same typed 422, not as the
-`Federation` error it redacts to 503. A refusal is told apart from a fan-out
+`Federation` error it redacts to 503. The fetch-memory carve-out applies here
+too: a remote out of fetch memory answers `BudgetExceeded` like a cap refusal
+does, and it keeps the retryable 503, because it is backpressure rather than a
+verdict on the query. A refusal is told apart from a fan-out
 failure by the wire status code, which only a remote that answered can set: a
 remote that was unreachable or timed out produces no status at all and keeps
 the retryable 503. The remote's message text selects only which cap is
