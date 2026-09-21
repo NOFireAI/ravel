@@ -34,10 +34,12 @@ how to choose a value, not what the flags are called.
   are at the top.
 
 When you budget host memory, remember the catalog's two per-tenant record
-caches: they are bounded by an entry count rather than by a share of the
-process memory budget, so they cost up to 45 MB per actively-queried tenant on
-top of the carved read-cache shares. [Caching](caching.md) has the derivation
-and the sizing.
+caches: they are bounded per tenant rather than by a share of the process
+memory budget, so they cost up to 45 MB per actively-queried tenant on top of
+the carved read-cache shares. Half of that is enforced in bytes (the
+compaction-record cache, whose entries have no bounded size) and half is an
+entry count times a 750-byte per-record estimate (the commit-record cache).
+[Caching](caching.md) has the derivation and the sizing.
 
 Related guides: [observability](observability.md) for the metric families and
 the label allowlist, [caching](caching.md) for read-cache sizing,

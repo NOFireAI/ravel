@@ -120,6 +120,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `30,000 x 750 bytes x 2` = 45 MB per actively-queried tenant, held constant
   across every deployment shape: `--shards 64` would otherwise derive
   2,073,600 entries and 3.1 GB per tenant, with nothing process-wide bounding
+  the next tenant. The two caches reach that figure in different units,
+  because only one of them holds entries of a bounded size. The commit-record
+  cache evicts on the entry count, and 750 bytes is an estimate for it rather
+  than a size the code enforces (`CommitRecord.declared_column_stats` is an
+  uncapped repeated field). The L1 compaction-record cache is bounded in BYTES
+  at the same 22.5 MB share, charging each entry an estimate of its live heap
+  and evicting oldest-first until the total is inside the budget: a
+  `CompactionRecord` carries one `CompactionInputIdentity` per compacted L0
+  segment, capped neither by the proto nor by `validate_compaction`, so one L1
+  record over 1,800 L0 segments charges about 137 KB, 180 times the per-entry
+  estimate, and an entry-count bound would have let one tenant exceed its
+  share of the 45 MB by two orders of magnitude. These caches sit outside
+  ADR-1170's carved shares, so an operator budgets 45 MB times the number of
+  concurrently queried tenants on top of them. The capacity covers a tenant's
+  unsealed tail up to the cap, not whatever the tail actually is: at the
+  shipped defaults the estimate is already 129,600 entries, the flush-cadence
+  term counts the age trigger only, so a tenant flushing on object size seals
+  more records per shard-hour than it assumes, and the three-unsealed-hours
+  term assumes the default seal parameters, under-counting by about 1.8x at
+  `--gc-max-flush-lifetime 4h`. Over the bound a resolve pays per-record GETs
+  as it did before, so the direction is safe. `--disable-cache` keeps the flat
+  10,000-entry capacity rather than the derived one, and with it a 7.5 MB
+  compaction-record byte budget, so the memory-constrained-container flag
+  never costs more record-cache memory than it did before this change. No new
+  CLI flag is added; the capacity is a function of existing ingest
+  configuration.
   the next tenant. These caches sit outside ADR-1170's carved shares, so an
   operator budgets 45 MB times the number of concurrently queried tenants on
   top of them. The capacity covers a tenant's unsealed tail up to the cap, not
