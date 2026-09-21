@@ -148,8 +148,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   term counts the age trigger only, so a tenant flushing on object size seals
   more records per shard-hour than it assumes, and the three-unsealed-hours
   term assumes the default seal parameters, under-counting by about 1.8x at
-  `--gc-max-flush-lifetime 4h`. Over the bound a resolve pays per-record GETs
-  as it did before, so the direction is safe. `--disable-cache` keeps the flat
+  `--gc-max-flush-lifetime 4h`. Over the bound a resolve pays per-record GETs;
+  a tenant whose records carry declared-column statistics now holds fewer than
+  the flat 10,000 the old cache held, so it can pay GETs it did not pay before,
+  which is the hit rate the enforced memory bound costs. `--disable-cache` keeps the flat
   10,000-entry capacity rather than the derived one, and with it a 9 MB byte
   budget for each of the two caches, so the memory-constrained-container flag
   stays on the lowest capacity the code supports short of disabling the

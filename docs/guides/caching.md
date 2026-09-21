@@ -382,8 +382,11 @@ unsealed hours, which assume the default seal parameters. That last term is
 the one an operator can move: `--gc-max-flush-lifetime 4h` puts the seal
 margin at 4h20m, so the oldest unsealed hour can have started 5h20m ago and
 the tail spans up to 5.34 hours, which three under-counts by about 1.8x. A
-tenant over the bound pays a per-record GET on every resolve, which is what it
-paid before the capacity was derived. The levers are a coarser
+tenant over the bound pays a per-record GET on every resolve. That is not what
+it paid before: the old cache held a flat 10,000 records whatever they cost, so
+a tenant whose records carry declared-column statistics now holds fewer than it
+did and pays GETs it did not pay before. The bound trades that hit rate for a
+memory figure the eviction path enforces. The levers are a coarser
 `--max-flush-delay`, a shorter `--gc-max-flush-lifetime`, or a lower shard
 count, all of which shrink the tail itself.
 
