@@ -44,6 +44,20 @@ pub enum QueryError {
     /// carry no server state, so they are echoed to the caller.
     #[error("slice returned {frames} response frames, exceeding the limit of {max}")]
     TooManySliceFrames { frames: usize, max: usize },
+    /// A remote streamed more response frame bytes for one slice than the
+    /// coordinator accepts (issue #1687 part B,
+    /// `distrib::codec::slice_byte_cap`). Distinct from
+    /// [`QueryError::TooManyBytesScanned`], which counts the store bytes a
+    /// query read: this counts the protobuf-encoded size of one slice's
+    /// response frames, a figure that appears in neither the query's accounting
+    /// nor `stats.fragments[].bytesReported`, so the message names the quantity
+    /// rather than leaving an operator to reconcile it against store bytes. A
+    /// budget refusal like the caps above; both figures are the coordinator's
+    /// own and carry no server state, so they are echoed to the caller.
+    #[error(
+        "slice returned {bytes} response frame wire bytes, exceeding the per-slice limit of {max}"
+    )]
+    TooManySliceBytes { bytes: u64, max: u64 },
     #[error("query issued {requests} S3 requests, exceeding the budget of {max}")]
     RequestBudgetExceeded { requests: u64, max: u64 },
     #[error("query exceeded its deadline of {deadline:?}")]

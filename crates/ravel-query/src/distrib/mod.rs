@@ -1219,17 +1219,23 @@ fn query_id_bytes(
 /// the frame is decoded and accumulated:
 ///
 /// * a frame count cap ([`codec::MAX_SLICE_RESPONSE_FRAMES`]), and
-/// * an aggregate byte cap, taken from the coordinator's own
-///   [`EngineConfig::max_bytes_scanned`] and measured as the protobuf-encoded
-///   length of each frame received (wire frame bytes, not S3 bytes and not
-///   decoded in-memory size).
+/// * an aggregate byte cap ([`codec::slice_byte_cap`]): the absolute
+///   [`codec::MAX_SLICE_RESPONSE_BYTES`] ceiling, lowered to the coordinator's
+///   own [`EngineConfig::max_bytes_scanned`] when that is smaller. Measured as
+///   the protobuf-encoded length of each frame received (wire frame bytes, not
+///   S3 bytes and not decoded in-memory size).
+///
+/// Both caps are PER SLICE. Each in-flight slice decodes through its own
+/// decoder carrying the full cap, so a coordinator fanning out to
+/// [`partition::DEFAULT_MAX_PARALLEL_SLICES`] slices holds up to that many
+/// times the per-slice byte cap in wire bytes, and more once decoded.
 ///
 /// Both refusals are a typed [`DistribError::Codec`] naming the exact counts,
 /// and [`cap_refusal_error`] maps them to the budget class (HTTP 422), not to
 /// the availability class. A caller must stop reading its stream on the first
 /// `Err`: the caps bound what has been held only if nothing more is pulled.
 pub struct SliceStreamDecoder {
-    max_bytes: ByteLimit,
+    max_bytes: u64,
     max_frames: usize,
     frames: usize,
     bytes: u64,
@@ -1240,14 +1246,16 @@ pub struct SliceStreamDecoder {
 }
 
 impl SliceStreamDecoder {
-    /// A decoder whose byte cap is this coordinator's own
-    /// `max_bytes_scanned` and whose frame cap is
-    /// [`codec::MAX_SLICE_RESPONSE_FRAMES`]. `ByteLimit::Unlimited` (the
-    /// `EngineConfig` default) leaves the byte cap off, so the frame cap is
-    /// then the only bound.
+    /// A decoder whose byte cap is [`codec::slice_byte_cap`] for this
+    /// coordinator's config and whose frame cap is
+    /// [`codec::MAX_SLICE_RESPONSE_FRAMES`]. Both caps always apply:
+    /// `ByteLimit::Unlimited` (the `EngineConfig` default, and what the
+    /// server's shipped query defaults resolve to) opts out of the store-bytes
+    /// budget, not out of the absolute [`codec::MAX_SLICE_RESPONSE_BYTES`]
+    /// ceiling.
     pub fn new(config: &EngineConfig) -> Self {
         SliceStreamDecoder {
-            max_bytes: config.max_bytes_scanned,
+            max_bytes: codec::slice_byte_cap(config),
             max_frames: codec::MAX_SLICE_RESPONSE_FRAMES,
             frames: 0,
             bytes: 0,
@@ -1281,6 +1289,12 @@ impl SliceStreamDecoder {
         self.frames
     }
 
+    /// The wire-byte cap this decoder enforces for its slice, as
+    /// [`codec::slice_byte_cap`] resolved it from the coordinator's config.
+    pub fn byte_cap(&self) -> u64 {
+        self.max_bytes
+    }
+
     /// Accept one frame, or refuse the slice.
     ///
     /// Both caps are checked before the frame's payload is decoded or kept, so
@@ -1296,12 +1310,10 @@ impl SliceStreamDecoder {
             }));
         }
         self.bytes = self.bytes.saturating_add(frame.encoded_len() as u64);
-        if let ByteLimit::Bounded(max) = self.max_bytes
-            && self.bytes > max
-        {
+        if self.bytes > self.max_bytes {
             return Err(DistribError::Codec(CodecError::SliceByteCapExceeded {
                 bytes: self.bytes,
-                max,
+                max: self.max_bytes,
             }));
         }
         match frame.frame {
@@ -1377,8 +1389,8 @@ impl SliceStreamDecoder {
 pub(crate) fn cap_refusal_error(err: &DistribError) -> Option<QueryError> {
     match err {
         DistribError::Codec(CodecError::SliceByteCapExceeded { bytes, max }) => {
-            Some(QueryError::TooManyBytesScanned {
-                scanned: *bytes,
+            Some(QueryError::TooManySliceBytes {
+                bytes: *bytes,
                 max: *max,
             })
         }
@@ -1459,6 +1471,11 @@ mod slice_cap_tests {
             ..EngineConfig::default()
         };
         let mut decoder = SliceStreamDecoder::new(&config);
+        assert_eq!(
+            decoder.byte_cap(),
+            64,
+            "a configured budget below the absolute ceiling is the cap in force"
+        );
         let err = decoder
             .push(series_frame(0, 64))
             .expect_err("one frame of 64 samples is already past a 64-byte cap");
@@ -1477,26 +1494,41 @@ mod slice_cap_tests {
         assert_eq!(decoder.frames_consumed(), 1);
     }
 
-    /// `ByteLimit::Unlimited` (the `EngineConfig` default) leaves the byte cap
-    /// off, so a default deployment is bounded by the frame cap alone. This is
-    /// the reason the frame cap exists.
+    /// A coordinator that configured no byte budget still decodes under the
+    /// absolute per-slice ceiling: `ByteLimit::Unlimited` opts out of the
+    /// store-bytes budget, not out of this cap. Ordinary traffic is far below
+    /// it, so the frames below are accepted.
     #[test]
-    fn unlimited_bytes_leaves_only_the_frame_cap() {
+    fn a_stock_config_decodes_under_the_absolute_byte_cap() {
         let mut decoder = SliceStreamDecoder::new(&EngineConfig::default());
+        assert_eq!(decoder.byte_cap(), codec::MAX_SLICE_RESPONSE_BYTES);
         for i in 0..8u8 {
             decoder
                 .push(series_frame(i, 4096))
-                .expect("no byte cap applies under the default config");
+                .expect("an ordinary slice is far below the absolute cap");
         }
-        assert!(decoder.bytes_consumed() > 100_000);
+        assert_eq!(decoder.bytes_consumed(), 8 * 36_912);
+    }
 
-        // And the byte cap could not stand in for the frame cap even when it is
-        // set: an empty frame is 2 wire bytes, so bytes bound a frame count
-        // only at 2 bytes per frame.
-        let empty = pb::FetchResponse {
-            frame: Some(pb::fetch_response::Frame::Series(pb::SeriesFrame::default())),
+    /// The cap the decoder enforces is the LOWER of the absolute ceiling and
+    /// the coordinator's own `max_bytes_scanned`: a configured budget tightens
+    /// it and never raises it.
+    #[test]
+    fn a_configured_budget_can_only_lower_the_decoder_cap() {
+        let lower = EngineConfig {
+            max_bytes_scanned: ByteLimit::Bounded(4_096),
+            ..EngineConfig::default()
         };
-        assert_eq!(empty.encoded_len(), 2);
+        assert_eq!(SliceStreamDecoder::new(&lower).byte_cap(), 4_096);
+
+        let higher = EngineConfig {
+            max_bytes_scanned: ByteLimit::Bounded(1u64 << 30),
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            SliceStreamDecoder::new(&higher).byte_cap(),
+            codec::MAX_SLICE_RESPONSE_BYTES
+        );
     }
 
     /// The funnel: a cap breach becomes a budget refusal that keeps its counts,
@@ -1518,13 +1550,7 @@ mod slice_cap_tests {
             max: 80,
         }));
         assert!(
-            matches!(
-                bytes,
-                QueryError::TooManyBytesScanned {
-                    scanned: 90,
-                    max: 80
-                }
-            ),
+            matches!(bytes, QueryError::TooManySliceBytes { bytes: 90, max: 80 }),
             "got {bytes:?}"
         );
 
