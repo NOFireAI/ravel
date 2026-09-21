@@ -50,6 +50,7 @@ async fn start_test_server() -> ravel_server::Running {
         audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
+        max_queued_flushes: 8,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),
         max_flush_delay_idle: std::time::Duration::from_secs(40),

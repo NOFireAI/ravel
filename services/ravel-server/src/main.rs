@@ -475,6 +475,7 @@ async fn main() -> anyhow::Result<()> {
         listen_grpc: cli.listen_grpc,
         shard_count: cli.shards,
         max_inflight_flushes: cli.max_inflight_flushes,
+        max_queued_flushes: cli.max_queued_flushes,
         adaptive_flush_delay: cli.adaptive_flush_delay,
         max_flush_delay: flush_cadence.max_flush_delay,
         max_flush_delay_idle: flush_cadence.max_flush_delay_idle,
