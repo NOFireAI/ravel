@@ -357,6 +357,46 @@ impl TerminalState {
     }
 }
 
+/// A fresh evaluation's terminal verdict: the same three cases as
+/// [`TerminalState`], with the below-threshold case carrying the L0 record
+/// count that evaluation found.
+///
+/// [`TerminalState`] cannot carry it. Its discriminants are the durable memo
+/// snapshot's frozen one-byte codes (ADR-0065 decision 3), and the snapshot
+/// body encodes states and verify times only, so a seeded entry has a state
+/// and no count by construction. This type is what a *live* evaluation
+/// produces, and pairing the two here is what makes
+/// [`MaintainMemo::mark_terminal`] unable to record one without the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalClassification {
+    Compacted,
+    BelowThreshold { l0_records_pending: usize },
+    SweptEmpty,
+}
+
+impl TerminalClassification {
+    /// The durable state this verdict memoizes as.
+    fn state(self) -> TerminalState {
+        match self {
+            TerminalClassification::Compacted => TerminalState::Compacted,
+            TerminalClassification::BelowThreshold { .. } => TerminalState::BelowThreshold,
+            TerminalClassification::SweptEmpty => TerminalState::SweptEmpty,
+        }
+    }
+
+    /// The count to store on the entry: `Some` exactly for the below-threshold
+    /// case, where it is the population a skipped tick still reports, and
+    /// `None` for the states where an L0 record count is meaningless.
+    fn l0_records_pending(self) -> Option<usize> {
+        match self {
+            TerminalClassification::BelowThreshold { l0_records_pending } => {
+                Some(l0_records_pending)
+            }
+            TerminalClassification::Compacted | TerminalClassification::SweptEmpty => None,
+        }
+    }
+}
+
 /// One memo entry: the terminal classification, the injected time the bucket
 /// was last verified against object storage, and (for
 /// [`TerminalState::BelowThreshold`] only) how many L0 records that
@@ -497,27 +537,27 @@ impl MaintainMemo {
             .unwrap_or(0)
     }
 
-    /// Record `key` as terminal in `state`, verified at `now_ns`, with no known
-    /// L0 record count. A below-threshold bucket's count is attached by
-    /// [`Self::set_l0_records_pending`] right after.
-    fn mark_terminal(&mut self, key: BucketKey, state: TerminalState, now_ns: i64) {
+    /// Record `key` as terminal in `classification`, verified at `now_ns`.
+    ///
+    /// The state and its L0 record count arrive as one value so they cannot be
+    /// written apart: a below-threshold entry whose count was set by a second
+    /// call reads as "no known count" in between, and a caller that reaches
+    /// the state and forgets the count drops those records out of
+    /// `l0_records_pending` for a whole re-verify interval.
+    fn mark_terminal(
+        &mut self,
+        key: BucketKey,
+        classification: TerminalClassification,
+        now_ns: i64,
+    ) {
         self.entries.insert(
             key,
             MemoEntry {
-                state,
+                state: classification.state(),
                 verified_at_ns: now_ns,
-                l0_records_pending: None,
+                l0_records_pending: classification.l0_records_pending(),
             },
         );
-    }
-
-    /// Attach the L0 record count a fresh evaluation found for `key`. No-op for
-    /// a key the memo does not hold: the memo is advisory, and a bucket that
-    /// was not memoized terminal is re-evaluated next tick anyway.
-    fn set_l0_records_pending(&mut self, key: &BucketKey, count: usize) {
-        if let Some(entry) = self.entries.get_mut(key) {
-            entry.l0_records_pending = Some(count);
-        }
     }
 
     /// Forget `key` (it is no longer terminal).
@@ -1102,10 +1142,10 @@ fn expand_run(
 fn classify_terminal(
     retention: &RetentionOutcome,
     compaction: &Option<CompactionOutcome>,
-) -> Option<TerminalState> {
+) -> Option<TerminalClassification> {
     match retention {
         // Physically swept empty: nothing remains in the bucket.
-        RetentionOutcome::Swept => Some(TerminalState::SweptEmpty),
+        RetentionOutcome::Swept => Some(TerminalClassification::SweptEmpty),
         // A tombstone is present but the horizon-gated sweep is still pending,
         // a sweep left residue, or the sweep is blocked because the snapshot
         // still reaches the bucket (ADR-0020): real work is due on a later tick
@@ -1117,7 +1157,9 @@ fn classify_terminal(
         // Retention left the bucket live; the compaction outcome decides.
         RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
             match compaction {
-                Some(CompactionOutcome::AlreadyCompacted) => Some(TerminalState::Compacted),
+                Some(CompactionOutcome::AlreadyCompacted) => {
+                    Some(TerminalClassification::Compacted)
+                }
                 // Mapped like an existing compaction record because the memo
                 // is advisory and never correctness-bearing: only interior-zone
                 // hours ever consult it, head and tail hours re-evaluate every
@@ -1125,9 +1167,14 @@ fn classify_terminal(
                 // at least every re-verify interval. Even a wrong terminal
                 // state here only defers the next real evaluation by at most
                 // that interval; it gates no deletion or durability decision.
-                Some(CompactionOutcome::RewritePresent) => Some(TerminalState::Compacted),
-                Some(CompactionOutcome::BelowMinInputs { .. }) => {
-                    Some(TerminalState::BelowThreshold)
+                Some(CompactionOutcome::RewritePresent) => Some(TerminalClassification::Compacted),
+                // The count travels with the verdict: it is the population a
+                // tick that skips this bucket still reports, and reading it
+                // here is the only place it is available.
+                Some(CompactionOutcome::BelowMinInputs { count }) => {
+                    Some(TerminalClassification::BelowThreshold {
+                        l0_records_pending: *count,
+                    })
                 }
                 // Just compacted this tick: re-verify next tick to reach the stable
                 // AlreadyCompacted state before memoizing it.
@@ -1303,14 +1350,7 @@ pub async fn scan_and_maintain_with_memo(
         // newly terminal bucket, and forget one that transitioned away from a
         // terminal state (e.g. a compacted bucket that just became expired).
         match classify_terminal(&retention_outcome, &compaction) {
-            Some(state) => {
-                memo.mark_terminal(key, state, now);
-                // Carry this evaluation's below-threshold population on the
-                // entry so the ticks that skip the bucket can still add it.
-                if let Some(CompactionOutcome::BelowMinInputs { count }) = compaction {
-                    memo.set_l0_records_pending(&key, count);
-                }
-            }
+            Some(classification) => memo.mark_terminal(key, classification, now),
             None => memo.forget(&key),
         }
     }
@@ -1413,23 +1453,29 @@ mod memo_snapshot_tests {
         for hour in 10..=20 {
             memo.mark_terminal(
                 (t, Signal::Metrics, 0, hour),
-                TerminalState::Compacted,
+                TerminalClassification::Compacted,
                 5_000,
             );
         }
         memo.mark_terminal(
             (t, Signal::Metrics, 0, 5),
-            TerminalState::BelowThreshold,
+            TerminalClassification::BelowThreshold {
+                l0_records_pending: 1,
+            },
             5_000,
         );
         memo.mark_terminal(
             (t, Signal::Metrics, 0, 25),
-            TerminalState::SweptEmpty,
+            TerminalClassification::SweptEmpty,
             5_000,
         );
         // Unit B (different shard, different signal): a small Compacted run.
         for hour in 100..=102 {
-            memo.mark_terminal((t, Signal::Logs, 3, hour), TerminalState::Compacted, 6_000);
+            memo.mark_terminal(
+                (t, Signal::Logs, 3, hour),
+                TerminalClassification::Compacted,
+                6_000,
+            );
         }
         let want_len = memo.len();
 
@@ -1480,7 +1526,7 @@ mod memo_snapshot_tests {
         for hour in 0..500 {
             memo.mark_terminal(
                 (t, Signal::Metrics, 0, hour),
-                TerminalState::Compacted,
+                TerminalClassification::Compacted,
                 1_000,
             );
         }
@@ -1498,7 +1544,11 @@ mod memo_snapshot_tests {
     fn stale_snapshot_is_ignored() {
         let t = tenant();
         let mut memo = MaintainMemo::with_default_interval();
-        memo.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 0);
+        memo.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalClassification::Compacted,
+            0,
+        );
         let bytes = memo.encode_snapshot(0);
 
         // Read one nanosecond past the staleness bound: excluded.
@@ -1538,7 +1588,7 @@ mod memo_snapshot_tests {
         let mut memo = MaintainMemo::with_default_interval();
         memo.mark_terminal(
             (t, Signal::Metrics, 0, 1),
-            TerminalState::Compacted,
+            TerminalClassification::Compacted,
             10 * NS_PER_HOUR,
         );
         let bytes = memo.encode_snapshot(10 * NS_PER_HOUR);
@@ -1557,8 +1607,16 @@ mod memo_snapshot_tests {
     fn only_owned_units_are_seeded() {
         let t = tenant();
         let mut memo = MaintainMemo::with_default_interval();
-        memo.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 0);
-        memo.mark_terminal((t, Signal::Metrics, 1, 1), TerminalState::Compacted, 0);
+        memo.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalClassification::Compacted,
+            0,
+        );
+        memo.mark_terminal(
+            (t, Signal::Metrics, 1, 1),
+            TerminalClassification::Compacted,
+            0,
+        );
         let bytes = memo.encode_snapshot(0);
 
         let mut seeded = MaintainMemo::with_default_interval();
@@ -1590,13 +1648,19 @@ mod memo_snapshot_tests {
         let mut older = MaintainMemo::with_default_interval();
         older.mark_terminal(
             (t, Signal::Metrics, 0, 1),
-            TerminalState::BelowThreshold,
+            TerminalClassification::BelowThreshold {
+                l0_records_pending: 1,
+            },
             1_000,
         );
         let older_bytes = older.encode_snapshot(1_000);
 
         let mut newer = MaintainMemo::with_default_interval();
-        newer.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 5_000);
+        newer.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalClassification::Compacted,
+            5_000,
+        );
         let newer_bytes = newer.encode_snapshot(5_000);
 
         // Apply older then newer: newer wins.
@@ -1639,7 +1703,11 @@ mod memo_snapshot_tests {
         // there: truncated, not a panic.
         let t = tenant();
         let mut good = MaintainMemo::with_default_interval();
-        good.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 0);
+        good.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalClassification::Compacted,
+            0,
+        );
         let mut bytes = good.encode_snapshot(0);
         bytes.truncate(bytes.len() - 3);
         assert!(matches!(
@@ -1659,12 +1727,12 @@ mod memo_snapshot_tests {
         for hour in [3u32, 1, 2, 7, 5] {
             a.mark_terminal(
                 (t, Signal::Metrics, 0, hour),
-                TerminalState::Compacted,
+                TerminalClassification::Compacted,
                 1_000,
             );
             b.mark_terminal(
                 (t, Signal::Metrics, 0, hour),
-                TerminalState::Compacted,
+                TerminalClassification::Compacted,
                 1_000,
             );
         }
@@ -1698,7 +1766,7 @@ mod memo_snapshot_tests {
         let mut poisoned = MaintainMemo::with_default_interval();
         poisoned.mark_terminal(
             (t, Signal::Metrics, 0, 1),
-            TerminalState::Compacted,
+            TerminalClassification::Compacted,
             future_ns,
         );
         // Re-frame the poisoned body under an honest, fresh header, so the
@@ -1743,6 +1811,19 @@ mod memo_snapshot_tests {
         }
     }
 
+    /// The live-evaluation verdict whose state is [`state_of`]'s. The
+    /// below-threshold count is arbitrary: the snapshot body encodes states
+    /// and verify times only, so the codec round-trip never reads it.
+    fn classification_of(code: u8) -> TerminalClassification {
+        match code % 3 {
+            0 => TerminalClassification::Compacted,
+            1 => TerminalClassification::BelowThreshold {
+                l0_records_pending: 1,
+            },
+            _ => TerminalClassification::SweptEmpty,
+        }
+    }
+
     proptest::proptest! {
         /// RLE memo codec round-trip. For an arbitrary
         /// per-hour terminal/non-terminal state sequence (independent choices at
@@ -1768,7 +1849,11 @@ mod memo_snapshot_tests {
                 if let Some((code, verified_ns)) = cell {
                     let hour = hour as u32;
                     let state = state_of(*code);
-                    memo.mark_terminal((t, Signal::Metrics, 0, hour), state, *verified_ns);
+                    memo.mark_terminal(
+                        (t, Signal::Metrics, 0, hour),
+                        classification_of(*code),
+                        *verified_ns,
+                    );
                     present.push((hour, state, *verified_ns));
                 }
             }
@@ -2115,7 +2200,7 @@ mod invalidate_tests {
         let mut memo = MaintainMemo::with_default_interval();
         memo.mark_terminal(
             (t, Signal::Metrics, SHARD, HOUR),
-            TerminalState::Compacted,
+            TerminalClassification::Compacted,
             0,
         );
         assert_eq!(
@@ -2162,7 +2247,11 @@ mod invalidate_tests {
         seed_logs(&store).await;
         let t = tenant_hash();
         let mut memo = MaintainMemo::with_default_interval();
-        memo.mark_terminal((t, Signal::Logs, SHARD, HOUR), TerminalState::Compacted, 0);
+        memo.mark_terminal(
+            (t, Signal::Logs, SHARD, HOUR),
+            TerminalClassification::Compacted,
+            0,
+        );
 
         let request = erasure_request(Signal::Logs, "service", "checkout");
         let pending = vec![PendingErasureRequest {
@@ -2203,7 +2292,11 @@ mod invalidate_tests {
         seed_spans(&store).await;
         let t = tenant_hash();
         let mut memo = MaintainMemo::with_default_interval();
-        memo.mark_terminal((t, Signal::Spans, SHARD, HOUR), TerminalState::Compacted, 0);
+        memo.mark_terminal(
+            (t, Signal::Spans, SHARD, HOUR),
+            TerminalClassification::Compacted,
+            0,
+        );
 
         let request = erasure_request(Signal::Spans, "service", "checkout");
         let pending = vec![PendingErasureRequest {
@@ -2231,5 +2324,276 @@ mod invalidate_tests {
             None,
             "a published spans rewrite must invalidate the memoized terminal state"
         );
+    }
+}
+
+/// `MaintainReport::l0_records_pending` (issue #1894): the figure
+/// `ravel_maintain_l0_records_pending` renders is owned here, and its two
+/// contributing paths (a bucket this pass evaluated, and a bucket the memo
+/// skipped) must produce the same total.
+///
+/// Lives in this module because it reads `MaintainMemo`'s private
+/// `l0_records_pending` accounting through the public report, and because the
+/// paths it separates are `scan_and_maintain_with_memo`'s own.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod l0_records_pending_tests {
+    use std::collections::BTreeMap;
+
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_segment::{
+        IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, VERSION_V7,
+    };
+    use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::clock::FixedClock;
+    use crate::sweep::NoLeases;
+
+    const TENANT: &str = "acme";
+    const SHARD: u32 = 0;
+    /// Two interior hours holding DIFFERENT numbers of L0 records, so a total
+    /// that double-counts one bucket, drops one, or reports a bucket count
+    /// instead of a record count cannot land on the same figure.
+    const HOUR_ONE: u32 = 500_000;
+    const RECORDS_IN_HOUR_ONE: usize = 1;
+    const HOUR_TWO: u32 = 500_001;
+    const RECORDS_IN_HOUR_TWO: usize = 3;
+    const EXPECTED_PENDING: usize = RECORDS_IN_HOUR_ONE + RECORDS_IN_HOUR_TWO;
+
+    fn tenant_hash() -> TenantHash {
+        TenantId::new(TENANT).hash()
+    }
+
+    /// `min_compaction_inputs` of 4 puts a 1-record and a 3-record bucket both
+    /// below the threshold, which is what makes the two counts differ. At the
+    /// default of 2 the only below-threshold population is 1 and the sum
+    /// would be indistinguishable from a bucket count.
+    fn config() -> CompactorConfig {
+        CompactorConfig {
+            min_compaction_inputs: 4,
+            ..CompactorConfig::default()
+        }
+    }
+
+    /// A "now" past the seal margin plus one hour for both buckets, so
+    /// [`classify_zone`] puts each in [`Zone::Interior`] and the memo path is
+    /// the one under test. With no retention policy there is no tail zone.
+    fn interior_now_ns() -> i64 {
+        (i64::from(HOUR_TWO) + 1) * NS_PER_HOUR + config().seal_margin_ns() + 2 * NS_PER_HOUR
+    }
+
+    /// Publish one single-sample L0 segment and its commit record into
+    /// `(SHARD, hour)` under `writer_seq`, returning the commit record's key.
+    async fn seed_l0(store: &dyn ObjectStoreBackend, hour: u32, writer_seq: u64) -> String {
+        let th = tenant_hash();
+        let writer_id = Uuid::from_u128(u128::from(hour) * 16 + u128::from(writer_seq));
+        let created = i64::from(hour) * NS_PER_HOUR + 1_000;
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "checkout_latency".to_string(),
+        }])
+        .expect("valid labels");
+        let series = SeriesInputV3 {
+            series_id: SeriesId::compute(&TenantId::new(TENANT), "checkout_latency", &labels)
+                .expect("series id"),
+            labels,
+            values: SeriesValues::Scalar(vec![Sample {
+                ts_ns: created,
+                value: 1.0,
+            }]),
+        };
+        let written = SegmentWriter::write_histograms_with_exemplars(
+            vec![series],
+            SegmentIdentity {
+                tenant_hash: th.0,
+                shard: SHARD,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: created,
+                max_ingest_ts_ns: created,
+            },
+            Vec::new(),
+        )
+        .expect("write L0");
+
+        let content_hash = written.summary.blake3;
+        let data_key = keys::data_key(
+            &th,
+            Signal::Metrics,
+            SHARD,
+            writer_id,
+            1,
+            writer_seq,
+            &content_hash,
+        )
+        .expect("data key");
+        store
+            .put(&data_key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put data object");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Metrics,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: u32::from(VERSION_V7),
+            created_unix_ns: created,
+            ingest_hour_bucket: hour,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+        commit_key
+    }
+
+    /// The seeded store, plus each hour's commit-record keys so a test can
+    /// take one hour back out of the shard listing.
+    async fn seeded_store() -> (MemoryStore, BTreeMap<u32, Vec<String>>) {
+        let store = MemoryStore::new();
+        let mut commit_keys: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        for (hour, records) in [
+            (HOUR_ONE, RECORDS_IN_HOUR_ONE),
+            (HOUR_TWO, RECORDS_IN_HOUR_TWO),
+        ] {
+            for seq in 1..=records as u64 {
+                commit_keys
+                    .entry(hour)
+                    .or_default()
+                    .push(seed_l0(&store, hour, seq).await);
+            }
+        }
+        (store, commit_keys)
+    }
+
+    async fn pass(
+        memo: &mut MaintainMemo,
+        store: &MemoryStore,
+        clock: &FixedClock,
+    ) -> MaintainReport {
+        scan_and_maintain_with_memo(
+            memo,
+            store,
+            clock,
+            &config(),
+            &RetentionConfig::default(),
+            &NoLeases,
+            tenant_hash(),
+            Signal::Metrics,
+            SHARD,
+        )
+        .await
+        .expect("scan")
+    }
+
+    /// The exact sum over two below-threshold buckets holding different record
+    /// counts, on the pass that evaluated them and again on the pass that
+    /// skipped them from the memo.
+    ///
+    /// The second assertion is the one issue #1894 is about: a below-threshold
+    /// bucket is memoized terminal and skipped for every tick inside
+    /// `interior_reverify_ns`, so a total built only from evaluated buckets
+    /// reads 0 on that pass. Asserting the same exact sum on both passes is
+    /// what rules that out; `skipped_terminal == 2` proves the second pass
+    /// really took the skip path rather than re-evaluating.
+    #[tokio::test]
+    async fn below_threshold_buckets_sum_the_same_on_the_evaluating_and_the_skipping_pass() {
+        let (store, _) = seeded_store().await;
+        let clock = FixedClock::new(interior_now_ns());
+        let mut memo = MaintainMemo::with_default_interval();
+
+        let first = pass(&mut memo, &store, &clock).await;
+        assert!(
+            first.head_tail_hours.is_empty(),
+            "both buckets must be interior, or the memo path is not what is under test"
+        );
+        assert_eq!(
+            first.skipped_terminal, 0,
+            "a cold memo skips nothing on the first pass"
+        );
+        assert_eq!(
+            first.already_done, 2,
+            "both buckets are below the compaction threshold, so neither compacts"
+        );
+        assert_eq!(
+            first.l0_records_pending, EXPECTED_PENDING,
+            "the evaluating pass sums every below-threshold bucket's own record count"
+        );
+
+        let second = pass(&mut memo, &store, &clock).await;
+        assert_eq!(
+            second.skipped_terminal, 2,
+            "the warm memo skips both buckets on the second pass"
+        );
+        assert_eq!(
+            second.already_done, 0,
+            "a skipped bucket is not re-evaluated, so it is not counted as done work"
+        );
+        assert_eq!(
+            second.l0_records_pending, EXPECTED_PENDING,
+            "a skipped bucket still reports the population it was last verified to hold, \
+             so the gauge does not sawtooth to zero between interior re-verifies"
+        );
+    }
+
+    /// The memo carries each bucket's OWN count, not one figure applied to
+    /// both. The exact sum alone cannot show that: a memo storing 2 per
+    /// bucket totals 4 as well.
+    ///
+    /// Each case warms the memo on both buckets, then removes one hour's
+    /// commit records so the shard listing no longer returns it. The
+    /// remaining hour is skipped from the memo, and the pass's total must be
+    /// exactly that hour's own record count.
+    #[tokio::test]
+    async fn the_memo_carries_each_buckets_own_below_threshold_count() {
+        for (dropped, survivor, expected) in [
+            (HOUR_ONE, HOUR_TWO, RECORDS_IN_HOUR_TWO),
+            (HOUR_TWO, HOUR_ONE, RECORDS_IN_HOUR_ONE),
+        ] {
+            let (store, commit_keys) = seeded_store().await;
+            let clock = FixedClock::new(interior_now_ns());
+            let mut memo = MaintainMemo::with_default_interval();
+            assert_eq!(
+                pass(&mut memo, &store, &clock).await.l0_records_pending,
+                EXPECTED_PENDING,
+                "the warming pass sees both hours"
+            );
+
+            for key in &commit_keys[&dropped] {
+                store.delete(key).await.expect("delete commit record");
+            }
+
+            let report = pass(&mut memo, &store, &clock).await;
+            assert_eq!(
+                report.skipped_terminal, 1,
+                "hour {survivor} is still memoized terminal and fresh; hour {dropped} is \
+                 no longer listed at all"
+            );
+            assert_eq!(
+                report.l0_records_pending, expected,
+                "the surviving hour contributes its own count from the memo, not the \
+                 other hour's and not the pair's sum"
+            );
+        }
     }
 }
