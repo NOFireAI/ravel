@@ -389,6 +389,34 @@ fn self_ordinal(covered_entries: &[SnapshotEntry], record: &CommitRecord) -> Opt
 // Rotating cursor (ADR-0059 decision 1, content tier)
 // ---------------------------------------------------------------------------
 
+/// Which part of the commit lineage a [`ScrubTarget`] came from. Compaction
+/// folds a set of L0 commit records into an L1 part, and selective-subject
+/// erasure (ADR-0064) folds a set into a rewrite part; both leave the L0
+/// commit records in place until a later sweep deletes them, so the same
+/// bytes can briefly exist at two levels. Once compaction runs on a bucket,
+/// the L1 part becomes the only copy of that data still worth scrubbing, so
+/// the corpus must carry L1 and rewrite parts too, not just L0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrubLevel {
+    /// An L0 commit record: the original segment written at ingest time.
+    L0,
+    /// An L1 part produced by compaction folding a set of L0s together.
+    L1,
+    /// A part produced by a selective-subject erasure rewrite.
+    Rewrite,
+}
+
+impl ScrubLevel {
+    /// The label value this level renders as on `/metrics`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrubLevel::L0 => "l0",
+            ScrubLevel::L1 => "l1",
+            ScrubLevel::Rewrite => "rewrite",
+        }
+    }
+}
+
 /// One object in a scrub rotation, in the cursor's iteration order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScrubTarget {
@@ -396,6 +424,8 @@ pub struct ScrubTarget {
     pub object_key: String,
     /// The object's size in bytes, for byte-budgeted ticks.
     pub object_size: u64,
+    /// Which part of the commit lineage this object came from.
+    pub level: ScrubLevel,
 }
 
 /// The bounded amount of work one content-tier tick may do. Every tick scrubs
@@ -857,6 +887,7 @@ mod tests {
             .map(|i| ScrubTarget {
                 object_key: format!("obj-{i:04}"),
                 object_size: 1,
+                level: ScrubLevel::L0,
             })
             .collect()
     }
@@ -899,6 +930,7 @@ mod tests {
             .map(|i| ScrubTarget {
                 object_key: format!("big-{i:02}"),
                 object_size: 100,
+                level: ScrubLevel::L0,
             })
             .collect();
         let budget = ScrubBudget::MaxBytes(1);
