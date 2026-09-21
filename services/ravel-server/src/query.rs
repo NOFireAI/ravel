@@ -123,6 +123,7 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// constant. Callers must pass the configured value, never
 /// `ravel_ingest::IngestConfig::default().max_flush_delay`, or the derived
 /// capacity stops tracking the deployment's actual flush cadence.
+#[allow(clippy::too_many_arguments)]
 pub fn build_catalog(
     store: Arc<dyn ObjectStoreBackend>,
     shard_count: u32,
@@ -584,8 +585,17 @@ mod catalog_cache_tests {
     fn build_catalog_wires_cache_max_bytes_through_to_the_byte_cache() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let budget = 7 * 1024 * 1024;
-        let catalog = build_catalog(store, 1, false, budget, None, None, None, Duration::from_secs(2))
-            .expect("catalog builds");
+        let catalog = build_catalog(
+            store,
+            1,
+            false,
+            budget,
+            None,
+            None,
+            None,
+            Duration::from_secs(2),
+        )
+        .expect("catalog builds");
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
             budget,

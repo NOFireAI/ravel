@@ -237,6 +237,50 @@ async fn publish_twelve(store: &dyn ObjectStoreBackend) -> Vec<String> {
     keys
 }
 
+/// Publish `count` records into a single unsealed bucket (`hour`), spaced
+/// evenly across the hour so every record's event timestamp falls inside
+/// `window()`. `publish_twelve`'s whole-minute spacing would overflow an hour
+/// at this record count; used only by the capacity acceptance test below.
+async fn publish_many(store: &dyn ObjectStoreBackend, hour: u32, count: u64) -> Vec<String> {
+    let spacing_ns = NS_PER_HOUR / (count as i64 + 1);
+    let mut keys = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let payload = format!("seg-{hour}-{index}").into_bytes();
+        let content_hash = *blake3::hash(&payload).as_bytes();
+        let event_ts_ns = i64::from(hour) * NS_PER_HOUR + spacing_ns * (index as i64 + 1);
+        let writer_id = Uuid::from_u128(u128::from(index) + 1);
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: index,
+            object_size: payload.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: event_ts_ns,
+            max_event_ts_ns: event_ts_ns,
+            min_ingest_ts_ns: event_ts_ns,
+            max_ingest_ts_ns: event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: event_ts_ns,
+            ingest_hour_bucket: hour,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(payload))
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        keys.push(keys::commit_key_for_record(&rec).expect("commit key"));
+    }
+    keys
+}
+
 async fn resolve(catalog: &Catalog) -> Result<ravel_catalog::Snapshot, CatalogError> {
     catalog
         .resolve_with_accounting(
@@ -466,4 +510,46 @@ async fn a_faulted_record_get_leaves_the_other_records_cached() {
         "only the record whose GET faulted may be re-read; the eleven cached ones must not be"
     );
     assert_eq!(second.segments.len(), 12);
+}
+
+/// Issue #1735: the per-tenant record cache is sized from the shipped ingest
+/// defaults (`shard_count: 4`, `max_flush_delay: 2s`), not the old flat
+/// 10,000-entry bound. At the old bound, a 16,800-record unsealed tail is
+/// larger than the cache, so it thrashes exactly like
+/// `a_bound_below_the_hot_region_loses_the_saving` above (both passes evict
+/// each other): a real run of this fixture against `config(10_000)` reports
+/// 33,600 record GETs on the second resolve (thousands today at 10,000, not
+/// zero). At `derive_cache_capacity_per_tenant(4, 2s)` (21,600), the tail
+/// fits and the second resolve issues none.
+#[tokio::test]
+async fn second_resolve_over_a_16800_record_unsealed_tail_issues_no_record_gets() {
+    const RECORD_COUNT: u64 = 16_800;
+    let inner = Arc::new(MemoryStore::new());
+    publish_many(inner.as_ref(), HOUR_A, RECORD_COUNT).await;
+    let (store, calls) = CountingStore::new(inner);
+
+    let derived =
+        ravel_catalog::derive_cache_capacity_per_tenant(4, std::time::Duration::from_secs(2));
+    assert_eq!(
+        derived, 21_600,
+        "pin the derived capacity at the shipped ingest defaults"
+    );
+
+    let catalog = Catalog::new(store, config(derived)).expect("catalog");
+
+    resolve(&catalog).await.expect("first resolve");
+    assert_eq!(
+        calls.record_get_count() as u64,
+        RECORD_COUNT,
+        "a cold resolve must GET each of the 16,800 commit records exactly once"
+    );
+    calls.reset();
+
+    resolve(&catalog).await.expect("second resolve");
+    assert_eq!(
+        calls.record_get_count(),
+        0,
+        "at the derived capacity a repeated resolve over a 16,800-record unsealed tail must \
+         issue no record GET"
+    );
 }
