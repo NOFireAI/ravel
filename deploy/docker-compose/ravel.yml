@@ -59,9 +59,8 @@ services:
     command: ["--store", "s3", "store", "qualify"]
     environment:
       RAVEL_S3_ENDPOINT: http://minio:9000
-      # Set for when ravel-cli honours it: the CLI still derives allow_http
-      # from the endpoint being set at all, which is the other half of this
-      # issue. Ignored by any binary that does not know the variable.
+      # minio is a compose service name, not loopback, so ravel-cli refuses
+      # this plaintext endpoint without the opt-in, exactly as the server does.
       RAVEL_S3_ALLOW_HTTP: "true"
       RAVEL_S3_BUCKET: ravel-dev
       RAVEL_S3_REGION: us-east-1

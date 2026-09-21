@@ -299,86 +299,12 @@ impl ObjectStoreBackend for SharedKmsStore {
     }
 }
 
-/// A plaintext `--s3-endpoint` pointing at a host this process cannot reach
-/// over the loopback interface, refused by [`resolve_s3_allow_http`].
-///
-/// Typed rather than an `anyhow::Error` so both callers that must agree on
-/// this rule (`Cli::validate`, which runs on every start, and [`build_store`],
-/// the only S3 client constructor in the shipping binary) render one message
-/// from one decision instead of two hand-written strings that can drift.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaintextS3Endpoint {
-    /// The refused endpoint, verbatim as the operator wrote it.
-    pub endpoint: String,
-}
-
-impl std::fmt::Display for PlaintextS3Endpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "--s3-endpoint '{}' uses plaintext http:// to a non-loopback host: every object \
-             this process writes and reads, and the credentials signing those requests, cross \
-             the network in the clear, so an on-path attacker can read telemetry and forge \
-             writes for any tenant. Use https://, point at a loopback address for local \
-             development, or pass --s3-allow-http (RAVEL_S3_ALLOW_HTTP) to accept plaintext \
-             deliberately.",
-            self.endpoint
-        )
-    }
-}
-
-impl std::error::Error for PlaintextS3Endpoint {}
-
-/// Whether the S3 client may speak plaintext HTTP, decided by the endpoint's
-/// own URL scheme rather than by whether an endpoint was set at all.
-///
-/// `https://` (and a real-AWS build, which sets no endpoint) is `false`: an
-/// `allow_http` of `true` there would let a redirect or a misconfigured proxy
-/// downgrade the connection silently. `http://` is `true`, because that is
-/// what the operator asked for, but only after this refuses a non-loopback
-/// host unless `allow_http_flag` is set. Loopback stays allowed unflagged:
-/// a plaintext connection that never leaves the host has no on-path attacker,
-/// and every local-development launcher in this repo depends on it.
-///
-/// An endpoint carrying neither scheme yields `false`, which is behavior
-/// preserving: `allow_http` is consulted by `object_store` only for an
-/// `http://` URL.
-pub fn resolve_s3_allow_http(
-    endpoint: Option<&str>,
-    allow_http_flag: bool,
-) -> Result<bool, PlaintextS3Endpoint> {
-    let Some(endpoint) = endpoint else {
-        return Ok(false);
-    };
-    let Some(rest) = endpoint.strip_prefix("http://") else {
-        return Ok(false);
-    };
-    if allow_http_flag || is_loopback_authority(rest) {
-        return Ok(true);
-    }
-    Err(PlaintextS3Endpoint {
-        endpoint: endpoint.to_string(),
-    })
-}
-
-/// Whether the authority beginning `rest` (everything after `http://`) names
-/// this host. Accepts `localhost`, a loopback IPv4 or IPv6 literal, and the
-/// bracketed IPv6 form a URL authority requires; anything else, including a
-/// name that merely resolves to loopback today, is treated as remote.
-fn is_loopback_authority(rest: &str) -> bool {
-    let authority = rest.split('/').next().unwrap_or("");
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
-    let host = match authority.strip_prefix('[') {
-        // `[::1]:9000`: the bracketed literal is the host, and the port (if
-        // any) follows the closing bracket.
-        Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
-        None => authority.split(':').next().unwrap_or(""),
-    };
-    host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-}
+/// The plaintext-endpoint rule (issue #1707), owned by `ravel-object-store`
+/// beside the `S3Config::allow_http` field it decides, because `ravel-cli`
+/// obeys the same rule against the same bucket and two copies of it would
+/// drift. Re-exported here for `Cli::validate` and [`build_store`], the two
+/// callers in this crate.
+pub use ravel_object_store::s3::{PlaintextS3Endpoint, resolve_s3_allow_http};
 
 /// The argument error for `--s3-auth instance-role` combined with an inline
 /// credential (ADR-0106), or `None` when no inline credential is set.
