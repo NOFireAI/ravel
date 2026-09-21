@@ -73,7 +73,9 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 ///   format (proto/ravel/commit.proto) nor by
 ///   `ravel_commit::record::validate_compaction`, so one L1 record over a
 ///   shard-hour that sealed 1,800 L0 records holds about 1,800 inputs and
-///   roughly 140 KB, about 190 times the per-entry estimate. Under an
+///   charges roughly 137 KB, about 180 times the per-entry estimate
+///   (`oversized_compaction_entries_evict_on_bytes_not_count` in
+///   `crate::cache` pins that charge). Under an
 ///   entry-count bound that cache could exceed its share of the figure below
 ///   by two orders of magnitude before evicting anything. It charges each
 ///   entry an estimate of its live heap
@@ -89,7 +91,7 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 /// the per-entry estimate above.
 ///
 /// This is not one of the ADR-1170 carved caches: it is not a share of
-/// `memory_budget_bytes`, it is an entry-count bound sized from ingest
+/// `memory_budget_bytes`, it is a per-tenant bound sized from ingest
 /// cadence, and its footprint scales with how many tenants are actively
 /// queried, not with a fixed process-wide ceiling. That is what the cap is
 /// for: an operator multiplies 45 MB by the number of tenants queried
@@ -115,7 +117,7 @@ pub const DEFAULT_CACHE_CAPACITY_PER_TENANT: usize = 10_000;
 /// `--max-flush-delay` are set to, one actively-queried tenant costs at most
 /// this, so the operator's question is only how many tenants are queried at
 /// once (100 of them is 4.5 GB worst case). These caches sit OUTSIDE
-/// ADR-1170's carved shares -- they are entry-count bounds, not slices of
+/// ADR-1170's carved shares -- their bounds are per-tenant, not slices of
 /// `memory_budget_bytes` -- so that product is what to subtract from what the
 /// host has left after the carved fetch, catalog-byte and SQL shares, not
 /// something already inside them.
