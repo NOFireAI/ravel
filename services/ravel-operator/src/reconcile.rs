@@ -32,6 +32,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
+use ravel_object_store::s3::resolve_s3_allow_http;
 
 use crate::crd::{
     AffinityBackend, AffinityKeySource, GATEWAY_DEFAULT_CPU_REQUEST,
@@ -93,6 +94,27 @@ pub enum RenderError {
         field: &'static str,
         /// The rejected value, as written in the spec.
         value: String,
+    },
+
+    /// `spec.storage.s3.endpoint` is a plaintext `http://` URL whose host is
+    /// not loopback while `spec.storage.s3.allowHttp` is false (issue #1707).
+    /// Every server container the operator would render refuses that endpoint
+    /// at startup, so rendering the Deployments anyway crashloops all three
+    /// tiers with the cause visible only in pod logs. The render fails here
+    /// instead, so the controller records a `Degraded` condition that names
+    /// the field and the remedy. The operator's own S3 client (`sys/auth`,
+    /// `shardOverrides`) is refused by the same rule from the same decision,
+    /// [`ravel_object_store::s3::resolve_s3_allow_http`].
+    #[error(
+        "spec.storage.s3.endpoint {endpoint:?} uses plaintext http:// to a non-loopback host, \
+         which every ravel-server container and the operator's own S3 client refuse: telemetry \
+         and S3 credentials would cross the cluster network in the clear. Set \
+         spec.storage.s3.allowHttp: true to accept plaintext deliberately, or use an https:// \
+         endpoint"
+    )]
+    PlaintextS3Endpoint {
+        /// The refused endpoint, verbatim as the spec wrote it.
+        endpoint: String,
     },
 }
 
@@ -500,6 +522,26 @@ fn audit_token_key_env(spec: &RavelClusterSpec) -> Option<EnvVar> {
 /// behalf.
 pub fn audit_token_key_missing(spec: &RavelClusterSpec) -> bool {
     spec.audit_token_key_secret_ref.is_none() && spec.deployment_key_secret_ref.is_none()
+}
+
+/// Whether an S3 client configured from this spec may speak plaintext HTTP,
+/// by the one rule every binary in this repo applies
+/// ([`ravel_object_store::s3::resolve_s3_allow_http`], issue #1707): decided
+/// by the endpoint's URL scheme, and refused for a plaintext non-loopback host
+/// unless `spec.storage.s3.allowHttp` accepts it deliberately.
+///
+/// Two callers, so the operator cannot disagree with itself: the render, which
+/// refuses a spec whose server containers would refuse their own endpoint at
+/// startup, and `controller::auth_store_config`, which builds the operator's
+/// own store handle for `sys/auth` and the `shardOverrides` reshard.
+pub fn s3_allow_http(spec: &RavelClusterSpec) -> Result<bool, RenderError> {
+    resolve_s3_allow_http(
+        spec.storage.s3.endpoint.as_deref(),
+        spec.storage.s3.allow_http,
+    )
+    .map_err(|refused| RenderError::PlaintextS3Endpoint {
+        endpoint: refused.endpoint,
+    })
 }
 
 /// Args shared by every mode: store selection, shard count, and the S3
@@ -2233,12 +2275,13 @@ pub const STORE_QUALIFIED_MESSAGE: &str =
     "the object store passed ravel-cli store qualify; serving Deployments may be created";
 
 /// A deterministic change-detection hash over the inputs store qualification
-/// proves against (issue #36): the bucket, region, endpoint, server image, the
-/// credentials Secret NAME, and that credentials Secret's `resourceVersion`.
-/// When any of these changes the store the cluster would serve on, or the
-/// credentials it would serve with, is different, so qualification is re-run; an
-/// unrelated spec edit (a replica count, a fold interval) leaves this stable and
-/// does not re-qualify.
+/// proves against (issue #36): the bucket, region, endpoint, `allowHttp`,
+/// server image, the credentials Secret NAME, and that credentials Secret's
+/// `resourceVersion`. When any of these changes the store the cluster would
+/// serve on, the credentials it would serve with, or (for `allowHttp`) whether
+/// the qualification can reach that store at all, is different, so
+/// qualification is re-run; an unrelated spec edit (a replica count, a fold
+/// interval) leaves this stable and does not re-qualify.
 ///
 /// The `resourceVersion` is what makes a fixed-name credential ROTATION
 /// re-qualify (finding, issue #36): rotating the Secret in place keeps its name
@@ -2288,10 +2331,28 @@ pub fn qualify_job_input_hash(
         Some(value) => format!("\u{1}{value}"),
         None => "\u{0}".to_string(),
     };
+    // `allowHttp` is in the hash even though it does not select a different
+    // store (finding 3, issue #1707). The premise is right and the conclusion
+    // would be wrong: this hash also gates whether the spec is re-checked at
+    // all, and setting the field is the remediation for a cluster whose
+    // endpoint the render refused. Excluding it would carry a stale
+    // `storeQualifiedHash` straight through that edit, so the qualify Job would
+    // never re-run with `RAVEL_S3_ALLOW_HTTP` set and nothing would prove
+    // `ravel-cli` reaches the store over plaintext before the Deployments are
+    // allowed up. It also renders a different Job (one more env var), so the
+    // Job's annotation must move with it. The cost is one re-qualification per
+    // existing cluster on the upgrade that adds this field, which is the same
+    // cost any other hashed input would carry.
+    let allow_http = if spec.storage.s3.allow_http {
+        "true"
+    } else {
+        "false"
+    };
     blake3_hex(&[
         spec.storage.s3.bucket.as_str(),
         spec.storage.s3.region.as_str(),
         endpoint.as_str(),
+        allow_http,
         spec.image.as_str(),
         spec.storage.s3.credentials_secret_ref.name.as_str(),
         credentials_rv.as_str(),
@@ -2309,12 +2370,12 @@ pub fn qualify_job_input_hash(
 /// `allowHttp` reach `ravel-cli` through the same `RAVEL_S3_*` env vars it
 /// reads (clap `env`), the exact shape the kind lane's hand-run Job used.
 ///
-/// `allowHttp` is not part of [`qualify_job_input_hash`]: that hash covers
-/// store identity (which bucket, over which endpoint, with which
-/// credentials), and turning plaintext on or off does not change which store
-/// was qualified. Enabling it on a cluster whose Job was refused reaches the
-/// Job anyway, because a refused Job is a failed Job and the gate recreates a
-/// failed Job from the current spec on its retry backoff.
+/// `allowHttp` IS part of [`qualify_job_input_hash`] (finding 3, issue #1707).
+/// It does not change which store was qualified, but the hash also gates
+/// whether the spec is re-checked at all: setting the field is the remediation
+/// for a cluster the render refused, and it adds this env var to the Job, so a
+/// hash that ignored it would skip the re-qualification that proves `ravel-cli`
+/// can reach the store over plaintext.
 ///
 /// The Job carries [`QUALIFY_SPEC_HASH_ANNOTATION`] so the controller re-runs it
 /// when its inputs change and skips it when they do not, and sets
@@ -2937,7 +2998,11 @@ pub struct DesiredObjects {
 /// Returns `Result` for a render error that must fail the whole reconcile: an
 /// invalid `spec.gc` horizon (#1083) propagates here so the controller records a
 /// `Degraded` condition rather than shipping a maintain pod with a flag the
-/// server rejects at startup. The router's render error (the ravel-native
+/// server rejects at startup, and a plaintext non-loopback
+/// `spec.storage.s3.endpoint` with `allowHttp` unset (#1707) propagates for the
+/// same reason: every tier's container would refuse that endpoint at startup, so
+/// rendering them crashloops the whole cluster with the cause only in pod logs.
+/// The router's render error (the ravel-native
 /// router's, ADR-0080 decision 3) is instead captured in
 /// [`DesiredObjects::router_render_error`] rather than propagated, so a
 /// misconfigured router degrades only the router and every other tier still
@@ -2949,6 +3014,12 @@ pub fn desired_objects(
     namespace: &str,
     ctx: &RenderCtx,
 ) -> Result<DesiredObjects, RenderError> {
+    // Refuse before rendering anything (#1707): a plaintext non-loopback
+    // endpoint with `allowHttp` unset renders three Deployments whose
+    // containers all refuse that endpoint at startup. Failing here is what puts
+    // the field name in a status condition instead of in the logs of pods that
+    // never become ready.
+    s3_allow_http(spec)?;
     // Capture the router render result instead of `?`-propagating it: a router
     // misconfiguration must not abort the gateway/query/maintain tiers below.
     // On error, render none of the router objects (all `None`) and surface the
@@ -3028,7 +3099,10 @@ mod tests {
                     bucket: "ravel-data".to_string(),
                     region: "eu-west-1".to_string(),
                     endpoint: Some("http://minio:9000".to_string()),
-                    allow_http: false,
+                    // A plaintext in-cluster endpoint is only renderable with
+                    // `allowHttp` set: the baseline is a spec that renders, so
+                    // the two travel together here.
+                    allow_http: true,
                     credentials_secret_ref: LocalSecretRef {
                         name: "ravel-s3".to_string(),
                     },
@@ -4027,11 +4101,12 @@ mod tests {
     /// default so an https:// or real-AWS cluster is untouched.
     #[test]
     fn allow_http_renders_the_flag_only_when_set() {
+        // The `false` half needs an https:// endpoint: a plaintext endpoint
+        // with the field unset no longer renders at all (it is refused, see
+        // `a_plaintext_endpoint_without_allow_http_is_refused_at_render_time`).
         let mut spec = base_spec();
-        assert!(
-            !spec.storage.s3.allow_http,
-            "precondition: allowHttp defaults off"
-        );
+        spec.storage.s3.endpoint = Some("https://minio.example:9000".to_string());
+        spec.storage.s3.allow_http = false;
         for deployment in [
             desired_gateway_deployment(&spec, "prod", &ctx()),
             desired_query_deployment(&spec, "prod", &ctx()),
@@ -4043,7 +4118,11 @@ mod tests {
             );
         }
 
-        spec.storage.s3.allow_http = true;
+        let spec = base_spec();
+        assert!(
+            spec.storage.s3.allow_http,
+            "precondition: the baseline sets allowHttp for its plaintext endpoint"
+        );
         for deployment in [
             desired_gateway_deployment(&spec, "prod", &ctx()),
             desired_query_deployment(&spec, "prod", &ctx()),
@@ -4054,6 +4133,59 @@ mod tests {
                 "allowHttp true must render the flag, got: {args:?}"
             );
         }
+    }
+
+    /// Issue #1707 finding 2: a plaintext non-loopback endpoint with
+    /// `allowHttp` unset is the state of every cluster upgrading across the
+    /// `--s3-endpoint` change, and every server container the operator would
+    /// render for it refuses to start. The render refuses instead, with a
+    /// typed error naming `spec.storage.s3.allowHttp` and what to set, so the
+    /// controller can degrade the cluster with the cause in its status rather
+    /// than leaving it in the pod logs of three crashlooping Deployments.
+    #[test]
+    fn a_plaintext_endpoint_without_allow_http_is_refused_at_render_time() {
+        let mut spec = base_spec();
+        spec.storage.s3.endpoint = Some("http://minio:9000".to_string());
+        spec.storage.s3.allow_http = false;
+
+        let err = desired_objects(&spec, "prod", "default", &ctx())
+            .expect_err("a plaintext non-loopback endpoint with allowHttp unset must refuse");
+        assert_eq!(
+            err,
+            RenderError::PlaintextS3Endpoint {
+                endpoint: "http://minio:9000".to_string(),
+            }
+        );
+        let message = err.to_string();
+        for needle in [
+            "spec.storage.s3.endpoint",
+            "spec.storage.s3.allowHttp",
+            "http://minio:9000",
+        ] {
+            assert!(
+                message.contains(needle),
+                "the refusal must name {needle}, got: {message}"
+            );
+        }
+
+        // The remediation the message asks for renders cleanly, and so does
+        // the https:// endpoint that needs no flag at all.
+        spec.storage.s3.allow_http = true;
+        desired_objects(&spec, "prod", "default", &ctx())
+            .expect("allowHttp true renders the plaintext endpoint");
+        spec.storage.s3.allow_http = false;
+        spec.storage.s3.endpoint = Some("https://minio.example:9000".to_string());
+        desired_objects(&spec, "prod", "default", &ctx())
+            .expect("an https endpoint renders without the field");
+
+        // Loopback is unchanged: a plaintext connection that never leaves the
+        // host has no on-path attacker, and the kind lane depends on it.
+        spec.storage.s3.endpoint = Some("http://127.0.0.1:9000".to_string());
+        desired_objects(&spec, "prod", "default", &ctx())
+            .expect("a loopback plaintext endpoint renders unflagged");
+        // Real AWS S3 (no endpoint at all) never reaches the rule.
+        spec.storage.s3.endpoint = None;
+        desired_objects(&spec, "prod", "default", &ctx()).expect("no endpoint renders unflagged");
     }
 
     #[test]
@@ -6798,10 +6930,11 @@ mod tests {
         }
     }
 
-    /// The input hash is stable for one spec and changes for each of the five
+    /// The input hash is stable for one spec and changes for each of the six
     /// inputs it covers, and only those. Pins the exact set of fields that
     /// re-trigger qualification (issue #36): a change to any of them is a
-    /// different store to prove, an unrelated change is not.
+    /// different store to prove, or (for `allowHttp`, issue #1707) a change to
+    /// whether the qualification can run at all; an unrelated change is not.
     #[test]
     fn qualify_input_hash_tracks_exactly_the_qualified_inputs() {
         let spec = base_spec();
@@ -6822,12 +6955,23 @@ mod tests {
         image.image = "registry.example/ravel:v2".to_string();
         let mut creds = spec.clone();
         creds.storage.s3.credentials_secret_ref.name = "other-s3".to_string();
+        // `allowHttp` is in the hash (finding 3, issue #1707) even though it
+        // does not select a different store: the hash also gates whether the
+        // spec is re-checked at all, and flipping this field is the
+        // remediation an operator applies to a cluster whose endpoint was
+        // refused. Excluding it would leave that edit unqualified -- the
+        // qualify Job never re-runs with `RAVEL_S3_ALLOW_HTTP` set, so
+        // nothing proves `ravel-cli` can reach the store over plaintext
+        // before the Deployments are allowed up.
+        let mut allow_http = spec.clone();
+        allow_http.storage.s3.allow_http = !spec.storage.s3.allow_http;
         for (label, changed) in [
             ("bucket", &bucket),
             ("region", &region),
             ("endpoint", &endpoint),
             ("image", &image),
             ("credentials secret", &creds),
+            ("allowHttp", &allow_http),
         ] {
             assert_ne!(
                 base,
@@ -6973,11 +7117,11 @@ mod tests {
     /// the env block it has today.
     #[test]
     fn qualify_job_carries_allow_http_only_when_set() {
+        // The `false` half needs an https:// endpoint: a plaintext endpoint
+        // with the field unset is refused at render time (finding 2).
         let mut spec = base_spec();
-        assert!(
-            !spec.storage.s3.allow_http,
-            "precondition: allowHttp defaults off"
-        );
+        spec.storage.s3.endpoint = Some("https://minio.example:9000".to_string());
+        spec.storage.s3.allow_http = false;
         let names_of = |job: &Job| -> Vec<String> {
             job.spec
                 .as_ref()
@@ -6996,7 +7140,11 @@ mod tests {
             "allowHttp false must render no env var, got: {names:?}"
         );
 
-        spec.storage.s3.allow_http = true;
+        let spec = base_spec();
+        assert!(
+            spec.storage.s3.allow_http,
+            "precondition: the baseline sets allowHttp for its plaintext endpoint"
+        );
         let job = desired_qualify_job(&spec, "prod", Some("rv-1"));
         let env = job
             .spec
@@ -7129,27 +7277,34 @@ mod tests {
     }
 
     /// The `activeDeadlineSeconds` and `backoffLimit` are tuning knobs, not
-    /// store-identity inputs: [`qualify_job_input_hash`] covers exactly the
-    /// bucket, region, endpoint, image, credentials Secret name, and credentials
-    /// `resourceVersion`, and never either knob, so tuning them leaves the hash
-    /// equal and does not re-run a qualification that already passed.
+    /// qualified inputs: [`qualify_job_input_hash`] covers exactly the
+    /// bucket, region, endpoint, `allowHttp`, image, credentials Secret name,
+    /// and credentials `resourceVersion`, and never either knob, so tuning them
+    /// leaves the hash equal and does not re-run a qualification that already
+    /// passed.
     #[test]
     fn the_deadline_is_not_part_of_the_qualified_input_hash() {
         let spec = base_spec();
 
-        // Recompute the hash over exactly the six qualified inputs, deliberately
-        // excluding both knobs, through the same `blake3_hex` composition the
-        // production hasher uses. If it folded either knob in, this reference
-        // would diverge and the assertion would fail.
+        // Recompute the hash over exactly the seven qualified inputs,
+        // deliberately excluding both knobs, through the same `blake3_hex`
+        // composition the production hasher uses. If it folded either knob in,
+        // this reference would diverge and the assertion would fail.
         let endpoint = match spec.storage.s3.endpoint.as_deref() {
             Some(value) => format!("\u{1}{value}"),
             None => "\u{0}".to_string(),
+        };
+        let allow_http = if spec.storage.s3.allow_http {
+            "true"
+        } else {
+            "false"
         };
         let credentials_rv = format!("\u{1}{}", "rv-1");
         let expected = blake3_hex(&[
             spec.storage.s3.bucket.as_str(),
             spec.storage.s3.region.as_str(),
             endpoint.as_str(),
+            allow_http,
             spec.image.as_str(),
             spec.storage.s3.credentials_secret_ref.name.as_str(),
             credentials_rv.as_str(),
@@ -7158,7 +7313,7 @@ mod tests {
         assert_eq!(
             qualify_job_input_hash(&spec, Some("rv-1")),
             expected,
-            "the qualified-input hash covers exactly the six store-identity inputs, never the \
+            "the qualified-input hash covers exactly the seven qualified inputs, never the \
              deadline or the backoff limit"
         );
     }
@@ -7200,19 +7355,21 @@ mod tests {
         );
     }
 
-    /// Golden value for [`qualify_job_input_hash`] (finding 3): the six
-    /// store-identity inputs of [`base_spec`] plus a fixed credentials
+    /// Golden value for [`qualify_job_input_hash`] (finding 3): the seven
+    /// qualified inputs of [`base_spec`] plus a fixed credentials
     /// `resourceVersion` hash to a fixed literal, stable by construction across
     /// Rust releases. The literal changed when the endpoint slot gained a
     /// presence byte (0x01 before a Some value) so endpoint: null and
-    /// endpoint: "" no longer collide, and again when the credentials
+    /// endpoint: "" no longer collide, again when the credentials
     /// `resourceVersion` slot gained the same presence byte so an unresolved
-    /// Secret (None) and a resolved empty version (Some("")) no longer collide.
+    /// Secret (None) and a resolved empty version (Some("")) no longer collide,
+    /// and again when `allowHttp` joined the hashed set (issue #1707), which
+    /// re-qualifies every existing cluster once on that upgrade.
     #[test]
     fn qualify_job_input_hash_golden_is_stable_by_construction() {
         assert_eq!(
             qualify_job_input_hash(&base_spec(), Some("rv-golden")),
-            "9dbbf674caab21157d312101c70e8d6947f8d86b14d075910a1e02779d7610fd",
+            "ee998b075cf112dde8b42bdc959dbaaed8cd9b629864a0a51f3da2eb4516edde",
         );
     }
 
@@ -7481,11 +7638,17 @@ mod tests {
             Some(value) => format!("\u{1}{value}"),
             None => "\u{0}".to_string(),
         };
+        let allow_http = if spec.storage.s3.allow_http {
+            "true"
+        } else {
+            "false"
+        };
         let credentials_rv = format!("\u{1}{}", "rv");
         let expected = blake3_hex(&[
             spec.storage.s3.bucket.as_str(),
             spec.storage.s3.region.as_str(),
             endpoint.as_str(),
+            allow_http,
             spec.image.as_str(),
             spec.storage.s3.credentials_secret_ref.name.as_str(),
             credentials_rv.as_str(),
