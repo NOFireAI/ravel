@@ -560,15 +560,16 @@ that decoder applies two caps per slice:
 | Cap | Value | Why it exists |
 |---|---|---|
 | Response frames | `MAX_SLICE_RESPONSE_FRAMES`, 1048576 | A slice emits one frame per returned run plus one terminal summary, so this is far above any ordinary slice. An empty frame costs two wire bytes, so the byte cap does not bound a frame count at the sizes a remote chooses. |
-| Aggregate wire bytes | `MAX_SLICE_RESPONSE_BYTES`, 64 MiB, lowered to the coordinator's own `max_bytes_scanned` when that is smaller | Applied to the encoded size of the frames this coordinator accepts. The 64 MiB ceiling is absolute: it applies with no configuration at all, and a configured `max_bytes_scanned` can only tighten it. Setting `max_bytes_scanned` above 64 MiB, or leaving it unlimited, does not raise it. |
+| Aggregate wire bytes | `MAX_SLICE_RESPONSE_BYTES`, 64 MiB, fixed | Applied to the encoded size of the frames this coordinator accepts. The ceiling is fixed and applies with no configuration at all. No setting raises or lowers it, `max_bytes_scanned` included: that is a store-byte budget on the compressed segment data a slice reads, enforced on a different path, and response frames are uncompressed wire bytes, so treating one as the other would refuse a slice that scanned well inside its configured budget. |
 
 Both caps are **per slice**, and each in-flight slice decodes through its own
 decoder holding the full cap. A query fans out to at most
 `max_parallel_slices` slices at once, which defaults to 8, so one query can
 make a coordinator hold up to 8 times the per-slice byte cap in wire bytes,
-512 MiB at the defaults, and more once those bytes are decoded into the
-in-memory series shapes. Lower `max_parallel_slices`, or `max_bytes_scanned`,
-to bound a coordinator more tightly than that.
+512 MiB, and more once those bytes are decoded into the in-memory series
+shapes. Lowering `max_parallel_slices` is what bounds a coordinator more
+tightly than that; `max_bytes_scanned` does not, because it does not move the
+per-slice wire cap.
 
 Both caps are checked before a frame is decoded or kept, and the client stops
 pulling from the stream at the first breach rather than reading it to the end.
