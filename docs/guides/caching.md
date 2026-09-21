@@ -321,42 +321,73 @@ in-process, which is what the `ravel-bench` logs scan does.
 
 Everything above is a read cache: a cache of object bytes whose ceiling is a
 share of the process memory budget. The catalog also keeps two per-tenant
-caches of decoded commit and compaction records, and they are bounded by an
-entry count rather than by a share of that budget, so their memory comes out
-of what is left after the carved shares, never out of them. Budget for them
-separately.
+caches of decoded commit and compaction records, and neither takes a share of
+that budget, so their memory comes out of what is left after the carved
+shares, never out of them. Budget for them separately.
 
-One capacity bounds both caches independently, so the worst case is twice the
-entry count. The capacity is derived per deployment from the shard count, the
-signal count and the configured max flush delay, not from a flat constant:
+One capacity bounds both caches independently. The capacity is derived per
+deployment from the shard count, the signal count and the configured max flush
+delay, not from a flat constant:
 
 ```text
 shards * 6 signals * ceil(3600 / max_flush_delay_seconds) * 3 unsealed hours
 ```
 
-floored at 10,000 entries and capped at 30,000. At the cap that is
-`30,000 x 750 bytes per cached record x 2 caches` = 45 MB per actively-queried
-tenant, which is what the cap holds constant across every deployment shape
-(`--shards 64` derives 2,073,600 entries and 3.1 GB per tenant uncapped).
-Budget it as 45 MB times the number of tenants queried concurrently: 100 of
-them is 4.5 GB worst case, and idle tenants are reclaimed by idle-tenant
-eviction. At the shipped 2-second cadence the cap decides the value for every
-shard count, so `--shards` does not move it there.
+floored at 10,000 entries and capped at 30,000. The two caches then spend that
+capacity in different units, because their entries differ in kind:
+
+- The **commit-record cache** is bounded by the entry count directly. A
+  commit record is estimated at 750 bytes, so the cap is 22.5 MB per tenant.
+  That 750 is an estimate for a record carrying no typed attribute column
+  statistics, not a size the code enforces: `CommitRecord.declared_column_stats`
+  is a repeated field with no cap in the proto or in validation, so a tenant
+  declaring many typed attribute columns per part sits above the estimate.
+- The **compaction-record cache** is bounded in bytes, at the same share:
+  `capacity x 750 bytes`, 22.5 MB per tenant at the cap. It cannot use an
+  entry count, because a compaction record carries one
+  `CompactionInputIdentity` per L0 segment it merged and that list is capped
+  neither by the format nor by validation. One L1 record over 1,800 L0
+  segments charges about 137 KB, roughly 180 times the per-entry estimate, so
+  an entry count alone would have let a single tenant hold hundreds of times
+  the figure below. The cache evicts oldest-first until its charged bytes are
+  back inside the budget, so the number is a bound rather than a projection.
+
+So the worst case is 45 MB per actively-queried tenant, half of it enforced in
+bytes and half of it resting on the per-entry estimate above. That is what the
+cap holds constant across every deployment shape (`--shards 64` derives
+2,073,600 entries and 3.1 GB per tenant uncapped). Budget it as 45 MB times
+the number of tenants queried concurrently: 100 of them is 4.5 GB worst case,
+and idle tenants are reclaimed by idle-tenant eviction. At the shipped
+2-second cadence the cap decides the value for every shard count, so
+`--shards` does not move it there.
 
 The capacity covers a tenant's unsealed tail up to the cap, not the whole
-tail. Two things put a real tail past it: the cap itself, since the estimate
-at the shipped defaults is already 129,600 entries, and the flush cadence
-term, which counts the age trigger only while a shard also flushes as soon as
-its estimated object bytes reach `target_bytes` (8 MiB by default). A tenant
-over the bound pays a per-record GET on every resolve, which is what it paid
-before the capacity was derived. The levers are a coarser `--max-flush-delay`
-or a lower shard count, both of which shrink the tail itself.
+tail. Three things put a real tail past it: the cap itself, since the estimate
+at the shipped defaults is already 129,600 entries; the flush cadence term,
+which counts the age trigger only while a shard also flushes as soon as its
+estimated object bytes reach `target_bytes` (8 MiB by default); and the three
+unsealed hours, which assume the default seal parameters. That last term is
+the one an operator can move: `--gc-max-flush-lifetime 4h` puts the seal
+margin at 4h20m, so the oldest unsealed hour can have started 5h20m ago and
+the tail spans up to 5.34 hours, which three under-counts by about 1.8x. A
+tenant over the bound pays a per-record GET on every resolve, which is what it
+paid before the capacity was derived. The levers are a coarser
+`--max-flush-delay`, a shorter `--gc-max-flush-lifetime`, or a lower shard
+count, all of which shrink the tail itself.
 
 `--disable-cache` does not turn these caches off, because a resolve with no
 record cache re-reads every record from the store. It does hold the capacity
 at the 10,000-entry floor rather than the derived value, so the flag costs
 about 15 MB per actively-queried tenant, the same as before the capacity was
-derived.
+derived: 7.5 MB of compaction-record bytes, enforced, plus 10,000 commit
+records at the estimate above.
+
+Neither cache is exported. The resident-bytes gauge covers the object-byte
+read caches only (`ravel_cache_resident_bytes` is emitted for the fetch
+family's tiers, and `ravel_cache_max_bytes` for the fetch and catalog byte
+ceilings), so there is no scrape-time figure for how many bytes a tenant's
+record caches actually hold. The numbers above are bounds to budget against,
+not something to read back off a running server.
 
 ## What is not cached
 

@@ -120,14 +120,20 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// [`ravel_catalog::derive_cache_capacity_per_tenant`]: `shard_count * 6
 /// signals * ceil(3600 / max_flush_delay_secs) * 3 unsealed hours`, clamped
 /// between the 10,000-entry floor and the cap that holds one actively-queried
-/// tenant to 45 MB across the two record caches the bound sizes. So the
-/// record caches hold as much of a tenant's unsealed hot region, across every
-/// signal it ingests, as the cap covers, rather than a flat cadence-blind
+/// tenant to 45 MB across the two record caches the bound sizes. Only the
+/// commit-record half of that is an entry count: the compaction-record cache
+/// holds entries whose size grows with their input list, so it is bounded in
+/// bytes at the same per-cache share
+/// ([`ravel_catalog::CatalogConfig::compaction_cache_max_bytes_per_tenant`]).
+/// So the record caches hold as much of a tenant's unsealed hot region, across
+/// every signal it ingests, as the cap covers, rather than a flat cadence-blind
 /// constant, and a wide deployment still cannot make one tenant cost
 /// gigabytes. It is up to 30,000 records of tail, not the whole tail: the cap
-/// binds before the estimate at the shipped defaults, and the cadence term
+/// binds before the estimate at the shipped defaults, the cadence term
 /// counts the age flush trigger only, so a size-triggered tenant seals more
-/// records per shard-hour than it assumes. See
+/// records per shard-hour than it assumes, and the three unsealed hours assume
+/// the default seal parameters, which a longer `--gc-max-flush-lifetime`
+/// stretches. See
 /// [`ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT`] for both limits and
 /// the memory figures. Callers must pass the
 /// configured value, never
@@ -781,6 +787,13 @@ mod catalog_cache_tests {
             ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT,
             "--disable-cache is the memory-constrained-container flag, so it must not raise \
              record-cache memory above what the flat constant cost before the derivation"
+        );
+        assert_eq!(
+            catalog.config().compaction_cache_max_bytes_per_tenant(),
+            7_500_000,
+            "the compaction cache's byte budget follows the floor too, so the flag costs the \
+             7.5 MB per tenant that 10,000 entries were assumed to cost, not the 22.5 MB the \
+             derived capacity would budget"
         );
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
