@@ -115,7 +115,7 @@ directory).
 |---|---|---|
 | `--cache-max-bytes <n>` | fetcher cache derived: 25% of the process memory budget; catalog byte cache derived: 5% of the same budget (each `268435456`, 256 MiB, when memory cannot be read) | Maximum bytes the RAM tier holds. **Set**, it bounds **both** caches at that one value. **Unset**, the two derive independently from the process memory budget (effective, cgroup-capped memory minus a fixed overhead reserve, not raw host memory): the fetcher cache at 25% (`7516192768` on the 30 GB reference host) and the catalog byte cache at 5% (`1503238553`), a smaller separate ceiling so the two LRU caches do not each claim a quarter of RAM. Startup refuses to start, rather than silently clamping, if an explicit value here pushes the two resolved caps above the process memory budget (not under `--disable-cache`, which builds neither cache, so neither cap claims anything). Read once at startup; there is no live resize. |
 | `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by its own resolved RAM ceiling: the fetcher cache's disk tier by `--cache-max-bytes` or its derived 25% share, the catalog byte cache's by its own resolved value (the derived 5% share, or `--cache-max-bytes` when that flag is set explicitly). There is no separate disk-tier capacity flag. Absent, the process has a RAM tier only. Bytes written here are not SSE-KMS encrypted, and on Unix Ravel keeps what it writes here readable by its own user only (see "Two tiers" above for both). |
-| `--disable-cache` | off | Turns **both** caches off. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. It covers the caches of object bytes only: the catalog's two per-tenant record caches stay on, held at their 10,000-entry floor rather than the derived capacity, about 15 MB per actively-queried tenant. See [the catalog record caches](#the-catalog-record-caches-which-this-budget-does-not-cover). Because neither cache exists, neither ceiling is charged against the process memory budget: the whole budget goes to the shared SQL/fetch accountant, and the startup refusal above cannot fire, whatever `--cache-max-bytes` says. |
+| `--disable-cache` | off | Turns **both** caches off. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. It covers the caches of object bytes only: the catalog's two per-tenant record caches stay on, held at their 10,000-entry floor rather than the derived capacity, about 18 MB per actively-queried tenant. See [the catalog record caches](#the-catalog-record-caches-which-this-budget-does-not-cover). Because neither cache exists, neither ceiling is charged against the process memory budget: the whole budget goes to the shared SQL/fetch accountant, and the startup refusal above cannot fire, whatever `--cache-max-bytes` says. |
 | `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole regardless of size; set it to `0` to use the block-range path for every object. Read once at startup. Under a resolved fetch policy that reads every object whole (`--logs-fetch-policy request-minimal`, or `cost-based` at a profile whose bytes are free) this flag is **overridden**, and startup logs a WARN naming the value it overrode. |
 | `--logs-fetch-policy <policy>` | `cost-based` | The logs read shape. `request-minimal` reads every object whole in one covering GET, with no tail probe and no ranged read: the cost-preferring shape where transfer is free and the object-store bill is requests. `byte-minimal` uses ranged reads wherever they save more bytes than a request costs, for egress-billed and network-constrained deployments. `cost-based` derives the choice from `--store-cost-profile`; at the shipped reference profile (intra-region, transfer free) that resolves to request-minimal behaviour, so **a deployment on default flags reads log objects whole**. `latency-first` resolves the same byte quantities as `byte-minimal`; it is an intent for deployments where cold wall-clock matters more than the request bill, and it pays off only once GET concurrency is also raised explicitly (it sets no concurrency default of its own), which carries a memory caveat -- see the operations guide before turning it on. Read once at startup; the running process never changes its own policy. The resolved policy, profile, and byte quantities are logged at startup on the `logs fetch policy resolved` line. |
 | `--store-cost-profile <path>` | reference profile (`s3-intra-region-2026`) | TOML file carrying this deployment's object-store prices in integer nanodollars: `name`, `put_class_nanodollars`, `get_class_nanodollars`, `transfer_nanodollars_per_gib`, `retrieval_nanodollars_per_gib`, and optionally `delete_class_nanodollars`. Only `--logs-fetch-policy cost-based` reads it, to derive how many transferred bytes one saved request is worth; no price reaches the fetch layer. An unreadable file, invalid TOML, an unknown key, or a blank `name` fails startup rather than falling back to the reference prices. |
@@ -139,7 +139,7 @@ against its real working set, not against the sum of the caps. Set an explicit
 host, or `--disable-cache` to hold no read-cache memory at all and leave the
 entire process memory budget to the query path. `--disable-cache` does not
 reach the catalog record caches, which are not read caches of object bytes and
-cost about 15 MB per actively-queried tenant under it; see
+cost about 18 MB per actively-queried tenant under it; see
 [the catalog record caches](#the-catalog-record-caches-which-this-budget-does-not-cover)
 below.
 
@@ -333,30 +333,42 @@ delay, not from a flat constant:
 shards * 6 signals * ceil(3600 / max_flush_delay_seconds) * 3 unsealed hours
 ```
 
-floored at 10,000 entries and capped at 30,000. The two caches then spend that
-capacity in different units, because their entries differ in kind:
+floored at 10,000 entries and capped at 25,000. Neither cache is denominated in
+entries alone: each is ALSO held to a byte budget of `capacity x 900 bytes`,
+22.5 MB per tenant at the cap, and evicts against whichever bound binds first.
+Neither record type has a bounded size, which is why:
 
-- The **commit-record cache** is bounded by the entry count directly. A
-  commit record is estimated at 750 bytes, so the cap is 22.5 MB per tenant.
-  That 750 is an estimate for a record carrying no typed attribute column
-  statistics, not a size the code enforces: `CommitRecord.declared_column_stats`
-  is a repeated field with no cap in the proto or in validation, so a tenant
-  declaring many typed attribute columns per part sits above the estimate.
-- The **compaction-record cache** is bounded in bytes, at the same share:
-  `capacity x 750 bytes`, 22.5 MB per tenant at the cap. It cannot use an
-  entry count, because a compaction record carries one
+- The **commit-record cache** is bounded in bytes at
+  `commit_cache_max_bytes_per_tenant`. `CommitRecord.declared_column_stats` is
+  a repeated field with no cap in the proto, in validation, or in the
+  tenant-config declared-column path, so a record declaring 200 typed
+  attribute columns charges about 20 KB where an ordinary one charges 864
+  bytes, more than twenty times the planning rate. The cache charges each
+  entry an estimate of the live heap it holds and evicts least-recently-used
+  until the charged total is back inside the budget.
+- The **compaction-record cache** is bounded in bytes at the same share,
+  `compaction_cache_max_bytes_per_tenant`. A compaction record carries one
   `CompactionInputIdentity` per L0 segment it merged and that list is capped
   neither by the format nor by validation. One L1 record over 1,800 L0
-  segments charges about 137 KB, roughly 180 times the per-entry estimate, so
-  an entry count alone would have let a single tenant hold hundreds of times
-  the figure below. The cache evicts oldest-first until its charged bytes are
-  back inside the budget, so the number is a bound rather than a projection.
+  segments charges about 137 KB, roughly 150 times the planning rate, so an
+  entry count alone would have let a single tenant hold hundreds of times the
+  figure below. The cache evicts oldest-first until its charged bytes are back
+  inside the budget.
 
-So the worst case is 45 MB per actively-queried tenant, half of it enforced in
-bytes and half of it resting on the per-entry estimate above. That is what the
-cap holds constant across every deployment shape (`--shards 64` derives
-2,073,600 entries and 3.1 GB per tenant uncapped). Budget it as 45 MB times
-the number of tenants queried concurrently: 100 of them is 4.5 GB worst case,
+The 900 bytes is a PLANNING rate the capacity is derived against, not a
+per-entry cap: an ordinary stats-free commit entry charges 864 bytes (a
+119-byte commit key held twice, the decoded struct, and the record's own heap),
+and what each cache enforces is the summed charge against its budget. So the
+capacity is an entry cap rather than a guaranteed residency: a tenant whose
+records carry typed attribute column statistics holds proportionally fewer than
+`capacity` of them, and the memory stays inside the figure either way.
+
+So the worst case is 45 MB per actively-queried tenant, both halves enforced in
+bytes by their own eviction path rather than projected from a per-entry
+estimate. That is what the cap holds constant across every deployment shape
+(`--shards 64` derives 2,073,600 entries and 3.7 GB per tenant uncapped).
+Budget it as 45 MB times the number of tenants queried concurrently: 100 of
+them is 4.5 GB worst case,
 and idle tenants are reclaimed by idle-tenant eviction. At the shipped
 2-second cadence the cap decides the value for every shard count, so
 `--shards` does not move it there.
@@ -378,9 +390,8 @@ count, all of which shrink the tail itself.
 `--disable-cache` does not turn these caches off, because a resolve with no
 record cache re-reads every record from the store. It does hold the capacity
 at the 10,000-entry floor rather than the derived value, so the flag costs
-about 15 MB per actively-queried tenant, the same as before the capacity was
-derived: 7.5 MB of compaction-record bytes, enforced, plus 10,000 commit
-records at the estimate above.
+about 18 MB per actively-queried tenant: a 9 MB byte budget for each of the
+two caches, both enforced.
 
 Neither cache is exported. The resident-bytes gauge covers the object-byte
 read caches only (`ravel_cache_resident_bytes` is emitted for the fetch

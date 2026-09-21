@@ -1111,11 +1111,20 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    their bucket is sealed and folded). A hit is counted as a cache hit with
    the cached object's byte size and issues no GET; a miss is counted as a
    miss and pays the GET, exactly as the part and postings caches do. The
-   bound is `cache_capacity_per_tenant`, in entries, evicted
-   least-recently-used so a hot ingest hour survives a wider one-off scan or
-   a fold's sweep of older buckets. Its default of 10,000 entries is sized to
-   hold a 10,000-segment hot region whole, at roughly 750 bytes per entry
-   (about 8 MB per actively-queried tenant); `0` disables the cache. A bound
+   cache carries TWO bounds, and evicts least-recently-used against whichever
+   binds first so a hot ingest hour survives a wider one-off scan or a fold's
+   sweep of older buckets: an entry cap of `cache_capacity_per_tenant`, and a
+   byte budget of `cache_capacity_per_tenant * RECORD_CACHE_ENTRY_BYTES`
+   (`CatalogConfig::commit_cache_max_bytes_per_tenant`). The byte budget is
+   what actually holds the memory figure, because a `CommitRecord` has no
+   bounded size: its `declared_column_stats` list is capped neither by the
+   format nor by validation, so a record declaring 200 columns charges about
+   20 KB where an ordinary one charges 864 bytes. Each entry is charged an
+   estimate of the live heap it holds and eviction runs until the tenant's
+   summed charge is inside the budget. At the shipped defaults the derivation
+   returns the 25,000-entry cap, so the budget is 22.5 MB per
+   actively-queried tenant; at the 10,000-entry floor (which is also what
+   `--disable-cache` holds) it is 9 MB. `0` disables the cache. A bound
    below a bucket's record count is worse than a small cache: this step's two
    passes (the concurrent prewarm, then the sequential include walk) then
    evict each other's entries and every record is read twice.
@@ -1426,11 +1435,17 @@ All five caches (`RecordCache`, `CompactionRecordCache`, `HeadCache`,
 `PartCache`, `PostingsCache`) record a cache hit or miss on every lookup and
 add the cached object's original wire-encoded byte size on a hit; a miss
 does not double-count bytes the funnel GET that filled the cache already
-recorded. `RecordCache` evicts least-recently-used within its per-tenant
-bound (`cache_capacity_per_tenant`); the other three per-tenant caches evict
-by insertion order. `HeadCache` additionally carries a process-wide capacity
-bound (`head_cache_capacity`, default 10,000 (tenant, signal) entries, FIFO
-eviction), closing the one cache of the five that previously had a TTL but
+recorded. The two record caches carry a per-tenant BYTE budget as well as the
+`cache_capacity_per_tenant` entry cap, because neither record type has a
+bounded size, and evict against whichever binds first: `RecordCache` evicts
+least-recently-used under `commit_cache_max_bytes_per_tenant`,
+`CompactionRecordCache` evicts by insertion order under
+`compaction_cache_max_bytes_per_tenant`. The two budgets are equal shares of
+the same per-tenant figure (22.5 MB each at the 25,000-entry cap, 45 MB
+together). `PartCache` and `PostingsCache` are bounded by their entry count
+alone and evict by insertion order. `HeadCache` additionally carries a
+process-wide capacity bound (`head_cache_capacity`, default 10,000 (tenant,
+signal) entries, FIFO eviction), closing the one cache of the five that previously had a TTL but
 no bound on the number of tenants it could grow to hold.
 
 ## Compaction protocol (ADR-0018)

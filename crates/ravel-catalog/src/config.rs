@@ -53,16 +53,16 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 /// deployment with very few shards and a very long flush delay still gets the
 /// same protection the fixed constant used to give everyone.
 ///
-/// An ordinary commit-record entry costs about 863 bytes, which
+/// An ordinary commit-record entry costs about 864 bytes, which
 /// [`RECORD_CACHE_ENTRY_BYTES`] rounds up to 900: a 119-byte commit key held
 /// twice (the map key and the recency index), the 224-byte decoded
-/// `CommitRecord` plus 209 bytes of its own heap (16-byte tenant hash, 36-byte
-/// writer uuid, 125-byte data object key, 32-byte content hash), and the two
+/// `CommitRecord` plus 210 bytes of its own heap (16-byte tenant hash, 36-byte
+/// writer uuid, 126-byte data object key, 32-byte content hash), and the two
 /// maps' slot overhead. That is a PLANNING figure for a record carrying no
 /// declared column statistics; what each cache enforces is the byte budget
 /// below, charged per entry against what the entry actually holds
 /// (`the_per_entry_planning_figure_bounds_an_ordinary_records_charge` in
-/// `crate::cache` pins the 863 against the constant).
+/// `crate::cache` pins the 864 against the constant).
 ///
 /// The capacity sizes TWO per-tenant caches, not one
 /// (`RECORD_CACHES_PER_TENANT`), and each is held to an equal share of the
@@ -124,7 +124,7 @@ pub const DEFAULT_CACHE_CAPACITY_PER_TENANT: usize = 10_000;
 /// The cap exists because the derivation multiplies shard count by signal
 /// count by flush cadence and so grows without bound on a wide deployment:
 /// `--shards 64` at the shipped 2-second cadence derives 2,073,600 entries
-/// uncapped, 3.1 GB per actively-queried tenant, with nothing process-wide to
+/// uncapped, 3.7 GB per actively-queried tenant, with nothing process-wide to
 /// stop a second tenant costing the same again. Capping in BYTES rather than
 /// in entries is what makes it checkable: whatever `--shards` and
 /// `--max-flush-delay` are set to, one actively-queried tenant costs at most
@@ -214,7 +214,7 @@ pub const HOT_REGION_HOURS: u64 = 3;
 ///
 /// It is a planning rate, not a per-entry cap: a cache charges each entry what
 /// that entry actually holds and evicts against the summed charge, so an
-/// ordinary 863-byte commit record leaves headroom under it and a record
+/// ordinary 864-byte commit record leaves headroom under it and a record
 /// carrying declared column statistics costs more than one of these and takes
 /// more than one entry's worth of the budget.
 pub const RECORD_CACHE_ENTRY_BYTES: u64 = 900;
@@ -636,7 +636,7 @@ pub struct CatalogConfig {
 impl CatalogConfig {
     /// One record cache's equal share of the per-tenant byte budget:
     /// [`cache_capacity_per_tenant`](Self::cache_capacity_per_tenant) times
-    /// [`RECORD_CACHE_ENTRY_BYTES`]. 22.5 MB at the 25,000-entry cap, 7.5 MB at
+    /// [`RECORD_CACHE_ENTRY_BYTES`]. 22.5 MB at the 25,000-entry cap, 9 MB at
     /// the 10,000-entry floor `--disable-cache` holds. Two caches hold a share
     /// each ([`RECORD_CACHES_PER_TENANT`]), so the per-tenant total is twice
     /// this: [`MAX_RECORD_CACHE_BYTES_PER_TENANT`] at the cap.
@@ -723,7 +723,7 @@ mod tests {
     /// Pins the derivation at the shipped ingest defaults (`shard_count` 4,
     /// `max_flush_delay` 2s, issue #1735): `4 shards * 6 signals * ceil(3600
     /// / 2) flushes * 3 hours = 129_600` uncapped, which the 45 MB per-tenant
-    /// budget caps at 30,000.
+    /// budget caps at 25,000.
     #[test]
     fn derive_at_ingest_defaults_is_the_cap() {
         let uncapped = 4 * SIGNAL_STREAMS * 1_800 * HOT_REGION_HOURS;
@@ -734,7 +734,7 @@ mod tests {
         );
         assert_eq!(
             derive_cache_capacity_per_tenant(4, Duration::from_secs(2)),
-            30_000
+            25_000
         );
     }
 
@@ -776,8 +776,8 @@ mod tests {
     }
 
     /// `--shards 64`, the case that motivated the cap: 2,073,600 entries
-    /// uncapped, 3.1 GB per actively-queried tenant across the two caches the
-    /// bound sizes. Capped it is 30,000 entries and exactly the 45 MB budget,
+    /// uncapped, 3.7 GB per actively-queried tenant across the two caches the
+    /// bound sizes. Capped it is 25,000 entries and exactly the 45 MB budget,
     /// the figure docs/guides/operations.md quotes.
     #[test]
     fn a_64_shard_deployment_is_capped_at_the_stated_memory_budget() {
@@ -785,12 +785,12 @@ mod tests {
         assert_eq!(uncapped, 2_073_600);
         assert_eq!(
             uncapped * RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT,
-            3_110_400_000,
-            "uncapped, one tenant would cost 3.1 GB across both caches"
+            3_732_480_000,
+            "uncapped, one tenant would cost 3.7 GB across both caches"
         );
 
         let capped = derive_cache_capacity_per_tenant(64, Duration::from_secs(2));
-        assert_eq!(capped, 30_000);
+        assert_eq!(capped, 25_000);
         assert_eq!(
             capped as u64 * RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT,
             MAX_RECORD_CACHE_BYTES_PER_TENANT,

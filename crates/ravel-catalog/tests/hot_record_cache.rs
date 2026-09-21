@@ -535,7 +535,7 @@ async fn a_faulted_record_get_leaves_the_other_records_cached() {
 /// second-resolve one: a real run reports `left: 33600, right: 16800` there,
 /// because both of `process_bucket`'s passes re-read every record once the
 /// bound is exceeded. The second-resolve assertion is never reached under the
-/// lever. At `derive_cache_capacity_per_tenant(4, 2s)` (30,000, the 45 MB
+/// lever. At `derive_cache_capacity_per_tenant(4, 2s)` (25,000, the 45 MB
 /// per-tenant cap that binds at the shipped defaults), the tail fits and the
 /// second resolve issues none.
 #[tokio::test]
@@ -548,7 +548,7 @@ async fn second_resolve_over_a_16800_record_unsealed_tail_issues_no_record_gets(
     let derived =
         ravel_catalog::derive_cache_capacity_per_tenant(4, std::time::Duration::from_secs(2));
     assert_eq!(
-        derived, 30_000,
+        derived, 25_000,
         "pin the derived capacity at the shipped ingest defaults"
     );
 
@@ -579,7 +579,7 @@ async fn second_resolve_over_a_16800_record_unsealed_tail_issues_no_record_gets(
 ///
 /// The fixture is one shard on a 4-second flush cadence, where the derived
 /// capacity is `1 * 6 signals * 900 flushes * 3 unsealed hours = 16_200`:
-/// clear of the 10,000-entry floor below it and of the 30,000-entry cap above
+/// clear of the 10,000-entry floor below it and of the 25,000-entry cap above
 /// it, so the signal term alone decides the outcome. Three signals of 4,000
 /// records is a 12,000-record tail, which fits 16,200 and does not fit the
 /// 10,000 the single-signal derivation would have produced here (`1 * 900 * 3

@@ -109,7 +109,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   10,000-entry constant, and is capped at a stated per-tenant memory budget**
   (issue #1735). The new `ravel_catalog::derive_cache_capacity_per_tenant`
   computes `shards * 6 signals * ceil(3600 / flush_secs) * 3 unsealed hours`,
-  floored at the old constant and capped at 30,000 entries;
+  floored at the old constant and capped at 25,000 entries;
   `build_catalog` calls it with the server's resolved `--max-flush-delay`
   instead of the flat default. The signal term matters because the caches are
   partitioned by tenant and not by (tenant, signal): a tenant ingesting
@@ -117,22 +117,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   single-signal derivation under-sizes it by that multiple and leaves it
   thrashing. The cap matters because one capacity bounds two caches per tenant
   (commit records and L1 compaction records), so the worst case is
-  `30,000 x 750 bytes x 2` = 45 MB per actively-queried tenant, held constant
+  `25,000 x 900 bytes x 2` = 45 MB per actively-queried tenant, held constant
   across every deployment shape: `--shards 64` would otherwise derive
-  2,073,600 entries and 3.1 GB per tenant, with nothing process-wide bounding
-  the next tenant. The two caches reach that figure in different units,
-  because only one of them holds entries of a bounded size. The commit-record
-  cache evicts on the entry count, and 750 bytes is an estimate for it rather
-  than a size the code enforces (`CommitRecord.declared_column_stats` is an
-  uncapped repeated field). The L1 compaction-record cache is bounded in BYTES
-  at the same 22.5 MB share, charging each entry an estimate of its live heap
-  and evicting oldest-first until the total is inside the budget: a
-  `CompactionRecord` carries one `CompactionInputIdentity` per compacted L0
-  segment, capped neither by the proto nor by `validate_compaction`, so one L1
-  record over 1,800 L0 segments charges about 137 KB, 180 times the per-entry
-  estimate, and an entry-count bound would have let one tenant exceed its
-  share of the 45 MB by two orders of magnitude. These caches sit outside
-  ADR-1170's carved shares, so an operator budgets 45 MB times the number of
+  2,073,600 entries and 3.7 GB per tenant, with nothing process-wide bounding
+  the next tenant. NEITHER cache is bounded by its entry count alone, because
+  neither record type has a bounded size: each is also held to an equal share
+  of that budget in BYTES (22.5 MB at the cap), charging each entry an
+  estimate of the live heap it holds and evicting until the tenant's summed
+  charge is inside the share. `CommitRecord.declared_column_stats` is a
+  repeated field capped neither by the proto, by `validate`, nor by the
+  tenant-config declared-column path, so a record declaring 200 typed
+  attribute columns charges about 20 KB against the 864 an ordinary one does;
+  the commit-record cache evicts least-recently-used against
+  `commit_cache_max_bytes_per_tenant`. A `CompactionRecord` carries one
+  `CompactionInputIdentity` per compacted L0 segment, capped neither by the
+  proto nor by `validate_compaction`, so one L1 record over 1,800 L0 segments
+  charges about 137 KB, 150 times the per-entry planning rate; the L1
+  compaction-record cache evicts oldest-first against
+  `compaction_cache_max_bytes_per_tenant`. An entry-count bound would have let
+  one tenant exceed its share of the 45 MB by two orders of magnitude on
+  either side. The 900 bytes is a planning rate the capacity is derived
+  against, not a per-entry cap, so the capacity is an entry cap rather than a
+  guaranteed residency: a tenant whose records carry typed attribute column
+  statistics holds proportionally fewer of them and the memory stays inside
+  the figure. These caches sit outside ADR-1170's carved shares, so an
+  operator budgets 45 MB times the number of
   concurrently queried tenants on top of them. The capacity covers a tenant's
   unsealed tail up to the cap, not whatever the tail actually is: at the
   shipped defaults the estimate is already 129,600 entries, the flush-cadence
@@ -141,6 +150,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   term assumes the default seal parameters, under-counting by about 1.8x at
   `--gc-max-flush-lifetime 4h`. Over the bound a resolve pays per-record GETs
   as it did before, so the direction is safe. `--disable-cache` keeps the flat
+  10,000-entry capacity rather than the derived one, and with it a 9 MB byte
+  budget for each of the two caches, so the memory-constrained-container flag
+  stays on the lowest capacity the code supports short of disabling the
+  resolve path's record cache entirely. No new CLI flag is added; the
+  capacity is a function of existing ingest configuration.
   10,000-entry capacity rather than the derived one, and with it a 7.5 MB
   compaction-record byte budget, so the memory-constrained-container flag
   never costs more record-cache memory than it did before this change. No new
