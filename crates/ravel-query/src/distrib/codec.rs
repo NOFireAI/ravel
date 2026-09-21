@@ -30,7 +30,7 @@ use ravel_rspan::{SpanRecord, StatusCode};
 use ravel_segment::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 use ravel_types::logstream::{AttrValue, LogStreamId};
 
-use crate::config::{ByteLimit, EngineConfig};
+use crate::config::EngineConfig;
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::{FetchedHistogramSeries, FetchedSeriesSoa, SamplePriority};
 use crate::span_fetcher::SpanRow;
@@ -91,10 +91,19 @@ pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_SLICE_RESPONSE_FRAMES: usize = 1 << 20;
 
 /// The absolute ceiling on the wire bytes a coordinator accepts for ONE slice
-/// (issue #1687). Not a tuning knob: no configuration raises it, and it applies
-/// on a deployment that configured nothing. [`slice_byte_cap`] combines it with
-/// `EngineConfig::max_bytes_scanned` by taking the LOWER of the two, so a
-/// configured budget can only lower the ceiling.
+/// (issue #1687). Not a tuning knob: it is fixed, no configuration raises or
+/// lowers it, and it applies on a deployment that configured nothing.
+/// [`slice_byte_cap`] returns it for every config.
+///
+/// In particular it is independent of `EngineConfig::max_bytes_scanned`, which
+/// is a STORE-byte budget enforced on a different path (over
+/// `total_s3_bytes` as slices complete) and is not the same measure: since
+/// #1725 each slice carries the query's whole `max_bytes_scanned` as its own
+/// store-byte budget, so a slice may legitimately scan that many compressed
+/// store bytes, and a scalar sample costs at least 9 wire bytes uncompressed.
+/// Letting the store budget lower this cap would refuse a slice that stayed
+/// inside the budget its operator configured, quoting a wire figure nobody
+/// set.
 ///
 /// The cap is PER SLICE, and every in-flight slice decodes through its own
 /// decoder holding the full cap, so a coordinator running
@@ -110,20 +119,19 @@ pub const MAX_SLICE_RESPONSE_FRAMES: usize = 1 << 20;
 /// bytes-scanned trip.
 pub const MAX_SLICE_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The per-slice wire-byte cap a coordinator running `config` applies: the
-/// lower of [`MAX_SLICE_RESPONSE_BYTES`] and the coordinator's own
-/// `max_bytes_scanned`.
+/// The per-slice wire-byte cap a coordinator running `config` applies:
+/// [`MAX_SLICE_RESPONSE_BYTES`], for every config.
 ///
-/// `ByteLimit::Unlimited` is an opt-out of the store-bytes budget, not of this
-/// ceiling, so it resolves to [`MAX_SLICE_RESPONSE_BYTES`] rather than to no
-/// cap. That is the case that matters most: both `EngineConfig::default` and
-/// the server's shipped query defaults resolve to `Unlimited`, so a stock
-/// deployment reaches this function through that arm.
-pub fn slice_byte_cap(config: &EngineConfig) -> u64 {
-    match config.max_bytes_scanned {
-        ByteLimit::Bounded(max) => max.min(MAX_SLICE_RESPONSE_BYTES),
-        ByteLimit::Unlimited => MAX_SLICE_RESPONSE_BYTES,
-    }
+/// The parameter is deliberately unread. This is the single place that decides
+/// a coordinator's wire cap, and what it decides is that nothing in the
+/// coordinator's configuration moves it: `max_bytes_scanned` is a store-byte
+/// budget, not a wire-byte one, and coupling the two here refused a slice that
+/// scanned inside its configured budget while its response frames, a larger
+/// and separately counted quantity, crossed the same number. Taking the
+/// config keeps that decision expressible against a real `EngineConfig` in a
+/// test rather than stated only in prose.
+pub fn slice_byte_cap(_config: &EngineConfig) -> u64 {
+    MAX_SLICE_RESPONSE_BYTES
 }
 
 /// The fragment-capability claim-set version (ADR-0071 amendment, decision 2).
@@ -328,8 +336,8 @@ pub enum CodecError {
          {max} frames for one slice"
     )]
     SliceFrameCapExceeded { frames: usize, max: usize },
-    /// The remote streamed more response bytes for one slice than the
-    /// coordinator's `max_bytes_scanned` allows (issue #1687 part B). `bytes`
+    /// The remote streamed more response bytes for one slice than
+    /// [`MAX_SLICE_RESPONSE_BYTES`] allows (issue #1687 part B). `bytes`
     /// counts the protobuf-encoded length of every frame received so far,
     /// including the one that crossed the cap; it is a wire-frame figure, not
     /// S3 bytes and not decoded in-memory size.
@@ -3614,13 +3622,35 @@ mod tests {
     }
 }
 
-/// Issue #1687: how the per-slice wire-byte cap resolves from a coordinator's
-/// configuration. The decoder that enforces it, and its refusal path, are
-/// covered by `super::slice_cap_tests` beside the decoder itself.
+/// Issue #1687: what the per-slice wire-byte cap is for a given coordinator
+/// configuration, which is the same fixed ceiling for all of them. The decoder
+/// that enforces it, and its refusal path, are covered by
+/// `super::slice_cap_tests` beside the decoder itself.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod slice_cap_tests {
     use super::*;
+    use crate::config::ByteLimit;
+
+    /// One series frame carrying `samples` samples: about 9 wire bytes each (a
+    /// 1-byte zigzag `ts_delta` plus a fixed64 `value_bits`), so a sample count
+    /// picks a wire size.
+    fn series_frame(id: u8, samples: usize) -> pb::FetchResponse {
+        pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Series(pb::SeriesFrame {
+                series_id: vec![id; 16],
+                labels: vec![pb::Label {
+                    name: "__name__".to_string(),
+                    value: "x".to_string(),
+                }],
+                runs: vec![pb::Run {
+                    ts_delta: vec![1i64; samples],
+                    value_bits: vec![1u64; samples],
+                    ..Default::default()
+                }],
+            })),
+        }
+    }
 
     /// The ceiling applies to a coordinator that configured no byte budget at
     /// all, which is every stock deployment: both `EngineConfig::default` and
@@ -3652,21 +3682,94 @@ mod slice_cap_tests {
         );
     }
 
-    /// A configured budget below the ceiling wins: the cap is the lower of the
-    /// two, so an operator can tighten it.
+    /// `max_bytes_scanned` is a STORE-byte budget and the per-slice cap is a
+    /// WIRE-byte ceiling. They count different things, so the ceiling is fixed
+    /// and a configured budget below it does not become the wire cap.
+    ///
+    /// Since #1725 a coordinator sends the query's whole `max_bytes_scanned` to
+    /// every slice as that slice's own store-byte budget, so a slice may
+    /// legitimately scan B compressed store bytes; its response frames are
+    /// uncompressed and cost at least 9 wire bytes per scalar sample, so a
+    /// wire cap of B refuses a slice that stayed inside the budget its operator
+    /// configured, quoting a figure nobody set.
+    ///
+    /// Two wrong implementations are ruled out, each by a different assertion:
+    ///
+    /// * The coupling left in place (`Bounded(max) => max.min(CEILING)`): the
+    ///   budget below is under the ceiling, so the cap assertions fail. An
+    ///   `Unlimited` config could not tell the two spellings apart, which is
+    ///   why this test configures a `Bounded` one.
+    /// * The cap removed rather than fixed (`slice_byte_cap` returning
+    ///   `u64::MAX`): the equality against the ceiling fails, and so does the
+    ///   refusal at the end, which drives a real frame across the real
+    ///   constant.
     #[test]
-    fn a_configured_budget_below_the_ceiling_wins() {
+    fn a_configured_store_byte_budget_does_not_lower_the_wire_ceiling() {
+        use prost::Message;
+
+        /// A store-byte budget an operator might plausibly set, well under the
+        /// wire ceiling: exactly the case the coupling broke.
+        const STORE_BUDGET: u64 = 1024 * 1024;
+        const { assert!(STORE_BUDGET < MAX_SLICE_RESPONSE_BYTES) };
+
         let config = EngineConfig {
-            max_bytes_scanned: ByteLimit::Bounded(4_096),
+            max_bytes_scanned: ByteLimit::Bounded(STORE_BUDGET),
             ..EngineConfig::default()
         };
-        assert_eq!(slice_byte_cap(&config), 4_096);
+        assert_eq!(slice_byte_cap(&config), MAX_SLICE_RESPONSE_BYTES);
+        assert_eq!(MAX_SLICE_RESPONSE_BYTES, 67_108_864);
+        assert_eq!(
+            crate::distrib::SliceStreamDecoder::new(&config).byte_cap(),
+            MAX_SLICE_RESPONSE_BYTES,
+            "the decoder built from that config enforces the ceiling, not the budget"
+        );
+
+        // A slice whose frames carry more wire bytes than that store budget is
+        // accepted, which is the behaviour the coupling removed.
+        let mut decoder = crate::distrib::SliceStreamDecoder::new(&config);
+        decoder
+            .push(series_frame(0, 200_000))
+            .expect("a slice past the store-byte budget in WIRE bytes is not a wire-cap breach");
+        assert!(
+            decoder.bytes_consumed() > STORE_BUDGET,
+            "the frame was meant to outweigh the store budget on the wire, got {}",
+            decoder.bytes_consumed()
+        );
+
+        // The ceiling itself still refuses, at its real value. One frame is
+        // enough: `push` measures before it decodes, so nothing this large is
+        // ever held decoded.
+        //
+        // 7_500_000 samples at about 9 wire bytes each is about 67.5 MB, just
+        // over the ceiling; the assertion below pins that rather than trusting
+        // the arithmetic.
+        let mut decoder = crate::distrib::SliceStreamDecoder::new(&config);
+        let huge = series_frame(1, 7_500_000);
+        assert!(
+            huge.encoded_len() as u64 > MAX_SLICE_RESPONSE_BYTES,
+            "the frame must actually cross the ceiling, it encodes to {}",
+            huge.encoded_len()
+        );
+        let err = decoder
+            .push(huge)
+            .expect_err("a frame past the ceiling is refused");
+        match crate::distrib::cap_refusal_error(&err) {
+            Some(crate::QueryError::TooManySliceBytes { bytes, max }) => {
+                assert_eq!(max, MAX_SLICE_RESPONSE_BYTES);
+                assert!(
+                    bytes > MAX_SLICE_RESPONSE_BYTES,
+                    "the refusal names the bytes it consumed ({bytes})"
+                );
+            }
+            other => panic!("expected a TooManySliceBytes refusal, got {other:?}"),
+        }
+        assert_eq!(decoder.frames_consumed(), 1);
     }
 
-    /// A configured budget above the ceiling does NOT raise it. The ceiling is
-    /// absolute: `max_bytes_scanned` governs store bytes a query may scan, and
-    /// letting it raise the per-slice wire cap would make a generous budget the
-    /// way to reopen the hole this cap closes.
+    /// A configured budget above the ceiling does NOT raise it either. The
+    /// ceiling is fixed in both directions: letting a generous
+    /// `max_bytes_scanned` raise the per-slice wire cap would make it the way
+    /// to reopen the hole this cap closes.
     #[test]
     fn a_configured_budget_above_the_ceiling_does_not_raise_it() {
         let config = EngineConfig {
@@ -3675,6 +3778,20 @@ mod slice_cap_tests {
         };
         const { assert!(1u64 << 30 > MAX_SLICE_RESPONSE_BYTES) };
         assert_eq!(slice_byte_cap(&config), MAX_SLICE_RESPONSE_BYTES);
+    }
+
+    /// The fan-out figure the docs quote: a query holds up to
+    /// `DEFAULT_MAX_PARALLEL_SLICES` times the per-slice cap in wire bytes at
+    /// once, 512 MiB at the defaults.
+    #[test]
+    fn the_documented_fan_out_worst_case_matches_the_constants() {
+        use super::super::partition::DEFAULT_MAX_PARALLEL_SLICES;
+
+        assert_eq!(DEFAULT_MAX_PARALLEL_SLICES, 8);
+        assert_eq!(
+            DEFAULT_MAX_PARALLEL_SLICES as u64 * MAX_SLICE_RESPONSE_BYTES,
+            512 * 1024 * 1024
+        );
     }
 
     /// The frame cap is not redundant with the byte cap: an empty frame is 2

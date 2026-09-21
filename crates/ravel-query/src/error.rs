@@ -46,12 +46,14 @@ pub enum QueryError {
     TooManySliceFrames { frames: usize, max: usize },
     /// A remote streamed more response frame bytes for one slice than the
     /// coordinator accepts (issue #1687 part B,
-    /// `distrib::codec::slice_byte_cap`). Distinct from
+    /// `distrib::codec::MAX_SLICE_RESPONSE_BYTES`). Distinct from
     /// [`QueryError::TooManyBytesScanned`], which counts the store bytes a
     /// query read: this counts the protobuf-encoded size of one slice's
     /// response frames, a figure that appears in neither the query's accounting
     /// nor `stats.fragments[].bytesReported`, so the message names the quantity
-    /// rather than leaving an operator to reconcile it against store bytes. A
+    /// rather than leaving an operator to reconcile it against store bytes. The
+    /// two limits are independent for the same reason: `max_bytes_scanned` does
+    /// not raise or lower this cap. A
     /// budget refusal like the caps above; both figures are the coordinator's
     /// own and carry no server state, so they are echoed to the caller.
     #[error(
