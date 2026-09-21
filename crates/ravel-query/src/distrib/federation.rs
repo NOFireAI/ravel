@@ -405,6 +405,15 @@ impl Federation {
                     continue;
                 }
                 Err(err) => {
+                    // A decoder cap breach (issue #1687 part B) is this
+                    // coordinator refusing to hold what the remote streamed,
+                    // not the remote answering badly: it keeps its budget class
+                    // and its counts, exactly as the `BudgetExceeded` arm below
+                    // keeps a remote's own refusal typed, instead of taking the
+                    // `Federation` redaction to a retryable 503.
+                    if let Some(refusal) = crate::distrib::cap_refusal_error(&err) {
+                        return Err(refusal);
+                    }
                     return Err(QueryError::Federation {
                         cluster: name.clone(),
                         reason: format!("remote returned a malformed response: {err}"),

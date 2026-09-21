@@ -63,9 +63,11 @@ pub fn accounting_stats_json(
 /// attaches this beside `accounting`/`estimate` only when a distributed run
 /// collected entries; a non-distributed query collects none, so the field is
 /// absent entirely. Each entry carries the slice's worker endpoint, its pinned
-/// segment count, the store bytes the worker reported, and the routing outcome
-/// (`ok` / `fallback` / `error`). No per-shard cardinality beyond the entries
-/// themselves: this is the response body, not the metric allowlist.
+/// segment count, the store bytes the worker reported, the response frame bytes
+/// the coordinator accepted off the wire for it (issue #1687 part B), and the
+/// routing outcome (`ok` / `fallback` / `error`). No per-shard cardinality
+/// beyond the entries themselves: this is the response body, not the metric
+/// allowlist.
 pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_json::Value {
     serde_json::Value::Array(
         entries
@@ -75,6 +77,7 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
                     "workerEndpoint": entry.worker_endpoint,
                     "segmentCount": entry.segment_count,
                     "bytesReported": entry.bytes_reported,
+                    "wireBytesConsumed": entry.wire_bytes_consumed,
                     "status": entry.status,
                 })
             })
@@ -579,8 +582,9 @@ mod catalog_cache_tests {
     }
 
     /// ADR-0071 (finding 4): `fragments_json` renders one camelCase object per
-    /// slice with the deliverable's four fields, and an empty input renders an
-    /// empty array (the query handler then omits the field entirely).
+    /// slice with the deliverable's fields plus `wireBytesConsumed` (issue
+    /// #1687 part B), and an empty input renders an empty array (the query
+    /// handler then omits the field entirely).
     #[test]
     fn fragments_json_renders_camelcase_per_slice_shape() {
         let entries = vec![
@@ -588,12 +592,14 @@ mod catalog_cache_tests {
                 worker_endpoint: "10.0.0.1:7000".to_string(),
                 segment_count: 3,
                 bytes_reported: 4096,
+                wire_bytes_consumed: 512,
                 status: "ok",
             },
             crate::distrib::FragmentStatEntry {
                 worker_endpoint: "192.0.2.1:9".to_string(),
                 segment_count: 1,
                 bytes_reported: 0,
+                wire_bytes_consumed: 0,
                 status: "fallback",
             },
         ];
@@ -603,8 +609,10 @@ mod catalog_cache_tests {
         assert_eq!(array[0]["workerEndpoint"], "10.0.0.1:7000");
         assert_eq!(array[0]["segmentCount"], 3);
         assert_eq!(array[0]["bytesReported"], 4096);
+        assert_eq!(array[0]["wireBytesConsumed"], 512);
         assert_eq!(array[0]["status"], "ok");
         assert_eq!(array[1]["workerEndpoint"], "192.0.2.1:9");
+        assert_eq!(array[1]["wireBytesConsumed"], 0);
         assert_eq!(array[1]["status"], "fallback");
         assert!(
             fragments_json(&[])
