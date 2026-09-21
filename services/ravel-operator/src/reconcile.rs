@@ -2305,9 +2305,16 @@ pub fn qualify_job_input_hash(
 /// so a backend that fails the object-store contract is caught at deploy time
 /// rather than crash-looping every server pod on a fresh bucket. Image and
 /// credentials mirror the server Deployment's shared
-/// `storage.s3.credentialsSecretRef`; the bucket, region, and endpoint reach
-/// `ravel-cli` through the same `RAVEL_S3_*` env vars it reads (clap `env`), the
-/// exact shape the kind lane's hand-run Job used.
+/// `storage.s3.credentialsSecretRef`; the bucket, region, endpoint, and
+/// `allowHttp` reach `ravel-cli` through the same `RAVEL_S3_*` env vars it
+/// reads (clap `env`), the exact shape the kind lane's hand-run Job used.
+///
+/// `allowHttp` is not part of [`qualify_job_input_hash`]: that hash covers
+/// store identity (which bucket, over which endpoint, with which
+/// credentials), and turning plaintext on or off does not change which store
+/// was qualified. Enabling it on a cluster whose Job was refused reaches the
+/// Job anyway, because a refused Job is a failed Job and the gate recreates a
+/// failed Job from the current spec on its retry backoff.
 ///
 /// The Job carries [`QUALIFY_SPEC_HASH_ANNOTATION`] so the controller re-runs it
 /// when its inputs change and skips it when they do not, and sets
@@ -2342,6 +2349,20 @@ pub fn desired_qualify_job(
         env.push(EnvVar {
             name: "RAVEL_S3_ENDPOINT".to_string(),
             value: Some(endpoint.clone()),
+            ..Default::default()
+        });
+    }
+    // `ravel-cli` applies the same plaintext-endpoint rule as the server
+    // (issue #1707), and this pod is never loopback to its object store, so a
+    // cluster whose server pods carry `--s3-allow-http` must hand the Job the
+    // same permission or qualification fails on a cluster configured to run.
+    // `true` is the only truthy spelling clap's `SetTrue` env parser accepts;
+    // rendered only when the field is set, so an https:// or real-AWS cluster
+    // keeps the env block it had.
+    if spec.storage.s3.allow_http {
+        env.push(EnvVar {
+            name: "RAVEL_S3_ALLOW_HTTP".to_string(),
+            value: Some("true".to_string()),
             ..Default::default()
         });
     }
@@ -6939,6 +6960,67 @@ mod tests {
                 .and_then(|s| s.secret_key_ref.as_ref())
                 .map(|r| (r.name.as_str(), r.key.as_str())),
             Some(("ravel-s3", S3_ACCESS_KEY_ID_KEY)),
+        );
+    }
+
+    /// Issue #1707: the qualify Job runs `ravel-cli` against the same bucket
+    /// over the same endpoint as the server pods, and `ravel-cli` refuses a
+    /// plaintext non-loopback endpoint exactly as the server does. A qualify
+    /// Job pod is never loopback to its object store, so `spec.s3.allowHttp`
+    /// must reach it as `RAVEL_S3_ALLOW_HTTP` or the Job fails on a cluster
+    /// whose server pods are configured to start. The variable is rendered
+    /// only when the field is set, so an https:// or real-AWS cluster keeps
+    /// the env block it has today.
+    #[test]
+    fn qualify_job_carries_allow_http_only_when_set() {
+        let mut spec = base_spec();
+        assert!(
+            !spec.storage.s3.allow_http,
+            "precondition: allowHttp defaults off"
+        );
+        let names_of = |job: &Job| -> Vec<String> {
+            job.spec
+                .as_ref()
+                .and_then(|s| s.template.spec.as_ref())
+                .map(|pod| pod.containers[0].env.clone().unwrap_or_default())
+                .unwrap_or_default()
+                .iter()
+                .map(|e| e.name.clone())
+                .collect()
+        };
+
+        let job = desired_qualify_job(&spec, "prod", Some("rv-1"));
+        let names = names_of(&job);
+        assert!(
+            !names.iter().any(|n| n == "RAVEL_S3_ALLOW_HTTP"),
+            "allowHttp false must render no env var, got: {names:?}"
+        );
+
+        spec.storage.s3.allow_http = true;
+        let job = desired_qualify_job(&spec, "prod", Some("rv-1"));
+        let env = job
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref())
+            .map(|pod| pod.containers[0].env.clone().unwrap_or_default())
+            .unwrap_or_default();
+        let allow_http = env
+            .iter()
+            .find(|e| e.name == "RAVEL_S3_ALLOW_HTTP")
+            .unwrap_or_else(|| {
+                panic!(
+                    "allowHttp true must render RAVEL_S3_ALLOW_HTTP, got: {:?}",
+                    names_of(&job)
+                )
+            });
+        // clap's `SetTrue` action parses the env value with the strict bool
+        // parser, so "true" and "false" are the only accepted spellings: "1"
+        // or an empty string would make `ravel-cli` exit on a parse error
+        // rather than run the qualification.
+        assert_eq!(
+            allow_http.value.as_deref(),
+            Some("true"),
+            "the env var must carry a truthy value clap accepts"
         );
     }
 

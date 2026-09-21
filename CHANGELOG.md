@@ -31,6 +31,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refusing it. The flag now follows the URL scheme. A non-loopback `http://`
   endpoint needs `--s3-allow-http` (env `RAVEL_S3_ALLOW_HTTP`), and the
   refusal names the flag; loopback `http` is unchanged, which is what the dev
+  compose stack, kind, and the tests use. `ravel-cli` applies the same rule
+  from the same function rather than a second copy of it, with the same
+  `--s3-allow-http` flag and `RAVEL_S3_ALLOW_HTTP` variable: it ships in the
+  server image and reaches the same bucket with the same credentials, and the
+  operator's store-qualification Job runs it before any server pod exists. The
+  operator gains `spec.s3.allowHttp` for an in-cluster MinIO, rendering the
+  flag on every server container and `RAVEL_S3_ALLOW_HTTP=true` on the qualify
+  Job. **On upgrade**, a deployment already pointing at a plaintext
+  non-loopback endpoint will not start until the flag or the environment
+  variable is set, and a `ravel-cli` invocation against one is refused the
+  same way.
   compose stack, kind, and the tests use. The operator gains
   `spec.s3.allowHttp` for an in-cluster MinIO. **On upgrade**, a deployment
   already pointing at a plaintext non-loopback endpoint will not start until

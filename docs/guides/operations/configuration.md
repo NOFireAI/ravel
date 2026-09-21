@@ -75,9 +75,19 @@ therefore refuses an `http://` endpoint whose host is not loopback unless
   though the traffic stays inside the cluster.
 - `https://...`: unaffected, and the flag does nothing.
 
+`ravel-cli` applies the same rule from the same code, with the same
+`--s3-allow-http` flag and `RAVEL_S3_ALLOW_HTTP` variable. It ships in the
+server image and talks to the same bucket with the same credentials, so a
+`ravel-cli` command against a plaintext non-loopback endpoint is refused
+unless the flag is passed, and an `https://` endpoint never enables plaintext
+there either.
+
 Under the Kubernetes operator the same decision is `spec.storage.s3.allowHttp`
 on the `RavelCluster` (default `false`), which renders the flag into every
-server container's arguments.
+server container's arguments and `RAVEL_S3_ALLOW_HTTP=true` into the
+store-qualification Job that runs `ravel-cli store qualify` before any server
+pod exists. A cluster with a plaintext in-cluster endpoint therefore needs
+`allowHttp: true` for qualification to run at all.
 
 Prefer terminating TLS at the object store over setting the flag. The flag is
 for a development backend that speaks no TLS, not for a production one whose
