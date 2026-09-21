@@ -39,10 +39,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   2,073,600 entries and 3.1 GB per tenant, with nothing process-wide bounding
   the next tenant. These caches sit outside ADR-1170's carved shares, so an
   operator budgets 45 MB times the number of concurrently queried tenants on
-  top of them. No new CLI flag is added; the capacity is a function of
-  existing ingest configuration. A repository guard now fails a pull request
-  that touches `crates/` or `services/` and carries no changelog entry, which
-  is why this internal sizing change carries one.
+  top of them. The capacity covers a tenant's unsealed tail up to the cap, not
+  whatever the tail actually is: at the shipped defaults the estimate is
+  already 129,600 entries, and the flush-cadence term counts the age trigger
+  only, so a tenant flushing on object size seals more records per shard-hour
+  than it assumes. Over the bound a resolve pays per-record GETs as it did
+  before, so the direction is safe. `--disable-cache` keeps the flat
+  10,000-entry capacity rather than the derived one, so the
+  memory-constrained-container flag never costs more record-cache memory than
+  it did before this change. No new CLI flag is added; the capacity is a
+  function of existing ingest configuration.
 - **A distributed deployment now refuses three unsafe listener shapes at
   startup** (issues #1724, #1703, #1690). Starting with `--distributed-query`
   and a wildcard bind refuses unless `--advertise-fragment-endpoint` names the

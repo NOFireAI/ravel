@@ -530,9 +530,12 @@ async fn a_faulted_record_get_leaves_the_other_records_cached() {
 /// 10,000-entry bound. At the old bound, a 16,800-record unsealed tail is
 /// larger than the cache, so it thrashes exactly like
 /// `a_bound_below_the_hot_region_loses_the_saving` above (both passes evict
-/// each other): a real run of this fixture against `config(10_000)` reports
-/// 33,600 record GETs on the second resolve (thousands today at 10,000, not
-/// zero). At `derive_cache_capacity_per_tenant(4, 2s)` (30,000, the 45 MB
+/// each other). The red lever is `config(10_000)` in place of
+/// `config(derived)` below, and it goes red on the COLD assertion, not the
+/// second-resolve one: a real run reports `left: 33600, right: 16800` there,
+/// because both of `process_bucket`'s passes re-read every record once the
+/// bound is exceeded. The second-resolve assertion is never reached under the
+/// lever. At `derive_cache_capacity_per_tenant(4, 2s)` (30,000, the 45 MB
 /// per-tenant cap that binds at the shipped defaults), the tail fits and the
 /// second resolve issues none.
 #[tokio::test]
