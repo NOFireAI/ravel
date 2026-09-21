@@ -66,6 +66,30 @@ use crate::span_fetcher::SpanRow;
 /// bump above.
 pub const PROTOCOL_VERSION: u32 = 4;
 
+/// The ceiling on how many response frames a coordinator accepts for ONE slice
+/// before refusing it (issue #1687 part B). Paired with the byte cap the
+/// coordinator takes from its own `EngineConfig::max_bytes_scanned`, this is
+/// what bounds the memory a remote can make a coordinator hold.
+///
+/// A conforming worker emits one frame per returned run (one per
+/// (series, segment) pair for scalars, one per native-histogram series, or one
+/// per partial aggregate on the pushdown path) plus one terminal summary, so
+/// this is a ceiling on runs, not on distinct series: at
+/// `EngineConfig::default`'s `max_series` of 10_000 a slice would have to carry
+/// full-cardinality runs from more than 104 segments to reach it. It is not a
+/// bound no legitimate slice can cross -- a slice packing enough segments can,
+/// and is then refused as a budget error naming both counts, the same class of
+/// refusal as a bytes-scanned trip -- but a slice that large costs the
+/// coordinator more memory than it can hold decoded anyway, which is the bound
+/// this exists to enforce.
+///
+/// A count cap is needed on top of the byte cap because
+/// `EngineConfig::max_bytes_scanned` defaults to `ByteLimit::Unlimited`: on a
+/// default deployment it is the only cap that bounds anything, and an empty
+/// frame costs 2 wire bytes, so a remote streaming them forever is otherwise
+/// bounded by nothing.
+pub const MAX_SLICE_RESPONSE_FRAMES: usize = 1 << 20;
+
 /// The fragment-capability claim-set version (ADR-0071 amendment, decision 2).
 /// Distinct from [`PROTOCOL_VERSION`]: it versions the canonical claim encoding
 /// [`encode_claims`] produces and the MAC covers, so the claim layout can evolve
@@ -259,6 +283,25 @@ pub enum CodecError {
     HistogramBucketCountMismatch { spans: u64, buckets: usize },
     #[error("histogram count is less than its zero_count or its total bucket count")]
     HistogramCountInconsistent,
+    /// The remote streamed more response frames for one slice than the
+    /// coordinator accepts (issue #1687 part B). `frames` is the count
+    /// including the frame that crossed the cap; the coordinator stops reading
+    /// the stream there, so no frame past it is ever held.
+    #[error(
+        "slice stream carried {frames} response frames, exceeding the coordinator's cap of \
+         {max} frames for one slice"
+    )]
+    SliceFrameCapExceeded { frames: usize, max: usize },
+    /// The remote streamed more response bytes for one slice than the
+    /// coordinator's `max_bytes_scanned` allows (issue #1687 part B). `bytes`
+    /// counts the protobuf-encoded length of every frame received so far,
+    /// including the one that crossed the cap; it is a wire-frame figure, not
+    /// S3 bytes and not decoded in-memory size.
+    #[error(
+        "slice stream carried {bytes} response frame bytes, exceeding the coordinator's cap of \
+         {max} bytes for one slice"
+    )]
+    SliceByteCapExceeded { bytes: u64, max: u64 },
 }
 
 /// Rejects any protocol version this build does not speak. `Ok(())` only for

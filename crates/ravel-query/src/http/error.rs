@@ -110,6 +110,12 @@ impl From<QueryError> for ApiError {
             | QueryError::TooManySeries { .. }
             | QueryError::TooManySamples { .. }
             | QueryError::TooManyBytesScanned { .. }
+            // A coordinator refusing a remote's oversized slice stream (issue
+            // #1687 part B) is the same class: it declined to hold what the
+            // remote offered, and the message carries only two counts of the
+            // coordinator's own, so it is echoed like the other budget trips
+            // rather than redacted to the retryable 503 a `Distrib` outage takes.
+            | QueryError::TooManySliceFrames { .. }
             | QueryError::RequestBudgetExceeded { .. } => ApiError::Unsupported(e.to_string()),
             // An over-wide window refused before any LIST is a
             // resource-budget rejection, grouped with the budget classes above
