@@ -978,10 +978,37 @@ those hours, after the fixed window and the frontier band:
   until the frontier band reaches it), and the sweep's HEAD-reachability
   gate remains the delete blocker in every case.
 
-The maintain-tier wiring that turns the sweep's blocked hours into a
-`RefoldRequest` is a separate change; until it lands this entry point has no
-production caller and every fold behaves exactly as the two preceding
-sections describe.
+### Who sends the request
+
+The producing side is the maintain tier. A sweep pass returns the ingest
+hours it held on `SnapshotBlock::Named` in `SweepReport::blocked_named_hours`,
+the maintain tick unions that set over the shards it owns under ADR-0065
+rendezvous, and it hands the union to the fold as one `RefoldRequest` per
+`(tenant, signal)` pair, which is the granularity a catalog covers. The fold
+loop drains the queue once per cycle, right after tenant discovery, and passes
+each tenant's drained hours to `fold_with_refold_request`. A request for a
+tenant that cycle does not maintain is taken off the queue and discarded
+rather than held, since holding it would evict fresher requests; the next
+sweep of that unit re-derives it. See
+docs/deletion-and-gc.md for the sweep-side rules that decide which hours
+enter the set.
+
+The hand-off is a hint on an in-process queue (`ravel_server::fold::RefoldQueue`,
+default capacity `DEFAULT_REFOLD_QUEUE_CAPACITY`, 256 pending requests), so
+three carve-outs apply on top of the per-pass rules above:
+
+- **No-op fold.** The re-fold pass sits inside the reconcile block, so a fold
+  that finds nothing to seal reconciles nothing and reports
+  `refold_hours_reconciled == 0` even though a request was delivered. The next
+  sweep re-derives the same hours and sends them again.
+- **Dropped request.** A full queue evicts the oldest pending request and
+  counts the eviction in `RefoldQueue::dropped_requests`. Nothing is lost
+  durably: the dropped pair's next sweep recomputes its blocked set from the
+  live snapshot and sends it again.
+- **Process locality.** The queue lives in one process. A deployment that
+  runs the sweep and the fold in separate processes delivers no request at
+  all, and every fold there behaves exactly as the two preceding sections
+  describe.
 
 ## Commit sequence (strict mode)
 
