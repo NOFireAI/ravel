@@ -838,6 +838,65 @@ async fn a_rule_loaded_from_the_config_file_shape_evaluates() {
     assert_eq!(records[0].rule_id, "high-cpu");
 }
 
+/// `AlertEvaluator::rules` is the per-tenant snapshot `GET /api/v1/rules`
+/// serves (issue #1711), so it must be the parsed rules for this evaluator's
+/// tenant, in document order, and nothing else. Without this, the endpoint and
+/// the evaluator could each be right about a different set: the assertion is
+/// that they agree, not merely that each is non-empty.
+#[tokio::test]
+async fn the_evaluator_exposes_its_own_tenants_parsed_rules() {
+    let document = format!(
+        r#"{{
+          "rules": [
+            {{
+              "tenant": "{TENANT}",
+              "rule_id": "high-cpu",
+              "promql": "{METRIC}",
+              "condition": {{"type": "threshold", "op": "gt", "value": 0.9}},
+              "labels": {{"severity": "page"}}
+            }},
+            {{
+              "tenant": "{TENANT}",
+              "rule_id": "low-cpu",
+              "promql": "{METRIC}",
+              "condition": {{"type": "threshold", "op": "lt", "value": 0.1}}
+            }},
+            {{
+              "tenant": "someone-else",
+              "rule_id": "not-ours",
+              "promql": "disk_free",
+              "condition": {{"type": "threshold", "op": "lt", "value": 0.1}}
+            }}
+          ]
+        }}"#
+    );
+    let by_tenant: HashMap<TenantHash, Vec<Rule>> = parse_rules(&document).expect("valid rules");
+    let tenant = TenantId::new(TENANT).hash();
+    let rules = by_tenant
+        .get(&tenant)
+        .cloned()
+        .expect("rules for the tenant");
+
+    let store = seeded_store().await;
+    let evaluator = evaluator(store, TestClock::at(NOW_NS), rules.clone(), Vec::new());
+
+    assert_eq!(evaluator.tenant(), tenant);
+    assert_eq!(
+        evaluator.rules(),
+        rules,
+        "the snapshot is this tenant's parsed rules, in document order"
+    );
+    assert_eq!(
+        evaluator
+            .rules()
+            .iter()
+            .map(|rule| rule.rule_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["high-cpu".to_string(), "low-cpu".to_string()],
+        "another tenant's rule must not appear in this evaluator's snapshot"
+    );
+}
+
 /// A rule whose condition does not hold writes nothing at all: an alert that
 /// never existed has no state to record.
 #[tokio::test]

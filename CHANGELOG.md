@@ -6,6 +6,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /api/v1/rules` serves the loaded alert rules in the Prometheus rules
+  shape** (issue #1711). A process running an alert evaluator (`all` or `query`
+  mode) now answers the Prometheus rules API with the rule set it parsed at
+  startup, as one group per tenant named `ravel-alert-rules`, so an operator
+  can confirm which rules a process is actually evaluating without reading the
+  file on its host. The tenant comes from the request's credential, and a
+  tenant with no rules gets an empty group list rather than anybody else's
+  rules. Each rule's `query` is its whole firing expression, with a PromQL
+  rule's threshold comparison appended to the query text. `health` and `state`
+  are reported as `unknown` and a rule carries no `alerts` array, because the
+  endpoint serves the loaded configuration and reads no evaluation outcome;
+  `/api/v1/alerts` is not served.
+
 ### Changed
 
 - **`ravel-cli load` reports a `--skip-rows` value past the end of the file

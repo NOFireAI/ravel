@@ -113,6 +113,59 @@ four tables.
   the scan. A PromQL rule evaluates as an instant query and does not use this
   window.
 
+## Reading back the loaded rules
+
+`GET /api/v1/rules` returns the rules the process loaded for the calling
+tenant, in the shape Prometheus's rules API uses. It reads configuration, not
+data, so it is the way to confirm that the rules file a process was started
+with is the one it parsed:
+
+```sh
+curl -s -H "Authorization: Bearer $RAVEL_TOKEN" \
+  http://localhost:4318/api/v1/rules
+```
+
+```json
+{
+  "status": "success",
+  "data": {
+    "groups": [
+      {
+        "name": "ravel-alert-rules",
+        "file": "",
+        "interval": 60.0,
+        "rules": [
+          {
+            "type": "alerting",
+            "name": "cpu-hot",
+            "query": "max by (instance) (cpu_usage) > 0.9",
+            "duration": 300.0,
+            "labels": {"severity": "page"},
+            "annotations": {"summary": "CPU over 90% for five minutes"},
+            "health": "unknown",
+            "state": "unknown"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The tenant comes from the credential, so a token for a tenant with no rules of
+its own gets `{"status": "success", "data": {"groups": []}}`. Every rule in the
+file for one tenant renders in a single group named `ravel-alert-rules`, whose
+`interval` is `--alert-eval-interval-secs`; the rules file has no group blocks
+to take a name or a `file` from. A rule's `query` is its whole firing
+expression, so a PromQL rule shows its threshold comparison appended to the
+query text, and a SQL detection rule shows its statement alone.
+
+`health` and `state` are reported as `unknown`, and a rule carries no `alerts`
+array: this endpoint serves the loaded rule set and reads no evaluation
+outcome, so it reports no firing state it has not checked. For what rules
+actually did, query the `alerts` table (below). Prometheus's companion
+`/api/v1/alerts` endpoint is not served.
+
 ## Notification sinks
 
 A sink is where a transition is delivered. Every sink flag is repeatable, and a

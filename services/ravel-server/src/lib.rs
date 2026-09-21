@@ -5,6 +5,7 @@ pub mod admission_reconcile;
 pub mod alert_sink;
 pub mod alert_state_memo;
 pub mod alerting;
+pub mod alerts_api;
 pub mod analytics;
 pub mod bucket_protection;
 pub mod cache_warm;
@@ -2665,6 +2666,32 @@ pub async fn start(
                 };
                 mtls_router = mtls_router.merge(fold_on_demand::router(mtls_fold_state));
             }
+        }
+
+        // GET /api/v1/rules (issue #1711): the alert rules this process
+        // loaded, for the caller's tenant, in the Prometheus rules-API shape.
+        // Mounted here, beside the on-demand fold above, so it is scoped by
+        // the same listener resolver every other `/api/v1` route on this
+        // router is: the primary listener's `config.tenant_resolver`, and the
+        // mTLS listener's own. It serves `config.alerting.rules`, the very map
+        // `alerting::spawn` below builds its evaluator tasks from, so the
+        // rules an operator reads back are the rules this process evaluates.
+        // Mounting it inside the query-surface block matches where the
+        // evaluator itself runs (`all` and `query` modes); a gateway or
+        // maintain process has no evaluator and serves no rules route.
+        let alert_rules_state = alerts_api::AlertRulesState {
+            rules: config.alerting.rules.clone(),
+            tenant_resolver: config.tenant_resolver.clone(),
+            eval_interval: config.alerting.interval,
+        };
+        http_router = http_router.merge(alerts_api::router(alert_rules_state));
+        if let Some(mtls) = &config.mtls_listener {
+            let mtls_alert_rules_state = alerts_api::AlertRulesState {
+                rules: config.alerting.rules.clone(),
+                tenant_resolver: mtls.resolver.clone(),
+                eval_interval: config.alerting.interval,
+            };
+            mtls_router = mtls_router.merge(alerts_api::router(mtls_alert_rules_state));
         }
 
         // GET/POST /api/v1/query_exemplars (ADR-0047 decision 4):
