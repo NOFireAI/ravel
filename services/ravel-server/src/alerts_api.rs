@@ -11,9 +11,10 @@
 //!
 //! The same scoping every other `/api/v1` route on this listener applies: the
 //! listener's configured [`TenantResolver`] chain resolves the request's
-//! credential to a [`TenantId`], and the response carries that tenant's rules
-//! and no other tenant's. The tenant is never taken from a request field --
-//! there is no request field. A credential that does not resolve is 401,
+//! credential to a [`ravel_types::TenantId`], and the response carries that
+//! tenant's rules and no other tenant's. The tenant is never taken from a
+//! request field: there is no request field. A credential that does not
+//! resolve is 401,
 //! before anything is rendered; a credential that resolves to a tenant with no
 //! rules gets an empty `groups` array, which is the same answer a tenant that
 //! exists but was left out of the rules file gets.
@@ -56,7 +57,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ravel_alerting::{Rule, RuleCondition, RuleQuery, ThresholdOp};
 use ravel_query::http::TenantResolver;
-use ravel_types::{TenantHash, TenantId};
+use ravel_types::TenantHash;
 use serde_json::{Value, json};
 
 /// The route this module serves. Named here so the wiring, the tests, and the
@@ -102,9 +103,9 @@ pub fn router(state: AlertRulesState) -> Router {
 }
 
 async fn handle(State(state): State<AlertRulesState>, headers: HeaderMap) -> Response {
-    let tenant = match authenticate(&state, &headers) {
+    let tenant = match state.tenant_resolver.resolve(&headers) {
         Ok(tenant) => tenant,
-        Err(response) => return response,
+        Err(err) => return unauthorized(&err),
     };
     let rules = state.rules.get(&tenant.hash());
     axum::Json(json!({
@@ -114,27 +115,26 @@ async fn handle(State(state): State<AlertRulesState>, headers: HeaderMap) -> Res
     .into_response()
 }
 
-fn authenticate(state: &AlertRulesState, headers: &HeaderMap) -> Result<TenantId, Response> {
-    state.tenant_resolver.resolve(headers).map_err(|err| {
-        // The same discipline the sibling routes apply: the caller gets a
-        // class-level answer and the server keeps the error. A resolver can
-        // fail for reasons that are not a bad credential (an unreachable
-        // durable auth map), and a bare 401 records none of them.
-        tracing::warn!(
-            error = %err,
-            route = RULES_ROUTE,
-            "alert rules API: tenant resolution failed"
-        );
-        (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(json!({
-                "status": "error",
-                "errorType": "unauthorized",
-                "error": "authentication required",
-            })),
-        )
-            .into_response()
-    })
+/// The 401 a request whose credential does not resolve gets.
+fn unauthorized(err: &dyn std::fmt::Display) -> Response {
+    // The same discipline the sibling routes apply: the caller gets a
+    // class-level answer and the server keeps the error. A resolver can
+    // fail for reasons that are not a bad credential (an unreachable
+    // durable auth map), and a bare 401 records none of them.
+    tracing::warn!(
+        error = %err,
+        route = RULES_ROUTE,
+        "alert rules API: tenant resolution failed"
+    );
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(json!({
+            "status": "error",
+            "errorType": "unauthorized",
+            "error": "authentication required",
+        })),
+    )
+        .into_response()
 }
 
 /// Renders one tenant's rules as the `groups` array. `None` (and an empty
@@ -217,6 +217,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use ravel_query::http::StaticBearerTokenResolver;
+    use ravel_types::TenantId;
     use tower::ServiceExt;
 
     const ACME_TOKEN: &str = "acme-token";
@@ -403,10 +404,7 @@ mod tests {
             let rule = Rule {
                 rule_id: "r".into(),
                 query: RuleQuery::Promql("cpu".into()),
-                condition: RuleCondition::Threshold {
-                    op,
-                    threshold: 1.0,
-                },
+                condition: RuleCondition::Threshold { op, threshold: 1.0 },
                 labels: Vec::new(),
                 annotations: Vec::new(),
                 for_duration: None,

@@ -188,6 +188,49 @@ The call returns 200 with one of four named outcomes:
 A 503 on this route means the outcome is unknown and the call should be retried,
 never that nothing was written.
 
+## Alert rules route
+
+Served in `all` and `query` modes, the modes that build a query engine and
+therefore the modes an alert evaluator runs in. A `gateway` or `maintain`
+process serves 404 here.
+
+| Method | Path | Request | Response | Status codes | Credential | Modes | Feature |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| GET | `/api/v1/rules` | none | Prometheus rules JSON envelope: `data.groups` | 200, 401 | Yes | `all`, `query` | none |
+
+`/api/v1/rules` returns the alert rules this process loaded, for the
+authenticated tenant, in the shape Prometheus's rules API uses. It is a read of
+configuration: it issues no object-store request and runs no query, and its two
+status codes are the whole set, 200 for a resolved credential and 401 for one
+that does not resolve. There is no request parameter, so the tenant comes from
+the credential and nothing else; a tenant with no loaded rules gets
+`{"status": "success", "data": {"groups": []}}` rather than another tenant's
+rules.
+
+A tenant's rules render as one group named `ravel-alert-rules`. Prometheus
+takes a group's name from a group block in its rules file; the Ravel rules
+document is one flat `rules` array with no group blocks, so the name is a
+constant and the group's `file` is the empty string. The group's `interval` is
+the evaluation interval (`--alert-eval-interval-secs`) in seconds.
+
+Each rule carries `type` (always `alerting`), `name` (the `rule_id`), `query`,
+`duration` (the `for` delay in seconds, `0` when unset), `labels`,
+`annotations`, `health`, and `state`. `query` is the rule's whole firing
+expression: for a PromQL rule the query text with its threshold comparison
+appended (`max by (instance) (cpu_usage) > 0.9`), and for a SQL detection rule
+the statement alone, since its condition is that the statement returned a row
+and there is nothing to append.
+
+`health` and `state` are both reported as `unknown` for every rule. This
+endpoint serves the loaded rule set and does not read evaluation outcomes, so
+it reports neither a health nor a firing state it has checked. `unknown` is
+Prometheus's own value for `health`; for `state` it is outside Prometheus's
+three values (`inactive`, `pending`, `firing`), chosen over reporting
+`inactive`, which would assert that a rule is not firing. For the same reason a
+rule carries no `alerts` array of currently-active alerts: an empty array would
+assert a negative this route never checked. Alert state itself is queryable
+today through the `alerts` SQL table.
+
 ## Health and metrics routes
 
 Unauthenticated, and served in every mode, including maintain mode.
@@ -238,3 +281,6 @@ per-tenant labels on the admission and query families are opt-in
   published image builds the feature; the flag is still required.
 - OTLP ingest for metrics, logs, and traces is additionally available over
   gRPC on the gRPC listener; this page documents the HTTP form.
+- `/api/v1/alerts`, Prometheus's list of currently-active alerts, is not served.
+  A request for it gets a 404 from the HTTP framework, in every mode. Only
+  `/api/v1/rules` is served today; query the `alerts` table for alert state.
