@@ -378,6 +378,7 @@ fn build_metrics_app(
     shard_count: u32,
 ) -> Router {
     let cli = Cli::try_parse_from(["ravel-server"]).expect("default flags parse");
+    let flush_cadence = cli.resolve_flush_cadence().expect("flush cadence resolves");
     let catalog = build_catalog(
         Arc::clone(&store),
         shard_count,
@@ -386,6 +387,7 @@ fn build_metrics_app(
         cli.cache_dir.clone(),
         cli.catalog_resolve_concurrency,
         None,
+        flush_cadence.max_flush_delay,
     )
     .expect("catalog");
     let mut tokens = std::collections::HashMap::new();
@@ -791,6 +793,7 @@ mod logs {
         tenant: &TenantId,
     ) -> Router {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("default flags parse");
+        let flush_cadence = cli.resolve_flush_cadence().expect("flush cadence resolves");
         let catalog = build_catalog(
             Arc::clone(&store),
             1,
@@ -799,6 +802,7 @@ mod logs {
             cli.cache_dir.clone(),
             cli.catalog_resolve_concurrency,
             None,
+            flush_cadence.max_flush_delay,
         )
         .expect("catalog");
         let mut tokens = std::collections::HashMap::new();
@@ -1123,6 +1127,7 @@ mod spans {
         tenant: &TenantHash,
     ) -> Vec<String> {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("cli");
+        let flush_cadence = cli.resolve_flush_cadence().expect("flush cadence resolves");
         let catalog = build_catalog(
             Arc::clone(store),
             1,
@@ -1131,6 +1136,7 @@ mod spans {
             cli.cache_dir.clone(),
             cli.catalog_resolve_concurrency,
             None,
+            flush_cadence.max_flush_delay,
         )
         .expect("catalog");
         let snapshot = catalog

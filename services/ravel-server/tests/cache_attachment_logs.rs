@@ -209,6 +209,9 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
         cli.cache_dir.clone(),
         cli.catalog_resolve_concurrency,
         None,
+        cli.resolve_flush_cadence()
+            .expect("flush cadence resolves")
+            .max_flush_delay,
     )
     .expect("catalog");
     let mut sql_state = build_sql_state(

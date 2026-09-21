@@ -33,6 +33,13 @@ how to choose a value, not what the flags are called.
   action. The procedures where acting on the obvious first makes things worse
   are at the top.
 
+The catalog's per-tenant commit-record cache is sized from the shard count and
+the configured max flush delay, not a flat constant: at the shipped defaults
+(4 shards, a 2-second max flush delay) it holds 21,600 entries, worth roughly
+16 MB per actively-queried tenant at about 750 bytes per cached record,
+reclaimed by idle-tenant eviction. It is not one of the memory-budget-carved
+caches [caching](caching.md) describes.
+
 Related guides: [observability](observability.md) for the metric families and
 the label allowlist, [caching](caching.md) for read-cache sizing,
 [disaster recovery](disaster-recovery.md) for bucket-level backup and restore,

@@ -383,6 +383,7 @@ fn catalog_listing_window_moves_with_the_flag() {
         None,
         None,
         Some(window_ns),
+        std::time::Duration::from_secs(2),
     )
     .expect("catalog builds");
     assert_eq!(
@@ -401,6 +402,7 @@ fn catalog_listing_window_moves_with_the_flag() {
         None,
         None,
         None,
+        std::time::Duration::from_secs(2),
     )
     .expect("catalog builds");
     assert_eq!(

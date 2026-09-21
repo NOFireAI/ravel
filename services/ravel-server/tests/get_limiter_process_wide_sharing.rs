@@ -392,6 +392,9 @@ async fn build_gated_app(get_limiter: Arc<GetLimiter>) -> (Router, GateHandle) {
         cli.cache_dir.clone(),
         None,
         None,
+        cli.resolve_flush_cadence()
+            .expect("flush cadence resolves")
+            .max_flush_delay,
     )
     .expect("catalog");
 
