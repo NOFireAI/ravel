@@ -563,12 +563,25 @@ that decoder applies two caps per slice:
 | Aggregate wire bytes | `MAX_SLICE_RESPONSE_BYTES`, 64 MiB, fixed | Applied to the encoded size of the frames this coordinator accepts. The ceiling is fixed and applies with no configuration at all. No setting raises or lowers it, `max_bytes_scanned` included: that is a store-byte budget on the compressed segment data a slice reads, enforced on a different path, and response frames are uncompressed wire bytes, so treating one as the other would refuse a slice that scanned well inside its configured budget. |
 
 Both caps are **per slice**, and each in-flight slice decodes through its own
-decoder holding the full cap. A query fans out to at most
-`max_parallel_slices` slices at once, which defaults to 8, so one query can
-make a coordinator hold up to 8 times the per-slice byte cap in wire bytes,
-512 MiB, and more once those bytes are decoded into the in-memory series
-shapes. Lowering `max_parallel_slices` is what bounds a coordinator more
-tightly than that; `max_bytes_scanned` does not, because it does not move the
+decoder holding the full cap. What multiplies that cap differs by path, so
+size a coordinator from the one it runs:
+
+- A **local fan-out** dispatches at most `max_parallel_slices` slices at
+  once, which defaults to 8, so one such query holds up to 8 times the
+  per-slice byte cap in wire bytes, 512 MiB, and more once those bytes are
+  decoded into the in-memory series shapes. Lowering `max_parallel_slices`
+  bounds this path.
+- A **federated query** is not bounded by that setting. `Federation::fetch`
+  spawns one task per configured remote cluster, all in flight together, each
+  with its own decoder at the full 64 MiB, and `max_parallel_slices` does not
+  reach it. One federated query therefore holds up to 64 MiB times the number
+  of remote clusters, and lowering `max_parallel_slices` does not reduce it.
+
+Both figures bound ONE query. The process-wide total is that figure times the
+number of queries running at once, which has no ceiling unless an operator
+sets `--max-concurrent-queries`; it is unset by default.
+
+`max_bytes_scanned` does not bound any of this, because it does not move the
 per-slice wire cap.
 
 Both caps are checked before a frame is decoded or kept, and the client stops
