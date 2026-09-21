@@ -2175,6 +2175,51 @@ pub async fn start(
             .map_err(|err| anyhow::anyhow!("invalid store GET concurrency: {err}"))?,
     );
 
+    // The real query engine's deadline is the value `main` validated
+    // against `sys/gc` (ADR-0050 section 4, EC4), not an independent
+    // `EngineConfig::default()`: the deadline validated is the deadline
+    // enforced. The bytes-scanned budget (ADR-0061 decision 1) is resolved
+    // the same way from `--limits-file`'s `[defaults]` table and threaded
+    // here into the one process-wide engine both query surfaces share, so
+    // the configured budget is the enforced budget on the PromQL/HTTP and
+    // SQL/HTTP paths alike (both `build_app_state` and `build_sql_state`
+    // below take this same value). Every other engine limit stays at its
+    // default.
+    // ADR-0088: fold `--fetch-concurrency` / `--max-segments` onto the base
+    // engine config via `QueryBudgets::apply_to_engine` (the single wiring
+    // point start and the reachability tests share). Without it the engine
+    // would keep `EngineConfig::default()`'s compiled-in 8 / 1024.
+    // `fetch_concurrency` is the same knob that sets the SQL scan partition
+    // count and S3 GET concurrency (ADR-0087).
+    // ADR-0996 decision 2: `apply_to_engine` also RESOLVES
+    // `--logs-fetch-policy` against the active store cost profile and the
+    // two ADR-0904 byte flags, so the quantities the fetcher builders read
+    // off this `EngineConfig` are the resolved ones. It is fallible for the
+    // fetch bound's validation (a zero `--logs-max-fetch-run-bytes` is
+    // refused here, not at a division inside the fetch layer).
+    //
+    // Resolved here, above the distributed scaffolding rather than beside the
+    // engine it configures, because the worker-side `FragmentService` clamps
+    // every coordinator's wire budget to these same limits (issue #1687 part
+    // A) and is built below: one resolved config serves the engine, the
+    // mounted fragment listeners, and the coordinator's no-hop local path.
+    // The `get_limiter` above is resolved from `config.query_budgets` for the
+    // same ordering reason.
+    let engine_config = config
+        .query_budgets
+        .apply_to_engine(ravel_query::EngineConfig {
+            deadline: config.query_deadline,
+            max_bytes_scanned: config.limits.query_defaults.max_bytes_scanned,
+            // The shard-aware S3 request budget (ADR-0075), resolved in `main`
+            // from `--max-s3-requests` (verbatim) or derived from `--shards`
+            // and the flush cadence. Threaded here so the running binary uses
+            // the derived value, not `EngineConfig::default()`'s
+            // no-deployment-context fallback.
+            max_s3_requests: config.max_s3_requests,
+            ..ravel_query::EngineConfig::default()
+        })
+        .map_err(|err| anyhow::anyhow!("invalid query engine configuration: {err}"))?;
+
     // --- ADR-0071 distributed read fan-out scaffolding ---
     // The coordinator (a `RoutingSliceFetcher` wrapped in a `Distributed`), the
     // worker-side `FragmentService`, and their shared `FragmentMetrics` are
@@ -2208,6 +2253,9 @@ pub async fn start(
         // Shared by the worker (verifies against every key) and the coordinator
         // (mints under the first): ADR-0071 amendment, decision 2.
         let fragment_keys = Arc::new(settings.fragment_keys.clone());
+        // `with_engine_config` before any clone is taken, so every mounted
+        // listener AND the coordinator's no-hop local path below run slices
+        // under this process's own limits (issue #1687 part A).
         let service = distrib::FragmentService::new(
             fragment_keys.clone(),
             config.tenant_resolver.clone(),
@@ -2218,7 +2266,8 @@ pub async fn start(
             Arc::new(SystemClock),
             metrics.clone(),
             get_limiter.clone(),
-        );
+        )
+        .with_engine_config(engine_config);
         // When this process runs a dedicated TLS fragment listener (ADR-0071
         // amendment decision 1), its coordinator dials remote workers' TLS
         // fragment endpoints: pin the operator CA and verify the fixed
@@ -2390,42 +2439,6 @@ pub async fn start(
         metrics_state.audit_pipeline = Some(audit_pipeline_handle.clone());
         running_audit_pipeline = Some(audit_pipeline_handle);
 
-        // The real query engine's deadline is the value `main` validated
-        // against `sys/gc` (ADR-0050 section 4, EC4), not an independent
-        // `EngineConfig::default()`: the deadline validated is the deadline
-        // enforced. The bytes-scanned budget (ADR-0061 decision 1) is resolved
-        // the same way from `--limits-file`'s `[defaults]` table and threaded
-        // here into the one process-wide engine both query surfaces share, so
-        // the configured budget is the enforced budget on the PromQL/HTTP and
-        // SQL/HTTP paths alike (both `build_app_state` and `build_sql_state`
-        // below take this same value). Every other engine limit stays at its
-        // default.
-        // ADR-0088: fold `--fetch-concurrency` / `--max-segments` onto the base
-        // engine config via `QueryBudgets::apply_to_engine` (the single wiring
-        // point start and the reachability tests share). Without it the engine
-        // would keep `EngineConfig::default()`'s compiled-in 8 / 1024.
-        // `fetch_concurrency` is the same knob that sets the SQL scan partition
-        // count and S3 GET concurrency (ADR-0087).
-        // ADR-0996 decision 2: `apply_to_engine` also RESOLVES
-        // `--logs-fetch-policy` against the active store cost profile and the
-        // two ADR-0904 byte flags, so the quantities the fetcher builders read
-        // off this `EngineConfig` are the resolved ones. It is fallible for the
-        // fetch bound's validation (a zero `--logs-max-fetch-run-bytes` is
-        // refused here, not at a division inside the fetch layer).
-        let engine_config = config
-            .query_budgets
-            .apply_to_engine(ravel_query::EngineConfig {
-                deadline: config.query_deadline,
-                max_bytes_scanned: config.limits.query_defaults.max_bytes_scanned,
-                // The shard-aware S3 request budget (ADR-0075), resolved in `main`
-                // from `--max-s3-requests` (verbatim) or derived from `--shards`
-                // and the flush cadence. Threaded here so the running binary uses
-                // the derived value, not `EngineConfig::default()`'s
-                // no-deployment-context fallback.
-                max_s3_requests: config.max_s3_requests,
-                ..ravel_query::EngineConfig::default()
-            })
-            .map_err(|err| anyhow::anyhow!("invalid query engine configuration: {err}"))?;
         // The provenance stamp of the resolved policy (ADR-0996 decision 2).
         // The server exposes no config endpoint, so this startup line is where
         // an operator reads which policy, profile, and byte quantities the

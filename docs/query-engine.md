@@ -770,6 +770,54 @@ resolution limit), wall deadline (server maximum, default
 server maximum are clamped to it. Exceeding a budget returns a
 Prometheus-style error, never a partial silent result.
 
+### Budgets under distributed fan-out (ADR-0071)
+
+A distributed query dispatches the query's **whole** budget to every slice,
+not a `budget / slice_count` share. Segment bytes are not spread evenly over
+ingest shards, so a share would fail a skewed query that is under its own
+total. What enforces the query budget is the coordinator's incremental
+re-check over the folded per-slice accounting, which it performs as each
+slice's summary arrives. The worst-case scan in flight before that fold trips
+is bounded by `slice_count` times the budget, and each worker also stops at
+its own limit.
+
+Every worker clamps the budget it receives to its own `EngineConfig`: the
+effective byte limit for a slice is `min(wire, own max_bytes_scanned)`, and
+the wire sentinel `0` (or an absent budget message) means the caller names no
+cap, which resolves to the worker's own limit rather than to unlimited. A
+That clamp is per SLICE, not per worker: rendezvous routing can place several
+of one query's slices on the same worker, each authorized for the full clamped
+budget independently, so one worker can scan up to slices-per-worker times its
+configured `max_bytes_scanned` for a single query. The per-query total is
+bounded by the coordinator on the folded figures; size a worker from the
+product rather than from the configured value alone. On the resolve scope (cross-cluster federation, where the
+remote resolves its own snapshot and nothing downstream re-checks on its
+behalf) the worker additionally enforces its own `max_series` and
+`max_samples` over the slice result. Intra-cluster pinned slices are exempt
+from those two, because their counts fold at the coordinator.
+
+A worker's budget refusal keeps its type end to end: the coordinator turns it
+back into `TooManyBytesScanned`, `TooManySeries`, `TooManySamples`, or
+`TooManySegments`, so it renders as the same 422 a local budget trip does. A
+503 means the fan-out itself failed or a worker was out of fetch memory, never
+that one of the query caps (bytes, series, samples, requests) was hit. The
+memory case is backpressure: the same slice can succeed once the worker has
+room, which is why it stays retryable while a cap refusal does not.
+
+That holds on the cross-cluster path too. A remote answering `BudgetExceeded`
+refused the query under its own caps (its wire-budget clamp, or the
+`max_series`/`max_samples` a resolve-scope slice enforces over its own
+result), so the coordinator renders it as the same typed 422, not as the
+`Federation` error it redacts to 503. The fetch-memory carve-out applies here
+too: a remote out of fetch memory answers `BudgetExceeded` like a cap refusal
+does, and it keeps the retryable 503, because it is backpressure rather than a
+verdict on the query. A refusal is told apart from a fan-out
+failure by the wire status code, which only a remote that answered can set: a
+remote that was unreachable or timed out produces no status at all and keeps
+the retryable 503. The remote's message text selects only which cap is
+reported, and a message matching no known cap falls back to 503 rather than
+naming a cap that may not be the one that was hit.
+
 ### Process-wide memory budget (ADR-1170)
 
 `ravel-server` derives one process-wide ceiling, `memory_budget_bytes`, at

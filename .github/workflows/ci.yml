@@ -21,9 +21,10 @@ env:
 #
 # Every checkout below carries `persist-credentials: false` for the same
 # reason from the other side: no job here runs git against the remote after
-# checking out (the merge-base filters in `changes`, `docker-build` and
-# `quickstart` read only what fetch-depth: 0 already fetched), so the token
-# must not sit in .git/config where that build-script code could read it.
+# checking out (the merge-base filters in `changes`, `docker-build`,
+# `quickstart`, and the changelog guard in `doc-scripts` read only what
+# fetch-depth: 0 already fetched), so the token must not sit in .git/config
+# where that build-script code could read it.
 permissions:
   contents: read
 
@@ -233,6 +234,12 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          # Full history, no further remote git access: the changelog guard
+          # below needs the pull request's base commit locally, and fetching
+          # it in a later, unauthenticated `git fetch` would fail on a
+          # private repo once persist-credentials strips the token. Same
+          # pattern as the `changes` job.
+          fetch-depth: 0
           persist-credentials: false
       - name: Supply-chain pin check cases (issue #1720)
         run: bash deploy/metricsbench/tests/every_comparator_pins_an_image_digest.test.sh
@@ -273,6 +280,27 @@ jobs:
         run: bash scripts/guards/check-workflow-permissions.test.sh
       - name: Workflow-permissions guard (issue #1717)
         run: scripts/guards/check-workflow-permissions.sh
+      # A pull request whose feat/fix commits touch crates/ or services/ must
+      # also touch CHANGELOG.md, or carry a `Changelog: none` trailer (issue
+      # #1719). The rule is defined over a pull request's base..head commit
+      # range, so the guard step itself runs only for the pull_request event;
+      # a push to main and a merge_group run replay commits that already
+      # passed this check on the pull_request run that put them on the
+      # branch, and neither event carries the same base..head shape (push
+      # diffs one ref update, merge_group tests a synthetic combination with
+      # other queued pull requests). Cases run unconditionally, same reason
+      # as every other guard above: a guard broken into always-passing must
+      # fail here rather than go quiet.
+      - name: Changelog guard cases (issue #1719)
+        run: bash scripts/guards/check-changelog-touched.test.sh
+      - name: Changelog guard (issue #1719)
+        if: github.event_name == 'pull_request'
+        # head.sha, NOT github.sha. On a pull_request event github.sha is the
+        # refs/pull/N/merge commit, whose first parent is the base branch tip,
+        # so every commit merged into main since this branch forked is
+        # reachable from it and the guard attributes a neighbour's feat commit
+        # to this pull request. head.sha is the branch tip itself.
+        run: scripts/guards/check-changelog-touched.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
       - name: Injected-clock helper guard cases (issue #1260)
         run: bash scripts/tests/check-injected-clock-helpers.test.sh
       - name: Injected-clock helper guard (issue #1260)

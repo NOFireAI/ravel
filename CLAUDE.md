@@ -665,11 +665,34 @@ than passing for "no pull request open".
   environment of every dependency build script cargo runs. A job that
   genuinely needs more declares it on itself; `# workflow-permissions-allow:
   top-level-write -- <reason>` above the key is the escape hatch for the
-  write rule only, and there is none for a missing block. A scan that finds
+  write rule only, and there is none for a missing block. A third rule,
+  `checkout-persists-credentials`, requires every `actions/checkout` step to
+  set `persist-credentials: false`: a checkout that leaves the token in
+  `.git/config` hands it to every later step in the job, including the build
+  scripts cargo runs. Its escape hatch is
+  `# workflow-permissions-allow: persist-credentials -- <reason>` on the line
+  or in the comment block above it, and the reason is required, as it is for
+  the write rule. The step bound is the enclosing list item, so the common
+  `- name:`/`uses:`/`with:` form is read correctly. A scan that finds
   no workflow file exits 64 rather than reporting clean, so a moved
   directory cannot turn the guard into a no-op. Wired into `gates.sh` and
   ci.yml's `doc-scripts` job, cases first. Cases in
   `scripts/guards/check-workflow-permissions.test.sh`.
+- `scripts/guards/check-changelog-touched.sh <base-ref> [head-ref]`: exits 1
+  when a `feat`/`fix` commit in the range touches `crates/` or `services/`
+  while `CHANGELOG.md` goes untouched across it, and no commit carries a
+  `Changelog: none` trailer (that exact spelling, on its own line). Exit 2 is
+  could-not-answer (missing argument, an unresolvable ref, a git failure), which
+  is never a pass. The range is taken from the MERGE BASE of the two refs, not
+  from the base ref directly: with a two-dot range a `CHANGELOG.md` edit that
+  landed on the base branch after the fork point reads as this range's and
+  exempts a pull request that touched no changelog. Since the guard makes
+  nearly every merged pull request touch `CHANGELOG.md`, that divergence is the
+  common case, not a rare one. The two exemptions are the trailer and a
+  changelog edit genuinely inside the range; there is no grace period and no
+  branch allowlist, because a guard with a cutoff stops being one. Wired into
+  ci.yml's `doc-scripts` job with the pull request's base SHA. Cases in
+  `scripts/guards/check-changelog-touched.test.sh`.
 - `scripts/check-injected-clock-helpers.sh [file]`: exits non-zero when an
   injected-clock test helper contains `thread::sleep`, `tokio::time::sleep`,
   a bare or aliased `sleep()` call, `tokio::time::timeout`, `Instant::`,
