@@ -311,9 +311,16 @@ together with the conditions the
 [troubleshooting guide](operations/troubleshooting.md) states. Load that file
 from Prometheus's `rule_files:` key rather than transcribing the block below:
 a `ravel-server` integration test asserts that every metric the shipped file
-names is one a running server renders, and a copy pasted out of this page has
-nothing behind it if a metric is later renamed. The block is kept here because
-its comments explain the rule.
+names is one a running server renders, and a copy pasted out of this page is
+a copy nothing updates when the deployment does. The block is kept here
+because its comments explain the rule.
+
+That test reads this page too. Every rule printed in a `yaml` block below is
+compared against the rule of the same name in the shipped file, expression,
+`for:` duration and severity alike, so a block here cannot drift into a
+condition the shipped file no longer carries. It does not compare the
+`annotations:` of a block, so a metric named only in a `description:` on this
+page is checked against nothing; the shipped file's own annotations are.
 
 ```yaml
 groups:

@@ -12,7 +12,12 @@
 #
 # services/ravel-server/tests/shipped_rules_name_emitted_metrics.rs asserts
 # that every Ravel metric name in this file appears in a rendered /metrics
-# body, so a metric rename cannot leave a rule here matching nothing.
+# body, so a metric rename cannot leave a rule here matching nothing. It
+# builds the groups and rules below by parsing, refusing any line it cannot
+# account for, so a corruption that leaves the `- alert:` lines intact fails
+# there instead of passing a count. It also compares every rule the
+# observability guide reprints against the one here, expression, `for:` and
+# severity, which is what holds the "character for character" above true.
 #
 # Load it with Prometheus's `rule_files:` key:
 #
