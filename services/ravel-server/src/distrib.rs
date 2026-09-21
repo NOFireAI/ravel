@@ -73,6 +73,7 @@ use ravel_query::distrib::client::{
     DistribError, SliceFetcher, SliceResponse, decode_slice_frames,
 };
 use ravel_query::distrib::codec;
+use ravel_query::distrib::SliceStreamDecoder;
 use ravel_query::distrib::proto::series_fetch_client::SeriesFetchClient;
 use ravel_query::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use ravel_query::distrib::service::{SeriesFetchService, SnapshotSegmentResolver};
@@ -1096,6 +1097,12 @@ pub struct FragmentStatEntry {
     /// Store bytes the slice's worker reported reading (its per-slice accounting
     /// `total_s3_bytes`); `0` when the slice ended in an error.
     pub bytes_reported: u64,
+    /// Response frame bytes this coordinator accepted off the wire for the
+    /// slice, summed over its remote attempts, including the frame that tripped
+    /// a decode cap (issue #1687 part B). `0` for a slice that ran
+    /// coordinator-local, which moves no frames. Distinct from
+    /// `bytes_reported`, which is store bytes the worker says it read.
+    pub wire_bytes_consumed: u64,
     /// The slice's outcome: `"ok"` (ran to completion, local or remote),
     /// `"fallback"` (remote dispatch failed at transport and the coordinator
     /// re-ran it locally), or `"error"` (the fetch returned a hard error).
@@ -1155,6 +1162,7 @@ fn record_fragment_stat(
     worker_endpoint: String,
     segment_count: u64,
     fell_back: bool,
+    wire_bytes_consumed: u64,
 ) {
     let (bytes_reported, status) = match result {
         Ok(response) => (
@@ -1167,6 +1175,7 @@ fn record_fragment_stat(
         worker_endpoint,
         segment_count,
         bytes_reported,
+        wire_bytes_consumed,
         status,
     };
     let _ = FRAGMENT_STATS.try_with(|sink| sink.record(entry));
@@ -1440,8 +1449,13 @@ impl RoutingSliceFetcher {
     /// (ADR-0071 deliverable 1). Transport loss and an `Unavailable` summary are
     /// [`Attempt::Retry`] (re-dispatchable); every other outcome, success or a
     /// hard decode/framing error, is [`Attempt::Keep`] and terminal.
-    async fn try_remote(&self, endpoint: &str, request: &pb::FetchRequest) -> Attempt {
-        match self.remote_fetch(endpoint, request.clone()).await {
+    async fn try_remote(
+        &self,
+        endpoint: &str,
+        request: &pb::FetchRequest,
+        wire_bytes: &AtomicU64,
+    ) -> Attempt {
+        match self.remote_fetch(endpoint, request.clone(), wire_bytes).await {
             Ok(response) if response.status == pb::status::Code::Unavailable => {
                 tracing::warn!(
                     %endpoint,
@@ -1507,11 +1521,22 @@ impl RoutingSliceFetcher {
     }
 
     /// Dispatch one slice to a remote worker over an authed channel and decode
-    /// its frames.
+    /// its frames as they arrive.
+    ///
+    /// The decode is incremental and bounded (issue #1687 part B): each frame is
+    /// counted and measured before it is decoded, and the first breach of either
+    /// the frame cap or this coordinator's own `max_bytes_scanned` returns
+    /// without pulling another message. Dropping the stream at that point
+    /// cancels the RPC, so the remote stops producing too.
+    ///
+    /// `wire_bytes` accumulates the frame bytes this attempt accepted, including
+    /// the frame that tripped a cap, so a refused slice still reports what it
+    /// made the coordinator hold.
     async fn remote_fetch(
         &self,
         endpoint: &str,
         mut request: pb::FetchRequest,
+        wire_bytes: &AtomicU64,
     ) -> Result<SliceResponse, DistribError> {
         let channel = self.channel(endpoint).await?;
         // Mint and attach the per-query capability (ADR-0071 amendment, decision
@@ -1527,16 +1552,43 @@ impl RoutingSliceFetcher {
             .fetch(tonic_request)
             .await
             .map_err(|s| DistribError::Transport(s.to_string()))?;
-        let mut frames = Vec::new();
+        let mut decoder = SliceStreamDecoder::new(&self.local.engine);
         let mut stream = response.into_inner();
-        while let Some(frame) = stream
-            .message()
-            .await
-            .map_err(|s| DistribError::Transport(s.to_string()))?
-        {
-            frames.push(frame);
+        let outcome = loop {
+            let next = stream
+                .message()
+                .await
+                .map_err(|s| DistribError::Transport(s.to_string()));
+            match next {
+                Ok(Some(frame)) => {
+                    if let Err(err) = decoder.push(frame) {
+                        break Err(err);
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(err) => break Err(err),
+            }
+        };
+        wire_bytes.fetch_add(decoder.bytes_consumed(), Ordering::Relaxed);
+        match outcome {
+            Ok(()) => decoder.finish(),
+            Err(err) => {
+                if matches!(
+                    err,
+                    DistribError::Codec(codec::CodecError::SliceFrameCapExceeded { .. })
+                        | DistribError::Codec(codec::CodecError::SliceByteCapExceeded { .. })
+                ) {
+                    tracing::warn!(
+                        %endpoint,
+                        frames = decoder.frames_consumed(),
+                        wire_bytes = decoder.bytes_consumed(),
+                        error = %err,
+                        "refused a slice that exceeded a coordinator decode cap",
+                    );
+                }
+                Err(err)
+            }
         }
-        decode_slice_frames(frames)
     }
 }
 
@@ -1546,9 +1598,21 @@ impl SliceFetcher for RoutingSliceFetcher {
         let start = Instant::now();
         let segment_count = pinned_segment_count(&request);
         let ranked = self.ranked_owners(&request);
-        let (result, worker_endpoint, fell_back) = self.dispatch(ranked, request).await;
+        // Wire frame bytes this slice made the coordinator hold, summed over
+        // every remote attempt it made (issue #1687 part B). A refused attempt
+        // contributes what it accepted before the cap tripped, so the accounting
+        // does not read as zero for the case the caps exist for.
+        let wire_bytes = AtomicU64::new(0);
+        let (result, worker_endpoint, fell_back) =
+            self.dispatch(ranked, request, &wire_bytes).await;
         self.metrics.observe_slice_fetch(start.elapsed());
-        record_fragment_stat(&result, worker_endpoint, segment_count, fell_back);
+        record_fragment_stat(
+            &result,
+            worker_endpoint,
+            segment_count,
+            fell_back,
+            wire_bytes.load(Ordering::Relaxed),
+        );
         result
     }
 }
@@ -1577,6 +1641,7 @@ impl RoutingSliceFetcher {
         &self,
         ranked: Vec<Owner>,
         request: pb::FetchRequest,
+        wire_bytes: &AtomicU64,
     ) -> (Result<SliceResponse, DistribError>, String, bool) {
         let primary = match ranked.first() {
             // Self-mapped or unroutable: local, the normal no-hop path.
@@ -1592,7 +1657,7 @@ impl RoutingSliceFetcher {
         };
 
         // First remote attempt against the top owner.
-        match self.try_remote(&primary, &request).await {
+        match self.try_remote(&primary, &request, wire_bytes).await {
             Attempt::Keep(result) => {
                 self.metrics.record_slice_remote();
                 return (*result, primary, false);
@@ -1615,7 +1680,7 @@ impl RoutingSliceFetcher {
             && *next != primary
         {
             self.metrics.record_slice_redispatched();
-            match self.try_remote(next, &request).await {
+            match self.try_remote(next, &request, wire_bytes).await {
                 Attempt::Keep(result) => {
                     self.metrics.record_slice_remote();
                     return (*result, next.clone(), false);
@@ -1748,6 +1813,13 @@ pub struct FederationSliceFetcher {
     /// The operator bearer token presented to the remote. This is the only
     /// principal the remote sees for a federated fetch.
     credential: String,
+    /// This coordinator's own query limits, the source of the decode byte cap
+    /// (issue #1687 part B). A remote cluster is outside this operator's
+    /// control, so what it streams is bounded here or nowhere. Defaults to
+    /// `EngineConfig::default`, whose `max_bytes_scanned` is `Unlimited`; the
+    /// process wires its resolved config in through
+    /// [`with_engine_config`](FederationSliceFetcher::with_engine_config).
+    engine: ravel_query::EngineConfig,
 }
 
 impl FederationSliceFetcher {
@@ -1788,7 +1860,19 @@ impl FederationSliceFetcher {
             cluster: config.name.clone(),
             channel: endpoint.connect_lazy(),
             credential: config.credential.clone(),
+            engine: ravel_query::EngineConfig::default(),
         })
+    }
+
+    /// Wire this process's resolved query limits into the fetcher, so a
+    /// federated slice's decode byte cap is this coordinator's own
+    /// `max_bytes_scanned` rather than the `Unlimited` default (issue #1687
+    /// part B). A post-construction builder, so an existing call site that does
+    /// not set one keeps the previous behaviour on the byte cap; the frame cap
+    /// applies either way.
+    pub fn with_engine_config(mut self, engine: ravel_query::EngineConfig) -> Self {
+        self.engine = engine;
+        self
     }
 }
 
@@ -1807,17 +1891,51 @@ impl SliceFetcher for FederationSliceFetcher {
         let response = client.fetch(tonic_request).await.map_err(|s| {
             DistribError::Transport(format!("federated fetch to cluster {}: {s}", self.cluster))
         })?;
-        let mut frames = Vec::new();
-        let mut stream = response.into_inner();
-        while let Some(frame) = stream.message().await.map_err(|s| {
-            DistribError::Transport(format!("federated fetch to cluster {}: {s}", self.cluster))
-        })? {
-            frames.push(frame);
-        }
         // A remote's frames get the same decode validation as an intra-cluster
         // slice's (ADR-0071 trust boundary): a malformed frame is a typed
-        // DistribError, never a panic and never silently dropped data.
-        decode_slice_frames(frames)
+        // DistribError, never a panic and never silently dropped data. They get
+        // the same two decode caps too (issue #1687 part B), checked before each
+        // frame is decoded, and the first breach returns without pulling
+        // another message.
+        let mut decoder = SliceStreamDecoder::new(&self.engine);
+        let mut stream = response.into_inner();
+        let outcome = loop {
+            let next = stream.message().await.map_err(|s| {
+                DistribError::Transport(format!("federated fetch to cluster {}: {s}", self.cluster))
+            });
+            match next {
+                Ok(Some(frame)) => {
+                    if let Err(err) = decoder.push(frame) {
+                        break Err(err);
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(err) => break Err(err),
+            }
+        };
+        match outcome {
+            Ok(()) => decoder.finish(),
+            Err(err) => {
+                // A federated slice has no `fragments[]` entry to record into
+                // (that array is the intra-cluster fan-out's), so the bytes this
+                // coordinator was made to hold are reported here and in the
+                // typed error's own counts.
+                if matches!(
+                    err,
+                    DistribError::Codec(codec::CodecError::SliceFrameCapExceeded { .. })
+                        | DistribError::Codec(codec::CodecError::SliceByteCapExceeded { .. })
+                ) {
+                    tracing::warn!(
+                        cluster = %self.cluster,
+                        frames = decoder.frames_consumed(),
+                        wire_bytes = decoder.bytes_consumed(),
+                        error = %err,
+                        "refused a federated slice that exceeded a coordinator decode cap",
+                    );
+                }
+                Err(err)
+            }
+        }
     }
 }
 

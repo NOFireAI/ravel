@@ -38,6 +38,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures::{StreamExt, stream};
+use prost::Message;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_logseg::LogRecord;
 use ravel_promql::LabelMatcher;
@@ -47,7 +48,10 @@ use ravel_types::logstream::canonical_attr_bytes;
 use ravel_types::{SeriesId, Signal, TenantHash};
 
 use crate::config::{ByteLimit, EngineConfig};
-use crate::distrib::client::{DistribError, SliceFetcher, SliceLogResponse, SliceSpanResponse};
+use crate::distrib::client::{
+    DistribError, SliceFetcher, SliceLogResponse, SliceResponse, SliceSpanResponse,
+};
+use crate::distrib::codec::CodecError;
 use crate::distrib::partition::{DistribThresholds, partition_snapshot};
 use crate::engine::bytes_scanned_exceeded;
 use crate::erasure::ErasurePredicate;
@@ -1205,7 +1209,184 @@ fn query_id_bytes(
     id
 }
 
+/// An incremental, bounded decoder for one slice's response frames (issue
+/// #1687 part B).
+///
+/// [`decode_slice_frames`](client::decode_slice_frames) takes the whole frame
+/// sequence as a `Vec`, so every caller of it must first hold the entire slice
+/// in memory: a remote decides how much the coordinator buffers. This decoder
+/// is the same decode, fed one frame at a time, with two caps checked BEFORE
+/// the frame is decoded and accumulated:
+///
+/// * a frame count cap ([`codec::MAX_SLICE_RESPONSE_FRAMES`]), and
+/// * an aggregate byte cap, taken from the coordinator's own
+///   [`EngineConfig::max_bytes_scanned`] and measured as the protobuf-encoded
+///   length of each frame received (wire frame bytes, not S3 bytes and not
+///   decoded in-memory size).
+///
+/// Both refusals are a typed [`DistribError::Codec`] naming the exact counts,
+/// and [`cap_refusal_error`] maps them to the budget class (HTTP 422), not to
+/// the availability class. A caller must stop reading its stream on the first
+/// `Err`: the caps bound what has been held only if nothing more is pulled.
+pub struct SliceStreamDecoder {
+    max_bytes: ByteLimit,
+    max_frames: usize,
+    frames: usize,
+    bytes: u64,
+    scalar: Vec<FetchedSeriesSoa>,
+    histogram: Vec<FetchedHistogramSeries>,
+    partials: Vec<codec::PartialAggregate>,
+    summary: Option<pb::Summary>,
+}
+
+impl SliceStreamDecoder {
+    /// A decoder whose byte cap is this coordinator's own
+    /// `max_bytes_scanned` and whose frame cap is
+    /// [`codec::MAX_SLICE_RESPONSE_FRAMES`]. `ByteLimit::Unlimited` (the
+    /// `EngineConfig` default) leaves the byte cap off, so the frame cap is
+    /// then the only bound.
+    pub fn new(config: &EngineConfig) -> Self {
+        SliceStreamDecoder {
+            max_bytes: config.max_bytes_scanned,
+            max_frames: codec::MAX_SLICE_RESPONSE_FRAMES,
+            frames: 0,
+            bytes: 0,
+            scalar: Vec::new(),
+            histogram: Vec::new(),
+            partials: Vec::new(),
+            summary: None,
+        }
+    }
+
+    /// Wire frame bytes accepted so far, including the frame that tripped a
+    /// cap. The protobuf-encoded length of each received frame, summed.
+    pub fn bytes_consumed(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Frames received so far, including the one that tripped a cap.
+    pub fn frames_consumed(&self) -> usize {
+        self.frames
+    }
+
+    /// Accept one frame, or refuse the slice.
+    ///
+    /// Both caps are checked before the frame's payload is decoded or kept, so
+    /// a refusal holds one frame more than the cap allows and nothing else.
+    /// Every other malformation is the same typed error
+    /// [`decode_slice_frames`](client::decode_slice_frames) raises for it.
+    pub fn push(&mut self, frame: pb::FetchResponse) -> Result<(), DistribError> {
+        self.frames += 1;
+        if self.frames > self.max_frames {
+            return Err(DistribError::Codec(CodecError::SliceFrameCapExceeded {
+                frames: self.frames,
+                max: self.max_frames,
+            }));
+        }
+        self.bytes = self.bytes.saturating_add(frame.encoded_len() as u64);
+        if let ByteLimit::Bounded(max) = self.max_bytes
+            && self.bytes > max
+        {
+            return Err(DistribError::Codec(CodecError::SliceByteCapExceeded {
+                bytes: self.bytes,
+                max,
+            }));
+        }
+        match frame.frame {
+            Some(pb::fetch_response::Frame::Series(sf)) => {
+                self.scalar.extend(codec::decode_series_frame(sf)?);
+            }
+            Some(pb::fetch_response::Frame::Hist(hf)) => {
+                self.histogram.extend(codec::decode_histogram_frame(hf)?);
+            }
+            Some(pb::fetch_response::Frame::LogRecord(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("log-record"));
+            }
+            Some(pb::fetch_response::Frame::Span(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("span"));
+            }
+            Some(pb::fetch_response::Frame::PartialAggregate(pa)) => {
+                self.partials.push(codec::decode_partial_aggregate(pa)?);
+            }
+            Some(pb::fetch_response::Frame::Summary(s)) => {
+                if self.summary.is_some() {
+                    return Err(DistribError::MultipleSummaries);
+                }
+                self.summary = Some(s);
+            }
+            None => return Err(DistribError::EmptyFrame),
+        }
+        Ok(())
+    }
+
+    /// Fold the accepted frames into the slice response, or fail for the same
+    /// reasons [`decode_slice_frames`](client::decode_slice_frames) does: no
+    /// terminal summary, a summary with no status, or an unknown status code.
+    pub fn finish(self) -> Result<SliceResponse, DistribError> {
+        let summary = self.summary.ok_or(DistribError::NoSummary)?;
+        let status = summary
+            .status
+            .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
+        let code = codec::decode_status_code(status.code)?;
+        let accounting = summary
+            .accounting
+            .map(codec::decode_accounting)
+            .unwrap_or_default();
+        Ok(SliceResponse {
+            scalar: self.scalar,
+            histogram: self.histogram,
+            partials: self.partials,
+            accounting,
+            stats: FetchStats {
+                raw_f64_pages: summary.raw_f64_pages,
+                raw_f64_bytes: summary.raw_f64_bytes,
+                // A metrics slice returns its histogram-kind series as their
+                // own frames, so nothing was skipped for a caller to be warned
+                // about (the same reasoning as in `decode_slice_frames`).
+                histogram_series_skipped: 0,
+            },
+            series_returned: summary.series_returned,
+            samples_returned: summary.samples_returned,
+            status: code,
+            status_message: status.message,
+        })
+    }
+}
+
+/// The typed budget refusal behind a [`SliceStreamDecoder`] cap breach, or
+/// `None` for any other [`DistribError`].
+///
+/// A cap breach is a refusal, not an outage: the coordinator declined to hold
+/// what a remote offered. Both arms therefore map to the budget class that
+/// `http/error.rs` renders as a 422 with its counts intact, never to
+/// `QueryError::Distrib`/`Federation`, which are redacted to a retryable 503.
+/// Retrying the same query against the same remote cannot succeed, so a 503
+/// would invite exactly the retry that cannot help.
+pub(crate) fn cap_refusal_error(err: &DistribError) -> Option<QueryError> {
+    match err {
+        DistribError::Codec(CodecError::SliceByteCapExceeded { bytes, max }) => {
+            Some(QueryError::TooManyBytesScanned {
+                scanned: *bytes,
+                max: *max,
+            })
+        }
+        DistribError::Codec(CodecError::SliceFrameCapExceeded { frames, max }) => {
+            Some(QueryError::TooManySliceFrames {
+                frames: *frames,
+                max: *max,
+            })
+        }
+        _ => None,
+    }
+}
+
 fn distrib_error(err: DistribError) -> QueryError {
+    // A decoder cap breach keeps its budget class end to end (issue #1687
+    // part B); everything else is an outage or a framing fault from the
+    // client's view.
+    if let Some(refusal) = cap_refusal_error(&err) {
+        return refusal;
+    }
     QueryError::Distrib {
         reason: err.to_string(),
     }

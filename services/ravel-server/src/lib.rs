@@ -2447,7 +2447,8 @@ pub async fn start(
         } else {
             let mut remotes = Vec::with_capacity(config.remote_clusters.len());
             for rc in &config.remote_clusters {
-                let fetcher = distrib::FederationSliceFetcher::connect(rc)?;
+                let fetcher =
+                    distrib::FederationSliceFetcher::connect(rc)?.with_engine_config(engine_config);
                 remotes.push(ravel_query::distrib::RemoteCluster {
                     name: rc.name.clone(),
                     fetcher: Arc::new(fetcher),
