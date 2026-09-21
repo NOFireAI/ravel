@@ -3,6 +3,37 @@
 Deployment assets for Ravel: Docker Compose stacks, Kubernetes manifests, and
 the IAM policy documents the operator renders into Secrets.
 
+## Prometheus alerting rules (`prometheus/ravel.rules.yaml`)
+
+`prometheus/ravel.rules.yaml` is the shipped alert rule file: 31 alerts in 8
+groups. Each carries the threshold its source document states, and the
+duration that document states where it states one. The sources are
+[the observability guide](../docs/guides/observability.md), which explains the
+groups it states durations for, and
+[the troubleshooting guide](../docs/guides/operations/troubleshooting.md),
+whose symptom table states the rest. 15 of the 31 carry no `for:` because the
+row they come from states no duration; each of those says so in an
+`as_documented` annotation, and every rule carries a `runbook` annotation
+naming the section to read when it fires.
+
+Load it from a Prometheus server's `rule_files:` key:
+
+```yaml
+rule_files:
+  - /etc/prometheus/ravel.rules.yaml
+```
+
+or wrap the same `groups:` list in a `PrometheusRule` custom resource under
+the Prometheus Operator. This directory ships the rule file alone, not a
+scrape configuration: point your own Prometheus at the Ravel processes you
+run.
+
+`services/ravel-server/tests/shipped_rules_name_emitted_metrics.rs` pins the
+names. It reads this file, extracts the 37 distinct `ravel_` metric names it
+references, and asserts each one appears on a `# TYPE` line of a `/metrics`
+body rendered by a running server, so renaming a metric in the code fails the
+test instead of leaving a rule here matching no series.
+
 ## Why MinIO and the OpenTelemetry Collector are not pulled from Docker Hub
 
 Docker Hub's anonymous pull allowance is per source IP and shared across
