@@ -1222,6 +1222,8 @@ pub struct Cli {
     /// tasks refuses further age and size triggers and counts them on
     /// `ravel_ingest_flush_trigger_deferred_total`; the buffer rides back
     /// untouched and the next tick re-fires once a flush has been reaped.
+    /// `/metrics` carries that counter and the depth it bounds,
+    /// `ravel_ingest_queued_flushes`, both by `{mode, signal}`.
     /// Nothing is acked and nothing is dropped, so a refusal is a deferral,
     /// not a shed. Drains (`FlushNow`, shutdown) are never refused, and
     /// neither is a tenant buffer that has crossed its per-(shard, tenant)
@@ -1229,20 +1231,33 @@ pub struct Cli {
     /// pressure: the backstop is the only bound on one buffer's resident
     /// memory, and refusing there would trade a bounded queue of flush tasks
     /// for an unbounded buffer, the worse of the two failures. Size the
-    /// steady state from this cap and the headroom for that overshoot from
-    /// the backstop. `0` is rejected, and so is a `--max-inflight-flushes`
+    /// steady state from this cap; what bounds the overshoot is the paragraph
+    /// below. `0` is rejected, and so is a `--max-inflight-flushes`
     /// above this value, since effective per-shard flush concurrency is the
     /// lower of the two. Matches
     /// [`ravel_ingest::IngestConfig::max_queued_flushes`]'s own default of 8
     ///
-    /// The memory backstop is
-    /// `max(min(--max-ingest-buffer-bytes / 8, 64 MiB), --target-flush-bytes)`
-    /// per (shard, tenant) buffer. Under `--max-ingest-buffer-bytes 0` the
-    /// process-wide byte budget is disabled and nothing sheds behind that
-    /// backstop at all, which is why a crossing spawns unconditionally.
-    /// The queue then grows by one window per backstop's worth of buffered
-    /// memory, so it is bounded by how fast memory fills rather than by the
-    /// flush cadence, and the buffer stays bounded either way.
+    /// The memory backstop has no flag of its own: it is
+    /// `max(min(--max-ingest-buffer-bytes / 8, 64 MiB), target_bytes)` per
+    /// (shard, tenant) buffer, where `target_bytes` is the ingest pipeline's
+    /// fixed 8 MiB object-size trigger and is not settable on this binary. So
+    /// 64 MiB at the default 512 MiB budget, and `--max-ingest-buffer-bytes`
+    /// is the only knob that moves it. See "Shard actor" in docs/ingest.md
+    /// for why it is a share of the budget rather than a constant.
+    ///
+    /// The exempt path is not bounded by a count. An exempt spawn consumes
+    /// the whole buffer it fires on, so the same tenant reaches the backstop
+    /// again only after buffering another backstop's worth, and the only
+    /// re-insert path is the ordinary one: the windows accumulate rather than
+    /// standing at one per buffer currently over its backstop. What bounds
+    /// them is the byte budget, since a queued flush stays charged until its
+    /// PUTs complete: under a `Bounded` budget the charges reach the ceiling
+    /// and admission sheds, which stops the refill that would spawn the next
+    /// one. Under `--max-ingest-buffer-bytes 0` the budget is disabled and
+    /// nothing sheds behind the backstop at all, which is why a crossing
+    /// spawns unconditionally and why nothing then bounds the queue except
+    /// how long the stall lasts. One buffer's own resident memory stays
+    /// bounded by the backstop either way.
     ///
     /// [`Cli::validate`] rejects `0` (it would refuse every non-drain
     /// trigger), and rejects a `--max-inflight-flushes` above this value: a

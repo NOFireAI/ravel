@@ -391,13 +391,19 @@ is the only bound on one buffer's resident memory, and under `Unlimited`
 nothing sheds behind it, so refusing a crossing would hold the queue at its
 cap and let the buffer grow for as long as the stall lasts: a bounded queue of
 flush tasks traded for an unbounded buffer, which is the worse of the two
-failures. The exemption keeps both bounded, at the cost of an overshoot on the
-queue. Under memory pressure the queue therefore carries one extra window per
-buffer sitting over its backstop, so it grows only as fast as memory fills,
-not with the flush cadence. Size the steady state from `max_queued_flushes`
-and the headroom for the overshoot from the backstop and the tenant count.
+failures. The trade is a bounded buffer for an overshoot on the queue that no
+count bounds: an exempt spawn drains the buffer it fires on, so the tenant
+crosses again only after buffering another backstop's worth, and each adds a
+window rather than replacing one. Under `Bounded` the byte budget still bounds
+the total, because a queued flush stays charged until its PUTs complete and
+admission sheds once the charges reach the ceiling, which stops the refill;
+under `Unlimited` only the length of the stall does. Size the steady state
+from `max_queued_flushes`, and size the overshoot from the byte ceiling rather
+than from a count of buffers.
 `flushes_queued` reading above the cap while `flush_trigger_deferred` stays
-flat is this exemption, not a queue that lost its bound.
+flat is this exemption, not a queue that lost its bound. Both are exported:
+`/metrics` renders them as `ravel_ingest_queued_flushes` (gauge) and
+`ravel_ingest_flush_trigger_deferred_total` (counter), by `{mode, signal}`.
 
 Raising the bound gives healthy tenants a permit to flush on while one prefix
 is throttled, at the cost of more concurrent PUTs and more encode memory in
@@ -860,26 +866,37 @@ terms:
    ratio hold for logs. Until a log workload is measured, size a log-heavy host
    from measurement rather than from this multiplier.
 
-   The in-flight flush half of this term has a second, count-based bound that
-   holds even when the byte ceiling is disabled. Under ADR-1642 a flush task is
-   spawned at every trigger and acquires its `max_inflight_flushes` permit
-   itself, so a stalled object store queues spawned flushes that each hold a
-   whole flush window; the ADR-1642 amendment caps that queue per shard at
-   `max_queued_flushes` (default 8). At the cap a shard refuses its size and
-   age triggers, leaving the rows buffered for the next tick, so flush-window
-   memory is bounded by `shard_count x (max_queued_flushes + over_backstop) x`
-   the largest flush window regardless of `--max-ingest-buffer-bytes`, where
-   `over_backstop` is the number of that shard's tenant buffers currently past
-   their memory backstop: such a buffer is exempt from the cap and spawns
-   anyway, because the backstop is the only bound on its own resident memory
-   and refusing there would make the buffer unbounded instead. Those two terms
-   trade against each other, so the sum stays bounded either way: each extra
-   flush window costs a backstop's worth of buffered memory that the flush
-   then drains. Under the default
-   `Bounded` budget this count bound is the looser of the two and the byte
-   ceiling is what an operator sizes to; under `0` (`Unlimited`) it is the only
-   bound on flush windows, and buffered rows are then bounded per tenant by the
-   per-tenant buffer caps but not in sum, which is the exposure `0` accepts.
+   The in-flight flush half of this term has a second, count-based bound on the
+   flushes its ordinary triggers open, and that one holds even when the byte
+   ceiling is disabled. Under ADR-1642 a flush task is spawned at every trigger
+   and acquires its `max_inflight_flushes` permit itself, so a stalled object
+   store queues spawned flushes that each hold a whole flush window; the
+   ADR-1642 amendment caps that queue per shard at `max_queued_flushes`
+   (default 8). At the cap a shard refuses its size and age triggers, leaving
+   the rows buffered for the next tick, so the windows those two triggers
+   produce are bounded by `shard_count x max_queued_flushes x` the largest
+   flush window regardless of `--max-ingest-buffer-bytes`.
+
+   The exempt path has no such product, and writing one would read as an upper
+   bound that does not hold. A tenant buffer past its memory backstop spawns
+   whatever the queue depth, because the backstop is the only bound on that
+   buffer's own resident memory and refusing there would make the buffer
+   unbounded instead. An exempt spawn consumes the whole buffer it fires on,
+   and the only path that re-inserts a buffer is the ordinary one, so the same
+   tenant crosses its backstop again only after buffering another backstop's
+   worth, and the windows it produces accumulate. Counting the buffers
+   currently sitting over their backstop therefore describes one instant, not
+   the queue that instant is a sample of. What bounds the exempt windows is the
+   byte budget rather than any count: a queued flush stays charged against
+   `--max-ingest-buffer-bytes` until its PUTs complete, so under the default
+   `Bounded` budget those charges reach the ceiling and admission sheds, which
+   is what stops the refill that would spawn the next exempt window, and the
+   byte ceiling is what an operator sizes to. Under `0` (`Unlimited`) nothing
+   sheds behind the backstop, so nothing bounds how many exempt windows a stall
+   accumulates except how long it lasts. One buffer's own resident memory is
+   still bounded by its backstop, and buffered rows are then bounded per tenant
+   by the per-tenant buffer caps but not in sum, which is the exposure `0`
+   accepts.
 2. **In-flight decode overhead**: each admitted in-flight request transiently
    holds one decoded/normalized request body during normalization, before its
    points reach a buffer. This is bounded by
@@ -1299,10 +1316,13 @@ still uncovered there.
 
 The per-shard dimension is not part of the flat `IngestMetricsSnapshot` or its
 log and span counterparts, whose `Copy` shape holds no per-shard field. The
-flat totals `in_flight_flushes_total` and `flush_permit_wait_ns_total` are on
-every snapshot, and the process `/metrics` surface renders
-`ravel_ingest_in_flight_flushes` and
-`ravel_ingest_flush_permit_wait_seconds_total` for every signal
+flat totals `in_flight_flushes_total`, `flush_permit_wait_ns_total`,
+`flushes_queued_total`, and `flush_trigger_deferred_total` are on every
+snapshot, and the process `/metrics` surface renders
+`ravel_ingest_in_flight_flushes`,
+`ravel_ingest_flush_permit_wait_seconds_total`,
+`ravel_ingest_queued_flushes`, and
+`ravel_ingest_flush_trigger_deferred_total` for every signal
 (`services/ravel-server/src/metrics.rs`); the per-shard breakdown stays
 internal, read only through `shard_skew_by_shard()`. Per shard
 (`ShardSkewStats`):
