@@ -550,6 +550,38 @@ labels, so the cross-cluster union is a plain set union). See
 [query-engine.md](../query-engine.md#cross-cluster-federation-adr-0071) for
 the full statement.
 
+## What bounds a slice the coordinator decodes
+
+A worker decides how many response frames a slice carries and how large each
+one is. The coordinator decodes them incrementally through one bounded
+decoder, shared by the intra-cluster fetcher and the federation fetcher, and
+that decoder applies two caps per slice:
+
+| Cap | Value | Why it exists |
+|---|---|---|
+| Response frames | `MAX_SLICE_RESPONSE_FRAMES`, 1048576 | A slice emits one frame per returned run plus one terminal summary, so this is far above any ordinary slice. It is the cap that still bounds a stream when the byte cap is unlimited, which is the default: an empty frame costs two wire bytes, so bytes alone do not bound a frame count. |
+| Aggregate wire bytes | the coordinator's own `max_bytes_scanned` | The same engine limit a local scan is held to, applied to the encoded size of the frames this coordinator accepts. `max_bytes_scanned` is unlimited unless configured, and then only the frame cap applies. |
+
+Both caps are checked before a frame is decoded or kept, and the client stops
+pulling from the stream at the first breach rather than reading it to the end.
+Dropping the stream cancels the RPC, so the worker stops producing. The
+coordinator therefore holds the frame that tripped the cap and whatever the
+HTTP/2 flow-control window had already put on the wire, not the rest of the
+slice.
+
+A breach is a **refusal, not an outage**. It renders as HTTP 422 naming both
+the observed count and the cap (`TooManySliceFrames` for the frame cap,
+`TooManyBytesScanned` for the byte cap), in the same `execution` error class a
+local budget trip uses. It is deliberately not the redacted 503 that every
+other distributed slice failure becomes: the counts are the coordinator's own,
+so there is no server state to redact, and retrying the same query against the
+same remote would break the same way. The bytes consumed before the breach are
+still folded into accounting, and the coordinator logs a `warn` naming the
+endpoint, the frame count, and the wire bytes.
+
+A federated slice is refused the same way. It has no `stats.fragments[]` entry,
+so its consumed bytes appear in the typed error and that `warn` log only.
+
 ## Reading `stats.fragments[]`
 
 A distributed query's stats block gains one `fragments` array, with one object
@@ -559,9 +591,9 @@ distribute, so its presence is itself the signal that fan-out happened.
 ```json
 "stats": {
   "fragments": [
-    { "workerEndpoint": "10.0.0.12:4317", "segmentCount": 41, "bytesReported": 189743104, "status": "ok" },
-    { "workerEndpoint": "10.0.0.13:4317", "segmentCount": 38, "bytesReported": 174260224, "status": "ok" },
-    { "workerEndpoint": "local", "segmentCount": 40, "bytesReported": 181403648, "status": "fallback" }
+    { "workerEndpoint": "10.0.0.12:4317", "segmentCount": 41, "bytesReported": 189743104, "wireBytesConsumed": 24117248, "status": "ok" },
+    { "workerEndpoint": "10.0.0.13:4317", "segmentCount": 38, "bytesReported": 174260224, "wireBytesConsumed": 22020096, "status": "ok" },
+    { "workerEndpoint": "local", "segmentCount": 40, "bytesReported": 181403648, "wireBytesConsumed": 0, "status": "fallback" }
   ]
 }
 ```
@@ -574,6 +606,13 @@ distribute, so its presence is itself the signal that fan-out happened.
   cut shard-major and a shard is never split, so shard skew becomes slice skew.
 - `bytesReported`: the store bytes that worker reported scanning, already
   folded into the query's own accounting total.
+- `wireBytesConsumed`: the encoded size of the response frames this
+  coordinator accepted off the slice's stream, including the frame that tripped
+  a decode cap. This is a different quantity from `bytesReported`: those are
+  store bytes the worker read, these are wire bytes the coordinator held. A
+  slice the coordinator ran with no remote attempt reports `0`, because nothing
+  was encoded; a `fallback` entry reports what its failed remote attempt had
+  already accepted before it failed.
 - `status`: `ok`, `fallback` (the slice ran on the coordinator after a remote
   attempt failed), or `error`.
 
@@ -652,6 +691,7 @@ What an operator will actually observe, case by case:
 | A pinned segment vanished (concurrent GC or compaction) | The coordinator re-resolves the snapshot once and re-dispatches the whole query, not one slice; a second occurrence fails | The same single-retry behavior a local query already has |
 | A worker reports a corrupt segment, or a frame fails to decode | Terminal immediately: no retry, no local fallback | Typed error; a retry would mask real corruption behind a clean local read |
 | A CAP trips on a slice, or on the folded total (bytes, series, samples, or the request count) | The same typed `TooManySeries` / `TooManyBytesScanned` a local query raises, never a transport error | HTTP 422 with the usual budget error |
+| A slice outruns a coordinator decode cap (the frame cap, or the coordinator's own `max_bytes_scanned` over wire bytes) | The client stops pulling at the first breach and fails typed: `TooManySliceFrames` or `TooManyBytesScanned`, never a transport error. See [What bounds a slice the coordinator decodes](#what-bounds-a-slice-the-coordinator-decodes) | HTTP 422 naming both counts, not a 503; an `error` entry in `stats.fragments[]` carrying `wireBytesConsumed`, and a `warn` log naming the endpoint |
 | A worker trips its FETCH MEMORY budget on a slice | `FetchMemoryExhausted`, which is backpressure rather than a cap on the query | HTTP 503, deliberately: the same slice may succeed when the worker has room, so a retry is the right response |
 | The query deadline is reached | The coordinator cancels the fan-out; stream teardown reaches the workers and drop-based cancellation frees their in-flight GETs and fragment permits | Normal deadline error; no leaked permits |
 | Protocol version skew during a rolling deploy | Skewed workers are dropped at routing time, so a mismatch costs no round trip; if none are eligible, the query runs fully local | `slices_local_total` rising, `slices_remote_total` flat |
