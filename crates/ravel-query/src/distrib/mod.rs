@@ -1432,8 +1432,7 @@ mod slice_cap_tests {
     /// exact counts.
     #[test]
     fn frame_cap_refuses_at_the_cap_with_exact_counts() {
-        let mut decoder =
-            SliceStreamDecoder::new(&EngineConfig::default()).with_max_frames(3);
+        let mut decoder = SliceStreamDecoder::new(&EngineConfig::default()).with_max_frames(3);
         for i in 0..3u8 {
             decoder
                 .push(series_frame(i, 1))
@@ -1490,6 +1489,14 @@ mod slice_cap_tests {
                 .expect("no byte cap applies under the default config");
         }
         assert!(decoder.bytes_consumed() > 100_000);
+
+        // And the byte cap could not stand in for the frame cap even when it is
+        // set: an empty frame is 2 wire bytes, so bytes bound a frame count
+        // only at 2 bytes per frame.
+        let empty = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Series(pb::SeriesFrame::default())),
+        };
+        assert_eq!(empty.encoded_len(), 2);
     }
 
     /// The funnel: a cap breach becomes a budget refusal that keeps its counts,
@@ -1502,10 +1509,7 @@ mod slice_cap_tests {
             max: 6,
         }));
         assert!(
-            matches!(
-                frames,
-                QueryError::TooManySliceFrames { frames: 7, max: 6 }
-            ),
+            matches!(frames, QueryError::TooManySliceFrames { frames: 7, max: 6 }),
             "got {frames:?}"
         );
 
@@ -1526,9 +1530,6 @@ mod slice_cap_tests {
 
         // Anything else keeps the availability class it had.
         let other = distrib_error(DistribError::NoSummary);
-        assert!(
-            matches!(other, QueryError::Distrib { .. }),
-            "got {other:?}"
-        );
+        assert!(matches!(other, QueryError::Distrib { .. }), "got {other:?}");
     }
 }
