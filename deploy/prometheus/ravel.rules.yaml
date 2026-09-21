@@ -1,0 +1,624 @@
+# Ravel alerting rules, for a Prometheus that scrapes Ravel's /metrics route.
+#
+# Every rule here is transcribed from a normative doc, not derived here:
+#   docs/guides/observability.md holds the groups whose thresholds and
+#   durations it states and explains. Their expressions, `for:` durations and
+#   severity labels are copied from it character for character; the comments
+#   are shortened, since the guide carries the long form, and a `runbook`
+#   annotation is added naming the section to read.
+#   docs/guides/operations/troubleshooting.md states the remaining conditions
+#   as symptom-table rows. A row that states no duration is carried with no
+#   `for:` and an `as_documented` annotation saying so.
+#
+# services/ravel-server/tests/shipped_rules_name_emitted_metrics.rs asserts
+# that every Ravel metric name in this file appears in a rendered /metrics
+# body, so a metric rename cannot leave a rule here matching nothing.
+#
+# Load it with Prometheus's `rule_files:` key:
+#
+#   rule_files:
+#     - /etc/prometheus/ravel.rules.yaml
+#
+# or wrap the same groups in a PrometheusRule custom resource under the
+# Prometheus Operator.
+groups:
+  - name: ravel-catalog-fold
+    # RavelCatalogFoldStalled fires on any deployment where some signal has
+    # no fresh fold, which includes a fleet that never folds at all: an
+    # intentionally maintain-only fleet, or one running --disable-fold
+    # everywhere. Such a fleet must drop this rule or inhibit it.
+    rules:
+      - alert: RavelCatalogFoldStalled
+        expr: |
+          (
+            time() - max by (signal) (
+              ravel_catalog_fold_last_success_timestamp_seconds
+            ) > 4800
+          )
+          or
+          absent(ravel_catalog_fold_last_success_timestamp_seconds)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            No Ravel process has completed a catalog fold of signal
+            {{ $labels.signal }} for longer than the unsealed ingest span the
+            configuration allows
+          description: >-
+            The unsealed span for this signal grows for as long as this holds,
+            and a cold recent-window query over a wide enough span is refused
+            for exceeding its object-store request budget. Check
+            ravel_catalog_fold_failures_total for the same signal for a fold
+            that is running and failing, and the fold task's logs for the
+            underlying store error.
+          runbook: docs/guides/observability.md#the-fold-stalled-alert
+      - alert: RavelCatalogFoldFailing
+        expr: |
+          sum by (signal) (rate(ravel_catalog_fold_failures_total[15m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ravel catalog folds of {{ $labels.signal }} are failing
+          description: >-
+            The fold retries each tick, so a transient store fault clears on
+            its own. A sustained failure rate does not, and it precedes
+            RavelCatalogFoldStalled by however long the threshold there
+            allows.
+          runbook: docs/guides/observability.md#the-fold-stalled-alert
+
+  - name: ravel-declared-stats
+    rules:
+      - alert: RavelFoldStampCoverageShortfall
+        expr: |
+          sum(increase(ravel_catalog_fold_stamped_records_total[1h]))
+            >
+          sum(increase(ravel_catalog_fold_stamped_entries_total[1h]))
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            The Ravel fold is reading more stamped carriers than it is writing
+            stamped snapshot entries
+          description: >-
+            Declared-column statistics are being read off commit records or
+            compaction parts and not carried onto the snapshot entries the
+            query side prunes with, so pruning silently degrades to a full scan
+            on the affected segments. A shortfall means every stamp of some
+            carrier was dropped as defective, so
+            ravel_declared_stats_drops_observed_total names the writer:
+            compare its rate on carrier="commit-record" against
+            carrier="compaction-part" over the same window as the shortfall.
+          runbook: docs/guides/observability.md#the-stamp-coverage-shortfall-alert
+      - alert: RavelFoldStampCoverageMissing
+        expr: |
+          absent(ravel_catalog_fold_stamped_records_total)
+          and
+          (
+            sum(increase(ravel_ingest_flushes_by_size_total{signal="logs"}[1h]))
+            +
+            sum(increase(ravel_ingest_flushes_by_age_total{signal="logs"}[1h]))
+            +
+            sum(increase(ravel_ingest_flushes_manual_total{signal="logs"}[1h]))
+          ) > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Ravel is flushing log segments but no process reports fold stamp
+            coverage
+          description: >-
+            No process in this deployment renders the stamp-coverage families
+            at all, so nothing can say whether the stamps the ingest side
+            writes are reaching the snapshot. What it detects is the absence
+            of the families, not that folds are old. For a deployment that
+            deliberately folds nowhere, RavelCatalogFoldStalled is the rule
+            that covers it; scope this one out.
+          runbook: docs/guides/observability.md#the-stamp-coverage-shortfall-alert
+
+  - name: ravel-maintain-liveness
+    # These rules assume at least one maintain-mode process is scraped. A
+    # deployment that runs no maintain mode at all (retention, compaction, and
+    # GC disabled by design) has no maintenance loop to be alive, and must drop
+    # or inhibit this group; the family is absent there and the absent() branch
+    # would otherwise fire permanently.
+    rules:
+      - alert: RavelMaintenanceLoopStalled
+        # No max()/min() aggregation: unlike the fold, the maintenance loop is
+        # NOT covered by peers. Ownership of units is partitioned across
+        # replicas (ADR-0065), so a single dead loop strands its own units
+        # while healthy peers keep their gauges fresh.
+        expr: |
+          (
+            time() - ravel_maintain_last_cycle_completed_timestamp_seconds > 1800
+          )
+          or
+          absent(ravel_maintain_last_cycle_completed_timestamp_seconds)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel maintenance loop has not completed a cycle for longer than
+            several maintain intervals
+          description: >-
+            Retention, compaction, and GC have stopped for the units this
+            process owns, and the pod still reads Running and Ready. Check
+            ravel_maintain_loop_panics_total for a crash-looping loop and the
+            maintain process logs for the panic. The threshold is set well
+            above the default 5m maintain interval so a slow cycle does not
+            page.
+          runbook: docs/guides/observability.md#the-maintenance-stalled-alert
+      - alert: RavelMaintenanceNoFullSweeps
+        # The counter advances per swept unit, so a process that owns none
+        # never moves it while completing cycles normally. The
+        # ravel_maintain_units_owned term is what keeps that healthy case
+        # quiet, and it is why this rule is not a bare counter check.
+        expr: |
+          increase(ravel_maintain_full_sweep_passes_total[3h]) == 0
+          and
+          ravel_maintain_units_owned > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            No Ravel maintenance full sweep has run in the last several hours
+          description: >-
+            The GC sweeper reclaims nothing while this holds. It precedes the
+            operator-visible symptom (a refused recent-window query) and
+            corroborates RavelMaintenanceLoopStalled.
+          runbook: docs/guides/observability.md#the-maintenance-stalled-alert
+      - alert: RavelMaintenanceLoopCrashLooping
+        # The shape neither rule above catches: a supervised attempt that
+        # completes a cycle and then panics re-stamps the liveness gauge, so
+        # the panic counter is the only signal that moves.
+        expr: |
+          increase(ravel_maintain_loop_panics_total[1h]) > 3
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            The Ravel maintenance loop is panicking and restarting repeatedly
+          description: >-
+            The supervisor is catching a panic and restarting the loop faster
+            than the loop is making progress. Read the maintain process logs
+            for the panic itself. This fires while the liveness gauge is still
+            fresh, so it is the only signal for a crash loop that completes a
+            cycle between panics.
+          runbook: docs/guides/observability.md#the-maintenance-stalled-alert
+
+  - name: ravel-alerting-pipeline
+    # None of these rules carries an absent() branch, unlike the maintenance
+    # group above, and that is deliberate. A deployment with no alert rules
+    # configured builds no evaluator and therefore exports none of this family,
+    # which is a legitimate steady state, not an outage.
+    rules:
+      - alert: RavelAlertLoopStalled
+        expr: |
+          time() - ravel_alert_last_tick_completed_timestamp_seconds > 600
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel alert evaluation loop has not completed a tick for ten
+            evaluation intervals
+          description: >-
+            No rule is being evaluated and no transition is being written or
+            notified on this process, while the pod still reads Running and
+            Ready. Check the process logs for a panic in an evaluator task.
+            This gauge is process-wide liveness and not per-tenant.
+          runbook: docs/guides/observability.md#the-alerting-pipeline-alerts
+      - alert: RavelAlertNotificationsAllFailing
+        expr: |
+          increase(ravel_alert_notifications_failed_total[15m]) > 0
+          and
+          increase(ravel_alert_notifications_delivered_total[15m]) == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Every Ravel alert notification is failing to reach its sinks
+          description: >-
+            Transitions are still being written durably, so no alert history is
+            lost, but nothing is reaching Alertmanager or the configured
+            webhooks. Check the sink URLs and credentials, and the evaluator
+            logs for the per-sink delivery error.
+          runbook: docs/guides/observability.md#the-alerting-pipeline-alerts
+      - alert: RavelAlertRuleEvaluationFailing
+        expr: |
+          increase(ravel_alert_rules_failed_total[30m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A Ravel alert rule has been failing to evaluate for half an hour
+          description: >-
+            The rule is skipped and retried every tick, so the condition it
+            watches is unguarded for as long as this holds. The evaluator logs
+            name the rule_id and the error.
+          runbook: docs/guides/observability.md#the-alerting-pipeline-alerts
+      - alert: RavelAlertPipelineBlocked
+        # The two store-failure outcomes, and ONLY those two. lease_not_held is
+        # excluded on purpose: it is the steady state of every replica that is
+        # not the lease holder.
+        expr: |
+          increase(ravel_alert_ticks_total{outcome=~"history_unavailable|lease_unavailable"}[30m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Ravel alert evaluation is blocked on object storage
+          description: >-
+            The evaluator can neither read the tenant's alert history nor hold
+            its lease, so no rule is evaluated on these ticks. The liveness
+            gauge does not advance on them either, so a sustained case also
+            trips RavelAlertLoopStalled; this rule names the cause. Check the
+            store reachability family.
+          runbook: docs/guides/observability.md#the-alerting-pipeline-alerts
+
+  - name: ravel-ingest-rejections
+    rules:
+      - alert: RavelStructuralRejections
+        expr: |
+          sum by (tenant_hash, signal) (
+            rate(ravel_admission_rejected_total{reason="structural"}[5m])
+          ) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Tenant {{ $labels.tenant_hash }} is sending {{ $labels.signal }}
+            data Ravel cannot represent
+          description: >-
+            Structural rejections do not clear on retry. Check the OTLP
+            partial-success message the sender receives for the reason, then
+            fix the exporter or add a collector processor for it.
+          runbook: docs/guides/observability.md#reading-the-reason-label
+      - alert: RavelEventTimeSkew
+        expr: |
+          sum by (tenant_hash, signal) (
+            rate(ravel_admission_rejected_total{reason="skew"}[5m])
+          ) > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Tenant {{ $labels.tenant_hash }} is dropping {{ $labels.signal }}
+            data outside the accepted event-time window
+          description: >-
+            This is an absolute rate of rejected points, records, or spans per
+            second, not a fraction of the tenant's traffic. Check sender clock
+            sync first, then whether a backfill is running outside the tenant's
+            accepted ingest lag. Raise the threshold for a tenant that runs a
+            steady expected backfill.
+          runbook: docs/guides/observability.md#reading-the-reason-label
+
+  # --- Transcribed from docs/guides/operations/troubleshooting.md ---
+  #
+  # Each rule below carries the threshold the symptom-table row states. A row
+  # that states no duration gets no `for:` and an `as_documented` annotation
+  # recording that, rather than a duration invented here.
+
+  - name: ravel-maintenance-health
+    # Same scoping caveat as ravel-maintain-liveness: these families render
+    # only on a --mode maintain process, so a deployment that scrapes none
+    # must drop this group.
+    rules:
+      - alert: RavelMaintainOrphanBreakerTripped
+        expr: |
+          increase(ravel_maintain_orphan_breaker_tripped_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel sweep pass refused to delete a large set of data objects
+            whose commit records are gone
+          description: >-
+            The counter only increments on a real trip, so the increment is the
+            confirmation. The troubleshooting guide's procedure is not
+            optional; read it before deleting or restoring anything.
+          as_documented: >-
+            The guide states this condition with no duration, and says to alert
+            on the first trip, so no for: is set.
+          runbook: docs/guides/operations/troubleshooting.md#the-mass-orphan-circuit-breaker-tripped
+      - alert: RavelMaintainOrphansPresent
+        expr: |
+          ravel_maintain_orphans_present > 0
+        for: 12h
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Ravel's sweeper has seen record-less data objects for the
+            {{ $labels.signal }} signal for twelve hours
+          description: >-
+            Either a handful of commit records lost for one shard, below both
+            breaker thresholds, or a genuinely stuck abandoned flush.
+          runbook: docs/guides/operations/troubleshooting.md#commit-records-were-deleted-out-of-band
+      - alert: RavelMaintainWorkersNotLive
+        expr: |
+          ravel_maintain_workers_live == 0
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel maintain process cannot see itself as live, so it owns no
+            units
+          description: >-
+            A heartbeat write persistently failing, or a liveness read
+            persistently erroring. Check the maintain role's write and list
+            grants on the coordination prefix.
+          as_documented: >-
+            The guide states this condition with no duration, and says to fire
+            on the level, so no for: is set.
+          runbook: docs/guides/operations/troubleshooting.md#maintenance-is-not-running-or-not-finishing
+      - alert: RavelMaintainTenantsUnmaintained
+        expr: |
+          ravel_maintain_tenants_maintained < ravel_maintain_tenants_discovered
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A Ravel tenant prefix holds data with no maintaining owner
+          description: >-
+            Ten minutes is two cycles at the default interval, long enough that
+            a restart or a tenant mid-onboarding does not page. For a
+            dynamically resolved tenant, add it with --maintain-tenant.
+          runbook: docs/guides/operations/troubleshooting.md#maintenance-is-not-running-or-not-finishing
+      - alert: RavelMaintainTenantDiscoveryFailing
+        expr: |
+          increase(ravel_maintain_tenant_discovery_failures_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Ravel tenant listing failed, which skips the whole maintenance
+            cycle for every tenant
+          description: >-
+            Treat as a full maintenance outage and act on the first occurrence.
+            Check the maintain credential's list grant, including the bare
+            tenant-prefix entry.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#maintenance-is-not-running-or-not-finishing
+      - alert: RavelMaintainUnitsStalled
+        expr: |
+          ravel_maintain_units_stalled > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A Ravel maintenance unit's last several ticks all failed with no
+            intervening success
+          description: >-
+            A single success resets the streak, so this is the same unit
+            failing, not a rotating cast of transient faults. Thirty minutes
+            covers several cycles at the default interval.
+          runbook: docs/guides/operations/troubleshooting.md#maintenance-is-not-running-or-not-finishing
+      - alert: RavelMaintainConservationAborts
+        expr: |
+          increase(ravel_maintain_conservation_aborts_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A Ravel compaction publish was refused because input and output
+            record counts disagreed
+          description: >-
+            Nothing was written. A bucket stuck retrying every tick without
+            ever compacting needs an operator rather than another retry.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#maintenance-is-not-running-or-not-finishing
+      - alert: RavelMaintainLegalHoldRefreshFailing
+        expr: |
+          increase(ravel_maintain_legal_hold_refresh_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            The Ravel maintenance loop could not read the legal hold records,
+            so it skipped that tenant's tick entirely
+          description: >-
+            A sustained failure means a tenant is silently receiving no
+            maintenance at all. Fix the read path first; the skip is the
+            fail-closed behaviour working as intended.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#maintenance-is-not-running-or-not-finishing
+
+  - name: ravel-storage-and-auth
+    rules:
+      - alert: RavelStoreUnreachable
+        expr: |
+          ravel_store_reachable == 0
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel process's background store probe has failed four
+            consecutive reads of sys/tenancy, so it reports /readyz 503
+          description: >-
+            Fix the store or the credential. Readiness recovers on the first
+            successful probe, without a restart. Do not lower the threshold; it
+            is a fixed constant so a single blip cannot eject a fleet.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#readiness-storage-and-authentication
+      - alert: RavelBucketProtectionUnknown
+        expr: |
+          ravel_bucket_protection_unknown == 1
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Ravel cannot see whether its bucket has Object Lock and versioning
+            on, while --require-bucket-protection is set
+          description: >-
+            Not necessarily a misconfiguration, but the platform cannot see the
+            protection it depends on. Confirm the bucket settings out of band.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#readiness-storage-and-authentication
+      - alert: RavelDurableAuthRefreshFailing
+        expr: |
+          increase(ravel_durable_auth_refresh_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Ravel's background refresh cannot read or decode sys/auth
+          description: >-
+            The cached map is still serving, so requests are not failing yet.
+            This is the early warning for
+            RavelDurableAuthFailingClosed. Fix the credential or the object
+            now.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#durable-auth-refresh-is-failing
+      - alert: RavelDurableAuthFailingClosed
+        expr: |
+          increase(ravel_durable_auth_stale_fail_closed_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Ravel is refusing durable bearer tokens because the cached sys/auth
+            map is past its hard-stale bound
+          description: >-
+            This is the cliff RavelDurableAuthRefreshFailing exists to keep you
+            off. Restore sys/auth readability; resolution recovers on the first
+            successful refresh.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#readiness-storage-and-authentication
+      - alert: RavelProvisioningShardCountMismatch
+        expr: |
+          increase(ravel_provisioning_shard_count_mismatch_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel tenant failed its provisioning check hard
+          description: >-
+            An unreadable record, a decodable record whose generation history
+            fails its structural invariants, or pre-ADR data a lower
+            shard_count would hide. Read the durable record for that tenant;
+            the remedy depends on which of the three it was. Any nonzero
+            increase is a real problem, not a rate to threshold.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#readiness-storage-and-authentication
+      - alert: RavelTenancyUnkeyedAdoption
+        expr: |
+          increase(ravel_tenancy_v1_unkeyed_adoptions_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A bucket with data and no tenancy marker was adopted as unkeyed
+          description: >-
+            If that bucket was meant to be keyed, stop: the adoption is
+            permanent and there is no migration. Start a fresh keyed bucket and
+            drain into it.
+          as_documented: >-
+            The guide states this condition ("incremented unexpectedly") with
+            neither a range nor a duration; the 5m range here matches the other
+            first-occurrence counter rows in the same table, and no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#readiness-storage-and-authentication
+
+  - name: ravel-data-integrity
+    rules:
+      - alert: RavelScrubChecksumMismatch
+        expr: |
+          increase(ravel_scrub_checksum_mismatch_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Ravel found at-rest corruption in a {{ $labels.signal }} data
+            object
+          description: >-
+            A whole-object hash mismatch against the recorded content hash, or
+            a section checksum failure. There is no redundant copy to repair
+            from, and the scrubber only detects. Confirm the extent with
+            ravel-cli maintain verify-custody, then restore from your
+            bucket-level controls.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#data-integrity-and-correctness-alarms
+      - alert: RavelScrubPostingsDisagreement
+        expr: |
+          increase(ravel_scrub_postings_disagreement_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel covering name-index object omitted a name its data object
+            really carries
+          description: >-
+            A correctness defect, not a capacity problem: a query filtering on
+            that name silently skips matching data. Capture the affected tenant
+            and signal and escalate.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#data-integrity-and-correctness-alarms
+      - alert: RavelScrubSealDivergence
+        expr: |
+          increase(ravel_scrub_seal_divergence_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Ravel's folded snapshot under-counts the sealed commit history for
+            the {{ $labels.signal }} signal
+          description: >-
+            reason="missing" is a sealed record absent from the snapshot;
+            reason="mismatched" is a snapshot entry whose content hash
+            disagrees with the record. Follow the troubleshooting guide's
+            "queries are missing recently written data" procedure.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#queries-are-missing-recently-written-data
+      - alert: RavelCatalogIsolationBreach
+        expr: |
+          increase(ravel_catalog_isolation_breach_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel cross-tenant key-layout or hashing fault was detected
+          description: >-
+            Escalate immediately. Every increment corresponds to a query that
+            already failed with an explicit isolation-fault error, so the
+            client saw it too. Coverage is not complete, so a zero reading is
+            not proof of isolation.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#data-integrity-and-correctness-alarms
