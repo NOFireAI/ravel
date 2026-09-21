@@ -1748,7 +1748,9 @@ mod tests {
     #[tokio::test]
     async fn a_superseded_compaction_part_is_left_out_of_the_corpus() {
         use ravel_commit::erasure;
-        use ravel_proto::commit::v1::{CompactionPart, RewriteDrop, RewriteRecord};
+        use ravel_proto::commit::v1::{
+            CompactionInputIdentity, CompactionPart, RewriteDrop, RewriteRecord,
+        };
 
         let store = MemoryStore::new();
         let tenant_id = tenant();
@@ -1845,8 +1847,11 @@ mod tests {
         };
         let request_id = Uuid::from_u128(0xEA5F);
         let request_ids = vec![request_id.to_string()];
+        // A supersession-only rewrite names no raw inputs: exactly one of
+        // `inputs` and `superseded_record_key` may be set.
+        let no_inputs: Vec<CompactionInputIdentity> = Vec::new();
         let input_set_hash = erasure::compute_rewrite_input_set_hash(
-            &[],
+            &no_inputs,
             Some(compaction_record_key.as_str()),
             &request_ids,
         );
