@@ -284,6 +284,24 @@ pub(crate) fn buffer_memory_backstop_bytes(
     share.max(config.target_bytes)
 }
 
+/// Whether a buffer holding `est_bytes` of memory has crossed its
+/// [`buffer_memory_backstop_bytes`], which is the backstop half of
+/// [`size_trigger_fires`] on its own.
+///
+/// Read a second time, after the trigger, by each shard actor's
+/// `queued_flush_cap_reached`: the queued-flush cap (issue #1740) bounds a queue
+/// of flush TASKS, while this backstop is the only thing bounding the BUFFER
+/// those tasks drain. Refusing a crossing here would trade a bounded queue for
+/// an unbounded buffer, which under [`IngestByteBudgetLimit::Unlimited`] nothing
+/// else sheds against, so the cap exempts it (PR #1903 review finding 1).
+pub(crate) fn memory_backstop_crossed(
+    est_bytes: usize,
+    config: &IngestConfig,
+    ceiling: IngestByteBudgetLimit,
+) -> bool {
+    est_bytes >= buffer_memory_backstop_bytes(config, ceiling)
+}
+
 /// The size trigger, shared by the metrics, log, and span shard actors:
 /// `flush_est_bytes` is the object-bytes estimate for the flush this buffer
 /// would write and gates `target_bytes`; `est_bytes` is the conservative
@@ -304,8 +322,7 @@ pub(crate) fn size_trigger_fires(
     config: &IngestConfig,
     ceiling: IngestByteBudgetLimit,
 ) -> bool {
-    flush_est_bytes >= config.target_bytes
-        || est_bytes >= buffer_memory_backstop_bytes(config, ceiling)
+    flush_est_bytes >= config.target_bytes || memory_backstop_crossed(est_bytes, config, ceiling)
 }
 
 /// All fields are overridable; defaults match the dev-sizing table.
@@ -392,10 +409,20 @@ pub struct IngestConfig {
     /// explicit flush-all, shutdown, channel close) are never refused, since
     /// nothing would retry them.
     ///
+    /// Neither is a trigger on a buffer that has crossed its memory backstop
+    /// ([`memory_backstop_crossed`]), so the queue CAN exceed this bound.
+    /// That backstop is the only bound on one buffer's resident memory, and
+    /// under [`IngestByteBudgetLimit::Unlimited`] nothing sheds behind it, so
+    /// refusing a crossing would trade a bounded queue of flush tasks for an
+    /// unbounded buffer. Under memory pressure the queue therefore grows by
+    /// one window per backstop's worth of buffered memory, which is bounded
+    /// by how fast memory fills rather than by the flush cadence.
+    ///
     /// This is the count bound that holds under
     /// [`IngestByteBudgetLimit::Unlimited`], where `try_charge` never sheds
     /// and the byte budget bounds nothing: resident flush memory per shard is
-    /// then this many flush windows plus the tenant buffers themselves.
+    /// then this many flush windows, plus one more per tenant buffer sitting
+    /// over its backstop, plus the tenant buffers themselves.
     ///
     /// Read through [`IngestConfig::queued_flush_cap`], which floors it at 1;
     /// 0 would refuse every trigger and never flush.

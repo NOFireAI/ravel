@@ -1205,9 +1205,57 @@ pub struct Cli {
     /// [`ravel_ingest::IngestConfig::max_inflight_flushes`]'s own default of
     /// 1 (today's non-pipelined behavior). `0` is rejected by
     /// [`Cli::validate`]: it would deadlock every flush, since a shard could
-    /// never acquire a permit to run one.
+    /// never acquire a permit to run one. So is a value above
+    /// `--max-queued-flushes` (default 8): a shard refuses a trigger once
+    /// that many flush tasks are spawned and unreaped, so it never spawns
+    /// enough tasks to use the extra permits. Raise both together.
     #[arg(long = "max-inflight-flushes", default_value_t = 1)]
     pub max_inflight_flushes: u32,
+
+    /// Per-shard bound on flush tasks spawned and not yet reaped, for all
+    /// three ingest pipelines (issue #1740). ADR-1642 moved the
+    /// `--max-inflight-flushes` permit acquisition inside the spawned task so
+    /// the shard actor never parks, which left the count of tasks parked on
+    /// that permit unbounded: a stalled object store plus a steady age cadence
+    /// spawns one task per tick, each holding a buffer and its ADR-0069 byte
+    /// charge. This bounds that queue. A shard already holding this many
+    /// tasks refuses further age and size triggers and counts them on
+    /// `ravel_ingest_flush_trigger_deferred_total`; the buffer rides back
+    /// untouched and the next tick re-fires once a flush has been reaped.
+    /// Nothing is acked and nothing is dropped, so a refusal is a deferral,
+    /// not a shed. Drains (`FlushNow`, shutdown) are never refused, and
+    /// neither is a tenant buffer that has crossed its per-(shard, tenant)
+    /// memory backstop, so THE QUEUE CAN EXCEED THIS CAP under memory
+    /// pressure: the backstop is the only bound on one buffer's resident
+    /// memory, and refusing there would trade a bounded queue of flush tasks
+    /// for an unbounded buffer, the worse of the two failures. Size the
+    /// steady state from this cap and the headroom for that overshoot from
+    /// the backstop. `0` is rejected, and so is a `--max-inflight-flushes`
+    /// above this value, since effective per-shard flush concurrency is the
+    /// lower of the two. Matches
+    /// [`ravel_ingest::IngestConfig::max_queued_flushes`]'s own default of 8
+    ///
+    /// The memory backstop is
+    /// `max(min(--max-ingest-buffer-bytes / 8, 64 MiB), --target-flush-bytes)`
+    /// per (shard, tenant) buffer. Under `--max-ingest-buffer-bytes 0` the
+    /// process-wide byte budget is disabled and nothing sheds behind that
+    /// backstop at all, which is why a crossing spawns unconditionally.
+    /// The queue then grows by one window per backstop's worth of buffered
+    /// memory, so it is bounded by how fast memory fills rather than by the
+    /// flush cadence, and the buffer stays bounded either way.
+    ///
+    /// [`Cli::validate`] rejects `0` (it would refuse every non-drain
+    /// trigger), and rejects a `--max-inflight-flushes` above this value: a
+    /// refused trigger never spawns a task to take a permit, so permits above
+    /// this cap are unreachable, and silently truncating the permit count
+    /// would report the difference as backpressure rather than as ignored
+    /// configuration. Raise this cap alongside the permit count.
+    #[arg(
+        long = "max-queued-flushes",
+        env = "RAVEL_MAX_QUEUED_FLUSHES",
+        default_value_t = 8
+    )]
+    pub max_queued_flushes: u32,
 
     /// Enables the adaptive flush-delay corridor for the metrics ingest
     /// pipeline (ADR-0067 decision 3): instead of always
@@ -4638,6 +4686,33 @@ impl Cli {
                 "--max-inflight-flushes '0' would deadlock every flush: a shard could never \
                  acquire a permit to run one. Set a positive count (1 keeps today's \
                  non-pipelined behavior)."
+            );
+        }
+
+        if self.max_queued_flushes == 0 {
+            anyhow::bail!(
+                "--max-queued-flushes '0' would refuse every age and size trigger: a shard \
+                 could never spawn a flush outside a drain. Set a positive count (8 is the \
+                 default)."
+            );
+        }
+
+        // Effective per-shard flush concurrency is the lower of the two: the
+        // queued-flush cap refuses a trigger before any task is spawned to
+        // take a permit, so permits above the cap are unreachable. Refuse the
+        // pair rather than truncate, which would report the difference as
+        // deferral (backpressure) instead of as configuration that was
+        // ignored.
+        if self.max_inflight_flushes > self.max_queued_flushes {
+            anyhow::bail!(
+                "--max-inflight-flushes '{inflight}' exceeds --max-queued-flushes \
+                 '{queued}': a shard refuses a trigger once {queued} flush tasks are \
+                 spawned and unreaped, so it never spawns enough tasks to use more than \
+                 {queued} permits and the excess is counted as deferral. Raise \
+                 --max-queued-flushes to at least {inflight}, or lower \
+                 --max-inflight-flushes to at most {queued}.",
+                inflight = self.max_inflight_flushes,
+                queued = self.max_queued_flushes,
             );
         }
 
@@ -10864,6 +10939,57 @@ mod tests {
         cli(&["--max-inflight-flushes", "3"])
             .validate()
             .expect("a positive --max-inflight-flushes is fine");
+    }
+
+    #[test]
+    fn zero_max_queued_flushes_fails_validate() {
+        let err = cli(&["--max-queued-flushes", "0"])
+            .validate()
+            .expect_err("--max-queued-flushes 0 would refuse every non-drain trigger");
+        assert!(
+            err.to_string().contains("--max-queued-flushes"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn inflight_flushes_above_the_queue_cap_fails_validate() {
+        // Effective per-shard flush concurrency is
+        // min(max_inflight_flushes, max_queued_flushes): the cap refuses the
+        // trigger before a task is ever spawned to take a permit. Refuse the
+        // pair rather than silently truncate the operator's setting and count
+        // the difference as deferral (PR #1903 review finding 2).
+        let err = cli(&["--max-inflight-flushes", "16"])
+            .validate()
+            .expect_err("16 inflight permits against the default queue cap of 8 must refuse");
+        let text = err.to_string();
+        for needle in [
+            "--max-inflight-flushes",
+            "--max-queued-flushes",
+            "'16'",
+            "'8'",
+        ] {
+            assert!(
+                text.contains(needle),
+                "refusal names both flags and both values, missing {needle}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn inflight_flushes_equal_to_the_queue_cap_validates() {
+        cli(&["--max-inflight-flushes", "16", "--max-queued-flushes", "16"])
+            .validate()
+            .expect("a queue cap raised to match the permit count is fine");
+    }
+
+    #[test]
+    fn max_queued_flushes_default() {
+        assert_eq!(
+            cli(&[]).max_queued_flushes,
+            8,
+            "default matches ravel_ingest::IngestConfig::max_queued_flushes"
+        );
     }
 
     #[test]

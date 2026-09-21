@@ -117,6 +117,7 @@ async fn start_server_configured(
         audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
+        max_queued_flushes: 8,
         adaptive_flush_delay: false,
         // Long enough that no time-based flush ever fires during a test: the
         // shutdown drain is the only thing that can flush the buffered record.
