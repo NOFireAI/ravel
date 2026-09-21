@@ -2108,6 +2108,7 @@ pub async fn start(
         config.cache_dir.clone(),
         config.catalog_resolve_concurrency,
         Some(ingest_lag.catalog_window_ns),
+        config.max_flush_delay,
     )?;
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
     // The two cache flags reach the catalog byte cache here, not only the

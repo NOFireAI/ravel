@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ravel_cache::CacheLimits;
 use ravel_catalog::{Catalog, CatalogConfig};
@@ -112,6 +113,17 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// `--max-ingest-lag`. `None` leaves `CatalogConfig`'s own 2h default; `Some(ns)`
 /// is the value `start` keeps equal to the OTLP admission bound so admitted late
 /// data stays discoverable.
+///
+/// `max_flush_delay` is the server's resolved `--max-flush-delay` (issue
+/// #1735), the same cadence every ingest pipeline flushes on. It sizes
+/// `cache_capacity_per_tenant` via
+/// [`ravel_catalog::derive_cache_capacity_per_tenant`]: `shard_count *
+/// ceil(3600 / max_flush_delay_secs) * 3`, so the commit-record cache holds a
+/// tenant's whole unsealed hot region rather than a flat, cadence-blind
+/// constant. Callers must pass the configured value, never
+/// `ravel_ingest::IngestConfig::default().max_flush_delay`, or the derived
+/// capacity stops tracking the deployment's actual flush cadence.
+#[allow(clippy::too_many_arguments)]
 pub fn build_catalog(
     store: Arc<dyn ObjectStoreBackend>,
     shard_count: u32,
@@ -120,6 +132,7 @@ pub fn build_catalog(
     cache_dir: Option<PathBuf>,
     resolve_get_concurrency: Option<usize>,
     max_ingest_lag_ns: Option<i64>,
+    max_flush_delay: Duration,
 ) -> anyhow::Result<Arc<Catalog>> {
     // `0` is the byte cache's disabled sentinel (ravel_catalog::CatalogConfig):
     // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
@@ -128,6 +141,10 @@ pub fn build_catalog(
     let mut catalog_config = CatalogConfig {
         shard_count,
         byte_cache_max_bytes,
+        cache_capacity_per_tenant: ravel_catalog::derive_cache_capacity_per_tenant(
+            shard_count,
+            max_flush_delay,
+        ),
         ..CatalogConfig::default()
     };
     // The catalog listing window (ADR-0051 section 4), from `--max-ingest-lag`.
@@ -465,6 +482,7 @@ mod catalog_cache_tests {
             None,
             None,
             None,
+            Duration::from_secs(2),
         )
         .expect("catalog");
         let engine_config = EngineConfig {
@@ -508,6 +526,7 @@ mod catalog_cache_tests {
             None,
             None,
             None,
+            Duration::from_secs(2),
         )
         .expect("catalog builds");
         assert!(
@@ -566,8 +585,17 @@ mod catalog_cache_tests {
     fn build_catalog_wires_cache_max_bytes_through_to_the_byte_cache() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let budget = 7 * 1024 * 1024;
-        let catalog =
-            build_catalog(store, 1, false, budget, None, None, None).expect("catalog builds");
+        let catalog = build_catalog(
+            store,
+            1,
+            false,
+            budget,
+            None,
+            None,
+            None,
+            Duration::from_secs(2),
+        )
+        .expect("catalog builds");
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
             budget,
@@ -620,6 +648,7 @@ mod catalog_cache_tests {
             cli.cache_dir.clone(),
             None,
             None,
+            Duration::from_secs(2),
         )
         .expect("catalog builds");
         assert_eq!(
@@ -646,12 +675,53 @@ mod catalog_cache_tests {
             flagged.cache_dir.clone(),
             None,
             None,
+            Duration::from_secs(2),
         )
         .expect("catalog builds");
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
             4096,
             "an explicit --cache-max-bytes bounds the catalog byte cache at the flag value"
+        );
+    }
+
+    /// Issue #1735 reachability: `build_catalog` must set
+    /// `cache_capacity_per_tenant` from `derive_cache_capacity_per_tenant`
+    /// applied to the `shard_count`/`max_flush_delay` it was actually passed,
+    /// never leave the flat `DEFAULT_CACHE_CAPACITY_PER_TENANT` in place.
+    #[test]
+    fn build_catalog_passes_the_derived_cache_capacity_per_tenant() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let shard_count = 4;
+        let max_flush_delay = std::time::Duration::from_secs(2);
+        let expected =
+            ravel_catalog::derive_cache_capacity_per_tenant(shard_count, max_flush_delay);
+        assert_eq!(
+            expected, 21_600,
+            "sanity: the shipped ingest defaults derive to 21,600"
+        );
+        assert_ne!(
+            expected,
+            ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT,
+            "sanity: the derived value must actually differ from the flat default"
+        );
+
+        let catalog = build_catalog(
+            store,
+            shard_count,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+            None,
+            None,
+            max_flush_delay,
+        )
+        .expect("catalog builds");
+
+        assert_eq!(
+            catalog.config().cache_capacity_per_tenant,
+            expected,
+            "build_catalog must pass the derived capacity through, not the flat constant"
         );
     }
 }
@@ -680,6 +750,7 @@ mod tests {
             None,
             None,
             None,
+            Duration::from_secs(2),
         )
         .expect("catalog");
         let tenant_resolver: Arc<dyn TenantResolver> =
@@ -738,6 +809,7 @@ mod tests {
             None,
             None,
             None,
+            Duration::from_secs(2),
         )
         .expect("catalog");
         let engine_config = EngineConfig {
@@ -785,6 +857,7 @@ mod tests {
             None,
             None,
             None,
+            Duration::from_secs(2),
         )
         .expect("catalog");
         let cli = crate::Cli::try_parse_from(argv).expect("flags parse");

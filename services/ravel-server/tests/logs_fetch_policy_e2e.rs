@@ -233,6 +233,9 @@ async fn run(argv: &[&str]) -> Routed {
         cli.cache_dir.clone(),
         cli.catalog_resolve_concurrency,
         None,
+        cli.resolve_flush_cadence()
+            .expect("flush cadence resolves")
+            .max_flush_delay,
     )
     .expect("catalog");
     let state = build_sql_state(

@@ -1,31 +1,75 @@
 //! Catalog configuration (docs/catalog-and-mvcc.md).
 
+use std::time::Duration;
+
 use crate::snapshot_format;
 
 /// Default `max_ingest_lag`: 2 hours, in nanoseconds.
 pub const DEFAULT_MAX_INGEST_LAG_NS: i64 = 2 * 60 * 60 * 1_000_000_000;
 /// Default `clock_skew_allowance`: 5 minutes, in nanoseconds.
 pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
-/// Default bound on decoded commit records cached per tenant, in entries.
-/// Not named in the ADR, which allows "simple LRU or capacity cap per
-/// tenant"; the cache is an LRU (crate::cache).
+/// Floor on decoded commit records cached per tenant, in entries. Not named
+/// in the ADR, which allows "simple LRU or capacity cap per tenant"; the
+/// cache is an LRU (crate::cache).
 ///
-/// 10,000 entries is sized so a tenant with a 10,000-segment hot region --
-/// the unsealed `max_flush_lifetime + clock_skew_allowance +
-/// fold_safety_margin` tail every query touches, since no fold has sealed it
-/// yet -- fits entirely, so a repeated resolve over it re-issues no
-/// per-record GET (issue #783). An entry costs roughly 750 bytes: a 119-byte
-/// commit key held twice (the map key and the recency index), the 200-byte
-/// decoded `CommitRecord` plus about 200 bytes of its own heap (tenant hash,
-/// writer uuid, data object key, content hash), and the two maps' slot
-/// overhead. The default is therefore about 8 MB per actively-queried tenant,
+/// The capacity actually configured is derived per deployment by
+/// [`derive_cache_capacity_per_tenant`] from `shard_count` and
+/// `max_flush_delay`: `shards * ceil(3600 / max_flush_delay_secs) * 3`, sized
+/// so a tenant's unsealed `max_flush_lifetime + clock_skew_allowance +
+/// fold_safety_margin` hot-region tail -- the part every query touches, since
+/// no fold has sealed it yet -- fits entirely, so a repeated resolve over it
+/// re-issues no per-record GET (issue #783, issue #1735). This constant is
+/// the saturating floor `derive_cache_capacity_per_tenant` never returns
+/// below, so a deployment with very few shards and a very long flush delay
+/// still gets the same protection the fixed constant used to give everyone.
+///
+/// An entry costs roughly 750 bytes: a 119-byte commit key held twice (the
+/// map key and the recency index), the 200-byte decoded `CommitRecord` plus
+/// about 200 bytes of its own heap (tenant hash, writer uuid, data object
+/// key, content hash), and the two maps' slot overhead. At the shipped
+/// ingest defaults (`shard_count` 4, `max_flush_delay` 2s) the derived
+/// capacity is 21,600 entries, about 16 MB per actively-queried tenant,
 /// reclaimed by the idle-tenant sweep
 /// ([`Catalog::evict_idle_tenants`](crate::Catalog::evict_idle_tenants)).
+/// This is not one of the ADR-1170 carved caches: it is not a share of
+/// `memory_budget_bytes`, it is an entry-count bound sized from ingest
+/// cadence, and its footprint scales with how many tenants are actively
+/// queried, not with a fixed process-wide ceiling.
 ///
 /// `0` is the disabled sentinel: nothing is admitted and every record read
 /// falls through to a store GET, matching
-/// [`CatalogConfig::byte_cache_max_bytes`]'s own `0` sentinel.
+/// [`CatalogConfig::byte_cache_max_bytes`]'s own `0` sentinel. `0` is passed
+/// explicitly (never derived) when the cache is meant to be off.
 pub const DEFAULT_CACHE_CAPACITY_PER_TENANT: usize = 10_000;
+
+/// Derive the per-tenant commit-record cache capacity (in entries) from the
+/// tenant's shard count and the deployment's configured `max_flush_delay`
+/// (issue #1735). See [`DEFAULT_CACHE_CAPACITY_PER_TENANT`] for the
+/// rationale: the result is sized so a tenant's unsealed hot-region tail
+/// fits the cache entirely, and it is `shards * ceil(3600 /
+/// max_flush_delay_secs) * 3`, one flush cycle's worth of records per shard
+/// per hour, times three hours of headroom, floored at
+/// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`] so a very coarse cadence never
+/// derives a capacity below what the fixed constant used to guarantee.
+///
+/// `max_flush_delay` of zero (or a duration so short it would otherwise
+/// overflow) saturates to `usize::MAX` rather than dividing by zero or
+/// panicking; a deployment configuring a zero flush delay is already
+/// rejected elsewhere (`ravel-server`'s `Cli::validate`), so this is defense
+/// in depth, not a path exercised in practice.
+pub fn derive_cache_capacity_per_tenant(shards: u32, max_flush_delay: Duration) -> usize {
+    let flush_secs = max_flush_delay.as_secs_f64();
+    let flushes_per_hour: u64 = if flush_secs > 0.0 {
+        (3_600.0 / flush_secs).ceil() as u64
+    } else {
+        u64::MAX
+    };
+    let derived = u64::from(shards)
+        .saturating_mul(flushes_per_hour)
+        .saturating_mul(3)
+        .max(DEFAULT_CACHE_CAPACITY_PER_TENANT as u64);
+    usize::try_from(derived).unwrap_or(usize::MAX)
+}
 /// Default `max_flush_lifetime`: 1 hour, in nanoseconds. The GC interlock
 /// (ADR-0010 §11) forbids publishing a commit record after this long past
 /// its ingest hour's end; the seal watermark relies on that bound (ADR-0020).
@@ -404,5 +448,40 @@ impl Default for CatalogConfig {
             frontier_reconcile_max_hours: DEFAULT_FRONTIER_RECONCILE_MAX_HOURS,
             resolve_get_concurrency: DEFAULT_RESOLVE_GET_CONCURRENCY,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the derivation at the shipped ingest defaults (`shard_count` 4,
+    /// `max_flush_delay` 2s, issue #1735): `4 * ceil(3600 / 2) * 3 = 21_600`.
+    #[test]
+    fn derive_at_ingest_defaults_is_21_600() {
+        assert_eq!(
+            derive_cache_capacity_per_tenant(4, Duration::from_secs(2)),
+            21_600
+        );
+    }
+
+    /// A single shard on a coarse hour-long flush cadence derives well below
+    /// the old fixed constant; the floor keeps it from going lower still.
+    #[test]
+    fn derive_never_goes_below_the_default_floor() {
+        assert_eq!(
+            derive_cache_capacity_per_tenant(1, Duration::from_secs(3_600)),
+            DEFAULT_CACHE_CAPACITY_PER_TENANT
+        );
+    }
+
+    /// A zero flush delay would otherwise divide by zero; it must saturate
+    /// instead of panicking.
+    #[test]
+    fn derive_saturates_on_a_zero_flush_delay() {
+        assert_eq!(
+            derive_cache_capacity_per_tenant(4, Duration::ZERO),
+            usize::MAX
+        );
     }
 }

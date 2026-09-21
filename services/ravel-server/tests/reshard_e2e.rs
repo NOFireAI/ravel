@@ -263,6 +263,7 @@ fn engine(store: Arc<dyn ObjectStoreBackend>, catalog_count: u32) -> (Arc<Catalo
         None,
         None,
         None,
+        std::time::Duration::from_secs(2),
     )
     .expect("catalog builds");
     let engine = QueryEngine::new(catalog.clone(), store, EngineConfig::default());

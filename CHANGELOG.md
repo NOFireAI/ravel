@@ -23,6 +23,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The catalog's per-tenant commit-record cache capacity is now derived from
+  the shard count and the configured max flush delay, not a flat 10,000-entry
+  constant** (issue #1735). The new `ravel_catalog::derive_cache_capacity_per_tenant`
+  computes `shards * ceil(3600 / flush_secs) * 3`, floored at the old
+  constant; `build_catalog` calls it with the server's resolved
+  `--max-flush-delay` instead of the flat default. At the shipped defaults (4
+  shards, a 2-second max flush delay) this holds 21,600 entries, about 16 MB
+  per actively-queried tenant at roughly 750 bytes per cached record, up from
+  the old flat bound. No new CLI flag is added; the capacity is a function of
+  existing ingest configuration. A repository guard now fails a pull request
+  that touches `crates/` or `services/` and carries no changelog entry, which
+  is why this internal sizing change carries one.
 - **The published PromQL conformance figure now says what it measures**
   (issue #1698). The committed table read `132/132 = 100%` under a heading
   that invites it to be read as agreement with Prometheus, while the block is
@@ -92,7 +104,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   absent now means the worker's own limit rather than unlimited, and the
   federation `Resolve` path enforces the worker's `max_series` and
   `max_samples` too.
-
 - **A distributed deployment now refuses three unsafe listener shapes at
   startup** (issues #1724, #1703, #1690). Starting with `--distributed-query`
   and a wildcard bind refuses unless `--advertise-fragment-endpoint` names the
