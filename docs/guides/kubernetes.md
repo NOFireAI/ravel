@@ -229,7 +229,7 @@ A minimal example is in
 | `spec.storage.s3.bucket` | string | required | |
 | `spec.storage.s3.region` | string | `us-east-1` | |
 | `spec.storage.s3.endpoint` | string | none | Omit for real AWS S3. Path-style addressing is always used. |
-| `spec.storage.s3.allowHttp` | boolean | `false` | Renders `--s3-allow-http`. Required when `endpoint` is a plaintext `http://` URL: no pod reaches its object store over loopback, so the server otherwise refuses to start rather than moving telemetry and S3 credentials across the cluster network in the clear. Leave unset for an `https://` endpoint and for real AWS S3. |
+| `spec.storage.s3.allowHttp` | boolean | `false` | Renders `--s3-allow-http` on every server container, and `RAVEL_S3_ALLOW_HTTP=true` on the store-qualification Job that runs `ravel-cli store qualify` before any server pod exists. Required when `endpoint` is a plaintext `http://` URL: no pod reaches its object store over loopback, so the server otherwise refuses to start, and the qualify Job refuses to run, rather than moving telemetry and S3 credentials across the cluster network in the clear. Leave unset for an `https://` endpoint and for real AWS S3. |
 | `spec.storage.s3.credentialsSecretRef.name` | string | required | Secret with keys `accessKeyId` and `secretAccessKey`. |
 | `spec.tenantTokensSecretRef.name` | string | none | Secret whose keys are tenant names and whose values are bearer tokens. |
 | `spec.deploymentKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters or 32 raw bytes): the deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
