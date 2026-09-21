@@ -666,6 +666,24 @@ impl AlertEvaluator {
         })
     }
 
+    /// The tenant this evaluator was built for.
+    pub fn tenant(&self) -> TenantHash {
+        self.tenant
+    }
+
+    /// A snapshot of the rules this evaluator evaluates, for its own tenant, in
+    /// the order [`parse_rules`] read them out of the rules document.
+    ///
+    /// A clone rather than a borrow, so a caller holding the snapshot does not
+    /// hold the evaluator. The set is static per process (ADR-0043 decision 2):
+    /// it is fixed at construction and never changes for the life of the task,
+    /// so two calls to this method on one evaluator return the same rules.
+    /// [`crate::alerts_api`] serves the same per-tenant set, from the same map
+    /// [`spawn`] built this evaluator from.
+    pub fn rules(&self) -> Vec<Rule> {
+        self.rules.clone()
+    }
+
     /// Fold this evaluator's ticks into `metrics` instead of the process-global
     /// handle. For tests: a shared global cannot carry an exact-value
     /// assertion when other tests in the same binary tick their own evaluators.
