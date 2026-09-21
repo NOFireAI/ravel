@@ -16,10 +16,32 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 /// [`derive_cache_capacity_per_tenant`] from `shard_count` and
 /// `max_flush_delay`: `shards * signals * flushes_per_hour *
 /// hot_region_hours`, clamped between this floor and the `30_000`-entry cap
-/// `MAX_CACHE_CAPACITY_PER_TENANT`. It is sized so a tenant's unsealed
+/// `MAX_CACHE_CAPACITY_PER_TENANT`. It holds as much of a tenant's unsealed
 /// hot-region tail -- the part every query touches, since no fold has sealed
-/// it yet -- fits entirely, so a repeated resolve over it re-issues no
-/// per-record GET (issue #783, issue #1735). This constant is the saturating
+/// it yet -- as those 30,000 entries cover, and a repeated resolve re-issues
+/// no per-record GET while the tail stays inside the bound (issue #783, issue
+/// #1735). Read that as "up to 30,000 records of tail", not "the tail": two
+/// things put a real tail over the bound.
+///
+/// * The cap. At the shipped defaults the uncapped derivation is already
+///   `4 * 6 * 1800 * 3` = 129,600 entries and the clamp returns 30,000, so a
+///   default deployment that really does ingest six signals across four
+///   shards for three unsealed hours is over the bound by the derivation's
+///   own estimate.
+/// * The size trigger. `flushes_per_hour` counts the age trigger only. A
+///   shard also flushes the moment its estimated object bytes reach
+///   `ravel_ingest::IngestConfig::target_bytes` (8 MiB by default),
+///   whatever its age, so a high-volume tenant seals more records per
+///   shard-hour than `ceil(3600 / max_flush_delay_secs)` assumes. The
+///   derivation cannot see ingest rate, so that term is a lower bound on
+///   records per shard-hour rather than the worst case.
+///
+/// Past the bound the resolve's two passes evict each other and the tenant
+/// pays per-record GETs again, which is what
+/// `a_bound_below_the_hot_region_loses_the_saving` in
+/// tests/hot_record_cache.rs pins. The direction is safe: an under-sized
+/// cache costs what the old flat constant already cost everyone, it never
+/// over-allocates. This constant is the saturating
 /// floor `derive_cache_capacity_per_tenant` never returns below, so a
 /// deployment with very few shards and a very long flush delay still gets the
 /// same protection the fixed constant used to give everyone.
@@ -107,10 +129,12 @@ pub const MAX_CACHE_CAPACITY_PER_TENANT: usize = (MAX_RECORD_CACHE_BYTES_PER_TEN
 /// case is one record per shard per signal per flush cycle. Six, one per
 /// `ravel_types::Signal` variant, pinned against the enum by
 /// `signal_streams_matches_the_signal_enum` below so a new variant fails a
-/// test rather than silently shrinking the derivation. (Alerts and audit pin
-/// fixed shard indices, 1 and 2, rather than fanning out over `shard_count`,
-/// so counting them at the full shard count is an over-estimate for any
-/// deployment with two or more shards, never an under-estimate.)
+/// test rather than silently shrinking the derivation. (Alerts and audit do
+/// not fan out over `shard_count` at all: their writers pin fixed shard
+/// indices, one shard for alerts and two for audit
+/// (`ravel_types::Signal::fixed_read_shards`), so counting them at the full
+/// shard count is an over-estimate for any deployment with two or more
+/// shards, never an under-estimate.)
 pub const SIGNAL_STREAMS: u64 = 6;
 
 /// Hours of a tenant's ingest timeline that can be unsealed at once.
@@ -153,6 +177,13 @@ pub const RECORD_CACHES_PER_TENANT: u64 = 2;
 /// at once and a single-signal derivation under-sizes it by that multiple
 /// (`a_multi_signal_tenant_resolves_its_unsealed_tail_without_record_gets`
 /// in tests/hot_record_cache.rs is red without it).
+///
+/// At the shipped 2-second cadence the cap is what decides the result,
+/// whatever `--shards` is: one shard alone derives `1 * 6 * 1800 * 3` =
+/// 32,400, already above the 30,000-entry cap. The shard and cadence terms
+/// only move the value at coarser cadences, from about 2.2 seconds at one
+/// shard and about 8.7 seconds at four. Do not expect `--shards` to change
+/// the number a default-cadence deployment runs with.
 ///
 /// `max_flush_delay` of zero (or a duration so short it would otherwise
 /// overflow) saturates to the cap rather than dividing by zero or panicking;
