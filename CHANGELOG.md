@@ -23,6 +23,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The at-rest scrub corpus now covers compaction and rewrite output parts,
+  not only original L0 segments, and `ravel_scrub_checksum_mismatch_total`
+  carries a new `level` label** (issue #1686). The corpus previously skipped
+  every compaction and rewrite record it listed, so a bit flip in an L1 or
+  rewrite part was never checksummed; a live compaction or rewrite record's
+  parts now join the same rotation an L0 segment does, and a part whose
+  inputs a retention tombstone has since retired is excluded the same way a
+  tombstoned L0 segment already was. `ravel_scrub_checksum_mismatch_total`
+  now carries `level="l0"`, `level="l1"`, or `level="rewrite"` instead of one
+  undifferentiated series per signal; a dashboard or alert rule that sums
+  over `signal` alone still sees the same total, but one that names the
+  metric without also grouping by `level` now gets three series back instead
+  of one. The scrub tick cadence is unchanged: an operator should expect the
+  first tick after upgrading to cover a larger corpus within the same
+  per-tick byte budget, which can extend how long a full rotation takes on a
+  bucket with many compacted or rewritten hours.
 - **A distributed query coordinator now decodes a slice incrementally under a
   frame cap and a byte cap instead of draining the whole stream into memory
   first** (issue #1687). Both fetch clients, intra-cluster and federated,

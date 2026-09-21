@@ -10,16 +10,23 @@
 //! Each tick re-discovers the tenant set from storage via the flag-restriction
 //! [`crate::tenant_discovery::discover_and_restrict`] and, for every
 //! `(tenant, signal, shard)` it holds data for, runs the content tier over the
-//! shard's committed L0 data objects. (The maintenance and fold supervisors
+//! shard's committed data objects at every level: L0 commit records, and the
+//! L1 and rewrite parts a live compaction or erasure-rewrite record
+//! supersedes them with. A tombstoned bucket's compaction/rewrite records are
+//! excluded (retention's sweep may delete their parts at any time). (The
+//! maintenance and fold supervisors
 //! have since moved to the lifecycle-aware
 //! [`crate::tenant_discovery::discover_and_restrict_by_lifecycle`] under
 //! ADR-0066 decision 6; the scrubber has not yet been migrated, so its tenant
 //! set is still the startup flag restriction rather than the durable per-tenant
 //! lifecycle records.)
 //!
-//! 1. LIST the shard's commit records, decode each, and reconstruct the data
-//!    object key it points at, building the rotation corpus
-//!    ([`ScrubTarget`]s keyed by object key, in key order).
+//! 1. LIST the shard's commit, compaction, rewrite, and tombstone records.
+//!    Decode each commit record and reconstruct the data object key it points
+//!    at; decode each live (non-tombstoned) compaction/rewrite record and
+//!    reconstruct its parts' keys the same way. Together these build the
+//!    rotation corpus ([`ScrubTarget`]s keyed by object key and tagged with a
+//!    [`ravel_maintain::ScrubLevel`], in key order).
 //! 2. Load this shard's persisted [`ScrubCursor`], size a per-tick byte budget
 //!    from the corpus size and the configured scrub period `P`
 //!    ([`per_tick_byte_budget`]), and [`advance_cursor`] to pick the bounded
@@ -82,7 +89,7 @@ use std::time::Duration;
 use ravel_commit::keys;
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::{
-    Clock, ScrubResult, ScrubTarget, WorkerSet, advance_cursor, per_tick_byte_budget,
+    Clock, ScrubLevel, ScrubResult, ScrubTarget, WorkerSet, advance_cursor, per_tick_byte_budget,
     scrub_one_object,
 };
 use ravel_maintain::{ScrubBudget, ScrubCursor};
@@ -126,6 +133,20 @@ fn signal_index(signal: Signal) -> usize {
     }
 }
 
+/// Number of [`ScrubLevel`] variants, and therefore the width of
+/// [`ScrubMetrics`]'s per-(signal, level) `checksum_mismatch` array.
+const SCRUB_LEVELS: usize = 3;
+
+/// Position of `level` within a signal's `checksum_mismatch` row. Exhaustive
+/// over every [`ScrubLevel`] variant, matching [`signal_index`]'s discipline.
+fn level_index(level: ScrubLevel) -> usize {
+    match level {
+        ScrubLevel::L0 => 0,
+        ScrubLevel::L1 => 1,
+        ScrubLevel::Rewrite => 2,
+    }
+}
+
 /// Process-global counters for the scrubber (ADR-0059 decision 3), rendered on
 /// the existing `GET /metrics` endpoint by
 /// [`crate::metrics::render_scrub_family`] with no second registry, following
@@ -137,7 +158,9 @@ fn signal_index(signal: Signal) -> usize {
 /// Structural corruption and a content-hash mismatch are both at-rest integrity
 /// failures of the same data object, so both increment
 /// `checksum_mismatch`; a [`ScrubResult::ReadError`] is transient and increments
-/// nothing.
+/// nothing. `checksum_mismatch` also carries a [`ScrubLevel`] dimension
+/// (`l0`/`l1`/`rewrite`, [`level_index`]): the postings tier only ever runs
+/// against L0 objects, so `postings_disagreement` stays signal-only.
 ///
 /// Seal divergence (ADR-0059 decision 2) is a distinct, metadata-cost
 /// check on the same tick: sealed commit records re-listed and diffed against the
@@ -146,7 +169,7 @@ fn signal_index(signal: Signal) -> usize {
 /// increments nothing.
 #[derive(Debug, Default)]
 pub struct ScrubMetrics {
-    checksum_mismatch: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    checksum_mismatch: [[AtomicU64; SCRUB_LEVELS]; MAINTAINED_SIGNALS.len()],
     postings_disagreement: [AtomicU64; MAINTAINED_SIGNALS.len()],
     /// Sealed commit records absent from the folded snapshot (an under-count),
     /// per signal. The `reason="missing"` value of
@@ -167,8 +190,8 @@ pub struct ScrubMetrics {
 }
 
 impl ScrubMetrics {
-    pub fn checksum_mismatch(&self, signal: Signal) -> u64 {
-        self.checksum_mismatch[signal_index(signal)].load(Ordering::Relaxed)
+    pub fn checksum_mismatch(&self, signal: Signal, level: ScrubLevel) -> u64 {
+        self.checksum_mismatch[signal_index(signal)][level_index(level)].load(Ordering::Relaxed)
     }
 
     pub fn postings_disagreement(&self, signal: Signal) -> u64 {
@@ -197,8 +220,9 @@ impl ScrubMetrics {
         (covered as f64 / total as f64).clamp(0.0, 1.0)
     }
 
-    fn record_checksum_mismatch(&self, signal: Signal) {
-        self.checksum_mismatch[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
+    fn record_checksum_mismatch(&self, signal: Signal, level: ScrubLevel) {
+        self.checksum_mismatch[signal_index(signal)][level_index(level)]
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_postings_disagreement(&self, signal: Signal) {
@@ -562,22 +586,173 @@ async fn run_shard_tick(
         }
     };
 
-    let mut corpus: Vec<ScrubTarget> = Vec::new();
-    let mut records: std::collections::HashMap<String, ravel_proto::commit::v1::CommitRecord> =
-        std::collections::HashMap::new();
+    // Retention's physical sweep deletes every object in a tombstoned bucket
+    // (L0 commit records, L1 parts, rewrite parts) as one unit, but does not
+    // do so atomically with the LIST above: a compaction/rewrite record can
+    // still be present in `metas` for an hour whose tombstone has already
+    // landed. Collect tombstoned hours first (filename-only classification,
+    // no GETs) so the second pass can skip their compaction/rewrite records
+    // rather than racing a sweep that may delete their parts mid-tick.
+    let mut tombstoned_hours: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for meta in &metas {
-        // Only L0 commit records name an object `scrub_one_object` can verify
-        // (its API is commit-record based). Compaction, rewrite (ADR-0064), and
-        // tombstone records are skipped here; L1 part verification is not part
-        // of this wiring. Listed explicitly so a new bucket-entry shape fails
-        // to compile here rather than being silently swallowed.
+        if let Ok(keys::BucketEntry::Tombstone(parsed)) = keys::partition_bucket_entry(&meta.key) {
+            tombstoned_hours.insert(parsed.ingest_hour_bucket);
+        }
+    }
+
+    let mut corpus: Vec<ScrubTarget> = Vec::new();
+    let mut records: std::collections::HashMap<
+        String,
+        (ravel_proto::commit::v1::CommitRecord, ScrubLevel),
+    > = std::collections::HashMap::new();
+    for meta in &metas {
+        // L0 commit records, and the L1/rewrite parts a compaction or
+        // erasure-rewrite record supersedes them with, all name objects
+        // `scrub_one_object` can verify (its API is commit-record based; L1
+        // and rewrite parts are wrapped in a synthetic record built from
+        // their own part fields). Tombstone records carry no object of their
+        // own. Listed explicitly so a new bucket-entry shape fails to
+        // compile here rather than being silently swallowed.
         match keys::partition_bucket_entry(&meta.key) {
-            Ok(keys::BucketEntry::CommitRecord(_)) => {}
-            Ok(
-                keys::BucketEntry::CompactionRecord(_)
-                | keys::BucketEntry::RewriteRecord(_)
-                | keys::BucketEntry::Tombstone(_),
-            ) => continue,
+            Ok(keys::BucketEntry::CommitRecord(_)) => {
+                let got = match store.get(&meta.key, GetRange::Full).await {
+                    Ok(got) => got,
+                    Err(err) => {
+                        tracing::warn!(
+                            key = %meta.key, error = %err,
+                            "scrub: commit record GET failed; skipping this object this tick"
+                        );
+                        continue;
+                    }
+                };
+                let record = match ravel_commit::record::decode(&got.data) {
+                    Ok(record) => record,
+                    Err(err) => {
+                        tracing::warn!(
+                            key = %meta.key, error = %err,
+                            "scrub: commit record decode failed; skipping this object this tick"
+                        );
+                        continue;
+                    }
+                };
+                let data_key = match keys::reconstruct_data_key(&record) {
+                    Ok(key) => key,
+                    Err(err) => {
+                        tracing::warn!(
+                            key = %meta.key, error = %err,
+                            "scrub: could not reconstruct data key; skipping this object this tick"
+                        );
+                        continue;
+                    }
+                };
+                corpus.push(ScrubTarget {
+                    object_key: data_key.clone(),
+                    object_size: record.object_size,
+                    level: ScrubLevel::L0,
+                });
+                records.insert(data_key, (record, ScrubLevel::L0));
+            }
+            Ok(keys::BucketEntry::CompactionRecord(parsed)) => {
+                if tombstoned_hours.contains(&parsed.ingest_hour_bucket) {
+                    continue;
+                }
+                let got = match store.get(&meta.key, GetRange::Full).await {
+                    Ok(got) => got,
+                    Err(err) => {
+                        tracing::warn!(
+                            key = %meta.key, error = %err,
+                            "scrub: compaction record GET failed; skipping this tick"
+                        );
+                        continue;
+                    }
+                };
+                let rec = match ravel_commit::record::decode_compaction(&got.data) {
+                    Ok(rec) => rec,
+                    Err(err) => {
+                        tracing::warn!(
+                            key = %meta.key, error = %err,
+                            "scrub: compaction record decode failed; skipping this tick"
+                        );
+                        continue;
+                    }
+                };
+                for part in &rec.parts {
+                    let part_key = match keys::reconstruct_l1_part_key(&rec, part) {
+                        Ok(key) => key,
+                        Err(err) => {
+                            tracing::warn!(
+                                key = %meta.key, error = %err,
+                                "scrub: could not reconstruct L1 part key; skipping this part this tick"
+                            );
+                            continue;
+                        }
+                    };
+                    let synthetic = ravel_proto::commit::v1::CommitRecord {
+                        signal: rec.signal,
+                        object_key: part_key.clone(),
+                        object_size: part.object_size,
+                        content_hash: part.content_hash.clone(),
+                        ..Default::default()
+                    };
+                    corpus.push(ScrubTarget {
+                        object_key: part_key.clone(),
+                        object_size: part.object_size,
+                        level: ScrubLevel::L1,
+                    });
+                    records.insert(part_key, (synthetic, ScrubLevel::L1));
+                }
+            }
+            Ok(keys::BucketEntry::RewriteRecord(parsed)) => {
+                if tombstoned_hours.contains(&parsed.ingest_hour_bucket) {
+                    continue;
+                }
+                let got = match store.get(&meta.key, GetRange::Full).await {
+                    Ok(got) => got,
+                    Err(err) => {
+                        tracing::warn!(
+                            key = %meta.key, error = %err,
+                            "scrub: rewrite record GET failed; skipping this tick"
+                        );
+                        continue;
+                    }
+                };
+                let rec = match ravel_commit::erasure::decode_rewrite(&got.data) {
+                    Ok(rec) => rec,
+                    Err(err) => {
+                        tracing::warn!(
+                            key = %meta.key, error = %err,
+                            "scrub: rewrite record decode failed; skipping this tick"
+                        );
+                        continue;
+                    }
+                };
+                for part in &rec.parts {
+                    let part_key = match keys::reconstruct_rewrite_part_key(&rec, part) {
+                        Ok(key) => key,
+                        Err(err) => {
+                            tracing::warn!(
+                                key = %meta.key, error = %err,
+                                "scrub: could not reconstruct rewrite part key; skipping this part this tick"
+                            );
+                            continue;
+                        }
+                    };
+                    let synthetic = ravel_proto::commit::v1::CommitRecord {
+                        signal: rec.signal,
+                        object_key: part_key.clone(),
+                        object_size: part.object_size,
+                        content_hash: part.content_hash.clone(),
+                        ..Default::default()
+                    };
+                    corpus.push(ScrubTarget {
+                        object_key: part_key.clone(),
+                        object_size: part.object_size,
+                        level: ScrubLevel::Rewrite,
+                    });
+                    records.insert(part_key, (synthetic, ScrubLevel::Rewrite));
+                }
+            }
+            Ok(keys::BucketEntry::Tombstone(_)) => continue,
             Err(err) => {
                 tracing::warn!(
                     key = %meta.key, error = %err,
@@ -586,41 +761,6 @@ async fn run_shard_tick(
                 continue;
             }
         }
-        let got = match store.get(&meta.key, GetRange::Full).await {
-            Ok(got) => got,
-            Err(err) => {
-                tracing::warn!(
-                    key = %meta.key, error = %err,
-                    "scrub: commit record GET failed; skipping this object this tick"
-                );
-                continue;
-            }
-        };
-        let record = match ravel_commit::record::decode(&got.data) {
-            Ok(record) => record,
-            Err(err) => {
-                tracing::warn!(
-                    key = %meta.key, error = %err,
-                    "scrub: commit record decode failed; skipping this object this tick"
-                );
-                continue;
-            }
-        };
-        let data_key = match keys::reconstruct_data_key(&record) {
-            Ok(key) => key,
-            Err(err) => {
-                tracing::warn!(
-                    key = %meta.key, error = %err,
-                    "scrub: could not reconstruct data key; skipping this object this tick"
-                );
-                continue;
-            }
-        };
-        corpus.push(ScrubTarget {
-            object_key: data_key.clone(),
-            object_size: record.object_size,
-        });
-        records.insert(data_key, record);
     }
 
     // `advance_cursor` requires the corpus in key order (as a strongly
@@ -647,30 +787,40 @@ async fn run_shard_tick(
     });
 
     for key in &slice.scrub_keys {
-        let Some(record) = records.get(key) else {
+        let Some((record, level)) = records.get(key) else {
             continue;
         };
+        let level = *level;
         // The structural + content tiers always run (footer crc re-verify, then
         // whole-object blake3 vs the recorded content hash). The postings tier
         // runs additionally when `covering_postings` is `Some`: the object's
         // true `__name__` set is re-derived and diffed against what the covering
-        // postings object claims for it (the false-negative check).
-        match scrub_one_object(store, clock, record, covering_postings).await {
+        // postings object claims for it (the false-negative check). Postings
+        // only ever cover L0 commit records (an L1/rewrite part's covering
+        // ordinal is not meaningfully defined), so L1 and rewrite targets never
+        // get the postings tier regardless of whether it loaded this tick.
+        let postings_for_object = if level == ScrubLevel::L0 {
+            covering_postings
+        } else {
+            None
+        };
+        match scrub_one_object(store, clock, record, postings_for_object).await {
             ScrubResult::Clean => {}
             ScrubResult::ChecksumMismatch { .. } => {
                 tracing::error!(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
+                    level = level.as_str(),
                     "scrub: content-hash mismatch at rest (bit rot or partial write)"
                 );
-                metrics.record_checksum_mismatch(signal);
+                metrics.record_checksum_mismatch(signal, level);
             }
             ScrubResult::StructuralCorruption { detail } => {
                 tracing::error!(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
-                    detail = %detail,
+                    level = level.as_str(), detail = %detail,
                     "scrub: structural corruption at rest (footer/section crc)"
                 );
-                metrics.record_checksum_mismatch(signal);
+                metrics.record_checksum_mismatch(signal, level);
             }
             ScrubResult::PostingsDisagreement { name, ordinal } => {
                 tracing::error!(
@@ -936,7 +1086,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(metrics.checksum_mismatch(Signal::Metrics), 0);
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0
+        );
         assert_eq!(metrics.postings_disagreement(Signal::Metrics), 0);
         // A completed rotation reads as full coverage.
         assert_eq!(metrics.cursor_position(Signal::Metrics), 1.0);
@@ -990,7 +1143,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            metrics.checksum_mismatch(Signal::Metrics),
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
             1,
             "the injected bit flip must surface as a scrub checksum mismatch"
         );
@@ -1069,7 +1222,10 @@ mod tests {
             &worker.solo_live_set(),
         )
         .await;
-        assert_eq!(metrics.checksum_mismatch(Signal::Metrics), 0);
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0
+        );
         assert_eq!(metrics.postings_disagreement(Signal::Metrics), 0);
     }
 
@@ -1137,7 +1293,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(metrics.checksum_mismatch(Signal::Metrics), 0);
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0
+        );
         assert_eq!(
             metrics.postings_disagreement(Signal::Metrics),
             0,
@@ -1231,9 +1390,307 @@ mod tests {
             "the omitted name must surface as a postings disagreement through the real tick"
         );
         assert_eq!(
-            metrics.checksum_mismatch(Signal::Metrics),
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
             0,
             "the segment data is untouched: no checksum mismatch"
+        );
+    }
+
+    /// Compaction parts join the scrub corpus tagged by their own level
+    /// (issue #1686): a bit flip in an L1 part must count under
+    /// `level="l1"`, not `level="l0"`, and must leave `level="l0"` at zero.
+    /// Drives the real production compactor (`ravel_maintain::compact_bucket`)
+    /// over two real L0 segments so the resulting L1 part carries a
+    /// byte-correct `content_hash`; a fabricated hash would make the
+    /// pre-corruption assertion below fail for the wrong reason.
+    #[tokio::test]
+    async fn corrupted_l1_part_is_counted_under_its_level_after_compaction() {
+        let store = MemoryStore::new();
+        let tenant_hash = tenant().hash();
+        publish_segment(&store, 1, &["cpu"]).await;
+        publish_segment(&store, 2, &["mem"]).await;
+
+        let bucket = ravel_maintain::Bucket::new(tenant_hash, Signal::Metrics, 0, 500_000);
+        let compact_clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let outcome = ravel_maintain::compact_bucket(
+            &store,
+            &compact_clock,
+            &ravel_maintain::CompactorConfig::default(),
+            &bucket,
+        )
+        .await
+        .expect("compact");
+        assert!(
+            matches!(outcome, ravel_maintain::CompactionOutcome::Compacted { .. }),
+            "two sealed L0 inputs must compact, got {outcome:?}"
+        );
+
+        // Find the published compaction record and its (single) L1 part key.
+        let prefix = keys::commit_shard_hour_prefix(&tenant_hash, Signal::Metrics, 0, 500_000)
+            .expect("prefix");
+        let metas = list_all(&store, &prefix).await.expect("list bucket");
+        let record_key = metas
+            .iter()
+            .map(|m| m.key.clone())
+            .find(|k| {
+                matches!(
+                    keys::partition_bucket_entry(k),
+                    Ok(keys::BucketEntry::CompactionRecord(_))
+                )
+            })
+            .expect("a compaction record was published");
+        let record_bytes = store
+            .get(&record_key, GetRange::Full)
+            .await
+            .expect("get compaction record")
+            .data;
+        let record = ravel_commit::record::decode_compaction(&record_bytes)
+            .expect("decode compaction record");
+        assert_eq!(
+            record.parts.len(),
+            1,
+            "two small inputs fit in a single L1 part"
+        );
+        let part_key =
+            keys::reconstruct_l1_part_key(&record, &record.parts[0]).expect("l1 part key");
+
+        let metrics = ScrubMetrics::default();
+        let worker = solo_worker();
+
+        // Pre-corruption: a full tick over the real (L0 + L1) corpus is clean
+        // at both levels.
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0
+        );
+
+        // Flip a byte in the L1 part's page region, the same proven
+        // GET/flip/Overwrite pattern `corrupted_object_surfaces_as_checksum_mismatch`
+        // uses for an L0 object.
+        let existing = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("get l1 part");
+        let mut corrupted = existing.data.to_vec();
+        corrupted[0] ^= 0x01;
+        store
+            .put(&part_key, Bytes::from(corrupted), PutOptions::default())
+            .await
+            .expect("overwrite corrupted l1 part");
+
+        let metrics = ScrubMetrics::default();
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            1,
+            "the injected L1 bit flip must surface under level=l1"
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0,
+            "an L1 corruption must not be counted under level=l0"
+        );
+    }
+
+    /// A rewrite output part joins the scrub corpus tagged `level="rewrite"`
+    /// (issue #1686): a bit flip in it must count there, not under
+    /// `level="l0"` or `level="l1"`. Manually publishes a `RewriteRecord` plus
+    /// a real stored part object at its reconstructed key, mirroring
+    /// `ravel_maintain::compact`'s own `rewrite_part`/`put_rewrite_record`
+    /// test helpers, but with the part's `content_hash` computed as the real
+    /// blake3 of the stored bytes (those helpers use an arbitrary
+    /// `vec![tag; 32]`, which would fail the pre-corruption "reads 0 on the
+    /// unmodified corpus" assertion below since the content tier's rehash
+    /// would never match a fabricated hash).
+    #[tokio::test]
+    async fn corrupted_rewrite_part_is_counted_under_its_level() {
+        use ravel_commit::erasure;
+        use ravel_proto::commit::v1::{
+            CompactionInputIdentity, CompactionPart, RewriteDrop, RewriteRecord,
+        };
+
+        let store = MemoryStore::new();
+        let tenant_id = tenant();
+        let tenant_hash = tenant_id.hash();
+        let shard = 0u32;
+        let ingest_hour_bucket = 500_000u32;
+        let created_unix_ns = 500_000 * NS_PER_HOUR;
+
+        // A real RSEG segment, not fabricated bytes: the scrub content tier
+        // rehashes the *whole object*, but the structural tier runs first and
+        // rejects anything that is not a well-formed RSEG segment, so the
+        // pre-corruption "reads 0" assertion below needs a real segment, the
+        // same way the L1 test above needs a byte-correct `content_hash`.
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "cpu".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&tenant_id, "cpu", &labels).expect("series id");
+        let series = vec![SeriesInput {
+            series_id,
+            labels,
+            samples: vec![Sample {
+                ts_ns: created_unix_ns,
+                value: 1.0,
+            }],
+        }];
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: Uuid::from_u128(2_000).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: created_unix_ns - 1_000,
+            max_ingest_ts_ns: created_unix_ns,
+        };
+        let written = SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let part_bytes = written.bytes;
+        let part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: written.summary.blake3.to_vec(),
+            object_size: part_bytes.len() as u64,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            run_count: 1,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            declared_column_stats: Vec::new(),
+        };
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let request_id = Uuid::from_u128(0xEA5E);
+        let request_ids = vec![request_id.to_string()];
+        let input_set_hash = erasure::compute_rewrite_input_set_hash(&inputs, None, &request_ids);
+        let record = RewriteRecord {
+            format_version: 1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard,
+            ingest_hour_bucket,
+            inputs,
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![part.clone()],
+            drops: vec![RewriteDrop {
+                request_id: request_id.to_string(),
+                dropped_count: 1,
+            }],
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        let part_key = keys::reconstruct_rewrite_part_key(&record, &part).expect("part key");
+        store
+            .put(&part_key, part_bytes, PutOptions::default())
+            .await
+            .expect("put rewrite part object");
+        let record_key = keys::rewrite_record_key_for(&record).expect("rewrite record key");
+        store
+            .put(
+                &record_key,
+                ravel_commit::erasure::encode_rewrite(&record),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put rewrite record");
+
+        let metrics = ScrubMetrics::default();
+        let worker = solo_worker();
+
+        // Pre-corruption: a full tick over the unmodified rewrite part is
+        // clean at every level.
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::Rewrite),
+            0
+        );
+
+        // Flip a byte in the rewrite part object.
+        let existing = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("get rewrite part");
+        let mut corrupted = existing.data.to_vec();
+        corrupted[0] ^= 0x01;
+        store
+            .put(&part_key, Bytes::from(corrupted), PutOptions::default())
+            .await
+            .expect("overwrite corrupted rewrite part");
+
+        let metrics = ScrubMetrics::default();
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::Rewrite),
+            1,
+            "the injected rewrite-part bit flip must surface under level=rewrite"
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0
         );
     }
 }
