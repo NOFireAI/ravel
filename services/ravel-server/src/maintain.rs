@@ -1903,17 +1903,17 @@ pub(crate) async fn run_tick_with_clock_and_refold(
         // per pair, after the shard loop, so a fold reconciles every owned
         // shard's blocked hours in a single pass instead of once per shard.
         // `send` ignores an empty set, which is every ordinary tick.
-        if let Some(queue) = refold {
-            if !blocked_named_hours.is_empty() {
-                tracing::info!(
-                    tenant = %tenant.to_hex(),
-                    signal = ?signal,
-                    hours = blocked_named_hours.len(),
-                    "maintenance: requesting a targeted re-fold of the hours whose snapshot \
-                     entry still names superseded inputs"
-                );
-                queue.send(*tenant, signal, std::mem::take(&mut blocked_named_hours));
-            }
+        if let Some(queue) = refold
+            && !blocked_named_hours.is_empty()
+        {
+            tracing::info!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                hours = blocked_named_hours.len(),
+                "maintenance: requesting a targeted re-fold of the hours whose snapshot \
+                 entry still names superseded inputs"
+            );
+            queue.send(*tenant, signal, std::mem::take(&mut blocked_named_hours));
         }
 
         // Idempotency markers exist only for logs and spans (ADR-0051 SS5);
