@@ -3402,6 +3402,7 @@ impl Catalog {
                         record.clone(),
                         bytes,
                         self.config.cache_capacity_per_tenant,
+                        self.config.commit_cache_max_bytes_per_tenant(),
                     );
                     let segment_ref = build_segment_ref(&key, &record)?;
                     if !out.contains_key(&segment_ref.data_object_key) {
@@ -3668,6 +3669,7 @@ impl Catalog {
             record.clone(),
             bytes,
             self.config.cache_capacity_per_tenant,
+            self.config.commit_cache_max_bytes_per_tenant(),
         );
         Ok((record, false))
     }
