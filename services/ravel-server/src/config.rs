@@ -1386,13 +1386,14 @@ pub struct Cli {
     /// memory-constrained container.
     ///
     /// The catalog's per-tenant commit-record and compaction-record caches are
-    /// outside its scope: they are entry-count bounds on decoded records, not
+    /// outside its scope: they are per-tenant bounds on decoded records, not
     /// ADR-0046 read caches, and turning them off would put every resolve back
     /// on a per-record GET. The flag does hold them to
     /// `ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT` instead of the
-    /// derived capacity (`query::build_catalog`), so it never costs more
-    /// record-cache memory than it did before the capacity was derived: 10,000
-    /// entries across two caches, about 15 MB per actively-queried tenant.
+    /// derived capacity (`query::build_catalog`), which is the lowest capacity
+    /// short of disabling the resolve path's record cache entirely: 10,000
+    /// entries and a 9 MB byte budget in each of the two caches, about 18 MB
+    /// per actively-queried tenant.
     #[arg(long)]
     pub disable_cache: bool,
 

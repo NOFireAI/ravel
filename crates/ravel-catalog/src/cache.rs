@@ -1004,32 +1004,25 @@ mod tests {
 
     /// `RECORD_CACHE_ENTRY_BYTES` is the planning rate the derived capacity is
     /// sized against, so it has to bound what an ordinary entry actually
-    /// charges. Pins the 863-byte breakdown
+    /// charges. Pins the 864-byte breakdown
     /// `DEFAULT_CACHE_CAPACITY_PER_TENANT`'s documentation states, against real
     /// keys rather than round numbers: a 119-byte commit key held twice, the
     /// fixed struct cost, and the record's own heap (16-byte tenant hash,
-    /// 36-byte writer uuid, 125-byte data object key, 32-byte content hash).
+    /// 36-byte writer uuid, 126-byte data object key, 32-byte content hash).
     #[test]
     fn the_per_entry_planning_figure_bounds_an_ordinary_records_charge() {
         let tenant = TenantHash([25; 16]);
         let writer_id = uuid::Uuid::from_u128(1);
         let content_hash = [7u8; 32];
-        let object_key = keys::data_key(
-            &tenant,
-            Signal::Metrics,
-            0,
-            writer_id,
-            1,
-            0,
-            &content_hash,
-        )
-        .expect("data key");
-        let key = keys::commit_key(&tenant, Signal::Metrics, 0, 0, writer_id, 1, 0)
-            .expect("commit key");
+        let object_key =
+            keys::data_key(&tenant, Signal::Metrics, 0, writer_id, 1, 0, &content_hash)
+                .expect("data key");
+        let key =
+            keys::commit_key(&tenant, Signal::Metrics, 0, 0, writer_id, 1, 0).expect("commit key");
         assert_eq!(key.len(), 119, "the commit key the breakdown is stated for");
         assert_eq!(
             object_key.len(),
-            125,
+            126,
             "the data object key the breakdown is stated for"
         );
 
@@ -1042,10 +1035,10 @@ mod tests {
         let charge = commit_entry_resident_bytes(&key, &ordinary);
         assert_eq!(
             charge,
-            COMMIT_ENTRY_FIXED_BYTES + 2 * 119 + 16 + 36 + 125 + 32,
+            COMMIT_ENTRY_FIXED_BYTES + 2 * 119 + 16 + 36 + 126 + 32,
             "the charge is the sum of the entry's parts, not a constant"
         );
-        assert_eq!(charge, 863);
+        assert_eq!(charge, 864);
         assert!(
             charge <= crate::config::RECORD_CACHE_ENTRY_BYTES,
             "the planning rate ({}) must bound an ordinary entry's charge ({charge}), or the \
@@ -1110,8 +1103,10 @@ mod tests {
         let budget = capacity as u64 * crate::config::RECORD_CACHE_ENTRY_BYTES;
         assert_eq!(budget, 900_000);
 
+        // Fixed-width keys: the charge counts the key itself, so `k9` and `k10`
+        // would not cost the same and the total could not be pinned exactly.
         let record = Arc::new(record_with_declared_columns([27; 16], 0, 200));
-        let charge = commit_entry_resident_bytes("k0", &record);
+        let charge = commit_entry_resident_bytes("k00", &record);
         assert!(
             charge > 19_000,
             "sanity: one such record is charged {charge} bytes, more than twenty times the 900 \
@@ -1126,7 +1121,7 @@ mod tests {
         for i in 0..60 {
             cache.insert(
                 tenant,
-                format!("k{i}"),
+                format!("k{i:02}"),
                 record.clone(),
                 1,
                 capacity,
@@ -1154,14 +1149,18 @@ mod tests {
         let accounting = QueryAccounting::new();
         for i in 0..15 {
             assert!(
-                cache.get(&tenant, &format!("k{i}"), &accounting).is_none(),
-                "k{i} must have been evicted"
+                cache
+                    .get(&tenant, &format!("k{i:02}"), &accounting)
+                    .is_none(),
+                "k{i:02} must have been evicted"
             );
         }
         for i in 15..60 {
             assert!(
-                cache.get(&tenant, &format!("k{i}"), &accounting).is_some(),
-                "k{i} must still be resident"
+                cache
+                    .get(&tenant, &format!("k{i:02}"), &accounting)
+                    .is_some(),
+                "k{i:02} must still be resident"
             );
         }
 

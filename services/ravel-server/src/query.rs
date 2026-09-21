@@ -120,33 +120,38 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// [`ravel_catalog::derive_cache_capacity_per_tenant`]: `shard_count * 6
 /// signals * ceil(3600 / max_flush_delay_secs) * 3 unsealed hours`, clamped
 /// between the 10,000-entry floor and the cap that holds one actively-queried
-/// tenant to 45 MB across the two record caches the bound sizes. Only the
-/// commit-record half of that is an entry count: the compaction-record cache
-/// holds entries whose size grows with their input list, so it is bounded in
-/// bytes at the same per-cache share
-/// ([`ravel_catalog::CatalogConfig::compaction_cache_max_bytes_per_tenant`]).
+/// tenant to 45 MB across the two record caches the bound sizes. Neither half
+/// of that 45 MB is an entry count: both record types hold a repeated field
+/// the format does not cap (a commit record's declared column statistics, a
+/// compaction record's input list), so each cache is bounded in BYTES at an
+/// equal per-cache share of 22.5 MB
+/// ([`ravel_catalog::CatalogConfig::commit_cache_max_bytes_per_tenant`] and
+/// [`ravel_catalog::CatalogConfig::compaction_cache_max_bytes_per_tenant`]),
+/// with the entry count capped at the capacity as a second bound.
 /// So the record caches hold as much of a tenant's unsealed hot region, across
 /// every signal it ingests, as the cap covers, rather than a flat cadence-blind
 /// constant, and a wide deployment still cannot make one tenant cost
-/// gigabytes. It is up to 30,000 records of tail, not the whole tail: the cap
+/// gigabytes. It is up to 25,000 records of tail, not the whole tail: the cap
 /// binds before the estimate at the shipped defaults, the cadence term
 /// counts the age flush trigger only, so a size-triggered tenant seals more
-/// records per shard-hour than it assumes, and the three unsealed hours assume
+/// records per shard-hour than it assumes, the three unsealed hours assume
 /// the default seal parameters, which a longer `--gc-max-flush-lifetime`
-/// stretches. See
+/// stretches, and the capacity is an entry CAP rather than a guaranteed
+/// residency: a tenant whose records carry declared column statistics hits its
+/// byte budget first and holds proportionally fewer. See
 /// [`ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT`] for both limits and
 /// the memory figures. Callers must pass the
 /// configured value, never
 /// `ravel_ingest::IngestConfig::default().max_flush_delay`, or the derived
 /// capacity stops tracking the deployment's actual flush cadence. At the
-/// shipped defaults (4 shards, 2s) the cap is what binds, so this is 30,000
+/// shipped defaults (4 shards, 2s) the cap is what binds, so this is 25,000
 /// entries, and at that cadence it binds for every shard count; the shard and
 /// cadence terms only decide the value at coarser cadences.
 ///
 /// `disable_cache` skips the derivation and leaves the capacity at
 /// [`ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT`]. The flag is
 /// documented as the one for a memory-constrained container, so it must not
-/// be the path that triples record-cache memory; it does not turn the record
+/// be the path that raises record-cache memory; it does not turn the record
 /// caches off, which is why it lands on the floor and not on `0`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_catalog(
@@ -730,9 +735,9 @@ mod catalog_cache_tests {
         let expected =
             ravel_catalog::derive_cache_capacity_per_tenant(shard_count, max_flush_delay);
         assert_eq!(
-            expected, 30_000,
+            expected, 25_000,
             "sanity: the shipped ingest defaults derive 4 * 6 * 1800 * 3 = 129,600, capped at \
-             the 45 MB per-tenant budget's 30,000 entries"
+             the 45 MB per-tenant budget's 25,000 entries"
         );
         assert_ne!(
             expected,
@@ -766,8 +771,8 @@ mod catalog_cache_tests {
         let max_flush_delay = std::time::Duration::from_secs(2);
         assert_eq!(
             ravel_catalog::derive_cache_capacity_per_tenant(shard_count, max_flush_delay),
-            30_000,
-            "sanity: without the flag these arguments derive 30,000"
+            25_000,
+            "sanity: without the flag these arguments derive 25,000"
         );
 
         let catalog = build_catalog(
@@ -785,15 +790,18 @@ mod catalog_cache_tests {
         assert_eq!(
             catalog.config().cache_capacity_per_tenant,
             ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT,
-            "--disable-cache is the memory-constrained-container flag, so it must not raise \
-             record-cache memory above what the flat constant cost before the derivation"
+            "--disable-cache is the memory-constrained-container flag, so it must hold the \
+             capacity at the floor rather than the derived value"
+        );
+        assert_eq!(
+            catalog.config().commit_cache_max_bytes_per_tenant(),
+            9_000_000,
+            "both byte budgets follow the floor, so the flag costs 9 MB per cache and 18 MB \
+             per tenant, not the 22.5 MB per cache the derived capacity would budget"
         );
         assert_eq!(
             catalog.config().compaction_cache_max_bytes_per_tenant(),
-            7_500_000,
-            "the compaction cache's byte budget follows the floor too, so the flag costs the \
-             7.5 MB per tenant that 10,000 entries were assumed to cost, not the 22.5 MB the \
-             derived capacity would budget"
+            9_000_000
         );
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
