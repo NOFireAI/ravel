@@ -62,7 +62,8 @@ use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_ALL_PASSES,
-    MAX_FLUSH_CLOCK_HOLD_NS, checked_ingest_hour_bucket, size_trigger_fires,
+    MAX_FLUSH_CLOCK_HOLD_NS, checked_ingest_hour_bucket, memory_backstop_crossed,
+    size_trigger_fires,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
@@ -1430,9 +1431,24 @@ impl LogShardActor {
     /// refusing there would strand acknowledged buffered-mode records on
     /// teardown; it also needs no bound of its own, since `flush_all` awaits
     /// every spawned flush before it returns.
-    fn queued_flush_cap_reached(&self, trigger: FlushTrigger) -> bool {
-        !matches!(trigger, FlushTrigger::Manual)
-            && self.flushes.len() >= self.config.queued_flush_cap()
+    ///
+    /// A buffer that has crossed its per-(shard, tenant) memory backstop
+    /// ([`memory_backstop_crossed`]) is never refused either, whatever the
+    /// trigger, for the reasons on
+    /// [`crate::shard::ShardActor::queued_flush_cap_reached`]: that backstop is
+    /// the only bound on one buffer's resident memory, so the queue may exceed
+    /// `max_queued_flushes` under memory pressure rather than let the buffer
+    /// grow without one (PR #1903 review finding 1). The exempt path is this
+    /// early return, the only way past the length check below; a refusal
+    /// always counts on `flush_trigger_deferred`.
+    fn queued_flush_cap_reached(&self, trigger: FlushTrigger, buf: &LogTenantBuf) -> bool {
+        if matches!(trigger, FlushTrigger::Manual) {
+            return false;
+        }
+        if memory_backstop_crossed(buf.est_bytes, &self.config, self.backstop_ceiling.get()) {
+            return false;
+        }
+        self.flushes.len() >= self.config.queued_flush_cap()
     }
 
     /// Publishes this shard's spawned-but-unreaped flush-task count (issue
@@ -1544,9 +1560,10 @@ impl LogShardActor {
             debug_assert!(buf.waiters.is_empty());
             return;
         }
-        if self.queued_flush_cap_reached(trigger) {
+        if self.queued_flush_cap_reached(trigger, &buf) {
             // Issue #1740: this shard is already holding `max_queued_flushes`
-            // flush windows. Refuse the trigger rather than spawn another task
+            // flush windows, and this buffer is still under its memory
+            // backstop. Refuse the trigger rather than spawn another task
             // to park on the semaphore, and put the buffer back exactly as it
             // arrived: records, waiters, `charges`, and the trigger bookkeeping
             // (`flush_est_bytes`, `est_bytes`, `oldest_arrival_ns`) all ride

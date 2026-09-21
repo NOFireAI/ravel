@@ -426,6 +426,264 @@ async fn a_manual_drain_is_never_refused_by_the_cap() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The memory-backstop exemption
+// ---------------------------------------------------------------------------
+
+/// Filler labels each heavy row carries beyond `__name__` and the `h`
+/// discriminator. Short names and values, which is the shape the memory
+/// backstop exists for: a `Label` is two `String` headers (48 bytes) whatever
+/// the strings hold, so the buffer's resident memory climbs 51 bytes per label
+/// while the object estimate climbs 3.
+const HEAVY_FILLER_LABELS: usize = 17;
+
+/// Exact buffered-memory cost of one heavy row, by `TenantBuf::merge`'s rule
+/// (16 per sample, plus `size_of::<Label>()` = 48 plus name and value bytes for
+/// each label of a newly seen series):
+/// `16 + (48 + 8 + 3) + (48 + 1 + 3) + 17 * (48 + 2 + 1)`, for `__name__=cpu`,
+/// the 3-character `h` discriminator, and the fillers.
+const HEAVY_ROW_EST_BYTES: usize = 16 + 59 + 52 + HEAVY_FILLER_LABELS * 51;
+
+/// Heavy rows buffered before the backstop fires. Chosen with
+/// [`BACKSTOP_CEILING_BYTES`] so the crossing is exact rather than an overshoot:
+/// row `HEAVY_ROWS - 1` leaves the buffer just under the backstop and row
+/// `HEAVY_ROWS` lands on it.
+const HEAVY_ROWS: usize = 16;
+
+/// The backstop this fixture arranges: `HEAVY_ROWS` rows exactly.
+const BACKSTOP_BYTES: usize = HEAVY_ROWS * HEAVY_ROW_EST_BYTES;
+
+/// The ADR-0069 ceiling that yields [`BACKSTOP_BYTES`], since the backstop is an
+/// eighth of the configured ceiling (`BUFFER_MEMORY_BACKSTOP_BUDGET_DIVISOR`).
+///
+/// Bounded, not `Unlimited`: under `Unlimited` the backstop is a flat 64 MiB,
+/// which a test would have to make genuinely resident to cross. The exempt code
+/// path is the same one either way -- it reads
+/// `buffer_memory_backstop_bytes(config, ceiling)`, whichever arm produced it --
+/// and this ceiling is far above everything this fixture charges, so nothing
+/// sheds here either (asserted on `shed_total` and `acks_err` below).
+const BACKSTOP_CEILING_BYTES: u64 = (8 * BACKSTOP_BYTES) as u64;
+
+/// Well above the object-bytes estimate of a full heavy buffer
+/// (`HEAVY_ROWS * (32 + 11 + 4 + 17 * 3 + 16)` = 1,824) and well below
+/// [`BACKSTOP_BYTES`], so the target half of the size trigger cannot fire and
+/// the backstop half is the only thing that can.
+const HEAVY_TARGET_BYTES: usize = 8 * 1024;
+
+/// Acceptance test for the memory-backstop exemption (PR #1903 review finding
+/// 1). The queued-flush cap bounds a queue of flush TASKS; the per-(shard,
+/// tenant) memory backstop is what bounds the BUFFER those tasks drain. Refusing
+/// a backstop-crossing trigger at the cap trades the first bound for the loss of
+/// the second, and under `IngestByteBudgetLimit::Unlimited` nothing else sheds,
+/// so the buffer would then grow without any bound at all.
+///
+/// Fixture: a shard held at its cap by `CAP` parked flushes, then heavy rows
+/// buffered one write at a time. No clock advance during the heavy phase, so no
+/// age tick competes: the only trigger that can fire is the size trigger, and
+/// only through its backstop half. The crossing row must spawn a flush even
+/// though the shard is at `CAP`, and the buffer figure at that moment must be
+/// exactly [`BACKSTOP_BYTES`] -- the count of rows that rode into the flush is
+/// read back from the commit record, so "the buffer never grew past the
+/// backstop" is an exact figure, not a bound.
+#[tokio::test]
+async fn a_backstop_crossing_flush_spawns_even_at_the_queue_cap() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let clock = TestClock::new(BASE_NS);
+    let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(BACKSTOP_CEILING_BYTES));
+    let config = IngestConfig {
+        target_bytes: HEAVY_TARGET_BYTES,
+        ..capped_config()
+    };
+    let router = Arc::new(
+        IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
+            .with_budget(Arc::clone(&budget)),
+    );
+
+    let acme = tenant("acme");
+    let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+
+    // Fill the queue to the cap exactly as the acceptance test above does: one
+    // small write per age tick, each spawning a flush that parks.
+    let mut capped_writes = Vec::new();
+    for i in 0..CAP {
+        capped_writes.push(spawn_point_write(&router, &acme, i));
+        let want = (i + 1) as u64;
+        until(|| router.metrics().snapshot().buffered_points_total >= want).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| in_flight(&router) == want).await;
+    }
+    assert_eq!(
+        queued_gauge(&router),
+        CAP as u64,
+        "the shard is at its cap before the backstop is approached"
+    );
+
+    // Everything buffered from here is the heavy tenant buffer, so the
+    // buffered-bytes counter's delta from this baseline is that buffer's own
+    // resident figure: nothing drains it until the backstop fires.
+    let baseline_bytes = router.metrics().snapshot().buffered_bytes_total;
+    let baseline_points = router.metrics().snapshot().buffered_points_total;
+
+    let mut heavy_writes = Vec::new();
+    for i in 0..HEAVY_ROWS {
+        heavy_writes.push(spawn_heavy_write(&router, &acme, i));
+        let want = baseline_points + (i + 1) as u64;
+        until(|| router.metrics().snapshot().buffered_points_total >= want).await;
+        if i + 1 < HEAVY_ROWS {
+            // Under the backstop, and the object estimate is nowhere near
+            // target_bytes, so no trigger fires and the cap is untouched.
+            assert_eq!(
+                router.metrics().snapshot().buffered_bytes_total - baseline_bytes,
+                ((i + 1) * HEAVY_ROW_EST_BYTES) as u64,
+                "row {i} charges exactly HEAVY_ROW_EST_BYTES to the buffer"
+            );
+            assert_eq!(
+                in_flight(&router),
+                CAP as u64,
+                "no trigger fires below the backstop, so the queue is still at \
+                 the cap after row {i}"
+            );
+        }
+    }
+
+    // The crossing row's trigger fired with the shard at its cap. Either it was
+    // exempted and a flush spawned, or it was refused and the deferred counter
+    // moved; wait for whichever happened rather than for the outcome under test.
+    until(|| in_flight(&router) > CAP as u64 || deferred_triggers(&router) >= 1).await;
+
+    // The headline assertion. Refusing here is what converts a bounded queue of
+    // flush tasks into an unbounded buffer.
+    assert_eq!(
+        in_flight(&router),
+        (CAP + 1) as u64,
+        "a backstop-crossing trigger must spawn even at max_queued_flushes: the \
+         backstop is the only bound on the buffer, and under an unlimited byte \
+         budget nothing else sheds"
+    );
+    assert_eq!(
+        queued_gauge(&router),
+        (CAP + 1) as u64,
+        "the gauge reports the real queue depth, which the exemption lets exceed \
+         max_queued_flushes under memory pressure"
+    );
+    assert_eq!(
+        deferred_triggers(&router),
+        0,
+        "the exempt path never counts a deferral: nothing was refused"
+    );
+    let snapshot = router.metrics().snapshot();
+    assert_eq!(
+        snapshot.flushes_by_size, 1,
+        "the backstop is the size trigger's memory half, so the flush it opens \
+         is counted as a size flush"
+    );
+    assert_eq!(
+        snapshot.flushes_by_age, CAP as u64,
+        "the heavy phase advanced no clock, so no age trigger fired in it"
+    );
+    assert_eq!(
+        snapshot.buffered_bytes_total - baseline_bytes,
+        BACKSTOP_BYTES as u64,
+        "the buffer crossed the backstop on its last row and was flushed there: \
+         exactly {BACKSTOP_BYTES} bytes, not one row more"
+    );
+    assert_eq!(
+        budget.shed_total(),
+        0,
+        "the ceiling is eight times the backstop, so nothing shed: the flush \
+         above is the exemption's work, not the byte budget's"
+    );
+    assert_eq!(snapshot.acks_err, 0);
+
+    // Release the parked prefix so every flush, the exempt one last, completes.
+    for id in gate.held() {
+        assert!(gate.release(id));
+    }
+    for (i, write) in capped_writes.into_iter().enumerate() {
+        write
+            .await
+            .expect("capped write task")
+            .unwrap_or_else(|e| panic!("capped write {i} acks: {e}"));
+    }
+    let mut heavy_tokens = Vec::new();
+    for (i, write) in heavy_writes.into_iter().enumerate() {
+        let receipt = write
+            .await
+            .expect("heavy write task")
+            .unwrap_or_else(|e| panic!("heavy write {i} acks: {e}"));
+        assert_eq!(receipt.tokens.len(), 1);
+        heavy_tokens.push(receipt.tokens[0].clone());
+    }
+
+    // Every heavy row rode the one exempt flush: one shared token, and its
+    // commit record carries exactly HEAVY_ROWS rows. That is the exact figure
+    // the buffer held when it flushed, read back from the object rather than
+    // from a gauge.
+    assert!(
+        heavy_tokens.windows(2).all(|w| w[0] == w[1]),
+        "the backstop flush took the whole buffer, so one flush acks every heavy \
+         row"
+    );
+    let commit_key = keys::commit_key_for_token(&acme.hash(), Signal::Metrics, &heavy_tokens[0])
+        .expect("commit key");
+    let commit_bytes = store
+        .get(&commit_key, GetRange::Full)
+        .await
+        .expect("get commit record")
+        .data;
+    let decoded = record::decode(&commit_bytes).expect("decode commit record");
+    assert_eq!(
+        decoded.sample_count, HEAVY_ROWS as u64,
+        "the exempt flush wrote the buffer at exactly the backstop: \
+         {HEAVY_ROWS} rows"
+    );
+    assert_eq!(decoded.series_count, HEAVY_ROWS as u64);
+
+    let final_snapshot = router.metrics().snapshot();
+    assert_eq!(final_snapshot.acks_ok, (CAP + HEAVY_ROWS) as u64);
+    assert_eq!(final_snapshot.acks_err, 0);
+
+    router.flush_all().await;
+}
+
+/// Spawns one strict single-point write whose series is deliberately
+/// label-heavy: `HEAVY_FILLER_LABELS` short labels, so the row costs
+/// [`HEAVY_ROW_EST_BYTES`] of buffered memory against 114 object bytes. The `h`
+/// discriminator is zero-padded to a fixed width so every row costs the same
+/// exact figure whatever `i` is.
+fn spawn_heavy_write(
+    router: &Arc<IngestRouter>,
+    tenant: &TenantId,
+    i: usize,
+) -> tokio::task::JoinHandle<Result<ravel_ingest::WriteReceipt, ravel_ingest::WriteError>> {
+    let router = Arc::clone(router);
+    let tenant = tenant.clone();
+    tokio::spawn(async move {
+        let discriminator = format!("{i:03}");
+        // Two-character names for every filler, so the per-row figure stays the
+        // constant the fixture's arithmetic depends on.
+        let filler: Vec<(String, String)> = (0..HEAVY_FILLER_LABELS)
+            .map(|n| {
+                let suffix = (b'a' + n as u8) as char;
+                (format!("a{suffix}"), "x".to_string())
+            })
+            .collect();
+        let mut labels: Vec<(&str, &str)> = vec![("h", discriminator.as_str())];
+        labels.extend(filler.iter().map(|(n, v)| (n.as_str(), v.as_str())));
+        let points = vec![make_point(
+            &tenant,
+            "cpu",
+            &labels,
+            1_000 + i as i64,
+            i as f64,
+        )];
+        router
+            .write(tenant, points, WriteMode::Strict, Duration::from_secs(60))
+            .await
+    })
+}
+
 /// Spawns one strict single-point write. Each call uses its own `host` label,
 /// so a buffer holding `n` of these holds `n` series and `n` samples and the
 /// commit record's counts are an exact row count.
