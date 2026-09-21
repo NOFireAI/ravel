@@ -821,6 +821,40 @@ mod tests {
         );
         build_store(&s3_args("http://minio:9000", true))
             .expect("--s3-allow-http must let a plaintext non-loopback endpoint build");
+
+        // Scheme and host name are case-insensitive, so an upper-case
+        // spelling decides the same way as the lower-case one.
+        for endpoint in ["http://LOCALHOST:9000", "HTTP://localhost:9000"] {
+            assert_eq!(
+                resolve_s3_allow_http(Some(endpoint), false),
+                Ok(true),
+                "{endpoint} is loopback plaintext however it is spelled"
+            );
+        }
+        assert!(
+            resolve_s3_allow_http(Some("HTTP://minio:9000"), false).is_err(),
+            "an upper-case scheme must not skip the plaintext refusal"
+        );
+
+        // The authority ends at the first `/`, `?` or `#`: a query or fragment
+        // carrying `@localhost` must not satisfy the loopback check.
+        for endpoint in [
+            "http://s3.example.com?x=@localhost",
+            "http://s3.example.com#@localhost",
+        ] {
+            assert!(
+                resolve_s3_allow_http(Some(endpoint), false).is_err(),
+                "{endpoint} points at a host on the network and must be refused"
+            );
+        }
+
+        // An endpoint with no scheme is not decided by this rule: it stays
+        // plaintext-incapable (`false`), and it is not refused here.
+        assert_eq!(
+            resolve_s3_allow_http(Some("minio:9000"), false),
+            Ok(false),
+            "a schemeless endpoint must not enable allow_http"
+        );
     }
 
     /// `--s3-auth` defaults to `static`, and static mode still requires both

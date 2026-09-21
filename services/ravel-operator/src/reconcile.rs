@@ -4096,8 +4096,8 @@ mod tests {
 
     /// Issue #1707: `ravel-server` refuses a plaintext `http://` endpoint
     /// whose host is not loopback, and a pod's in-cluster MinIO or floci
-    /// Service is never loopback. `spec.s3.allowHttp` is what renders the
-    /// flag that accepts it, and it must render nothing at its `false`
+    /// Service is never loopback. `spec.storage.s3.allowHttp` is what renders
+    /// the flag that accepts it, and it must render nothing at its `false`
     /// default so an https:// or real-AWS cluster is untouched.
     #[test]
     fn allow_http_renders_the_flag_only_when_set() {
@@ -7110,8 +7110,9 @@ mod tests {
     /// Issue #1707: the qualify Job runs `ravel-cli` against the same bucket
     /// over the same endpoint as the server pods, and `ravel-cli` refuses a
     /// plaintext non-loopback endpoint exactly as the server does. A qualify
-    /// Job pod is never loopback to its object store, so `spec.s3.allowHttp`
-    /// must reach it as `RAVEL_S3_ALLOW_HTTP` or the Job fails on a cluster
+    /// Job pod is never loopback to its object store, so
+    /// `spec.storage.s3.allowHttp` must reach it as `RAVEL_S3_ALLOW_HTTP`
+    /// or the Job fails on a cluster
     /// whose server pods are configured to start. The variable is rendered
     /// only when the field is set, so an https:// or real-AWS cluster keeps
     /// the env block it has today.
