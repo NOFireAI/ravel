@@ -899,6 +899,9 @@ pub async fn sweep(
         // Always `Run` here: this is `sweep_shard`, which never gates rule 1.
         orphan_pass: _,
         full_pass,
+        // The fold's re-fold work list. A one-shot CLI sweep has no fold loop
+        // to hand it to; the server's maintain tick is what forwards it.
+        blocked_named_hours: _,
     } = sweep_shard(
         store.as_ref(),
         &clock,
