@@ -71,8 +71,8 @@ pub const RAVEL_ONLY_RUN_LABEL: &str = concat!(
 /// Prometheus binary was folded in.
 pub const DIFFERENTIAL_RUN_LABEL: &str = concat!(
     "Run: differential. A run report against the pinned Prometheus binary was\n",
-    "folded in, so the agreed score below counts constructs whose corpus\n",
-    "entries matched Prometheus. A construct whose only evidence is a\n",
+    "folded in, so the agreed score below counts constructs whose compared\n",
+    "corpus entries matched Prometheus. A construct whose only evidence is a\n",
     "divergence an ADR already accepts is counted on its own line instead:\n",
     "those entries were never expected to match, so neither agreement nor\n",
     "divergence is the honest word for them."
@@ -336,7 +336,9 @@ pub enum AgreedState {
 /// down as not matching.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AgreedCounts {
-    /// Constructs whose every exercising corpus entry matched Prometheus.
+    /// Constructs whose every compared corpus entry matched Prometheus. A
+    /// construct here can still carry ADR-accepted entries, which are not
+    /// compared for a match; its row names how many.
     pub agreed: usize,
     /// Constructs at least one of whose exercising entries did not match.
     pub diverged: usize,
