@@ -13,13 +13,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first** (issue #1687). Both fetch clients, intra-cluster and federated,
   buffered every response frame a remote sent and only then decoded them, so
   the remote decided how much the coordinator held. Each slice is now capped at
-  1048576 response frames and at the coordinator's own `max_bytes_scanned` in
-  wire bytes, both checked before a frame is decoded, and the client stops
-  pulling at the first breach, which cancels the RPC. A breach is a refusal
-  rather than an outage: HTTP 422 naming the observed count and the cap, in the
-  same class a local budget trip uses, not the redacted 503 other slice
-  failures become. The wire bytes a slice made the coordinator accept are
-  reported as `wireBytesConsumed` in `stats.fragments[]`.
+  1048576 response frames and at 64 MiB of wire bytes, both checked before a
+  frame is decoded, and the client stops pulling at the first breach, which
+  cancels the RPC. The byte ceiling is absolute: it applies with no
+  configuration at all, and a `max_bytes_scanned` smaller than it lowers it
+  further, while a larger one does not raise it. Both caps are per slice, so a
+  query fanning out to the default 8 parallel slices can make a coordinator
+  hold 8 times the ceiling. A breach is a refusal rather than an outage: HTTP
+  422 naming the observed figure and the cap, in the same class a local budget
+  trip uses, not the redacted 503 other slice failures become. A refusal fails
+  the query and so carries no stats block; the wire bytes a slice made the
+  coordinator accept are reported as `wireBytesConsumed` in `stats.fragments[]`
+  on the slices that completed.
 
 - **`ravel-cli load` reports a `--skip-rows` value past the end of the file
   instead of succeeding quietly** (issue #1713). The value was clamped to the

@@ -559,28 +559,45 @@ that decoder applies two caps per slice:
 
 | Cap | Value | Why it exists |
 |---|---|---|
-| Response frames | `MAX_SLICE_RESPONSE_FRAMES`, 1048576 | A slice emits one frame per returned run plus one terminal summary, so this is far above any ordinary slice. It is the cap that still bounds a stream when the byte cap is unlimited, which is the default: an empty frame costs two wire bytes, so bytes alone do not bound a frame count. |
-| Aggregate wire bytes | the coordinator's own `max_bytes_scanned` | The same engine limit a local scan is held to, applied to the encoded size of the frames this coordinator accepts. `max_bytes_scanned` is unlimited unless configured, and then only the frame cap applies. |
+| Response frames | `MAX_SLICE_RESPONSE_FRAMES`, 1048576 | A slice emits one frame per returned run plus one terminal summary, so this is far above any ordinary slice. An empty frame costs two wire bytes, so the byte cap does not bound a frame count at the sizes a remote chooses. |
+| Aggregate wire bytes | `MAX_SLICE_RESPONSE_BYTES`, 64 MiB, lowered to the coordinator's own `max_bytes_scanned` when that is smaller | Applied to the encoded size of the frames this coordinator accepts. The 64 MiB ceiling is absolute: it applies with no configuration at all, and a configured `max_bytes_scanned` can only tighten it. Setting `max_bytes_scanned` above 64 MiB, or leaving it unlimited, does not raise it. |
+
+Both caps are **per slice**, and each in-flight slice decodes through its own
+decoder holding the full cap. A query fans out to at most
+`max_parallel_slices` slices at once, which defaults to 8, so one query can
+make a coordinator hold up to 8 times the per-slice byte cap in wire bytes,
+512 MiB at the defaults, and more once those bytes are decoded into the
+in-memory series shapes. Lower `max_parallel_slices`, or `max_bytes_scanned`,
+to bound a coordinator more tightly than that.
 
 Both caps are checked before a frame is decoded or kept, and the client stops
 pulling from the stream at the first breach rather than reading it to the end.
 Dropping the stream cancels the RPC, so the worker stops producing. The
 coordinator therefore holds the frame that tripped the cap and whatever the
 HTTP/2 flow-control window had already put on the wire, not the rest of the
-slice.
+slice. A single frame is capped separately, at the 4 MiB
+`max_decoding_message_size` the coordinator sets on its fragment client: a
+frame larger than that is refused by the gRPC layer before this decoder sees
+it.
 
 A breach is a **refusal, not an outage**. It renders as HTTP 422 naming both
-the observed count and the cap (`TooManySliceFrames` for the frame cap,
-`TooManyBytesScanned` for the byte cap), in the same `execution` error class a
-local budget trip uses. It is deliberately not the redacted 503 that every
-other distributed slice failure becomes: the counts are the coordinator's own,
-so there is no server state to redact, and retrying the same query against the
-same remote would break the same way. The bytes consumed before the breach are
-still folded into accounting, and the coordinator logs a `warn` naming the
-endpoint, the frame count, and the wire bytes.
+the observed figure and the cap (`TooManySliceFrames` for the frame cap,
+`TooManySliceBytes` for the byte cap, whose message says wire bytes so it is
+not read as the store bytes `TooManyBytesScanned` counts), in the same
+`execution` error class a local budget trip uses. It is deliberately not the
+redacted 503 that every other distributed slice failure becomes: the counts
+are the coordinator's own, so there is no server state to redact, and retrying
+the same query against the same remote would break the same way.
 
-A federated slice is refused the same way. It has no `stats.fragments[]` entry,
-so its consumed bytes appear in the typed error and that `warn` log only.
+A refusal fails the whole query, and an error response carries no stats block,
+so the figures for a refused slice are in the 422 body and in the coordinator's
+`warn` log (naming the endpoint or the federated cluster, the frame count, and
+the wire bytes) and nowhere else. They are not in `stats.fragments[]`, and the
+wire bytes are not folded into the query's accounting totals, which count store
+bytes.
+
+A federated slice is refused the same way, and has no `stats.fragments[]` entry
+even when it succeeds.
 
 ## Reading `stats.fragments[]`
 
@@ -607,14 +624,17 @@ distribute, so its presence is itself the signal that fan-out happened.
 - `bytesReported`: the store bytes that worker reported scanning, already
   folded into the query's own accounting total.
 - `wireBytesConsumed`: the encoded size of the response frames this
-  coordinator accepted off the slice's stream, including the frame that tripped
-  a decode cap. This is a different quantity from `bytesReported`: those are
-  store bytes the worker read, these are wire bytes the coordinator held. A
-  slice the coordinator ran with no remote attempt reports `0`, because nothing
-  was encoded; a `fallback` entry reports what its failed remote attempt had
-  already accepted before it failed.
-- `status`: `ok`, `fallback` (the slice ran on the coordinator after a remote
-  attempt failed), or `error`.
+  coordinator accepted off the slice's stream. This is a different quantity
+  from `bytesReported`: those are store bytes the worker read, these are wire
+  bytes the coordinator held. A slice the coordinator ran with no remote
+  attempt reports `0`, because nothing was encoded; a `fallback` entry reports
+  what its failed remote attempt had already accepted before it failed. The
+  field is not a place to read a decode-cap refusal: a refused slice fails the
+  whole query, and an error response carries no stats block, so only `ok` and
+  `fallback` entries ever reach a client.
+- `status`: `ok` or `fallback` (the slice ran on the coordinator after a remote
+  attempt failed). An `error` entry is recorded internally, but a slice that
+  ends in a hard error fails the query, so no response body renders one.
 
 A `fallback` entry is the single most useful diagnostic here: it means a peer
 was unreachable or reported itself unavailable, the query still returned a
@@ -691,7 +711,7 @@ What an operator will actually observe, case by case:
 | A pinned segment vanished (concurrent GC or compaction) | The coordinator re-resolves the snapshot once and re-dispatches the whole query, not one slice; a second occurrence fails | The same single-retry behavior a local query already has |
 | A worker reports a corrupt segment, or a frame fails to decode | Terminal immediately: no retry, no local fallback | Typed error; a retry would mask real corruption behind a clean local read |
 | A CAP trips on a slice, or on the folded total (bytes, series, samples, or the request count) | The same typed `TooManySeries` / `TooManyBytesScanned` a local query raises, never a transport error | HTTP 422 with the usual budget error |
-| A slice outruns a coordinator decode cap (the frame cap, or the coordinator's own `max_bytes_scanned` over wire bytes) | The client stops pulling at the first breach and fails typed: `TooManySliceFrames` or `TooManyBytesScanned`, never a transport error. See [What bounds a slice the coordinator decodes](#what-bounds-a-slice-the-coordinator-decodes) | HTTP 422 naming both counts, not a 503; an `error` entry in `stats.fragments[]` carrying `wireBytesConsumed`, and a `warn` log naming the endpoint |
+| A slice outruns a coordinator decode cap (the frame cap, or the per-slice wire-byte ceiling) | The client stops pulling at the first breach and fails typed: `TooManySliceFrames` or `TooManySliceBytes`, never a transport error. See [What bounds a slice the coordinator decodes](#what-bounds-a-slice-the-coordinator-decodes) | HTTP 422 naming both figures, not a 503, and a `warn` log naming the endpoint (or the federated cluster) with both figures. The refusal fails the query, so there is no stats block and no `stats.fragments[]` entry for it |
 | A worker trips its FETCH MEMORY budget on a slice | `FetchMemoryExhausted`, which is backpressure rather than a cap on the query | HTTP 503, deliberately: the same slice may succeed when the worker has room, so a retry is the right response |
 | The query deadline is reached | The coordinator cancels the fan-out; stream teardown reaches the workers and drop-based cancellation frees their in-flight GETs and fragment permits | Normal deadline error; no leaked permits |
 | Protocol version skew during a rolling deploy | Skewed workers are dropped at routing time, so a mismatch costs no round trip; if none are eligible, the query runs fully local | `slices_local_total` rising, `slices_remote_total` flat |

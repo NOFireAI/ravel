@@ -3673,7 +3673,7 @@ mod slice_cap_tests {
             max_bytes_scanned: ByteLimit::Bounded(1u64 << 30),
             ..EngineConfig::default()
         };
-        assert!(1u64 << 30 > MAX_SLICE_RESPONSE_BYTES);
+        const { assert!(1u64 << 30 > MAX_SLICE_RESPONSE_BYTES) };
         assert_eq!(slice_byte_cap(&config), MAX_SLICE_RESPONSE_BYTES);
     }
 
