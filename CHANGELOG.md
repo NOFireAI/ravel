@@ -8,6 +8,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A distributed query coordinator now decodes a slice incrementally under a
+  frame cap and a byte cap instead of draining the whole stream into memory
+  first** (issue #1687). Both fetch clients, intra-cluster and federated,
+  buffered every response frame a remote sent and only then decoded them, so
+  the remote decided how much the coordinator held. Each slice is now capped at
+  1048576 response frames and at the coordinator's own `max_bytes_scanned` in
+  wire bytes, both checked before a frame is decoded, and the client stops
+  pulling at the first breach, which cancels the RPC. A breach is a refusal
+  rather than an outage: HTTP 422 naming the observed count and the cap, in the
+  same class a local budget trip uses, not the redacted 503 other slice
+  failures become. The wire bytes a slice made the coordinator accept are
+  reported as `wireBytesConsumed` in `stats.fragments[]`.
+
 - **`ravel-cli load` reports a `--skip-rows` value past the end of the file
   instead of succeeding quietly** (issue #1713). The value was clamped to the
   file's row count and the run exited 0 having written nothing, and the

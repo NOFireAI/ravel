@@ -69,11 +69,11 @@ use ravel_object_store::instrument::{LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKE
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_query::ReadCache;
 use ravel_query::SegmentFetcher;
+use ravel_query::distrib::SliceStreamDecoder;
 use ravel_query::distrib::client::{
     DistribError, SliceFetcher, SliceResponse, decode_slice_frames,
 };
 use ravel_query::distrib::codec;
-use ravel_query::distrib::SliceStreamDecoder;
 use ravel_query::distrib::proto::series_fetch_client::SeriesFetchClient;
 use ravel_query::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use ravel_query::distrib::service::{SeriesFetchService, SnapshotSegmentResolver};
@@ -1470,7 +1470,10 @@ impl RoutingSliceFetcher {
         request: &pb::FetchRequest,
         wire_bytes: &AtomicU64,
     ) -> Attempt {
-        match self.remote_fetch(endpoint, request.clone(), wire_bytes).await {
+        match self
+            .remote_fetch(endpoint, request.clone(), wire_bytes)
+            .await
+        {
             Ok(response) if response.status == pb::status::Code::Unavailable => {
                 tracing::warn!(
                     %endpoint,
@@ -4393,12 +4396,11 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         tokio::sync::oneshot::Sender<()>,
     ) {
         let produced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let server = tonic::transport::Server::builder().add_service(SeriesFetchServer::new(
-            FrameFlood {
+        let server =
+            tonic::transport::Server::builder().add_service(SeriesFetchServer::new(FrameFlood {
                 total,
                 produced: Arc::clone(&produced),
-            },
-        ));
+            }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
@@ -4504,12 +4506,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         .with_max_slice_frames(CAP);
 
         let sink = FragmentStatsSink::new();
-        let err = with_fragment_stats(
-            sink.clone(),
-            fetcher.fetch(pinned_request([9u8; 16], &[0])),
-        )
-        .await
-        .expect_err("a slice past the frame cap is refused, not decoded");
+        let err = with_fragment_stats(sink.clone(), fetcher.fetch(pinned_request([9u8; 16], &[0])))
+            .await
+            .expect_err("a slice past the frame cap is refused, not decoded");
 
         // Rules out the byte-cap-only decoder: with an Unlimited byte cap it has
         // nothing to trip on and returns the whole slice.
@@ -4534,7 +4533,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             TOTAL + 1
         );
         assert!(
-            produced >= CAP + 1,
+            produced > CAP,
             "the coordinator did read up to its cap before refusing, so the \
              refusal is the cap and not an earlier transport failure \
              (produced {produced})"
@@ -4619,12 +4618,10 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         .with_max_slice_frames(TOTAL + 1);
 
         let sink = FragmentStatsSink::new();
-        let response = with_fragment_stats(
-            sink.clone(),
-            fetcher.fetch(pinned_request([9u8; 16], &[0])),
-        )
-        .await
-        .expect("a slice inside both caps decodes");
+        let response =
+            with_fragment_stats(sink.clone(), fetcher.fetch(pinned_request([9u8; 16], &[0])))
+                .await
+                .expect("a slice inside both caps decodes");
         assert_eq!(response.status, pb::status::Code::Ok);
         assert_eq!(
             response.scalar.len(),
