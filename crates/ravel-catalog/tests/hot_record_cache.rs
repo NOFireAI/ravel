@@ -237,21 +237,27 @@ async fn publish_twelve(store: &dyn ObjectStoreBackend) -> Vec<String> {
     keys
 }
 
-/// Publish `count` records into a single unsealed bucket (`hour`), spaced
-/// evenly across the hour so every record's event timestamp falls inside
-/// `window()`. `publish_twelve`'s whole-minute spacing would overflow an hour
-/// at this record count; used only by the capacity acceptance test below.
-async fn publish_many(store: &dyn ObjectStoreBackend, hour: u32, count: u64) -> Vec<String> {
+/// Publish `count` records for `signal` into a single unsealed bucket
+/// (`hour`), spaced evenly across the hour so every record's event timestamp
+/// falls inside `window()`. `publish_twelve`'s whole-minute spacing would
+/// overflow an hour at this record count; used only by the capacity
+/// acceptance tests below.
+async fn publish_many(
+    store: &dyn ObjectStoreBackend,
+    signal: Signal,
+    hour: u32,
+    count: u64,
+) -> Vec<String> {
     let spacing_ns = NS_PER_HOUR / (count as i64 + 1);
     let mut keys = Vec::with_capacity(count as usize);
     for index in 0..count {
-        let payload = format!("seg-{hour}-{index}").into_bytes();
+        let payload = format!("seg-{}-{hour}-{index}", signal.key_prefix()).into_bytes();
         let content_hash = *blake3::hash(&payload).as_bytes();
         let event_ts_ns = i64::from(hour) * NS_PER_HOUR + spacing_ns * (index as i64 + 1);
         let writer_id = Uuid::from_u128(u128::from(index) + 1);
         let rec = record::build(NewCommitRecord {
             tenant_hash: tenant(),
-            signal: Signal::Metrics,
+            signal,
             shard: 0,
             writer_id,
             writer_epoch: 1,
@@ -282,10 +288,17 @@ async fn publish_many(store: &dyn ObjectStoreBackend, hour: u32, count: u64) -> 
 }
 
 async fn resolve(catalog: &Catalog) -> Result<ravel_catalog::Snapshot, CatalogError> {
+    resolve_signal(catalog, Signal::Metrics).await
+}
+
+async fn resolve_signal(
+    catalog: &Catalog,
+    signal: Signal,
+) -> Result<ravel_catalog::Snapshot, CatalogError> {
     catalog
         .resolve_with_accounting(
             &tenant(),
-            Signal::Metrics,
+            signal,
             window(),
             &[],
             now_ns(),
@@ -519,19 +532,20 @@ async fn a_faulted_record_get_leaves_the_other_records_cached() {
 /// `a_bound_below_the_hot_region_loses_the_saving` above (both passes evict
 /// each other): a real run of this fixture against `config(10_000)` reports
 /// 33,600 record GETs on the second resolve (thousands today at 10,000, not
-/// zero). At `derive_cache_capacity_per_tenant(4, 2s)` (21,600), the tail
-/// fits and the second resolve issues none.
+/// zero). At `derive_cache_capacity_per_tenant(4, 2s)` (30,000, the 45 MB
+/// per-tenant cap that binds at the shipped defaults), the tail fits and the
+/// second resolve issues none.
 #[tokio::test]
 async fn second_resolve_over_a_16800_record_unsealed_tail_issues_no_record_gets() {
     const RECORD_COUNT: u64 = 16_800;
     let inner = Arc::new(MemoryStore::new());
-    publish_many(inner.as_ref(), HOUR_A, RECORD_COUNT).await;
+    publish_many(inner.as_ref(), Signal::Metrics, HOUR_A, RECORD_COUNT).await;
     let (store, calls) = CountingStore::new(inner);
 
     let derived =
         ravel_catalog::derive_cache_capacity_per_tenant(4, std::time::Duration::from_secs(2));
     assert_eq!(
-        derived, 21_600,
+        derived, 30_000,
         "pin the derived capacity at the shipped ingest defaults"
     );
 
@@ -552,4 +566,90 @@ async fn second_resolve_over_a_16800_record_unsealed_tail_issues_no_record_gets(
         "at the derived capacity a repeated resolve over a 16,800-record unsealed tail must \
          issue no record GET"
     );
+}
+
+/// Issue #1735 fix round: the derivation counts records per shard per hour
+/// AND per signal. The record caches are partitioned by `TenantHash` alone,
+/// never by (tenant, signal), so one tenant ingesting metrics, logs and spans
+/// keeps three unsealed tails in one LRU and a derivation blind to the signal
+/// count under-sizes it by that multiple.
+///
+/// The fixture is one shard on a 4-second flush cadence, where the derived
+/// capacity is `1 * 6 signals * 900 flushes * 3 unsealed hours = 16_200`:
+/// clear of the 10,000-entry floor below it and of the 30,000-entry cap above
+/// it, so the signal term alone decides the outcome. Three signals of 4,000
+/// records is a 12,000-record tail, which fits 16,200 and does not fit the
+/// 10,000 the single-signal derivation would have produced here (`1 * 900 * 3
+/// = 2_700`, floored).
+///
+/// The red lever is one line: delete `.saturating_mul(SIGNAL_STREAMS)` from
+/// `derive_cache_capacity_per_tenant` in crates/ravel-catalog/src/config.rs.
+/// The capacity is then the 10,000 floor, the three tails evict each other,
+/// and this test's second-resolve assertion on the first signal reports 4,000
+/// record GETs (its whole tail, since the two passes evict each other once
+/// the bound does not fit) where it demands zero. Measured by running this
+/// fixture at `single_signal_derived` rather than `derived`.
+#[tokio::test]
+async fn a_multi_signal_tenant_resolves_its_unsealed_tail_without_record_gets() {
+    const PER_SIGNAL: u64 = 4_000;
+    const SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+    let tail_records = PER_SIGNAL * SIGNALS.len() as u64;
+
+    let derived =
+        ravel_catalog::derive_cache_capacity_per_tenant(1, std::time::Duration::from_secs(4));
+    assert_eq!(
+        derived, 16_200,
+        "pin the derived capacity for this fixture: 1 shard * 6 signals * 900 flushes * 3 hours"
+    );
+    let single_signal_derived = (derived / 6).max(ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT);
+    assert_eq!(
+        single_signal_derived, 10_000,
+        "the derivation without its signal term floors at the old flat constant here"
+    );
+    assert!(
+        (single_signal_derived as u64) < tail_records && tail_records <= derived as u64,
+        "the fixture must sit strictly between the two derivations: {single_signal_derived} < \
+         {tail_records} <= {derived}"
+    );
+
+    let inner = Arc::new(MemoryStore::new());
+    for signal in SIGNALS {
+        publish_many(inner.as_ref(), signal, HOUR_A, PER_SIGNAL).await;
+    }
+    let (store, calls) = CountingStore::new(inner);
+    let catalog = Catalog::new(store, config(derived)).expect("catalog");
+
+    // Every signal's tail is resolved cold once, so all three are resident
+    // before any of them is resolved a second time. That simultaneity is the
+    // property a single-signal derivation gets wrong.
+    for signal in SIGNALS {
+        calls.reset();
+        resolve_signal(&catalog, signal)
+            .await
+            .expect("cold resolve");
+        assert_eq!(
+            calls.record_get_count() as u64,
+            PER_SIGNAL,
+            "a cold resolve of {signal:?} must GET each of its {PER_SIGNAL} commit records \
+             exactly once"
+        );
+    }
+
+    for signal in SIGNALS {
+        calls.reset();
+        let snapshot = resolve_signal(&catalog, signal)
+            .await
+            .expect("second resolve");
+        assert_eq!(
+            calls.record_get_count(),
+            0,
+            "with all three signals' tails resident, a repeated resolve of {signal:?} must \
+             issue no record GET"
+        );
+        assert_eq!(
+            snapshot.segments.len() as u64,
+            PER_SIGNAL,
+            "each signal's snapshot holds only its own records"
+        );
+    }
 }

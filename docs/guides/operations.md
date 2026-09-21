@@ -33,12 +33,23 @@ how to choose a value, not what the flags are called.
   action. The procedures where acting on the obvious first makes things worse
   are at the top.
 
-The catalog's per-tenant commit-record cache is sized from the shard count and
-the configured max flush delay, not a flat constant: at the shipped defaults
-(4 shards, a 2-second max flush delay) it holds 21,600 entries, worth roughly
-16 MB per actively-queried tenant at about 750 bytes per cached record,
-reclaimed by idle-tenant eviction. It is not one of the memory-budget-carved
-caches [caching](caching.md) describes.
+The catalog's per-tenant record caches are sized from the shard count, the
+signal count and the configured max flush delay, not a flat constant:
+`shards * 6 signals * ceil(3600 / max_flush_delay_seconds) * 3 unsealed
+hours`, floored at 10,000 entries and capped at 30,000. One capacity bounds
+**two** caches per tenant, the commit-record cache and the L1
+compaction-record cache, each independently, so the worst case is twice that
+entry count: at the cap, 30,000 x 750 bytes per cached record x 2 caches =
+45 MB per actively-queried tenant, which is what the cap is chosen to hold
+constant across every deployment shape (`--shards 64` derives 2,073,600
+entries and 3.1 GB per tenant uncapped). Budget it as 45 MB times the number
+of tenants queried concurrently: 100 of them is 4.5 GB worst case, and idle
+tenants are reclaimed by idle-tenant eviction. These are not among the
+memory-budget-carved caches [caching](caching.md) describes, so that product
+comes out of what is left after the carved shares, not out of them. The cost
+of the cap is that a tenant whose unsealed tail exceeds 30,000 records does
+not keep the whole tail cached and pays per-record GETs on every resolve; a
+coarser `--max-flush-delay` or a lower shard count shrinks the tail itself.
 
 Related guides: [observability](observability.md) for the metric families and
 the label allowlist, [caching](caching.md) for read-cache sizing,

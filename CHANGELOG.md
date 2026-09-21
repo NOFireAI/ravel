@@ -104,6 +104,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   absent now means the worker's own limit rather than unlimited, and the
   federation `Resolve` path enforces the worker's `max_series` and
   `max_samples` too.
+- **The catalog's per-tenant record cache capacity is now derived from the
+  shard count, the signal count and the configured max flush delay, not a flat
+  10,000-entry constant, and is capped at a stated per-tenant memory budget**
+  (issue #1735). The new `ravel_catalog::derive_cache_capacity_per_tenant`
+  computes `shards * 6 signals * ceil(3600 / flush_secs) * 3 unsealed hours`,
+  floored at the old constant and capped at 30,000 entries;
+  `build_catalog` calls it with the server's resolved `--max-flush-delay`
+  instead of the flat default. The signal term matters because the caches are
+  partitioned by tenant and not by (tenant, signal): a tenant ingesting
+  metrics, logs and spans keeps three unsealed tails in one LRU, and a
+  single-signal derivation under-sizes it by that multiple and leaves it
+  thrashing. The cap matters because one capacity bounds two caches per tenant
+  (commit records and L1 compaction records), so the worst case is
+  `30,000 x 750 bytes x 2` = 45 MB per actively-queried tenant, held constant
+  across every deployment shape: `--shards 64` would otherwise derive
+  2,073,600 entries and 3.1 GB per tenant, with nothing process-wide bounding
+  the next tenant. These caches sit outside ADR-1170's carved shares, so an
+  operator budgets 45 MB times the number of concurrently queried tenants on
+  top of them. No new CLI flag is added; the capacity is a function of
+  existing ingest configuration. A repository guard now fails a pull request
+  that touches `crates/` or `services/` and carries no changelog entry, which
+  is why this internal sizing change carries one.
+
 - **A distributed deployment now refuses three unsafe listener shapes at
   startup** (issues #1724, #1703, #1690). Starting with `--distributed-query`
   and a wildcard bind refuses unless `--advertise-fragment-endpoint` names the
