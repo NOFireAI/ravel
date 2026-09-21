@@ -180,8 +180,10 @@ authoritative: it classifies every construct as supported, intentionally
 rejected, or an accepted divergence, and its counts are regenerated from a
 Ravel-only run rather than written by hand. That run measures what Ravel
 reaches and answers. Agreement with the pinned Prometheus binary is the
-table's separate `agreed with Prometheus` row, which the gated differential
-lane publishes.
+table's separate `agreed with Prometheus` row. That row reads `not measured in
+this run` in the committed table: the gated differential lane publishes its
+counts into the `promql-difftest` job log, and nothing writes them back into
+the table.
 
 A handful of constructs are intentionally rejected. Each answers with a
 typed `422 unprocessable_entity` error naming the construct, never a panic and

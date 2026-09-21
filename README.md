@@ -177,15 +177,18 @@ Also live:
   comparisons and aggregates need no `CAST` over the stringified `attrs` map.
   See the [query guide](docs/guides/query.md).
 
-The [SQL conformance table](docs/sql-conformance.md) and the PromQL conformance
-table in the [query engine spec](docs/query-engine.md) classify every construct
-as supported, intentionally rejected, an accepted divergence, or unclassified.
-Both are generated, not written: the PromQL table from a Ravel-only run that
-measures which constructs Ravel reaches and answers, and the SQL table from the
-conformance suite's recorded verdict for each construct. Agreement with
-Prometheus is a separate row of the PromQL table, published by the gated
-differential lane against a pinned Prometheus binary. The gaps are measured
-rather than claimed.
+The PromQL conformance table in the
+[query engine spec](docs/query-engine.md) classifies every construct as
+supported, intentionally rejected, an accepted divergence, or unclassified; the
+[SQL conformance table](docs/sql-conformance.md) uses three states, without the
+accepted-divergence one. Both are generated, not written: the PromQL table from
+a Ravel-only run that measures which constructs Ravel reaches and answers, and
+the SQL table from the conformance suite's recorded verdict for each construct.
+Agreement with Prometheus is a separate row of the PromQL table. That row reads
+`not measured in this run` in the committed table: the gated differential lane
+runs against a pinned Prometheus binary and publishes its counts into the
+`promql-difftest` job log, and nothing writes them back into the table. The gaps
+are measured rather than claimed.
 
 Two ingest limits are worth knowing before you point a sender at Ravel:
 
