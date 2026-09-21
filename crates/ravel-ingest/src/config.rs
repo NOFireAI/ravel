@@ -284,6 +284,24 @@ pub(crate) fn buffer_memory_backstop_bytes(
     share.max(config.target_bytes)
 }
 
+/// Whether a buffer holding `est_bytes` of memory has crossed its
+/// [`buffer_memory_backstop_bytes`], which is the backstop half of
+/// [`size_trigger_fires`] on its own.
+///
+/// Read a second time, after the trigger, by each shard actor's
+/// `queued_flush_cap_reached`: the queued-flush cap (issue #1740) bounds a queue
+/// of flush TASKS, while this backstop is the only thing bounding the BUFFER
+/// those tasks drain. Refusing a crossing here would trade a bounded queue for
+/// an unbounded buffer, which under [`IngestByteBudgetLimit::Unlimited`] nothing
+/// else sheds against, so the cap exempts it (PR #1903 review finding 1).
+pub(crate) fn memory_backstop_crossed(
+    est_bytes: usize,
+    config: &IngestConfig,
+    ceiling: IngestByteBudgetLimit,
+) -> bool {
+    est_bytes >= buffer_memory_backstop_bytes(config, ceiling)
+}
+
 /// The size trigger, shared by the metrics, log, and span shard actors:
 /// `flush_est_bytes` is the object-bytes estimate for the flush this buffer
 /// would write and gates `target_bytes`; `est_bytes` is the conservative
@@ -304,8 +322,7 @@ pub(crate) fn size_trigger_fires(
     config: &IngestConfig,
     ceiling: IngestByteBudgetLimit,
 ) -> bool {
-    flush_est_bytes >= config.target_bytes
-        || est_bytes >= buffer_memory_backstop_bytes(config, ceiling)
+    flush_est_bytes >= config.target_bytes || memory_backstop_crossed(est_bytes, config, ceiling)
 }
 
 /// All fields are overridable; defaults match the dev-sizing table.
