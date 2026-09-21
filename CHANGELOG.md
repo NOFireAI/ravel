@@ -8,6 +8,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ravel-cli load` reports a `--skip-rows` value past the end of the file
+  instead of succeeding quietly** (issue #1713). The value was clamped to the
+  file's row count and the run exited 0 having written nothing, and the
+  summary printed the clamped figure, so a resume script reading the exit code
+  recorded the load as done and a human reading the output could not see that
+  the requested offset had missed the file. A request strictly larger than the
+  row count now prints a warning naming both numbers. A request equal to the
+  row count is the legitimate resume of an already-complete file and stays
+  silent.
 - **A distributed query now sends each slice the full byte budget instead of
   an even share, and a worker clamps every wire budget to its own
   `EngineConfig`** (issues #1725 and #1687). The per-slice share failed a query
