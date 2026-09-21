@@ -239,6 +239,7 @@ impl ServiceError {
             | QueryError::TooManySamples { .. }
             | QueryError::TooManyBytesScanned { .. }
             | QueryError::TooManySliceFrames { .. }
+            | QueryError::TooManySliceBytes { .. }
             | QueryError::RequestBudgetExceeded { .. } => ServiceErrorKind::BudgetExceeded,
             QueryError::DeadlineExceeded { .. } => ServiceErrorKind::Deadline,
             QueryError::SnapshotInvalidated => ServiceErrorKind::SnapshotInvalidated,
