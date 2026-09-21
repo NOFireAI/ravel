@@ -24,10 +24,10 @@ use ravel_promql_difftest::generator::{DatasetConfig, generate};
 use ravel_promql_difftest::ravel_stack::RavelStack;
 use ravel_promql_difftest::runner::{Failure, RunReport};
 use ravel_promql_difftest::scoring::{
-    AGREED_NOT_MEASURED, AGREED_ROW_LABEL, BEGIN_MARKER, ConformanceReport, ConstructState,
-    CorpusFile, DIFFERENTIAL_RUN_LABEL, END_MARKER, RAVEL_ONLY_RUN_LABEL, REACHED_ROW_LABEL,
-    REGISTRY, REJECTION_CASES, RejectionEval, TYPED_ERROR_TAGS, TypedErrorTag, UNIT_TEST_PREFIX,
-    declared_typed_error, scan_test_fn_names, splice_generated_block,
+    AGREED_NOT_MEASURED, AGREED_ROW_LABEL, AgreedState, BEGIN_MARKER, ConformanceReport,
+    ConstructState, CorpusFile, DIFFERENTIAL_RUN_LABEL, END_MARKER, RAVEL_ONLY_RUN_LABEL,
+    REACHED_ROW_LABEL, REGISTRY, REJECTION_CASES, RejectionEval, TYPED_ERROR_TAGS, TypedErrorTag,
+    UNIT_TEST_PREFIX, declared_typed_error, percent, scan_test_fn_names, splice_generated_block,
 };
 use ravel_types::TenantId;
 use serde_json::Value as Json;
@@ -349,10 +349,18 @@ fn every_cited_ravel_promql_unit_test_exists() {
 /// produces. Because the table is generated, a regression from supported to
 /// unclassified shows up as a diff in the same change that caused it, and
 /// cannot be edited away in prose (ADR-0035 Consequences).
+///
+/// The committed block is the Ravel-only rendering, so this builds with `None`
+/// rather than folding in whatever [`REPORT_ENV`] names. A differential
+/// rendering could not be reproduced by anyone without the pinned Prometheus
+/// binary, and committing one would make every environment that has no binary
+/// report the table as stale. The agreed figures from a differential run are
+/// published by [`the_supplied_run_report_publishes_the_agreed_score`] in that
+/// run's own output instead.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used)]
 async fn query_engine_doc_table_matches_a_real_run() {
-    let report = build_report().await;
+    let report = build_report_with(None).await;
     let block = report.to_markdown();
 
     let path = query_engine_doc();
@@ -497,11 +505,13 @@ async fn a_supplied_run_report_populates_the_agreed_score() {
         block.contains(DIFFERENTIAL_RUN_LABEL),
         "block was:\n{block}"
     );
+    // The score's denominator is what the run compared, which the divergence
+    // does not change: the demoted constructs move from agreed to diverged,
+    // both inside the compared set.
     assert!(
         block.contains(&format!(
-            "| {AGREED_ROW_LABEL} | **{}/{} = ",
+            "| {AGREED_ROW_LABEL} | **{}/{exercised} = ",
             agreed_clean - demoted.len(),
-            diverged.counts().total()
         )),
         "block was:\n{block}"
     );
@@ -509,6 +519,166 @@ async fn a_supplied_run_report_populates_the_agreed_score() {
         block.contains(&format!("diverged from Prometheus: {failing}")),
         "block was:\n{block}"
     );
+}
+
+/// The agreed score is scored against the constructs that were actually
+/// compared, so a run in which Prometheus agreed with everything it saw
+/// publishes full agreement rather than a figure dragged down by constructs no
+/// corpus entry exercises. Those sit beside the score as their own count: a
+/// denominator that mixes "never compared" with "diverged" is the same
+/// two-meanings-in-one-figure collapse the reached/agreed split removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_agreeing_on_every_compared_construct_publishes_full_agreement() {
+    let parsed = parsed_corpus();
+    let entries: usize = parsed.iter().map(|(_, e)| e.len()).sum();
+    let report = build_report_with(Some(&RunReport {
+        total: entries,
+        failures: Vec::new(),
+    }))
+    .await;
+
+    let agreed = count_agreed_state(&report, AgreedState::Agreed);
+    let diverged = count_agreed_state(&report, AgreedState::Diverged);
+    let not_compared = count_agreed_state(&report, AgreedState::NotCompared);
+    let total = report.counts().total();
+    assert_eq!(
+        diverged, 0,
+        "a run report with no failures diverges nowhere"
+    );
+    assert!(
+        not_compared > 0,
+        "no construct is out of the compared set, so this run cannot show the \
+         difference between scoring against the compared set and scoring \
+         against the whole surface"
+    );
+    assert_eq!(
+        agreed + diverged + not_compared,
+        total,
+        "every construct carries exactly one agreed state once a report is \
+         folded in"
+    );
+
+    let block = report.to_markdown();
+    assert!(
+        block.contains(&format!(
+            "| {AGREED_ROW_LABEL} | **{agreed}/{agreed} = 100% ({diverged} \
+             diverged, {not_compared} not compared)** |"
+        )),
+        "a run agreeing on every compared construct must publish 100% with \
+         the not-compared count beside it:\n{block}"
+    );
+    assert!(
+        !block.contains(&format!("{agreed}/{total}")),
+        "the agreed score still divides by the whole surface, so constructs \
+         that were never compared sit in its denominator:\n{block}"
+    );
+}
+
+/// The three counts, against a synthetic run report whose split is known: one
+/// named corpus entry mismatching demotes exactly the constructs it exercises
+/// to diverged, every other exercised construct is agreed, and every construct
+/// with no corpus evidence is not compared.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agreed_row_reports_agreed_diverged_and_not_compared_separately() {
+    let parsed = parsed_corpus();
+    let entries: usize = parsed.iter().map(|(_, e)| e.len()).sum();
+    let failing = "instant_rate_counter_reset_inside_window";
+    let report = build_report_with(Some(&RunReport {
+        total: entries,
+        failures: vec![Failure {
+            entry_name: failing.to_string(),
+            query: "rate(diff_counter_total{shape=\"reset\"}[5m])".to_string(),
+            detail: "synthetic mismatch".to_string(),
+            prometheus_body: Json::Null,
+            ravel_body: Json::Null,
+        }],
+    }))
+    .await;
+
+    let exercised = report
+        .outcomes
+        .iter()
+        .filter(|o| !o.evidence.is_empty())
+        .count();
+    let demoted = report
+        .outcomes
+        .iter()
+        .filter(|o| o.evidence.iter().any(|e| e.entry == failing))
+        .count();
+    assert!(
+        demoted > 0,
+        "corpus entry '{failing}' no longer exists, so this test proves nothing"
+    );
+    let total = report.counts().total();
+    let agreed = exercised - demoted;
+    let not_compared = total - exercised;
+    assert_eq!(count_agreed_state(&report, AgreedState::Agreed), agreed);
+    assert_eq!(count_agreed_state(&report, AgreedState::Diverged), demoted);
+    assert_eq!(
+        count_agreed_state(&report, AgreedState::NotCompared),
+        not_compared
+    );
+
+    let block = report.to_markdown();
+    assert!(
+        block.contains(&format!(
+            "| {AGREED_ROW_LABEL} | **{agreed}/{} = {}% ({demoted} diverged, \
+             {not_compared} not compared)** |",
+            exercised,
+            percent(agreed, exercised)
+        )),
+        "the block does not carry the three counts separately:\n{block}"
+    );
+}
+
+/// The field names [`load_run_report`] reads are a contract, and `RunReport`'s
+/// own `Serialize` is the only producer of them. A report written by the
+/// differential lane (`RAVEL_DIFFTEST_REPORT_OUT`) must load back here, or the
+/// agreed row is unreachable however green both halves look on their own.
+#[test]
+#[allow(clippy::expect_used)]
+fn a_report_the_difftest_lane_writes_loads_back() {
+    let written = RunReport {
+        total: 265,
+        failures: vec![Failure {
+            entry_name: "instant_rate_counter_reset_inside_window".to_string(),
+            query: "rate(diff_counter_total{shape=\"reset\"}[5m])".to_string(),
+            detail: "value mismatch".to_string(),
+            prometheus_body: serde_json::json!({"status": "success"}),
+            ravel_body: serde_json::json!({"status": "success"}),
+        }],
+    };
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("nested").join("run-report.json");
+    written.write_json(&path).expect("writing the run report");
+
+    let loaded = load_run_report(&path).expect("the written report must load back");
+    assert_eq!(loaded.total, written.total);
+    assert_eq!(loaded.failures.len(), 1);
+    assert_eq!(
+        loaded.failures[0].entry_name,
+        written.failures[0].entry_name
+    );
+    assert_eq!(loaded.failures[0].query, written.failures[0].query);
+    assert_eq!(loaded.failures[0].detail, written.failures[0].detail);
+    assert_eq!(
+        loaded.failures[0].prometheus_body,
+        written.failures[0].prometheus_body
+    );
+    assert_eq!(
+        loaded.failures[0].ravel_body,
+        written.failures[0].ravel_body
+    );
+}
+
+/// How many constructs a folded-in differential run left in one agreed state.
+fn count_agreed_state(report: &ConformanceReport, state: AgreedState) -> usize {
+    report
+        .outcomes
+        .iter()
+        .filter(|o| o.agreed_state() == state)
+        .count()
 }
 
 /// The score itself, printed so a reader of the test output sees the same
@@ -530,8 +700,8 @@ async fn the_unclassified_bucket_is_reported_not_hidden() {
         counts.conformant(),
         counts.total(),
         counts.reached_percent(),
-        match report.agreed_count() {
-            Some(agreed) => format!("{agreed} of {}", counts.total()),
+        match report.agreed_counts() {
+            Some(agreed) => agreed.render(),
             None => AGREED_NOT_MEASURED.to_string(),
         }
     );
@@ -552,6 +722,59 @@ async fn the_unclassified_bucket_is_reported_not_hidden() {
     assert!(
         counts.supported > 0,
         "no construct came out supported, so the run did not happen"
+    );
+}
+
+/// The consuming end of the loop the differential lane opens: with
+/// [`REPORT_ENV`] naming a report the lane wrote, the agreed dimension is
+/// populated from a real Prometheus comparison and its three counts are
+/// published in this run's output.
+///
+/// Skips, loudly, when the variable is unset, the way `difftest_selectors` does
+/// without the pinned binary: CI's `promql-difftest` job greps for the skip
+/// line, so a lane that stops producing a report fails there instead of going
+/// quiet.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used)]
+async fn the_supplied_run_report_publishes_the_agreed_score() {
+    let Ok(path) = env::var(REPORT_ENV) else {
+        eprintln!(
+            "skipping: set {REPORT_ENV}=<path to a JSON RunReport written by \
+             the differential lane, RAVEL_DIFFTEST_REPORT_OUT> to publish the \
+             agreed score"
+        );
+        return;
+    };
+    let path = PathBuf::from(path);
+    let run =
+        load_run_report(&path).unwrap_or_else(|e| panic!("{REPORT_ENV}={}: {e}", path.display()));
+    let report = build_report_with(Some(&run)).await;
+
+    let agreed = report
+        .agreed_counts()
+        .expect("a supplied run report populates the agreed dimension");
+    eprintln!(
+        "PromQL agreement with the pinned Prometheus binary: {} (from {}, {} \
+         entries, {} mismatching)",
+        agreed.render(),
+        path.display(),
+        run.total,
+        run.failures.len()
+    );
+    assert!(
+        agreed.compared() > 0,
+        "the report folded in compared no construct at all, so it says nothing \
+         about agreement"
+    );
+    assert_eq!(
+        agreed.agreed + agreed.diverged + agreed.not_compared,
+        report.counts().total(),
+        "every construct carries exactly one agreed state"
+    );
+    let block = report.to_markdown();
+    assert!(
+        block.contains(&format!("| {AGREED_ROW_LABEL} | **{}** |", agreed.render())),
+        "block was:\n{block}"
     );
 }
 
