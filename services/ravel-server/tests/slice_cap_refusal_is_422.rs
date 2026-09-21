@@ -47,21 +47,60 @@ fn frame_cap_refusal_renders_as_422_with_both_counts() {
     );
 }
 
-/// The byte cap's refusal takes the same shape through the existing
-/// `TooManyBytesScanned` variant, so a bytes trip on the wire reads exactly
-/// like a bytes trip on a local scan.
+/// The byte cap's refusal takes the same status and class, and its rendered
+/// body names both figures AND which quantity they are.
+///
+/// It is deliberately not `TooManyBytesScanned`: that message says "query
+/// scanned N bytes", meaning store bytes the query read, a figure an operator
+/// can reconcile against `bytesReported` and the query's accounting. These are
+/// one slice's protobuf frame bytes, which appear in neither. A reader given
+/// the wrong noun has no way to tell the two apart, so the body is asserted to
+/// carry the distinguishing words, not only the numbers.
 #[test]
-fn byte_cap_refusal_renders_as_422_with_both_counts() {
-    let rendered = render(QueryError::TooManyBytesScanned {
-        scanned: 4_097,
-        max: 4_096,
+fn byte_cap_refusal_renders_as_422_naming_the_wire_bytes_and_the_cap() {
+    let rendered = render(QueryError::TooManySliceBytes {
+        bytes: 67_117_056,
+        max: 67_108_864,
     });
     assert_eq!(rendered.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(rendered.error_type, "execution");
     assert!(
-        rendered.message.contains("4097") && rendered.message.contains("4096"),
-        "both counts are echoed: {}",
+        rendered.message.contains("67117056") && rendered.message.contains("67108864"),
+        "the bytes consumed and the cap are both echoed: {}",
         rendered.message
+    );
+    assert!(
+        rendered.message.contains("wire bytes") && rendered.message.contains("per-slice"),
+        "and the body says which quantity they are: {}",
+        rendered.message
+    );
+}
+
+/// The two cap refusals are distinguishable in the rendered body, not only in
+/// the typed error: an operator reading a 422 can tell a frame-count breach
+/// from a wire-byte breach without server access.
+#[test]
+fn the_two_cap_refusals_are_distinguishable_in_the_rendered_body() {
+    let frames = render(QueryError::TooManySliceFrames {
+        frames: 1_048_577,
+        max: 1_048_576,
+    });
+    let bytes = render(QueryError::TooManySliceBytes {
+        bytes: 67_117_056,
+        max: 67_108_864,
+    });
+    assert_eq!(frames.status, bytes.status);
+    assert_eq!(frames.error_type, bytes.error_type);
+    assert_ne!(frames.message, bytes.message);
+    assert!(
+        frames.message.contains("response frames") && !frames.message.contains("wire bytes"),
+        "the frame cap names frames: {}",
+        frames.message
+    );
+    assert!(
+        bytes.message.contains("wire bytes") && !bytes.message.contains("response frames,"),
+        "the byte cap names wire bytes: {}",
+        bytes.message
     );
 }
 
@@ -104,7 +143,7 @@ fn cap_refusals_classify_as_budget_exceeded_for_non_http_transports() {
 
     for err in [
         QueryError::TooManySliceFrames { frames: 9, max: 8 },
-        QueryError::TooManyBytesScanned { scanned: 9, max: 8 },
+        QueryError::TooManySliceBytes { bytes: 9, max: 8 },
     ] {
         assert_eq!(
             ServiceError::from_query(err).kind,
