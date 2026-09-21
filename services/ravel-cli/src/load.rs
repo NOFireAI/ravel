@@ -9666,26 +9666,6 @@ type = "i64"
             );
         }
 
-        /// A load that fails mid-file prints the two figures a resume needs
-        /// (`rows_skipped` and `rows_written`), their sum as the next
-        /// `--skip-rows`, and whether this run's settings make that sum mean
-        /// anything -- end to end through [`run_warning_to`], the CLI's own
-        /// entry point, so the mapping file, the error path and the output
-        /// stream are the operator's.
-        ///
-        /// The run is `--read-cursors 1 --pipeline-depth 1` so the failure point
-        /// is deterministic: batches are submitted and resolved one at a time,
-        /// the first batch (file rows 2, 3) commits, and the scripted fault
-        /// fails the second batch's data-object PUT. The same error is then
-        /// asked for the multi-cursor verdict, which is the case the figures
-        /// must NOT be pasted into a resume.
-        ///
-        /// Non-vacuity (prove-the-test), both demonstrated failing: delete the
-        /// `resume_hint` emit block in `run_warning_to` and the first
-        /// assertion fails against a stream carrying only the admission-bypass
-        /// warning; force `sequential` in `resume_hint` to `true` (one verdict
-        /// for every geometry) and the multi-cursor assertion fails against the
-        /// prefix verdict.
         /// The past-end warning reaches the operator, not just the function
         /// that builds it. The two cases above call
         /// `skip_rows_past_end_warning` directly, so deleting the `if let`
@@ -9742,6 +9722,26 @@ type = "i64"
             );
         }
 
+        /// A load that fails mid-file prints the two figures a resume needs
+        /// (`rows_skipped` and `rows_written`), their sum as the next
+        /// `--skip-rows`, and whether this run's settings make that sum mean
+        /// anything -- end to end through [`run_warning_to`], the CLI's own
+        /// entry point, so the mapping file, the error path and the output
+        /// stream are the operator's.
+        ///
+        /// The run is `--read-cursors 1 --pipeline-depth 1` so the failure point
+        /// is deterministic: batches are submitted and resolved one at a time,
+        /// the first batch (file rows 2, 3) commits, and the scripted fault
+        /// fails the second batch's data-object PUT. The same error is then
+        /// asked for the multi-cursor verdict, which is the case the figures
+        /// must NOT be pasted into a resume.
+        ///
+        /// Non-vacuity (prove-the-test), both demonstrated failing: delete the
+        /// `resume_hint` emit block in `run_warning_to` and the first
+        /// assertion fails against a stream carrying only the admission-bypass
+        /// warning; force `sequential` in `resume_hint` to `true` (one verdict
+        /// for every geometry) and the multi-cursor assertion fails against the
+        /// prefix verdict.
         #[tokio::test]
         async fn a_failed_load_prints_the_resume_figures_and_the_settings_precondition() {
             use ravel_object_store::fault::{
