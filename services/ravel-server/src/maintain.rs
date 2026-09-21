@@ -75,6 +75,7 @@
 //! ([`crate::maintain::seed_memo_from_snapshots`],
 //! [`crate::maintain::persist_memo_snapshot`]).
 
+use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -101,6 +102,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::fold::RefoldQueue;
 use crate::tenant_discovery::{TenantDiscoveryMetrics, discover_and_restrict_by_lifecycle};
 
 /// Default `maintain_interval`: 5 minutes.
@@ -1530,6 +1532,61 @@ pub(crate) async fn run_tick_with_clock(
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> MaintainReport {
+    run_tick_with_clock_and_refold(
+        clock,
+        store,
+        tenant,
+        compactor,
+        retention,
+        shard_count,
+        memo,
+        safety,
+        ownership,
+        worker,
+        live_set,
+        None,
+    )
+    .await
+}
+
+/// [`run_tick_with_clock`], with the sweep-to-fold re-fold channel connected
+/// (issue #1763 part b).
+///
+/// After each `(tenant, signal)`'s shard loop, the hours rule 2 held on
+/// [`ravel_maintain::SnapshotBlock::Named`]
+/// ([`ravel_maintain::SweepReport::blocked_named_hours`]) are unioned over the
+/// shards this process OWNED and swept, and sent to `refold` as one request
+/// for that pair. A fold loop for the same signal in this process drains it
+/// before its next tick and reconciles those hours, which is what stops the
+/// snapshot naming the pre-rewrite inputs so the next sweep can collect them.
+///
+/// The union is over owned shards only, and that is the whole interaction with
+/// ADR-0065 ownership: an hour blocked in a shard a peer owns is that peer's
+/// to report, and it reports it to the fold loop in ITS process. The request
+/// is per `(tenant, signal)` because the catalog is: a fold covers every shard
+/// of the pair, so a request carrying one owner's hours still produces a
+/// snapshot that is correct for every shard, and a peer's un-sent hour is
+/// simply reconciled a fold later, when that peer's own sweep sends it.
+/// Nothing here depends on one process owning every shard of a pair.
+///
+/// `None` (what [`run_tick_with_clock`] and [`run_tick`] pass) sweeps exactly
+/// as before: the blocked set is computed, logged with the rest of the sweep
+/// report, and handed to nobody.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tick_with_clock_and_refold(
+    clock: &dyn Clock,
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    compactor: &CompactorConfig,
+    retention: &RetentionConfig,
+    shard_count: u32,
+    memo: &mut MaintainMemo,
+    safety: &MaintenanceSafetyMetrics,
+    ownership: &MaintenanceOwnershipMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    refold: Option<&RefoldQueue>,
+) -> MaintainReport {
     // Record this tenant's owned units from the ownership gate alone, before
     // anything that can fail. Ownership is a pure function of
     // (live set, tenant, signal, shard) under the rendezvous hash, so it is
@@ -1739,6 +1796,10 @@ pub(crate) async fn run_tick_with_clock(
         )
         .await;
 
+        // The re-fold work list for this (tenant, signal): the union over the
+        // shards this process owned and swept above.
+        let mut blocked_named_hours: BTreeSet<u32> = BTreeSet::new();
+
         for (shard, unit_memo, scan_result, sweep_result) in unit_results {
             memo.merge_unit(unit_memo);
             ownership.observe_unit_tick(
@@ -1809,8 +1870,10 @@ pub(crate) async fn run_tick_with_clock(
                         superseded_records = report.superseded_records_deleted,
                         superseded_data = report.superseded_data_deleted,
                         unreferenced_parts = report.unreferenced_parts_deleted,
+                        blocked_named_hours = report.blocked_named_hours.len(),
                         "maintenance: sweep pass complete"
                     );
+                    blocked_named_hours.extend(report.blocked_named_hours.iter().copied());
                     if report.orphan_breaker_tripped {
                         tracing::error!(
                             tenant = %tenant.to_hex(),
@@ -1833,6 +1896,23 @@ pub(crate) async fn run_tick_with_clock(
                         "maintenance: sweep pass failed; retried next tick"
                     );
                 }
+            }
+        }
+
+        // Hand this (tenant, signal)'s blocked hours to the fold. One request
+        // per pair, after the shard loop, so a fold reconciles every owned
+        // shard's blocked hours in a single pass instead of once per shard.
+        // `send` ignores an empty set, which is every ordinary tick.
+        if let Some(queue) = refold {
+            if !blocked_named_hours.is_empty() {
+                tracing::info!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    hours = blocked_named_hours.len(),
+                    "maintenance: requesting a targeted re-fold of the hours whose snapshot \
+                     entry still names superseded inputs"
+                );
+                queue.send(*tenant, signal, std::mem::take(&mut blocked_named_hours));
             }
         }
 
