@@ -181,6 +181,9 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
         cli.cache_dir.clone(),
         cli.catalog_resolve_concurrency,
         None,
+        cli.resolve_flush_cadence()
+            .expect("flush cadence resolves")
+            .max_flush_delay,
     )
     .expect("catalog");
     assert!(

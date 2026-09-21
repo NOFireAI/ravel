@@ -603,7 +603,7 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
     let metrics = Arc::new(FragmentMetrics::new());
     let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let local_catalog =
-        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None, std::time::Duration::from_secs(2))
             .expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
@@ -645,12 +645,12 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
     // The coordinator engine (distributed) and a local-only engine, both over
     // the shared store.
     let coordinator_catalog =
-        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None, std::time::Duration::from_secs(2))
             .expect("catalog");
     let coordinator = QueryEngine::new(coordinator_catalog, store.clone(), EngineConfig::default())
         .with_distributed(distributed);
     let plain_catalog =
-        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None, std::time::Duration::from_secs(2))
             .expect("catalog");
     let plain = QueryEngine::new(plain_catalog, store.clone(), EngineConfig::default());
 
@@ -1259,7 +1259,7 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
     let metrics = Arc::new(FragmentMetrics::new());
     let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let local_catalog =
-        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None, std::time::Duration::from_secs(2))
             .expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
@@ -1292,7 +1292,7 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
         always_distribute_settings().thresholds,
     ));
     let coordinator_catalog =
-        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None, std::time::Duration::from_secs(2))
             .expect("catalog");
     let coordinator = QueryEngine::new(coordinator_catalog, store.clone(), EngineConfig::default())
         .with_distributed(distributed);
@@ -1391,7 +1391,7 @@ async fn version_mismatch_falls_back_to_local() {
     let metrics = Arc::new(FragmentMetrics::new());
     let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let local_catalog =
-        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None, std::time::Duration::from_secs(2))
             .expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
@@ -1431,12 +1431,12 @@ async fn version_mismatch_falls_back_to_local() {
         always_distribute_settings().thresholds,
     ));
     let coordinator_catalog =
-        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None, std::time::Duration::from_secs(2))
             .expect("catalog");
     let coordinator = QueryEngine::new(coordinator_catalog, store.clone(), EngineConfig::default())
         .with_distributed(distributed);
     let plain_catalog =
-        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None, std::time::Duration::from_secs(2))
             .expect("catalog");
     let plain = QueryEngine::new(plain_catalog, store.clone(), EngineConfig::default());
 
@@ -1555,7 +1555,7 @@ async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
     let metrics = Arc::new(FragmentMetrics::new());
     let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let local_catalog =
-        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None, std::time::Duration::from_secs(2))
             .expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
@@ -1687,6 +1687,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
         None,
         None,
         None,
+        std::time::Duration::from_secs(2),
     )
     .expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
@@ -1733,6 +1734,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
         None,
         None,
         None,
+        std::time::Duration::from_secs(2),
     )
     .expect("catalog");
     let coordinator = QueryEngine::new(
@@ -1880,7 +1882,7 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
     let metrics = Arc::new(FragmentMetrics::new());
     let admission = AdmissionClasses::new(8, 8, metrics.clone());
     let local_catalog =
-        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None, std::time::Duration::from_secs(2))
             .expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
@@ -1912,7 +1914,7 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
         always_distribute_settings().thresholds,
     ));
     let coordinator_catalog =
-        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None)
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES, None, None, None, std::time::Duration::from_secs(2))
             .expect("catalog");
     let coordinator = QueryEngine::new(coordinator_catalog, store.clone(), EngineConfig::default())
         .with_distributed(distributed);
