@@ -155,6 +155,23 @@ when it creates the per-call capture directory, before the task's first
 Bash call, so exporting it from inside a task changes nothing. Setting it
 on the executor image is the real fix and is tracked on #1526.
 Commit with trailer "Refs: #N".
+
+CLAIMS AUDIT (answer in your report): list every sentence you wrote or
+edited in docs, HELP text, doc comments or an ADR that asserts a property
+of the system, and name the test or exact code line that makes it true.
+Delete or qualify any you cannot pair with one. Do not write "never" or
+"always" about behaviour you have not checked on every path, and recompute
+every number you state against the tree you are committing.
+
+DISTINGUISHING TESTS: name at least TWO plausible WRONG implementations
+the acceptance test rules out, and show it failing against each, not only
+against deleted code. <When the shape is known, name them here: e.g. "one
+that counts per unit instead of per signal" and "one that hardcodes 1".>
+
+CLASS CLOSURE: <when this change is an instance of a pattern, name the
+grep> -- list every other site, and say fixed, out of scope with the
+reason, or already handled and where.
+
 Self-check before the commit (see the checklist below): no tool-call
 artifacts in files, no debug_assert-only guards, generated docs
 regenerated, tests demonstrated failing, no stray files staged.
@@ -183,6 +200,14 @@ commit:
 - **Vacuous tests**: the prove-the-test skill's rule applies to you -
   demonstrate the new test failing against the pre-fix code and name the
   flipped line in your report. A test that cannot fail proves nothing.
+- **Unpaired claims**: a sentence in a doc, HELP string or comment that
+  asserts a property with no test or code line behind it. Half of one
+  epic's review findings were exactly this, and every one cost a round.
+- **A test that only rules out deletion**: if it passes against a plausible
+  wrong implementation (per-unit instead of per-signal, a hardcoded 1, a
+  check that runs after the work it was meant to prevent), it pins nothing.
+- **A pattern fixed at one site**: grep for the other instances before
+  calling the class closed.
 - **Stray files**: nothing staged that the deliverables do not name
   (scratch scripts, logs, `__pycache__/`, editor droppings). `.gate-logs/`
   and `.dd-tools/` are covered by the tracked `.gitignore`; never
@@ -275,6 +300,99 @@ site changes behaviour when this lands". If the honest answer is none, the
 spec says so and names the follow-up, and the orchestrator does not record
 the epic as having closed the gap. A capability with no caller is a
 half-finished feature that reads as a finished one.
+
+## The claims audit: prose is a deliverable, and it is usually wrong
+
+Measured over epic #1678's 13 pull requests (10 review rounds on one, 5 on
+two more, ~60 should_fix findings), roughly HALF of every finding was not a
+defect in the change at all. It was a sentence: a doc, a HELP string, a
+doc comment or an ADR paragraph asserting a property the code does not have.
+A gauge whose doc said a dip "surfaces as units_stalled" when the paths that
+drop the most records never reach that counter. A rule stated as "a worker
+refusal is never a 503" when a fetch-memory refusal is one by design. "A
+worker's own configuration is always an upper bound on what it scans" when
+rendezvous routing gives one worker several slices, each clamped
+independently. A `--max-queued-flushes` help pointing operators at a metric
+family nothing rendered.
+
+Each cost a full round. None would have survived the author reading their own
+sentence next to the code.
+
+So every spec carries this, and the executor answers it in the report:
+
+> CLAIMS AUDIT. Before your final commit, list every sentence you wrote or
+> edited in docs, HELP text, doc comments or an ADR that asserts a property
+> of the system, and name the test or the exact code line that makes it true.
+> Delete or qualify any sentence you cannot pair with one.
+
+Two rules inside it, both learned the expensive way:
+
+- **Never write "never" or "always" about a path you have not checked on
+  every path.** The recurring shape is a sentence true of the intra-cluster
+  case and false of the federated one, or true of a cap refusal and false of
+  a memory refusal. If the sentence needs a carve-out, the carve-out is the
+  interesting half.
+- **A number in prose is a claim.** "23 fields", "64 MiB per shard",
+  "shard_count x max_queued_flushes x window": recompute each against the
+  tree you are committing, or remove it. One of these multiplied an
+  instantaneous count by an accumulating one and read as an upper bound while
+  bounding nothing.
+
+## Distinguishing tests: "demonstrate it failing" is not enough
+
+The prove-the-test rule is satisfied formally by a test that fails when the
+fix is deleted, and that is a weaker claim than it sounds. A test can fail
+against deleted code and still pass against every plausible WRONG
+implementation, which is what a reviewer actually probes.
+
+Real examples from one epic: an acceptance test for a per-signal, per-process
+summation used one bucket holding one record on one shard of one tenant, so
+`+= count`, `+= 1` and `= count` all produced the same number. A cache-capacity
+derivation missing its signal multiplier passed a single-signal fixture. A
+stated mutation proof, written in the doc comment, turned out not to hold when
+the reviewer ran it.
+
+So the spec names the alternatives, not just the deletion:
+
+> DISTINGUISHING TESTS. Name at least TWO plausible WRONG implementations the
+> acceptance test rules out, and show it failing against each, not only
+> against deleted code. If it passes against either, it does not pin the
+> behaviour.
+
+Write those two into the spec yourself when you know the shape of the bug:
+"a decoder that enforces the byte cap but not the frame cap" and "one that
+enforces both only after draining the stream" are better instructions than
+"demonstrate the test failing".
+
+## Class closure: did you fix the pattern, or the site you were shown?
+
+A fix that closes two of three sites is the single most repeated way a task
+on this epic earned an extra round. `allow_http` derived from endpoint
+presence was fixed in the server, then found again in ravel-cli, then found a
+third time in the operator's own S3 client, which holds the cluster
+credentials. A "never a 503" carve-out was applied to three intra-cluster
+copies and missed three cross-cluster ones. A scrub corpus covering L0 but
+not the L1 parts that outlive it.
+
+Every spec whose change is an instance of a pattern says so:
+
+> CLASS CLOSURE. Grep the tree for every other site of this pattern, list each
+> one in your report, and say fixed, out of scope with the reason, or already
+> handled and where.
+
+The orchestrator writes the grep into the spec when the pattern is known
+("every construction of S3Config", "every place a stream is drained before a
+budget check"). An executor that only sees one call site will only fix one.
+
+## Observability a doc names must render
+
+If the change adds or documents a metric family, a label, a flag or a report
+field, a test scrapes the real surface and asserts it appears. A
+`flush_trigger_deferred_total` that exists in the crate and reaches no
+exposition is not shipped, and the help text that names it sends an operator
+looking for something that is not there. Same for a report row whose only
+producer does not exist: the row reads "not measured" forever and the doc
+says a lane publishes it.
 
 ## Soundness claims need a failing test
 
