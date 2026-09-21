@@ -137,8 +137,10 @@ The mental model, in the order it makes sense.
 - [sql-conformance.md](sql-conformance.md): every SQL construct Ravel
   claims, classified as supported, intentionally rejected, or unclassified,
   generated from the conformance suite's recorded verdicts.
-- The PromQL conformance table, generated from a differential test against
-  a real Prometheus binary, is in [query-engine.md](query-engine.md).
+- The PromQL conformance table, generated from a Ravel-only run that measures
+  which constructs Ravel reaches and answers, is in
+  [query-engine.md](query-engine.md). Agreement with the pinned Prometheus
+  binary is a separate row there, published by the differential lane.
 
 ## Deep dives
 

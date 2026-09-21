@@ -179,10 +179,13 @@ Also live:
 
 The [SQL conformance table](docs/sql-conformance.md) and the PromQL conformance
 table in the [query engine spec](docs/query-engine.md) classify every construct
-as supported, intentionally rejected, or unclassified. Both are generated, not
-written: the PromQL table from a differential test against a real Prometheus
-binary, and the SQL table from the conformance suite's recorded verdict for
-each construct. The gaps are measured rather than claimed.
+as supported, intentionally rejected, an accepted divergence, or unclassified.
+Both are generated, not written: the PromQL table from a Ravel-only run that
+measures which constructs Ravel reaches and answers, and the SQL table from the
+conformance suite's recorded verdict for each construct. Agreement with
+Prometheus is a separate row of the PromQL table, published by the gated
+differential lane against a pinned Prometheus binary. The gaps are measured
+rather than claimed.
 
 Two ingest limits are worth knowing before you point a sender at Ravel:
 
@@ -413,7 +416,8 @@ hold Ravel to them:
   orphan-free sweeps every cycle. Any violation prints its master seed and a
   one-command replay. A nightly job sweeps 200 seeds.
 - The PromQL evaluator is differentially tested against a pinned real Prometheus
-  binary, and the per-construct result is published as a conformance table.
+  binary. The per-construct conformance table publishes what Ravel reaches, and
+  agreement with that binary as its own row.
 - `unsafe` is forbidden workspace-wide, at the compiler rather than by review.
 - Property tests cover every codec and parser. Fuzz targets run on the segment
   and span formats.
