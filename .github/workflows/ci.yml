@@ -1479,6 +1479,7 @@ jobs:
         id: fetch-prometheus
         run: echo "bin_path=$(scripts/fetch-prometheus.sh)" >> "$GITHUB_OUTPUT"
       - name: Run PromQL differential test
+        id: difftest
         env:
           RAVEL_DIFFTEST: "1"
           RAVEL_DIFFTEST_PROM_BIN: ${{ steps.fetch-prometheus.outputs.bin_path }}
@@ -1518,15 +1519,18 @@ jobs:
       # the JSON RAVEL_DIFFTEST_REPORT names. `always()` because a mismatching
       # run is exactly the run whose agreed figure matters; the step above has
       # already failed the job by then, and the report was written before it
-      # panicked.
+      # panicked. The `steps.difftest` guard keeps a failure that happened
+      # BEFORE that run started out of here: a failed fetch-prometheus skips
+      # the step above, and resurfacing that as a missing report would report
+      # the wrong cause under the wording reserved for the lane going quiet.
       - name: Publish the agreed conformance score
-        if: always()
+        if: always() && steps.difftest.outcome != 'skipped'
         env:
           RAVEL_DIFFTEST_REPORT: ${{ github.workspace }}/difftest-run-report.json
         run: |
           set -o pipefail
           if [ ! -f "$RAVEL_DIFFTEST_REPORT" ]; then
-            echo "::error::the differential run wrote no report to $RAVEL_DIFFTEST_REPORT"
+            echo "::error::the differential run started but archived no report to $RAVEL_DIFFTEST_REPORT. This step cannot tell the two causes apart: the run died before run_corpus reached its archive step (a failing PrometheusProcess::spawn, say), or run_corpus stopped writing a report at all. Read the 'Run PromQL differential test' step's log."
             exit 1
           fi
           # `--color never` for the same reason as above: the grep guards below
