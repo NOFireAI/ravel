@@ -1,7 +1,7 @@
 //! `deploy/prometheus/ravel.rules.yaml` ships alert rules an operator loads
-//! verbatim. Every metric name in that file must name a series Ravel really
-//! renders, or the rule matches nothing and the condition it covers pages
-//! nobody, with no error at scrape time.
+//! verbatim. Every Ravel metric name in that file must name a series Ravel
+//! really renders, or the rule matches nothing and the condition it covers
+//! pages nobody, with no error at scrape time.
 //!
 //! The assertion is against a RENDERED `/metrics` body, obtained the way
 //! `metrics_endpoint.rs` obtains one (an in-process server on `MemoryStore`,
@@ -9,10 +9,22 @@
 //! `services/ravel-server/src/metrics.rs`: a name that is declared in the
 //! source but that nothing renders would pass a source scan and still leave
 //! the shipped rule dead.
+//!
+//! Both tests here read the rule file through [`parse_rule_file`], which
+//! builds its groups and rules as a structure and refuses any line it cannot
+//! account for, rather than matching strings in the raw text. A corruption
+//! that leaves the `- alert:` lines intact still stops the file loading in
+//! Prometheus, so it has to stop the file parsing here.
+//!
+//! `docs/guides/observability.md` reprints 13 of these rules in fenced `yaml`
+//! blocks, to explain them in place. Those blocks are parsed the same way and
+//! compared field by field against the shipped file, which is what keeps a
+//! rename from updating one copy and leaving the other handing readers a dead
+//! rule.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use ravel_object_store::StoreMetrics;
@@ -28,8 +40,19 @@ const RULES_FILE: &str = concat!(
     "/../../deploy/prometheus/ravel.rules.yaml"
 );
 
-/// Distinct `ravel_*` metric names the shipped rule file references, counted
-/// over expressions, annotations and comments alike.
+/// The guide that reprints part of the shipped file in fenced `yaml` blocks.
+const GUIDE_FILE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/guides/observability.md"
+);
+
+/// Distinct `ravel_*` metric names the shipped rules reference, over every
+/// parsed `expr` and every parsed annotation value.
+///
+/// Annotations count because one name reaches the set through them alone
+/// (`ravel_declared_stats_drops_observed_total`, named by the annotation that
+/// tells the responder where to look): a scan of the expressions by
+/// themselves would drop it, and a rename of it would then go unnoticed.
 ///
 /// A literal, not a figure derived from the same scan the assertions run over:
 /// an extractor that silently matches nothing (a broken pattern, a path that
@@ -38,10 +61,17 @@ const RULES_FILE: &str = concat!(
 /// here until this number is updated.
 const EXPECTED_METRIC_NAMES: usize = 37;
 
-/// Alert rules in the shipped file. Pinned for the same reason as the name
-/// count: a file that stopped parsing, or that lost a group, must fail rather
-/// than shrink the scan.
+/// Alert rules in the shipped file, counted off the parsed structure. Pinned
+/// for the same reason as the name count: a file that lost a group, or a
+/// group that lost a rule, must fail rather than shrink the scan.
 const EXPECTED_ALERTS: usize = 31;
+
+/// Fenced `yaml` blocks in the guide, and the alert rules they hold between
+/// them. Pinned so that an extractor that matches no block, or a block that
+/// stops holding rules, fails here rather than leaving the per-alert
+/// comparison below iterating an empty set.
+const EXPECTED_GUIDE_BLOCKS: usize = 5;
+const EXPECTED_GUIDE_ALERTS: usize = 13;
 
 /// One tenant, one trivially valid PromQL rule. Enough for `alerting::spawn`
 /// to build an evaluator, which is what puts the whole `ravel_alert_*` family
@@ -57,6 +87,418 @@ const ALERT_RULES_JSON: &str = r#"{
     }
   ]
 }"#;
+
+// ---------------------------------------------------------------------------
+// A reader for the block-mapping subset a Prometheus rule file is written in.
+// ---------------------------------------------------------------------------
+
+/// A parsed node. The subset has no flow collections, no anchors, no tags and
+/// no multi-document streams, so these three cases cover it.
+#[derive(Debug)]
+enum Value {
+    Scalar(String),
+    Mapping(Vec<(String, Value)>),
+    Sequence(Vec<Value>),
+}
+
+/// One `- alert:` rule, with the fields the shipped file and the guide both
+/// write.
+#[derive(Debug)]
+struct AlertRule {
+    name: String,
+    expr: String,
+    /// The `for:` duration, absent on a rule transcribed from a source that
+    /// states none.
+    fires_after: Option<String>,
+    labels: BTreeMap<String, String>,
+    annotations: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+struct RuleGroup {
+    #[allow(dead_code)]
+    name: String,
+    rules: Vec<AlertRule>,
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+/// Splits `alert: RavelFoo` into its key and the text after the colon.
+///
+/// Returns `None` for anything that is not a mapping key, which is what turns
+/// a spliced line into a parse failure rather than into text the reader walks
+/// past.
+fn split_key(content: &str) -> Option<(String, String)> {
+    let colon = content.find(':')?;
+    let key = &content[..colon];
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return None;
+    }
+    let after = &content[colon + 1..];
+    if !after.is_empty() && !after.starts_with(' ') {
+        return None;
+    }
+    Some((key.to_string(), after.trim().to_string()))
+}
+
+/// The value of a plain (unquoted, single-line) scalar.
+///
+/// A `#` preceded by a space opens a comment, which is why the `runbook:`
+/// values keep their `#section` anchors: nothing there has a space before the
+/// `#`.
+fn plain_scalar(text: &str) -> Result<String, String> {
+    let value = match text.find(" #") {
+        Some(cut) => text[..cut].trim_end(),
+        None => text,
+    };
+    let first = value
+        .chars()
+        .next()
+        .ok_or_else(|| "a key was given an empty value".to_string())?;
+    if matches!(first, '[' | '{' | '&' | '*' | '!' | '%' | '@' | '`') {
+        return Err(format!(
+            "{value:?} opens a YAML construct this reader does not accept"
+        ));
+    }
+    if first == '"' || first == '\'' {
+        if value.len() < 2 || !value.ends_with(first) {
+            return Err(format!("{value:?} opens a quote that is never closed"));
+        }
+        return Ok(value[1..value.len() - 1].to_string());
+    }
+    Ok(value.to_string())
+}
+
+struct Reader {
+    lines: Vec<String>,
+    at: usize,
+}
+
+impl Reader {
+    fn new(text: &str) -> Self {
+        Reader {
+            lines: text.lines().map(str::to_string).collect(),
+            at: 0,
+        }
+    }
+
+    fn line_no(&self) -> usize {
+        self.at + 1
+    }
+
+    fn skip_ignorable(&mut self) {
+        while let Some(line) = self.lines.get(self.at) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Indentation and content of the next significant line, left in place.
+    fn peek(&mut self) -> Option<(usize, String)> {
+        self.skip_ignorable();
+        let line = self.lines.get(self.at)?;
+        let indent = indent_of(line);
+        Some((indent, line[indent..].trim_end().to_string()))
+    }
+
+    /// Reads the mapping whose keys sit at `indent`, stopping at the first
+    /// significant line that is shallower or is a sequence item.
+    fn parse_mapping(&mut self, indent: usize) -> Result<Vec<(String, Value)>, String> {
+        let mut entries: Vec<(String, Value)> = Vec::new();
+        while let Some((line_indent, content)) = self.peek() {
+            if line_indent < indent {
+                break;
+            }
+            if line_indent > indent {
+                return Err(format!(
+                    "line {}: indented {line_indent} where a key at column {indent} was expected",
+                    self.line_no()
+                ));
+            }
+            if content.starts_with("- ") {
+                break;
+            }
+            let key_line = self.line_no();
+            let (key, after) = split_key(&content).ok_or_else(|| {
+                format!("line {key_line}: this is not a mapping key: {content:?}")
+            })?;
+            if entries.iter().any(|(seen, _)| *seen == key) {
+                return Err(format!("line {key_line}: duplicate key {key:?}"));
+            }
+            self.at += 1;
+            let value = self.parse_value(indent, &after, key_line)?;
+            entries.push((key, value));
+        }
+        Ok(entries)
+    }
+
+    /// Reads the sequence whose `- ` markers sit at `indent`. Every item in
+    /// this subset is a mapping.
+    fn parse_sequence(&mut self, indent: usize) -> Result<Vec<Value>, String> {
+        let mut items = Vec::new();
+        while let Some((line_indent, content)) = self.peek() {
+            if line_indent < indent {
+                break;
+            }
+            if line_indent > indent {
+                return Err(format!(
+                    "line {}: indented {line_indent} where a sequence item at column {indent} \
+                     was expected",
+                    self.line_no()
+                ));
+            }
+            if !content.starts_with("- ") {
+                return Err(format!(
+                    "line {}: this is not a sequence item: {content:?}",
+                    self.line_no()
+                ));
+            }
+            self.lines[self.at].replace_range(indent..indent + 2, "  ");
+            items.push(Value::Mapping(self.parse_mapping(indent + 2)?));
+        }
+        Ok(items)
+    }
+
+    fn parse_value(
+        &mut self,
+        key_indent: usize,
+        after: &str,
+        key_line: usize,
+    ) -> Result<Value, String> {
+        if after.is_empty() {
+            let child = self
+                .peek()
+                .filter(|(child_indent, _)| *child_indent > key_indent);
+            let Some((child_indent, content)) = child else {
+                return Err(format!("line {key_line}: this key opens nothing below it"));
+            };
+            return if content.starts_with("- ") {
+                Ok(Value::Sequence(self.parse_sequence(child_indent)?))
+            } else {
+                Ok(Value::Mapping(self.parse_mapping(child_indent)?))
+            };
+        }
+        if matches!(after, "|" | "|-" | ">" | ">-") {
+            return Ok(Value::Scalar(self.parse_block_scalar(key_indent, after)?));
+        }
+        Ok(Value::Scalar(
+            plain_scalar(after).map_err(|e| format!("line {key_line}: {e}"))?,
+        ))
+    }
+
+    /// Reads the block scalar a `|`, `|-`, `>` or `>-` header opened: every
+    /// following line indented past the key, dedented by the least of their
+    /// indents.
+    ///
+    /// A literal block joins those lines with newlines. A folded one joins
+    /// them with spaces, and refuses a blank or a more-indented line, since
+    /// those fold by rules this reader does not implement and must not be
+    /// guessed at.
+    fn parse_block_scalar(&mut self, key_indent: usize, style: &str) -> Result<String, String> {
+        let opened_at = self.line_no();
+        let mut raw: Vec<String> = Vec::new();
+        while let Some(line) = self.lines.get(self.at) {
+            if line.trim().is_empty() {
+                raw.push(String::new());
+                self.at += 1;
+                continue;
+            }
+            if indent_of(line) <= key_indent {
+                break;
+            }
+            raw.push(line.trim_end().to_string());
+            self.at += 1;
+        }
+        while raw.last().is_some_and(String::is_empty) {
+            raw.pop();
+            self.at -= 1;
+        }
+        if raw.is_empty() {
+            return Err(format!(
+                "line {opened_at}: this block scalar has no content"
+            ));
+        }
+        let base = raw
+            .iter()
+            .filter(|line| !line.is_empty())
+            .map(|line| indent_of(line))
+            .min()
+            .unwrap_or(0);
+        let body: Vec<String> = raw
+            .iter()
+            .map(|line| {
+                if line.is_empty() {
+                    String::new()
+                } else {
+                    line[base..].to_string()
+                }
+            })
+            .collect();
+        if style.starts_with('>') {
+            if body
+                .iter()
+                .any(|line| line.is_empty() || indent_of(line) > 0)
+            {
+                return Err(format!(
+                    "line {opened_at}: this folded block scalar has a blank or a more-indented \
+                     line, which this reader does not fold"
+                ));
+            }
+            return Ok(body.join(" "));
+        }
+        Ok(body.join("\n"))
+    }
+}
+
+fn scalar(value: &Value, key: &str) -> Result<String, String> {
+    match value {
+        Value::Scalar(text) => Ok(text.clone()),
+        _ => Err(format!("`{key}` must hold a scalar")),
+    }
+}
+
+fn scalar_map(value: &Value, key: &str) -> Result<BTreeMap<String, String>, String> {
+    let Value::Mapping(entries) = value else {
+        return Err(format!("`{key}` must hold a mapping"));
+    };
+    entries
+        .iter()
+        .map(|(name, held)| Ok((name.clone(), scalar(held, name)?)))
+        .collect()
+}
+
+fn build_rule(fields: &[(String, Value)]) -> Result<AlertRule, String> {
+    let mut name = None;
+    let mut expr = None;
+    let mut fires_after = None;
+    let mut labels = BTreeMap::new();
+    let mut annotations = BTreeMap::new();
+    for (key, value) in fields {
+        match key.as_str() {
+            "alert" => name = Some(scalar(value, "alert")?),
+            "expr" => expr = Some(scalar(value, "expr")?),
+            "for" => fires_after = Some(scalar(value, "for")?),
+            "labels" => labels = scalar_map(value, "labels")?,
+            "annotations" => annotations = scalar_map(value, "annotations")?,
+            other => return Err(format!("unexpected key {other:?} in an alert rule")),
+        }
+    }
+    Ok(AlertRule {
+        name: name.ok_or_else(|| "a rule carries no `alert` key".to_string())?,
+        expr: expr.ok_or_else(|| "a rule carries no `expr` key".to_string())?,
+        fires_after,
+        labels,
+        annotations,
+    })
+}
+
+/// Parses a Prometheus rule file, or one fenced block holding the same shape,
+/// into its groups and rules.
+///
+/// Every non-blank, non-comment line has to be a mapping key, a sequence item
+/// or a line of a block scalar some key opened, at an indentation its parent
+/// allows, and every key has to be one this shape defines. A line that is
+/// none of those is an error rather than text the reader steps over, so a
+/// file Prometheus would refuse at startup fails here too. This is not a
+/// general YAML implementation: it accepts the subset these files are written
+/// in and rejects the rest, which is the direction that makes a corrupt file
+/// fail rather than pass.
+fn parse_rule_file(text: &str) -> Result<Vec<RuleGroup>, String> {
+    if text.contains('\t') {
+        return Err("a tab appears in the text; YAML forbids tabs in indentation".to_string());
+    }
+    let mut reader = Reader::new(text);
+    let root = reader.parse_mapping(0)?;
+    if let Some((_, content)) = reader.peek() {
+        return Err(format!(
+            "line {}: content past the end of the document: {content:?}",
+            reader.line_no()
+        ));
+    }
+    let top: Vec<&str> = root.iter().map(|(key, _)| key.as_str()).collect();
+    if top != ["groups"] {
+        return Err(format!(
+            "the top level must be a single `groups` key, found {top:?}"
+        ));
+    }
+    let Value::Sequence(groups) = &root[0].1 else {
+        return Err("`groups` must hold a sequence".to_string());
+    };
+
+    let mut out = Vec::new();
+    for group in groups {
+        let Value::Mapping(fields) = group else {
+            return Err("every entry of `groups` must be a mapping".to_string());
+        };
+        let mut name = None;
+        let mut rules = None;
+        for (key, value) in fields {
+            match key.as_str() {
+                "name" => name = Some(scalar(value, "name")?),
+                "rules" => {
+                    let Value::Sequence(items) = value else {
+                        return Err("`rules` must hold a sequence".to_string());
+                    };
+                    let mut parsed = Vec::new();
+                    for item in items {
+                        let Value::Mapping(rule_fields) = item else {
+                            return Err("every entry of `rules` must be a mapping".to_string());
+                        };
+                        parsed.push(build_rule(rule_fields)?);
+                    }
+                    rules = Some(parsed);
+                }
+                other => return Err(format!("unexpected key {other:?} in a rule group")),
+            }
+        }
+        out.push(RuleGroup {
+            name: name.ok_or_else(|| "a group carries no `name` key".to_string())?,
+            rules: rules.ok_or_else(|| "a group carries no `rules` key".to_string())?,
+        });
+    }
+    Ok(out)
+}
+
+/// The body of every ```` ```yaml ```` fenced block in a Markdown document.
+fn fenced_yaml_blocks(markdown: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in markdown.lines() {
+        match current {
+            None => {
+                if line.trim_end() == "```yaml" {
+                    current = Some(Vec::new());
+                }
+            }
+            Some(ref mut body) => {
+                if line.trim_end() == "```" {
+                    blocks.push(body.join("\n"));
+                    current = None;
+                } else {
+                    body.push(line);
+                }
+            }
+        }
+    }
+    blocks
+}
+
+fn shipped_rule_groups() -> Vec<RuleGroup> {
+    let text = std::fs::read_to_string(RULES_FILE)
+        .unwrap_or_else(|e| panic!("shipped rule file {RULES_FILE} must be readable: {e}"));
+    parse_rule_file(&text)
+        .unwrap_or_else(|e| panic!("shipped rule file {RULES_FILE} must parse: {e}"))
+}
 
 /// Every `ravel_<segment>[_<segment>...]` token in `text`.
 ///
@@ -94,9 +536,9 @@ fn metric_names(text: &str) -> BTreeSet<String> {
 /// lines.
 ///
 /// Not [`metric_names`] over the whole body: a family's HELP text names other
-/// families (`ravel_ingest_wire_bytes_total`'s names
-/// `ravel_admission_admitted_bytes_total`), so a substring scan would accept a
-/// rule whose metric only ever appears inside someone else's help string.
+/// families (`ravel_admission_admitted_bytes_total`'s names
+/// `ravel_ingest_wire_bytes_total`), so a substring scan would accept a rule
+/// whose metric only ever appears inside someone else's help string.
 fn exposed_families(body: &str) -> BTreeSet<String> {
     body.lines()
         .filter_map(|line| line.strip_prefix("# TYPE "))
@@ -227,16 +669,21 @@ async fn rendered_bodies() -> String {
 
 #[tokio::test]
 async fn every_metric_named_by_a_shipped_rule_is_rendered() {
-    let rules = std::fs::read_to_string(RULES_FILE)
-        .unwrap_or_else(|e| panic!("shipped rule file {RULES_FILE} must be readable: {e}"));
-
+    let groups = shipped_rule_groups();
+    let alerts: Vec<&AlertRule> = groups.iter().flat_map(|group| group.rules.iter()).collect();
     assert_eq!(
-        rules.matches("\n      - alert: ").count(),
+        alerts.len(),
         EXPECTED_ALERTS,
         "shipped rule file must carry exactly {EXPECTED_ALERTS} alert rules"
     );
 
-    let names = metric_names(&rules);
+    let mut names = BTreeSet::new();
+    for alert in &alerts {
+        names.extend(metric_names(&alert.expr));
+        for text in alert.annotations.values() {
+            names.extend(metric_names(text));
+        }
+    }
     assert_eq!(
         names.len(),
         EXPECTED_METRIC_NAMES,
@@ -259,4 +706,78 @@ async fn every_metric_named_by_a_shipped_rule_is_rendered() {
         missing.is_empty(),
         "shipped rules name metrics no /metrics body renders: {missing:?}"
     );
+}
+
+/// The guide's fenced blocks are what a reader copies off the page. Where the
+/// guide and the shipped file both carry a rule, the condition has to be the
+/// same one, or the page hands out a rule that fires differently from the one
+/// the operator was told to load.
+#[test]
+fn the_guide_and_the_shipped_rule_file_agree() {
+    let groups = shipped_rule_groups();
+    let shipped: BTreeMap<&str, &AlertRule> = groups
+        .iter()
+        .flat_map(|group| group.rules.iter())
+        .map(|rule| (rule.name.as_str(), rule))
+        .collect();
+    assert_eq!(
+        shipped.len(),
+        EXPECTED_ALERTS,
+        "shipped rule file must carry exactly {EXPECTED_ALERTS} distinctly named alert rules"
+    );
+
+    let guide = std::fs::read_to_string(GUIDE_FILE)
+        .unwrap_or_else(|e| panic!("guide {GUIDE_FILE} must be readable: {e}"));
+    let blocks = fenced_yaml_blocks(&guide);
+    assert_eq!(
+        blocks.len(),
+        EXPECTED_GUIDE_BLOCKS,
+        "guide must hold exactly {EXPECTED_GUIDE_BLOCKS} fenced yaml blocks, found {}",
+        blocks.len()
+    );
+
+    let mut guide_rules: Vec<AlertRule> = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        let parsed = parse_rule_file(block).unwrap_or_else(|e| {
+            panic!(
+                "fenced yaml block {} of {GUIDE_FILE} must parse: {e}",
+                index + 1
+            )
+        });
+        guide_rules.extend(parsed.into_iter().flat_map(|group| group.rules));
+    }
+    assert_eq!(
+        guide_rules.len(),
+        EXPECTED_GUIDE_ALERTS,
+        "guide's fenced blocks must hold exactly {EXPECTED_GUIDE_ALERTS} alert rules, found {}",
+        guide_rules.len()
+    );
+
+    for rule in &guide_rules {
+        let name = rule.name.as_str();
+        let Some(shipped_rule) = shipped.get(name) else {
+            panic!(
+                "the guide prints alert {name:?}, which the shipped rule file does not carry; \
+                 a rule a reader can copy off the page must be one the shipped file ships"
+            );
+        };
+        assert_eq!(
+            shipped_rule.expr, rule.expr,
+            "alert {name:?}: the guide's expression is not the shipped one"
+        );
+        assert_eq!(
+            shipped_rule.fires_after, rule.fires_after,
+            "alert {name:?}: the guide's `for:` duration is not the shipped one"
+        );
+        let shipped_severity = shipped_rule.labels.get("severity");
+        assert_eq!(
+            shipped_severity,
+            rule.labels.get("severity"),
+            "alert {name:?}: the guide's severity label is not the shipped one"
+        );
+        assert!(
+            shipped_severity.is_some(),
+            "alert {name:?} carries no severity label"
+        );
+    }
 }
