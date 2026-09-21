@@ -23,6 +23,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The published PromQL conformance figure now says what it measures**
+  (issue #1698). The committed table read `132/132 = 100%` under a heading
+  that invites it to be read as agreement with Prometheus, while the block is
+  regenerated with no Prometheus in the loop: the number counted constructs
+  Ravel *reaches*. The row is now split. `reached` keeps the old meaning and
+  the old number; `agreed with Prometheus` is scored only over the constructs
+  a differential run actually compared, reads `not measured in this run` when
+  no run report was folded in, and reports `not compared` and
+  `accepted divergence` as their own counts rather than folding either into
+  the ratio. An ADR-accepted one-sided divergence is never published as
+  agreement. The difftest lane now writes the report the agreed row reads, so
+  the figure can move at all.
 - **`--s3-endpoint` now decides whether plaintext is allowed, and a
   non-loopback `http://` endpoint is refused at startup** (issue #1707).
   `allow_http` was true whenever any endpoint was set, so a deployment
