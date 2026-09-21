@@ -1511,9 +1511,17 @@ the federation path where the caller is another cluster.
 3. **A worker clamps every wire budget to its own `EngineConfig`.** The
    effective byte limit for a slice is `min(wire, own max_bytes_scanned)`. The
    wire value `0`, and an absent `Budgets` message, mean "the caller names no
-   cap"; both resolve to the worker's own limit, never to unlimited. A worker's
-   own configuration is always an upper bound on what any caller can make it
-   scan.
+   cap"; both resolve to the worker's own limit, never to unlimited.
+
+   The clamp is per SLICE, not per worker. Rendezvous routing is per
+   `(tenant_hash, signal, shard)` unit, so a fan-out wider than the worker set
+   places several of one query's slices on the same worker, each clamped
+   independently to the full `min(wire, own)` and each running under its own
+   accounting handle. One worker can therefore scan up to
+   slices-per-worker times its configured `max_bytes_scanned` for a single
+   query. Size a worker from that product, not from the configured value:
+   the per-query total is bounded by the coordinator on the folded figures,
+   and the per-worker bound is the clamp times the slices it was given.
 
 4. **On the resolve scope a worker also enforces its own `max_series` and
    `max_samples`** over the result the slice is about to return. A resolve-scope

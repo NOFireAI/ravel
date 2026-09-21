@@ -785,8 +785,12 @@ Every worker clamps the budget it receives to its own `EngineConfig`: the
 effective byte limit for a slice is `min(wire, own max_bytes_scanned)`, and
 the wire sentinel `0` (or an absent budget message) means the caller names no
 cap, which resolves to the worker's own limit rather than to unlimited. A
-worker's own configuration is therefore always an upper bound on what a caller
-can ask it to scan. On the resolve scope (cross-cluster federation, where the
+That clamp is per SLICE, not per worker: rendezvous routing can place several
+of one query's slices on the same worker, each authorized for the full clamped
+budget independently, so one worker can scan up to slices-per-worker times its
+configured `max_bytes_scanned` for a single query. The per-query total is
+bounded by the coordinator on the folded figures; size a worker from the
+product rather than from the configured value alone. On the resolve scope (cross-cluster federation, where the
 remote resolves its own snapshot and nothing downstream re-checks on its
 behalf) the worker additionally enforces its own `max_series` and
 `max_samples` over the slice result. Intra-cluster pinned slices are exempt
