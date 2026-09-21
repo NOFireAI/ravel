@@ -27,7 +27,9 @@
 //! headline reads as agreement it never measured. That score is taken over the
 //! constructs the run actually compared ([`AgreedCounts`]); the constructs no
 //! corpus entry exercises are published as their own count beside it, never
-//! summed into the denominator.
+//! summed into the denominator, and so are the constructs whose only evidence
+//! is a divergence an ADR accepts ([`AgreedState::AcceptedDivergence`]), which
+//! belong in neither half of the score.
 //!
 //! Scope of the enumerated surface: the 72 functions promql-parser 0.10 marks
 //! non-experimental, the 12 non-experimental aggregation operators, all 16
@@ -70,7 +72,10 @@ pub const RAVEL_ONLY_RUN_LABEL: &str = concat!(
 pub const DIFFERENTIAL_RUN_LABEL: &str = concat!(
     "Run: differential. A run report against the pinned Prometheus binary was\n",
     "folded in, so the agreed score below counts constructs whose corpus\n",
-    "entries matched Prometheus."
+    "entries matched Prometheus. A construct whose only evidence is a\n",
+    "divergence an ADR already accepts is counted on its own line instead:\n",
+    "those entries were never expected to match, so neither agreement nor\n",
+    "divergence is the honest word for them."
 );
 
 /// The reached score row's label.
@@ -81,7 +86,10 @@ pub const REACHED_ROW_LABEL: &str =
 /// whole surface: a construct no corpus entry exercises was never put to
 /// Prometheus, and folding it into the denominator republishes, for agreement,
 /// the same two-meanings-in-one-figure collapse the reached/agreed split
-/// removed.
+/// removed. A construct whose only evidence is an ADR-accepted divergence is
+/// out of both halves for the same reason read the other way round: those
+/// entries matched nothing, so counting them in the numerator would publish a
+/// documented divergence as agreement.
 pub const AGREED_ROW_LABEL: &str = "**agreed with Prometheus** (constructs whose corpus entries matched the pinned binary / constructs compared)";
 
 /// What the agreed score row reads when no [`RunReport`] was supplied. Never a
@@ -298,22 +306,35 @@ pub enum AgreedState {
     Agreed,
     /// At least one exercising corpus entry did not match it.
     Diverged,
+    /// A run report was folded in and every exercising corpus entry is one an
+    /// ADR already accepts as diverging: ADR-0030's one-sided
+    /// `mode: ravel_error_prom_success` shape, or an ADR-0025 `tolerance:`
+    /// entry that matches only within a declared ULP band. Neither agreement
+    /// nor divergence: the comparator was never asked for a match on those
+    /// entries, so they belong in no part of the agreed score.
+    AcceptedDivergence,
 }
 
-/// The three counts a folded-in differential run publishes, kept separate on
+/// The four counts a folded-in differential run publishes, kept separate on
 /// purpose.
 ///
 /// [`Self::agreed`] over [`Self::compared`] is the score; [`Self::not_compared`]
-/// is reported beside it and never inside it. Summing the third into the
-/// denominator would make a run in which Prometheus agreed with everything it
-/// saw publish less than full agreement, and would leave a reader unable to
-/// tell a construct that diverged from one the corpus never exercises.
+/// and [`Self::accepted_divergence`] are reported beside it and never inside it.
+/// Summing the not-compared count into the denominator would make a run in
+/// which Prometheus agreed with everything it saw publish less than full
+/// agreement, and would leave a reader unable to tell a construct that diverged
+/// from one the corpus never exercises. Summing the accepted-divergence count
+/// into the numerator would publish, as agreement, entries that an ADR wrote
+/// down as not matching.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AgreedCounts {
     /// Constructs whose every exercising corpus entry matched Prometheus.
     pub agreed: usize,
     /// Constructs at least one of whose exercising entries did not match.
     pub diverged: usize,
+    /// Constructs whose only evidence is an ADR-accepted divergence, so there
+    /// was nothing for the two engines to agree on.
+    pub accepted_divergence: usize,
     /// Constructs no corpus entry exercises, so Prometheus never ran them.
     pub not_compared: usize,
 }
@@ -335,21 +356,22 @@ impl AgreedCounts {
     }
 
     /// The agreed score row's value: the score over the compared set with the
-    /// two other counts beside it, or [`AGREED_NONE_COMPARED`] when nothing was
-    /// compared.
+    /// three other counts beside it, or [`AGREED_NONE_COMPARED`] when nothing
+    /// was compared.
     pub fn render(&self) -> String {
         match self.agreed_percent() {
             Some(pct) => format!(
-                "{}/{} = {}% ({} diverged, {} not compared)",
+                "{}/{} = {}% ({} diverged, {} accepted divergence, {} not compared)",
                 self.agreed,
                 self.compared(),
                 pct,
                 self.diverged,
+                self.accepted_divergence,
                 self.not_compared
             ),
             None => format!(
-                "{AGREED_NONE_COMPARED} ({} not compared)",
-                self.not_compared
+                "{AGREED_NONE_COMPARED} ({} accepted divergence, {} not compared)",
+                self.accepted_divergence, self.not_compared
             ),
         }
     }
@@ -363,6 +385,7 @@ impl AgreedState {
             AgreedState::NotCompared => "not compared",
             AgreedState::Agreed => "agreed",
             AgreedState::Diverged => "diverged",
+            AgreedState::AcceptedDivergence => "accepted divergence",
         }
     }
 }
@@ -1323,6 +1346,19 @@ pub fn exercises(probe: Probe, tokens: &[Token], entry: &CorpusEntry) -> bool {
     }
 }
 
+/// Whether a corpus entry's comparison is one an ADR already accepts as a
+/// divergence, so a clean run of it is not evidence that the two engines
+/// matched.
+///
+/// The two shapes: ADR-0030's `mode: ravel_error_prom_success`, where the
+/// comparator asserts that Ravel rejects and Prometheus accepts (comparator.rs:
+/// "there is nothing for the two engines to agree on"), and ADR-0025's
+/// `tolerance:` entries, whose values match only within a declared ULP band
+/// rather than bit for bit.
+pub fn is_accepted_divergence_entry(entry: &CorpusEntry) -> bool {
+    entry.mode == ComparisonMode::RavelErrorPromSuccess || entry.tolerance_ulps.is_some()
+}
+
 fn exercises_shape(shape: Shape, tokens: &[Token]) -> bool {
     match shape {
         Shape::VectorSelector => tokens.iter().enumerate().any(|(idx, t)| {
@@ -1410,6 +1446,11 @@ pub struct Evidence {
     pub path: &'static str,
     /// The entry's `name:` field.
     pub entry: String,
+    /// Whether the entry's comparison is one an ADR already accepts as
+    /// diverging ([`is_accepted_divergence_entry`]). Such an entry is evidence
+    /// that Ravel reached the construct, never evidence that the two engines
+    /// matched on it.
+    pub accepted_divergence: bool,
 }
 
 /// What a run showed about one construct.
@@ -1718,6 +1759,7 @@ impl ConformanceReport {
                         outcome.evidence.push(Evidence {
                             path: file.path,
                             entry: entry.name.clone(),
+                            accepted_divergence: is_accepted_divergence_entry(entry),
                         });
                     }
                 }
@@ -1778,12 +1820,25 @@ impl ConformanceReport {
                 .filter(|name| failed.contains(name))
                 .collect();
             outcome.disagreements = disagreements.into_iter().map(str::to_string).collect();
+            // Evidence an ADR already accepts as diverging is not evidence of a
+            // match: `compare_ravel_error_prom_success` returns a non-mismatch
+            // exactly when the two engines disagree in the accepted shape, and a
+            // tolerance entry matches only within its declared ULP band. A
+            // construct with no other evidence was therefore never put to
+            // Prometheus for a match, so it is neither agreed nor diverged.
+            let matchable = outcome
+                .evidence
+                .iter()
+                .filter(|e| !e.accepted_divergence)
+                .count();
             outcome.agreed = Some(if outcome.evidence.is_empty() {
                 AgreedState::NotCompared
-            } else if outcome.disagreements.is_empty() {
-                AgreedState::Agreed
-            } else {
+            } else if !outcome.disagreements.is_empty() {
                 AgreedState::Diverged
+            } else if matchable == 0 {
+                AgreedState::AcceptedDivergence
+            } else {
+                AgreedState::Agreed
             });
         }
         Ok(())
@@ -1804,6 +1859,7 @@ impl ConformanceReport {
             match outcome.agreed_state() {
                 AgreedState::Agreed => counts.agreed += 1,
                 AgreedState::Diverged => counts.diverged += 1,
+                AgreedState::AcceptedDivergence => counts.accepted_divergence += 1,
                 AgreedState::NotCompared => counts.not_compared += 1,
                 // Unreachable while `apply_run_report` sets every outcome, and
                 // deliberately counted nowhere if that ever stops holding: a
@@ -2038,15 +2094,28 @@ impl ConformanceReport {
                 }
             }
         }
-        // Only a measured disagreement is reported here. An unmeasured
-        // agreement says nothing per row: the block's own label and its agreed
-        // score row carry that, once, rather than repeating it on every row.
-        if outcome.agreed_state() == AgreedState::Diverged {
-            parts.push(format!(
-                "{} exercising entries diverged from Prometheus: {}",
-                outcome.disagreements.len(),
-                outcome.disagreements.join(", ")
-            ));
+        // Only a measured disagreement, or a measured accepted divergence, is
+        // reported here. An unmeasured agreement says nothing per row: the
+        // block's own label and its agreed score row carry that, once, rather
+        // than repeating it on every row.
+        match outcome.agreed_state() {
+            AgreedState::Diverged => {
+                let n = outcome.disagreements.len();
+                parts.push(format!(
+                    "{n} exercising {} diverged from Prometheus: {}",
+                    plural_entries(n),
+                    outcome.disagreements.join(", ")
+                ));
+            }
+            AgreedState::AcceptedDivergence => {
+                let n = outcome.evidence.len();
+                parts.push(format!(
+                    "not compared for agreement: all {n} exercising {} are \
+                     accepted divergences",
+                    plural_entries(n)
+                ));
+            }
+            AgreedState::Agreed | AgreedState::NotCompared | AgreedState::NotMeasured => {}
         }
         if !outcome.construct.note.is_empty() {
             parts.push(collapse_whitespace(outcome.construct.note));
@@ -3171,6 +3240,7 @@ fn an_attributed_helper() {}
             Some(AgreedCounts {
                 agreed: RATE_QUERY_CONSTRUCTS.len(),
                 diverged: 0,
+                accepted_divergence: 0,
                 not_compared: REGISTRY.len() - RATE_QUERY_CONSTRUCTS.len(),
             })
         );
@@ -3202,7 +3272,8 @@ fn an_attributed_helper() {}
         // count beside it, not a share of the denominator.
         assert!(
             block.contains(&format!(
-                "| {AGREED_ROW_LABEL} | **{0}/{0} = 100% (0 diverged, {1} not compared)** |",
+                "| {AGREED_ROW_LABEL} | **{0}/{0} = 100% (0 diverged, 0 accepted \
+                 divergence, {1} not compared)** |",
                 RATE_QUERY_CONSTRUCTS.len(),
                 REGISTRY.len() - RATE_QUERY_CONSTRUCTS.len()
             )),
@@ -3238,7 +3309,8 @@ fn an_attributed_helper() {}
         let block = report.to_markdown();
         assert!(
             block.contains(&format!(
-                "| {AGREED_ROW_LABEL} | **{AGREED_NONE_COMPARED} ({} not compared)** |",
+                "| {AGREED_ROW_LABEL} | **{AGREED_NONE_COMPARED} (0 accepted \
+                 divergence, {} not compared)** |",
                 REGISTRY.len()
             )),
             "block was:\n{block}"
@@ -3276,6 +3348,7 @@ fn an_attributed_helper() {}
             Some(AgreedCounts {
                 agreed: 0,
                 diverged: RATE_QUERY_CONSTRUCTS.len(),
+                accepted_divergence: 0,
                 not_compared: REGISTRY.len() - RATE_QUERY_CONSTRUCTS.len(),
             })
         );
@@ -3290,7 +3363,7 @@ fn an_attributed_helper() {}
 
         let block = report.to_markdown();
         assert!(
-            block.contains("1 exercising entries diverged from Prometheus: t"),
+            block.contains("1 exercising entry diverged from Prometheus: t"),
             "block was:\n{block}"
         );
         // A run that compared four constructs and agreed on none of them is 0%
@@ -3298,7 +3371,8 @@ fn an_attributed_helper() {}
         // compared nothing.
         assert!(
             block.contains(&format!(
-                "| {AGREED_ROW_LABEL} | **0/{0} = 0% ({0} diverged, {1} not compared)** |",
+                "| {AGREED_ROW_LABEL} | **0/{0} = 0% ({0} diverged, 0 accepted \
+                 divergence, {1} not compared)** |",
                 RATE_QUERY_CONSTRUCTS.len(),
                 REGISTRY.len() - RATE_QUERY_CONSTRUCTS.len()
             )),
