@@ -172,36 +172,56 @@ base="$(git -C "${d}" rev-parse HEAD)"
 check "a feat commit on the base branch is not this range's" \
   "${d}" "${base}" "${head}" 0 "clean"
 
-# --- a pull-request merge ref does not borrow the base branch's commits ------
+# --- what a caller must pass, and what happens when it does not -------------
 #
-# This is what CI actually hands the guard when a caller passes github.sha:
-# refs/pull/N/merge, whose FIRST parent is the base branch tip and whose second
-# is the branch under review. Everything merged into the base branch since the
-# fork point is reachable from it, so the walk reports a neighbour's feat
-# commit as this range's. Observed on this guard's own pull request, where a
-# feat commit that had just merged to main failed the check.
-d="$(new_repo merge-ref)"
-# base.sha is stamped when the pull request is opened, so it is main as it was
-# THEN, not main as it is when the check runs.
+# A merge ref (refs/pull/N/merge) has the base branch tip as its FIRST parent,
+# so walking it attributes every commit merged into the base branch since the
+# fork point to this range. The guard does NOT try to detect that and rewrite
+# the head: it cannot distinguish a merge ref from an ordinary merge commit
+# authored on the branch, and guessing wrong discards the pull request mainline
+# and reports clean. These two cases pin both halves of that decision.
+
+d="$(new_repo merge-ref-is-walked-as-given)"
 base="$(git -C "${d}" rev-parse HEAD)"
 git -C "${d}" checkout -q -b feature
 printf 'text\n' >"${d}/README.md"
 git -C "${d}" add README.md
 git -C "${d}" commit -q -m "docs: this branch qualifies for nothing"
 feature="$(git -C "${d}" rev-parse HEAD)"
-# Main moves on: a neighbour feat commit lands after base.sha was stamped.
 git -C "${d}" checkout -q main
 mkdir -p "${d}/crates/c"
 printf 'pub fn neighbour() {}\n' >"${d}/crates/c/neighbour.rs"
 git -C "${d}" add crates/c/neighbour.rs
 git -C "${d}" commit -q -m "feat(c): a neighbour feature that merged first"
 main_tip="$(git -C "${d}" rev-parse HEAD)"
-# The merge ref GitHub rebuilds against CURRENT main: main tip first, branch
-# second. The neighbour feat is reachable from it and not from base.sha.
 merge_ref="$(git -C "${d}" commit-tree "$(git -C "${d}" rev-parse "${feature}^{tree}")" \
   -p "${main_tip}" -p "${feature}" -m "Merge ${feature} into main")"
-check "a merge ref does not attribute the base branch's feat commit to this range" \
-  "${d}" "${base}" "${merge_ref}" 0 "clean"
+# Documented hazard, not a bug: a caller that passes a merge ref gets the base
+# branch's commits in the range. ci.yml passes head.sha so this cannot happen
+# there, and this case exists so that contract is not quietly dropped.
+check "a merge ref is walked as given, which is why callers pass the branch tip" \
+  "${d}" "${base}" "${merge_ref}" 1 "neighbour feature"
+
+# An ordinary merge commit authored ON the branch must be walked as itself: its
+# first parent is the branch mainline, and a backstop that swapped in the second
+# parent would skip the feat commit entirely and report clean.
+d="$(new_repo ordinary-merge-on-branch)"
+base="$(git -C "${d}" rev-parse HEAD)"
+git -C "${d}" checkout -q -b feature
+mkdir -p "${d}/crates/c"
+printf 'pub fn f() {}\n' >"${d}/crates/c/feature.rs"
+git -C "${d}" add crates/c/feature.rs
+git -C "${d}" commit -q -m "feat(c): add feature with no changelog entry"
+feature_tip="$(git -C "${d}" rev-parse HEAD)"
+git -C "${d}" checkout -q -b side "${base}"
+printf 'side\n' >"${d}/README.md"
+git -C "${d}" add README.md
+git -C "${d}" commit -q -m "docs: a side branch"
+side_tip="$(git -C "${d}" rev-parse HEAD)"
+merge="$(git -C "${d}" commit-tree "$(git -C "${d}" rev-parse "${feature_tip}^{tree}")" \
+  -p "${feature_tip}" -p "${side_tip}" -m "Merge side into feature")"
+check "an ordinary merge on the branch still walks its own feat commit" \
+  "${d}" "${base}" "${merge}" 1 "add feature with no changelog entry"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
