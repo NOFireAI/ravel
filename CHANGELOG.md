@@ -26,22 +26,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`--s3-endpoint` now decides whether plaintext is allowed, and a
   non-loopback `http://` endpoint is refused at startup** (issue #1707).
   `allow_http` was true whenever any endpoint was set, so a deployment
-  pointing at an `https` endpoint still permitted a downgrade, and an endpoint
-  that lost its scheme sent credentials and telemetry in clear with nothing
-  refusing it. The flag now follows the URL scheme. A non-loopback `http://`
-  endpoint needs `--s3-allow-http` (env `RAVEL_S3_ALLOW_HTTP`), and the
-  refusal names the flag; loopback `http` is unchanged, which is what the dev
-  compose stack, kind, and the tests use. `ravel-cli` applies the same rule
+  pointing at an `https` endpoint still permitted a downgrade, and a plaintext
+  endpoint naming a host on the network moved credentials and telemetry in
+  clear with nothing refusing it. The flag now follows the URL scheme. An
+  endpoint carrying no scheme at all enables no plaintext, and this rule does
+  not refuse it either: it fails later, inside the S3 client, on a message
+  that names neither the endpoint nor the flag (issue #1911). A non-loopback
+  `http://` endpoint needs `--s3-allow-http` (env `RAVEL_S3_ALLOW_HTTP`), and
+  the refusal names the flag; loopback `http` is unchanged, which is what the
+  dev compose stack, kind, and the tests use. `ravel-cli` applies the same rule
   from the same function rather than a second copy of it, with the same
   `--s3-allow-http` flag and `RAVEL_S3_ALLOW_HTTP` variable: it ships in the
   server image and reaches the same bucket with the same credentials, and the
   operator's store-qualification Job runs it before any server pod exists. The
-  operator gains `spec.s3.allowHttp` for an in-cluster MinIO, rendering the
-  flag on every server container and `RAVEL_S3_ALLOW_HTTP=true` on the qualify
-  Job. The operator applies the rule from the same function at its own two
-  remaining sites: it refuses a plaintext non-loopback endpoint at render time,
-  with a `Degraded` condition whose reason is `PlaintextS3Endpoint` and whose
-  message names `spec.storage.s3.allowHttp`, rather than creating Deployments
+  operator gains `spec.storage.s3.allowHttp` for an in-cluster MinIO,
+  rendering the flag on every server container and `RAVEL_S3_ALLOW_HTTP=true`
+  on the qualify Job. The operator applies the rule from the same function at
+  its own two remaining sites: it refuses a plaintext non-loopback endpoint at
+  render time, with a `Degraded` condition whose reason is
+  `PlaintextS3Endpoint` and whose message names
+  `spec.storage.s3.allowHttp`, rather than creating Deployments
   that crashloop with the refusal only in their pod logs; and its own S3
   client, the one that reconciles `sys/auth` and applies `shardOverrides` with
   the cluster's credentials, no longer derives plaintext from endpoint presence

@@ -430,9 +430,15 @@ impl std::error::Error for PlaintextS3Endpoint {}
 /// a plaintext connection that never leaves the host has no on-path attacker,
 /// and every local-development launcher in this repo depends on it.
 ///
-/// An endpoint carrying neither scheme yields `false`, which is behavior
-/// preserving: `allow_http` is consulted by `object_store` only for an
-/// `http://` URL.
+/// An endpoint carrying neither scheme yields `false`, so the client stays
+/// HTTPS-only and nothing it signs goes out in the clear. This rule does not
+/// refuse it: such an endpoint is not a usable URL, and `object_store` rejects
+/// it when it signs the first request, on a message that names neither the
+/// endpoint nor this flag. Issue #1911 is the follow-up that refuses it here.
+///
+/// The scheme is matched without regard to case (RFC 3986 section 3.1) and so
+/// is the `localhost` host name, while the refusal still quotes the endpoint
+/// exactly as it was written.
 pub fn resolve_s3_allow_http(
     endpoint: Option<&str>,
     allow_http_flag: bool,
@@ -440,9 +446,10 @@ pub fn resolve_s3_allow_http(
     let Some(endpoint) = endpoint else {
         return Ok(false);
     };
-    let Some(rest) = endpoint.strip_prefix("http://") else {
+    if !endpoint.to_ascii_lowercase().starts_with("http://") {
         return Ok(false);
-    };
+    }
+    let rest = &endpoint["http://".len()..];
     if allow_http_flag || is_loopback_authority(rest) {
         return Ok(true);
     }
@@ -455,8 +462,12 @@ pub fn resolve_s3_allow_http(
 /// this host. Accepts `localhost`, a loopback IPv4 or IPv6 literal, and the
 /// bracketed IPv6 form a URL authority requires; anything else, including a
 /// name that merely resolves to loopback today, is treated as remote.
+///
+/// The authority ends at the first `/`, `?` or `#`. Ending it at `/` alone let
+/// `http://s3.example.com?x=@localhost` read as loopback, which accepted
+/// plaintext to a host on the network without the flag.
 fn is_loopback_authority(rest: &str) -> bool {
-    let authority = rest.split('/').next().unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let authority = authority.rsplit('@').next().unwrap_or(authority);
     let host = match authority.strip_prefix('[') {
         // `[::1]:9000`: the bracketed literal is the host, and the port (if
@@ -464,7 +475,7 @@ fn is_loopback_authority(rest: &str) -> bool {
         Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
         None => authority.split(':').next().unwrap_or(""),
     };
-    host == "localhost"
+    host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
