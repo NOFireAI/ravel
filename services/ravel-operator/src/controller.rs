@@ -635,7 +635,7 @@ async fn resolve_s3_credentials(
 /// `ravel-server`'s
 /// `build_store` S3 branch: `force_path_style: true` (path-style addressing,
 /// what MinIO/most S3-compatible endpoints expect), `allow_http` from
-/// [`reconcile::s3_allow_http`], the one rule every binary here applies
+/// [`crate::reconcile::s3_allow_http`], the one rule every binary here applies
 /// (issue #1707), and `kms_key_id: None` (no server-side KMS encryption
 /// configured here). A plaintext non-loopback endpoint that
 /// `spec.storage.s3.allowHttp` does not accept is refused rather than

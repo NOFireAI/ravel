@@ -524,6 +524,26 @@ pub fn audit_token_key_missing(spec: &RavelClusterSpec) -> bool {
     spec.audit_token_key_secret_ref.is_none() && spec.deployment_key_secret_ref.is_none()
 }
 
+/// Whether an S3 client configured from this spec may speak plaintext HTTP,
+/// by the one rule every binary in this repo applies
+/// ([`ravel_object_store::s3::resolve_s3_allow_http`], issue #1707): decided
+/// by the endpoint's URL scheme, and refused for a plaintext non-loopback host
+/// unless `spec.storage.s3.allowHttp` accepts it deliberately.
+///
+/// Two callers, so the operator cannot disagree with itself: the render, which
+/// refuses a spec whose server containers would refuse their own endpoint at
+/// startup, and `controller::auth_store_config`, which builds the operator's
+/// own store handle for `sys/auth` and the `shardOverrides` reshard.
+pub fn s3_allow_http(spec: &RavelClusterSpec) -> Result<bool, RenderError> {
+    resolve_s3_allow_http(
+        spec.storage.s3.endpoint.as_deref(),
+        spec.storage.s3.allow_http,
+    )
+    .map_err(|refused| RenderError::PlaintextS3Endpoint {
+        endpoint: refused.endpoint,
+    })
+}
+
 /// Args shared by every mode: store selection, shard count, and the S3
 /// bucket/region/endpoint/allow-http flags. Access/secret keys are NOT here
 /// (they are env vars, see [`s3_credential_env`]).
@@ -546,26 +566,6 @@ pub fn audit_token_key_missing(spec: &RavelClusterSpec) -> bool {
 /// make it conditional on. `ravel-server`'s own default stays off for the
 /// dev binary and any other direct invocation; only the operator's rendered
 /// command line turns it on.
-/// Whether an S3 client configured from this spec may speak plaintext HTTP,
-/// by the one rule every binary in this repo applies
-/// ([`ravel_object_store::s3::resolve_s3_allow_http`], issue #1707): decided
-/// by the endpoint's URL scheme, and refused for a plaintext non-loopback host
-/// unless `spec.storage.s3.allowHttp` accepts it deliberately.
-///
-/// Two callers, so the operator cannot disagree with itself: the render, which
-/// refuses a spec whose server containers would refuse their own endpoint at
-/// startup, and `controller::auth_store_config`, which builds the operator's
-/// own store handle for `sys/auth` and the `shardOverrides` reshard.
-pub fn s3_allow_http(spec: &RavelClusterSpec) -> Result<bool, RenderError> {
-    resolve_s3_allow_http(
-        spec.storage.s3.endpoint.as_deref(),
-        spec.storage.s3.allow_http,
-    )
-    .map_err(|refused| RenderError::PlaintextS3Endpoint {
-        endpoint: refused.endpoint,
-    })
-}
-
 fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
     let mut args = vec![
         "--store".to_string(),
