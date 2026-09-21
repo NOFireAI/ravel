@@ -229,7 +229,7 @@ A minimal example is in
 | `spec.storage.s3.bucket` | string | required | |
 | `spec.storage.s3.region` | string | `us-east-1` | |
 | `spec.storage.s3.endpoint` | string | none | Omit for real AWS S3. Path-style addressing is always used. |
-| `spec.storage.s3.allowHttp` | boolean | `false` | Renders `--s3-allow-http` on every server container, and `RAVEL_S3_ALLOW_HTTP=true` on the store-qualification Job that runs `ravel-cli store qualify` before any server pod exists. Required when `endpoint` is a plaintext `http://` URL: no pod reaches its object store over loopback, so the server otherwise refuses to start, and the qualify Job refuses to run, rather than moving telemetry and S3 credentials across the cluster network in the clear. Leave unset for an `https://` endpoint and for real AWS S3. |
+| `spec.storage.s3.allowHttp` | boolean | `false` | Renders `--s3-allow-http` on every server container, and `RAVEL_S3_ALLOW_HTTP=true` on the store-qualification Job that runs `ravel-cli store qualify` before any server pod exists. Required when `endpoint` is a plaintext `http://` URL whose host is not loopback: no pod reaches its object store over loopback, so without it the operator refuses the cluster at render time (`Degraded`, reason `PlaintextS3Endpoint`, message naming this field) and creates no Deployment, Service, or qualify Job, rather than moving telemetry and S3 credentials across the cluster network in the clear. The same rule governs the operator's own S3 client, the one that reconciles `sys/auth` and applies `shardOverrides`. Editing this field re-runs store qualification, since it changes whether that check can reach the store. Leave unset for an `https://` endpoint and for real AWS S3. |
 | `spec.storage.s3.credentialsSecretRef.name` | string | required | Secret with keys `accessKeyId` and `secretAccessKey`. |
 | `spec.tenantTokensSecretRef.name` | string | none | Secret whose keys are tenant names and whose values are bearer tokens. |
 | `spec.deploymentKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters or 32 raw bytes): the deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
@@ -477,6 +477,15 @@ Store qualification above. If a reconcile fails (a missing Secret,
 an apply error), the operator writes a `Degraded=True` condition with the
 reason and flips `Available` to `False`. A `kubectl wait` then fails with an
 explanation instead of timing out silently.
+
+A spec whose rendered pods could not start is refused the same way, before
+anything is created: a plaintext `http://` `spec.storage.s3.endpoint` whose
+host is not loopback, with `spec.storage.s3.allowHttp` unset, reports
+`Degraded=True` with reason `PlaintextS3Endpoint` and a message naming the
+field to set. This is the upgrade state of a cluster that pointed at an
+in-cluster MinIO or floci by Service name before the endpoint rule changed:
+set `allowHttp: true` to accept plaintext deliberately, or move the endpoint
+to `https://`.
 
 On a cluster below the Kubernetes 1.30 floor (see "Installing the operator
 yourself" above), every `RavelCluster` also carries a

@@ -38,6 +38,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   operator's store-qualification Job runs it before any server pod exists. The
   operator gains `spec.s3.allowHttp` for an in-cluster MinIO, rendering the
   flag on every server container and `RAVEL_S3_ALLOW_HTTP=true` on the qualify
+  Job. The operator applies the rule from the same function at its own two
+  remaining sites: it refuses a plaintext non-loopback endpoint at render time,
+  with a `Degraded` condition whose reason is `PlaintextS3Endpoint` and whose
+  message names `spec.storage.s3.allowHttp`, rather than creating Deployments
+  that crashloop with the refusal only in their pod logs; and its own S3
+  client, the one that reconciles `sys/auth` and applies `shardOverrides` with
+  the cluster's credentials, no longer derives plaintext from endpoint presence
+  either. Editing `allowHttp` re-runs store qualification, so the remediation
+  is re-checked instead of skipped. **On upgrade**, a deployment already
+  pointing at a plaintext non-loopback endpoint will not start until the flag
+  or the environment variable is set, a `RavelCluster` in that state is refused
+  with the field named in its status, and a `ravel-cli` invocation against one
+  is refused the same way.
   Job. **On upgrade**, a deployment already pointing at a plaintext
   non-loopback endpoint will not start until the flag or the environment
   variable is set, and a `ravel-cli` invocation against one is refused the

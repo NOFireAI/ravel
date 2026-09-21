@@ -50,7 +50,7 @@ use crate::reconcile::{
     httproute_api_resource, plan_qualify_gate, possible_gateway_route_names,
     possible_ingest_ingress_names, possible_pod_disruption_budget_names,
     possible_router_object_names, qualification_decision, qualify_job_input_hash,
-    qualify_job_phase,
+    qualify_job_phase, s3_allow_http,
 };
 
 /// Server-side-apply field manager name.
@@ -634,10 +634,12 @@ async fn resolve_s3_credentials(
 /// this -- from `spec.storage.s3` plus its credential Secret. Mirrors
 /// `ravel-server`'s
 /// `build_store` S3 branch: `force_path_style: true` (path-style addressing,
-/// what MinIO/most S3-compatible endpoints expect), `allow_http:
-/// endpoint.is_some()` (only a custom endpoint may be plain HTTP; real AWS S3
-/// always uses TLS), `kms_key_id: None` (no server-side KMS encryption
-/// configured here).
+/// what MinIO/most S3-compatible endpoints expect), `allow_http` from
+/// [`crate::reconcile::s3_allow_http`], the one rule every binary here applies
+/// (issue #1707), and `kms_key_id: None` (no server-side KMS encryption
+/// configured here). A plaintext non-loopback endpoint that
+/// `spec.storage.s3.allowHttp` does not accept is refused rather than
+/// connected to, the same way the rendered server containers refuse it.
 async fn build_auth_store(
     client: &Client,
     namespace: &str,
@@ -645,9 +647,28 @@ async fn build_auth_store(
 ) -> Result<S3Store, Error> {
     let (access_key_id, secret_access_key) =
         resolve_s3_credentials(client, namespace, &spec.storage.s3.credentials_secret_ref).await?;
+    let config = auth_store_config(spec, access_key_id, secret_access_key)?;
+    S3Store::new(config).map_err(Error::Store)
+}
+
+/// The [`S3Config`] [`build_auth_store`] connects with, split out from the
+/// Secret read so the plaintext-endpoint decision is testable without a
+/// `kube::Client`: the refusal is entirely here and `build_auth_store` is a
+/// credential read plus [`S3Store::new`] around it.
+fn auth_store_config(
+    spec: &RavelClusterSpec,
+    access_key_id: String,
+    secret_access_key: String,
+) -> Result<S3Config, Error> {
+    // The same decision the rendered server containers make, from the same
+    // function (issue #1707): endpoint SCHEME, not endpoint presence, and a
+    // plaintext non-loopback host refused unless `spec.storage.s3.allowHttp`
+    // accepts it. This client holds the cluster's credentials for `sys/auth`
+    // and the `shardOverrides` reshard, so deriving it from presence let the
+    // operator downgrade connections the pods it renders refuse.
+    let allow_http = s3_allow_http(spec)?;
     let endpoint = spec.storage.s3.endpoint.clone();
-    let allow_http = endpoint.is_some();
-    let config = S3Config {
+    Ok(S3Config {
         bucket: spec.storage.s3.bucket.clone(),
         region: spec.storage.s3.region.clone(),
         endpoint,
@@ -660,8 +681,7 @@ async fn build_auth_store(
         credentials_file: None,
         auth: Default::default(),
         instance_metadata_endpoint: None,
-    };
-    S3Store::new(config).map_err(Error::Store)
+    })
 }
 
 /// Bounded retry budget for a `sys/auth` primitive call that can fail with
@@ -1340,6 +1360,14 @@ async fn reconcile_inner(
     proceed_hash: &mut Option<String>,
     store_qualified_condition: &mut Option<Condition>,
 ) -> Result<Action, Error> {
+    // Refuse a plaintext non-loopback `spec.storage.s3.endpoint` that
+    // `allowHttp` does not accept before this pass creates ANYTHING (issue
+    // #1707). `desired_objects` refuses the same spec, but the qualify Job and
+    // the operator's own `sys/auth` store come first: a Job whose `ravel-cli`
+    // applies this same rule cannot pass, so running it just delays the real
+    // cause behind a `StoreQualified=False` with a pod-log message. Failing
+    // here puts the field name in the `Degraded` condition on the first pass.
+    s3_allow_http(&obj.spec)?;
     // Read the resourceVersion of every credential Secret the spec references
     // BEFORE the qualification gate (finding 3): the shared storage.s3 credential
     // plus any per-tier override (ADR-0055 section 5). Resolving credentials
@@ -2515,6 +2543,13 @@ fn degraded_reason(err: &Error) -> (String, String) {
             "CanonicalTenantResolverMissing".to_string(),
             err.to_string(),
         ),
+        // The refusal names `spec.storage.s3.allowHttp` and the remedy in its
+        // own Display (issue #1707), so the condition message is the error
+        // text: an operator reading `kubectl describe ravelcluster` learns the
+        // field to set without opening a pod log.
+        Error::Render(RenderError::PlaintextS3Endpoint { .. }) => {
+            ("PlaintextS3Endpoint".to_string(), err.to_string())
+        }
         other => ("ReconcileError".to_string(), other.to_string()),
     }
 }
@@ -2914,6 +2949,85 @@ mod tests {
             degraded_reason(&Error::Render(RenderError::CanonicalTenantResolverMissing));
         assert_eq!(reason, "CanonicalTenantResolverMissing");
         assert!(!message.is_empty(), "message carries the error text");
+    }
+
+    /// Issue #1707 finding 2: the plaintext-endpoint refusal reaches the
+    /// RavelCluster as a named condition whose message carries the field to
+    /// set, not as a bare `ReconcileError` that leaves an operator reading
+    /// crashlooping pod logs.
+    #[test]
+    fn degraded_reason_names_the_plaintext_endpoint_field() {
+        let (reason, message) = degraded_reason(&Error::Render(RenderError::PlaintextS3Endpoint {
+            endpoint: "http://minio:9000".to_string(),
+        }));
+        assert_eq!(reason, "PlaintextS3Endpoint");
+        for needle in [
+            "spec.storage.s3.endpoint",
+            "spec.storage.s3.allowHttp",
+            "http://minio:9000",
+        ] {
+            assert!(
+                message.contains(needle),
+                "the condition message must name {needle}, got: {message}"
+            );
+        }
+    }
+
+    /// Issue #1707 finding 1: the operator's OWN S3 client -- the one holding
+    /// the cluster's credentials for `sys/auth` and the `shardOverrides`
+    /// reshard -- decided `allow_http` from endpoint PRESENCE, so a cluster
+    /// with an `https://` endpoint still permitted a downgrade and a plaintext
+    /// one was accepted silently while the server pods it renders refuse it.
+    /// It now shares [`ravel_object_store::s3::resolve_s3_allow_http`] with
+    /// those pods and honours `spec.storage.s3.allowHttp`.
+    #[test]
+    fn build_auth_store_refuses_a_plaintext_endpoint_without_allow_http() {
+        let config_for = |endpoint: Option<&str>, allow_http: bool| {
+            let mut spec = spec_with_affinity(None);
+            spec.storage.s3.endpoint = endpoint.map(str::to_string);
+            spec.storage.s3.allow_http = allow_http;
+            auth_store_config(&spec, "key".to_string(), "secret".to_string())
+        };
+
+        let err = config_for(Some("http://minio:9000"), false)
+            .expect_err("the operator's own client must refuse the shape its pods refuse");
+        assert!(
+            matches!(
+                err,
+                Error::Render(RenderError::PlaintextS3Endpoint { ref endpoint })
+                    if endpoint == "http://minio:9000"
+            ),
+            "expected a typed plaintext-endpoint refusal, got: {err:?}"
+        );
+
+        // `https://` never permits the downgrade, whatever the field says: a
+        // redirect or a misconfigured proxy would otherwise silently drop to
+        // plaintext with the cluster's credentials on the wire.
+        for allow_http in [false, true] {
+            let config = config_for(Some("https://s3.example.com"), allow_http)
+                .expect("an https endpoint is always accepted");
+            assert!(
+                !config.allow_http,
+                "https must never set allow_http (allowHttp: {allow_http})"
+            );
+        }
+        // Real AWS S3 sets no endpoint at all.
+        assert!(
+            !config_for(None, false)
+                .expect("no endpoint is accepted")
+                .allow_http
+        );
+        // The deliberate opt-in, and loopback, are the two plaintext cases.
+        assert!(
+            config_for(Some("http://minio:9000"), true)
+                .expect("allowHttp true accepts plaintext")
+                .allow_http
+        );
+        assert!(
+            config_for(Some("http://localhost:9000"), false)
+                .expect("loopback plaintext is accepted unflagged")
+                .allow_http
+        );
     }
 
     /// A minimal spec whose only interesting field is `gateway.ingestAffinity`.
