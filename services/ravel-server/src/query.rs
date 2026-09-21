@@ -117,12 +117,18 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// `max_flush_delay` is the server's resolved `--max-flush-delay` (issue
 /// #1735), the same cadence every ingest pipeline flushes on. It sizes
 /// `cache_capacity_per_tenant` via
-/// [`ravel_catalog::derive_cache_capacity_per_tenant`]: `shard_count *
-/// ceil(3600 / max_flush_delay_secs) * 3`, so the commit-record cache holds a
-/// tenant's whole unsealed hot region rather than a flat, cadence-blind
-/// constant. Callers must pass the configured value, never
+/// [`ravel_catalog::derive_cache_capacity_per_tenant`]: `shard_count * 6
+/// signals * ceil(3600 / max_flush_delay_secs) * 3 unsealed hours`, clamped
+/// between the 10,000-entry floor and the cap that holds one actively-queried
+/// tenant to 45 MB across the two record caches the bound sizes. So the
+/// record caches hold a tenant's unsealed hot region, across every signal it
+/// ingests, rather than a flat cadence-blind constant, and a wide deployment
+/// still cannot make one tenant cost gigabytes. Callers must pass the
+/// configured value, never
 /// `ravel_ingest::IngestConfig::default().max_flush_delay`, or the derived
-/// capacity stops tracking the deployment's actual flush cadence.
+/// capacity stops tracking the deployment's actual flush cadence. At the
+/// shipped defaults (4 shards, 2s) the cap is what binds, so this is 30,000
+/// entries; the shard and cadence terms decide the value below it.
 #[allow(clippy::too_many_arguments)]
 pub fn build_catalog(
     store: Arc<dyn ObjectStoreBackend>,
@@ -697,8 +703,9 @@ mod catalog_cache_tests {
         let expected =
             ravel_catalog::derive_cache_capacity_per_tenant(shard_count, max_flush_delay);
         assert_eq!(
-            expected, 21_600,
-            "sanity: the shipped ingest defaults derive to 21,600"
+            expected, 30_000,
+            "sanity: the shipped ingest defaults derive 4 * 6 * 1800 * 3 = 129,600, capped at \
+             the 45 MB per-tenant budget's 30,000 entries"
         );
         assert_ne!(
             expected,

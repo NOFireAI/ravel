@@ -14,27 +14,42 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 ///
 /// The capacity actually configured is derived per deployment by
 /// [`derive_cache_capacity_per_tenant`] from `shard_count` and
-/// `max_flush_delay`: `shards * ceil(3600 / max_flush_delay_secs) * 3`, sized
-/// so a tenant's unsealed `max_flush_lifetime + clock_skew_allowance +
-/// fold_safety_margin` hot-region tail -- the part every query touches, since
-/// no fold has sealed it yet -- fits entirely, so a repeated resolve over it
-/// re-issues no per-record GET (issue #783, issue #1735). This constant is
-/// the saturating floor `derive_cache_capacity_per_tenant` never returns
-/// below, so a deployment with very few shards and a very long flush delay
-/// still gets the same protection the fixed constant used to give everyone.
+/// `max_flush_delay`: `shards * signals * flushes_per_hour *
+/// hot_region_hours`, clamped between this floor and the `30_000`-entry cap
+/// `MAX_CACHE_CAPACITY_PER_TENANT`. It is sized so a tenant's unsealed
+/// hot-region tail -- the part every query touches, since no fold has sealed
+/// it yet -- fits entirely, so a repeated resolve over it re-issues no
+/// per-record GET (issue #783, issue #1735). This constant is the saturating
+/// floor `derive_cache_capacity_per_tenant` never returns below, so a
+/// deployment with very few shards and a very long flush delay still gets the
+/// same protection the fixed constant used to give everyone.
 ///
-/// An entry costs roughly 750 bytes: a 119-byte commit key held twice (the
-/// map key and the recency index), the 200-byte decoded `CommitRecord` plus
-/// about 200 bytes of its own heap (tenant hash, writer uuid, data object
-/// key, content hash), and the two maps' slot overhead. At the shipped
-/// ingest defaults (`shard_count` 4, `max_flush_delay` 2s) the derived
-/// capacity is 21,600 entries, about 16 MB per actively-queried tenant,
-/// reclaimed by the idle-tenant sweep
-/// ([`Catalog::evict_idle_tenants`](crate::Catalog::evict_idle_tenants)).
+/// An entry costs roughly 750 bytes (`RECORD_CACHE_ENTRY_BYTES`): a 119-byte
+/// commit key held twice (the map key and the recency index), the 200-byte
+/// decoded `CommitRecord` plus about 200 bytes of its own heap (tenant hash,
+/// writer uuid, data object key, content hash), and the two maps' slot
+/// overhead. The bound sizes TWO per-tenant caches, not one
+/// (`RECORD_CACHES_PER_TENANT`): [`CatalogConfig::cache_capacity_per_tenant`]
+/// is passed to both the commit-record cache and the L1 compaction-record
+/// cache (`crate::cache::RecordCache` and
+/// `crate::cache::CompactionRecordCache`), each bounded at that entry count
+/// independently, so the worst case per actively-queried tenant is twice the
+/// capacity in entries. At the cap that is 30,000 * 750 * 2 = 45 MB per
+/// tenant (22.5 MB per cache), reclaimed by the idle-tenant sweep
+/// ([`Catalog::evict_idle_tenants`](crate::Catalog::evict_idle_tenants)). A
+/// compaction record's own size varies with the input list it carries, and in
+/// steady state that cache holds far fewer entries than the commit-record one
+/// (one per compacted bucket, not one per L0 segment); 45 MB is the bound to
+/// budget against, not the expected residency.
+///
 /// This is not one of the ADR-1170 carved caches: it is not a share of
 /// `memory_budget_bytes`, it is an entry-count bound sized from ingest
 /// cadence, and its footprint scales with how many tenants are actively
-/// queried, not with a fixed process-wide ceiling.
+/// queried, not with a fixed process-wide ceiling. That is what the cap is
+/// for: an operator multiplies 45 MB by the number of tenants queried
+/// concurrently (100 of them is 4.5 GB worst case) and compares that with
+/// what is left of the host after ADR-1170's carved shares, rather than
+/// against a number that also moves with `--shards`.
 ///
 /// `0` is the disabled sentinel: nothing is admitted and every record read
 /// falls through to a store GET, matching
@@ -42,21 +57,108 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 /// explicitly (never derived) when the cache is meant to be off.
 pub const DEFAULT_CACHE_CAPACITY_PER_TENANT: usize = 10_000;
 
-/// Derive the per-tenant commit-record cache capacity (in entries) from the
-/// tenant's shard count and the deployment's configured `max_flush_delay`
-/// (issue #1735). See [`DEFAULT_CACHE_CAPACITY_PER_TENANT`] for the
-/// rationale: the result is sized so a tenant's unsealed hot-region tail
-/// fits the cache entirely, and it is `shards * ceil(3600 /
-/// max_flush_delay_secs) * 3`, one flush cycle's worth of records per shard
-/// per hour, times three hours of headroom, floored at
-/// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`] so a very coarse cadence never
-/// derives a capacity below what the fixed constant used to guarantee.
+/// Memory budget the derived capacity is capped at, per actively-queried
+/// tenant, across BOTH caches the capacity bounds. 45 MB.
+///
+/// The cap exists because the derivation multiplies shard count by signal
+/// count by flush cadence and so grows without bound on a wide deployment:
+/// `--shards 64` at the shipped 2-second cadence derives 2,073,600 entries
+/// uncapped, 3.1 GB per actively-queried tenant, with nothing process-wide to
+/// stop a second tenant costing the same again. Capping in BYTES rather than
+/// in entries is what makes it checkable: whatever `--shards` and
+/// `--max-flush-delay` are set to, one actively-queried tenant costs at most
+/// this, so the operator's question is only how many tenants are queried at
+/// once (100 of them is 4.5 GB worst case). These caches sit OUTSIDE
+/// ADR-1170's carved shares -- they are entry-count bounds, not slices of
+/// `memory_budget_bytes` -- so that product is what to subtract from what the
+/// host has left after the carved fetch, catalog-byte and SQL shares, not
+/// something already inside them.
+///
+/// 45 MB is chosen against that multiplication rather than against a single
+/// tenant's appetite: it keeps a 100-tenant working set inside single-digit
+/// GB on the 30 GiB reference box ADR-1170 measures, while still holding
+/// three signals' worth of an ordinary tenant's unsealed tail.
+pub const MAX_RECORD_CACHE_BYTES_PER_TENANT: u64 = 45_000_000;
+
+/// Cap on the value [`derive_cache_capacity_per_tenant`] returns, in entries:
+/// [`MAX_RECORD_CACHE_BYTES_PER_TENANT`] divided by what one entry costs in
+/// each of the two caches. 30,000 entries. Deliberately above the
+/// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`] floor, so the clamp cannot invert.
+///
+/// The cost of the cap is stated rather than hidden: a tenant whose unsealed
+/// tail exceeds 30,000 records does not get the whole tail cached, and
+/// because a bound below the working set makes the resolve's two passes evict
+/// each other (docs/catalog-and-mvcc.md, and
+/// `a_bound_below_the_hot_region_loses_the_saving` in
+/// tests/hot_record_cache.rs), such a tenant is back to paying per-record
+/// GETs. The levers for it are a coarser `max_flush_delay` or fewer shards,
+/// both of which shrink the tail itself; raising the ceiling is a code change
+/// today, since no flag exposes it.
+pub const MAX_CACHE_CAPACITY_PER_TENANT: usize = (MAX_RECORD_CACHE_BYTES_PER_TENANT
+    / (RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT))
+    as usize;
+
+/// Signal streams whose commit records share one tenant's cache partition.
+///
+/// The record caches are keyed by `TenantHash` alone
+/// (`crate::cache::RecordCache`), not by `(tenant, signal)`, so every signal a
+/// tenant ingests holds its unsealed tail in the same LRU and the per-signal
+/// tails add up. Shard indices are per (tenant, signal) as well, so the worst
+/// case is one record per shard per signal per flush cycle. Six, one per
+/// `ravel_types::Signal` variant, pinned against the enum by
+/// `signal_streams_matches_the_signal_enum` below so a new variant fails a
+/// test rather than silently shrinking the derivation. (Alerts and audit pin
+/// fixed shard indices, 1 and 2, rather than fanning out over `shard_count`,
+/// so counting them at the full shard count is an over-estimate for any
+/// deployment with two or more shards, never an under-estimate.)
+pub const SIGNAL_STREAMS: u64 = 6;
+
+/// Hours of a tenant's ingest timeline that can be unsealed at once.
+///
+/// A fold may seal ingest hour `H` only `max_flush_lifetime +
+/// clock_skew_allowance + fold_safety_margin` after `H` ends (ADR-0020),
+/// which at the defaults is 1h + 5m + 15m = 1h20m. The oldest unsealed hour
+/// can therefore have STARTED 2h20m ago, so an unsealed tail spans up to
+/// 2.34 hours of ingest; 3 is that rounded up. Every record in it is read by
+/// every query over the tail, because no snapshot part covers it yet.
+pub const HOT_REGION_HOURS: u64 = 3;
+
+/// Bytes one cached record entry costs, the figure the operator-facing
+/// footprints in this module and in docs/guides/operations.md are computed
+/// from. See [`DEFAULT_CACHE_CAPACITY_PER_TENANT`] for the breakdown.
+pub const RECORD_CACHE_ENTRY_BYTES: u64 = 750;
+
+/// Number of per-tenant caches [`CatalogConfig::cache_capacity_per_tenant`]
+/// bounds at that same entry count: the commit-record cache and the L1
+/// compaction-record cache. A per-tenant worst case is this many times
+/// capacity times [`RECORD_CACHE_ENTRY_BYTES`].
+pub const RECORD_CACHES_PER_TENANT: u64 = 2;
+
+/// Derive the per-tenant record-cache capacity (in entries) from the tenant's
+/// shard count and the deployment's configured `max_flush_delay` (issue
+/// #1735). See [`DEFAULT_CACHE_CAPACITY_PER_TENANT`] for the rationale and
+/// the memory figures. The result is
+///
+/// ```text
+/// shards * SIGNAL_STREAMS * ceil(3600 / max_flush_delay_secs) * HOT_REGION_HOURS
+/// ```
+///
+/// clamped into `DEFAULT_CACHE_CAPACITY_PER_TENANT ..=
+/// MAX_CACHE_CAPACITY_PER_TENANT`: one commit record per shard per signal per
+/// flush cycle, over as many hours as can be unsealed at once, never below
+/// what the old fixed constant guaranteed and never above the capped
+/// per-tenant memory footprint. The signal term is load-bearing rather than
+/// cosmetic: the caches are partitioned by tenant, not by (tenant, signal),
+/// so a tenant ingesting metrics, logs and spans keeps three tails resident
+/// at once and a single-signal derivation under-sizes it by that multiple
+/// (`a_multi_signal_tenant_resolves_its_unsealed_tail_without_record_gets`
+/// in tests/hot_record_cache.rs is red without it).
 ///
 /// `max_flush_delay` of zero (or a duration so short it would otherwise
-/// overflow) saturates to `usize::MAX` rather than dividing by zero or
-/// panicking; a deployment configuring a zero flush delay is already
-/// rejected elsewhere (`ravel-server`'s `Cli::validate`), so this is defense
-/// in depth, not a path exercised in practice.
+/// overflow) saturates to the cap rather than dividing by zero or panicking;
+/// a deployment configuring a zero flush delay is already rejected elsewhere
+/// (`ravel-server`'s `Cli::validate`), so this is defense in depth, not a
+/// path exercised in practice.
 pub fn derive_cache_capacity_per_tenant(shards: u32, max_flush_delay: Duration) -> usize {
     let flush_secs = max_flush_delay.as_secs_f64();
     let flushes_per_hour: u64 = if flush_secs > 0.0 {
@@ -65,9 +167,13 @@ pub fn derive_cache_capacity_per_tenant(shards: u32, max_flush_delay: Duration) 
         u64::MAX
     };
     let derived = u64::from(shards)
+        .saturating_mul(SIGNAL_STREAMS)
         .saturating_mul(flushes_per_hour)
-        .saturating_mul(3)
-        .max(DEFAULT_CACHE_CAPACITY_PER_TENANT as u64);
+        .saturating_mul(HOT_REGION_HOURS)
+        .clamp(
+            DEFAULT_CACHE_CAPACITY_PER_TENANT as u64,
+            MAX_CACHE_CAPACITY_PER_TENANT as u64,
+        );
     usize::try_from(derived).unwrap_or(usize::MAX)
 }
 /// Default `max_flush_lifetime`: 1 hour, in nanoseconds. The GC interlock
@@ -455,13 +561,40 @@ impl Default for CatalogConfig {
 mod tests {
     use super::*;
 
+    use ravel_types::Signal;
+
     /// Pins the derivation at the shipped ingest defaults (`shard_count` 4,
-    /// `max_flush_delay` 2s, issue #1735): `4 * ceil(3600 / 2) * 3 = 21_600`.
+    /// `max_flush_delay` 2s, issue #1735): `4 shards * 6 signals * ceil(3600
+    /// / 2) flushes * 3 hours = 129_600` uncapped, which the 45 MB per-tenant
+    /// budget caps at 30,000.
     #[test]
-    fn derive_at_ingest_defaults_is_21_600() {
+    fn derive_at_ingest_defaults_is_the_cap() {
+        let uncapped = 4 * SIGNAL_STREAMS * 1_800 * HOT_REGION_HOURS;
+        assert_eq!(uncapped, 129_600, "the shipped defaults derive this much");
+        assert!(
+            uncapped > MAX_CACHE_CAPACITY_PER_TENANT as u64,
+            "sanity: the cap is what decides the shipped default"
+        );
         assert_eq!(
             derive_cache_capacity_per_tenant(4, Duration::from_secs(2)),
-            21_600
+            30_000
+        );
+    }
+
+    /// The signal term is what the fix adds (issue #1735 fix round): at one
+    /// shard on a 4-second cadence, `1 * 6 * 900 * 3 = 16_200` entries, clear
+    /// of both the floor and the cap, where the single-signal derivation
+    /// (`1 * 900 * 3 = 2_700`) would have fallen back to the 10,000 floor.
+    #[test]
+    fn derive_folds_the_signal_count_in() {
+        assert_eq!(
+            derive_cache_capacity_per_tenant(1, Duration::from_secs(4)),
+            16_200
+        );
+        assert_eq!(
+            16_200 / SIGNAL_STREAMS as usize,
+            2_700,
+            "without the signal term the derivation would floor at 10,000 instead"
         );
     }
 
@@ -476,12 +609,68 @@ mod tests {
     }
 
     /// A zero flush delay would otherwise divide by zero; it must saturate
-    /// instead of panicking.
+    /// into the cap, not into `usize::MAX`.
     #[test]
     fn derive_saturates_on_a_zero_flush_delay() {
         assert_eq!(
             derive_cache_capacity_per_tenant(4, Duration::ZERO),
-            usize::MAX
+            MAX_CACHE_CAPACITY_PER_TENANT
         );
+    }
+
+    /// `--shards 64`, the case that motivated the cap: 2,073,600 entries
+    /// uncapped, 3.1 GB per actively-queried tenant across the two caches the
+    /// bound sizes. Capped it is 30,000 entries and exactly the 45 MB budget,
+    /// the figure docs/guides/operations.md quotes.
+    #[test]
+    fn a_64_shard_deployment_is_capped_at_the_stated_memory_budget() {
+        let uncapped = 64 * SIGNAL_STREAMS * 1_800 * HOT_REGION_HOURS;
+        assert_eq!(uncapped, 2_073_600);
+        assert_eq!(
+            uncapped * RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT,
+            3_110_400_000,
+            "uncapped, one tenant would cost 3.1 GB across both caches"
+        );
+
+        let capped = derive_cache_capacity_per_tenant(64, Duration::from_secs(2));
+        assert_eq!(capped, 30_000);
+        assert_eq!(
+            capped as u64 * RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT,
+            MAX_RECORD_CACHE_BYTES_PER_TENANT,
+            "the capped capacity is exactly the 45 MB per-tenant budget"
+        );
+        assert_eq!(MAX_RECORD_CACHE_BYTES_PER_TENANT, 45_000_000);
+    }
+
+    /// The clamp cannot invert: the cap sits above the floor.
+    #[test]
+    fn the_cap_is_above_the_floor() {
+        const { assert!(MAX_CACHE_CAPACITY_PER_TENANT > DEFAULT_CACHE_CAPACITY_PER_TENANT) };
+    }
+
+    /// `SIGNAL_STREAMS` is the `Signal` variant count, not a number that
+    /// drifts. The exhaustive match fails to compile on a new variant, and
+    /// the length assertion fails if the constant is not updated with it.
+    #[test]
+    fn signal_streams_matches_the_signal_enum() {
+        let all = [
+            Signal::Metrics,
+            Signal::Logs,
+            Signal::Spans,
+            Signal::Profiles,
+            Signal::Alerts,
+            Signal::Audit,
+        ];
+        for signal in all {
+            match signal {
+                Signal::Metrics
+                | Signal::Logs
+                | Signal::Spans
+                | Signal::Profiles
+                | Signal::Alerts
+                | Signal::Audit => {}
+            }
+        }
+        assert_eq!(all.len() as u64, SIGNAL_STREAMS);
     }
 }
