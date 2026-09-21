@@ -1047,7 +1047,7 @@ carries max token per shard).
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
 | max_inflight_flushes (per shard, all three pipelines) | 1 on `ravel-server`, 4 on `ravel-cli load` (`--max-inflight-flushes`, rejects 0) |
-| max_queued_flushes (per shard, all three pipelines) | 8 (`--max-queued-flushes`, `RAVEL_MAX_QUEUED_FLUSHES`, rejects 0 and rejects a `max_inflight_flushes` above it; floored at 1 in `IngestConfig`; a buffer over its memory backstop spawns past the cap) |
+| max_queued_flushes (per shard, all three pipelines) | 8 (`--max-queued-flushes`, `RAVEL_MAX_QUEUED_FLUSHES`, rejects 0; a `max_inflight_flushes` above it raises the effective cap to match, with a warning; floored at 1 in `IngestConfig`; a buffer over its memory backstop spawns past the cap) |
 | adaptive_flush_delay (metrics pipeline only) | off (`--adaptive-flush-delay`) |
 | idle-tenant state TTL (process-wide) | 1 h (`--idle-tenant-state-ttl`, 0 = disabled) |
 
@@ -1189,8 +1189,9 @@ count replaces `shards` and the real ceiling is lower. The third term is the
 queued-flush cap (the ADR-1642 amendment): a shard stops spawning flush tasks
 at that count, so permits above it are unreachable. The loader takes the
 `IngestConfig` default of 8, above both other windows at their defaults of 4,
-so it does not bind there; `ravel-server` refuses a `--max-inflight-flushes`
-above `--max-queued-flushes` rather than let the difference read as
+so it does not bind there; `ravel-server` raises the effective
+`--max-queued-flushes` to match a larger `--max-inflight-flushes`, with a
+warning naming both numbers, rather than let the difference read as
 backpressure.
 
 Because that term is a `min`, neither window alone changes anything, which is
@@ -1284,9 +1285,12 @@ Counters recorded today:
   `shard_count x max_queued_flushes`. A shard's reading can sit above that
   cap while one of its tenant buffers is past its memory backstop: such a
   buffer spawns whatever the queue depth, since the backstop is the only bound
-  on its resident memory. The overshoot is one window per over-backstop
-  buffer, and it costs a backstop's worth of buffered memory each, so it
-  tracks memory pressure rather than the flush cadence.
+  on its resident memory. The overshoot is one window per backstop CROSSING,
+  not one per buffer currently over its backstop: an exempt spawn drains the
+  buffer it fires on, so the windows accumulate as the tenant crosses again.
+  Each costs a backstop's worth of buffered memory, so the overshoot tracks
+  memory pressure rather than the flush cadence, and under `Bounded` the byte
+  ceiling bounds it; under `Unlimited` only the length of the stall does.
   Unlike every other counter here it is per-shard underneath
   (`IngestMetrics::in_flight_flushes_by_shard`) before being summed into this
   flat total; a shard with no flush in flight contributes 0.

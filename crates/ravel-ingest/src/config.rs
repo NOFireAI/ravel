@@ -269,7 +269,10 @@ const BUFFER_MEMORY_BACKSTOP_CAP_BYTES: usize = 64 * 1024 * 1024;
 /// wins and one buffer's share of the budget is larger than an eighth. That
 /// configuration is already degenerate: a ceiling that holds only a few
 /// target-sized objects sheds on tenant count whatever the backstop does.
-pub(crate) fn buffer_memory_backstop_bytes(
+/// Exported so `ravel-server` can assert its `--max-queued-flushes` help text
+/// against the value each arm actually returns, rather than against a formula
+/// restated in prose (PR #1903 review finding 4).
+pub fn buffer_memory_backstop_bytes(
     config: &IngestConfig,
     ceiling: IngestByteBudgetLimit,
 ) -> usize {
