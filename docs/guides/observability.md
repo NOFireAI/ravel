@@ -1191,10 +1191,20 @@ output part, or `rewrite` a selective-erasure rewrite output part. The scrub
 corpus now covers all three: a compaction or rewrite output part that a record
 still lists as live joins the same rotation an L0 segment does.
 
-The lineage filter applies to those output parts only. A compaction or rewrite
-record that a later rewrite record names in `superseded_record_key`, and one in
-a bucket a retention tombstone has retired, are both left out, because their
-parts survive until a sweep retires them and no query reads them. L0 commit
+The lineage filter applies to those output parts only, and it leaves out three
+shapes. A compaction or rewrite record that a later rewrite record names in
+`superseded_record_key`, and one in a bucket a retention tombstone has retired,
+are left out because their parts survive until a sweep retires them and no
+query reads them. A compaction record that loses its bucket's overlap component
+to another compaction record is left out too: two compactors racing leave two
+records in one bucket whose input sets share an L0 input, and the catalog keeps
+one authoritative record per overlap component and serves none of the other's
+parts. That last exclusion carries a caveat the first two do not. The loser's
+parts are read by no node that has adopted the overlap rule, but a node that
+has not may still serve them, and the loser is not horizon-bounded the way a
+superseded generation is: the losing record keeps its parts referenced for as
+long as it exists, so the sweep reclaims none of them and an unfiltered corpus
+would re-page on the same bytes every rotation. L0 commit
 records are scrubbed whatever their lineage: there is no supersession or
 tombstone check on that path, so an L0 segment a live compaction has already
 folded into a compaction output part stays in the rotation. A `level="l0"`

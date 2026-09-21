@@ -618,9 +618,11 @@ async fn run_shard_tick(
     > = std::collections::HashMap::new();
     // Compaction and rewrite records are decoded in the pass below but their
     // parts are not expanded there: a bucket can hold a superseded generation
-    // alongside the live one until a horizon-gated sweep retires it, and only
-    // the full listing says which is which. Buffer them, resolve supersession
-    // once, then expand. Each record is still fetched exactly once.
+    // alongside the live one until a horizon-gated sweep retires it, and can
+    // hold two compaction records whose input sets overlap, and only the full
+    // listing says which record of each pair the read path serves. Buffer
+    // them, resolve both exclusions once, then expand. Each record is still
+    // fetched exactly once.
     let mut compaction_records: Vec<(String, ravel_proto::commit::v1::CompactionRecord)> =
         Vec::new();
     let mut rewrite_records: Vec<(String, ravel_proto::commit::v1::RewriteRecord)> = Vec::new();
@@ -750,8 +752,44 @@ async fn run_shard_tick(
         .map(|(_, rec)| rec.superseded_record_key.as_str())
         .collect();
 
+    // Supersession is only one of the two ways a compaction record's parts
+    // stop being served. The other is overlap (issue #1070): two compactors
+    // racing leave two records in one bucket whose input sets share an L0
+    // input, and the catalog keeps one authoritative record per overlap
+    // component and ignores every other record's parts. Resolve it through
+    // the same helper snapshot resolution, the index fold, the sweep, migrate
+    // and the erasure completion gate use, so the corpus and the read path
+    // derive identical bucket state. Per bucket, because an overlap component
+    // is a property of one ingest-hour bucket: that is the unit the resolver
+    // reads. A loser is not horizon-bounded the way a superseded generation
+    // is -- the losing record keeps its parts referenced for as long as it
+    // exists, so the sweep reclaims none of them -- and rot in one would
+    // otherwise page an operator on every rotation, indefinitely, for bytes
+    // no query on a fleet that has adopted the overlap rule reads.
+    let losing_compaction_records: std::collections::HashSet<String> = {
+        let mut by_bucket: std::collections::HashMap<
+            u32,
+            Vec<(&str, &ravel_proto::commit::v1::CompactionRecord)>,
+        > = std::collections::HashMap::new();
+        for (record_key, rec) in &compaction_records {
+            by_bucket
+                .entry(rec.ingest_hour_bucket)
+                .or_default()
+                .push((record_key.as_str(), rec));
+        }
+        let mut losing: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for in_bucket in by_bucket.values() {
+            for record_key in ravel_catalog::select_authoritative_compaction_records(in_bucket) {
+                losing.insert(record_key.to_string());
+            }
+        }
+        losing
+    };
+
     for (record_key, rec) in &compaction_records {
-        if superseded.contains(record_key.as_str()) {
+        if superseded.contains(record_key.as_str())
+            || losing_compaction_records.contains(record_key.as_str())
+        {
             continue;
         }
         for part in &rec.parts {
@@ -1954,5 +1992,256 @@ mod tests {
             0,
             "the superseded compaction part must be left out of the corpus"
         );
+    }
+
+    /// An overlap loser's parts stay out of the corpus (issue #1686, the
+    /// second exclusion mechanism after supersession). Compacts a bucket to
+    /// get a real two-input compaction record, then publishes a second record
+    /// in the same bucket whose single input is one of those two: the shared
+    /// input puts both in one overlap component, and
+    /// `select_authoritative_compaction_records` gives the larger input set
+    /// the win, so the hand-built record is the loser and the catalog serves
+    /// none of its parts.
+    ///
+    /// Two ticks, because one cannot say both things. The first corrupts only
+    /// the loser's part: `l1 == 0` says the loser is excluded, but on its own
+    /// that also holds if the filter dropped the whole component. The second
+    /// corrupts the winner's part as well, leaving both corrupt in one tick:
+    /// `l1 == 1` says the winner is still scrubbed (so the corpus is not
+    /// empty and the component was not dropped wholesale) and that exactly
+    /// one of the two overlapping records contributed parts (so the winner is
+    /// chosen per component, not per record).
+    #[tokio::test]
+    async fn an_overlap_loser_part_is_left_out_of_the_corpus() {
+        use ravel_commit::erasure;
+        use ravel_proto::commit::v1::{CompactionPart, CompactionRecord};
+
+        let store = MemoryStore::new();
+        let tenant_id = tenant();
+        let tenant_hash = tenant_id.hash();
+        let shard = 0u32;
+        let ingest_hour_bucket = 500_000u32;
+        let created_unix_ns = 500_000 * NS_PER_HOUR;
+
+        publish_segment(&store, 1, &["cpu"]).await;
+        publish_segment(&store, 2, &["mem"]).await;
+
+        let bucket = ravel_maintain::Bucket::new(tenant_hash, Signal::Metrics, shard, 500_000);
+        let compact_clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let outcome = ravel_maintain::compact_bucket(
+            &store,
+            &compact_clock,
+            &ravel_maintain::CompactorConfig::default(),
+            &bucket,
+        )
+        .await
+        .expect("compact");
+        assert!(
+            matches!(outcome, ravel_maintain::CompactionOutcome::Compacted { .. }),
+            "two sealed L0 inputs must compact, got {outcome:?}"
+        );
+
+        let prefix = keys::commit_shard_hour_prefix(&tenant_hash, Signal::Metrics, shard, 500_000)
+            .expect("prefix");
+        let metas = list_all(&store, &prefix).await.expect("list bucket");
+        let winner_record_key = metas
+            .iter()
+            .map(|m| m.key.clone())
+            .find(|k| {
+                matches!(
+                    keys::partition_bucket_entry(k),
+                    Ok(keys::BucketEntry::CompactionRecord(_))
+                )
+            })
+            .expect("a compaction record was published");
+        let winner_record_bytes = store
+            .get(&winner_record_key, GetRange::Full)
+            .await
+            .expect("get compaction record")
+            .data;
+        let winner = ravel_commit::record::decode_compaction(&winner_record_bytes)
+            .expect("decode compaction record");
+        assert_eq!(
+            winner.inputs.len(),
+            2,
+            "the compactor's record must name both sealed L0 inputs, so its input set is \
+             strictly larger than the loser's and the tie-break is decided"
+        );
+        let winner_part_key =
+            keys::reconstruct_l1_part_key(&winner, &winner.parts[0]).expect("winner l1 part key");
+
+        // The loser: a second compaction record in the same bucket naming one
+        // of the winner's inputs. Sharing an input is what puts the two in
+        // one overlap component; naming strictly fewer is what makes the
+        // winner's win deterministic rather than hash-order dependent.
+        let shared_inputs = vec![winner.inputs[0].clone()];
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "cpu".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&tenant_id, "cpu", &labels).expect("series id");
+        let series = vec![SeriesInput {
+            series_id,
+            labels,
+            samples: vec![Sample {
+                ts_ns: created_unix_ns,
+                value: 1.0,
+            }],
+        }];
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: Uuid::from_u128(4_000).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: created_unix_ns - 1_000,
+            max_ingest_ts_ns: created_unix_ns,
+        };
+        let written = SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let loser_part_bytes = written.bytes;
+        let loser_part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: written.summary.blake3.to_vec(),
+            object_size: loser_part_bytes.len() as u64,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            run_count: 1,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            declared_column_stats: Vec::new(),
+        };
+        let loser = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard,
+            ingest_hour_bucket,
+            level: 1,
+            input_set_hash: erasure::compute_compaction_input_set_hash(&shared_inputs).to_vec(),
+            inputs: shared_inputs,
+            parts: vec![loser_part.clone()],
+            created_unix_ns,
+        };
+        let loser_record_key = keys::compaction_record_key_for(&loser).expect("loser record key");
+        assert_ne!(
+            loser_record_key, winner_record_key,
+            "the two records must be distinct objects in one bucket"
+        );
+        let loser_part_key =
+            keys::reconstruct_l1_part_key(&loser, &loser_part).expect("loser l1 part key");
+        assert_ne!(
+            loser_part_key, winner_part_key,
+            "the two records' parts must be distinct objects"
+        );
+        store
+            .put(&loser_part_key, loser_part_bytes, PutOptions::default())
+            .await
+            .expect("put loser l1 part object");
+        store
+            .put(
+                &loser_record_key,
+                ravel_commit::record::encode_compaction(&loser),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put loser compaction record");
+
+        let worker = solo_worker();
+
+        // Pre-corruption: both records' parts are byte-correct, so a full
+        // tick is clean at every level whatever the filter admits.
+        let metrics = ScrubMetrics::default();
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::Rewrite),
+            0
+        );
+
+        corrupt_first_byte(&store, &loser_part_key).await;
+
+        let metrics = ScrubMetrics::default();
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0,
+            "the overlap loser's part must be left out of the corpus"
+        );
+
+        corrupt_first_byte(&store, &winner_part_key).await;
+
+        let metrics = ScrubMetrics::default();
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            1,
+            "with both overlapping records' parts corrupt in one tick, exactly one is counted: \
+             the authoritative record's part is still scrubbed and the loser's is not"
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0,
+            "the two L0 segments are untouched"
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::Rewrite),
+            0,
+            "this bucket holds no rewrite record"
+        );
+    }
+
+    /// Flip the first byte of a stored object, so the content tier's
+    /// whole-object blake3 disagrees with the hash its record recorded.
+    async fn corrupt_first_byte(store: &MemoryStore, key: &str) {
+        let existing = store.get(key, GetRange::Full).await.expect("get part");
+        let mut corrupted = existing.data.to_vec();
+        corrupted[0] ^= 0x01;
+        store
+            .put(key, Bytes::from(corrupted), PutOptions::default())
+            .await
+            .expect("overwrite corrupted part");
     }
 }
