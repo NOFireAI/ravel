@@ -390,6 +390,21 @@ impl LogIngestMetrics {
         self.shard_skew.record_off_actor_ns(shard, off_actor_ns);
     }
 
+    /// Shard `shard`'s current spawned-but-unreaped flush-task count, the
+    /// quantity `IngestConfig::max_queued_flushes` caps (issue #1740).
+    /// Published by the shard actor wherever its flush set changes length, so
+    /// the gauge reflects what the next trigger will be tested against.
+    pub(crate) fn record_shard_flushes_queued(&self, shard: u32, queued: u64) {
+        self.shard_skew.record_flushes_queued(shard, queued);
+    }
+
+    /// One size or age flush trigger refused because shard `shard` was already
+    /// at its queued-flush cap (issue #1740). The rows stay buffered for the
+    /// next tick.
+    pub(crate) fn record_shard_flush_trigger_deferred(&self, shard: u32) {
+        self.shard_skew.record_flush_trigger_deferred(shard);
+    }
+
     /// Point-in-time per-shard skew figures, sorted by shard index (issue #865),
     /// the log counterpart of [`crate::IngestMetrics::shard_skew_by_shard`]. A
     /// shard with no recorded activity is simply absent.
