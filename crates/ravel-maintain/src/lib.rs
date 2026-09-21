@@ -120,7 +120,7 @@ pub use scan::{
     ScanReport, SeedStats, scan_and_compact, scan_and_maintain,
 };
 pub use scrub::{
-    CoveringPostings, ScrubBudget, ScrubCursor, ScrubResult, ScrubSlice, ScrubTarget,
+    CoveringPostings, ScrubBudget, ScrubCursor, ScrubLevel, ScrubResult, ScrubSlice, ScrubTarget,
     advance_cursor, per_tick_byte_budget, scrub_one_object,
 };
 pub use sweep::{

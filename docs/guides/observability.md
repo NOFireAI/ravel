@@ -1172,19 +1172,25 @@ ticks here is the same evidence six missed cycles is there.
 
 ### At-rest scrubber (`ravel_scrub_*`)
 
-Labels: `mode` and `signal`, plus `reason` on the seal-divergence counter.
-These carry no `tenant_hash` label.
+Labels: `mode` and `signal`, plus `level` on the checksum-mismatch counter and
+`reason` on the seal-divergence counter. These carry no `tenant_hash` label.
 
 | Metric | Meaning |
 |---|---|
-| `ravel_scrub_checksum_mismatch_total` | Data objects that failed at-rest integrity re-verification (a whole-object blake3 mismatch or a footer or section crc failure), by signal. |
+| `ravel_scrub_checksum_mismatch_total` | Data objects that failed at-rest integrity re-verification (a whole-object blake3 mismatch or a footer or section crc failure), by signal and level. |
 | `ravel_scrub_postings_disagreement_total` | Objects whose covering name-postings object omitted a `__name__` the object really carries (a false negative), by signal. |
 | `ravel_scrub_seal_divergence_total` | Divergences between the folded snapshot and the re-listed sealed commit history, by signal and reason. |
 | `ravel_scrub_cursor_position` | Gauge. Fraction of the current scrub rotation the content-tier cursor has covered so far, by signal, in [0,1]. |
 
 `ravel_scrub_checksum_mismatch_total` is the one to alert on for any increase:
 there is no redundant copy to repair from, so a nonzero increase is corruption
-an operator must investigate. The `reason` label on
+an operator must investigate. Its `level` label says which part of the commit
+lineage the corrupt object came from: `l0` an original ingested segment, `l1`
+a compaction output part, or `rewrite` a selective-erasure rewrite output
+part. The scrub corpus now covers all three: an L1 or rewrite part that a
+compaction or rewrite record still lists as live joins the same rotation an
+L0 segment does, and a part an input tombstone has since retired is excluded
+the same way a tombstoned L0 segment already was. The `reason` label on
 `ravel_scrub_seal_divergence_total` carries `missing` (a sealed commit record
 absent from the snapshot, an under-count) or `mismatched` (a snapshot entry
 whose content hash disagrees with the sealed record); an orphaned entry, a

@@ -11,12 +11,12 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly sixteen label keys: `tenant_hash`, `signal`, `mode`, `op`,
+//! renders exactly seventeen label keys: `tenant_hash`, `signal`, `mode`, `op`,
 //! `error_kind`, `workload_class`, `level`, `reason`, `cache`, `tier`,
-//! `kind`, `outcome`, `allocator`, `stat`, `component`, and `class` (ADR-0044
-//! section 4; `reason` added by ADR-0051 section 6 for the admission-rejection
-//! family and reused by ADR-0059 section 2 for the scrub seal-divergence family,
-//! `cache` to split the read-cache family into the
+//! `kind`, `outcome`, `allocator`, `stat`, `component`, `class`, and `carrier`
+//! (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
+//! admission-rejection family and reused by ADR-0059 section 2 for the scrub
+//! seal-divergence family, `cache` to split the read-cache family into the
 //! fetcher and catalog byte caches, `tier` added by #97 to split each of those
 //! into its RAM and local-disk tiers when a disk tier is configured, `kind`
 //! added by ADR-0065 decision 4 to split the maintenance merge-memory gauge into
@@ -24,11 +24,15 @@
 //! the alert-tick family by how one evaluation tick ended, `allocator`/`stat`
 //! added by #1170 for the process allocator gauges, `component` added by
 //! ADR-1170 decision 4 to split the process memory budget's reserved-bytes
-//! gauge by which side reserved it, and `class` added by ADR-0071's admission
+//! gauge by which side reserved it, `class` added by ADR-0071's admission
 //! disjointness deliverable (issue #1722) to split the fragment in-flight
 //! gauge and admission-wait counters into their `Pinned` and `Resolve`
-//! classes). The sixteen keys come from seventeen
-//! `Label` variants: `RejectReason` and `ScrubReason` both render `reason`.
+//! classes, and `carrier` added by ADR-0873 decision 2 to split the
+//! declared-statistics drop tally across its four carriers). The seventeen
+//! keys come from twenty `Label` variants: `RejectReason` and `ScrubReason`
+//! both render `reason`, and `Level` (log/tracing severity) and `ScrubLevel`
+//! (issue #1686, which part of the commit lineage -- `l0`/`l1`/`rewrite` -- a
+//! scrub target came from) both render `level`.
 //! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
 //! anywhere on this path an unlisted label could travel through, and adding a
@@ -66,6 +70,7 @@ use ravel_ingest::{
     LogIngestRouter, SpanIngestMetricsSnapshot, SpanIngestRouter, TenantPutAttribution,
     TenantUsage,
 };
+use ravel_maintain::ScrubLevel;
 use ravel_object_store::StoreMetrics;
 use ravel_object_store::instrument::{
     LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKET_COUNT, StoreErrorClass, StoreMetricsSnapshot,
@@ -251,6 +256,11 @@ pub enum Label {
     Level(Level),
     RejectReason(RejectReason),
     ScrubReason(ScrubReason),
+    /// Which commit-lineage part a scrub target came from (issue #1686):
+    /// `l0`, `l1`, or `rewrite`. Shares the `level` key with [`Label::Level`]
+    /// (log/tracing severity), the same shared-key discipline
+    /// `RejectReason`/`ScrubReason` already use for `reason`.
+    ScrubLevel(ScrubLevel),
     Cache(CacheFamily),
     CacheTier(CacheTier),
     MergeMemoryKind(MergeMemoryKind),
@@ -446,6 +456,7 @@ impl Label {
             Label::Level(_) => "level",
             Label::RejectReason(_) => "reason",
             Label::ScrubReason(_) => "reason",
+            Label::ScrubLevel(_) => "level",
             Label::Cache(_) => "cache",
             Label::CacheTier(_) => "tier",
             Label::MergeMemoryKind(_) => "kind",
@@ -470,6 +481,7 @@ impl Label {
             Label::Level(level) => level.name().to_string(),
             Label::RejectReason(reason) => reason.name().to_string(),
             Label::ScrubReason(reason) => reason.name().to_string(),
+            Label::ScrubLevel(level) => level.as_str().to_string(),
             Label::Cache(family) => family.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
@@ -3173,6 +3185,16 @@ fn render_alert_family(out: &mut String, mode: Mode, snapshot: &AlertSnapshot) {
     );
 }
 
+/// Per-level breakdown of one signal's `checksum_mismatch` counter (issue
+/// #1686): which commit-lineage part -- `l0`, `l1`, or `rewrite` -- the
+/// scrub corpus found the corruption in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrubLevelCounts {
+    pub l0: u64,
+    pub l1: u64,
+    pub rewrite: u64,
+}
+
 /// One signal's at-rest scrubber counters for one scrape (ADR-0059 decisions
 /// 1, 3).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3181,8 +3203,10 @@ pub struct ScrubSignalSnapshot {
     /// Objects that failed at-rest integrity re-verification for this signal:
     /// a whole-object blake3 mismatch against the recorded content hash (bit
     /// rot / partial write) or a footer/section crc failure. Both are
-    /// data-object corruption, so both increment this one counter.
-    pub checksum_mismatch: u64,
+    /// data-object corruption, so both increment this one counter, broken
+    /// down by which commit-lineage part (`l0`, `l1`, `rewrite`) it came from
+    /// (issue #1686).
+    pub checksum_mismatch: ScrubLevelCounts,
     /// Objects where the covering name-postings object omitted a `__name__`
     /// the object really carries (a false negative). Wired but only
     /// nonzero once covering-postings resolution lands in the scrub task.
@@ -3224,18 +3248,31 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
         out,
         "ravel_scrub_checksum_mismatch_total",
         "Data objects that failed at-rest integrity re-verification (whole-object blake3 mismatch \
-         or footer/section crc failure), by signal (ADR-0059). Alert on increase() > 0: there is \
-         no redundant copy to repair from, so any nonzero increase is corruption an operator must \
-         investigate.",
+         or footer/section crc failure), by signal and level (ADR-0059, issue #1686): \
+         level=\"l0\" is an original ingested segment, level=\"l1\" a compaction output part, \
+         level=\"rewrite\" a selective-erasure rewrite output part. Alert on increase() > 0: there \
+         is no redundant copy to repair from, so any nonzero increase is corruption an operator \
+         must investigate.",
         "counter",
     );
     for signal in &snapshot.signals {
-        write_sample(
-            out,
-            "ravel_scrub_checksum_mismatch_total",
-            &labels(mode, signal.signal),
-            signal.checksum_mismatch,
-        );
+        for level in [ScrubLevel::L0, ScrubLevel::L1, ScrubLevel::Rewrite] {
+            let value = match level {
+                ScrubLevel::L0 => signal.checksum_mismatch.l0,
+                ScrubLevel::L1 => signal.checksum_mismatch.l1,
+                ScrubLevel::Rewrite => signal.checksum_mismatch.rewrite,
+            };
+            write_sample(
+                out,
+                "ravel_scrub_checksum_mismatch_total",
+                &[
+                    Label::Mode(mode),
+                    Label::Signal(signal.signal),
+                    Label::ScrubLevel(level),
+                ],
+                value,
+            );
+        }
     }
 
     write_header(
@@ -5228,7 +5265,11 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
             .iter()
             .map(|&signal| ScrubSignalSnapshot {
                 signal,
-                checksum_mismatch: metrics.checksum_mismatch(signal),
+                checksum_mismatch: ScrubLevelCounts {
+                    l0: metrics.checksum_mismatch(signal, ScrubLevel::L0),
+                    l1: metrics.checksum_mismatch(signal, ScrubLevel::L1),
+                    rewrite: metrics.checksum_mismatch(signal, ScrubLevel::Rewrite),
+                },
                 postings_disagreement: metrics.postings_disagreement(signal),
                 seal_divergence_missing: metrics.seal_divergence_missing(signal),
                 seal_divergence_mismatched: metrics.seal_divergence_mismatched(signal),
@@ -5579,6 +5620,7 @@ mod tests {
             Label::Level(Level::Info),
             Label::RejectReason(RejectReason::ByteRate),
             Label::ScrubReason(ScrubReason::Missing),
+            Label::ScrubLevel(ScrubLevel::L0),
             Label::Cache(CacheFamily::Fetch),
             Label::CacheTier(CacheTier::Ram),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
@@ -5602,6 +5644,7 @@ mod tests {
                 Label::Level(_) => "level",
                 Label::RejectReason(_) => "reason",
                 Label::ScrubReason(_) => "reason",
+                Label::ScrubLevel(_) => "level",
                 Label::Cache(_) => "cache",
                 Label::CacheTier(_) => "tier",
                 Label::MergeMemoryKind(_) => "kind",
@@ -5629,6 +5672,10 @@ mod tests {
                 // the allowlist of distinct keys is unchanged; two variants map
                 // to it.
                 "reason",
+                // ScrubLevel (issue #1686) reuses the `level` key, so the
+                // allowlist of distinct keys is unchanged; two variants map to
+                // it.
+                "level",
                 "cache",
                 "tier",
                 "kind",
@@ -5647,13 +5694,13 @@ mod tests {
              ADR-0059 section 2's scrub seal-divergence family), the `cache` label, #97's `tier` \
              label, ADR-0065 decision 4's `kind` (also reused by issue #1729's deleted-objects \
              family), #532's `outcome`, #1170's `allocator`/`stat`, ADR-1170 decision 4's \
-             `component`, ADR-0071's `class` (issue #1722), and ADR-0873 decision 2's `carrier`; \
-             `shard` must never appear here"
+             `component`, ADR-0071's `class` (issue #1722), ADR-0873 decision 2's `carrier`, and \
+             issue #1686's `level` reuse by `ScrubLevel`; `shard` must never appear here"
         );
         assert_eq!(
             one_of_each.len(),
-            19,
-            "exactly 19 label variants, 17 distinct keys"
+            20,
+            "exactly 20 label variants, 17 distinct keys"
         );
     }
 
@@ -7966,7 +8013,11 @@ mod tests {
             signals: vec![
                 ScrubSignalSnapshot {
                     signal: Signal::Metrics,
-                    checksum_mismatch: 2,
+                    checksum_mismatch: ScrubLevelCounts {
+                        l0: 2,
+                        l1: 5,
+                        rewrite: 0,
+                    },
                     postings_disagreement: 1,
                     seal_divergence_missing: 3,
                     seal_divergence_mismatched: 4,
@@ -7974,7 +8025,7 @@ mod tests {
                 },
                 ScrubSignalSnapshot {
                     signal: Signal::Logs,
-                    checksum_mismatch: 0,
+                    checksum_mismatch: ScrubLevelCounts::default(),
                     postings_disagreement: 0,
                     seal_divergence_missing: 0,
                     seal_divergence_mismatched: 0,
@@ -8016,9 +8067,21 @@ mod tests {
 
         assert!(
             body.contains(
-                "ravel_scrub_checksum_mismatch_total{mode=\"maintain\",signal=\"metrics\"} 2"
+                "ravel_scrub_checksum_mismatch_total{mode=\"maintain\",signal=\"metrics\",level=\"l0\"} 2"
             ),
-            "missing checksum_mismatch sample:\n{body}"
+            "missing checksum_mismatch l0 sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_scrub_checksum_mismatch_total{mode=\"maintain\",signal=\"metrics\",level=\"l1\"} 5"
+            ),
+            "missing checksum_mismatch l1 sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_scrub_checksum_mismatch_total{mode=\"maintain\",signal=\"metrics\",level=\"rewrite\"} 0"
+            ),
+            "missing checksum_mismatch rewrite sample:\n{body}"
         );
         assert!(
             body.contains(
@@ -8053,12 +8116,12 @@ mod tests {
             body.contains("# TYPE ravel_scrub_cursor_position gauge"),
             "cursor_position must carry a gauge TYPE header:\n{body}"
         );
-        // Zero-valued signal (logs) still renders: zero-is-not-absence.
+        // Zero-valued signal (logs) still renders every level: zero-is-not-absence.
         assert!(
             body.contains(
-                "ravel_scrub_checksum_mismatch_total{mode=\"maintain\",signal=\"logs\"} 0"
+                "ravel_scrub_checksum_mismatch_total{mode=\"maintain\",signal=\"logs\",level=\"l0\"} 0"
             ),
-            "a zero-valued signal must still render:\n{body}"
+            "a zero-valued signal must still render every level:\n{body}"
         );
         // No tenant_hash label on this unauthenticated route (ADR-0044 §4).
         for line in body.lines().filter(|l| l.starts_with("ravel_scrub_")) {
