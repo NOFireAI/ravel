@@ -3253,6 +3253,7 @@ impl Catalog {
             record.clone(),
             bytes,
             self.config.cache_capacity_per_tenant,
+            self.config.compaction_cache_max_bytes_per_tenant(),
         );
         Ok(record)
     }
