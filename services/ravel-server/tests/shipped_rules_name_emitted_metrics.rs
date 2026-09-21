@@ -13,8 +13,9 @@
 //! Both tests here read the rule file through [`parse_rule_file`], which
 //! builds its groups and rules as a structure and refuses any line it cannot
 //! account for, rather than matching strings in the raw text. A corruption
-//! that leaves the `- alert:` lines intact still stops the file loading in
-//! Prometheus, so it has to stop the file parsing here.
+//! that leaves the `- alert:` lines intact holds a string count at 31 while
+//! Prometheus refuses the whole file and every alert in it goes dead, so the
+//! count has to come off a parse to mean anything.
 //!
 //! `docs/guides/observability.md` reprints 13 of these rules in fenced `yaml`
 //! blocks, to explain them in place. Those blocks are parsed the same way and
@@ -61,10 +62,17 @@ const GUIDE_FILE: &str = concat!(
 /// here until this number is updated.
 const EXPECTED_METRIC_NAMES: usize = 37;
 
-/// Alert rules in the shipped file, counted off the parsed structure. Pinned
-/// for the same reason as the name count: a file that lost a group, or a
-/// group that lost a rule, must fail rather than shrink the scan.
+/// Groups and alert rules in the shipped file, counted off the parsed
+/// structure. Pinned for the same reason as the name count: a file that lost
+/// a group, or a group that lost a rule, must fail rather than shrink the
+/// scan. `deploy/README.md` states both figures.
+const EXPECTED_GROUPS: usize = 8;
 const EXPECTED_ALERTS: usize = 31;
+
+/// Rules transcribed from a troubleshooting-table row that states no
+/// duration, so they carry no `for:` and say so in an `as_documented`
+/// annotation. `deploy/README.md` states this figure too.
+const EXPECTED_ALERTS_WITHOUT_FOR: usize = 15;
 
 /// Fenced `yaml` blocks in the guide, and the alert rules they hold between
 /// them. Pinned so that an extractor that matches no block, or a block that
@@ -116,7 +124,6 @@ struct AlertRule {
 
 #[derive(Debug)]
 struct RuleGroup {
-    #[allow(dead_code)]
     name: String,
     rules: Vec<AlertRule>,
 }
@@ -408,11 +415,12 @@ fn build_rule(fields: &[(String, Value)]) -> Result<AlertRule, String> {
 /// Every non-blank, non-comment line has to be a mapping key, a sequence item
 /// or a line of a block scalar some key opened, at an indentation its parent
 /// allows, and every key has to be one this shape defines. A line that is
-/// none of those is an error rather than text the reader steps over, so a
-/// file Prometheus would refuse at startup fails here too. This is not a
-/// general YAML implementation: it accepts the subset these files are written
-/// in and rejects the rest, which is the direction that makes a corrupt file
-/// fail rather than pass.
+/// none of those is an error rather than text the reader steps over.
+///
+/// This is not a general YAML implementation and does not claim to accept
+/// exactly what Prometheus accepts: it takes the subset these two files are
+/// written in and refuses the rest, which is the direction that makes a
+/// corrupt file fail rather than pass.
 fn parse_rule_file(text: &str) -> Result<Vec<RuleGroup>, String> {
     if text.contains('\t') {
         return Err("a tab appears in the text; YAML forbids tabs in indentation".to_string());
@@ -496,8 +504,16 @@ fn fenced_yaml_blocks(markdown: &str) -> Vec<String> {
 fn shipped_rule_groups() -> Vec<RuleGroup> {
     let text = std::fs::read_to_string(RULES_FILE)
         .unwrap_or_else(|e| panic!("shipped rule file {RULES_FILE} must be readable: {e}"));
-    parse_rule_file(&text)
-        .unwrap_or_else(|e| panic!("shipped rule file {RULES_FILE} must parse: {e}"))
+    let groups = parse_rule_file(&text)
+        .unwrap_or_else(|e| panic!("shipped rule file {RULES_FILE} must parse: {e}"));
+    assert_eq!(
+        groups.len(),
+        EXPECTED_GROUPS,
+        "shipped rule file must carry exactly {EXPECTED_GROUPS} groups, found {}: {:?}",
+        groups.len(),
+        groups.iter().map(|group| &group.name).collect::<Vec<_>>()
+    );
+    groups
 }
 
 /// Every `ravel_<segment>[_<segment>...]` token in `text`.
@@ -676,6 +692,29 @@ async fn every_metric_named_by_a_shipped_rule_is_rendered() {
         EXPECTED_ALERTS,
         "shipped rule file must carry exactly {EXPECTED_ALERTS} alert rules"
     );
+
+    let undated: Vec<&str> = alerts
+        .iter()
+        .filter(|alert| alert.fires_after.is_none())
+        .map(|alert| alert.name.as_str())
+        .collect();
+    assert_eq!(
+        undated.len(),
+        EXPECTED_ALERTS_WITHOUT_FOR,
+        "exactly {EXPECTED_ALERTS_WITHOUT_FOR} rules come from a source that states no duration \
+         and so carry no `for:`, found {undated:?}"
+    );
+    for alert in &alerts {
+        let name = alert.name.as_str();
+        assert!(
+            alert.annotations.contains_key("runbook"),
+            "alert {name:?} carries no `runbook` annotation naming the section to read"
+        );
+        assert!(
+            alert.fires_after.is_some() || alert.annotations.contains_key("as_documented"),
+            "alert {name:?} carries no `for:` and no `as_documented` annotation saying why"
+        );
+    }
 
     let mut names = BTreeSet::new();
     for alert in &alerts {

@@ -29,10 +29,23 @@ scrape configuration: point your own Prometheus at the Ravel processes you
 run.
 
 `services/ravel-server/tests/shipped_rules_name_emitted_metrics.rs` pins the
-names. It reads this file, extracts the 37 distinct `ravel_` metric names it
-references, and asserts each one appears on a `# TYPE` line of a `/metrics`
-body rendered by a running server, so renaming a metric in the code fails the
-test instead of leaving a rule here matching no series.
+names. It parses this file into its 8 groups and 31 rules, extracts the 37
+distinct `ravel_` metric names their expressions and annotations reference,
+and asserts each one appears on a `# TYPE` line of a `/metrics` body rendered
+by a running server, so renaming a metric in the code fails the test instead
+of leaving a rule here matching no series. Parsing rather than scanning is
+what makes the rule count mean something: a corruption that leaves the
+`- alert:` lines intact keeps a string count at 31 while Prometheus refuses
+the whole file, and the reader the test uses refuses any line it cannot
+account for, so that corruption fails there instead.
+
+The same test parses the five fenced `yaml` blocks the
+[observability guide](../docs/guides/observability.md) prints, and asserts
+that each of the 13 rules they hold carries the same expression, `for:`
+duration and severity as the rule of that name here. The blocks stay on the
+page because they are where each rule is explained, and the comparison is
+what stops them drifting into rules a reader can copy but nothing else
+ships.
 
 ## Why MinIO and the OpenTelemetry Collector are not pulled from Docker Hub
 
