@@ -236,6 +236,27 @@ pub struct SweepReport {
     /// caller running the slow safety-net cadence increments its own counter
     /// when this is `true`.
     pub full_pass: bool,
+    /// The ingest hours in which rule 2 held at least one superseded-input
+    /// group this pass *because the live catalog HEAD snapshot still names
+    /// its objects* ([`SnapshotBlock::Named`]), ascending.
+    ///
+    /// This is the fold's work list, not a hold counter: an hour in here is an
+    /// hour whose snapshot entry is older than the compaction or rewrite
+    /// record that superseded its inputs, so a fold that reconciles that hour
+    /// re-reads the bucket, stops naming the pre-rewrite inputs, and the next
+    /// sweep collects them. `ravel-server`'s maintain tick unions this across
+    /// the shards it swept and hands the union to the fold loop as a
+    /// [`ravel_catalog::RefoldRequest`].
+    ///
+    /// Only the `Named` block contributes. An hour held by an unreadable HEAD
+    /// ([`SnapshotBlock::Unreadable`]) is absent: a fold cannot reconcile what
+    /// it cannot read, and re-folding on that signal would turn an operator
+    /// problem into fold churn. An hour held only by a lease or legal hold is
+    /// absent for the same reason (the fold changes nothing about the hold),
+    /// and an hour whose groups all cleared the gate is absent because there
+    /// is nothing left to reconcile. So this set is a subset of the hours the
+    /// pass looked at, never all of them.
+    pub blocked_named_hours: BTreeSet<u32>,
 }
 
 /// Run all three sweep rules over one `(tenant, signal, shard)` and report
@@ -327,6 +348,7 @@ pub async fn sweep_shard_with_holds(
             orphan_breaker_overridden,
             orphan_pass: OrphanPass::Run,
             full_pass: true,
+            blocked_named_hours: superseded.blocked_named_hours.clone(),
         },
         superseded_holds,
     ))
@@ -522,6 +544,7 @@ pub async fn sweep_shard_zoned_with_holds(
             orphan_breaker_overridden,
             orphan_pass,
             full_pass: false,
+            blocked_named_hours: superseded.blocked_named_hours.clone(),
         },
         superseded_holds,
     ))
@@ -529,10 +552,12 @@ pub async fn sweep_shard_zoned_with_holds(
 
 /// Surface a superseded-input hold to an operator running the combined
 /// [`sweep_shard`] / [`sweep_shard_zoned`] pass. [`SweepReport`] carries no
-/// hold counter: the structured counters live on [`SupersededSweepOutcome`], which
-/// [`sweep_superseded`] returns directly, and this log line is what a caller
-/// that only has the combined report sees. Silent on a pass that held nothing,
-/// which is every ordinary pass.
+/// hold *counter*: the structured counters live on
+/// [`SupersededSweepOutcome`], which [`sweep_superseded`] returns directly,
+/// and this log line is what a caller that only has the combined report sees.
+/// The report does carry [`SweepReport::blocked_named_hours`], which is the
+/// fold's work list rather than a count of what was held. Silent on a pass
+/// that held nothing, which is every ordinary pass.
 fn log_superseded_holds(
     tenant: &TenantHash,
     signal: Signal,
@@ -1001,6 +1026,11 @@ pub struct SupersededSweepOutcome {
     /// are not in `held_request_ids`, because no surviving record names them,
     /// so rule 6 falls back to the bucket.
     pub held_truncated_buckets: BTreeSet<HeldBucket>,
+    /// The ingest hours held by [`SnapshotBlock::Named`] this pass, ascending:
+    /// the hours a fold can unblock by reconciling them. See
+    /// [`SweepReport::blocked_named_hours`], which this feeds, for why the
+    /// other two hold reasons do not contribute.
+    pub blocked_named_hours: BTreeSet<u32>,
 }
 
 impl SupersededSweepOutcome {
@@ -1341,6 +1371,11 @@ async fn sweep_superseded_impl(
             SnapshotGate::Blocked(SnapshotBlock::Named) => {
                 outcome.held_by_snapshot += group.object_count();
                 outcome.note_hold(group, shard);
+                // The one predicate that a fold can clear. Recording the hour
+                // here rather than beside `cleared.push` or in the other two
+                // hold arms is what keeps the fold's work list to hours whose
+                // snapshot entry is genuinely stale.
+                outcome.blocked_named_hours.insert(group.ingest_hour_bucket);
             }
             SnapshotGate::Blocked(SnapshotBlock::Unreadable) => {
                 outcome.held_by_unreadable_head += group.object_count();
