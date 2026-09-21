@@ -167,12 +167,20 @@ pub struct S3Spec {
     pub endpoint: Option<String>,
 
     /// Accept a plaintext `http://` `endpoint` whose host is not loopback
-    /// (`--s3-allow-http`). A server pod never reaches its object store over
+    /// (`--s3-allow-http`). A pod never reaches its object store over
     /// loopback, so an in-cluster MinIO or floci addressed by Service name
-    /// needs this; without it the server refuses to start rather than moving
-    /// telemetry and S3 credentials across the cluster network in the clear.
-    /// Leave false (the default) for any `https://` endpoint and for real
-    /// AWS S3.
+    /// needs this. Without it the operator refuses to render the cluster at
+    /// all: the `RavelCluster` gets a `Degraded` condition with reason
+    /// `PlaintextS3Endpoint` naming this field, and no Deployment, Service, or
+    /// qualification Job is created, rather than moving telemetry and S3
+    /// credentials across the cluster network in the clear. The same rule
+    /// governs the operator's own S3 client (the one that reconciles
+    /// `sys/auth` and applies `shardOverrides`), the rendered server
+    /// containers, and the `ravel-cli store qualify` Job, all from one
+    /// decision. Setting it re-runs store qualification, because it changes
+    /// whether that check can reach the store. Leave false (the default) for
+    /// any `https://` endpoint and for real AWS S3: there it is inert, since
+    /// an `https://` endpoint never permits a downgrade.
     #[serde(default)]
     pub allow_http: bool,
 
