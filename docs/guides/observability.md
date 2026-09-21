@@ -305,6 +305,16 @@ logs alone.
 
 #### The fold-stalled alert
 
+This group, and every other rule block in this guide, ships as
+[`deploy/prometheus/ravel.rules.yaml`](../../deploy/prometheus/ravel.rules.yaml)
+together with the conditions the
+[troubleshooting guide](operations/troubleshooting.md) states. Load that file
+from Prometheus's `rule_files:` key rather than transcribing the block below:
+a `ravel-server` integration test asserts that every metric the shipped file
+names is one a running server renders, and a copy pasted out of this page has
+nothing behind it if a metric is later renamed. The block is kept here because
+its comments explain the rule.
+
 ```yaml
 groups:
   - name: ravel-catalog-fold
@@ -562,6 +572,10 @@ exists: every `maintain` process, and a `gateway` process run with
 `ravel_catalog_fold_stamped_*` series missing from the exposition.
 
 #### The stamp-coverage shortfall alert
+
+Shipped as the `ravel-declared-stats` group in
+[`deploy/prometheus/ravel.rules.yaml`](../../deploy/prometheus/ravel.rules.yaml);
+load that file rather than copying the block.
 
 ```yaml
 groups:
@@ -890,6 +904,10 @@ that moves.
 
 #### The maintenance-stalled alert
 
+Shipped as the `ravel-maintain-liveness` group in
+[`deploy/prometheus/ravel.rules.yaml`](../../deploy/prometheus/ravel.rules.yaml);
+load that file rather than copying the block.
+
 ```yaml
 groups:
   - name: ravel-maintain-liveness
@@ -1053,6 +1071,10 @@ the loop stops. A tick that ended in `lease_not_held` stamps the gauge: a
 standby replica is alive and evaluating nothing by design.
 
 #### The alerting-pipeline alerts
+
+Shipped as the `ravel-alerting-pipeline` group in
+[`deploy/prometheus/ravel.rules.yaml`](../../deploy/prometheus/ravel.rules.yaml);
+load that file rather than copying the block.
 
 ```yaml
 groups:
@@ -1296,6 +1318,10 @@ backfill problem and clears on its own once the sender is fixed; `structural`
 never clears without a change to what the sender emits, so any sustained rate
 is worth paging a human who can go and read
 [the ingest guide's temporality recipe](ingest.md#delta-temporality-metrics).
+
+Both alerts ship as the `ravel-ingest-rejections` group in
+[`deploy/prometheus/ravel.rules.yaml`](../../deploy/prometheus/ravel.rules.yaml);
+load that file rather than copying the block.
 
 ```yaml
 groups:
