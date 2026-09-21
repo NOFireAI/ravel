@@ -228,8 +228,23 @@ BEFORE any merge.
    - unwrap/expect on production paths; `unsafe`
    - silent approximation; placeholder implementations on critical paths
    - acceptance tests that don't genuinely assert the claimed behavior
+   - a sentence in a doc, HELP string, doc comment or ADR that asserts a
+     property the code does not have, especially one using "never" or
+     "always" that holds on one path and not another, and any number
+     stated in prose that no longer matches the tree
+   - a pattern fixed at one site and left at another: grep the instance
+     the change fixes and check every other occurrence
+   - a metric family, label, flag or report field that a doc names and
+     nothing renders or produces
    Require findings as `file:line - claim - why it's wrong`, and a
    verdict: pass or block.
+
+   Run this BEFORE opening the pull request, not after. Skipping it on a
+   wave moves round one of the review into public, where each finding
+   costs a CI cycle and a re-review instead of a local fix: one epic ran
+   10 review rounds on a single pull request this way, and about half of
+   every finding across it was an unpaired prose claim the checkpoint
+   would have caught.
 3. Block verdict: fix before merging anything. Small and mechanical fix
    locally (in a worktree); otherwise a fix task to the fleet. Re-review
    the changed area. Wave N+1 does not dispatch until pass.
