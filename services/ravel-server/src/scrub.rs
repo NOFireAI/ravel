@@ -11,11 +11,18 @@
 //! [`crate::tenant_discovery::discover_and_restrict`] and, for every
 //! `(tenant, signal, shard)` it holds data for, runs the content tier over the
 //! shard's committed data objects at every level: L0 commit records, and the
-//! L1 and rewrite parts a live compaction or erasure-rewrite record
-//! supersedes them with. Only the live generation counts: a record another
-//! rewrite record names in `superseded_record_key` is excluded, and so is a
-//! tombstoned bucket's (retention's sweep may delete either one's parts at
-//! any time, and no query reads them meanwhile). (The
+//! L1 and rewrite parts a compaction or erasure-rewrite record supersedes them
+//! with.
+//!
+//! The lineage filter applies to the parts only. A compaction or rewrite
+//! record another rewrite record names in `superseded_record_key` is left out,
+//! and so is one in a tombstoned bucket: retention's sweep may delete either
+//! one's parts at any time, and no query reads them meanwhile. L0 commit
+//! records carry no such check (neither arm below tests supersession or a
+//! tombstone for them), so an L0 object a live compaction already folded is
+//! still scrubbed, and a `level="l0"` mismatch on an already-compacted hour
+//! may name a copy nothing reads: the catalog puts a live compaction record's
+//! input identities into the query-time excluded set. (The
 //! maintenance and fold supervisors
 //! have since moved to the lifecycle-aware
 //! [`crate::tenant_discovery::discover_and_restrict_by_lifecycle`] under
@@ -27,9 +34,10 @@
 //!    Decode each commit record and reconstruct the data object key it points
 //!    at; decode each compaction/rewrite record, drop the tombstoned and
 //!    superseded ones, and reconstruct the survivors' parts' keys the same
-//!    way. Together these build the
-//!    rotation corpus ([`ScrubTarget`]s keyed by object key and tagged with a
-//!    [`ravel_maintain::ScrubLevel`], in key order).
+//!    way. Together these build the rotation corpus ([`ScrubTarget`]s in key
+//!    order) and, beside it, the per-key map holding the record to verify and
+//!    its [`ravel_maintain::ScrubLevel`]. The level lives in that map alone,
+//!    so the label a mismatch is counted under has one owner.
 //! 2. Load this shard's persisted [`ScrubCursor`], size a per-tick byte budget
 //!    from the corpus size and the configured scrub period `P`
 //!    ([`per_tick_byte_budget`]), and [`advance_cursor`] to pick the bounded
@@ -659,7 +667,6 @@ async fn run_shard_tick(
                 corpus.push(ScrubTarget {
                     object_key: data_key.clone(),
                     object_size: record.object_size,
-                    level: ScrubLevel::L0,
                 });
                 records.insert(data_key, (record, ScrubLevel::L0));
             }
@@ -768,7 +775,6 @@ async fn run_shard_tick(
             corpus.push(ScrubTarget {
                 object_key: part_key.clone(),
                 object_size: part.object_size,
-                level: ScrubLevel::L1,
             });
             records.insert(part_key, (synthetic, ScrubLevel::L1));
         }
@@ -799,7 +805,6 @@ async fn run_shard_tick(
             corpus.push(ScrubTarget {
                 object_key: part_key.clone(),
                 object_size: part.object_size,
-                level: ScrubLevel::Rewrite,
             });
             records.insert(part_key, (synthetic, ScrubLevel::Rewrite));
         }
