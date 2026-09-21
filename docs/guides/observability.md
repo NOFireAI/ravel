@@ -164,6 +164,8 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_flushes_by_age_adaptive_total` | Flushes opened on the adaptive-delay corridor age trigger rather than the fixed max_flush_delay. A rising figure means the adaptive corridor, not the fixed delay, is driving age flushes. |
 | `ravel_ingest_in_flight_flushes` | Flush tasks spawned but not yet acked, summed across shards (a gauge). A sustained high value means flushes are not keeping up with the load. |
 | `ravel_ingest_flush_permit_wait_seconds_total` | Total seconds every flush has spent waiting for a `max_inflight_flushes` permit, summed across shards. Zero unless a shard is actually asked for a second concurrent flush; a rising figure means `max_inflight_flushes` is the binding window. |
+| `ravel_ingest_queued_flushes` | Flush tasks spawned and not yet reaped, summed across shards (a gauge): the per-shard queue `--max-queued-flushes` caps. It can exceed the shard count times that cap, because a tenant buffer over its memory backstop spawns whatever the queue depth; this gauge rising while `ravel_ingest_flush_trigger_deferred_total` stays flat is that exemption, not a queue that lost its bound. |
+| `ravel_ingest_flush_trigger_deferred_total` | Size and age flush triggers refused because their shard was already holding `--max-queued-flushes` spawned flush tasks, summed across shards. A refusal is a deferral, not a shed: the buffer rides back untouched and the next tick re-fires once a flush has been reaped, so a rising figure means flush latency slipped past `--max-flush-delay` while nothing was dropped. |
 
 The collisions family carries no `signal="spans"` series. Spans derive no
 identity that can collide, so that sample is structurally absent, not zero.
@@ -176,14 +178,17 @@ The `ravel_ingest_flushes_by_age_adaptive_total` family likewise carries only
 the `signal="metrics"` series: the adaptive-delay corridor is a
 metrics-pipeline feature, so that sample is structurally absent for logs and
 spans, not zero. `ravel_ingest_in_flight_flushes`,
-`ravel_ingest_flush_permit_wait_seconds_total`, and
-`ravel_ingest_grace_extended_stale_flushes_total` are carried for every
+`ravel_ingest_flush_permit_wait_seconds_total`,
+`ravel_ingest_queued_flushes`, `ravel_ingest_flush_trigger_deferred_total`,
+and `ravel_ingest_grace_extended_stale_flushes_total` are carried for every
 signal, each for its own reason: the in-flight gauge because all three shard
 actors arm an `InFlightFlushGuard`; the permit-wait counter because the
 `max_inflight_flushes` acquire runs off-actor for all three ingest pipelines;
-the grace-extended counter because all three snapshots already expose the
-stale-provisioning counter it pairs with. A logs- or spans-only process
-therefore still renders a real (possibly zero) sample for all three.
+the queue-depth gauge and its deferral counter because the queued-flush cap is
+wired identically in all three; the grace-extended counter because all three
+snapshots already expose the stale-provisioning counter it pairs with. A logs-
+or spans-only process therefore still renders a real (possibly zero) sample
+for all five.
 
 #### Per-tenant PUT attribution (`ravel_ingest_attribution_puts_total`)
 

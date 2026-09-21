@@ -215,6 +215,22 @@ pub struct SpanIngestMetricsSnapshot {
     /// not fit this struct's flat Copy shape; call `shard_skew_by_shard`
     /// directly for that.
     pub flush_permit_wait_ns_total: u64,
+    /// Sum across shards of `flushes_queued` from
+    /// [`SpanIngestMetrics::shard_skew_by_shard`] at snapshot time: flush tasks
+    /// spawned and not yet reaped, the quantity
+    /// [`crate::IngestConfig::max_queued_flushes`] caps per shard (issue
+    /// #1740). A gauge, so this sum is point-in-time and can fall. It can read
+    /// above `shard_count * max_queued_flushes`: a buffer over its memory
+    /// backstop spawns past the cap. The per-shard breakdown does not fit this
+    /// struct's flat Copy shape; call `shard_skew_by_shard` directly for that.
+    pub flushes_queued_total: u64,
+    /// Sum across shards of `flush_trigger_deferred` from
+    /// [`SpanIngestMetrics::shard_skew_by_shard`] at snapshot time: size and
+    /// age flush triggers refused because the shard was already at
+    /// `max_queued_flushes` (issue #1740). Cumulative. The per-shard breakdown
+    /// does not fit this struct's flat Copy shape; call `shard_skew_by_shard`
+    /// directly for that.
+    pub flush_trigger_deferred_total: u64,
 }
 
 impl SpanIngestMetrics {
@@ -441,6 +457,7 @@ impl SpanIngestMetrics {
     }
 
     pub fn snapshot(&self) -> SpanIngestMetricsSnapshot {
+        let skew = self.shard_skew_by_shard();
         SpanIngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
             flushes_by_age: self.flushes_by_age.load(Ordering::Relaxed),
@@ -466,10 +483,14 @@ impl SpanIngestMetrics {
                 .into_iter()
                 .map(|(_, count)| count)
                 .sum(),
-            flush_permit_wait_ns_total: self
-                .shard_skew_by_shard()
-                .into_iter()
+            flush_permit_wait_ns_total: skew
+                .iter()
                 .map(|(_, stats)| stats.flush_permit_wait_ns)
+                .sum(),
+            flushes_queued_total: skew.iter().map(|(_, stats)| stats.flushes_queued).sum(),
+            flush_trigger_deferred_total: skew
+                .iter()
+                .map(|(_, stats)| stats.flush_trigger_deferred)
                 .sum(),
         }
     }

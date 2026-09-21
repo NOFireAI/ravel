@@ -40,8 +40,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   next tick** (issue #1740). Before this, every trigger spawned a task, so a
   shard whose writes were slow kept spawning while each task held its built
   batch resident, with the worst case set by how long the object store stayed
-  slow rather than by anything configured. A per-shard `flushes_queued` gauge
-  and a `flush_trigger_deferred` counter report it. Two things to know: a
+  slow rather than by anything configured. `/metrics` reports it with two new
+  families, both by `{mode, signal}`: `ravel_ingest_queued_flushes`, the
+  spawned-and-unreaped depth summed across shards, and
+  `ravel_ingest_flush_trigger_deferred_total`, the refusals that bound it.
+  Two things to know: a
   flush that crosses the per-tenant memory backstop is **exempt** and spawns
   even at the cap, because a bounded queue of tasks is worth less than a
   bounded buffer; and the server now **refuses to start** when
