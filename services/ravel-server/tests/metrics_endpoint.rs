@@ -170,6 +170,69 @@ async fn metrics_ingest_family_present_only_in_ingest_modes() {
     }
 }
 
+/// The queued-flush cap (issue #1740) is only operable if the two figures it
+/// moves are readable on the surface an operator actually scrapes.
+/// `--max-queued-flushes`' help tells an operator to watch
+/// `ravel_ingest_flush_trigger_deferred_total` for refusals and
+/// `ravel_ingest_queued_flushes` for the queue depth those refusals bound, so
+/// both families must render on `/metrics`, with a sample per ingest signal,
+/// wherever an ingest router exists.
+///
+/// Counted, not merely tested for presence: a family emitted twice is a
+/// duplicate series a scrape rejects and reads the same as a single one to
+/// `contains`. Asserted zero in the modes that build no router, so a family
+/// hardcoded into the exposition regardless of the routers would fail here
+/// rather than read as coverage.
+#[tokio::test]
+async fn metrics_render_queued_flush_families_named_by_the_flag_help() {
+    for (mode, mode_label, expect_ingest) in [
+        (Mode::All, "all", true),
+        (Mode::Gateway, "gateway", true),
+        (Mode::Query, "query", false),
+        (Mode::Maintain, "maintain", false),
+    ] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let base = format!("http://{}", running.http_addr);
+        let client = reqwest::Client::new();
+
+        let body = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request completes")
+            .text()
+            .await
+            .expect("metrics body is text");
+
+        for (family, metric_type) in [
+            ("ravel_ingest_queued_flushes", "gauge"),
+            ("ravel_ingest_flush_trigger_deferred_total", "counter"),
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {family} {metric_type}"))
+                    .count(),
+                usize::from(expect_ingest),
+                "mode {mode:?} must declare {family} exactly {} time(s):\n{body}",
+                usize::from(expect_ingest)
+            );
+            for signal in ["metrics", "logs", "spans"] {
+                assert_eq!(
+                    body.matches(&format!(
+                        "{family}{{mode=\"{mode_label}\",signal=\"{signal}\"}} "
+                    ))
+                    .count(),
+                    usize::from(expect_ingest),
+                    "mode {mode:?} must render {family} for signal {signal} exactly {} \
+                     time(s):\n{body}",
+                    usize::from(expect_ingest)
+                );
+            }
+        }
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
 /// ADR-0873's three observability families on a live `/metrics` scrape.
 ///
 /// The per-carrier drop tally renders in every mode: its four carriers are
