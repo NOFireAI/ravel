@@ -1,7 +1,8 @@
 # ADR-1642: acquire the flush permit inside the flush task
 
-Status: Accepted (2026-09-12). Supersedes ADR-0067 decision 2. Issues #1292
-and #1641.
+Status: Accepted (2026-09-12). Amended 2026-09-20 (issue #1740, see
+"Amendment: the queued-flush cap" below). Supersedes ADR-0067 decision 2.
+Issues #1292, #1641, and #1740.
 
 ## Context
 
@@ -122,6 +123,12 @@ flowchart LR
     with every other `0`-means-no-limit ceiling in ingest; operators who set it
     accept unbounded buffered flush memory under a long stall.
 
+    Amended by issue #1740: the spawned flush queue is now bounded by
+    `max_queued_flushes` under every budget setting, so "nothing bounds the
+    spawned-but-waiting flush queue except host memory" no longer holds. What
+    `Unlimited` still opts out of is the bound on buffered rows waiting in the
+    tenant map. See the amendment below.
+
   `max_inflight_flushes` keeps its other meaning unchanged: it is the
   concurrency of flushes actually executing against the object store, and so
   the bound on concurrent PUTs and on encode memory in flight.
@@ -172,3 +179,64 @@ flowchart LR
   and one disabled under `Unlimited` alongside the byte budget would leave the
   same exposure. The only bound that fires without the on-actor wait is a shed,
   and shedding is what an operator turns off by setting `0`.
+
+  Amended by issue #1740. That last sentence is wrong: it enumerates two
+  policies for a reached bound and there is a third, refusing the trigger
+  and leaving the rows buffered. See "Amendment: the queued-flush cap"
+  below, which adopts the count bound this bullet rejected.
+
+## Amendment: the queued-flush cap (issue #1740)
+
+The `Unlimited` exposure in the consequences above is now bounded by a count,
+`IngestConfig::max_queued_flushes` (default 8, per shard). Before spawning a
+flush the actor compares its spawned-but-unreaped flush count against the cap,
+and at the cap it refuses the trigger instead of spawning. The refused buffer
+goes back into the tenant map exactly as it arrived: rows, waiters, byte
+charges, and the trigger bookkeeping including `oldest_arrival_ns`, so the age
+clock is not reset and the next tick re-fires the same trigger once a flush has
+been reaped. Nothing is acked and nothing is dropped.
+
+This is the policy the "bound the spawned-but-waiting queue with its own limit"
+bullet above ruled out, and that bullet's reasoning was incomplete. It held that
+a second bound must resolve to either the on-actor wait this ADR removes or a
+shed. Refusing a trigger is neither. The actor does not wait: the comparison is
+a `JoinSet::len()` read and the refusal returns to the select loop immediately,
+so the channel arm, the age-tick arm, and the reap arm all keep running, which
+is the whole property this ADR bought. The write is not shed either: the rows
+are still buffered, still charged, and their waiters are still pending, so a
+write that would have been acked is still acked, one tick later. So `0` does not
+come to mean "shed", and the exposure is bounded regardless of the byte budget's
+setting.
+
+What the cap does change is the deadline. A deferred age trigger misses
+`max_flush_delay` by however long the shard stays at the cap, which is the cost
+the first rejected alternative names for a `try_acquire` skip. The difference is
+that this skip has the re-trigger mechanism that alternative said it would need:
+the age tick fires every `flush_tick` against an unreset `oldest_arrival_ns`, so
+a refused trigger is retried on the next tick with no new write required. The
+trade is a bounded visibility delay under a sustained stall against an unbounded
+queue under the same stall, and a stall long enough to fill the queue has
+already missed the deadline on the flushes ahead of it.
+
+`FlushTrigger::Manual` is exempt. Manual is what every drain path uses
+(`flush_all` for an explicit flush, shutdown, and channel close), and those
+loop until the tenant map empties. A refused Manual trigger would therefore
+either spin or leave residue, and residue on the shutdown path is acknowledged
+data that never reaches the object store. Drains are also the one place the
+actor is permitted to park on in-flight flushes, so the queue they add is
+bounded by the drain itself.
+
+Two per-shard metrics make the cap observable: `flushes_queued`, a gauge of the
+spawned-but-unreaped count the cap tests, and `flush_trigger_deferred`, a
+counter of refused triggers. Both are on `ShardSkewStats`, for all three
+pipelines. A nonzero `flush_trigger_deferred` rate means a shard is at its cap
+and its tenants' visibility deadlines are slipping; it is the signal that the
+object store, not ingest, is the thing to look at.
+
+The consequence bullets above are unchanged except in their bound. Memory per
+shard still rises by one flush window per spawned flush, and the in-flight gauge
+can still read above `max_inflight_flushes`; what is new is that the gauge
+cannot exceed `max_queued_flushes`, under any byte-budget setting. Buffered
+memory is not bounded by this cap: a shard at its cap keeps merging new writes
+into tenant buffers, which is what the byte budget bounds and what `Unlimited`
+still opts out of.

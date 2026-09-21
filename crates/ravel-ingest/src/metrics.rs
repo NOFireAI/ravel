@@ -367,6 +367,10 @@ struct ShardSkewAtomics {
     on_actor_ns: AtomicU64,
     flush_permit_wait_ns: AtomicU64,
     off_actor_ns: AtomicU64,
+    /// Gauge, not a counter: the actor `store`s its current spawned-but-unreaped
+    /// flush-task count here whenever that count changes (issue #1740).
+    flushes_queued: AtomicU64,
+    flush_trigger_deferred: AtomicU64,
 }
 
 /// The per-shard skew accumulator (issue #865), shared by the metrics pipeline's
@@ -442,6 +446,24 @@ impl ShardSkew {
         }
     }
 
+    /// Publish shard `shard`'s current spawned-but-unreaped flush-task count
+    /// (issue #1740). A `store`, because this is a gauge: the actor writes the
+    /// whole value wherever its flush set changes length, and it is the only
+    /// writer for its own shard.
+    pub(crate) fn record_flushes_queued(&self, shard: u32, queued: u64) {
+        if let Some(s) = self.shards.get(shard as usize) {
+            s.flushes_queued.store(queued, Ordering::Relaxed);
+        }
+    }
+
+    /// One size or age flush trigger refused because shard `shard` was already
+    /// at `max_queued_flushes` (issue #1740).
+    pub(crate) fn record_flush_trigger_deferred(&self, shard: u32) {
+        if let Some(s) = self.shards.get(shard as usize) {
+            s.flush_trigger_deferred.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Point-in-time per-shard figures, sorted by shard index. A shard with no
     /// recorded activity is simply absent. `queue_depth` is derived here as
     /// `messages_enqueued - messages_processed`, saturating at 0.
@@ -461,11 +483,15 @@ impl ShardSkew {
                 let on_actor_ns = s.on_actor_ns.load(Ordering::Relaxed);
                 let flush_permit_wait_ns = s.flush_permit_wait_ns.load(Ordering::Relaxed);
                 let off_actor_ns = s.off_actor_ns.load(Ordering::Relaxed);
+                let flushes_queued = s.flushes_queued.load(Ordering::Relaxed);
+                let flush_trigger_deferred = s.flush_trigger_deferred.load(Ordering::Relaxed);
                 if messages_enqueued == 0
                     && messages_processed == 0
                     && on_actor_ns == 0
                     && flush_permit_wait_ns == 0
                     && off_actor_ns == 0
+                    && flushes_queued == 0
+                    && flush_trigger_deferred == 0
                 {
                     return None;
                 }
@@ -478,6 +504,8 @@ impl ShardSkew {
                         on_actor_ns,
                         flush_permit_wait_ns,
                         off_actor_ns,
+                        flushes_queued,
+                        flush_trigger_deferred,
                     },
                 ))
             })
@@ -568,6 +596,30 @@ pub struct ShardSkewStats {
     /// a flush bottleneck -- the exact ambiguity a single figure cannot
     /// resolve.
     pub off_actor_ns: u64,
+    /// Gauge: flush tasks this shard's actor has spawned and not yet reaped,
+    /// at snapshot time (issue #1740). Counts a flush parked on the
+    /// `max_inflight_flushes` semaphore the same as one executing against the
+    /// object store, because both hold a flush window of memory and an
+    /// ADR-0069 charge. `IngestConfig::max_queued_flushes` is its ceiling: at
+    /// the ceiling the actor refuses further size and age triggers and bumps
+    /// `flush_trigger_deferred` instead of spawning.
+    ///
+    /// Distinct from the pipeline's in-flight-flush gauge
+    /// ([`IngestMetrics::in_flight_flushes_by_shard`]) in when it stops
+    /// counting: in-flight stops when the flush task's guard drops, this one
+    /// when the actor next reaps the finished task, so this is the figure the
+    /// cap is enforced against and it reads at or above the other.
+    pub flushes_queued: u64,
+    /// Size and age flush triggers this shard refused because `flushes_queued`
+    /// was already at `IngestConfig::max_queued_flushes` (issue #1740). The
+    /// tenant's rows stay buffered with their arrival bookkeeping intact and
+    /// the next tick re-fires the trigger, so a nonzero figure is deferred
+    /// work, never lost work. Sustained growth means flushes are not draining
+    /// and every tenant this shard refuses is missing its visibility deadline.
+    ///
+    /// Drain triggers ([`FlushTrigger::Manual`]: explicit flush-all, shutdown,
+    /// channel close) are never refused and never counted here.
+    pub flush_trigger_deferred: u64,
 }
 
 /// Point-in-time copy of [`IngestMetrics`] for scraping. See the
@@ -754,6 +806,21 @@ impl IngestMetrics {
     /// double-counting.
     pub(crate) fn record_shard_off_actor_ns(&self, shard: u32, off_actor_ns: u64) {
         self.shard_skew.record_off_actor_ns(shard, off_actor_ns);
+    }
+
+    /// Shard `shard`'s current spawned-but-unreaped flush-task count, the
+    /// quantity `IngestConfig::max_queued_flushes` caps (issue #1740).
+    /// Published by the shard actor wherever its flush set changes length, so
+    /// the gauge reflects what the next trigger will be tested against.
+    pub(crate) fn record_shard_flushes_queued(&self, shard: u32, queued: u64) {
+        self.shard_skew.record_flushes_queued(shard, queued);
+    }
+
+    /// One size or age flush trigger refused because shard `shard` was already
+    /// at its queued-flush cap (issue #1740). The rows stay buffered for the
+    /// next tick.
+    pub(crate) fn record_shard_flush_trigger_deferred(&self, shard: u32) {
+        self.shard_skew.record_flush_trigger_deferred(shard);
     }
 
     /// Point-in-time per-shard skew figures, sorted by shard index (issue
@@ -1078,6 +1145,8 @@ mod tests {
                         on_actor_ns: 300,
                         flush_permit_wait_ns: 700,
                         off_actor_ns: 9_000,
+                        flushes_queued: 0,
+                        flush_trigger_deferred: 0,
                     }
                 ),
                 (
@@ -1089,6 +1158,8 @@ mod tests {
                         on_actor_ns: 50,
                         flush_permit_wait_ns: 0,
                         off_actor_ns: 0,
+                        flushes_queued: 0,
+                        flush_trigger_deferred: 0,
                     }
                 ),
             ]
@@ -1119,6 +1190,40 @@ mod tests {
                     on_actor_ns: 40,
                     flush_permit_wait_ns: 150,
                     off_actor_ns: 500,
+                    flushes_queued: 0,
+                    flush_trigger_deferred: 0,
+                }
+            )]
+        );
+    }
+
+    /// The queued-flush cap's two figures have different shapes and the
+    /// accumulator must keep them apart: `flushes_queued` is a gauge the actor
+    /// republishes at its current depth (a later smaller value wins), while
+    /// `flush_trigger_deferred` counts refusals and only ever rises. A shard
+    /// that has done nothing but refuse a trigger must still appear in the
+    /// report, or the one shard at its cap is the one the reader cannot see.
+    #[test]
+    fn queued_flush_gauge_replaces_while_the_deferred_counter_accumulates() {
+        let metrics = IngestMetrics::new(2);
+        metrics.record_shard_flushes_queued(1, 3);
+        metrics.record_shard_flushes_queued(1, 1);
+        metrics.record_shard_flush_trigger_deferred(1);
+        metrics.record_shard_flush_trigger_deferred(1);
+
+        assert_eq!(
+            metrics.shard_skew_by_shard(),
+            vec![(
+                1,
+                ShardSkewStats {
+                    messages_enqueued: 0,
+                    messages_processed: 0,
+                    queue_depth: 0,
+                    on_actor_ns: 0,
+                    flush_permit_wait_ns: 0,
+                    off_actor_ns: 0,
+                    flushes_queued: 1,
+                    flush_trigger_deferred: 2,
                 }
             )]
         );
@@ -1144,6 +1249,8 @@ mod tests {
                     on_actor_ns: 0,
                     flush_permit_wait_ns: 0,
                     off_actor_ns: 0,
+                    flushes_queued: 0,
+                    flush_trigger_deferred: 0,
                 }
             )]
         );
@@ -1277,6 +1384,8 @@ mod tests {
                     on_actor_ns: 7_000,
                     flush_permit_wait_ns: 11,
                     off_actor_ns: 13,
+                    flushes_queued: 0,
+                    flush_trigger_deferred: 0,
                 }
             )]
         );
@@ -1305,6 +1414,8 @@ mod tests {
                     on_actor_ns: 42,
                     flush_permit_wait_ns: 0,
                     off_actor_ns: 0,
+                    flushes_queued: 0,
+                    flush_trigger_deferred: 0,
                 }
             )]
         );
