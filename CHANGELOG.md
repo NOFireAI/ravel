@@ -29,14 +29,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every compaction and rewrite record it listed, so a bit flip in an L1 or
   rewrite part was never checksummed; a live compaction or rewrite record's
   parts now join the same rotation an L0 segment does. The lineage filter
-  applies to the parts only: a compaction or rewrite record another rewrite
-  record names in `superseded_record_key`, and one in a bucket a retention
-  tombstone has retired, are both left out, so no operator is paged on rot in
-  bytes no query reads. L0 commit records carry no supersession or tombstone
-  check and are scrubbed whatever their lineage, so a `level="l0"` mismatch on
-  an hour a live compaction has already folded may name a redundant copy
-  rather than data a query can still reach. The mismatch counter
-  now carries `level="l0"`, `level="l1"`, or `level="rewrite"` instead of one
+  applies to the parts only, and leaves out three shapes: a compaction or
+  rewrite record another rewrite record names in `superseded_record_key`, a
+  compaction record that loses its bucket's overlap component to another
+  compaction record (the state a compactor race leaves behind, resolved through
+  the same selection the snapshot resolver, the index fold and the sweep use),
+  and either kind in a bucket a retention tombstone has retired. No query reads
+  a superseded or tombstoned record's parts, and an overlap loser's parts are
+  read by no node that has adopted the overlap rule, so no operator is paged on
+  rot in bytes nothing serves. L0 commit records carry no supersession, overlap
+  or tombstone check and are scrubbed whatever their lineage, so a `level="l0"`
+  mismatch on an hour a live compaction has already folded may name a redundant
+  copy rather than data a query can still reach. The mismatch counter now
+  carries `level="l0"`, `level="l1"`, or `level="rewrite"` instead of one
   undifferentiated series per signal; a dashboard or alert rule that sums
   over `signal` alone still sees the same total, but one that names the
   metric without also grouping by `level` now gets three series back instead
