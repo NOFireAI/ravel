@@ -13,14 +13,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first** (issue #1687). Both fetch clients, intra-cluster and federated,
   buffered every response frame a remote sent and only then decoded them, so
   the remote decided how much the coordinator held. Each slice is now capped at
-  1048576 response frames and at 64 MiB of wire bytes, both checked before a
+  1048576 response frames and at 230331648 wire bytes, both checked before a
   frame is decoded, and the client stops pulling at the first breach, which
-  cancels the RPC. The byte ceiling is fixed: it applies with no configuration
-  at all, and nothing raises or lowers it. In particular it is independent of
-  `max_bytes_scanned`, which budgets the compressed store bytes a slice reads
-  rather than the uncompressed bytes it sends back. Both caps are per slice, so a
-  query fanning out to the default 8 parallel slices can make a coordinator
-  hold 8 times the ceiling. A breach is a refusal rather than an outage: HTTP
+  cancels the RPC. The byte ceiling is derived from the sample budget rather
+  than picked as a round number: it is `DEFAULT_MAX_SAMPLES` (10000000) times
+  the widest wire cost of one scalar sample (18 bytes), plus the frame cap
+  times 48 bytes of per-frame framing as headroom, so a slice carrying the
+  whole sample budget a worker is allowed to return still fits under it. The
+  ceiling is fixed: it applies with no configuration at all, and nothing raises
+  or lowers it. In particular it is independent of `max_bytes_scanned`, which
+  budgets the compressed store bytes a slice reads rather than the uncompressed
+  bytes it sends back. Both caps are per slice, and what multiplies them
+  depends on the path: a local fan-out runs up to `promql_fetch_fanout` times
+  `max_parallel_slices` decoders at once (64 at the defaults), while a
+  federated query runs one per remote cluster and `max_parallel_slices` does
+  not bound it. A breach is a refusal rather than an outage: HTTP
   422 naming the observed figure and the cap, in the same class a local budget
   trip uses, not the redacted 503 other slice failures become. A refusal fails
   the query and so carries no stats block; the wire bytes a slice made the
