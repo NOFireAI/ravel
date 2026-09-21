@@ -418,14 +418,17 @@ impl ScrubLevel {
 }
 
 /// One object in a scrub rotation, in the cursor's iteration order.
+///
+/// The target carries no [`ScrubLevel`]: the caller that builds the corpus
+/// also keeps the per-key record it will scrub, and the level belongs beside
+/// that record so there is exactly one owner of it. A copy here could disagree
+/// with that one, and nothing in the rotation reads a level anyway.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScrubTarget {
     /// The object's full key.
     pub object_key: String,
     /// The object's size in bytes, for byte-budgeted ticks.
     pub object_size: u64,
-    /// Which part of the commit lineage this object came from.
-    pub level: ScrubLevel,
 }
 
 /// The bounded amount of work one content-tier tick may do. Every tick scrubs
@@ -887,7 +890,6 @@ mod tests {
             .map(|i| ScrubTarget {
                 object_key: format!("obj-{i:04}"),
                 object_size: 1,
-                level: ScrubLevel::L0,
             })
             .collect()
     }
@@ -930,7 +932,6 @@ mod tests {
             .map(|i| ScrubTarget {
                 object_key: format!("big-{i:02}"),
                 object_size: 100,
-                level: ScrubLevel::L0,
             })
             .collect();
         let budget = ScrubBudget::MaxBytes(1);
